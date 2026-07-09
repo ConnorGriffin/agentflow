@@ -24,6 +24,12 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   sets a repo's position on the autonomy dial. High in `ciq-autotune` (medical),
   low in a vibe-code project.
 
+- **Tier** — the per-issue cost-appropriate model size, assigned by intake as a hard
+  gate: `light` (routine — haiku/Luna), `standard` (sonnet/Terra), `deep`
+  (correctness-sensitive — opus/Sol). Tool-agnostic; each runner resolves it to its
+  tool's model. Orthogonal to the pool: pool = *which plan* (by headroom), tier =
+  *how big a model within it* (by complexity). Both protect the scarce headroom.
+
 - **Runner** — the interchangeable executor that performs a pipeline stage:
   Claude (Opus) or Codex (GPT-5.6 Sol). Chosen per stage by cost / availability /
   preference, **not** by a capability ceiling — both are full-loop capable.

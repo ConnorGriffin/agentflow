@@ -39,3 +39,5 @@ then Context / Decision / Alternatives / Consequences.
   a live repo (method + the `/ui-mockups` and deep-module gates).
 - [0013](0013-engineering-charter.md) — Engineering standards: one canonical charter,
   both tools, enforced at review.
+- [0014](0014-cost-appropriate-model-tiers.md) — Cost-appropriate model tiers: intake
+  sizes every issue (`light`/`standard`/`deep`).

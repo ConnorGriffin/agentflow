@@ -2,16 +2,17 @@
 
 A deep module. Callers say `runner.build(task)` and get back a classified
 `BuildOutcome`. Hidden behind that one call: creating a git worktree off fresh
-`origin/main`, provisioning its environment, invoking the tool-specific CLI
-(`claude -p` vs `codex exec`), and classifying what happened by inspecting the
-resulting PR and marker comments. The two tools differ *only* inside their
-adapters' `_launch`; the worktree choreography and the classification are shared.
+`origin/main`, provisioning its environment, invoking the tool-specific CLI at the
+issue's cost tier (`claude -p --model …` vs `codex exec -m …`), and classifying
+what happened by inspecting the resulting PR and marker comments. The two tools
+differ *only* inside their adapters (`_launch` + the tier→model map); the worktree
+choreography and the classification are shared.
 
 Ported and generalized from the dotfiles `codex-go` wrapper (Codex-only) into a
 two-tool abstraction — the "unified runner" the reuse map flagged as net-new.
 
-The interface is the test surface: `classify_build` is a pure function so the
-outcome logic is tested without spawning anything (see tests/test_runner.py).
+The interface is the test surface: `classify_build` and each adapter's tier→model
+resolution are pure, tested without spawning anything (see tests/test_runner.py).
 """
 
 from __future__ import annotations
@@ -29,6 +30,19 @@ MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
 _MARKER_RE = re.compile(rf"^({'|'.join(MARKERS)}):")
 
 
+class Tier(str, Enum):
+    """Cost-appropriate model tier, assigned per issue by intake (ADR 0014).
+
+    Tool-agnostic; each adapter maps it to a concrete model. A hard requirement —
+    the deep tier burns rate-limit headroom fastest, so mis-sizing wastes the very
+    resource ADR 0006 optimizes.
+    """
+
+    LIGHT = "light"        # routine/mechanical: CSS, config, docs, default flips
+    STANDARD = "standard"  # ordinary features, moderate logic
+    DEEP = "deep"          # correctness-sensitive, design-heavy, multi-surface
+
+
 class BuildStatus(str, Enum):
     PR_OPENED = "pr_opened"      # a PR exists for the branch — success
     BAIL = "bail"               # session posted a marker comment and stopped
@@ -42,6 +56,7 @@ class BuildTask:
     workdir: str     # local main checkout (worktrees are cut from here)
     issue: int
     slug: str        # short kebab title, for branch/worktree naming
+    tier: Tier       # cost tier assigned by intake — no build without one
     prompt: str      # the work order / self-scoped brief handed to the agent
 
 
@@ -74,9 +89,14 @@ def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
 
 
 class _WorktreeRunner:
-    """Shared build orchestration; subclasses supply `tool` and `_launch`."""
+    """Shared build orchestration; subclasses supply `tool`, `MODELS`, `_launch`."""
 
     tool: str = "?"
+    MODELS: dict[Tier, str] = {}
+
+    def model_for(self, tier: Tier) -> str:
+        """Resolve a tool-agnostic tier to this tool's concrete model."""
+        return self.MODELS[tier]
 
     def build(self, task: BuildTask) -> BuildOutcome:
         branch = f"agentflow/{self.tool}/issue-{task.issue}-{task.slug}"
@@ -88,7 +108,7 @@ class _WorktreeRunner:
             return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
 
         started = time.time()
-        launched = self._launch(task.prompt, cwd=str(wt))
+        launched = self._launch(task.prompt, cwd=str(wt), model=self.model_for(task.tier))
 
         pr_url = self._pr_for_branch(task.repo, branch)
         markers = self._new_marker_comments(task.repo, task.issue, since=started)
@@ -115,8 +135,7 @@ class _WorktreeRunner:
     def _pr_for_branch(self, repo: str, branch: str) -> str | None:
         r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
                   "--state", "all", "--json", "url", "-q", ".[0].url // \"\""])
-        url = r.stdout.strip()
-        return url or None
+        return r.stdout.strip() or None
 
     def _new_marker_comments(self, repo: str, issue: int, since: float) -> list[str]:
         r = _run(["gh", "issue", "view", str(issue), "--repo", repo, "--json", "comments"])
@@ -133,29 +152,29 @@ class _WorktreeRunner:
                 out.append(c.get("body", ""))
         return out
 
-    def _launch(self, prompt: str, cwd: str) -> bool:  # returns launched_ok
+    def _launch(self, prompt: str, cwd: str, model: str) -> bool:  # returns launched_ok
         raise NotImplementedError
 
 
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
+    MODELS = {Tier.LIGHT: "haiku", Tier.STANDARD: "sonnet", Tier.DEEP: "opus"}
 
-    def __init__(self, model: str = "opus"):
-        self.model = model
-
-    def _launch(self, prompt: str, cwd: str) -> bool:
+    def _launch(self, prompt: str, cwd: str, model: str) -> bool:
         # Hazard-free autonomous build: skip permission prompts. A hazardous repo
         # would pass a tight --allowedTools instead (profile-driven, later).
-        r = _run(["claude", "-p", prompt, "--model", self.model,
+        r = _run(["claude", "-p", prompt, "--model", model,
                   "--dangerously-skip-permissions"], cwd=cwd)
         return r.returncode == 0
 
 
 class CodexRunner(_WorktreeRunner):
     tool = "codex"
+    # TODO(verify): gpt-5.6-sol confirmed working; confirm the terra/luna IDs.
+    MODELS = {Tier.LIGHT: "gpt-5.6-luna", Tier.STANDARD: "gpt-5.6-terra", Tier.DEEP: "gpt-5.6-sol"}
 
-    def _launch(self, prompt: str, cwd: str) -> bool:
-        r = _run(["codex", "exec", "--dangerously-bypass-approvals-and-sandbox",
+    def _launch(self, prompt: str, cwd: str, model: str) -> bool:
+        r = _run(["codex", "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
                   "--skip-git-repo-check", prompt], cwd=cwd)
         return r.returncode == 0
 
