@@ -102,13 +102,13 @@ class _WorktreeRunner:
         branch = f"agentflow/{self.tool}/issue-{task.issue}-{task.slug}"
         wt = Path(task.workdir) / ".agentflow" / "worktrees" / self.tool / f"issue-{task.issue}-{task.slug}"
         try:
-            self._prepare_worktree(task.workdir, branch, wt)
-            self._provision(wt)
+            self.prepare_worktree(task.workdir, branch, wt)
+            self.provision(wt)
         except subprocess.CalledProcessError as e:
             return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
 
         started = time.time()
-        launched = self._launch(task.prompt, cwd=str(wt), model=self.model_for(task.tier))
+        launched = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.tier))
 
         pr_url = self._pr_for_branch(task.repo, branch)
         markers = self._new_marker_comments(task.repo, task.issue, since=started)
@@ -117,8 +117,8 @@ class _WorktreeRunner:
             return BuildOutcome(BuildStatus.ERROR, detail="launch exited non-zero, no PR, no marker")
         return outcome
 
-    # --- shared git/gh plumbing -------------------------------------------------
-    def _prepare_worktree(self, workdir: str, branch: str, wt: Path) -> None:
+    # --- shared git/gh plumbing (reused by the reviewer) ------------------------
+    def prepare_worktree(self, workdir: str, branch: str, wt: Path) -> None:
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
             return
@@ -128,9 +128,21 @@ class _WorktreeRunner:
         add += [str(wt), branch] if have_branch else ["-b", branch, str(wt), "origin/main"]
         _run(add).check_returncode()
 
-    def _provision(self, wt: Path) -> None:
+    def provision(self, wt: Path) -> None:
         if (wt / "uv.lock").exists() and not (wt / ".venv" / "bin" / "python").exists():
             _run(["uv", "sync", "--all-extras"], cwd=str(wt)).check_returncode()
+
+    def prepare_worktree_detached(self, workdir: str, ref: str, wt: Path) -> None:
+        """A detached worktree at `ref` (e.g. `origin/<pr-branch>`) — for review.
+
+        Detached avoids the "branch already checked out" collision with the
+        builder's worktree, which still holds the PR branch.
+        """
+        _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
+        if wt.exists():
+            return
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
 
     def _pr_for_branch(self, repo: str, branch: str) -> str | None:
         r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
@@ -152,7 +164,7 @@ class _WorktreeRunner:
                 out.append(c.get("body", ""))
         return out
 
-    def _launch(self, prompt: str, cwd: str, model: str) -> bool:  # returns launched_ok
+    def launch(self, prompt: str, cwd: str, model: str) -> bool:  # returns launched_ok
         raise NotImplementedError
 
 
@@ -160,7 +172,7 @@ class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Tier.LIGHT: "haiku", Tier.STANDARD: "sonnet", Tier.DEEP: "opus"}
 
-    def _launch(self, prompt: str, cwd: str, model: str) -> bool:
+    def launch(self, prompt: str, cwd: str, model: str) -> bool:
         # Hazard-free autonomous build: skip permission prompts. A hazardous repo
         # would pass a tight --allowedTools instead (profile-driven, later).
         r = _run(["claude", "-p", prompt, "--model", model,
@@ -173,7 +185,7 @@ class CodexRunner(_WorktreeRunner):
     # TODO(verify): gpt-5.6-sol confirmed working; confirm the terra/luna IDs.
     MODELS = {Tier.LIGHT: "gpt-5.6-luna", Tier.STANDARD: "gpt-5.6-terra", Tier.DEEP: "gpt-5.6-sol"}
 
-    def _launch(self, prompt: str, cwd: str, model: str) -> bool:
+    def launch(self, prompt: str, cwd: str, model: str) -> bool:
         r = _run(["codex", "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
                   "--skip-git-repo-check", prompt], cwd=cwd)
         return r.returncode == 0

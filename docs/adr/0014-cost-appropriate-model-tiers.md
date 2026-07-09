@@ -41,14 +41,14 @@ build runs without one.**
   picks the *tier* within it by complexity. A `light` issue runs haiku on the Claude
   pool, Luna on the Codex pool.
 
-### Reviewer tier — OPEN (pending confirmation)
+### Reviewer tier — tracks the issue tier, floored at `standard`
 
-The cross-tool reviewer needs a tier too. Options: (a) track the issue tier; (b)
-track it but **floor at `standard`** (never review with the light tier, since review
-is the safety gate that permits unattended merge); (c) always `deep`. **Rec: (b)** —
-size review to the work, but a light-tier reviewer risks rubber-stamping and defeats
-the cross-tool safety argument ([ADR 0003](0003-cross-tool-review.md)/[0004](0004-auto-merge-gate.md)).
-To be finalized before the reviewer stage is built.
+The cross-tool reviewer's tier **tracks the issue tier but never drops below
+`standard`**: a `light` issue is reviewed at `standard`, `standard` at `standard`,
+`deep` at `deep`. Review is the safety gate that permits unattended merge, so a
+light-tier (haiku/Luna) reviewer risks rubber-stamping and defeats the cross-tool
+argument ([ADR 0003](0003-cross-tool-review.md)/[0004](0004-auto-merge-gate.md)).
+Sized to the work, but with a competence floor.
 
 ## Alternatives considered
 
