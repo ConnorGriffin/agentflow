@@ -16,8 +16,13 @@ from pathlib import Path
 
 from agentflow.balancer import pick_pair
 from agentflow.gate import MergeDecision, ci_is_green, decide_merge, park, squash_merge
+from agentflow.notify import notify
 from agentflow.reviewer import Finding, Reviewer, Verdict
 from agentflow.runner import BuildStatus, BuildTask, Tier, _run
+
+
+def _pr_url(repo: str, pr: int) -> str:
+    return f"https://github.com/{repo}/pull/{pr}"
 
 _TIER_LABEL = re.compile(r"^tier:(light|standard|deep)$")
 
@@ -102,6 +107,8 @@ def run_once(cfg: RepoConfig) -> str:
                                                 body=issue.get("body") or ""))
     outcome = builder.build(task)
     if outcome.status is not BuildStatus.PR_OPENED:
+        notify("agentflow", f"{cfg.repo} #{n}: build {outcome.status.value}",
+               f"https://github.com/{cfg.repo}/issues/{n}")
         return f"#{n}: build {outcome.status.value} — {outcome.detail}"
 
     pr = pr_number(outcome.pr_url)
@@ -110,6 +117,8 @@ def run_once(cfg: RepoConfig) -> str:
         # Single-tool fallback (ADR 0003): no independent reviewer — never auto-merge.
         park(cfg.repo, pr, Verdict(clean=False, parsed=False,
              findings=(Finding("blocking", "no independent cross-tool reviewer available"),)))
+        notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked — single-tool",
+               _pr_url(cfg.repo, pr))
         return f"#{n}: built PR #{pr}; parked — only one pool had headroom"
     reviewer = Reviewer(reviewer_runner)
 
@@ -125,6 +134,8 @@ def run_once(cfg: RepoConfig) -> str:
             return f"#{n}: MERGED PR #{pr}" if ok else f"#{n}: merge failed on PR #{pr}"
         if decision is MergeDecision.PARK:
             park(cfg.repo, pr, verdict)
+            notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",
+                   _pr_url(cfg.repo, pr))
             return f"#{n}: parked PR #{pr} for human review"
         # REVISE — one builder pass on the PR branch, then re-review (ADR 0004).
         findings = "\n".join(f"- {f.summary}" for f in verdict.blocking) or "- (see review)"

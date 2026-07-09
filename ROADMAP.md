@@ -43,16 +43,19 @@ no `codex-code-mode-host`, so PATH `codex` can't run commands — repair pending
   a machine-readable `PASS`/`BLOCK` verdict — *the one genuinely new must-build*;
   (3) a ~15-line auto-merge decision wiring existing `revise`/`close`.
 
-### M1 — Two pools + balancer + collision floor
-Port the per-plan headroom logic into the two-pool load balancer
-([ADR 0006](docs/adr/0006-two-pool-runner-assignment.md)); run issues concurrently
-across pools; add the universal collision floor — rebase-once + serialized merge
-([ADR 0009](docs/adr/0009-collision-safety.md)).
+### M1 — Two pools + balancer + collision floor — ✅ DONE 2026-07-09
+`balancer.py` picks builder = the pool with more rate-limit headroom (reusing
+`triage-gate.sh` per agent), reviewer = the other tool; single-tool fallback returns
+no reviewer so the loop can't auto-merge without independence. `daemon.py` is the
+dormant-by-default, crash-isolated poll loop. Collision floor = rebase-once +
+`INTEGRATION-COLLISION` marker in the build prompt + serialized (one-at-a-time)
+merges. Balancer live-validated (correctly defers when both pools are busy).
+*Concurrent dispatch across pools is a later refinement — M1 is serial.*
 
-### M2 — The not-clean paths
-One auto-revise round + drop-to-reviewed + ntfy pings
-([ADR 0004](docs/adr/0004-auto-merge-gate.md)). Now `autonomous` is provably never
-less safe than `reviewed`.
+### M2 — The not-clean paths — ✅ DONE 2026-07-09
+Auto-revise round + drop-to-reviewed proven live in M0; `notify.py` adds ntfy pings
+for the needs-you set (parks, build bails), silent on autonomous merges
+([ADR 0004](docs/adr/0004-auto-merge-gate.md)/[0010](docs/adr/0010-operator-dashboard.md)).
 
 ### M3 — Operator dashboard  *(UI gate applies)*
 `/ui-mockups` → locked spec first. Read-only first (fleet overview, two-pool
