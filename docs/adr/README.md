@@ -35,3 +35,5 @@ then Context / Decision / Alternatives / Consequences.
   GitHub-as-source-of-truth.
 - [0011](0011-persistent-orchestrator.md) — Persistent orchestrator, ephemeral
   hands.
+- [0012](0012-build-in-vertical-slices.md) — Build in vertical slices, dogfooded on
+  a live repo (method + the `/ui-mockups` and deep-module gates).
