@@ -27,7 +27,13 @@ One vibe-code repo at `profile: autonomous`, one issue through the whole loop:
 intake → build (tool A, worktree) → cross-review (tool B) → auto-merge on green +
 clean. Proves session-spawn, the cross-tool handoff, and the merge gate on real
 GitHub. May hardcode a single pool.
-- **Reuse map:** _pending the in-flight port-inventory pass; fold in when it lands._
+- **Reuse map:** [docs/reuse-map.md](docs/reuse-map.md). Leans on `codex-go`
+  (generalized) + `spin-worktree.py` = spawner, `triage-gate.sh check` = balancer,
+  the `triage-sweep` poller (filtered `ready-for-agent`, intake skipped), `close`'s
+  `gh pr merge --squash` = merge, ntfy = notify. **New glue:** (1) a tiny persistent
+  poll→build→review→merge loop holding both pools; (2) the cross-tool review call +
+  a machine-readable `PASS`/`BLOCK` verdict — *the one genuinely new must-build*;
+  (3) a ~15-line auto-merge decision wiring existing `revise`/`close`.
 
 ### M1 — Two pools + balancer + collision floor
 Port the per-plan headroom logic into the two-pool load balancer
