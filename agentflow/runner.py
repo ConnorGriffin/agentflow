@@ -193,10 +193,14 @@ class CodexRunner(_WorktreeRunner):
 
     def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
         # `-o <file>` writes Codex's final message to a file we control.
+        # AGENTFLOW_CODEX_BIN overrides the binary — needed when the PATH `codex`
+        # is missing its `codex-code-mode-host` companion (e.g. an incomplete
+        # Homebrew cask) and can't run shell commands.
+        codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
         fd, outfile = tempfile.mkstemp(prefix="agentflow-codex-")
         os.close(fd)
         try:
-            r = _run(["codex", "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
+            r = _run([codex_bin, "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
                       "--skip-git-repo-check", "-o", outfile, prompt], cwd=cwd)
             try:
                 msg = Path(outfile).read_text()
