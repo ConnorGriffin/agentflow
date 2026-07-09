@@ -1,0 +1,13 @@
+[project]
+name = "agentflow"
+version = "0.0.1"
+description = "Tool-agnostic autonomous issue → PR → review pipeline (runs on Claude or Codex)"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
