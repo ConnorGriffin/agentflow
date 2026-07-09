@@ -14,9 +14,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from agentflow.balancer import pick_pair
 from agentflow.gate import MergeDecision, ci_is_green, decide_merge, park, squash_merge
-from agentflow.reviewer import Reviewer
-from agentflow.runner import (BuildStatus, BuildTask, ClaudeRunner, CodexRunner, Tier, _run)
+from agentflow.reviewer import Finding, Reviewer, Verdict
+from agentflow.runner import BuildStatus, BuildTask, Tier, _run
 
 _TIER_LABEL = re.compile(r"^tier:(light|standard|deep)$")
 
@@ -50,10 +51,16 @@ BUILD_PROMPT = """Implement {repo} issue #{n}: {title}
 {body}
 
 You are in a fresh worktree on a new branch off origin/main. Implement the change,
-add or update tests, and make the suite green. Then commit, push the branch, and
-open a PR with `Closes #{n}` in the body. Keep the change minimal and match the
-surrounding code. If you hit a blocker you cannot safely resolve, post a comment
-prefixed `MISSING-CONTEXT:` and stop instead of guessing."""
+add or update tests, and make the suite green. Commit your work.
+
+Before opening the PR, `git fetch origin` and rebase once onto `origin/main`, then
+rerun the tests. If the rebase conflicts (or tests fail post-rebase for a reason not
+your own), stop and post a comment prefixed `INTEGRATION-COLLISION:` instead of
+forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the body.
+
+Keep the change minimal and match the surrounding code. If you hit a blocker you
+cannot safely resolve, post a comment prefixed `MISSING-CONTEXT:` and stop instead
+of guessing."""
 
 REVISE_PROMPT = """Address the blocking review findings on PR #{n} in this worktree,
 push to the same branch, and keep the test suite green. Do NOT open a new PR.
@@ -86,7 +93,9 @@ def run_once(cfg: RepoConfig) -> str:
     if tier is None:
         return f"#{n}: skipped — no tier:* label (ADR 0014 hard gate)"
 
-    builder, reviewer_runner = ClaudeRunner(), CodexRunner()  # M0 fixed cross-tool pair
+    builder, reviewer_runner = pick_pair()   # ADR 0006: more headroom builds; other reviews
+    if builder is None:
+        return f"#{n}: no pool has headroom right now — deferring"
     sl = slug(issue["title"])
     task = BuildTask(cfg.repo, cfg.workdir, n, sl, tier,
                      prompt=BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
@@ -97,6 +106,11 @@ def run_once(cfg: RepoConfig) -> str:
 
     pr = pr_number(outcome.pr_url)
     head_branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
+    if reviewer_runner is None:
+        # Single-tool fallback (ADR 0003): no independent reviewer — never auto-merge.
+        park(cfg.repo, pr, Verdict(clean=False, parsed=False,
+             findings=(Finding("blocking", "no independent cross-tool reviewer available"),)))
+        return f"#{n}: built PR #{pr}; parked — only one pool had headroom"
     reviewer = Reviewer(reviewer_runner)
 
     acceptance = issue.get("body") or ""
