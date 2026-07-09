@@ -142,6 +142,10 @@ class _WorktreeRunner:
         """
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
+            # Freshen a reused worktree to the (possibly moved) ref — otherwise a
+            # re-review after a revise push would inspect a stale checkout.
+            _run(["git", "-C", str(wt), "reset", "--hard", ref]).check_returncode()
+            _run(["git", "-C", str(wt), "clean", "-fdx"])
             return
         wt.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
