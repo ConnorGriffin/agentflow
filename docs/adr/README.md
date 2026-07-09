@@ -37,3 +37,5 @@ then Context / Decision / Alternatives / Consequences.
   hands.
 - [0012](0012-build-in-vertical-slices.md) — Build in vertical slices, dogfooded on
   a live repo (method + the `/ui-mockups` and deep-module gates).
+- [0013](0013-engineering-charter.md) — Engineering standards: one canonical charter,
+  both tools, enforced at review.

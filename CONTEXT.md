@@ -97,6 +97,13 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Needs-you inbox** — the operator's action list: `guarded` merges awaiting,
   drop-to-reviewed parks, and intent-gap grillings. The same set ntfy pings.
 
+- **Charter** — the canonical engineering-standards file (`standards/CHARTER.md`)
+  every app in the flow must meet: deep-module architecture, UI→`/ui-mockups`,
+  test-through-the-interface, maintainability. Both tools read the *same bytes*
+  (Claude `@import`s it; Codex's global `AGENTS.md` symlinks to it), and it's
+  enforced at cross-review as blocking findings. Machine-global scope; per-repo files
+  carry facts + `profile`, not the charter.
+
 - **Hazard** — an *environmental* obstacle to autonomous work: PHI/real data,
   live credentials, a demo that needs a running app. Historically fenced work off
   to a specific tool; now treated as agent-handleable and captured in per-repo
