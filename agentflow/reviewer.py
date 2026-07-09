@@ -130,15 +130,22 @@ def review_tier(issue_tier: Tier) -> Tier:
 
 
 REVIEW_PROMPT = """You are the independent cross-tool reviewer for PR #{pr} in this repo.
-A different agent built it. Decide whether it is safe to merge unattended.
+A different agent built it to satisfy a specific issue. Decide if it is safe to merge.
+
+The issue's acceptance criteria — judge against THIS, not your own wishlist:
+---
+{acceptance}
+---
 
 First, prove you looked: run `gh pr view {pr} --json headRefOid` and `gh pr diff {pr}`.
 
-Judge the diff against, in order:
-- correctness and security — any real bug or vulnerability is BLOCKING;
-- the engineering charter in your instructions — a shallow module, an unmocked UI
-  surface, or an interface you cannot test through is BLOCKING.
-Everything else (style, naming, minor perf) is a nit, not blocking.
+BLOCKING (only these):
+- a real bug or security hole that breaks a stated acceptance criterion, or
+- a violation of the engineering charter in your instructions (a shallow module, an
+  unmocked UI surface, or an interface you cannot test through).
+A correctness gap BEYOND the stated acceptance — an unhandled case the issue did not
+ask for — is a NIT, not blocking; note it so it can be filed as a follow-up.
+Style, naming, and minor perf are nits.
 
 Your FINAL message must be STRICT JSON and nothing else — no prose, no code fence:
 {{"verdict": "PASS" | "BLOCK",
@@ -154,7 +161,7 @@ class Reviewer:
         self.runner = runner  # the tool that did NOT build this PR
 
     def review(self, repo: str, workdir: str, pr_number: int, pr_head_branch: str,
-               slug: str, issue_tier: Tier) -> Verdict:
+               slug: str, issue_tier: Tier, acceptance: str = "") -> Verdict:
         head_sha = self._head_sha(repo, pr_number)
         if not head_sha:
             return _unparseable("could not read PR head SHA")
@@ -168,7 +175,7 @@ class Reviewer:
 
         # The verdict is the reviewer's captured final message — read by US, not a
         # model-written file in the (untrusted) PR tree, so a builder cannot forge it.
-        prompt = REVIEW_PROMPT.format(pr=pr_number)
+        prompt = REVIEW_PROMPT.format(pr=pr_number, acceptance=acceptance or "(none provided)")
         model = self.runner.model_for(review_tier(issue_tier))
         ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
         if not ok:

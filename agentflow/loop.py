@@ -99,9 +99,10 @@ def run_once(cfg: RepoConfig) -> str:
     head_branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
     reviewer = Reviewer(reviewer_runner)
 
+    acceptance = issue.get("body") or ""
     revises_used = 0
     while True:
-        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, tier)
+        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, tier, acceptance=acceptance)
         decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
                                 reviewer_tool=reviewer_runner.tool, builder_tool=builder.tool,
                                 revises_used=revises_used)

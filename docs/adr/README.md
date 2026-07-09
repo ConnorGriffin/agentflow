@@ -41,3 +41,5 @@ then Context / Decision / Alternatives / Consequences.
   both tools, enforced at review.
 - [0014](0014-cost-appropriate-model-tiers.md) — Cost-appropriate model tiers: intake
   sizes every issue (`light`/`standard`/`deep`).
+- [0015](0015-review-anchors-to-acceptance.md) — Review anchors to the issue's
+  acceptance criteria (beyond-scope correctness is a follow-up, not a blocker).
