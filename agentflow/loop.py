@@ -14,6 +14,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+from agentflow import ratchet
 from agentflow.balancer import pick_pair
 from agentflow.gate import MergeDecision, ci_is_green, decide_merge, park, squash_merge
 from agentflow.notify import notify
@@ -153,9 +154,13 @@ def run_once(cfg: RepoConfig) -> str:
                                 revises_used=revises_used)
         if decision is MergeDecision.MERGE:
             ok = squash_merge(cfg.repo, pr)
+            if ok:
+                ratchet.record(cfg.repo, ratchet.CLEAN_MERGE if revises_used == 0
+                               else "merge_after_revise")
             return f"#{n}: MERGED PR #{pr}" if ok else f"#{n}: merge failed on PR #{pr}"
         if decision is MergeDecision.PARK:
             park(cfg.repo, pr, verdict)
+            ratchet.record(cfg.repo, "parked")
             notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",
                    _pr_url(cfg.repo, pr))
             return f"#{n}: parked PR #{pr} for human review"
