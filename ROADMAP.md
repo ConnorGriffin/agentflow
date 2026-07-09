@@ -57,10 +57,14 @@ Auto-revise round + drop-to-reviewed proven live in M0; `notify.py` adds ntfy pi
 for the needs-you set (parks, build bails), silent on autonomous merges
 ([ADR 0004](docs/adr/0004-auto-merge-gate.md)/[0010](docs/adr/0010-operator-dashboard.md)).
 
-### M3 — Operator dashboard  *(UI gate applies)*
-`/ui-mockups` → locked spec first. Read-only first (fleet overview, two-pool
-headroom, needs-you inbox, recently-merged audit feed), then the controls (merge,
-ratchet, pause) ([ADR 0010](docs/adr/0010-operator-dashboard.md)).
+### M3 — Operator dashboard — ✅ read-only v0, 2026-07-09
+`server.py` (zero-dependency stdlib http.server) serves `static/dashboard.html` +
+`GET /api/snapshot` from `dashboard_data.py` — live two-pool headroom, per-repo
+profile, in-flight PRs, recently-merged audit feed, and ratchet state, grounded in
+the real payload. **Remaining:** the write *controls* (merge / ratchet / pause) and a
+formal `/ui-mockups` pass *with the human* to lock the final visual (this v0 honors
+the "mockups bind real data" rule but skipped the multi-variant exploration — the one
+charter step still owed) ([ADR 0010](docs/adr/0010-operator-dashboard.md)).
 
 ### M4 — `guarded`  *(validates the load-bearing unknown)*
 Grounding pass + frozen work order + gap protocol + named-invariant gate
