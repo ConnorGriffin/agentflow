@@ -25,6 +25,25 @@ from agentflow.runner import BuildStatus, BuildTask, Tier, _run
 def _pr_url(repo: str, pr: int) -> str:
     return f"https://github.com/{repo}/pull/{pr}"
 
+
+_OPEN_AS_RE = re.compile(r"(?m)^Open as:")
+
+
+def _work_order(repo: str, n: int) -> str | None:
+    """The latest frozen work-order comment on the issue (marked by an `Open as:`
+    line — the codex-go convention). None if there isn't one."""
+    r = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "comments"])
+    if r.returncode != 0:
+        return None
+    try:
+        comments = json.loads(r.stdout).get("comments", [])
+    except json.JSONDecodeError:
+        return None
+    for c in reversed(comments):
+        if _OPEN_AS_RE.search(c.get("body", "")):
+            return c["body"]
+    return None
+
 _TIER_LABEL = re.compile(r"^tier:(light|standard|deep)$")
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
 
@@ -115,10 +134,17 @@ def run_once(cfg: RepoConfig) -> str:
     builder, reviewer_runner = pick_pair()   # ADR 0006: more headroom builds; other reviews
     if builder is None:
         return f"#{n}: no pool has headroom right now — deferring"
+    profile = repo_profile(cfg.workdir)
     sl = slug(issue["title"])
-    task = BuildTask(cfg.repo, cfg.workdir, n, sl, tier,
-                     prompt=BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
-                                                body=issue.get("body") or ""))
+    if profile == "guarded":
+        # guarded builds from a frozen work order, never a self-scoped brief (ADR 0005).
+        build_prompt = _work_order(cfg.repo, n)
+        if not build_prompt:
+            return f"#{n}: guarded repo needs a frozen work order (ADR 0005); none found — skipping"
+    else:
+        build_prompt = BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
+                                           body=issue.get("body") or "")
+    task = BuildTask(cfg.repo, cfg.workdir, n, sl, tier, prompt=build_prompt)
     outcome = builder.build(task)
     if outcome.status is not BuildStatus.PR_OPENED:
         notify("agentflow", f"{cfg.repo} #{n}: build {outcome.status.value}",
@@ -136,7 +162,6 @@ def run_once(cfg: RepoConfig) -> str:
         return f"#{n}: built PR #{pr}; parked — only one pool had headroom"
     reviewer = Reviewer(reviewer_runner)
     acceptance = issue.get("body") or ""
-    profile = repo_profile(cfg.workdir)
 
     if profile != "autonomous":
         # reviewed / guarded: one cross-tool review, then a HUMAN merges (ADR 0002).
