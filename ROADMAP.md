@@ -22,11 +22,19 @@ sequence, and it will change as slices land.
 
 Each milestone is a working end-to-end slice, not a layer.
 
-### M0 — Walking skeleton  *(= rollout step 1)*
+### M0 — Walking skeleton  *(= rollout step 1)* — ✅ DONE 2026-07-09
 One vibe-code repo at `profile: autonomous`, one issue through the whole loop:
 intake → build (tool A, worktree) → cross-review (tool B) → auto-merge on green +
 clean. Proves session-spawn, the cross-tool handoff, and the merge gate on real
 GitHub. May hardcode a single pool.
+
+**Proven live** on `agentflow-sandbox` #1: Claude built `slugify`; Codex cross-reviewed
+and caught a real spec ambiguity (ASCII vs Unicode); one revise round made it
+Unicode-aware; Codex re-reviewed clean; the gate auto-squash-merged PR #3. Findings
+folded in along the way: verdict-capture (not a model-written file), park-not-revise
+on an unusable review, review anchors to acceptance ([ADR 0015](docs/adr/0015-review-anchors-to-acceptance.md)),
+stale-review-worktree reset, and `AGENTFLOW_CODEX_BIN` (the Homebrew codex cask ships
+no `codex-code-mode-host`, so PATH `codex` can't run commands — repair pending).
 - **Reuse map:** [docs/reuse-map.md](docs/reuse-map.md). Leans on `codex-go`
   (generalized) + `spin-worktree.py` = spawner, `triage-gate.sh check` = balancer,
   the `triage-sweep` poller (filtered `ready-for-agent`, intake skipped), `close`'s
