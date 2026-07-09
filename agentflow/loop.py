@@ -25,6 +25,19 @@ def _pr_url(repo: str, pr: int) -> str:
     return f"https://github.com/{repo}/pull/{pr}"
 
 _TIER_LABEL = re.compile(r"^tier:(light|standard|deep)$")
+_PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
+
+
+def repo_profile(workdir: str) -> str:
+    """The repo's autonomy profile from its AGENTS.md/CLAUDE.md `profile:` line.
+    Defaults to `reviewed` (ADR 0002) — the safe middle, never auto-merge by accident."""
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        p = Path(workdir) / name
+        if p.exists():
+            m = _PROFILE_RE.search(p.read_text(errors="replace"))
+            if m:
+                return m.group(1)
+    return "reviewed"
 
 
 @dataclass(frozen=True)
@@ -121,8 +134,17 @@ def run_once(cfg: RepoConfig) -> str:
                _pr_url(cfg.repo, pr))
         return f"#{n}: built PR #{pr}; parked — only one pool had headroom"
     reviewer = Reviewer(reviewer_runner)
-
     acceptance = issue.get("body") or ""
+    profile = repo_profile(cfg.workdir)
+
+    if profile != "autonomous":
+        # reviewed / guarded: one cross-tool review, then a HUMAN merges (ADR 0002).
+        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, tier, acceptance=acceptance)
+        park(cfg.repo, pr, verdict, reason=f"is a `{profile}` repo — reviewed; a human merges")
+        notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
+               _pr_url(cfg.repo, pr))
+        return f"#{n}: PR #{pr} reviewed ({profile}) — awaiting human merge"
+
     revises_used = 0
     while True:
         verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, tier, acceptance=acceptance)

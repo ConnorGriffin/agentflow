@@ -57,11 +57,12 @@ def squash_merge(repo: str, pr_number: int) -> bool:
     return r.returncode == 0
 
 
-def park(repo: str, pr_number: int, verdict: Verdict) -> None:
-    """Drop-to-reviewed: post the blocking findings so a human can pick it up."""
+def park(repo: str, pr_number: int, verdict: Verdict,
+         reason: str = "could not be auto-merged after review") -> None:
+    """Post the review findings so a human can pick the PR up (drop-to-reviewed, or
+    the normal hand-off for a `reviewed`/`guarded` repo)."""
     lines = [f"- **{f.severity}** {f.file}:{f.line} — {f.summary}".rstrip(" —:0")
-             for f in verdict.findings] or ["- (no machine-readable findings)"]
-    body = ("> *agentflow: parked for human review (dropped from autonomous).*\n\n"
-            "This PR could not be auto-merged after review. Blocking items:\n"
-            + "\n".join(lines))
+             for f in verdict.findings] or ["- (no blocking findings)"]
+    body = ("> *agentflow: parked for human review.*\n\n"
+            f"This PR {reason}. Review findings:\n" + "\n".join(lines))
     _run(["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body", body])
