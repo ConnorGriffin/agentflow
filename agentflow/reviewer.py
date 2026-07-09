@@ -6,23 +6,40 @@ act on deterministically. A green build with a confident-but-wrong diff is the
 failure this exists to catch — so parsing is **fail-safe**: anything we cannot read
 as a clean PASS is treated as not-clean, and never auto-merges.
 
-Deep module: `Reviewer(other_tool).review(...) -> Verdict`. Hidden behind it: a
-detached worktree on the PR head, the review prompt (the charter rubric is inherited
-from the repo's instruction file), the tool launch at the floored review tier, and
-reading + validating the verdict file. `parse_verdict` is pure — the test surface.
+Hardened after an adversarial pass (see git history) that found several routes to a
+false `clean=True`. The invariants now enforced:
+
+- The verdict is written to a fresh temp file **outside** the PR checkout, so a
+  builder cannot commit a forged `review-verdict.json` into its own PR tree.
+- The reviewer session must actually run (`launch()` must return True) — a
+  rate-limited/crashed reviewer yields not-clean, never a stale/leftover PASS.
+- The verdict must carry the PR head SHA we're about to merge (proof it reviewed
+  *this* diff), or it's not-clean.
+- Severity is fail-safe: any finding whose severity is not an explicit nit counts
+  as blocking (so "critical"/"BLOCKER"/"" don't leak through as nits).
+- Malformed containers, duplicate keys, and any parse exception → not-clean.
+
+Deep module: `Reviewer(other_tool).review(...) -> Verdict`. `parse_verdict` is pure
+— the test surface — and every adversarial case above is a regression test.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentflow.runner import Tier, _WorktreeRunner
+from agentflow.runner import Tier, _WorktreeRunner, _run
 
-_FENCE_RE = re.compile(r"^```[a-zA-Z]*\n(.*)\n```$", re.DOTALL)
+# Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
+# "blocker", "high", unknown) is treated as blocking — fail safe.
+_NIT_SEVERITIES = {"nit", "nits", "info", "minor", "low", "style", "note",
+                   "suggestion", "trivial", "cosmetic"}
+_FENCE_RE = re.compile(r"```[a-zA-Z]*\s*\n(.*?)\n```", re.DOTALL)
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +56,7 @@ class Verdict:
     findings: tuple[Finding, ...] = ()
     parsed: bool = True
     detail: str = ""
+    reviewer_tool: str = ""
 
     @property
     def blocking(self) -> list[Finding]:
@@ -52,36 +70,60 @@ def _unparseable(detail: str) -> Verdict:
                    parsed=False, detail=detail)
 
 
-def _strip_fences(text: str) -> str:
-    m = _FENCE_RE.match(text.strip())
-    return m.group(1) if m else text
+def _severity(raw: object) -> str:
+    return "nit" if str(raw).strip().lower() in _NIT_SEVERITIES else "blocking"
 
 
-def parse_verdict(payload: str) -> Verdict:
-    """Parse a reviewer's JSON verdict. Pure and defensive (the test surface)."""
-    text = _strip_fences(payload).strip()
-    if not text:
-        return _unparseable("empty verdict")
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
+    seen: dict = {}
+    for k, v in pairs:
+        if k in seen:
+            raise ValueError(f"duplicate key {k!r}")
+        seen[k] = v
+    return seen
+
+
+def _extract_json(text: str) -> str:
+    """Prefer the last fenced code block; else the whole string. Parsing stays
+    strict, so this only reduces false *drops*, never creates a false clean."""
+    blocks = _FENCE_RE.findall(text)
+    return blocks[-1].strip() if blocks else text.strip()
+
+
+def parse_verdict(payload: str, expected_sha: str | None = None) -> Verdict:
+    """Parse a reviewer's JSON verdict. Pure, defensive, fail-safe (test surface).
+
+    `clean` requires: valid JSON dict, verdict == PASS, no blocking finding, and —
+    when `expected_sha` is given — a matching `reviewed_sha` (proof it reviewed the
+    head we're about to merge). Any deviation returns not-clean.
+    """
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError as e:
-        return _unparseable(f"invalid JSON ({e})")
-    if not isinstance(data, dict) or "verdict" not in data:
-        return _unparseable("missing 'verdict' field")
-    findings = []
-    for f in (data.get("findings") or []):
-        if not isinstance(f, dict):
-            continue
-        sev = "blocking" if str(f.get("severity", "")).lower() == "blocking" else "nit"
-        try:
-            line = int(f.get("line") or 0)
-        except (TypeError, ValueError):
-            line = 0
-        findings.append(Finding(sev, str(f.get("summary", "")), str(f.get("file", "")), line))
-    said_pass = str(data.get("verdict", "")).upper() == "PASS"
-    has_blocking = any(f.severity == "blocking" for f in findings)
-    # Defensive: an agent that says PASS but lists a blocking finding is still BLOCK.
-    return Verdict(clean=said_pass and not has_blocking, findings=tuple(findings), parsed=True)
+        text = _extract_json(payload)
+        if not text:
+            return _unparseable("empty verdict")
+        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
+        if not isinstance(data, dict) or "verdict" not in data:
+            return _unparseable("missing 'verdict' field")
+
+        raw_findings = data.get("findings", [])
+        if not isinstance(raw_findings, list):
+            return _unparseable("'findings' is not a list")
+        findings = []
+        for f in raw_findings:
+            if not isinstance(f, dict):
+                return _unparseable("a finding is not an object")
+            line = f.get("line") or 0
+            findings.append(Finding(_severity(f.get("severity")), str(f.get("summary", "")),
+                                    str(f.get("file", "")), int(line) if str(line).isdigit() else 0))
+
+        if expected_sha is not None and str(data.get("reviewed_sha", "")) != expected_sha:
+            return _unparseable("reviewed_sha missing or does not match the PR head")
+
+        said_pass = str(data.get("verdict", "")).upper() == "PASS"
+        has_blocking = any(f.severity == "blocking" for f in findings)
+        return Verdict(clean=said_pass and not has_blocking, findings=tuple(findings), parsed=True)
+    except Exception as e:  # noqa: BLE001 — the whole point is to never propagate
+        return _unparseable(f"parse error: {type(e).__name__}")
 
 
 def review_tier(issue_tier: Tier) -> Tier:
@@ -92,16 +134,18 @@ def review_tier(issue_tier: Tier) -> Tier:
 REVIEW_PROMPT = """You are the independent cross-tool reviewer for PR #{pr} in this repo.
 A different agent built it. Decide whether it is safe to merge unattended.
 
+First, prove you looked: run `gh pr view {pr} --json headRefOid` and `gh pr diff {pr}`.
+
 Judge the diff against, in order:
 - correctness and security — any real bug or vulnerability is BLOCKING;
 - the engineering charter in your instructions — a shallow module, an unmocked UI
   surface, or an interface you cannot test through is BLOCKING.
 Everything else (style, naming, minor perf) is a nit, not blocking.
 
-Inspect it: run `gh pr diff {pr}` and read the surrounding code in this worktree.
-
-Then WRITE your verdict as STRICT JSON to `{path}` (create parent dirs). Schema:
+Then WRITE your verdict as STRICT JSON to `{path}` (an absolute path; create parent
+dirs). Schema:
 {{"verdict": "PASS" | "BLOCK",
+  "reviewed_sha": "<the headRefOid you fetched above>",
   "findings": [{{"severity": "blocking" | "nit", "file": "path", "line": 0, "summary": "..."}}]}}
 "verdict" is PASS only if there are zero blocking findings. Writing that file is the task."""
 
@@ -114,19 +158,36 @@ class Reviewer:
 
     def review(self, repo: str, workdir: str, pr_number: int, pr_head_branch: str,
                slug: str, issue_tier: Tier) -> Verdict:
+        head_sha = self._head_sha(repo, pr_number)
+        if not head_sha:
+            return _unparseable("could not read PR head SHA")
+
         wt = Path(workdir) / ".agentflow" / "worktrees" / f"{self.runner.tool}-review" / f"pr-{pr_number}-{slug}"
         try:
             self.runner.prepare_worktree_detached(workdir, f"origin/{pr_head_branch}", wt)
             self.runner.provision(wt)
         except subprocess.CalledProcessError as e:
             return _unparseable(f"review worktree/provision failed: {e}")
-        verdict_path = wt / ".agentflow" / "review-verdict.json"
-        prompt = REVIEW_PROMPT.format(pr=pr_number, path=verdict_path)
-        model = self.runner.model_for(review_tier(issue_tier))
-        self.runner.launch(prompt, cwd=str(wt), model=model)
-        if not verdict_path.exists():
-            return _unparseable("reviewer wrote no verdict file")
+
+        # Verdict lives OUTSIDE the (untrusted) PR checkout, in a fresh temp dir, so
+        # a builder cannot commit a forged verdict into its own PR tree, and a stale
+        # file from a prior run can never be read.
+        vdir = Path(tempfile.mkdtemp(prefix=f"agentflow-review-{pr_number}-"))
+        verdict_path = vdir / "verdict.json"
         try:
-            return parse_verdict(verdict_path.read_text())
-        except OSError as e:
-            return _unparseable(f"could not read verdict file ({e})")
+            prompt = REVIEW_PROMPT.format(pr=pr_number, path=verdict_path)
+            model = self.runner.model_for(review_tier(issue_tier))
+            if not self.runner.launch(prompt, cwd=str(wt), model=model):
+                return _unparseable("reviewer session errored (launch non-zero)")
+            if not verdict_path.exists():
+                return _unparseable("reviewer wrote no verdict file")
+            raw = verdict_path.read_bytes().decode("utf-8", errors="replace")
+            v = parse_verdict(raw, expected_sha=head_sha)
+            return Verdict(v.clean, v.findings, v.parsed, v.detail, reviewer_tool=self.runner.tool)
+        finally:
+            shutil.rmtree(vdir, ignore_errors=True)
+
+    def _head_sha(self, repo: str, pr_number: int) -> str:
+        r = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
+                  "--json", "headRefOid", "-q", ".headRefOid"])
+        return r.stdout.strip() if r.returncode == 0 else ""

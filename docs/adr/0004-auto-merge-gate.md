@@ -56,3 +56,24 @@ a second model actually doubted.
 - Drop-to-reviewed means `autonomous` is never *less* safe than `reviewed` — worst
   case it degrades to it. That is the property that makes the top rung defensible.
 - One-round cap bounds cost per issue: build + review + (revise + review) at most.
+
+## Amendment (2026-07-09) — review-integrity invariants (from the adversarial pass)
+
+An adversarial refutation of the reviewer ([ADR 0012](0012-build-in-vertical-slices.md)'s
+per-slice attack) found real routes to a false `clean`. The gate now depends on these
+invariants, enforced in `reviewer.py`:
+
+- **Verdict lives *outside* the reviewed tree** (a fresh temp dir), so a builder
+  cannot commit a forged `verdict.json` into its own PR checkout and have it read as
+  the independent review.
+- **The reviewer must actually run** — `launch()` must succeed; a rate-limited or
+  crashed reviewer is not-clean, never a leftover/stale PASS.
+- **Proof-of-work** — the verdict must carry the PR **head SHA** being merged, or it's
+  not-clean (a rubber-stamp that never fetched the diff fails).
+- **Severity is fail-safe** — any finding severity that isn't an explicit nit counts
+  as blocking ("critical"/"BLOCKER"/"" don't leak through).
+- **The parser never raises and never emits a false clean** — malformed containers,
+  duplicate keys, and any exception → not-clean.
+- **Still owed by the gate + loop (next):** CI-green AND-ed with `clean`, and
+  reviewer-tool ≠ builder-tool (independence). The reviewer returns `reviewer_tool`
+  for the gate to check.
