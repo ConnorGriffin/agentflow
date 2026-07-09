@@ -18,8 +18,10 @@ resolution are pure, tested without spawning anything (see tests/test_runner.py)
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -108,7 +110,7 @@ class _WorktreeRunner:
             return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
 
         started = time.time()
-        launched = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.tier))
+        launched, _ = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.tier))
 
         pr_url = self._pr_for_branch(task.repo, branch)
         markers = self._new_marker_comments(task.repo, task.issue, since=started)
@@ -164,7 +166,10 @@ class _WorktreeRunner:
                 out.append(c.get("body", ""))
         return out
 
-    def launch(self, prompt: str, cwd: str, model: str) -> bool:  # returns launched_ok
+    def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
+        """Run a session; return (ok, final_message). The message is captured by
+        us — used by the reviewer to read the verdict without trusting a
+        model-written file in the (untrusted) PR tree."""
         raise NotImplementedError
 
 
@@ -172,12 +177,13 @@ class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Tier.LIGHT: "haiku", Tier.STANDARD: "sonnet", Tier.DEEP: "opus"}
 
-    def launch(self, prompt: str, cwd: str, model: str) -> bool:
+    def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
         # Hazard-free autonomous build: skip permission prompts. A hazardous repo
         # would pass a tight --allowedTools instead (profile-driven, later).
+        # `claude -p` prints the final assistant message to stdout — that's the message.
         r = _run(["claude", "-p", prompt, "--model", model,
                   "--dangerously-skip-permissions"], cwd=cwd)
-        return r.returncode == 0
+        return r.returncode == 0, r.stdout
 
 
 class CodexRunner(_WorktreeRunner):
@@ -185,10 +191,20 @@ class CodexRunner(_WorktreeRunner):
     # TODO(verify): gpt-5.6-sol confirmed working; confirm the terra/luna IDs.
     MODELS = {Tier.LIGHT: "gpt-5.6-luna", Tier.STANDARD: "gpt-5.6-terra", Tier.DEEP: "gpt-5.6-sol"}
 
-    def launch(self, prompt: str, cwd: str, model: str) -> bool:
-        r = _run(["codex", "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
-                  "--skip-git-repo-check", prompt], cwd=cwd)
-        return r.returncode == 0
+    def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
+        # `-o <file>` writes Codex's final message to a file we control.
+        fd, outfile = tempfile.mkstemp(prefix="agentflow-codex-")
+        os.close(fd)
+        try:
+            r = _run(["codex", "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
+                      "--skip-git-repo-check", "-o", outfile, prompt], cwd=cwd)
+            try:
+                msg = Path(outfile).read_text()
+            except OSError:
+                msg = r.stdout
+            return r.returncode == 0, msg
+        finally:
+            Path(outfile).unlink(missing_ok=True)
 
 
 def _iso_to_epoch(s: str) -> float | None:

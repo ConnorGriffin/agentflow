@@ -27,9 +27,7 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -142,12 +140,11 @@ Judge the diff against, in order:
   surface, or an interface you cannot test through is BLOCKING.
 Everything else (style, naming, minor perf) is a nit, not blocking.
 
-Then WRITE your verdict as STRICT JSON to `{path}` (an absolute path; create parent
-dirs). Schema:
+Your FINAL message must be STRICT JSON and nothing else — no prose, no code fence:
 {{"verdict": "PASS" | "BLOCK",
   "reviewed_sha": "<the headRefOid you fetched above>",
   "findings": [{{"severity": "blocking" | "nit", "file": "path", "line": 0, "summary": "..."}}]}}
-"verdict" is PASS only if there are zero blocking findings. Writing that file is the task."""
+"verdict" is PASS only if there are zero blocking findings."""
 
 
 class Reviewer:
@@ -169,23 +166,15 @@ class Reviewer:
         except subprocess.CalledProcessError as e:
             return _unparseable(f"review worktree/provision failed: {e}")
 
-        # Verdict lives OUTSIDE the (untrusted) PR checkout, in a fresh temp dir, so
-        # a builder cannot commit a forged verdict into its own PR tree, and a stale
-        # file from a prior run can never be read.
-        vdir = Path(tempfile.mkdtemp(prefix=f"agentflow-review-{pr_number}-"))
-        verdict_path = vdir / "verdict.json"
-        try:
-            prompt = REVIEW_PROMPT.format(pr=pr_number, path=verdict_path)
-            model = self.runner.model_for(review_tier(issue_tier))
-            if not self.runner.launch(prompt, cwd=str(wt), model=model):
-                return _unparseable("reviewer session errored (launch non-zero)")
-            if not verdict_path.exists():
-                return _unparseable("reviewer wrote no verdict file")
-            raw = verdict_path.read_bytes().decode("utf-8", errors="replace")
-            v = parse_verdict(raw, expected_sha=head_sha)
-            return Verdict(v.clean, v.findings, v.parsed, v.detail, reviewer_tool=self.runner.tool)
-        finally:
-            shutil.rmtree(vdir, ignore_errors=True)
+        # The verdict is the reviewer's captured final message — read by US, not a
+        # model-written file in the (untrusted) PR tree, so a builder cannot forge it.
+        prompt = REVIEW_PROMPT.format(pr=pr_number)
+        model = self.runner.model_for(review_tier(issue_tier))
+        ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
+        if not ok:
+            return _unparseable("reviewer session errored (launch non-zero)")
+        v = parse_verdict(message, expected_sha=head_sha)
+        return Verdict(v.clean, v.findings, v.parsed, v.detail, reviewer_tool=self.runner.tool)
 
     def _head_sha(self, repo: str, pr_number: int) -> str:
         r = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,

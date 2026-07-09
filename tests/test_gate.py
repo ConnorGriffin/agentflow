@@ -49,3 +49,10 @@ def test_independence_dominates_even_a_clean_green_pr():
 @pytest.mark.parametrize("revises_used", [0, 1, 2])
 def test_never_merges_without_independence(revises_used):
     assert d(reviewer_tool="claude", revises_used=revises_used) is not MergeDecision.MERGE
+
+
+def test_unusable_review_parks_never_revises():
+    # A review that failed to parse is an infra failure, not a code problem —
+    # re-running the builder can't help, so park (don't waste a revise).
+    unparsed = Verdict(clean=False, parsed=False, findings=(Finding("blocking", "no verdict"),))
+    assert d(verdict=unparsed, revises_used=0) is MergeDecision.PARK

@@ -28,6 +28,10 @@ def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,
     if not independent:
         # ADR 0003: a same-tool / missing review never auto-merges.
         return MergeDecision.PARK
+    if not verdict.parsed:
+        # The review itself failed to produce a usable verdict — a builder revise
+        # can't fix that. Park for a human (or a review retry), don't churn the build.
+        return MergeDecision.PARK
     if ci_green and verdict.clean:
         return MergeDecision.MERGE
     if revises_used == 0:
