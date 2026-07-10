@@ -8,7 +8,7 @@ this module (see reviewer.py docstring / git history).
 
 import pytest
 
-from agentflow.reviewer import Verdict, parse_verdict
+from agentflow.reviewer import REVIEW_PROMPT, Verdict, parse_verdict
 
 
 def test_pass_with_no_findings_is_clean():
@@ -103,3 +103,16 @@ def test_sha_match_required_when_expected():
                                      "\x00\xff not utf clean", '{"verdict"}'])
 def test_parse_never_raises(payload):
     assert parse_verdict(payload).clean is False  # returns, does not throw
+
+
+def test_review_prompt_formats_and_carries_the_evidence_gates():
+    # The live reviewer formats this before every review (reviewer.py: launch). A stray
+    # unescaped brace in the rubric would KeyError here and wedge every review — so this
+    # both guards the bracing and locks ADR 0018's two always-on gates into the rubric,
+    # without which the reviewer structurally can't block on them.
+    body = REVIEW_PROMPT.format(pr=42, acceptance="ships a thing")
+    assert "#42" in body and "ships a thing" in body
+    # the reviewer must actually fetch the body/files, not just the diff
+    assert "headRefOid,files,body" in body
+    assert "screenshot" in body.lower()                # UI-change evidence gate
+    assert "framed for the human" in body.lower()      # plain-language / no-jargon gate
