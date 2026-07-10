@@ -63,10 +63,34 @@ def _held(detail: str) -> IntakeResult:
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail)
 
 
-def _extract_json(text: str) -> str:
-    """Prefer the last fenced block; else the whole string (mirrors the reviewer)."""
-    blocks = _FENCE_RE.findall(text)
-    return blocks[-1].strip() if blocks else text.strip()
+def _json_objects(text: str) -> list[dict]:
+    """Candidate JSON dicts from a model message, best-guess first: any fenced ```json
+    blocks (last first), the whole message, then every balanced {...} object scanning
+    from the end. Robust to a decision that follows the model's reasoning prose — models
+    reason before they answer, so 'STRICT JSON only' is not reliable on its own."""
+    text = text.strip()
+    out: list[dict] = []
+
+    def _try(s: str) -> None:
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            return
+        if isinstance(obj, dict):
+            out.append(obj)
+
+    for b in reversed(_FENCE_RE.findall(text)):
+        _try(b.strip())
+    _try(text)
+    dec = json.JSONDecoder()
+    for i in reversed([j for j, c in enumerate(text) if c == "{"]):
+        try:
+            obj, _end = dec.raw_decode(text[i:])
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            out.append(obj)
+    return out
 
 
 def _enum_or_none(enum, raw):
@@ -79,32 +103,26 @@ def _enum_or_none(enum, raw):
 def parse_intake(payload: str) -> IntakeResult:
     """Parse a grounding session's JSON decision. Pure, fail-safe (test surface).
 
-    A confident `ready` needs a valid route and a non-empty body; a missing/garbled
-    complexity defaults to `deep` (a bigger model is the safe sizing miss, never a
-    wrong build) and effort to `medium`. Anything unreadable → held for a human
-    (`grill`). Never raises.
+    Recovers the decision even when the model prefixes it with reasoning prose. A
+    confident `ready` needs a valid route and a non-empty body; a missing/garbled
+    complexity defaults to `deep` (a bigger model is the safe sizing miss, never a wrong
+    build) and effort to `medium`. Anything unreadable → held for a human. Never raises.
     """
     try:
-        text = _extract_json(payload)
-        if not text:
-            return _held("empty intake payload")
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            return _held("intake payload is not a JSON object")
-
-        route = _enum_or_none(IntakeRoute, data.get("route"))
-        if route is None:
-            return _held(f"unknown route {data.get('route')!r}")
-        body = str(data.get("body", "")).strip()
-        if not body:
-            return _held("intake produced no body")
-        title = str(data.get("title", "")).strip()
-
-        if route is IntakeRoute.READY:
-            complexity = _enum_or_none(Complexity, data.get("complexity")) or Complexity.DEEP
-            effort = _enum_or_none(Effort, data.get("effort")) or Effort.MEDIUM
-            return IntakeResult(route, body, title, complexity, effort)
-        return IntakeResult(route, body, title)
+        for data in _json_objects(payload):
+            route = _enum_or_none(IntakeRoute, data.get("route"))
+            if route is None:
+                continue  # not the decision object — try the next candidate
+            body = str(data.get("body", "")).strip()
+            if not body:
+                return _held("intake decision carried no body")
+            title = str(data.get("title", "")).strip()
+            if route is IntakeRoute.READY:
+                complexity = _enum_or_none(Complexity, data.get("complexity")) or Complexity.DEEP
+                effort = _enum_or_none(Effort, data.get("effort")) or Effort.MEDIUM
+                return IntakeResult(route, body, title, complexity, effort)
+            return IntakeResult(route, body, title)
+        return _held("no JSON decision with a valid route in the intake output")
     except Exception as e:  # noqa: BLE001 — fail-safe, never propagate
         return _held(f"parse error: {type(e).__name__}")
 
@@ -221,12 +239,14 @@ DIALS (only for "ready"):
   design-heavy -> opus/Sol). If this repo is correctness-sensitive (e.g. medical), lean deep.
 - effort: "low" | "medium" | "high" | "extra" — how much work it warrants.
 
-Your FINAL message MUST be STRICT JSON and nothing else — no prose, no code fence:
+END your message with the decision as ONE valid JSON object. It may follow brief
+reasoning, but the JSON must be the LAST thing in your message and must parse — escape
+every newline inside a string value as \\n and every quote as \\":
 {"route": "ready" | "grill" | "mockup",
  "title": "<rewritten title>",
  "complexity": "standard" | "deep",
  "effort": "low" | "medium" | "high" | "extra",
- "body": "<the Markdown to post>"}
+ "body": "<the Markdown to post, newlines written as \\n>"}
 For "grill"/"mockup", omit complexity and effort."""
 
 
