@@ -67,7 +67,13 @@ def _query_pool(tool: str) -> PoolStatus:
         ck = subprocess.run([_GATE, "check"], env=env, text=True, capture_output=True)
     except OSError:
         return PoolStatus(tool, False, 100.0)           # no gate → treat as no headroom
-    return PoolStatus(tool, ck.returncode == 0, parse_pct(sp.stdout, sp.returncode))
+    # Prefer the real spend %; fall back to `check`'s output if the gate is too old
+    # to have `spend` mode — degrade gracefully, never crash.
+    if sp.stdout.strip().startswith("spend:"):
+        pct = parse_pct(sp.stdout, 0)
+    else:
+        pct = parse_pct(ck.stdout, ck.returncode)
+    return PoolStatus(tool, ck.returncode == 0, pct)
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,
