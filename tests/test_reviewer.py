@@ -67,6 +67,27 @@ def test_prose_then_fenced_json_is_parsed():
     assert parse_verdict(payload).clean is True
 
 
+def test_prose_then_bare_json_verdict_is_recovered():
+    # The live loop failure (PR #7): the reviewer reasons, then emits a bare verdict.
+    payload = ("I checked the diff against the acceptance criteria — word_count is correct\n"
+               "and the test covers empty + multi-word. No blocking issues.\n\n"
+               '{"verdict": "PASS", "reviewed_sha": "abc123", "findings": []}')
+    v = parse_verdict(payload, expected_sha="abc123")
+    assert v.clean is True and v.parsed is True
+
+
+def test_prose_then_bare_json_block_recovers_findings():
+    payload = 'Looks off.\n{"verdict": "BLOCK", "findings": [{"severity": "blocking", "summary": "off-by-one"}]}'
+    v = parse_verdict(payload)
+    assert v.clean is False and len(v.blocking) == 1
+
+
+# adversarial: dup-key protection must survive even with leading reasoning prose
+def test_prose_then_duplicate_verdict_keys_is_not_clean():
+    payload = 'Reasoning first...\n{"verdict": "BLOCK", "verdict": "PASS", "findings": []}'
+    assert parse_verdict(payload).clean is False
+
+
 # adversarial #2 — proof-of-work: the verdict must name the head SHA we're merging
 def test_sha_match_required_when_expected():
     ok = '{"verdict": "PASS", "reviewed_sha": "abc123", "findings": []}'

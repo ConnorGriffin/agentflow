@@ -81,27 +81,50 @@ def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return seen
 
 
-def _extract_json(text: str) -> str:
-    """Prefer the last fenced code block; else the whole string. Parsing stays
-    strict, so this only reduces false *drops*, never creates a false clean."""
-    blocks = _FENCE_RE.findall(text)
-    return blocks[-1].strip() if blocks else text.strip()
+def _verdict_dicts(text: str):
+    """Yield candidate verdict dicts best-first: fenced ```json blocks (last first),
+    the whole message, then every balanced {...} object scanning from the end. EVERY
+    parse uses the duplicate-key hook, so `{"verdict":"BLOCK","verdict":"PASS"}` still
+    fails. Robust to a verdict that trails the reviewer's reasoning prose — 'STRICT
+    JSON only' is not reliable, so we recover the object rather than drop the review."""
+    text = text.strip()
+
+    def _load(s: str):
+        try:
+            obj = json.loads(s, object_pairs_hook=_no_duplicate_keys)
+        except ValueError:
+            return None
+        return obj if isinstance(obj, dict) else None
+
+    for b in reversed(_FENCE_RE.findall(text)):
+        d = _load(b.strip())
+        if d is not None:
+            yield d
+    d = _load(text)
+    if d is not None:
+        yield d
+    dec = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
+    for i in reversed([j for j, c in enumerate(text) if c == "{"]):
+        try:
+            obj, _end = dec.raw_decode(text[i:])
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
 
 
 def parse_verdict(payload: str, expected_sha: str | None = None) -> Verdict:
     """Parse a reviewer's JSON verdict. Pure, defensive, fail-safe (test surface).
 
-    `clean` requires: valid JSON dict, verdict == PASS, no blocking finding, and —
-    when `expected_sha` is given — a matching `reviewed_sha` (proof it reviewed the
-    head we're about to merge). Any deviation returns not-clean.
+    `clean` requires: a JSON dict carrying `verdict`, verdict == PASS, no blocking
+    finding, and — when `expected_sha` is given — a matching `reviewed_sha` (proof it
+    reviewed the head we're about to merge). Recovers the verdict even when the reviewer
+    prefixes it with reasoning prose; any deviation returns not-clean.
     """
     try:
-        text = _extract_json(payload)
-        if not text:
-            return _unparseable("empty verdict")
-        data = json.loads(text, object_pairs_hook=_no_duplicate_keys)
-        if not isinstance(data, dict) or "verdict" not in data:
-            return _unparseable("missing 'verdict' field")
+        data = next((d for d in _verdict_dicts(payload) if "verdict" in d), None)
+        if data is None:
+            return _unparseable("no usable verdict object")
 
         raw_findings = data.get("findings", [])
         if not isinstance(raw_findings, list):
@@ -142,7 +165,8 @@ A correctness gap BEYOND the stated acceptance — an unhandled case the issue d
 ask for — is a NIT, not blocking; note it so it can be filed as a follow-up.
 Style, naming, and minor perf are nits.
 
-Your FINAL message must be STRICT JSON and nothing else — no prose, no code fence:
+END your message with the verdict as ONE JSON object. Your reasoning may come first, but
+the JSON must be the LAST thing in your message and must parse:
 {{"verdict": "PASS" | "BLOCK",
   "reviewed_sha": "<the headRefOid you fetched above>",
   "findings": [{{"severity": "blocking" | "nit", "file": "path", "line": 0, "summary": "..."}}]}}
