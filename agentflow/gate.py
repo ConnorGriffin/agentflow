@@ -1,10 +1,10 @@
-"""The auto-merge gate — decide to merge, revise, or park (ADR 0003, 0004).
+"""The auto-merge gate — decide to merge, revise, or park (ADR 0003, 0004, 0020).
 
 `decide_merge` is pure: auto-merge requires ALL of an independent (cross-tool)
-review, green CI, and a clean verdict. Anything else gets exactly one revise round,
-then drops to reviewed — a human merges. So `autonomous` is never less safe than
-`reviewed`. The gh actions it dispatches (CI check, squash-merge, park) are thin
-wrappers around the pure decision.
+review, green CI, and a clean verdict. Anything else revises — up to `MAX_REVISES`
+rounds — then parks for a human. So `autonomous` is never less safe than `reviewed`.
+The gh actions it dispatches (CI check, squash-merge, park) are thin wrappers around
+the pure decision.
 """
 
 from __future__ import annotations
@@ -21,6 +21,11 @@ class MergeDecision(str, Enum):
     PARK = "park"    # drop-to-reviewed: a human merges
 
 
+# Revise a fixable miss, but bail after this many unproductive rounds rather than
+# looping forever (ADR 0020; was a single round under ADR 0004).
+MAX_REVISES = 2
+
+
 def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,
                  builder_tool: str, revises_used: int) -> MergeDecision:
     """Pure. Merge only on independent review + green CI + clean verdict."""
@@ -34,8 +39,8 @@ def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,
         return MergeDecision.PARK
     if ci_green and verdict.clean:
         return MergeDecision.MERGE
-    if revises_used == 0:
-        # ADR 0004: exactly one auto-revise round for a fixable miss.
+    if revises_used < MAX_REVISES:
+        # ADR 0020: revise a fixable miss, bailing after MAX_REVISES rounds.
         return MergeDecision.REVISE
     return MergeDecision.PARK
 

@@ -32,17 +32,24 @@ MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
 _MARKER_RE = re.compile(rf"^({'|'.join(MARKERS)}):")
 
 
-class Tier(str, Enum):
-    """Cost-appropriate model tier, assigned per issue by intake (ADR 0014).
-
-    Tool-agnostic; each adapter maps it to a concrete model. A hard requirement —
-    the deep tier burns rate-limit headroom fastest, so mis-sizing wastes the very
-    resource ADR 0006 optimizes.
+class Complexity(str, Enum):
+    """The model-size dial intake stamps per issue (ADR 0018). Tool-agnostic; each
+    adapter maps it to a concrete model. A hard gate — the deep tier burns rate-limit
+    headroom fastest, so mis-sizing wastes the very resource ADR 0006 optimizes.
     """
 
-    LIGHT = "light"        # routine/mechanical: CSS, config, docs, default flips
-    STANDARD = "standard"  # ordinary features, moderate logic
-    DEEP = "deep"          # correctness-sensitive, design-heavy, multi-surface
+    STANDARD = "standard"  # ordinary features, moderate logic → sonnet/Terra
+    DEEP = "deep"          # correctness-sensitive, design-heavy → opus/Sol
+
+
+class Effort(str, Enum):
+    """The second dial intake stamps (ADR 0018): how much work the issue warrants,
+    independent of model size. Carried into the build brief as guidance."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    EXTRA = "extra"
 
 
 class BuildStatus(str, Enum):
@@ -58,7 +65,8 @@ class BuildTask:
     workdir: str     # local main checkout (worktrees are cut from here)
     issue: int
     slug: str        # short kebab title, for branch/worktree naming
-    tier: Tier       # cost tier assigned by intake — no build without one
+    complexity: Complexity  # model-size dial from intake — no build without one
+    effort: Effort   # effort dial from intake — how much work the issue warrants
     prompt: str      # the work order / self-scoped brief handed to the agent
 
 
@@ -94,11 +102,11 @@ class _WorktreeRunner:
     """Shared build orchestration; subclasses supply `tool`, `MODELS`, `_launch`."""
 
     tool: str = "?"
-    MODELS: dict[Tier, str] = {}
+    MODELS: dict[Complexity, str] = {}
 
-    def model_for(self, tier: Tier) -> str:
-        """Resolve a tool-agnostic tier to this tool's concrete model."""
-        return self.MODELS[tier]
+    def model_for(self, complexity: Complexity) -> str:
+        """Resolve a tool-agnostic complexity to this tool's concrete model."""
+        return self.MODELS[complexity]
 
     def build(self, task: BuildTask) -> BuildOutcome:
         branch = f"agentflow/{self.tool}/issue-{task.issue}-{task.slug}"
@@ -110,7 +118,7 @@ class _WorktreeRunner:
             return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
 
         started = time.time()
-        launched, _ = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.tier))
+        launched, _ = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.complexity))
 
         pr_url = self._pr_for_branch(task.repo, branch)
         markers = self._new_marker_comments(task.repo, task.issue, since=started)
@@ -179,7 +187,7 @@ class _WorktreeRunner:
 
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
-    MODELS = {Tier.LIGHT: "haiku", Tier.STANDARD: "sonnet", Tier.DEEP: "opus"}
+    MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
 
     def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
         # Hazard-free autonomous build: skip permission prompts. A hazardous repo
@@ -192,8 +200,8 @@ class ClaudeRunner(_WorktreeRunner):
 
 class CodexRunner(_WorktreeRunner):
     tool = "codex"
-    # TODO(verify): gpt-5.6-sol confirmed working; confirm the terra/luna IDs.
-    MODELS = {Tier.LIGHT: "gpt-5.6-luna", Tier.STANDARD: "gpt-5.6-terra", Tier.DEEP: "gpt-5.6-sol"}
+    # TODO(verify): gpt-5.6-sol confirmed working; confirm the terra ID.
+    MODELS = {Complexity.STANDARD: "gpt-5.6-terra", Complexity.DEEP: "gpt-5.6-sol"}
 
     def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
         # `-o <file>` writes Codex's final message to a file we control.

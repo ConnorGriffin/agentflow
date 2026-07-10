@@ -46,12 +46,19 @@ def _prs(repo: str, state: str) -> list[dict]:
         return []
 
 
-def _tier_of(labels: list[dict]) -> str | None:
+def _dial_of(labels: list[dict], prefix: str) -> str | None:
     for lbl in labels:
-        n = lbl.get("name", "")
-        if n.startswith("tier:"):
-            return n.split(":", 1)[1]
+        if lbl.get("name", "").startswith(prefix):
+            return lbl["name"].split(":")[-1]
     return None
+
+
+def _complexity_of(labels: list[dict]) -> str | None:
+    return _dial_of(labels, "agentflow:complexity:")
+
+
+def _effort_of(labels: list[dict]) -> str | None:
+    return _dial_of(labels, "agentflow:effort:")
 
 
 def _ready_issues(repo: str) -> list[dict]:
@@ -64,7 +71,8 @@ def _ready_issues(repo: str) -> list[dict]:
         issues = json.loads(r.stdout)
     except json.JSONDecodeError:
         return []
-    return [{"number": i["number"], "title": i["title"], "tier": _tier_of(i["labels"])}
+    return [{"number": i["number"], "title": i["title"],
+             "complexity": _complexity_of(i["labels"]), "effort": _effort_of(i["labels"])}
             for i in issues]
 
 

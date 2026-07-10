@@ -43,3 +43,13 @@ then Context / Decision / Alternatives / Consequences.
   sizes every issue (`light`/`standard`/`deep`).
 - [0015](0015-review-anchors-to-acceptance.md) — Review anchors to the issue's
   acceptance criteria (beyond-scope correctness is a follow-up, not a blocker).
+- [0016](0016-intake-stage.md) — Intake: the autonomous front of the pipe (ground →
+  rewrite → route; native, drops the `/triage` skill).
+- [0017](0017-ciq-auto-scope-human-merge.md) — ciq-autotune: auto-scope, human-merge
+  (promotes ADR 0008's reserved off-diagonal knob).
+- [0018](0018-two-dials-review-by-evidence.md) — Two dials (complexity + effort);
+  review by evidence not demo; `tier:` retired.
+- [0019](0019-human-re-entry.md) — Human re-entry: hold states, comment-resume, the
+  `/agentflow` interactive surface, and the skip invariant.
+- [0020](0020-build-review-under-partial-availability.md) — Running build/review under
+  partial tool availability (prefer-don't-gate review; revise-until-clean with a bail).

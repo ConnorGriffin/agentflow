@@ -5,24 +5,25 @@ behind adapters; the *decision* of what a session outcome means is `classify_bui
 and that is what actually needs to be right.
 """
 
-from agentflow.runner import BuildStatus, ClaudeRunner, CodexRunner, Tier, classify_build
+from agentflow.runner import BuildStatus, ClaudeRunner, CodexRunner, Complexity, Effort, classify_build
 
 
-def test_tiers_resolve_to_cost_appropriate_models():
+def test_complexity_resolves_to_cost_appropriate_models():
     claude, codex = ClaudeRunner(), CodexRunner()
-    # light work must NOT land on the deep-tier model — the whole point.
-    assert claude.model_for(Tier.LIGHT) == "haiku"
-    assert claude.model_for(Tier.STANDARD) == "sonnet"
-    assert claude.model_for(Tier.DEEP) == "opus"
-    assert codex.model_for(Tier.LIGHT) == "gpt-5.6-luna"
-    assert codex.model_for(Tier.STANDARD) == "gpt-5.6-terra"
-    assert codex.model_for(Tier.DEEP) == "gpt-5.6-sol"
+    assert claude.model_for(Complexity.STANDARD) == "sonnet"
+    assert claude.model_for(Complexity.DEEP) == "opus"
+    assert codex.model_for(Complexity.STANDARD) == "gpt-5.6-terra"
+    assert codex.model_for(Complexity.DEEP) == "gpt-5.6-sol"
 
 
-def test_every_tier_maps_for_every_tool():
+def test_every_complexity_maps_for_every_tool():
     for runner in (ClaudeRunner(), CodexRunner()):
-        for tier in Tier:
-            assert runner.model_for(tier)  # no tier left unmapped
+        for complexity in Complexity:
+            assert runner.model_for(complexity)  # no complexity left unmapped
+
+
+def test_effort_has_four_levels():
+    assert [e.value for e in Effort] == ["low", "medium", "high", "extra"]
 
 
 def test_pr_opened_is_success():

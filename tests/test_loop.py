@@ -3,24 +3,29 @@ proven by the first live run; these are the parsing bits that must be exact."""
 
 import pytest
 
-from agentflow.loop import pr_number, repo_profile, slug, tier_from_labels
-from agentflow.runner import Tier
+from agentflow.loop import (complexity_from_labels, effort_from_labels, pr_number,
+                            repo_profile, slug)
+from agentflow.runner import Complexity, Effort
 
 
-def test_tier_from_labels_reads_the_tier_label():
-    assert tier_from_labels(["ready-for-agent", "tier:light"]) is Tier.LIGHT
-    assert tier_from_labels(["tier:standard"]) is Tier.STANDARD
-    assert tier_from_labels(["tier:deep"]) is Tier.DEEP
+def test_complexity_from_labels_reads_the_label():
+    assert complexity_from_labels(["ready-for-agent", "agentflow:complexity:standard"]) is Complexity.STANDARD
+    assert complexity_from_labels(["agentflow:complexity:deep"]) is Complexity.DEEP
 
 
-def test_tier_from_labels_is_none_without_one():
-    # ADR 0014 hard gate: no tier label => the loop must skip, not guess.
-    assert tier_from_labels(["ready-for-agent", "bug"]) is None
-    assert tier_from_labels([]) is None
+def test_complexity_from_labels_is_none_without_one():
+    # Hard gate (ADR 0018): no complexity label => the loop must skip, not guess.
+    assert complexity_from_labels(["ready-for-agent", "bug"]) is None
+    assert complexity_from_labels([]) is None
 
 
-def test_tier_from_labels_ignores_lookalikes():
-    assert tier_from_labels(["tier:xl", "tiering"]) is None
+def test_complexity_from_labels_ignores_lookalikes():
+    assert complexity_from_labels(["agentflow:complexity:xl", "tier:deep"]) is None
+
+
+def test_effort_from_labels_defaults_to_medium():
+    assert effort_from_labels(["agentflow:effort:high"]) is Effort.HIGH
+    assert effort_from_labels(["ready-for-agent"]) is Effort.MEDIUM  # default, not a hard gate
 
 
 @pytest.mark.parametrize("title,expected", [

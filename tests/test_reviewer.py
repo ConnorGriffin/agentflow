@@ -8,8 +8,7 @@ this module (see reviewer.py docstring / git history).
 
 import pytest
 
-from agentflow.reviewer import Verdict, parse_verdict, review_tier
-from agentflow.runner import Tier
+from agentflow.reviewer import Verdict, parse_verdict
 
 
 def test_pass_with_no_findings_is_clean():
@@ -83,9 +82,3 @@ def test_sha_match_required_when_expected():
                                      "\x00\xff not utf clean", '{"verdict"}'])
 def test_parse_never_raises(payload):
     assert parse_verdict(payload).clean is False  # returns, does not throw
-
-
-def test_review_tier_floors_at_standard():
-    assert review_tier(Tier.LIGHT) is Tier.STANDARD
-    assert review_tier(Tier.STANDARD) is Tier.STANDARD
-    assert review_tier(Tier.DEEP) is Tier.DEEP
