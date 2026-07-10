@@ -3,96 +3,386 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agentflow</title>
+<title>agentflow · inbox</title>
+<!--
+  agentflow operator dashboard (ADR 0010) — shipped implementation of the locked
+  "inbox" visual spec (mockups/dashboard-inbox.html): needs-you-first — the inbox
+  holds only what needs a human (guarded/reviewed merges, a ratchet ready to loosen);
+  everything the fleet auto-merges is demoted to the rail. Fetches GET /api/snapshot
+  (dashboard_data.snapshot()) and refreshes every 15s. PRODUCT.md bans honored (no
+  side-stripe accents; state carries a text label, not color alone); reduced-motion
+  fallback below.
+-->
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
     --green:#3fb950; --blue:#58a6ff; --amber:#d29922; --red:#f85149;
+    /* derived-only, for hover/tint depth */
+    --panel-2:#1a2029; --border-2:#3d444d;
   }
   *{box-sizing:border-box}
+  html,body{height:100%}
   body{margin:0;background:var(--bg);color:var(--fg);
-    font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace}
-  header{display:flex;align-items:baseline;gap:12px;padding:16px 24px;border-bottom:1px solid var(--border)}
-  header h1{margin:0;font-size:18px;letter-spacing:.5px}
-  header .sub{color:var(--muted);font-size:12px}
-  main{max-width:960px;margin:0 auto;padding:24px}
-  h2{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);margin:24px 0 10px}
-  .pools{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  .pool{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px}
-  .pool .top{display:flex;justify-content:space-between;margin-bottom:8px}
-  .bar{height:8px;background:#21262d;border-radius:4px;overflow:hidden}
-  .bar>i{display:block;height:100%;border-radius:4px}
-  .repo{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:12px}
-  .repo .name{font-weight:600}
-  .badge{font-size:11px;padding:2px 8px;border-radius:20px;border:1px solid;margin-left:8px}
-  .autonomous{color:var(--green);border-color:var(--green)}
-  .reviewed{color:var(--blue);border-color:var(--blue)}
-  .guarded{color:var(--amber);border-color:var(--amber)}
-  .row{display:grid;grid-template-columns:1fr 1fr;gap:20px;margin-top:12px}
-  .col h3{font-size:11px;text-transform:uppercase;color:var(--muted);margin:0 0 6px;letter-spacing:1px}
-  .item{padding:4px 0;border-top:1px solid var(--border)}
-  .item .n{color:var(--muted)}
-  .empty{color:var(--muted);font-style:italic}
-  .ratchet{margin-top:12px;padding-top:12px;border-top:1px solid var(--border);
-    display:flex;gap:16px;align-items:center;font-size:12px;color:var(--muted)}
-  .loosen{color:var(--green);border:1px solid var(--green);border-radius:20px;padding:1px 8px}
+    font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+    display:flex;flex-direction:column;overflow:hidden}
+
+  /* ---- header ---- */
+  header{display:flex;align-items:center;gap:14px;padding:12px 22px;
+    border-bottom:1px solid var(--border);flex:none}
+  header h1{margin:0;font-size:17px;letter-spacing:.5px}
+  header .tag{color:var(--muted);font-size:11px;letter-spacing:.3px}
+  .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;
+    padding:4px 10px;border-radius:20px;border:1px solid}
+  .pill .dot{width:7px;height:7px;border-radius:50%}
+  .pill.ok{color:var(--green);border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.08)}
+  .pill.ok .dot{background:var(--green)}
+  .pill.bad{color:var(--red);border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.08)}
+  .pill.bad .dot{background:var(--red)}
+  .pill.warn{color:var(--amber);border-color:rgba(210,153,34,.4);background:rgba(210,153,34,.08)}
+  .pill.warn .dot{background:var(--amber)}
+  .pill.calm{color:var(--green);border-color:rgba(63,185,80,.35);background:rgba(63,185,80,.06)}
+  .pill.calm .dot{background:var(--green)}
+  .spacer{flex:1}
+  .updated{color:var(--muted);font-size:11px}
+
+  /* ---- layout ---- */
+  main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1.7fr) 344px;
+    gap:20px;padding:18px 22px;overflow:hidden}
+  .col{min-width:0;min-height:0;display:flex;flex-direction:column}
+  .sechead{display:flex;align-items:baseline;gap:9px;margin:0 2px 11px}
+  .sechead h2{font-size:12px;text-transform:uppercase;letter-spacing:1.2px;
+    color:var(--muted);margin:0}
+  .sechead .count{font-size:11px;color:var(--fg);background:var(--panel-2);
+    border:1px solid var(--border);border-radius:20px;padding:1px 8px}
+  .sechead .hint{margin-left:auto;font-size:11px;color:var(--muted)}
+
+  /* ---- inbox (dominant) ---- */
+  .inbox{overflow-y:auto;padding-right:4px;display:flex;flex-direction:column;gap:10px}
+  .card{position:relative;display:flex;align-items:center;gap:14px;
+    background:var(--panel);border:1px solid var(--border);
+    border-radius:9px;padding:14px 16px;transition:border-color .12s,background .12s}
+  .card:hover{border-color:var(--border-2);background:var(--panel-2)}
+  /* Accent = a leading status dot + the colored kind label + the colored action,
+     NOT a border-left stripe (PRODUCT.md ban: no side-stripe accent cards). */
+  .card .lead{width:8px;height:8px;border-radius:50%;flex:none;align-self:flex-start;margin-top:5px}
+  .card.guarded .lead{background:var(--amber)}
+  .card.reviewed .lead{background:var(--blue)}
+  .card.loosen .lead{background:var(--green)}
+  .card.parked .lead{background:var(--red)}
+  .card .body{flex:1;min-width:0}
+  .kind{font-size:10.5px;letter-spacing:1.1px;text-transform:uppercase;color:var(--muted)}
+  .kind b{font-weight:600}
+  .kind.guarded b{color:var(--amber)} .kind.reviewed b{color:var(--blue)}
+  .kind.loosen b{color:var(--green)} .kind.parked b{color:var(--red)}
+  .title{margin-top:4px;font-size:14.5px;color:var(--fg);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .title .num{color:var(--muted)}
+  .title .open{color:var(--muted);text-decoration:none;opacity:0;margin-left:2px}
+  .card:hover .title .open{opacity:1}
+  .meta{margin-top:5px;font-size:12px;color:var(--muted);
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .tool-claude{color:var(--amber)} .tool-codex{color:var(--blue)}
+  .chk{color:var(--green)}
+  .caution{color:var(--amber)}
+  /* the ONE action */
+  .act{font:600 13px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    padding:10px 15px;border-radius:7px;border:1px solid transparent;cursor:pointer;
+    white-space:nowrap;color:#0d1117;flex:none;transition:filter .12s,transform .06s}
+  .act:hover{filter:brightness(1.09)} .act:active{transform:translateY(1px)}
+  .act.guarded{background:var(--amber)} .act.reviewed{background:var(--blue)}
+  .act.loosen{background:var(--green)} .act.parked{background:var(--red);color:#fff}
+  .act .kbd{opacity:.55;margin-left:8px;font-weight:400;font-size:11px}
+
+  /* ---- empty inbox ---- */
+  .zero{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;gap:8px;border:1px dashed var(--border);border-radius:12px;
+    color:var(--muted);padding:40px}
+  .zero .mark{width:52px;height:52px;border-radius:50%;display:grid;place-items:center;
+    border:1.5px solid rgba(63,185,80,.5);background:rgba(63,185,80,.07);margin-bottom:6px}
+  .zero h3{margin:0;font-size:16px;color:var(--green);letter-spacing:.3px}
+  .zero p{margin:0;font-size:12.5px;max-width:360px}
+
+  /* ---- rail ---- */
+  .rail{overflow-y:auto;display:flex;flex-direction:column;gap:14px;padding-right:2px}
+  .block{background:var(--panel);border:1px solid var(--border);border-radius:9px;padding:14px}
+  .block h3{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:1.1px;color:var(--muted)}
+  .block .h3sub{font-size:11px;color:var(--muted);float:right;font-weight:400;letter-spacing:0}
+  /* pools */
+  .pool{margin-top:11px}
+  .pool .top{display:flex;justify-content:space-between;align-items:baseline;font-size:12px;margin-bottom:5px}
+  .pool .top b{font-weight:600}
+  .pool .top .hr{color:var(--muted)}
+  .bar{height:7px;background:#21262d;border-radius:4px;overflow:hidden}
+  .bar>i{display:block;height:100%;border-radius:4px}
+  /* fleet */
+  .frepo{display:flex;align-items:center;gap:9px;padding:10px 0 4px;border-top:1px solid var(--border)}
+  .frepo.first{border-top:0}
+  .dot{width:8px;height:8px;border-radius:50%;flex:none}
+  .frepo .nm{color:var(--fg);font-size:13px}
+  .mini{font-size:10px;padding:1px 7px;border-radius:20px;border:1px solid;letter-spacing:.3px}
+  .mini.autonomous{color:var(--green);border-color:rgba(63,185,80,.5)}
+  .mini.reviewed{color:var(--blue);border-color:rgba(88,166,255,.5)}
+  .mini.guarded{color:var(--amber);border-color:rgba(210,153,34,.5)}
+  .frepo .rt{margin-left:auto;color:var(--muted);font-size:11px;text-align:right}
+  /* trust-ratchet mini-block, grafted from the stream variant */
+  .ratblock{padding:2px 0 10px 17px}
+  .ratblock.is-loosen{background:rgba(63,185,80,.05);border-radius:6px;
+    padding:6px 8px 8px 17px;margin-bottom:2px}
+  .rlabel{font-size:10px;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);
+    display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+  .rbar{height:5px;background:#21262d;border-radius:3px;overflow:hidden}
+  .rbar>i{display:block;height:100%;border-radius:3px;transition:width .3s}
+  .rstat{font-size:11px;color:var(--muted);margin-top:4px;font-variant-numeric:tabular-nums}
+  /* distinct name — the inbox already uses `.loosen` as a card/button modifier */
+  .rt-loosen{color:var(--green);border:1px solid rgba(63,185,80,.5);border-radius:20px;
+    padding:1px 8px;font-size:10px;display:inline-flex;align-items:center;gap:4px;
+    background:rgba(63,185,80,.08);letter-spacing:.3px}
+  .auto{color:var(--green)}
+  /* merged feed */
+  .mrow{display:flex;gap:8px;align-items:baseline;padding:7px 0;border-top:1px solid var(--border);font-size:12px}
+  .mrow.first{border-top:0}
+  .mrow .num{color:var(--muted);flex:none}
+  .mrow .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+  .mrow .ago{color:var(--muted);flex:none;font-size:11px}
+  .mrow .rp{color:var(--muted);flex:none;font-size:11px}
+
+  @media (prefers-reduced-motion: reduce){
+    *{transition:none !important; animation:none !important}
+  }
+  @media (max-width:880px){
+    main{grid-template-columns:1fr;overflow-y:auto}
+    .inbox{overflow:visible}
+    .rail{overflow:visible}
+  }
 </style>
 </head>
 <body>
 <header>
   <h1>agentflow</h1>
-  <span class="sub" id="updated">loading…</span>
+  <span class="tag">over GitHub · read-only</span>
+  <span id="health"></span>
+  <span id="needs"></span>
+  <span class="spacer"></span>
+  <span class="updated" id="updated">loading…</span>
 </header>
+
 <main>
-  <h2>Pools · rate-limit headroom</h2>
-  <div class="pools" id="pools"></div>
-  <h2>Fleet</h2>
-  <div id="fleet"></div>
-</main>
-<script>
-const pct = v => Math.max(0, Math.min(100, v));
-const color = h => h > 40 ? 'var(--green)' : h > 15 ? 'var(--amber)' : 'var(--red)';
-
-function poolCard(p){
-  const h = pct(p.headroom_pct);
-  return `<div class="pool">
-    <div class="top"><b class="tool-${p.tool}">${p.tool}</b>
-      <span>${h}% headroom ${p.clear ? '' : '· busy'}</span></div>
-    <div class="bar"><i style="width:${h}%;background:${color(h)}"></i></div></div>`;
-}
-
-function list(items, render){
-  return items.length ? items.map(render).join('') : '<div class="empty">none</div>';
-}
-
-function repoCard(r){
-  const rt = r.ratchet || {};
-  return `<div class="repo">
-    <div><span class="name">${r.repo}</span>
-      <span class="badge ${r.profile}">${r.profile}</span></div>
-    <div class="row">
-      <div class="col"><h3>In flight</h3>${list(r.in_flight, p =>
-        `<div class="item"><span class="n">#${p.number}</span> ${p.title}
-          <span class="tool-${p.builder}">· ${p.builder}</span></div>`)}</div>
-      <div class="col"><h3>Recently merged</h3>${list(r.recent_merges, p =>
-        `<div class="item"><span class="n">#${p.number}</span> ${p.title}</div>`)}</div>
+  <section class="col">
+    <div class="sechead">
+      <h2>Needs you</h2>
+      <span class="count" id="inboxCount">0</span>
+      <span class="hint">most urgent first · one action each</span>
     </div>
-    <div class="ratchet">
-      <span>ratchet: ${rt.samples||0} samples · ${Math.round((rt.correction_rate||0)*100)}% corrected</span>
-      ${rt.ready_to_loosen ? '<span class="loosen">ready to loosen</span>' : ''}
-    </div></div>`;
+    <div class="inbox" id="inbox"></div>
+  </section>
+
+  <aside class="col rail" id="rail"></aside>
+</main>
+
+<script>
+/* ============================================================================
+   agentflow — inbox variant. Binds the EXACT snapshot() shape:
+     pools[]  {tool, clear, spent_pct, headroom_pct}
+     repos[]  {repo, profile, in_flight[]{number,title,builder},
+               recent_merges[]{number,title,merged_at},
+               ratchet{samples,correction_rate,ready_to_loosen}}
+   ========================================================================== */
+const SNAPSHOT_URL = '/api/snapshot';
+
+const PROFILE_COLOR = {autonomous:'var(--green)', reviewed:'var(--blue)', guarded:'var(--amber)'};
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const short = repo => repo.split('/').pop();
+const pct = v => Math.max(0, Math.min(100, v));
+const headroomColor = h => h > 40 ? 'var(--green)' : h > 15 ? 'var(--amber)' : 'var(--red)';
+const reviewerOf = builder => builder === 'claude' ? 'codex' : 'claude';
+/* trust-ratchet bar, grafted from the stream variant: correction-rate width +
+   color, and a stat line; 0 samples reads as "earning trust". */
+function ratchetBar(rt){
+  const s = rt.samples || 0, corr = rt.correction_rate || 0;
+  if (s === 0) return {barW:0, barC:'var(--muted)', stat:'no samples yet · gates on, earning trust'};
+  const c = corr < 0.10 ? 'var(--green)' : corr < 0.25 ? 'var(--amber)' : 'var(--red)';
+  return {barW:Math.round(corr*100), barC:c, stat:`${s} decisions · ${Math.round(corr*100)}% corrected`};
 }
 
-async function refresh(){
-  try{
-    const s = await (await fetch('/api/snapshot')).json();
-    document.getElementById('pools').innerHTML = s.pools.map(poolCard).join('');
-    document.getElementById('fleet').innerHTML = s.repos.map(repoCard).join('');
-    document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
-  }catch(e){ document.getElementById('updated').textContent = 'error: ' + e; }
+/* Derive the needs-you queue from the real shape (see task derivation rule):
+   - reviewed/guarded repos' in_flight PRs  = awaiting your merge
+   - ratchet.ready_to_loosen === true       = a loosen-the-dial prompt
+   Autonomous in_flight PRs auto-merge → they never enter the inbox.
+   'parked' (drop-to-reviewed) would be weight 0 here, but snapshot() carries no
+   park marker yet, so none derive from real data — hook left for when it does. */
+function deriveInbox(snap){
+  const items = [];
+  for (const r of snap.repos){
+    const needsHumanMerge = r.profile === 'reviewed' || r.profile === 'guarded';
+    if (needsHumanMerge){
+      for (const pr of (r.in_flight || [])){
+        items.push({
+          kind:'merge', accent:r.profile, weight:r.profile === 'guarded' ? 1 : 2,
+          repo:r.repo, number:pr.number, title:pr.title,
+          builder:pr.builder, reviewer:reviewerOf(pr.builder), profile:r.profile
+        });
+      }
+    }
+    if (r.ratchet && r.ratchet.ready_to_loosen){
+      items.push({
+        kind:'loosen', accent:'loosen', weight:3,
+        repo:r.repo, samples:r.ratchet.samples, rate:r.ratchet.correction_rate
+      });
+    }
+  }
+  return items.sort((a,b) => a.weight - b.weight);
 }
-refresh(); setInterval(refresh, 15000);
+
+function rel(iso, nowMs){
+  let d = Math.max(0, Math.floor((nowMs - Date.parse(iso)) / 1000));
+  if (d < 60)    return 'just now';
+  if (d < 3600)  return Math.floor(d/60) + 'm ago';
+  if (d < 86400) return Math.floor(d/3600) + 'h ago';
+  return Math.floor(d/86400) + 'd ago';
+}
+
+/* ---- renderers ---- */
+function renderInbox(items){
+  const el = document.getElementById('inbox');
+  document.getElementById('inboxCount').textContent = items.length;
+  if (!items.length){
+    el.classList.remove('inbox');
+    el.innerHTML = `<div class="zero">
+      <div class="mark"><svg width="24" height="24" viewBox="0 0 24 24" fill="none"
+        stroke="var(--green)" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M4 12.5l5 5L20 6"/></svg></div>
+      <h3>Inbox zero</h3>
+      <p>Every repo is running itself — nothing is awaiting your merge, nothing's
+      parked, no dial is ready to loosen. The fleet's telemetry is on the right.</p>
+    </div>`;
+    return;
+  }
+  el.classList.add('inbox');
+  el.innerHTML = items.map(it => it.kind === 'loosen'
+    ? loosenCard(it) : mergeCard(it)).join('');
+}
+
+function mergeCard(it){
+  const careful = it.profile === 'guarded'
+    ? ` · <span class="caution">read before merging</span>` : ` · quick glance`;
+  return `<div class="card ${it.accent}">
+    <span class="lead"></span>
+    <div class="body">
+      <div class="kind ${it.accent}"><b>${it.profile}</b> · awaiting your merge</div>
+      <div class="title"><span class="num">#${it.number}</span> ${esc(it.title)}
+        <a class="open" href="#" title="open PR">↗</a></div>
+      <div class="meta"><span class="tool-${it.builder}">${it.builder}</span> built ·
+        <span class="tool-${it.reviewer}">${it.reviewer}</span> reviewed
+        <span class="chk">✓</span>${careful}</div>
+    </div>
+    <button class="act ${it.accent}" aria-label="Merge #${it.number} in ${short(it.repo)}">
+      Merge #${it.number}${it.weight === 1 ? '' : '<span class="kbd">⏎</span>'}</button>
+  </div>`;
+}
+
+function loosenCard(it){
+  const rate = Math.round((it.rate || 0) * 100);
+  return `<div class="card loosen">
+    <span class="lead"></span>
+    <div class="body">
+      <div class="kind loosen"><b>ratchet</b> · ready to loosen</div>
+      <div class="title">${esc(short(it.repo))}
+        <a class="open" href="#" title="open repo">↗</a></div>
+      <div class="meta">${it.samples} clean samples · ${rate}% corrected —
+        consistently confirmed. Move toward more autonomy?</div>
+    </div>
+    <button class="act loosen" aria-label="Loosen the dial on ${short(it.repo)}">
+      Loosen dial</button>
+  </div>`;
+}
+
+function renderRail(snap, nowMs){
+  // pools
+  const pools = snap.pools.map(p => {
+    const h = pct(p.headroom_pct);
+    return `<div class="pool">
+      <div class="top"><b class="tool-${p.tool}">${p.tool}</b>
+        <span class="hr">${h}% headroom${p.clear ? '' : ' · busy'}</span></div>
+      <div class="bar"><i style="width:${h}%;background:${headroomColor(h)}"></i></div>
+    </div>`;
+  }).join('');
+
+  // fleet — profile + in-flight, each with the grafted trust-ratchet bar (stream)
+  const fleet = snap.repos.map((r, i) => {
+    const rt = r.ratchet || {};
+    const rb = ratchetBar(rt);
+    const loosen = !!rt.ready_to_loosen;
+    const nFlight = (r.in_flight || []).length;
+    const auto = r.profile === 'autonomous';
+    let right;
+    if (nFlight){
+      const pr = r.in_flight[0];
+      right = `#${pr.number} · <span class="tool-${pr.builder}">${pr.builder}</span>` +
+        (auto ? ` · <span class="auto">auto</span>` : '');
+    } else {
+      right = 'idle';
+    }
+    return `<div class="frepo ${i === 0 ? 'first' : ''}">
+        <span class="dot" style="background:${PROFILE_COLOR[r.profile]}"></span>
+        <span class="nm">${esc(short(r.repo))}</span>
+        <span class="mini ${r.profile}">${r.profile}</span>
+        <span class="rt">${right}</span>
+      </div>
+      <div class="ratblock ${loosen ? 'is-loosen' : ''}">
+        <div class="rlabel"><span>trust ratchet</span>
+          ${loosen ? '<span class="rt-loosen">▲ ready to loosen</span>' : ''}</div>
+        <div class="rbar"><i style="width:${rb.barW}%;background:${rb.barC}"></i></div>
+        <div class="rstat">${rb.stat}</div>
+      </div>`;
+  }).join('');
+
+  // recently merged (flatten, newest first)
+  const merges = [];
+  for (const r of snap.repos) for (const m of (r.recent_merges || []))
+    merges.push({ ...m, repo:r.repo });
+  merges.sort((a,b) => Date.parse(b.merged_at) - Date.parse(a.merged_at));
+  const feed = merges.slice(0, 6).map((m, i) =>
+    `<div class="mrow ${i === 0 ? 'first' : ''}">
+      <span class="chk">✓</span>
+      <span class="num">#${m.number}</span>
+      <span class="t">${esc(m.title)}</span>
+      <span class="rp">${esc(short(m.repo))}</span>
+      <span class="ago">${rel(m.merged_at, nowMs)}</span>
+    </div>`).join('') || '<div class="mrow first" style="color:var(--muted)">none yet</div>';
+
+  document.getElementById('rail').innerHTML = `
+    <div class="block">
+      <h3>Pools <span class="h3sub">rate-limit headroom</span></h3>${pools}</div>
+    <div class="block">
+      <h3>Fleet <span class="h3sub">${snap.repos.length} repos</span></h3>${fleet}</div>
+    <div class="block">
+      <h3>Just merged <span class="h3sub">audit feed</span></h3>${feed}</div>`;
+}
+
+function renderHeader(snap, inbox){
+  const worst = Math.min(...snap.pools.map(p => p.headroom_pct));
+  const healthy = worst >= 15;
+  document.getElementById('health').outerHTML = healthy
+    ? `<span id="health" class="pill ok"><span class="dot"></span>fleet healthy</span>`
+    : `<span id="health" class="pill bad"><span class="dot"></span>rate-limited · ${worst}% headroom</span>`;
+  document.getElementById('needs').outerHTML = inbox.length
+    ? `<span id="needs" class="pill warn"><span class="dot"></span>${inbox.length} need you</span>`
+    : `<span id="needs" class="pill calm"><span class="dot"></span>inbox zero</span>`;
+  document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+/* ---- driver ---- */
+async function render(){
+  let snap;
+  try { snap = await (await fetch(SNAPSHOT_URL)).json(); }
+  catch(e){ document.getElementById('updated').textContent = 'error: ' + e; return; }
+  const inbox = deriveInbox(snap);
+  renderHeader(snap, inbox);
+  renderInbox(inbox);
+  renderRail(snap, Date.now());
+}
+render();
+setInterval(render, 15000);
 </script>
 </body>
 </html>
