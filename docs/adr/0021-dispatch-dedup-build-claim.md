@@ -1,4 +1,4 @@
-# ADR 0021 — Dispatch dedup: claim an issue before building it
+# ADR 0021 — Dispatch dedup: claim an issue before building (and before triaging) it
 
 - Status: Accepted
 - Date: 2026-07-10
@@ -30,6 +30,28 @@ racing the daemon) fires a duplicate.
   stale. Single-instance is load-bearing: without it a second daemon's reclaim would clear
   a live claim and duplicate the build.
 
+**The same claim guards intake ([ADR 0016](0016-intake-stage.md)).** Intake has the
+*identical* no-signal-yet window: `intake_once` picks the oldest issue carrying none of
+intake's state labels, grounds it in a **multi-minute** session, and only stamps the state
+label (`ready-for-agent` / `needs-grilling` / `needs-mockup`) at the *end* via
+`apply_intake`. Between selection and that stamp the issue still reads as un-triaged, so a
+concurrent dispatch — a manual `/agentflow` triage racing the daemon — would fire a second
+grounding session and post a duplicate intake summary. (This window is latent under the
+serial single-instance daemon; the *observed* double-summary on an issue was a distinct bug
+— the grounding session ran `gh` to post the body itself while `apply_intake` also posted it
+— fixed separately by making the session's only output its JSON decision.)
+
+- `intake_once` applies **`agentflow:triaging`** *before* the grounding session and releases
+  it in a `finally`. `_untriaged` (the pure selector predicate) skips the state labels **and**
+  the claim; `_next_resumable_issue` skips a held issue already being re-triaged.
+- **One asymmetry from the build claim: no `reclaim_claims` equivalent.** A build proves
+  liveness with its open PR, so a claim without one is safely stale. **Intake opens no PR** —
+  no liveness signal — and the case it guards *is* a manual triage racing the daemon, so a
+  blind cycle-top reclaim would clear that live claim and reopen the race. The `finally`
+  covers normal completion and in-process errors; only a hard crash (SIGKILL / machine death)
+  mid-intake strands the claim, which is fail-safe (the issue is *skipped*, never
+  double-triaged) and cleared by hand.
+
 ## Alternatives considered
 
 - **Open-PR check alone.** Rejected: lagging — it can't see a build that hasn't opened a
@@ -39,14 +61,19 @@ racing the daemon) fires a duplicate.
 
 ## Consequences
 
-- Dedup is **prediction-free** and visible (you can see `agentflow:building` in the UI).
+- Dedup is **prediction-free** and visible (you can see `agentflow:building` /
+  `agentflow:triaging` in the UI).
 - **Known limitations** (surfaced by an adversarial verification pass, left for when they
   become reachable):
   - **Concurrent fan-out (future, [ADR 0006](0006-two-pool-runner-assignment.md)):** the
     claim is a flag, not a lock — check-then-`--add-label` is a TOCTOU, and `--remove-label`
     is not ref-counted. Safe under the *current serial* single-instance daemon; when
     parallel builds land, the claim must be set in the serial dispatch step before
-    fan-out (or moved to an atomic reservation).
+    fan-out (or moved to an atomic reservation). Applies to both claims.
+  - **A crash mid-intake strands `agentflow:triaging`** — deliberately not auto-reclaimed
+    (see the asymmetry above), so that one issue is skipped until the label is cleared by
+    hand. If this becomes reachable, the safe reclaim is age- or daemon-startup-based, not
+    the build's open-PR check.
   - **A manual agent that opens no PR and sets no claim is invisible** to the daemon — it
     leaves no source-of-truth signal. Manual paths should claim (or draft-PR) early.
 - ADR 0009's merge-time floor is unchanged; this is a *distinct* layer (stop the duplicate

@@ -12,7 +12,8 @@ Properties:
 - **Single instance** — a lock dir prevents overlapping runs; the running daemon
   heartbeats the lock each cycle so it is never seen as stale, and only a genuinely
   stale lock (from a crashed run) is reclaimed. Single-instance is load-bearing:
-  dispatch dedup (the `agentflow:building` claim) assumes one daemon.
+  dispatch dedup (the `agentflow:building` and `agentflow:triaging` claims) assumes one
+  daemon — each is check-then-claim, not atomic, so it dedups within one serial daemon.
 
 M1 is serial (one issue per repo per cycle). Concurrent dispatch across pools
 (ADR 0006) is a later refinement — not a silent cap.

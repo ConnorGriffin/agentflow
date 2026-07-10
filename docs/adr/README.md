@@ -53,5 +53,6 @@ then Context / Decision / Alternatives / Consequences.
   `/agentflow` interactive surface, and the skip invariant.
 - [0020](0020-build-review-under-partial-availability.md) — Running build/review under
   partial tool availability (prefer-don't-gate review; revise-until-clean with a bail).
-- [0021](0021-dispatch-dedup-build-claim.md) — Dispatch dedup: claim an issue
-  (`agentflow:building`) before building it; lock heartbeat keeps single-instance sound.
+- [0021](0021-dispatch-dedup-build-claim.md) — Dispatch dedup: claim an issue before
+  building (`agentflow:building`) and before triaging (`agentflow:triaging`) it; lock
+  heartbeat keeps single-instance sound.
