@@ -152,16 +152,43 @@ def _issues_in_flight(cfg: RepoConfig) -> set[int]:
             if (n := issue_of_branch(pr.get("headRefName", ""))) is not None}
 
 
+BUILDING = "agentflow:building"   # dispatch claim — an agent is building this issue
+
+
+def _free_to_dispatch(issue: dict, in_flight: set[int]) -> bool:
+    """A ready issue is free only if no agent already owns it — no `agentflow:building`
+    claim (set before the build, closing the no-PR-yet window) and no open agentflow PR
+    (the parked-in-review window, which outlives the claim). Pure (test surface)."""
+    return (issue["number"] not in in_flight
+            and BUILDING not in {lbl["name"] for lbl in issue.get("labels", [])})
+
+
 def _next_ready_issue(cfg: RepoConfig) -> dict | None:
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--label", "ready-for-agent", "--json", "number,title,body,labels",
               "--limit", "50"])
     if r.returncode != 0:
         return None
-    in_flight = _issues_in_flight(cfg)   # skip issues an agent already owns
-    issues = sorted((i for i in json.loads(r.stdout or "[]") if i["number"] not in in_flight),
+    in_flight = _issues_in_flight(cfg)
+    issues = sorted((i for i in json.loads(r.stdout or "[]") if _free_to_dispatch(i, in_flight)),
                     key=lambda i: i["number"])
     return issues[0] if issues else None
+
+
+def reclaim_claims(cfg: RepoConfig) -> int:
+    """Drop `agentflow:building` claims orphaned by a crash — a freshly-started daemon has
+    no live builds, so any claim without an open agentflow PR is stale. A stale claim is
+    fail-safe (the issue is skipped, never duplicated) but blocks that issue until cleared.
+    Returns how many it cleared."""
+    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+              "--label", BUILDING, "--json", "number", "--limit", "100"])
+    if r.returncode != 0:
+        return 0
+    in_flight = _issues_in_flight(cfg)
+    stale = [i["number"] for i in json.loads(r.stdout or "[]") if i["number"] not in in_flight]
+    for n in stale:
+        _release(cfg.repo, n)
+    return len(stale)
 
 
 def _next_untriaged_issue(cfg: RepoConfig) -> dict | None:
@@ -236,6 +263,33 @@ def run_once(cfg: RepoConfig) -> str:
     else:
         build_prompt = BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
                                            body=issue.get("body") or "", effort=effort.value)
+    _claim(cfg.repo, n)   # an agent now owns this issue — no duplicate dispatch (dedup)
+    try:
+        return _build_review_merge(cfg, issue, n, sl, complexity, effort,
+                                   builder, reviewer_runner, profile, build_prompt)
+    finally:
+        _release(cfg.repo, n)
+
+
+def _claim(repo: str, n: int) -> None:
+    """Mark issue n as owned by an agent *before* its build runs, so a concurrent or
+    next-cycle dispatch skips it (closes the no-PR-yet window). Ensures the label first."""
+    _run(["gh", "label", "create", BUILDING, "--repo", repo, "--color", "fbca04",
+          "--description", "An agent is building this issue", "--force"])
+    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", BUILDING])
+
+
+def _release(repo: str, n: int) -> None:
+    """Drop the build claim when the build is done, whatever the outcome. A parked PR
+    stays skipped via the open-PR check; a failed build is free to retry next cycle."""
+    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", BUILDING])
+
+
+def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexity: Complexity,
+                        effort: Effort, builder, reviewer_runner, profile: str,
+                        build_prompt: str) -> str:
+    """Build the issue, then cross-review -> merge/park. Runs under run_once's
+    `agentflow:building` claim (dispatch dedup)."""
     task = BuildTask(cfg.repo, cfg.workdir, n, sl, complexity, effort, prompt=build_prompt)
     outcome = builder.build(task)
     if outcome.status is not BuildStatus.PR_OPENED:

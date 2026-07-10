@@ -25,7 +25,7 @@ import os
 import time
 from pathlib import Path
 
-from agentflow.loop import RepoConfig, pipeline_once
+from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 ENABLE_FLAG = STATE_DIR / "enabled"
@@ -78,9 +78,16 @@ def main() -> None:
         log("another daemon is running; exiting")
         return
     log(f"daemon up — enable={ENABLE_FLAG}, poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}")
+    reclaimed = False
     try:
         while True:
             if ENABLE_FLAG.exists():
+                if not reclaimed:  # one-time: clear build claims orphaned by a prior crash
+                    for cfg in REPOS:
+                        cleared = reclaim_claims(cfg)
+                        if cleared:
+                            log(f"{cfg.repo}: reclaimed {cleared} stale build claim(s)")
+                    reclaimed = True
                 cycle(REPOS)
             else:
                 log(f"dormant (no {ENABLE_FLAG}); sleeping")
