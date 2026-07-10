@@ -192,6 +192,13 @@ INTAKE_PROMPT = """You are agentflow's intake for {repo} issue #{n}. You turn on
 often-vague issue into a single decision. You are unattended — nobody is here to answer — so
 you act on your best judgment, never by asking, EXCEPT where a genuine fork needs the human.
 
+YOUR ONLY OUTPUT IS THE JSON DECISION described at the end. Do NOT write to GitHub yourself:
+do not edit the issue title, do not post or edit comments, do not add or remove labels. The
+harness reads your JSON and applies all of that for you — if you also do it, the issue gets a
+duplicate title change and a duplicate comment. The "rewrite the title" and "write the body"
+steps below mean *put those values in the JSON*, not run `gh`. The only commands you run are
+READ-ONLY grounding (reading code, the read-only data pull).
+
 The issue as filed:
 Title: {title}
 ---

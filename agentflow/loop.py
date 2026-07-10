@@ -191,16 +191,27 @@ def reclaim_claims(cfg: RepoConfig) -> int:
     return len(stale)
 
 
+TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns this issue
+
+# Out of the intake queue: a resolved state label, or a live triaging claim.
+_TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING}
+
+
+def _untriaged(issue: dict) -> bool:
+    """An issue is in the intake queue only if nothing has resolved or claimed it — none of
+    intake's state labels and no `agentflow:triaging` claim (set before the grounding session,
+    closing intake's no-label-yet window, symmetric to `_free_to_dispatch`). Pure (test surface)."""
+    return not ({lbl["name"] for lbl in issue.get("labels", [])} & _TRIAGE_SKIP)
+
+
 def _next_untriaged_issue(cfg: RepoConfig) -> dict | None:
-    """The oldest open issue carrying none of intake's state labels — the front of
-    the intake queue (ADR 0016)."""
+    """The oldest open issue in the intake queue — none of intake's state labels and unclaimed
+    by a live grounding session (ADR 0016)."""
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--json", "number,title,body,labels", "--limit", "50"])
     if r.returncode != 0:
         return None
-    issues = json.loads(r.stdout or "[]")
-    untriaged = [i for i in issues
-                 if not ({lbl["name"] for lbl in i["labels"]} & set(STATE_LABELS))]
+    untriaged = [i for i in json.loads(r.stdout or "[]") if _untriaged(i)]
     return min(untriaged, key=lambda i: i["number"]) if untriaged else None
 
 
@@ -285,6 +296,23 @@ def _release(repo: str, n: int) -> None:
     _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", BUILDING])
 
 
+def _claim_triage(repo: str, n: int) -> None:
+    """Claim issue n for intake *before* its grounding session, so a concurrent or next-cycle
+    dispatch skips it — closing intake's no-label-yet window (the state label is only stamped
+    once the session finishes). Symmetric to `_claim`; ensures the label first."""
+    _run(["gh", "label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
+          "--description", "A grounding session is triaging this issue", "--force"])
+    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", TRIAGING])
+
+
+def _release_triage(repo: str, n: int) -> None:
+    """Drop the intake claim once routing is written (the state label dedups from here) or the
+    session ended. A crash *before* this strands the claim: fail-safe (the issue is skipped,
+    never double-triaged), cleared by hand — intake opens no PR, so there's no liveness signal
+    for a safe auto-reclaim like builds have."""
+    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", TRIAGING])
+
+
 def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexity: Complexity,
                         effort: Effort, builder, reviewer_runner, profile: str,
                         build_prompt: str) -> str:
@@ -355,6 +383,8 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
     if r.returncode != 0:
         return None
     for issue in sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"]):
+        if TRIAGING in {lbl["name"] for lbl in issue["labels"]}:
+            continue   # a re-intake already owns this held issue
         cr = _run(["gh", "issue", "view", str(issue["number"]), "--repo", cfg.repo, "--json", "comments"])
         if cr.returncode != 0:
             continue
@@ -375,9 +405,13 @@ def intake_once(cfg: RepoConfig) -> str:
     builder, _ = pick_pair()   # intake needs one available tool, not a pair
     if builder is None:
         return f"#{n}: no pool has headroom for intake — deferring"
-    result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
-    current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
-    summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
+    _claim_triage(cfg.repo, n)   # own the issue before the long session (dispatch dedup)
+    try:
+        result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
+        current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
+        summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
+    finally:
+        _release_triage(cfg.repo, n)   # the state label dedups from here; drop the claim
     if result.route in (IntakeRoute.GRILL, IntakeRoute.MOCKUP):
         notify("agentflow needs you", f"{cfg.repo} #{n}: {result.route.value}",
                f"https://github.com/{cfg.repo}/issues/{n}")

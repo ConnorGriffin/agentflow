@@ -3,8 +3,8 @@ proven by the first live run; these are the parsing bits that must be exact."""
 
 import pytest
 
-from agentflow.loop import (_free_to_dispatch, complexity_from_labels, effort_from_labels,
-                            issue_of_branch, pr_number, repo_profile, slug)
+from agentflow.loop import (_free_to_dispatch, _untriaged, complexity_from_labels,
+                            effort_from_labels, issue_of_branch, pr_number, repo_profile, slug)
 from agentflow.runner import Complexity, Effort
 
 
@@ -65,6 +65,15 @@ def test_free_to_dispatch_skips_claimed_or_in_flight():
     assert _free_to_dispatch(ready, {5}) is False   # an open agentflow PR already owns it
     claimed = {"number": 6, "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}]}
     assert _free_to_dispatch(claimed, set()) is False   # claimed — an agent is building it
+
+
+def test_untriaged_skips_state_labels_and_triage_claim():
+    fresh = {"number": 1, "labels": [{"name": "bug"}]}
+    assert _untriaged(fresh) is True
+    triaging = {"number": 2, "labels": [{"name": "bug"}, {"name": "agentflow:triaging"}]}
+    assert _untriaged(triaging) is False   # a grounding session already owns it — no re-dispatch
+    routed = {"number": 3, "labels": [{"name": "ready-for-agent"}]}
+    assert _untriaged(routed) is False     # already has a state label
 
 
 def test_repo_profile_reads_the_dial(tmp_path):
