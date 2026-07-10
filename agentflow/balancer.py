@@ -58,12 +58,16 @@ def choose_pair(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
 
 
 def _query_pool(tool: str) -> PoolStatus:
+    env = {**os.environ, "TRIAGE_AGENT": tool}
     try:
-        r = subprocess.run([_GATE, "check"], env={**os.environ, "TRIAGE_AGENT": tool},
-                           text=True, capture_output=True)
+        # `spend` reports the REAL trailing-5h % even when the interactive-use gate
+        # would block dispatch — so headroom is honest while you're active. `check`
+        # is the separate dispatch-availability question (clear vs busy).
+        sp = subprocess.run([_GATE, "spend"], env=env, text=True, capture_output=True)
+        ck = subprocess.run([_GATE, "check"], env=env, text=True, capture_output=True)
     except OSError:
         return PoolStatus(tool, False, 100.0)           # no gate → treat as no headroom
-    return PoolStatus(tool, r.returncode == 0, parse_pct(r.stdout, r.returncode))
+    return PoolStatus(tool, ck.returncode == 0, parse_pct(sp.stdout, sp.returncode))
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,
