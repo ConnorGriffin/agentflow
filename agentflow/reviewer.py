@@ -31,7 +31,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentflow.runner import Tier, _WorktreeRunner, _run
+from agentflow.runner import Complexity, _WorktreeRunner, _run
 
 # Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
 # "blocker", "high", unknown) is treated as blocking — fail safe.
@@ -124,11 +124,6 @@ def parse_verdict(payload: str, expected_sha: str | None = None) -> Verdict:
         return _unparseable(f"parse error: {type(e).__name__}")
 
 
-def review_tier(issue_tier: Tier) -> Tier:
-    """ADR 0014(b): review tracks the issue tier but never drops below `standard`."""
-    return Tier.DEEP if issue_tier is Tier.DEEP else Tier.STANDARD
-
-
 REVIEW_PROMPT = """You are the independent cross-tool reviewer for PR #{pr} in this repo.
 A different agent built it to satisfy a specific issue. Decide if it is safe to merge.
 
@@ -161,7 +156,7 @@ class Reviewer:
         self.runner = runner  # the tool that did NOT build this PR
 
     def review(self, repo: str, workdir: str, pr_number: int, pr_head_branch: str,
-               slug: str, issue_tier: Tier, acceptance: str = "") -> Verdict:
+               slug: str, issue_complexity: Complexity, acceptance: str = "") -> Verdict:
         head_sha = self._head_sha(repo, pr_number)
         if not head_sha:
             return _unparseable("could not read PR head SHA")
@@ -176,7 +171,9 @@ class Reviewer:
         # The verdict is the reviewer's captured final message — read by US, not a
         # model-written file in the (untrusted) PR tree, so a builder cannot forge it.
         prompt = REVIEW_PROMPT.format(pr=pr_number, acceptance=acceptance or "(none provided)")
-        model = self.runner.model_for(review_tier(issue_tier))
+        # Review at the issue's own complexity — a correctness-sensitive build gets a
+        # correctness-sensitive reviewer (ADR 0018; the old light floor is moot).
+        model = self.runner.model_for(issue_complexity)
         ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
         if not ok:
             return _unparseable("reviewer session errored (launch non-zero)")

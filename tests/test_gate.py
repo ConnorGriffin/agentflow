@@ -31,14 +31,16 @@ def test_missing_reviewer_never_merges():
     assert d(reviewer_tool="") is MergeDecision.PARK
 
 
-def test_blocking_verdict_revises_once_then_parks():
+def test_blocking_verdict_revises_then_bails():
+    # ADR 0020: revise until clean, then bail after MAX_REVISES (=2) rounds.
     assert d(verdict=DIRTY, revises_used=0) is MergeDecision.REVISE
-    assert d(verdict=DIRTY, revises_used=1) is MergeDecision.PARK
+    assert d(verdict=DIRTY, revises_used=1) is MergeDecision.REVISE
+    assert d(verdict=DIRTY, revises_used=2) is MergeDecision.PARK
 
 
-def test_red_ci_revises_once_then_parks():
+def test_red_ci_revises_then_bails():
     assert d(ci_green=False, revises_used=0) is MergeDecision.REVISE
-    assert d(ci_green=False, revises_used=1) is MergeDecision.PARK
+    assert d(ci_green=False, revises_used=2) is MergeDecision.PARK
 
 
 def test_independence_dominates_even_a_clean_green_pr():

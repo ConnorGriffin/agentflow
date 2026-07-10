@@ -24,11 +24,14 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   sets a repo's position on the autonomy dial. High in `ciq-autotune` (medical),
   low in a vibe-code project.
 
-- **Tier** — the per-issue cost-appropriate model size, assigned by intake as a hard
-  gate: `light` (routine — haiku/Luna), `standard` (sonnet/Terra), `deep`
-  (correctness-sensitive — opus/Sol). Tool-agnostic; each runner resolves it to its
-  tool's model. Orthogonal to the pool: pool = *which plan* (by headroom), tier =
-  *how big a model within it* (by complexity). Both protect the scarce headroom.
+- **Complexity** — the per-issue model size intake stamps as a hard gate: `standard`
+  (sonnet/Terra) or `deep` (correctness-sensitive — opus/Sol). Tool-agnostic; each
+  runner resolves it to its tool's model. Orthogonal to the pool: pool = *which plan*
+  (by headroom), complexity = *how big a model within it*. (Supersedes the earlier
+  single `tier` dial; `light`/haiku dropped — ADR 0018.)
+
+- **Effort** — the second dial intake stamps alongside complexity: `low | medium |
+  high | extra` — how much work the issue warrants, independent of model size.
 
 - **Runner** — the interchangeable executor that performs a pipeline stage:
   Claude (Opus) or Codex (GPT-5.6 Sol). Chosen per stage by cost / availability /
@@ -82,9 +85,20 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   maximally utilized in parallel: builder → the pool with more headroom, reviewer →
   the other tool/pool. Never leaves a prepaid plan idle while work is queued.
 
-- **Intake** — the thin, decisive router every new issue passes through: it stamps
-  category, autonomy profile, pool, and a build-ready judgment. Not a tollbooth —
-  build-ready issues proceed; heavy triage roles fire only as exceptions.
+- **Intake** — the autonomous stage every new issue passes through (fires on any open
+  issue with **no state label**): it grounds the request (reads code + a read-only data
+  pull if the repo declares one), rewrites the title/description, stamps the dials, and
+  routes to one outcome — `ready-for-agent`, `needs-mockup`, or `needs-grilling`. Not a
+  tollbooth: it scopes anything it can pin down confidently and holds only an
+  *outcome-changing* fork it can't settle from code/data (ADR 0016).
+
+- **Held issue** — an issue parked at `needs-grilling` or `needs-mockup`: inert to
+  agents until the maintainer replies in a comment (which auto-advances it) or drives it
+  with `/agentflow pickup` (ADR 0019). No builder touches a held issue.
+
+- **Grounding fetch** — a per-repo, **read-only** pull of real data intake runs to check
+  facts before scoping (ciq: `ciq-pull-db` → `ciq.readonly.db`). Declared once in the
+  repo's config; run on-demand, skipped for issues already crisp (ADR 0016).
 
 - **Decide-then-review** — the pipeline's default posture: a stage makes its best
   decision and *stages it under a review gate* instead of asking the human up front.

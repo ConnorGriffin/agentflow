@@ -3,8 +3,8 @@
 Ephemeral hands, single issue (ADR 0011); the persistent daemon and real two-pool
 balancing are M1. For M0 the pair is fixed — Claude builds, Codex reviews — so
 cross-tool independence holds and swapping in the headroom balancer is the M1 change.
-Every issue must carry a `tier:*` label (ADR 0014's hard gate); intake will stamp it
-later, but M0 reads it directly and skips an issue that has none.
+Every ready issue must carry an `agentflow:complexity:*` label (the hard gate,
+ADR 0018) — intake stamps it; the loop reads it and skips an issue that has none.
 """
 
 from __future__ import annotations
@@ -16,10 +16,12 @@ from pathlib import Path
 
 from agentflow import ratchet
 from agentflow.balancer import pick_pair
-from agentflow.gate import MergeDecision, ci_is_green, decide_merge, park, squash_merge
+from agentflow.gate import MAX_REVISES, MergeDecision, ci_is_green, decide_merge, park, squash_merge
+from agentflow.intake import (Intake, IntakeRoute, STATE_LABELS, apply_intake,
+                              awaiting_recheck, replies_since_intake)
 from agentflow.notify import notify
-from agentflow.reviewer import Finding, Reviewer, Verdict
-from agentflow.runner import BuildStatus, BuildTask, Tier, _run
+from agentflow.reviewer import Reviewer, Verdict
+from agentflow.runner import BuildStatus, BuildTask, Complexity, Effort, _run
 
 
 def _pr_url(repo: str, pr: int) -> str:
@@ -44,7 +46,8 @@ def _work_order(repo: str, n: int) -> str | None:
             return c["body"]
     return None
 
-_TIER_LABEL = re.compile(r"^tier:(light|standard|deep)$")
+_COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
+_EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
 
 
@@ -66,13 +69,24 @@ class RepoConfig:
     workdir: str     # local main checkout
 
 
-def tier_from_labels(labels: list[str]) -> Tier | None:
-    """The issue's cost tier from a `tier:<light|standard|deep>` label. Hard gate."""
+def complexity_from_labels(labels: list[str]) -> Complexity | None:
+    """The issue's model-size dial from its `agentflow:complexity:*` label. Hard gate
+    — no build without one (ADR 0018)."""
     for name in labels:
-        m = _TIER_LABEL.match(name)
+        m = _COMPLEXITY_LABEL.match(name)
         if m:
-            return Tier(m.group(1))
+            return Complexity(m.group(1))
     return None
+
+
+def effort_from_labels(labels: list[str]) -> Effort:
+    """The issue's effort dial from its `agentflow:effort:*` label; defaults to
+    `medium` when absent (guidance, not a hard gate — ADR 0018)."""
+    for name in labels:
+        m = _EFFORT_LABEL.match(name)
+        if m:
+            return Effort(m.group(1))
+    return Effort.MEDIUM
 
 
 def slug(title: str) -> str:
@@ -88,6 +102,9 @@ BUILD_PROMPT = """Implement {repo} issue #{n}: {title}
 
 {body}
 
+Effort budget: {effort}. Scope your work to match — don't gold-plate a low-effort
+issue or under-invest a high-effort one.
+
 You are in a fresh worktree on a new branch off origin/main. Implement the change,
 add or update tests, and make the suite green. Commit your work.
 
@@ -95,6 +112,11 @@ Before opening the PR, `git fetch origin` and rebase once onto `origin/main`, th
 rerun the tests. If the rebase conflicts (or tests fail post-rebase for a reason not
 your own), stop and post a comment prefixed `INTEGRATION-COLLISION:` instead of
 forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the body.
+
+Write the PR body for the human who merges it — plain language: what changed, why, and
+what to check. No jargon (ADR 0018). If the change touches a user-facing surface, capture
+before/after screenshots headlessly (Playwright) and attach them to the PR as proof it
+matches the locked mockup.
 
 Keep the change minimal and match the surrounding code. If you hit a blocker you
 cannot safely resolve, post a comment prefixed `MISSING-CONTEXT:` and stop instead
@@ -117,8 +139,51 @@ def _next_ready_issue(cfg: RepoConfig) -> dict | None:
     return issues[0] if issues else None
 
 
+def _next_untriaged_issue(cfg: RepoConfig) -> dict | None:
+    """The oldest open issue carrying none of intake's state labels — the front of
+    the intake queue (ADR 0016)."""
+    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+              "--json", "number,title,body,labels", "--limit", "50"])
+    if r.returncode != 0:
+        return None
+    issues = json.loads(r.stdout or "[]")
+    untriaged = [i for i in issues
+                 if not ({lbl["name"] for lbl in i["labels"]} & set(STATE_LABELS))]
+    return min(untriaged, key=lambda i: i["number"]) if untriaged else None
+
+
 def _builder_worktree(cfg: RepoConfig, tool: str, n: int, sl: str) -> str:
     return str(Path(cfg.workdir) / ".agentflow" / "worktrees" / tool / f"issue-{n}-{sl}")
+
+
+def _launch_revise(builder, cfg: RepoConfig, pr: int, n: int, sl: str,
+                   complexity: Complexity, verdict: Verdict) -> None:
+    """One builder pass addressing the blocking findings on the PR branch (ADR 0020)."""
+    findings = "\n".join(f"- {f.summary}" for f in verdict.blocking) or "- (see review)"
+    builder.launch(REVISE_PROMPT.format(n=pr, findings=findings),
+                   cwd=_builder_worktree(cfg, builder.tool, n, sl),
+                   model=builder.model_for(complexity))
+
+
+def _preserve_progress(cfg: RepoConfig, tool: str, n: int, sl: str) -> str | None:
+    """A stuck build's commits live in its worktree but aren't on GitHub. If there are
+    any, push the branch and open a DRAFT PR so nothing is lost; else None. Returns the
+    draft PR url. Live orchestration, not unit-tested (ADR 0020)."""
+    wt = _builder_worktree(cfg, tool, n, sl)
+    branch = f"agentflow/{tool}/issue-{n}-{sl}"
+    ahead = _run(["git", "-C", wt, "rev-list", "--count", "origin/main..HEAD"])
+    if ahead.returncode != 0 or ahead.stdout.strip() in ("", "0"):
+        return None
+    if _run(["git", "-C", wt, "push", "-u", "origin", branch]).returncode != 0:
+        return None
+    existing = _run(["gh", "pr", "list", "--repo", cfg.repo, "--head", branch,
+                     "--state", "all", "--json", "url", "-q", '.[0].url // ""']).stdout.strip()
+    if existing:
+        return existing
+    r = _run(["gh", "pr", "create", "--repo", cfg.repo, "--draft", "--head", branch,
+              "--title", f"[draft] #{n} — handed back (build did not finish)",
+              "--body", f"> *agentflow: build stopped early; progress saved for you.*\n\nCloses #{n} when finished."])
+    return r.stdout.strip() or None
 
 
 def run_once(cfg: RepoConfig) -> str:
@@ -127,9 +192,11 @@ def run_once(cfg: RepoConfig) -> str:
     if not issue:
         return "no ready-for-agent issues"
     n = issue["number"]
-    tier = tier_from_labels([lbl["name"] for lbl in issue["labels"]])
-    if tier is None:
-        return f"#{n}: skipped — no tier:* label (ADR 0014 hard gate)"
+    labels = [lbl["name"] for lbl in issue["labels"]]
+    complexity = complexity_from_labels(labels)
+    if complexity is None:
+        return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
+    effort = effort_from_labels(labels)
 
     builder, reviewer_runner = pick_pair()   # ADR 0006: more headroom builds; other reviews
     if builder is None:
@@ -143,37 +210,43 @@ def run_once(cfg: RepoConfig) -> str:
             return f"#{n}: guarded repo needs a frozen work order (ADR 0005); none found — skipping"
     else:
         build_prompt = BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
-                                           body=issue.get("body") or "")
-    task = BuildTask(cfg.repo, cfg.workdir, n, sl, tier, prompt=build_prompt)
+                                           body=issue.get("body") or "", effort=effort.value)
+    task = BuildTask(cfg.repo, cfg.workdir, n, sl, complexity, effort, prompt=build_prompt)
     outcome = builder.build(task)
     if outcome.status is not BuildStatus.PR_OPENED:
-        notify("agentflow", f"{cfg.repo} #{n}: build {outcome.status.value}",
-               f"https://github.com/{cfg.repo}/issues/{n}")
-        return f"#{n}: build {outcome.status.value} — {outcome.detail}"
+        # Stuck (a bail marker, or ran with no PR). Preserve the work as a draft PR so
+        # nothing is lost, then hand back to a human (ADR 0020).
+        draft = _preserve_progress(cfg, builder.tool, n, sl)
+        where = f"draft PR {draft}" if draft else "the build session's comment"
+        notify("agentflow needs you", f"{cfg.repo} #{n}: build {outcome.status.value} — {where}",
+               draft or f"https://github.com/{cfg.repo}/issues/{n}")
+        return f"#{n}: build {outcome.status.value} — {outcome.detail}; progress in {where}"
 
     pr = pr_number(outcome.pr_url)
     head_branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
-    if reviewer_runner is None:
-        # Single-tool fallback (ADR 0003): no independent reviewer — never auto-merge.
-        park(cfg.repo, pr, Verdict(clean=False, parsed=False,
-             findings=(Finding("blocking", "no independent cross-tool reviewer available"),)))
-        notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked — single-tool",
-               _pr_url(cfg.repo, pr))
-        return f"#{n}: built PR #{pr}; parked — only one pool had headroom"
+    # Prefer cross-tool; if only one tool is free, review same-tool rather than stall
+    # (ADR 0020). Same-tool never auto-merges — decide_merge parks it.
+    reviewer_runner = reviewer_runner or builder
     reviewer = Reviewer(reviewer_runner)
     acceptance = issue.get("body") or ""
 
     if profile != "autonomous":
-        # reviewed / guarded: one cross-tool review, then a HUMAN merges (ADR 0002).
-        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, tier, acceptance=acceptance)
-        park(cfg.repo, pr, verdict, reason=f"is a `{profile}` repo — reviewed; a human merges")
-        notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
-               _pr_url(cfg.repo, pr))
-        return f"#{n}: PR #{pr} reviewed ({profile}) — awaiting human merge"
+        # reviewed / guarded: revise until the review is clean (or we bail), then a
+        # HUMAN merges (ADR 0002, 0020) — hand over a clean PR when we can.
+        revises_used = 0
+        while True:
+            verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity, acceptance=acceptance)
+            if verdict.clean or not (verdict.parsed and verdict.blocking) or revises_used >= MAX_REVISES:
+                park(cfg.repo, pr, verdict, reason=f"is a `{profile}` repo — a human merges")
+                notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
+                       _pr_url(cfg.repo, pr))
+                return f"#{n}: PR #{pr} reviewed ({profile}) — awaiting human merge"
+            _launch_revise(builder, cfg, pr, n, sl, complexity, verdict)
+            revises_used += 1
 
     revises_used = 0
     while True:
-        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, tier, acceptance=acceptance)
+        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity, acceptance=acceptance)
         decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
                                 reviewer_tool=reviewer_runner.tool, builder_tool=builder.tool,
                                 revises_used=revises_used)
@@ -189,15 +262,56 @@ def run_once(cfg: RepoConfig) -> str:
             notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",
                    _pr_url(cfg.repo, pr))
             return f"#{n}: parked PR #{pr} for human review"
-        # REVISE — one builder pass on the PR branch, then re-review (ADR 0004).
-        findings = "\n".join(f"- {f.summary}" for f in verdict.blocking) or "- (see review)"
-        builder.launch(REVISE_PROMPT.format(n=pr, findings=findings),
-                       cwd=_builder_worktree(cfg, builder.tool, n, sl),
-                       model=builder.model_for(tier))
+        _launch_revise(builder, cfg, pr, n, sl, complexity, verdict)
         revises_used += 1
 
 
-if __name__ == "__main__":  # M0 entrypoint — the sandbox dogfood target
+def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
+    """A `needs-grilling` issue whose latest comment is the maintainer's reply — return
+    it with their answer text so intake can resolve it (ADR 0019). `needs-mockup` resumes
+    via `/agentflow mockup`, not an unattended re-triage."""
+    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+              "--label", "agentflow:needs-grilling", "--json", "number,title,body,labels",
+              "--limit", "50"])
+    if r.returncode != 0:
+        return None
+    for issue in sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"]):
+        cr = _run(["gh", "issue", "view", str(issue["number"]), "--repo", cfg.repo, "--json", "comments"])
+        if cr.returncode != 0:
+            continue
+        comments = json.loads(cr.stdout or "{}").get("comments", [])
+        if awaiting_recheck(comments):
+            return issue, replies_since_intake(comments)
+    return None
+
+
+def intake_once(cfg: RepoConfig) -> str:
+    """Triage the next issue: a held issue the maintainer just answered (resume, ADR
+    0019) or the oldest un-triaged one (ADR 0016). Ground, route, write to GitHub."""
+    resumable = _next_resumable_issue(cfg)
+    issue, extra = resumable if resumable else (_next_untriaged_issue(cfg), "")
+    if not issue:
+        return "no un-triaged issues"
+    n = issue["number"]
+    builder, _ = pick_pair()   # intake needs one available tool, not a pair
+    if builder is None:
+        return f"#{n}: no pool has headroom for intake — deferring"
+    result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
+    current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
+    summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
+    if result.route in (IntakeRoute.GRILL, IntakeRoute.MOCKUP):
+        notify("agentflow needs you", f"{cfg.repo} #{n}: {result.route.value}",
+               f"https://github.com/{cfg.repo}/issues/{n}")
+    return f"#{n}: {summary}{' (resumed)' if extra else ''}"
+
+
+def pipeline_once(cfg: RepoConfig) -> str:
+    """One full pass for a repo: triage one un-triaged issue, then build one ready
+    issue (ADR 0016 — intake runs ahead of the build queue)."""
+    return f"intake: {intake_once(cfg)} · build: {run_once(cfg)}"
+
+
+if __name__ == "__main__":  # entrypoint — the sandbox dogfood target
     cfg = RepoConfig(repo="ConnorGriffin/agentflow-sandbox",
                      workdir=str(Path.home() / "Code" / "ConnorGriffin" / "agentflow-sandbox"))
-    print(run_once(cfg))
+    print(pipeline_once(cfg))

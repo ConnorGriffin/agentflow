@@ -1,11 +1,17 @@
-from agentflow.dashboard_data import _tier_of, pr_stage
+from agentflow.dashboard_data import _complexity_of, _effort_of, pr_stage
 
 
-def test_tier_of_labels():
-    assert _tier_of([{"name": "ready-for-agent"}, {"name": "tier:light"}]) == "light"
-    assert _tier_of([{"name": "tier:deep"}]) == "deep"
-    assert _tier_of([{"name": "bug"}]) is None
-    assert _tier_of([]) is None
+def test_complexity_of_labels():
+    assert _complexity_of([{"name": "ready-for-agent"},
+                           {"name": "agentflow:complexity:standard"}]) == "standard"
+    assert _complexity_of([{"name": "agentflow:complexity:deep"}]) == "deep"
+    assert _complexity_of([{"name": "bug"}]) is None
+    assert _complexity_of([]) is None
+
+
+def test_effort_of_labels():
+    assert _effort_of([{"name": "agentflow:effort:extra"}]) == "extra"
+    assert _effort_of([{"name": "bug"}]) is None
 
 
 def test_pr_stage_from_branch():

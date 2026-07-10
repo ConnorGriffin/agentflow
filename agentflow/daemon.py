@@ -1,8 +1,9 @@
 """The persistent orchestrator daemon (ADR 0011) — brain persistent, hands ephemeral.
 
-Polls for `ready-for-agent` work and runs one issue per cycle through the pipeline
-(`loop.run_once`, which balances the pool per ADR 0006 and spawns an ephemeral
-worktree session per issue). Properties:
+Polls each repo and runs one full pass per cycle through the pipeline
+(`loop.pipeline_once`: triage one un-triaged issue, then build one ready issue —
+balancing the pool per ADR 0006 and spawning an ephemeral worktree session).
+Properties:
 
 - **Dormant by default** — does nothing unless the enable flag exists, so it can be
   stopped instantly (`rm ~/.agentflow/enabled`). ADR 0011's kill switch.
@@ -24,7 +25,7 @@ import os
 import time
 from pathlib import Path
 
-from agentflow.loop import RepoConfig, run_once
+from agentflow.loop import RepoConfig, pipeline_once
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 ENABLE_FLAG = STATE_DIR / "enabled"
@@ -38,6 +39,8 @@ REPOS = [
                os.path.expanduser("~/Code/ConnorGriffin/agentflow-sandbox")),
     RepoConfig("ConnorGriffin/home-depot-location-probe",
                os.path.expanduser("~/Code/ConnorGriffin/home-depot-location-probe")),
+    RepoConfig("ConnorGriffin/ciq-autotune",  # guarded: medical/PHI, human merges
+               os.path.expanduser("~/Code/ConnorGriffin/ciq-autotune")),
     RepoConfig("ConnorGriffin/agentflow",  # dogfood: the engine in its own fleet
                os.path.expanduser("~/Code/ConnorGriffin/agentflow")),
 ]
@@ -47,7 +50,7 @@ def log(msg: str) -> None:
     print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} agentflow: {msg}", flush=True)
 
 
-def cycle(repos: list[RepoConfig], run=run_once, _log=log) -> None:
+def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
     """One pass over the repos. Each is isolated: an error in one never stops the rest."""
     for cfg in repos:
         try:
