@@ -98,6 +98,16 @@ def pr_number(url: str) -> int:
     return int(url.rstrip("/").rsplit("/", 1)[-1])
 
 
+_BRANCH_ISSUE_RE = re.compile(r"^agentflow/[^/]+/issue-(\d+)-")
+
+
+def issue_of_branch(branch: str) -> int | None:
+    """The issue number an agentflow PR branch is working, or None. Pure — the signal
+    that an agent already owns an issue (dispatch dedup, beyond ADR 0009's merge floor)."""
+    m = _BRANCH_ISSUE_RE.match(branch or "")
+    return int(m.group(1)) if m else None
+
+
 BUILD_PROMPT = """Implement {repo} issue #{n}: {title}
 
 {body}
@@ -129,13 +139,28 @@ Blocking findings:
 {findings}"""
 
 
+def _issues_in_flight(cfg: RepoConfig) -> set[int]:
+    """Issues that already have an OPEN agentflow PR — an agent is on them, so don't
+    re-dispatch a duplicate. Dispatch dedup, distinct from ADR 0009's merge-time floor:
+    an issue stays `ready-for-agent` while its PR is in review, so without this the loop
+    would re-build it every cycle (a second PR on a different tool)."""
+    r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
+              "--json", "headRefName", "--limit", "100"])
+    if r.returncode != 0:
+        return set()
+    return {n for pr in json.loads(r.stdout or "[]")
+            if (n := issue_of_branch(pr.get("headRefName", ""))) is not None}
+
+
 def _next_ready_issue(cfg: RepoConfig) -> dict | None:
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--label", "ready-for-agent", "--json", "number,title,body,labels",
               "--limit", "50"])
     if r.returncode != 0:
         return None
-    issues = sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"])
+    in_flight = _issues_in_flight(cfg)   # skip issues an agent already owns
+    issues = sorted((i for i in json.loads(r.stdout or "[]") if i["number"] not in in_flight),
+                    key=lambda i: i["number"])
     return issues[0] if issues else None
 
 
