@@ -3,8 +3,8 @@ proven by the first live run; these are the parsing bits that must be exact."""
 
 import pytest
 
-from agentflow.loop import (complexity_from_labels, effort_from_labels, pr_number,
-                            repo_profile, slug)
+from agentflow.loop import (_free_to_dispatch, complexity_from_labels, effort_from_labels,
+                            issue_of_branch, pr_number, repo_profile, slug)
 from agentflow.runner import Complexity, Effort
 
 
@@ -45,6 +45,26 @@ def test_slug_truncates_to_40():
 def test_pr_number_from_url():
     assert pr_number("https://github.com/o/r/pull/42") == 42
     assert pr_number("https://github.com/o/r/pull/42/") == 42
+
+
+def test_issue_of_branch_identifies_the_owned_issue():
+    # an open agentflow PR on this branch means issue N is already being worked
+    assert issue_of_branch("agentflow/codex/issue-2-harden-and-deploy") == 2
+    assert issue_of_branch("agentflow/claude/issue-42-foo-bar") == 42
+
+
+def test_issue_of_branch_is_none_for_non_agentflow_branches():
+    assert issue_of_branch("some-human-branch") is None
+    assert issue_of_branch("agentflow/codex/no-issue-marker") is None
+    assert issue_of_branch("") is None
+
+
+def test_free_to_dispatch_skips_claimed_or_in_flight():
+    ready = {"number": 5, "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    assert _free_to_dispatch(ready, set()) is True
+    assert _free_to_dispatch(ready, {5}) is False   # an open agentflow PR already owns it
+    claimed = {"number": 6, "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}]}
+    assert _free_to_dispatch(claimed, set()) is False   # claimed — an agent is building it
 
 
 def test_repo_profile_reads_the_dial(tmp_path):
