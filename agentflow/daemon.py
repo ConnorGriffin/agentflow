@@ -31,9 +31,14 @@ ENABLE_FLAG = STATE_DIR / "enabled"
 LOCK = STATE_DIR / "daemon.lock"
 POLL_SECONDS = int(os.environ.get("AGENTFLOW_POLL_SECONDS", "300"))
 
-# One repo per entry. M1 target = the sandbox; extend as repos are enrolled.
-REPOS = [RepoConfig("ConnorGriffin/agentflow-sandbox",
-                    os.path.expanduser("~/Code/ConnorGriffin/agentflow-sandbox"))]
+# One repo per entry; extend as repos are enrolled (each needs an AGENTS.md
+# `profile:` line, ready-for-agent + tier:* labels, and PR CI).
+REPOS = [
+    RepoConfig("ConnorGriffin/agentflow-sandbox",
+               os.path.expanduser("~/Code/ConnorGriffin/agentflow-sandbox")),
+    RepoConfig("ConnorGriffin/home-depot-location-probe",
+               os.path.expanduser("~/Code/ConnorGriffin/home-depot-location-probe")),
+]
 
 
 def log(msg: str) -> None:
