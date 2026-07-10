@@ -124,9 +124,10 @@ your own), stop and post a comment prefixed `INTEGRATION-COLLISION:` instead of
 forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the body.
 
 Write the PR body for the human who merges it — plain language: what changed, why, and
-what to check. No jargon (ADR 0018). If the change touches a user-facing surface, capture
-before/after screenshots headlessly (Playwright) and attach them to the PR as proof it
-matches the locked mockup.
+what to check, in the app's own domain terms. No jargon: no file/function/test names or
+CSS/API specifics (ADR 0018). If the change touches a user-facing surface, you MUST attach
+before/after screenshots (headless Playwright) as proof it matches the locked mockup — the
+cross-review blocks a UI PR that has none. Both are charter gates, not style points.
 
 Keep the change minimal and match the surrounding code. If you hit a blocker you
 cannot safely resolve, post a comment prefixed `MISSING-CONTEXT:` and stop instead

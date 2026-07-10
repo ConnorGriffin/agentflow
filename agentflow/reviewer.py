@@ -155,12 +155,20 @@ The issue's acceptance criteria — judge against THIS, not your own wishlist:
 {acceptance}
 ---
 
-First, prove you looked: run `gh pr view {pr} --json headRefOid` and `gh pr diff {pr}`.
+First, prove you looked: run `gh pr view {pr} --json headRefOid,files,body` and
+`gh pr diff {pr}`. If any changed file is under a user-facing surface (e.g. `frontend/`),
+also run `gh pr view {pr} --json comments` to check for attached screenshots. Judge the
+PR as a merge-ready artifact — its body and evidence, not only its diff.
 
 BLOCKING (only these):
 - a real bug or security hole that breaks a stated acceptance criterion, or
-- a violation of the engineering charter in your instructions (a shallow module, an
-  unmocked UI surface, or an interface you cannot test through).
+- a violation of the engineering charter in your instructions:
+  - a shallow module, an unmocked UI surface, or an interface you cannot test through;
+  - a **PR body not framed for the human who merges** — it leans on file / function /
+    test names or CSS / API specifics instead of plain app behavior (ADR 0018);
+  - a **user-facing change with no screenshot** — any PR whose files touch a
+    user-facing surface (e.g. `frontend/`) must attach before/after screenshots, in
+    the body or a comment; none is a blocking gap (ADR 0018). Backend-only PRs need none.
 A correctness gap BEYOND the stated acceptance — an unhandled case the issue did not
 ask for — is a NIT, not blocking; note it so it can be filed as a follow-up.
 Style, naming, and minor perf are nits.

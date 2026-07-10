@@ -23,6 +23,19 @@ Standards every app built in the agentflow flow must meet. Read by **both** tool
 
 - Any user-facing surface goes through **`/ui-mockups` to a *locked* visual spec**
   before it is implemented. No ad-hoc UI.
+- A PR that changes a user-facing surface **attaches before/after screenshots**
+  (headless Playwright) as proof-of-match to the locked spec — the unattended
+  stand-in for a live demo ([ADR 0018](docs/adr/0018-two-dials-review-by-evidence.md)).
+  A UI change with no screenshot is a **blocking** gap, not a nit.
+
+## The pull request — framed for the human who merges
+
+- **The PR body is written for whoever merges it, in plain language:** what changed,
+  why, and what to check — in the app's own domain terms (**`CONTEXT.md`**), not the
+  implementation. The PR already *is* the diff; don't narrate it in code.
+- **No jargon** ([ADR 0018](docs/adr/0018-two-dials-review-by-evidence.md)): a body
+  that leans on file / function / test names or CSS / API specifics instead of app
+  behavior can't be merged at a glance — that's a **blocking** gap, not a nit.
 
 ## Testing — through the interface
 

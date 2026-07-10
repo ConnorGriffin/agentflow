@@ -3,7 +3,7 @@ proven by the first live run; these are the parsing bits that must be exact."""
 
 import pytest
 
-from agentflow.loop import (_free_to_dispatch, _untriaged, complexity_from_labels,
+from agentflow.loop import (BUILD_PROMPT, _free_to_dispatch, _untriaged, complexity_from_labels,
                             effort_from_labels, issue_of_branch, pr_number, repo_profile, slug)
 from agentflow.runner import Complexity, Effort
 
@@ -89,3 +89,13 @@ def test_repo_profile_prefers_agents_md_then_claude(tmp_path):
 def test_repo_profile_defaults_reviewed_when_absent(tmp_path):
     # ADR 0002 safe default — never auto-merge a repo that didn't opt in.
     assert repo_profile(str(tmp_path)) == "reviewed"
+
+
+def test_build_prompt_formats_and_tells_the_builder_the_pr_gates():
+    # Formatted before every build (loop.py: dispatch). Guards the bracing and keeps the
+    # builder's marching orders in step with what cross-review now blocks on (ADR 0018),
+    # so a UI build self-complies instead of bouncing off the gate.
+    body = BUILD_PROMPT.format(repo="o/r", n=7, title="Do a thing", body="details", effort="medium")
+    assert "o/r" in body and "#7" in body and "Do a thing" in body
+    assert "screenshot" in body.lower()   # UI-change evidence gate
+    assert "jargon" in body.lower()        # plain-language gate
