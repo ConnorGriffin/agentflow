@@ -52,6 +52,32 @@ def test_prose_then_fenced_json_is_parsed():
     assert parse_intake(payload).route is IntakeRoute.GRILL
 
 
+def test_prose_then_bare_json_object_is_recovered():
+    # The real dry-run failure: the model reasons, then emits a bare (unfenced) JSON
+    # object with \n-escaped body. parse must recover the decision, not choke on prose.
+    payload = ("The premise doesn't hold - truncate already exists.\n\n"
+               "It shipped in #4 with tests, so there is nothing to build.\n\n"
+               '{"route": "grill", "title": "truncate: clarify the cap", '
+               '"body": "> *agentflow intake*\\n\\n**Already built.** Which did you mean?"}')
+    v = parse_intake(payload)
+    assert v.route is IntakeRoute.GRILL and v.parsed
+    assert "Already built" in v.body and v.title.startswith("truncate")
+
+
+def test_prose_then_json_ready_recovers_dials():
+    payload = ('Grounded against the code; a clean add.\n'
+               '{"route":"ready","body":"## Brief","complexity":"deep","effort":"high"}')
+    v = parse_intake(payload)
+    assert v.route is IntakeRoute.READY and v.complexity is Complexity.DEEP and v.effort is Effort.HIGH
+
+
+def test_last_json_object_wins_over_an_example_in_prose():
+    payload = ('For example I might answer {"route": "ready", "body": "x"} but actually\n'
+               '{"route": "grill", "body": "the real question"}')
+    v = parse_intake(payload)
+    assert v.route is IntakeRoute.GRILL and v.body == "the real question"
+
+
 # fail-safe: whatever the input, intake never raises and never invents a `ready`
 @pytest.mark.parametrize("payload", ["", "null", "5", "not json", '{"route": 5}',
                                      '{"route": "ready"}', '{"body": "x"}', '{"route"}'])
