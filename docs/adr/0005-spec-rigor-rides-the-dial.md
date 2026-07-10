@@ -1,6 +1,6 @@
 # ADR 0005 — Spec rigor rides the dial: self-scoped brief vs frozen work order
 
-- Status: Accepted
+- Status: Accepted (mechanism amended by [ADR 0022](0022-one-build-input-and-the-build-verb.md))
 - Date: 2026-07-09
 
 ## Context
@@ -53,3 +53,13 @@ confidently is not safer, it's more convincing.
 - The gap/marker protocol is preserved as a **per-level safety**, not a
   Codex-specific cage — any builder at `guarded` obeys it.
 - The heavy work-order authoring cost is now paid only where domain risk earns it.
+
+## Amendment (2026-07-10) — the grounding rides in the Brief, not a separate comment
+
+[ADR 0022](0022-one-build-input-and-the-build-verb.md) unifies the build input to the
+**Agent Brief** for every profile. This decision's *intent* is unchanged — a guarded
+issue's domain grounding (frozen literals, fixtures, file allow-list, named invariant
+tests) is still pre-decided before the issue is buildable, and the gap-marker protocol
+still holds. What changes is the **vessel**: that grounding now lives *in the guarded
+Brief* (a heavier version of the same write-up every issue gets), not in a separate
+frozen work-order comment. `loop.run_once` no longer requires `_work_order` for guarded.

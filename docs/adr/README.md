@@ -56,3 +56,6 @@ then Context / Decision / Alternatives / Consequences.
 - [0021](0021-dispatch-dedup-build-claim.md) — Dispatch dedup: claim an issue before
   building (`agentflow:building`) and before triaging (`agentflow:triaging`) it; lock
   heartbeat keeps single-instance sound.
+- [0022](0022-one-build-input-and-the-build-verb.md) — One build input (the Agent Brief)
+  for every profile; `build <N>` triggers a ready issue by hand; personal `/go` +
+  `/work-order` retired (amends 0005's mechanism).
