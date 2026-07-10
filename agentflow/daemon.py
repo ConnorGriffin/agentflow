@@ -9,7 +9,10 @@ Properties:
   stopped instantly (`rm ~/.agentflow/enabled`). ADR 0011's kill switch.
 - **Crash-tolerant** — each cycle is independent; an exception is logged and the loop
   continues. State of record is GitHub, so a restart loses nothing.
-- **Single instance** — a lock dir prevents overlapping runs; a stale lock is reclaimed.
+- **Single instance** — a lock dir prevents overlapping runs; the running daemon
+  heartbeats the lock each cycle so it is never seen as stale, and only a genuinely
+  stale lock (from a crashed run) is reclaimed. Single-instance is load-bearing:
+  dispatch dedup (the `agentflow:building` claim) assumes one daemon.
 
 M1 is serial (one issue per repo per cycle). Concurrent dispatch across pools
 (ADR 0006) is a later refinement — not a silent cap.
@@ -78,16 +81,20 @@ def main() -> None:
         log("another daemon is running; exiting")
         return
     log(f"daemon up — enable={ENABLE_FLAG}, poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}")
-    reclaimed = False
     try:
         while True:
+            # Heartbeat the lock so a *healthy* daemon is never seen as stale — else a
+            # second daemon reclaims the (frozen-mtime) lock, runs concurrently, and its
+            # reclaim clears this daemon's live build claim → a duplicate build. The lock
+            # is what makes dispatch dedup's single-instance assumption actually hold.
+            os.utime(LOCK, None)
             if ENABLE_FLAG.exists():
-                if not reclaimed:  # one-time: clear build claims orphaned by a prior crash
-                    for cfg in REPOS:
-                        cleared = reclaim_claims(cfg)
-                        if cleared:
-                            log(f"{cfg.repo}: reclaimed {cleared} stale build claim(s)")
-                    reclaimed = True
+                # Self-heal build claims stranded by a crash or a swallowed `gh` release,
+                # every cycle (serial builds mean none is live at the top of a cycle).
+                for cfg in REPOS:
+                    cleared = reclaim_claims(cfg)
+                    if cleared:
+                        log(f"{cfg.repo}: reclaimed {cleared} stale build claim(s)")
                 cycle(REPOS)
             else:
                 log(f"dormant (no {ENABLE_FLAG}); sleeping")
