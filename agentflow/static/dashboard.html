@@ -357,7 +357,7 @@ function renderRail(snap, nowMs){
   const queueHtml = queue.length ? queue.map((q, i) =>
     `<div class="mrow ${i === 0 ? 'first' : ''}"><span class="num">#${q.number}</span>
       <span class="t">${esc(q.title)}</span>
-      ${q.tier ? `<span class="qtier">${esc(q.tier)}</span>` : ''}
+      ${q.complexity ? `<span class="qtier">${esc(q.complexity)}</span>` : ''}
       <span class="rp">${esc(short(q.repo))}</span></div>`).join('')
     : '<div class="mrow first" style="color:var(--muted)">queue empty — file ready-for-agent issues</div>';
 
