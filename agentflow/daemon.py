@@ -38,6 +38,8 @@ REPOS = [
                os.path.expanduser("~/Code/ConnorGriffin/agentflow-sandbox")),
     RepoConfig("ConnorGriffin/home-depot-location-probe",
                os.path.expanduser("~/Code/ConnorGriffin/home-depot-location-probe")),
+    RepoConfig("ConnorGriffin/agentflow",  # dogfood: the engine in its own fleet
+               os.path.expanduser("~/Code/ConnorGriffin/agentflow")),
 ]
 
 

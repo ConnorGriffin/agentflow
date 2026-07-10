@@ -145,6 +145,7 @@
   .mrow .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
   .mrow .ago{color:var(--muted);flex:none;font-size:11px}
   .mrow .rp{color:var(--muted);flex:none;font-size:11px}
+  .qtier{font-size:10px;color:var(--muted);border:1px solid var(--border);border-radius:20px;padding:0 6px;flex:none}
 
   @media (prefers-reduced-motion: reduce){
     *{transition:none !important; animation:none !important}
@@ -350,11 +351,23 @@ function renderRail(snap, nowMs){
       <span class="ago">${rel(m.merged_at, nowMs)}</span>
     </div>`).join('') || '<div class="mrow first" style="color:var(--muted)">none yet</div>';
 
+  // ready-for-agent queue across the fleet — the open issues waiting to be built
+  const queue = [];
+  for (const r of snap.repos) for (const q of (r.ready || [])) queue.push({ ...q, repo: r.repo });
+  const queueHtml = queue.length ? queue.map((q, i) =>
+    `<div class="mrow ${i === 0 ? 'first' : ''}"><span class="num">#${q.number}</span>
+      <span class="t">${esc(q.title)}</span>
+      ${q.tier ? `<span class="qtier">${esc(q.tier)}</span>` : ''}
+      <span class="rp">${esc(short(q.repo))}</span></div>`).join('')
+    : '<div class="mrow first" style="color:var(--muted)">queue empty — file ready-for-agent issues</div>';
+
   document.getElementById('rail').innerHTML = `
     <div class="block">
       <h3>Pools <span class="h3sub">rate-limit headroom</span></h3>${pools}</div>
     <div class="block">
       <h3>Fleet <span class="h3sub">${snap.repos.length} repos</span></h3>${fleet}</div>
+    <div class="block">
+      <h3>Queue <span class="h3sub">${queue.length} ready for agent</span></h3>${queueHtml}</div>
     <div class="block">
       <h3>Just merged <span class="h3sub">audit feed</span></h3>${feed}</div>`;
 }

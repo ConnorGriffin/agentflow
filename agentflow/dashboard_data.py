@@ -46,10 +46,33 @@ def _prs(repo: str, state: str) -> list[dict]:
         return []
 
 
+def _tier_of(labels: list[dict]) -> str | None:
+    for lbl in labels:
+        n = lbl.get("name", "")
+        if n.startswith("tier:"):
+            return n.split(":", 1)[1]
+    return None
+
+
+def _ready_issues(repo: str) -> list[dict]:
+    """Open issues labeled ready-for-agent — the queue waiting to be built."""
+    r = _run(["gh", "issue", "list", "--repo", repo, "--state", "open",
+              "--label", "ready-for-agent", "--json", "number,title,labels", "--limit", "20"])
+    if r.returncode != 0:
+        return []
+    try:
+        issues = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        return []
+    return [{"number": i["number"], "title": i["title"], "tier": _tier_of(i["labels"])}
+            for i in issues]
+
+
 def repo_view(cfg: RepoConfig) -> dict:
     return {
         "repo": cfg.repo,
         "profile": repo_profile(cfg.workdir),
+        "ready": _ready_issues(cfg.repo),
         "in_flight": [{"number": p["number"], "title": p["title"],
                        "builder": pr_stage(p.get("headRefName", ""))}
                       for p in _prs(cfg.repo, "open")],
