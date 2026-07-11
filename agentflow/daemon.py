@@ -58,6 +58,8 @@ REPOS = [
                os.path.expanduser("~/Code/ConnorGriffin/ciq-autotune")),
     RepoConfig("ConnorGriffin/agentflow",  # dogfood: the engine in its own fleet
                os.path.expanduser("~/Code/ConnorGriffin/agentflow")),
+    RepoConfig("ConnorGriffin/homelab",  # reviewed: manual deploy, live DNS/tailnet
+               os.path.expanduser("~/Code/ConnorGriffin/homelab")),
 ]
 
 
