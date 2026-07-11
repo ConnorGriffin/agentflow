@@ -7,11 +7,12 @@ import pytest
 
 from agentflow import loop
 from agentflow.intake import IntakeRoute
-from agentflow.loop import (BUILD_PROMPT, REVISE_PROMPT, RepoConfig, _build_review_merge,
-                            _free_to_dispatch, _issues_in_flight, _next_ready_issue, _untriaged,
-                            build_issue, complexity_from_labels, effort_from_labels,
-                            held_build_result, issue_of_branch, pr_number, reclaim_claims,
-                            repo_profile, slug, ui_surfaces)
+from agentflow.loop import (BUILD_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, RepoConfig,
+                            _build_review_merge, _free_to_dispatch, _issues_in_flight,
+                            _next_pr_awaiting_reply, _next_ready_issue, _untriaged, build_issue,
+                            complexity_from_labels, effort_from_labels, held_build_result,
+                            issue_of_branch, pr_number, reclaim_claims, repo_profile,
+                            respond_once, slug, ui_surfaces)
 from agentflow.reviewer import Verdict
 from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
 
@@ -329,3 +330,70 @@ def test_reviewed_path_parks_a_screenshotless_ui_change_on_the_gate(monkeypatch)
                              Complexity.STANDARD, Effort.MEDIUM, _Builder(),
                              reviewer_runner, "reviewed", "prompt")
     assert "screenshot" in parked["reason"].lower()
+
+
+# --- issue #18: answering maintainer comments on parked PRs ---------------------
+
+_PARK = "> *agentflow: parked for human review.*\n\nfindings"
+_MAINT = "Show me a screenshot please?"
+
+
+def _pr_gh(monkeypatch, prs, comments_by_pr):
+    """Route loop._run's `gh pr list` / `gh pr view <n>` at canned payloads."""
+    def fake_run(argv):
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _FakeRun(json.dumps(prs))
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _FakeRun(json.dumps({"comments": comments_by_pr.get(int(argv[3]), [])}))
+        return _FakeRun("")
+    monkeypatch.setattr(loop, "_run", fake_run)
+
+
+def test_next_pr_awaiting_reply_picks_the_unanswered_one(monkeypatch):
+    prs = [{"number": 7, "headRefName": "agentflow/claude/issue-3-do-thing"},
+           {"number": 8, "headRefName": "agentflow/codex/issue-4-other"}]
+    comments = {7: [{"body": _PARK}],                     # our marker last — answered
+                8: [{"body": _PARK}, {"body": _MAINT}]}   # maintainer last — pending
+    _pr_gh(monkeypatch, prs, comments)
+    assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (8, "agentflow/codex/issue-4-other", _MAINT)
+
+
+def test_next_pr_awaiting_reply_ignores_human_branches(monkeypatch):
+    # A maintainer's own branch is not an agentflow PR — never spawn a responder on it.
+    prs = [{"number": 9, "headRefName": "my-hotfix"}]
+    _pr_gh(monkeypatch, prs, {9: [{"body": _MAINT}]})
+    assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) is None
+
+
+def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
+    # The responder's contract: a marker-prefixed reply, same branch, never a merge and
+    # never a new PR. Fails first if respond_once touches squash_merge or opens a PR.
+    prs = [{"number": 8, "headRefName": "agentflow/claude/issue-4-other"}]
+    _pr_gh(monkeypatch, prs, {8: [{"body": _PARK}, {"body": _MAINT}]})
+    monkeypatch.setattr(loop, "_checkout_pr_branch", lambda cfg, branch, wt: True)
+
+    launched = {}
+
+    class _FakeRunner:
+        tool = "claude"
+        def provision(self, wt): pass
+        def model_for(self, c): return "opus"
+        def launch(self, prompt, cwd, model):
+            launched["prompt"] = prompt
+            return True, "replied"
+        def build(self, task): pytest.fail("responder must never build/open a PR")
+
+    monkeypatch.setattr(loop, "pick_pair", lambda: (_FakeRunner(), None))
+    monkeypatch.setattr(loop, "squash_merge", lambda *a: pytest.fail("responder must never merge"))
+
+    out = respond_once(RepoConfig("o/r", "/tmp"))
+    assert "8" in out and "maintainer" in out.lower()
+    assert _MAINT in launched["prompt"]              # answers what was asked
+    assert "same branch" in launched["prompt"].lower()   # pushes fixes to the PR branch
+
+
+def test_respond_once_noop_when_nothing_pending(monkeypatch):
+    _pr_gh(monkeypatch, [{"number": 7, "headRefName": "agentflow/claude/issue-3-x"}],
+           {7: [{"body": _PARK}]})   # our marker had the last word
+    monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))
+    assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"

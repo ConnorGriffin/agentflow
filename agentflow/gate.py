@@ -29,18 +29,59 @@ class MergeDecision(str, Enum):
 # looping forever (ADR 0020; was a single round under ADR 0004).
 MAX_REVISES = 2
 
+# Every agentflow comment on a PR (the park notice, a build-agent reply) carries this
+# marker in its disclaimer, so we can tell our own comments from the maintainer's — the
+# same discipline intake uses on issues (INTAKE_MARK). The bot posts as the maintainer,
+# so we key on the marker, not authorship.
+PR_MARK = "agentflow:"
+
+
+def reply_pending(comments: list[dict]) -> bool:
+    """True when a PR's most recent non-empty comment is the maintainer's — an open
+    question from the human who merges, still unanswered. False when our own marker had
+    the last word (a park notice or an earlier reply), or there are no comments. Pure
+    (test surface).
+
+    On an `autonomous` repo this BLOCKS auto-merge: nothing merges while a maintainer
+    question hangs (issue #18). Mirrors intake's `awaiting_recheck`, keyed on our marker."""
+    for c in reversed(comments):
+        body = c.get("body", "").strip()
+        if not body:
+            continue
+        return PR_MARK not in body
+    return False
+
+
+def maintainer_comment(comments: list[dict]) -> str:
+    """The maintainer's comment text since our last PR marker — what the responder must
+    answer. Pure (test surface)."""
+    tail = []
+    for c in reversed(comments):
+        if PR_MARK in c.get("body", ""):
+            break
+        body = c.get("body", "").strip()
+        if body:
+            tail.append(body)
+    return "\n\n".join(reversed(tail))
+
 
 def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,
                  builder_tool: str, revises_used: int,
-                 ui_evidence_missing: bool = False) -> MergeDecision:
+                 ui_evidence_missing: bool = False,
+                 reply_pending: bool = False) -> MergeDecision:
     """Pure. Merge only on independent review + green CI + clean verdict — and never
-    when a change to a declared UI surface carries no screenshot.
+    when a change to a declared UI surface carries no screenshot, nor over an
+    unanswered maintainer question on the PR (issue #18).
 
     `ui_evidence_missing` is the mechanical UI-evidence gate (ADR 0018): it is decided
     from the diff and the PR's attachments, NOT from the review verdict, so a reviewer
     who waves a screenshot-less UI change through as "not blocking" cannot clear it.
     A missing screenshot parks for a human rather than churning revises — the builder
     was already told to attach one."""
+    if reply_pending:
+        # An open question from the human who merges blocks auto-merge until the
+        # responder addresses it — a reply, not a merge, is the next move.
+        return MergeDecision.PARK
     independent = bool(reviewer_tool) and reviewer_tool != builder_tool
     if not independent:
         # ADR 0003: a same-tool / missing review never auto-merges.

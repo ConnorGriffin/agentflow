@@ -10,8 +10,8 @@ import time
 import pytest
 
 import agentflow.gate as gate
-from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
-                            has_image_evidence, touches_ui_surface)
+from agentflow.gate import (MergeDecision, ci_is_green, decide_merge, has_image_evidence,
+                            maintainer_comment, reply_pending, touches_ui_surface)
 from agentflow.reviewer import Finding, Verdict
 
 CLEAN = Verdict(clean=True)
@@ -136,3 +136,42 @@ class TestHasImageEvidence:
 
     def test_prose_only_body_has_no_image(self):
         assert not has_image_evidence("This changes the dashboard layout. Looks great.")
+
+
+# --- issue #18: an unanswered maintainer comment blocks auto-merge --------------
+
+_PARK = {"body": "> *agentflow: parked for human review.*\n\nfindings..."}
+_REPLY = {"body": "> *agentflow: reply from the build agent.*\n\nhere's the screenshot"}
+_MAINT = {"body": "Show me a screenshot please?"}
+
+
+def test_unanswered_maintainer_comment_blocks_merge():
+    # The whole point of #18: an otherwise-perfect PR still must NOT auto-merge while the
+    # human who merges has an open question. Fails first if the block isn't wired in.
+    assert d(reply_pending=True) is MergeDecision.PARK
+
+
+def test_answered_comment_does_not_block_merge():
+    assert d(reply_pending=False) is MergeDecision.MERGE
+
+
+def test_reply_pending_true_when_maintainer_spoke_last():
+    assert reply_pending([_PARK, _MAINT]) is True
+
+
+def test_reply_pending_false_when_our_marker_spoke_last():
+    # Don't wake on our own park notice or our own reply — that's the loop-forever trap.
+    assert reply_pending([_MAINT, _REPLY]) is False        # we already answered
+    assert reply_pending([_MAINT, _PARK, _REPLY]) is False
+    assert reply_pending([_PARK]) is False
+    assert reply_pending([]) is False
+
+
+def test_reply_pending_ignores_trailing_blank_comments():
+    assert reply_pending([_PARK, _MAINT, {"body": "   "}]) is True
+
+
+def test_maintainer_comment_is_text_since_our_last_marker():
+    comments = [_PARK, {"body": "First follow-up"}, {"body": "Show me a screenshot please?"}]
+    assert maintainer_comment(comments) == "First follow-up\n\nShow me a screenshot please?"
+    assert maintainer_comment([_MAINT, _REPLY]) == ""   # our reply was the last word
