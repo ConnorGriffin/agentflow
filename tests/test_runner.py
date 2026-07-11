@@ -5,7 +5,10 @@ behind adapters; the *decision* of what a session outcome means is `classify_bui
 and that is what actually needs to be right.
 """
 
-from agentflow.runner import BuildStatus, ClaudeRunner, CodexRunner, Complexity, Effort, classify_build
+import subprocess
+from unittest.mock import patch
+
+from agentflow.runner import BuildStatus, ClaudeRunner, CodexRunner, Complexity, Effort, _run, classify_build
 
 
 def test_complexity_resolves_to_cost_appropriate_models():
@@ -59,3 +62,13 @@ def test_non_marker_comment_is_not_a_bail():
 def test_nothing_left_behind_is_incomplete():
     out = classify_build(None, [])
     assert out.status is BuildStatus.INCOMPLETE
+
+
+def test_run_timeout_returns_nonzero_and_does_not_propagate():
+    """A hung subprocess is killed and classified as a failure, not an exception."""
+    def raise_timeout(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 1))
+    with patch("subprocess.run", raise_timeout):
+        r = _run(["sleep", "100"], timeout=1)
+    assert r.returncode != 0
+    assert "timed out" in r.stderr

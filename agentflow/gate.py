@@ -9,6 +9,8 @@ the pure decision.
 
 from __future__ import annotations
 
+import os
+import time
 from enum import Enum
 
 from agentflow.reviewer import Verdict
@@ -46,14 +48,28 @@ def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,
 
 
 # --- gh actions (exercised live, not unit-tested) ------------------------------
-def ci_is_green(repo: str, pr_number: int) -> bool:
+def ci_is_green(repo: str, pr_number: int, *,
+                timeout: int | None = None,
+                interval: int | None = None) -> bool:
     """True only if all required checks completed successfully.
 
-    `--watch` waits for pending checks to finish (avoids racing a just-pushed PR),
-    then exits 0 iff every check passed. Non-zero on fail — or on a repo with no
-    checks at all — is treated as not-green: fail safe, never auto-merges.
+    Polls `gh pr checks` every `interval` seconds until all checks pass or
+    `timeout` is reached. `timeout` defaults to AGENTFLOW_CI_TIMEOUT (30 min);
+    `interval` defaults to AGENTFLOW_CI_INTERVAL (30 s). Returns False at the
+    deadline — never hangs indefinitely. Non-zero on fail or on a repo with no
+    checks at all is treated as not-green: fail safe, never auto-merges.
     """
-    return _run(["gh", "pr", "checks", str(pr_number), "--repo", repo, "--watch"]).returncode == 0
+    t = timeout if timeout is not None else int(os.environ.get("AGENTFLOW_CI_TIMEOUT", str(30 * 60)))
+    iv = interval if interval is not None else int(os.environ.get("AGENTFLOW_CI_INTERVAL", "30"))
+    deadline = time.monotonic() + t
+    while True:
+        r = _run(["gh", "pr", "checks", str(pr_number), "--repo", repo])
+        if r.returncode == 0:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(iv, remaining))
 
 
 def squash_merge(repo: str, pr_number: int) -> bool:
