@@ -405,7 +405,14 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
             if ok:
                 ratchet.record(cfg.repo, ratchet.CLEAN_MERGE if revises_used == 0
                                else "merge_after_revise")
-            return f"#{n}: MERGED PR #{pr}" if ok else f"#{n}: merge failed on PR #{pr}"
+                return f"#{n}: MERGED PR #{pr}"
+            park(cfg.repo, pr, verdict,
+                 reason="could not be squash-merged (branch protection, conflict, or transient error)")
+            ratchet.record(cfg.repo, "parked")
+            notify("agentflow needs you",
+                   f"{cfg.repo} #{n}: PR #{pr} merge failed — your action needed",
+                   _pr_url(cfg.repo, pr))
+            return f"#{n}: merge failed on PR #{pr}"
         if decision is MergeDecision.PARK:
             park(cfg.repo, pr, verdict)
             ratchet.record(cfg.repo, "parked")
