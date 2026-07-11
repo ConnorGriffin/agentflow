@@ -189,26 +189,49 @@ def intake_labels(result: IntakeResult) -> list[str]:
     return ["agentflow:needs-grilling"]
 
 
-def awaiting_recheck(comments: list[dict]) -> bool:
-    """True when a held issue's most recent non-empty comment is the maintainer's reply
-    — i.e. they answered and it's our move again (ADR 0019). False when the last word is
-    ours, or there are no comments. Pure. The bot posts as the maintainer, so author
-    can't tell us apart — we key on our own marker."""
+_DOUBLE_QUOTED_RE = re.compile(r"^>\s*>", re.MULTILINE)
+
+
+def _strip_quoted_lines(body: str) -> str:
+    """Remove re-quoted lines (starting with '> >') so a GitHub quote-reply of our
+    comment doesn't mask our marker. Our marker lives on a single-'>' line in our
+    posts — those are kept so we can still detect our own comments."""
+    return "\n".join(
+        line for line in body.splitlines() if not _DOUBLE_QUOTED_RE.match(line)
+    )
+
+
+def awaiting_recheck(comments: list[dict], allowlist: set[str] | None = None) -> bool:
+    """True when a held issue's most recent non-empty comment from an allowlisted author
+    is the maintainer's reply — i.e. they answered and it's our move again (ADR 0019).
+    False when the last word is ours, or there are no qualifying comments. Pure.
+
+    Quote-reply lines (starting with '>') are stripped before scanning so a maintainer
+    who quotes our comment still counts as a reply, not as us. Comments from authors not
+    in *allowlist* are skipped entirely; *allowlist=None* disables the author filter."""
     for c in reversed(comments):
         body = c.get("body", "").strip()
         if not body:
             continue
-        return INTAKE_MARK not in body
+        if allowlist is not None and c.get("author", {}).get("login", "") not in allowlist:
+            continue
+        return INTAKE_MARK not in _strip_quoted_lines(body)
     return False
 
 
-def replies_since_intake(comments: list[dict]) -> str:
+def replies_since_intake(comments: list[dict], allowlist: set[str] | None = None) -> str:
     """The maintainer's comment(s) after our last intake comment — their answer text.
-    Pure (test surface)."""
+    Pure (test surface).
+
+    Quote-reply lines are stripped before scanning for the cut point so a maintainer
+    quote-reply is not mistaken for our marker. Only comments from *allowlist* authors
+    are collected; *allowlist=None* collects all (backwards-compatible)."""
     tail = []
     for c in reversed(comments):
-        if INTAKE_MARK in c.get("body", ""):
+        if INTAKE_MARK in _strip_quoted_lines(c.get("body", "")):
             break
+        if allowlist is not None and c.get("author", {}).get("login", "") not in allowlist:
+            continue
         tail.append(c.get("body", "").strip())
     return "\n\n".join(b for b in reversed(tail) if b)
 
