@@ -23,7 +23,7 @@ from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _
                               apply_intake, awaiting_recheck, replies_since_intake)
 from agentflow.notify import notify
 from agentflow.reviewer import Reviewer, Verdict
-from agentflow.runner import BuildStatus, BuildTask, Complexity, Effort, _run
+from agentflow.runner import BuildStatus, BuildTask, Complexity, Effort, _run, prune_stale_worktrees
 
 
 def _pr_url(repo: str, pr: int) -> str:
@@ -688,6 +688,8 @@ def pipeline_once(cfg: RepoConfig) -> str:
     """One full pass for a repo: triage one un-triaged issue, build one ready issue, and
     answer one parked PR the maintainer commented on (ADR 0016 — intake runs ahead of the
     build queue; issue #18 — parked PRs stay answered)."""
+    for tool in ("claude", "codex"):
+        prune_stale_worktrees(cfg.repo, cfg.workdir, tool)
     return f"intake: {intake_once(cfg)} · build: {run_once(cfg)} · respond: {respond_once(cfg)}"
 
 
