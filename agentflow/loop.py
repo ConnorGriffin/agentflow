@@ -16,8 +16,9 @@ from pathlib import Path
 
 from agentflow import ratchet
 from agentflow.balancer import pick_pair
-from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge, park,
-                            squash_merge, ui_evidence_gap)
+from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
+                            maintainer_comment, park, reply_pending, squash_merge,
+                            ui_evidence_gap)
 from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _DISCLAIMER,
                               apply_intake, awaiting_recheck, replies_since_intake)
 from agentflow.notify import notify
@@ -27,6 +28,19 @@ from agentflow.runner import BuildStatus, BuildTask, Complexity, Effort, _run
 
 def _pr_url(repo: str, pr: int) -> str:
     return f"https://github.com/{repo}/pull/{pr}"
+
+
+def _pr_comments(repo: str, pr: int) -> list[dict]:
+    """The PR's comments, or [] if they can't be read. Impure. A read failure reads as
+    'no maintainer question' — but `decide_merge` still needs independent review + green
+    CI + a clean verdict, so a `gh` blip never turns into an unsafe merge."""
+    r = _run(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "comments"])
+    if r.returncode != 0:
+        return []
+    try:
+        return json.loads(r.stdout or "{}").get("comments", [])
+    except json.JSONDecodeError:
+        return []
 
 
 _COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
@@ -111,6 +125,7 @@ def pr_number(url: str) -> int:
 
 
 _BRANCH_ISSUE_RE = re.compile(r"^agentflow/[^/]+/issue-(\d+)-")
+_BRANCH_RE = re.compile(r"^agentflow/([^/]+)/issue-(\d+)-(.+)$")
 
 
 def issue_of_branch(branch: str) -> int | None:
@@ -161,6 +176,33 @@ Do not degrade the two charter gates while revising (ADR 0018):
 
 Blocking findings:
 {findings}"""
+
+# The responder's reply disclaimer — carries the PR marker (`agentflow:`) so the next
+# cycle can tell it apart from the maintainer's comment (see gate.reply_pending).
+_RESPOND_DISCLAIMER = "> *agentflow: reply from the build agent.*"
+
+RESPOND_PROMPT = """A maintainer left a comment on PR #{n} in this worktree and it is
+still unanswered. Read the full conversation first (`gh pr view {n} --json comments`),
+then answer their latest comment. This is a REPLY, not a fresh review — answer what they
+actually asked, nothing more.
+
+Their comment:
+---
+{comment}
+---
+
+Reply conversationally in a PR comment that STARTS with this exact line, so we can tell
+your reply apart from theirs:
+{disclaimer}
+
+- Answer in plain language, in the app's own terms — no code symbols or file paths.
+- If they asked for evidence (e.g. "show me a screenshot"), produce it and ATTACH it to
+  your comment — headless Playwright against the locked mockup for a UI surface, the same
+  way a build does.
+- If they asked for a small change, make it, commit, and push to THIS SAME branch.
+
+Same contract as a revision: never open a new PR, never merge. If you genuinely can't
+address it, say so plainly in the reply."""
 
 
 def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
@@ -457,7 +499,8 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
         decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
                                 reviewer_tool=reviewer_runner.tool, builder_tool=builder.tool,
-                                revises_used=revises_used, ui_evidence_missing=ui_gap)
+                                revises_used=revises_used, ui_evidence_missing=ui_gap,
+                                reply_pending=reply_pending(_pr_comments(cfg.repo, pr)))
         if decision is MergeDecision.MERGE:
             ok = squash_merge(cfg.repo, pr)
             if ok:
@@ -527,10 +570,71 @@ def intake_once(cfg: RepoConfig) -> str:
     return f"#{n}: {summary}{' (resumed)' if extra else ''}"
 
 
+def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str] | None:
+    """The next open agentflow PR whose latest comment is the maintainer's unanswered
+    question — returns (pr_number, head_branch, their_comment). Skips a PR where our own
+    marker had the last word (a park notice, or a reply we already posted) so the responder
+    never wakes on its own comments (issue #18)."""
+    r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
+              "--json", "number,headRefName", "--limit", "100"])
+    if r.returncode != 0:
+        return None
+    for pr in sorted(json.loads(r.stdout or "[]"), key=lambda p: p.get("number", 0)):
+        branch = pr.get("headRefName", "")
+        if issue_of_branch(branch) is None:
+            continue   # not an agentflow PR — a human's own branch
+        cr = _run(["gh", "pr", "view", str(pr["number"]), "--repo", cfg.repo, "--json", "comments"])
+        if cr.returncode != 0:
+            continue
+        comments = json.loads(cr.stdout or "{}").get("comments", [])
+        if reply_pending(comments):
+            return pr["number"], branch, maintainer_comment(comments)
+    return None
+
+
+def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
+    """Put the PR branch in a worktree so a responder can push fixes to it. Reuses the
+    builder's worktree when it's still there (freshened to the PR head), else cuts a fresh
+    one tracking `origin/<branch>`. Returns success. Live orchestration, not unit-tested."""
+    if _run(["git", "-C", cfg.workdir, "fetch", "origin", "--quiet"]).returncode != 0:
+        return False
+    if wt.exists():
+        return _run(["git", "-C", str(wt), "reset", "--hard", f"origin/{branch}"]).returncode == 0
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    return _run(["git", "-C", cfg.workdir, "worktree", "add", "-B", branch,
+                 str(wt), f"origin/{branch}"]).returncode == 0
+
+
+def respond_once(cfg: RepoConfig) -> str:
+    """Answer the next parked PR whose latest comment is an unanswered maintainer question:
+    spawn a responder in the PR-branch worktree that replies in-thread, attaches requested
+    evidence, and pushes small fixes to the same branch (issue #18). Never merges, never a
+    new PR — same contract as a revise."""
+    pending = _next_pr_awaiting_reply(cfg)
+    if not pending:
+        return "no parked PRs awaiting reply"
+    pr, branch, comment = pending
+    m = _BRANCH_RE.match(branch)
+    if not m:
+        return f"PR #{pr}: unrecognized branch {branch}"
+    tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
+    builder, _ = pick_pair()   # a reply needs one available tool, not a pair
+    if builder is None:
+        return f"PR #{pr}: no pool has headroom to respond — deferring"
+    wt = Path(_builder_worktree(cfg, tool, n, sl))
+    if not _checkout_pr_branch(cfg, branch, wt):
+        return f"PR #{pr}: could not check out {branch} to respond — retry next cycle"
+    builder.provision(wt)
+    ok, _ = builder.launch(RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
+                           cwd=str(wt), model=builder.model_for(Complexity.DEEP))
+    return f"PR #{pr}: replied to the maintainer" if ok else f"PR #{pr}: responder session errored"
+
+
 def pipeline_once(cfg: RepoConfig) -> str:
-    """One full pass for a repo: triage one un-triaged issue, then build one ready
-    issue (ADR 0016 — intake runs ahead of the build queue)."""
-    return f"intake: {intake_once(cfg)} · build: {run_once(cfg)}"
+    """One full pass for a repo: triage one un-triaged issue, build one ready issue, and
+    answer one parked PR the maintainer commented on (ADR 0016 — intake runs ahead of the
+    build queue; issue #18 — parked PRs stay answered)."""
+    return f"intake: {intake_once(cfg)} · build: {run_once(cfg)} · respond: {respond_once(cfg)}"
 
 
 if __name__ == "__main__":  # entrypoint — the sandbox dogfood target
