@@ -328,8 +328,10 @@ class Intake:
         prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(n), disclaimer=_DISCLAIMER,
                        title=issue.get("title", ""), body=issue.get("body") or "(no description)")
         if extra:
-            prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier questions — treat this as the "
-                       "answer: promote to ready if it's settled, else re-post ONLY what's still open. "
+            prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier hold — treat this as their "
+                       "answer or waiver: promote to ready if the issue is now settled (they answered "
+                       "your questions, waived the visual spec requirement, or pointed at a locked spec), "
+                       "else re-post ONLY what's still open. "
                        'If nothing genuinely open changed — the reply was chit-chat, or it didn\'t move '
                        'any open question — answer route "nothing-new" (no body) and I\'ll stay quiet '
                        "rather than restate myself.\n"
