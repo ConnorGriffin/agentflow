@@ -23,30 +23,59 @@ marker the daemon keys resume off — keep it).
 `/agentflow <verb> <N>` in a repo enrolled in the fleet. `pickup`/`triage`/`scope`/`build`
 take an issue `<N>`; `revise` takes a **PR** (number or URL).
 
+### Claiming — prevent daemon races on manual verbs
+
+`pickup`, `triage`, and `scope` all do grounding work that takes time. Without a claim, the
+daemon can reach the same issue in parallel and post a duplicate intake summary. **Before**
+starting grounding on any of these verbs, set the `agentflow:triaging` claim:
+
+```bash
+gh label create agentflow:triaging --repo "$REPO" --color d4c5f9 \
+   --description "A grounding session is triaging this issue" --force
+gh issue edit "$N" --repo "$REPO" --add-label agentflow:triaging
+```
+
+Release it when the state label lands **or when you give up** (the state label dedups from
+that point; the claim alone is not enough if you abandon mid-session):
+
+```bash
+gh issue edit "$N" --repo "$REPO" --remove-label agentflow:triaging
+```
+
+A stranded `agentflow:triaging` claim blocks the issue (fail-safe — never double-triaged)
+but must be cleared by hand, since intake opens no PR to check liveness against.
+
 ### `pickup <N>` — resume a held issue live
 The main verb — for a held *issue*. (A *parked PR* is the sibling case: use `revise <PR>`.)
 For an issue at `agentflow:needs-grilling` or `agentflow:needs-mockup`:
-1. Read the issue, its intake comment (the questions/kickoff), and any replies.
-2. **Ground** first if it helps — read the code; if the repo declares a read-only data
+1. **Claim** `agentflow:triaging` (see above) before any grounding work.
+2. Read the issue, its intake comment (the questions/kickoff), and any replies.
+3. **Ground** first if it helps — read the code; if the repo declares a read-only data
    pull (ciq's `ciq-pull-db` → `ciq.readonly.db`), run it and check real numbers.
-3. **needs-grilling →** grill the user *live*, one question at a time, in **their voice**:
+4. **needs-grilling →** grill the user *live*, one question at a time, in **their voice**:
    the app's behavior and their real numbers, never code symbols / ADR numbers / file
    paths. Symptom + concrete options + your recommendation. When the decision tree is
    locked, go to **Land it as ready** below.
-4. **needs-mockup →** run `/ui-mockups` to a *locked* visual spec (charter gate), then
+5. **needs-mockup →** run `/ui-mockups` to a *locked* visual spec (charter gate), then
    land it as ready with the `★ LOCKED visual spec` handoff (mockup file + numbered
    decisions), and set complexity/effort as usual.
+6. **Release** `agentflow:triaging` once the state label lands — or immediately if you give up.
 
 ### `triage <N>` — force intake on a specific issue now
 Run the full intake pass on one issue immediately (don't wait for the daemon to reach it).
-Ground → rewrite title/body → route. If it's clear, land it as ready; if a real fork
-survives, post grilling questions and label `agentflow:needs-grilling`; if it's UI beyond
-a minor fix, label `agentflow:needs-mockup`.
+1. **Claim** `agentflow:triaging` (see above) before any grounding work.
+2. Ground → rewrite title/body → route. If it's clear, land it as ready; if a real fork
+   survives, post grilling questions and label `agentflow:needs-grilling`; if it's UI beyond
+   a minor fix, label `agentflow:needs-mockup`.
+3. **Release** `agentflow:triaging` once the state label lands — or immediately if you give up.
 
 ### `scope <N>` (or from the conversation) — skip the front, go straight to ready
 When the issue is already clear — because you just discussed it with the user, or they
 filed it well — write the Agent Brief and land it as ready **without** a grilling round.
 This is the "I'll just tell you what I want" path.
+1. **Claim** `agentflow:triaging` (see above) before composing the brief.
+2. Run **Land it as ready** below.
+3. **Release** `agentflow:triaging` once the state label lands — or immediately if you give up.
 
 ### `build <N>` — build a ready issue on demand
 The by-hand trigger for an already-`ready-for-agent` issue (ADR 0022) — the replacement for
@@ -110,21 +139,23 @@ agentflow's own code so the shape is identical:
    re-intake updates the body brief in place, never a second one:
 
    ```bash
-   uv run python - "$REPO" "$N" "$TITLE" <<'PY'
-   import sys
+   LABELS=$(gh issue view "$N" --repo "$REPO" --json labels -q '[.labels[].name]')
+   uv run python - "$REPO" "$N" "$TITLE" "$LABELS" <<'PY'
+   import sys, json
    from agentflow.intake import IntakeResult, IntakeRoute, apply_intake
    from agentflow.runner import Complexity, Effort
-   repo, n, title = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+   repo, n, title, labels_json = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
    brief = """<the Agent Brief markdown you composed>"""
    result = IntakeResult(IntakeRoute.READY, brief, title,
                          Complexity.DEEP, Effort.MEDIUM)   # set the dials you chose
-   print(apply_intake(repo, n, title, current_labels=[], result=result))
+   print(apply_intake(repo, n, title, current_labels=json.loads(labels_json), result=result))
    PY
    ```
 
-   (Pass the issue's current labels in `current_labels` so a promotion clears the old
-   `needs-grilling`/`needs-mockup`.) The daemon's build queue picks it up from there — or
-   run `build <N>` (above) to build it now.
+   The `LABELS` fetch passes the issue's real labels so `apply_intake` clears the old
+   `needs-grilling`/`needs-mockup` hold — passing `[]` would leave both hold and state label
+   set, causing the daemon to treat the issue as both held and ready simultaneously. The
+   daemon's build queue picks it up from there — or run `build <N>` (above) to build it now.
 
 ## Notes
 - **Don't invent labels or a brief format** — use `agentflow.intake` so the daemon and you
