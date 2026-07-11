@@ -57,8 +57,14 @@ def choose_pair(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
     return runners[builder.tool], runners[other.tool]
 
 
-def _query_pool(tool: str) -> PoolStatus:
+def _query_pool(tool: str, operator: bool = False) -> PoolStatus:
     env = {**os.environ, "TRIAGE_AGENT": tool}
+    if operator:
+        # By-hand dispatch: the operator IS the live session and asked for this
+        # run, so tell the gate to skip its recent-activity block. The spend
+        # ceiling still applies — `check` keeps failing when a pool is genuinely
+        # rate-limited, so the gate stays the single source of truth for it.
+        env["TRIAGE_SKIP_ACTIVITY"] = "1"
     try:
         # `spend` reports the REAL trailing-5h % even when the interactive-use gate
         # would block dispatch — so headroom is honest while you're active. `check`
@@ -77,9 +83,12 @@ def _query_pool(tool: str) -> PoolStatus:
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,
-              codex: _WorktreeRunner | None = None) -> tuple:
-    """Live: query both pools and choose the pair. See `choose_pair`."""
+              codex: _WorktreeRunner | None = None,
+              operator: bool = False) -> tuple:
+    """Live: query both pools and choose the pair. See `choose_pair`. `operator=True`
+    marks an explicit by-hand dispatch, which skips the pools' recent-activity guard
+    while still honoring their spend ceiling — the pair-vs-single decision is unchanged."""
     claude = claude or ClaudeRunner()
     codex = codex or CodexRunner()
-    return choose_pair(_query_pool("claude"), _query_pool("codex"),
+    return choose_pair(_query_pool("claude", operator), _query_pool("codex", operator),
                        {"claude": claude, "codex": codex})
