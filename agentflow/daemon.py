@@ -24,6 +24,7 @@ on PATH, and — since it spawns tool sessions — an unsandboxed environment.
 
 from __future__ import annotations
 
+import argparse
 import datetime
 import os
 import time
@@ -78,11 +79,23 @@ def _acquire_lock() -> bool:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="agentflow daemon")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="run one cycle and exit (bypasses the enable flag; still respects the lock)",
+    )
+    args = parser.parse_args()
+
     if not _acquire_lock():
         log("another daemon is running; exiting")
         return
-    log(f"daemon up — enable={ENABLE_FLAG}, poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}")
     try:
+        if args.once:
+            log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
+            cycle(REPOS)
+            return
+        log(f"daemon up — enable={ENABLE_FLAG}, poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}")
         while True:
             # Heartbeat the lock so a *healthy* daemon is never seen as stale — else a
             # second daemon reclaims the (frozen-mtime) lock, runs concurrently, and its
