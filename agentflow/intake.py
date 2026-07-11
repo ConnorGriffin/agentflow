@@ -239,6 +239,16 @@ def replies_since_intake(comments: list[dict], allowlist: set[str] | None = None
 # The three state labels intake owns — kept mutually exclusive on an issue.
 STATE_LABELS = ("ready-for-agent", "agentflow:needs-grilling", "agentflow:needs-mockup")
 
+# Dial label prefixes — cleared when stamping new dials (or dropping to a hold route).
+_DIAL_PREFIXES = ("agentflow:complexity:", "agentflow:effort:")
+
+# Bare pre-enrollment vocabulary → agentflow:* canonical form.
+# Note: ready-for-agent stays bare (ADR 0018 — settled; excluded from this map).
+_LEGACY_LABEL_MAP: dict[str, str] = {
+    "needs-grilling": "agentflow:needs-grilling",
+    "needs-mockup": "agentflow:needs-mockup",
+}
+
 _LABEL_COLORS = {
     "ready-for-agent": "0e8a16",
     "agentflow:needs-grilling": "d93f0b",
@@ -434,12 +444,52 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
 
     for name in labels:
         _ensure_label(repo, name)
+    new_labels_set = set(labels)
     args = ["gh", "issue", "edit", str(issue_number), "--repo", repo]
     for name in labels:
         args += ["--add-label", name]
     for name in STATE_LABELS:  # keep exactly one state label — clear stale holds on promote
-        if name not in labels and name in current_labels:
+        if name not in new_labels_set and name in current_labels:
+            args += ["--remove-label", name]
+    for name in current_labels:  # clear stale dials — a re-route leaves exactly one of each
+        if any(name.startswith(p) for p in _DIAL_PREFIXES) and name not in new_labels_set:
             args += ["--remove-label", name]
     _run(args)
     tail = "" if result.parsed else " (fail-safe hold)"
     return f"routed -> {result.route.value}{tail}"
+
+
+def sweep_legacy_labels(repo: str) -> list[str]:
+    """Migrate bare pre-enrollment needs-* labels to the agentflow:* vocabulary on open
+    issues. Idempotent — safe to run more than once. Returns one-line change descriptions,
+    one per issue touched."""
+    r = _run(["gh", "issue", "list", "--repo", repo, "--state", "open",
+              "--json", "number,labels", "--limit", "500"])
+    if r.returncode != 0:
+        return [f"error: could not list issues (exit {r.returncode})"]
+    changed = []
+    for issue in json.loads(r.stdout or "[]"):
+        n = issue["number"]
+        names = {lbl["name"] for lbl in issue.get("labels", [])}
+        to_add: list[str] = []
+        to_remove: list[str] = []
+        for bare, namespaced in _LEGACY_LABEL_MAP.items():
+            if bare in names:
+                if namespaced not in names:
+                    to_add.append(namespaced)
+                to_remove.append(bare)
+        if not to_remove:
+            continue
+        args = ["gh", "issue", "edit", str(n), "--repo", repo]
+        for name in to_add:
+            _ensure_label(repo, name)
+            args += ["--add-label", name]
+        for name in to_remove:
+            args += ["--remove-label", name]
+        _run(args)
+        parts = []
+        if to_add:
+            parts.append(f"added {', '.join(sorted(to_add))}")
+        parts.append(f"removed {', '.join(sorted(to_remove))}")
+        changed.append(f"#{n}: {'; '.join(parts)}")
+    return changed

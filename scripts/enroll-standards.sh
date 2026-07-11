@@ -85,9 +85,8 @@ enroll_repo() { # <dir>
   echo "Per-repo enroll — $dir"
 
   if [ -L "$cl" ] && [ "$(readlink "$cl")" = "AGENTS.md" ] && [ -f "$ag" ]; then
-    note "ok:   already AGENTS.md + CLAUDE.md symlink"; return
-  fi
-  if [ -f "$ag" ] && [ -f "$cl" ] && [ ! -L "$cl" ]; then
+    note "ok:   already AGENTS.md + CLAUDE.md symlink"
+  elif [ -f "$ag" ] && [ -f "$cl" ] && [ ! -L "$cl" ]; then
     if cmp -s "$ag" "$cl"; then
       backup "$cl"
       do_or_show "replace duplicate CLAUDE.md with symlink -> AGENTS.md" \
@@ -102,6 +101,15 @@ enroll_repo() { # <dir>
     do_or_show "seed AGENTS.md (add repo facts + 'profile:' by hand)" \
       bash -c 'printf "# %s\n\n<!-- repo facts, hazards, and: profile: reviewed -->\n" "$1" > "$2"' _ "$(basename "$dir")" "$ag"
     do_or_show "symlink CLAUDE.md -> AGENTS.md" ln -sfn "AGENTS.md" "$cl"
+  fi
+
+  # Sweep bare pre-enrollment needs-* labels to the agentflow:* vocabulary (idempotent).
+  local gh_repo
+  if gh_repo="$(gh repo view "$dir" --json nameWithOwner -q .nameWithOwner 2>/dev/null)"; then
+    do_or_show "sweep legacy label vocabulary in $gh_repo (python -m agentflow.enroll $gh_repo)" \
+      python -m agentflow.enroll "$gh_repo"
+  else
+    note "SKIP: could not resolve GitHub repo — run 'python -m agentflow.enroll <owner/repo>' manually"
   fi
 }
 
