@@ -6,9 +6,11 @@ import json
 import pytest
 
 from agentflow import loop
-from agentflow.loop import (BUILD_PROMPT, RepoConfig, _free_to_dispatch, _untriaged,
-                            build_issue, complexity_from_labels, effort_from_labels,
-                            issue_of_branch, pr_number, repo_profile, slug)
+from agentflow.intake import IntakeRoute
+from agentflow.loop import (BUILD_PROMPT, RepoConfig, _free_to_dispatch, _issues_in_flight,
+                            _next_ready_issue, _untriaged, build_issue, complexity_from_labels,
+                            effort_from_labels, held_build_result, issue_of_branch, pr_number,
+                            reclaim_claims, repo_profile, slug)
 from agentflow.runner import Complexity, Effort
 
 
@@ -100,6 +102,45 @@ def test_repo_profile_prefers_agents_md_then_claude(tmp_path):
 def test_repo_profile_defaults_reviewed_when_absent(tmp_path):
     # ADR 0002 safe default — never auto-merge a repo that didn't opt in.
     assert repo_profile(str(tmp_path)) == "reviewed"
+
+
+def test_issues_in_flight_is_unknown_when_gh_fails(monkeypatch):
+    # Unknown is not empty (ADR 0021): a `gh` blip must not read as "nothing in flight",
+    # or every in-review issue gets a duplicate dispatch.
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(returncode=1))
+    assert _issues_in_flight(RepoConfig("o/r", ".")) is None
+
+
+def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
+    ready = [{"number": 5, "title": "t", "body": "", "labels": [{"name": "ready-for-agent"}]}]
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(ready)))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
+    assert _next_ready_issue(RepoConfig("o/r", ".")) is None
+    # sanity: same listing dispatches once in-flight is actually known
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 5
+
+
+def test_reclaim_claims_strips_nothing_when_in_flight_unknown(monkeypatch):
+    # The reclaim exists to prevent duplicates; failing open here would *create* one by
+    # clearing a live build's claim on a transient `gh` error.
+    claimed = [{"number": 7}]
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(claimed)))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
+    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(n))
+    assert reclaim_claims(RepoConfig("o/r", ".")) == 0
+    assert released == []
+
+
+def test_held_build_result_holds_instead_of_requeueing():
+    # A stuck build hands the issue back held — still-`ready` means a fresh build, a
+    # duplicate bail comment, and a duplicate ping every cycle, with the queue stalled.
+    result = held_build_result("bail", "draft PR https://github.com/o/r/pull/9")
+    assert result.route is IntakeRoute.GRILL
+    assert result.body.startswith("> *agentflow intake")   # resumes via the ADR 0019 path
+    assert "pull/9" in result.body and "pickup" in result.body
+    assert result.title == ""   # never retitles on a hold
 
 
 def test_build_prompt_formats_and_tells_the_builder_the_pr_gates():

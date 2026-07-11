@@ -17,8 +17,8 @@ from pathlib import Path
 from agentflow import ratchet
 from agentflow.balancer import pick_pair
 from agentflow.gate import MAX_REVISES, MergeDecision, ci_is_green, decide_merge, park, squash_merge
-from agentflow.intake import (Intake, IntakeRoute, STATE_LABELS, apply_intake,
-                              awaiting_recheck, replies_since_intake)
+from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _DISCLAIMER,
+                              apply_intake, awaiting_recheck, replies_since_intake)
 from agentflow.notify import notify
 from agentflow.reviewer import Reviewer, Verdict
 from agentflow.runner import BuildStatus, BuildTask, Complexity, Effort, _run
@@ -124,15 +124,19 @@ Blocking findings:
 {findings}"""
 
 
-def _issues_in_flight(cfg: RepoConfig) -> set[int]:
+def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
     """Issues that already have an OPEN agentflow PR — an agent is on them, so don't
     re-dispatch a duplicate. Dispatch dedup, distinct from ADR 0009's merge-time floor:
     an issue stays `ready-for-agent` while its PR is in review, so without this the loop
-    would re-build it every cycle (a second PR on a different tool)."""
+    would re-build it every cycle (a second PR on a different tool).
+
+    Returns None when the listing itself failed — unknown is NOT empty. Treating a `gh`
+    blip as "nothing in flight" would both re-dispatch every in-review issue and let
+    `reclaim_claims` strip live claims; callers fail closed (skip, retry next cycle)."""
     r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
               "--json", "headRefName", "--limit", "100"])
     if r.returncode != 0:
-        return set()
+        return None
     return {n for pr in json.loads(r.stdout or "[]")
             if (n := issue_of_branch(pr.get("headRefName", ""))) is not None}
 
@@ -155,6 +159,8 @@ def _next_ready_issue(cfg: RepoConfig) -> dict | None:
     if r.returncode != 0:
         return None
     in_flight = _issues_in_flight(cfg)
+    if in_flight is None:
+        return None   # can't see what's in flight — fail closed, dispatch next cycle
     issues = sorted((i for i in json.loads(r.stdout or "[]") if _free_to_dispatch(i, in_flight)),
                     key=lambda i: i["number"])
     return issues[0] if issues else None
@@ -170,6 +176,8 @@ def reclaim_claims(cfg: RepoConfig) -> int:
     if r.returncode != 0:
         return 0
     in_flight = _issues_in_flight(cfg)
+    if in_flight is None:
+        return 0   # can't see what's in flight — a live claim must never be stripped
     stale = [i["number"] for i in json.loads(r.stdout or "[]") if i["number"] not in in_flight]
     for n in stale:
         _release(cfg.repo, n)
@@ -211,6 +219,19 @@ def _launch_revise(builder, cfg: RepoConfig, pr: int, n: int, sl: str,
     builder.launch(REVISE_PROMPT.format(n=pr, findings=findings),
                    cwd=_builder_worktree(cfg, builder.tool, n, sl),
                    model=builder.model_for(complexity))
+
+
+def held_build_result(status: str, where: str) -> IntakeResult:
+    """The hold a stuck build hands back — routes the issue to `needs-grilling` instead of
+    leaving it `ready-for-agent`, where the loop would re-pick it every cycle: a fresh build
+    session, a duplicate bail comment, and a duplicate ping per cycle, with the rest of the
+    queue stalled behind it (ADR 0021's claim only covers a *live* build). The body carries
+    the intake marker, so a maintainer reply resumes it through the normal re-intake path
+    (ADR 0019). Pure (test surface)."""
+    body = (f"{_DISCLAIMER}\n\nThe build stopped before opening a PR ({status}) — details in "
+            f"{where}. I've held this rather than retrying blind. Reply here with what's "
+            "missing (or run `/agentflow pickup` to drive it live) and I'll re-scope and retry.")
+    return IntakeResult(IntakeRoute.GRILL, body)
 
 
 def _preserve_progress(cfg: RepoConfig, tool: str, n: int, sl: str) -> str | None:
@@ -264,7 +285,10 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
         if held:
             return f"#{n}: held — resume it with `/agentflow pickup {n}`, not build"
         return f"#{n}: not ready — run `/agentflow triage {n}` (or `scope {n}`) first"
-    if not _free_to_dispatch(issue, _issues_in_flight(cfg)):
+    in_flight = _issues_in_flight(cfg)
+    if in_flight is None:
+        return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"
+    if not _free_to_dispatch(issue, in_flight):
         return f"#{n}: already claimed or in flight — a build already owns it"
     return _dispatch_build(cfg, issue)
 
@@ -337,12 +361,16 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
     outcome = builder.build(task)
     if outcome.status is not BuildStatus.PR_OPENED:
         # Stuck (a bail marker, or ran with no PR). Preserve the work as a draft PR so
-        # nothing is lost, then hand back to a human (ADR 0020).
+        # nothing is lost, then hand the issue back HELD — still-`ready` would be
+        # re-dispatched every cycle (see held_build_result).
         draft = _preserve_progress(cfg, builder.tool, n, sl)
-        where = f"draft PR {draft}" if draft else "the build session's comment"
+        where = f"draft PR {draft}" if draft else "the build session's comment on the issue"
+        apply_intake(cfg.repo, n, issue.get("title", ""),
+                     [lbl["name"] for lbl in issue.get("labels", [])],
+                     held_build_result(outcome.status.value, where))
         notify("agentflow needs you", f"{cfg.repo} #{n}: build {outcome.status.value} — {where}",
                draft or f"https://github.com/{cfg.repo}/issues/{n}")
-        return f"#{n}: build {outcome.status.value} — {outcome.detail}; progress in {where}"
+        return f"#{n}: build {outcome.status.value} — {outcome.detail}; held for you ({where})"
 
     pr = pr_number(outcome.pr_url)
     head_branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
