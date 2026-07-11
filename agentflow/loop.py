@@ -34,6 +34,13 @@ _EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
 _UI_SURFACES_RE = re.compile(r"^ui-surfaces:\s*(.+)$", re.MULTILINE)
 
+# The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to
+# know the block is the missing screenshot, not the review verdict. Unwaivable, so it
+# reads the same whether a reviewed repo hands over or an autonomous one drops out.
+_UI_GAP_REASON = ("touches a user-facing surface but has no before/after screenshot — the "
+                  "charter requires visual proof it matches the locked design, so it can't "
+                  "merge unseen (ADR 0018)")
+
 
 def repo_profile(workdir: str) -> str:
     """The repo's autonomy profile from its AGENTS.md/CLAUDE.md `profile:` line.
@@ -429,7 +436,12 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
             verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity,
                                       acceptance=acceptance, surfaces=surfaces_phrase)
             if verdict.clean or not (verdict.parsed and verdict.blocking) or revises_used >= MAX_REVISES:
-                park(cfg.repo, pr, verdict, reason=f"is a `{profile}` repo — a human merges")
+                # A human merges either way, but the mechanical UI-evidence gate still runs
+                # (ADR 0018): a screenshot-less UI change must park with the missing-screenshot
+                # reason, so the human isn't handed one that silently fails the charter gate.
+                ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
+                reason = _UI_GAP_REASON if ui_gap else f"is a `{profile}` repo — a human merges"
+                park(cfg.repo, pr, verdict, reason=reason)
                 notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
                        _pr_url(cfg.repo, pr))
                 return f"#{n}: PR #{pr} reviewed ({profile}) — awaiting human merge"
@@ -460,9 +472,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
                    _pr_url(cfg.repo, pr))
             return f"#{n}: merge failed on PR #{pr}"
         if decision is MergeDecision.PARK:
-            reason = ("touches a user-facing surface but has no before/after screenshot — the "
-                      "charter requires visual proof it matches the locked design, so it can't "
-                      "auto-merge unseen (ADR 0018)") if ui_gap else "could not be auto-merged after review"
+            reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
             park(cfg.repo, pr, verdict, reason=reason)
             ratchet.record(cfg.repo, "parked")
             notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",

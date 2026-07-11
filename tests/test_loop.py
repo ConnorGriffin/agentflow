@@ -297,3 +297,35 @@ def test_failed_merge_parks_and_pings(monkeypatch):
     assert notified, "notify must be called on merge failure"
     assert "needs you" in notified[0][0]
     assert "parked" in recorded
+
+
+def test_reviewed_path_parks_a_screenshotless_ui_change_on_the_gate(monkeypatch):
+    # ADR 0018: a reviewed/guarded repo hands the PR to a human either way, but the
+    # mechanical UI-evidence gate still runs — a UI change with no screenshot must park
+    # with the missing-screenshot reason, not the generic "a human merges". Fails first
+    # if the reviewed branch skips ui_evidence_gap and parks with the profile reason.
+    from agentflow.reviewer import Verdict
+    from agentflow.runner import BuildOutcome, BuildStatus
+
+    class _Builder:
+        tool = "claude"
+        def build(self, task):
+            return BuildOutcome(BuildStatus.PR_OPENED, pr_url="https://github.com/o/r/pull/7")
+
+    class _FakeReviewer:
+        def __init__(self, runner): pass
+        def review(self, *a, **k):
+            return Verdict(clean=True)   # review says clean; the gate must still bite
+
+    reviewer_runner = type("R", (), {"tool": "codex"})()
+    monkeypatch.setattr(loop, "Reviewer", _FakeReviewer)
+    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
+    monkeypatch.setattr(loop, "ui_evidence_gap", lambda repo, pr, surfaces: True)
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
+    parked = {}
+    monkeypatch.setattr(loop, "park", lambda repo, pr, verdict, reason: parked.update(reason=reason))
+
+    loop._build_review_merge(RepoConfig("o/r", "/tmp"), {"body": ""}, 5, "x",
+                             Complexity.STANDARD, Effort.MEDIUM, _Builder(),
+                             reviewer_runner, "reviewed", "prompt")
+    assert "screenshot" in parked["reason"].lower()
