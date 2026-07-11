@@ -47,6 +47,7 @@ _COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
 _EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
 _UI_SURFACES_RE = re.compile(r"^ui-surfaces:\s*(.+)$", re.MULTILINE)
+_ALLOWLIST_RE = re.compile(r"^intake-allowlist:\s*(.+)", re.MULTILINE)
 
 # The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to
 # know the block is the missing screenshot, not the review verdict. Unwaivable, so it
@@ -87,6 +88,20 @@ def _surfaces_phrase(surfaces: list[str]) -> str:
     """How to name the repo's UI surfaces to a builder/reviewer prompt."""
     return ", ".join(f"`{s}`" for s in surfaces) if surfaces \
         else "any user-facing surface (frontend, UI templates, etc.)"
+
+
+def intake_allowlist(repo: str, workdir: str) -> set[str]:
+    """Authors whose comments can trigger a resume or re-intake. Always includes the repo
+    owner; extend via an `intake-allowlist: alice, bob` line in AGENTS.md/CLAUDE.md."""
+    owner = repo.split("/")[0]
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        p = Path(workdir) / name
+        if p.exists():
+            m = _ALLOWLIST_RE.search(p.read_text(errors="replace"))
+            if m:
+                extra = {s.strip() for s in m.group(1).split(",") if s.strip()}
+                return {owner} | extra
+    return {owner}
 
 
 @dataclass(frozen=True)
@@ -552,8 +567,9 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
         if cr.returncode != 0:
             continue
         comments = json.loads(cr.stdout or "{}").get("comments", [])
-        if awaiting_recheck(comments):
-            return issue, replies_since_intake(comments)
+        allowlist = intake_allowlist(cfg.repo, cfg.workdir)
+        if awaiting_recheck(comments, allowlist):
+            return issue, replies_since_intake(comments, allowlist)
     return None
 
 

@@ -12,8 +12,9 @@ from agentflow.loop import (BUILD_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, RepoCon
                             _build_review_merge, _free_to_dispatch, _issues_in_flight,
                             _main_config, _next_pr_awaiting_reply, _next_ready_issue,
                             _next_resumable_issue, _untriaged, build_issue, complexity_from_labels,
-                            effort_from_labels, held_build_result, issue_of_branch, pr_number,
-                            reclaim_claims, repo_profile, respond_once, slug, ui_surfaces)
+                            effort_from_labels, held_build_result, intake_allowlist,
+                            issue_of_branch, pr_number, reclaim_claims, repo_profile, respond_once,
+                            slug, ui_surfaces)
 from agentflow.reviewer import Verdict
 from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
 
@@ -106,6 +107,20 @@ def test_repo_profile_prefers_agents_md_then_claude(tmp_path):
 def test_repo_profile_defaults_reviewed_when_absent(tmp_path):
     # ADR 0002 safe default — never auto-merge a repo that didn't opt in.
     assert repo_profile(str(tmp_path)) == "reviewed"
+
+
+def test_intake_allowlist_always_includes_owner(tmp_path):
+    assert intake_allowlist("owner/repo", str(tmp_path)) == {"owner"}
+
+
+def test_intake_allowlist_reads_extra_names_from_agents_md(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("# repo\n\nintake-allowlist: alice, bob\n\n## facts\n")
+    assert intake_allowlist("owner/repo", str(tmp_path)) == {"owner", "alice", "bob"}
+
+
+def test_intake_allowlist_falls_back_to_claude_md(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("intake-allowlist: carol\n")
+    assert intake_allowlist("owner/repo", str(tmp_path)) == {"owner", "carol"}
 
 
 def test_issues_in_flight_is_unknown_when_gh_fails(monkeypatch):
@@ -253,7 +268,9 @@ _MAINTAINER_REPLY = "Here is my answer / waiver."
 
 def _make_resumable_run(grilling_issues, mockup_issues, reply=_MAINTAINER_REPLY):
     """A fake _run that serves canned issue listings and a single-reply comment thread."""
-    comments = [{"body": _INTAKE_COMMENT}, {"body": reply}]
+    # The reply is from the repo owner (always allowlisted), so it counts as a resume-
+    # triggering maintainer reply under the allowlist filter (issue #25).
+    comments = [{"body": _INTAKE_COMMENT}, {"body": reply, "author": {"login": "o"}}]
 
     def fake_run(cmd):
         if "--label" in cmd:
