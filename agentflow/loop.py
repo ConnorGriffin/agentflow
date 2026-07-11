@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agentflow import ratchet
@@ -546,6 +546,30 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
     return None
 
 
+# Consecutive intake infra failures per (repo, issue), in-memory in the daemon. Infra
+# failures leave no GitHub trace by design (no comment, no label), so the retry streak
+# lives here; a restart resets it — fine for a bounded safety backstop, not state of record.
+_intake_infra_failures: dict[tuple[str, int], int] = {}
+INTAKE_MAX_INFRA_FAILURES = 3   # after this many in a row on one issue, post one held comment
+
+
+def _handle_intake_infra_failure(cfg: RepoConfig, n: int, result: IntakeResult) -> str:
+    """An intake that fell over before the model weighed in (worktree/provision/launch).
+    Post nothing, change no labels, leave the issue for next cycle — until the streak hits
+    the backstop, when we post exactly one held comment so a truly broken issue isn't
+    retried forever in silence (ADR 0019)."""
+    key = (cfg.repo, n)
+    fails = _intake_infra_failures.get(key, 0) + 1
+    _intake_infra_failures[key] = fails
+    if fails < INTAKE_MAX_INFRA_FAILURES:
+        return f"#{n}: intake couldn't start ({result.detail}) — retrying silently ({fails}/{INTAKE_MAX_INFRA_FAILURES})"
+    del _intake_infra_failures[key]
+    apply_intake(cfg.repo, n, "", [], replace(result, infra_failed=False))  # a real, human-visible hold
+    notify("agentflow needs you", f"{cfg.repo} #{n}: intake keeps failing to start",
+           f"https://github.com/{cfg.repo}/issues/{n}")
+    return f"#{n}: intake couldn't start ({result.detail}) — held after {INTAKE_MAX_INFRA_FAILURES} tries"
+
+
 def intake_once(cfg: RepoConfig) -> str:
     """Triage the next issue: a held issue the maintainer just answered (resume, ADR
     0019) or the oldest un-triaged one (ADR 0016). Ground, route, write to GitHub."""
@@ -560,6 +584,9 @@ def intake_once(cfg: RepoConfig) -> str:
     _claim_triage(cfg.repo, n)   # own the issue before the long session (dispatch dedup)
     try:
         result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
+        if result.infra_failed:
+            return _handle_intake_infra_failure(cfg, n, result)
+        _intake_infra_failures.pop((cfg.repo, n), None)   # a clean run ends the streak
         current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
         summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
     finally:

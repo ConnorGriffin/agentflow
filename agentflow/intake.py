@@ -58,6 +58,7 @@ class IntakeRoute(str, Enum):
     READY = "ready"     # build-ready — write the brief, stamp dials, proceed
     GRILL = "grill"     # hold: a real fork only the human can settle
     MOCKUP = "mockup"   # hold: needs a locked visual spec first
+    NOTHING_NEW = "nothing-new"  # resume found nothing genuinely open changed — stay quiet
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +70,7 @@ class IntakeResult:
     effort: Effort | None = None
     parsed: bool = True
     detail: str = ""
+    infra_failed: bool = False       # a worktree/provision/launch failure, not a model decision
 
 
 def _held(detail: str) -> IntakeResult:
@@ -77,6 +79,18 @@ def _held(detail: str) -> IntakeResult:
             "Let's settle it together — reply here with what you meant, or run "
             "`/agentflow pickup` to drive it live.")
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail)
+
+
+def _infra_failed(detail: str) -> IntakeResult:
+    """An *infrastructure* failure — the worktree, provision, or launch fell over before
+    the model ever weighed in. Unlike a model-level hold this is not the issue's fault, so
+    the loop retries it silently next cycle rather than spending the issue's state on a
+    spammy hold (ADR 0019 — no spam). The body is only ever posted if the loop's bounded
+    backstop fires after a run of consecutive failures."""
+    body = (f"{_DISCLAIMER}\n\nI keep hitting a setup problem before I can even start "
+            "grounding this — it's on my end, not your issue. I'll keep retrying; flagging "
+            "it here in case it needs a look.")
+    return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail, infra_failed=True)
 
 
 def _json_objects(text: str) -> list[dict]:
@@ -129,6 +143,8 @@ def parse_intake(payload: str) -> IntakeResult:
             route = _enum_or_none(IntakeRoute, data.get("route"))
             if route is None:
                 continue  # not the decision object — try the next candidate
+            if route is IntakeRoute.NOTHING_NEW:
+                return IntakeResult(route, "")  # a no-op resume: no body, nothing to post
             body = str(data.get("body", "")).strip()
             if not body:
                 return _held("intake decision carried no body")
@@ -307,18 +323,21 @@ class Intake:
             self.runner.prepare_worktree_detached(workdir, "origin/main", wt)
             self.runner.provision(wt)
         except subprocess.CalledProcessError as e:
-            return _held(f"intake worktree/provision failed: {e}")
+            return _infra_failed(f"intake worktree/provision failed: {e}")
 
         prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(n), disclaimer=_DISCLAIMER,
                        title=issue.get("title", ""), body=issue.get("body") or "(no description)")
         if extra:
             prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier questions — treat this as the "
-                       "answer: promote to ready if it's settled, else re-post only what's still open.\n"
+                       "answer: promote to ready if it's settled, else re-post ONLY what's still open. "
+                       'If nothing genuinely open changed — the reply was chit-chat, or it didn\'t move '
+                       'any open question — answer route "nothing-new" (no body) and I\'ll stay quiet '
+                       "rather than restate myself.\n"
                        f"---\n{extra}\n---")
         # Ground at the capable tier — a cheap model that mis-scopes is the expensive miss.
         ok, message = self.runner.launch(prompt, cwd=str(wt), model=self.runner.model_for(Complexity.DEEP))
         if not ok:
-            return _held("intake session errored (launch non-zero)")
+            return _infra_failed("intake session errored (launch non-zero)")
         return parse_intake(message)
 
 
@@ -339,6 +358,21 @@ def _issue_body(repo: str, issue_number: int) -> str:
         return ""
 
 
+def _latest_comment(repo: str, issue_number: int) -> str:
+    """The issue's most recent non-empty comment body, or "" if none / unreadable. Impure."""
+    r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"])
+    if r.returncode != 0:
+        return ""
+    try:
+        comments = json.loads(r.stdout or "{}").get("comments", [])
+    except ValueError:
+        return ""
+    for c in reversed(comments):
+        if c.get("body", "").strip():
+            return c["body"].strip()
+    return ""
+
+
 def apply_intake(repo: str, issue_number: int, current_title: str,
                  current_labels: list[str], result: IntakeResult) -> str:
     """Write the decision to GitHub, then set the one state label + dials (clearing any
@@ -347,21 +381,30 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
     On `ready` the brief is a **build input**: it goes into the issue *body* (where the
     builder prompt and reviewer acceptance read it, ADR 0016/0022), the as-filed text is
     preserved below it, and the thread gets a short conversational note. On `grill` /
-    `mockup` — those are conversations, not build inputs — the full text stays a comment."""
-    labels = intake_labels(result)
-    retitled_from = None
-    if result.title and result.title != current_title:
-        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", result.title])
-        retitled_from = current_title
+    `mockup` — those are conversations, not build inputs — the full text stays a comment.
 
+    No-spam (ADR 0019): a `nothing-new` resume writes nothing at all, and an apply whose
+    comment materially matches the latest comment we already posted is skipped — a
+    nothing-changed recheck must not restate itself."""
+    if result.route is IntakeRoute.NOTHING_NEW:
+        return "nothing new — nothing to post"
+
+    labels = intake_labels(result)
+    retitled_from = current_title if (result.title and result.title != current_title) else None
+    comment = _READY_COMMENT if result.route is IntakeRoute.READY else result.body
+    if retitled_from is not None:
+        comment = f'> Retitled from: "{retitled_from}"\n\n{comment}'
+
+    # Idempotent: if our last word on this issue already says the same thing, changing
+    # nothing (no comment, no label churn) is the whole point — don't re-post it.
+    if INTAKE_MARK in comment and comment.strip() == _latest_comment(repo, issue_number):
+        return f"unchanged -> {result.route.value} (already posted)"
+
+    if retitled_from is not None:
+        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", result.title])
     if result.route is IntakeRoute.READY:
         body = compose_ready_body(result.body, _issue_body(repo, issue_number))
         _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--body", body])
-        comment = _READY_COMMENT
-    else:
-        comment = result.body
-    if retitled_from is not None:
-        comment = f'> Retitled from: "{retitled_from}"\n\n{comment}'
     _run(["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", comment])
 
     for name in labels:
