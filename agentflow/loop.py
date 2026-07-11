@@ -521,6 +521,8 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
             if ok:
                 ratchet.record(cfg.repo, ratchet.CLEAN_MERGE if revises_used == 0
                                else "merge_after_revise")
+                _run(["gh", "issue", "edit", str(n), "--repo", cfg.repo,
+                      "--remove-label", "ready-for-agent"])
                 return f"#{n}: MERGED PR #{pr}"
             park(cfg.repo, pr, verdict,
                  reason="could not be squash-merged (branch protection, conflict, or transient error)")

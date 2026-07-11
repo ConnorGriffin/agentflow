@@ -11,7 +11,7 @@ import pytest
 from agentflow import intake as intake_mod
 from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, apply_intake,
                               awaiting_recheck, compose_ready_body, intake_labels,
-                              parse_intake, replies_since_intake)
+                              parse_intake, replies_since_intake, sweep_legacy_labels)
 from agentflow.runner import Complexity, Effort
 
 
@@ -348,3 +348,134 @@ def test_intake_marks_a_worktree_failure_as_infra(tmp_path, monkeypatch):
     r = intake_mod.Intake(runner).intake("owner/repo", str(tmp_path),
                                          {"number": 5, "title": "t", "body": "b"})
     assert r.infra_failed is True
+
+
+# --- dial label cleanup on re-route (issue #27) ----------------------------------
+
+def _label_edit_cmd(rec: _GhRecorder) -> list[str]:
+    """The gh issue edit call that sets labels (has --add-label or just removes)."""
+    for c in rec.calls:
+        if "edit" in c and ("--add-label" in c or "--remove-label" in c) and "--body" not in c:
+            return c
+    return []
+
+
+def test_apply_intake_clears_stale_dial_labels_on_reroute(monkeypatch):
+    # Before fix: only STATE_LABELS were stripped; old dials accreted.
+    # After fix: stale agentflow:complexity:* and agentflow:effort:* are removed too.
+    rec = _GhRecorder(current_body="brief v1")
+    monkeypatch.setattr(intake_mod, "_run", rec)
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief v2\nnew scope",
+                          "", Complexity.STANDARD, Effort.LOW)
+    apply_intake("owner/repo", 7, "t",
+                 ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:medium"],
+                 result)
+
+    cmd = _label_edit_cmd(rec)
+    assert cmd, "should have a label edit command"
+    adds = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--add-label"]
+    removes = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--remove-label"]
+
+    assert "agentflow:complexity:standard" in adds
+    assert "agentflow:effort:low" in adds
+    assert "agentflow:complexity:deep" in removes, "stale complexity dial must be stripped"
+    assert "agentflow:effort:medium" in removes, "stale effort dial must be stripped"
+
+
+def test_apply_intake_unchanged_dials_not_removed(monkeypatch):
+    # Re-routing with the same dials should not generate spurious --remove-label calls.
+    rec = _GhRecorder(current_body="brief v1")
+    monkeypatch.setattr(intake_mod, "_run", rec)
+    result = IntakeResult(IntakeRoute.READY, "## Brief v2", "", Complexity.DEEP, Effort.MEDIUM)
+    apply_intake("owner/repo", 9, "t",
+                 ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:medium"],
+                 result)
+
+    cmd = _label_edit_cmd(rec)
+    removes = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--remove-label"]
+    assert "agentflow:complexity:deep" not in removes
+    assert "agentflow:effort:medium" not in removes
+
+
+def test_apply_intake_strips_dials_when_routing_to_hold(monkeypatch):
+    # Transitioning from ready to grill should clear dial labels — they belong only on ready.
+    rec = _GhRecorder()
+    monkeypatch.setattr(intake_mod, "_run", rec)
+    result = IntakeResult(IntakeRoute.GRILL, "> *agentflow intake*\n\nwhich did you mean?")
+    apply_intake("owner/repo", 5, "t",
+                 ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:high"],
+                 result)
+
+    cmd = _label_edit_cmd(rec)
+    removes = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--remove-label"]
+    assert "agentflow:complexity:deep" in removes
+    assert "agentflow:effort:high" in removes
+
+
+# --- legacy label sweep (issue #27) ----------------------------------------------
+
+def _fake_run_for_sweep(issues_payload: str):
+    """Return a fake _run that serves the given payload for list calls."""
+    calls: list[list[str]] = []
+
+    def _run(cmd, cwd=None):
+        calls.append(cmd)
+        if "list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=issues_payload)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    return _run, calls
+
+
+def test_sweep_migrates_bare_grilling_label(monkeypatch):
+    issues = [{"number": 1, "labels": [{"name": "needs-grilling"}]}]
+    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
+    monkeypatch.setattr(intake_mod, "_run", fake_run)
+
+    changed = sweep_legacy_labels("owner/repo")
+
+    assert len(changed) == 1 and "#1" in changed[0]
+    assert "agentflow:needs-grilling" in changed[0]
+    edit_calls = [c for c in calls if "edit" in c]
+    assert any("--add-label" in c and "agentflow:needs-grilling" in c for c in edit_calls)
+    assert any("--remove-label" in c and "needs-grilling" in c for c in edit_calls)
+
+
+def test_sweep_removes_bare_when_namespaced_already_present(monkeypatch):
+    # Issue already has the namespaced form — just drop the bare one, don't re-add.
+    issues = [{"number": 2, "labels": [{"name": "needs-mockup"},
+                                        {"name": "agentflow:needs-mockup"}]}]
+    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
+    monkeypatch.setattr(intake_mod, "_run", fake_run)
+
+    changed = sweep_legacy_labels("owner/repo")
+
+    assert len(changed) == 1
+    cmd = next(c for c in calls if "edit" in c)
+    assert "--remove-label" in cmd and "needs-mockup" in cmd
+    assert "--add-label" not in cmd, "should not re-add the namespaced label that's already there"
+
+
+def test_sweep_leaves_already_correct_and_unrelated_labels_alone(monkeypatch):
+    issues = [
+        {"number": 3, "labels": [{"name": "agentflow:needs-grilling"}]},  # already namespaced
+        {"number": 4, "labels": [{"name": "ready-for-agent"}, {"name": "bug"}]},  # unrelated
+    ]
+    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
+    monkeypatch.setattr(intake_mod, "_run", fake_run)
+
+    changed = sweep_legacy_labels("owner/repo")
+
+    assert changed == [], "nothing to change"
+    edit_calls = [c for c in calls if "edit" in c]
+    assert edit_calls == [], "no edits should be issued"
+
+
+def test_sweep_ready_for_agent_stays_bare(monkeypatch):
+    # ready-for-agent is intentionally bare (ADR 0018) — sweep must not touch it.
+    issues = [{"number": 5, "labels": [{"name": "ready-for-agent"}]}]
+    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
+    monkeypatch.setattr(intake_mod, "_run", fake_run)
+
+    changed = sweep_legacy_labels("owner/repo")
+    assert changed == []
