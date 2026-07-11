@@ -7,11 +7,12 @@ import pytest
 
 from agentflow import loop
 from agentflow.intake import IntakeRoute
-from agentflow.loop import (BUILD_PROMPT, RepoConfig, _free_to_dispatch, _issues_in_flight,
-                            _next_ready_issue, _untriaged, build_issue, complexity_from_labels,
-                            effort_from_labels, held_build_result, issue_of_branch, pr_number,
-                            reclaim_claims, repo_profile, slug)
-from agentflow.runner import Complexity, Effort
+from agentflow.loop import (BUILD_PROMPT, RepoConfig, _build_review_merge, _free_to_dispatch,
+                            _issues_in_flight, _next_ready_issue, _untriaged, build_issue,
+                            complexity_from_labels, effort_from_labels, held_build_result,
+                            issue_of_branch, pr_number, reclaim_claims, repo_profile, slug)
+from agentflow.reviewer import Verdict
+from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
 
 
 class _FakeRun:
@@ -226,3 +227,47 @@ def test_build_issue_refuses_an_in_flight_issue(monkeypatch):
     monkeypatch.setattr(loop, "_dispatch_build", lambda *a: pytest.fail("must not double-dispatch"))
     out = build_issue(RepoConfig("o/r", "/tmp"), 9)
     assert "flight" in out.lower() or "claim" in out.lower()
+
+
+def test_failed_merge_parks_and_pings(monkeypatch):
+    # A squash-merge failure (branch protection, conflict, transient error) must not
+    # silently idle — it must park the PR, ping, and record a ratchet event.
+    CLEAN_VERDICT = Verdict(clean=True)
+
+    class _FakeBuilder:
+        tool = "claude"
+        def build(self, task):
+            return BuildOutcome(BuildStatus.PR_OPENED, pr_url="https://github.com/o/r/pull/42")
+
+    class _FakeReviewer:
+        tool = "codex"
+
+    parked, notified, recorded = [], [], []
+
+    monkeypatch.setattr(loop, "ci_is_green", lambda repo, pr: True)
+    monkeypatch.setattr(loop, "squash_merge", lambda repo, pr: False)
+    monkeypatch.setattr(loop, "park",
+                        lambda repo, pr, verdict, reason="": parked.append((repo, pr, reason)))
+    monkeypatch.setattr(loop, "notify",
+                        lambda title, msg, url="": notified.append((title, msg)))
+    monkeypatch.setattr(loop.ratchet, "record",
+                        lambda repo, outcome: recorded.append(outcome))
+
+    class _PatchedReviewer:
+        def __init__(self, runner): pass
+        def review(self, *args, **kwargs): return CLEAN_VERDICT
+
+    monkeypatch.setattr(loop, "Reviewer", _PatchedReviewer)
+
+    cfg = RepoConfig("o/r", "/tmp")
+    issue = {"number": 42, "title": "t", "body": ""}
+    out = _build_review_merge(cfg, issue, 42, "t", Complexity.STANDARD, Effort.MEDIUM,
+                              _FakeBuilder(), _FakeReviewer(), "autonomous", "build")
+
+    assert "merge failed" in out
+    assert parked, "park must be called on merge failure"
+    assert parked[0][1] == 42
+    assert "branch protection" in parked[0][2] or "squash" in parked[0][2]
+    assert notified, "notify must be called on merge failure"
+    assert "needs you" in notified[0][0]
+    assert "parked" in recorded
