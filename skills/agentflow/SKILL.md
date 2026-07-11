@@ -103,8 +103,11 @@ agentflow's own code so the shape is identical:
    checkbox list; grounded numeric literals where they apply, and a test that fails if the
    bug regressed) · **Out of scope**.
 2. Pick the two dials: `complexity` ∈ {standard, deep}, `effort` ∈ {low, medium, high, extra}.
-3. Write it with the shared core (retitles, posts the brief, sets `ready-for-agent` + the
-   dials, clears any hold label):
+3. Write it with the shared core (retitles, **writes the brief into the issue body** —
+   where the builder and reviewer actually read it, ADR 0016/0022 — preserving the
+   as-filed text under a collapsed `<details>` block and leaving a short conversational
+   comment on the thread; sets `ready-for-agent` + the dials, clears any hold label). A
+   re-intake updates the body brief in place, never a second one:
 
    ```bash
    uv run python - "$REPO" "$N" "$TITLE" <<'PY'
