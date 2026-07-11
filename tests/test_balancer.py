@@ -60,13 +60,34 @@ def test_neither_clear_is_no_capacity():
     assert choose_pair(claude, codex, RUNNERS) == (None, None)
 
 
+def test_pick_pair_block_msg_names_blocked_pools(stub_gate, monkeypatch):
+    """When both pools are blocked the third return value names each pool and its reason
+    so callers can surface it in deferral log lines instead of a bare 'no headroom'."""
+    monkeypatch.setenv("TEST_ACTIVE", "1")
+    monkeypatch.setenv("TEST_SPEND_PCT", "19")   # activity gate fires; spend is fine
+    _, _, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
+    assert "claude" in block_msg
+    assert "codex" in block_msg
+    # Each pool should carry something from the gate's check output
+    assert "session" in block_msg or "active" in block_msg
+
+
+def test_pick_pair_block_msg_empty_when_headroom(stub_gate, monkeypatch):
+    """block_msg is empty string when at least one pool is clear and a builder is returned."""
+    monkeypatch.setenv("TEST_SPEND_PCT", "19")
+    builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX")
+    assert builder is not None
+    assert block_msg == ""
+
+
 def test_operator_dispatch_ignores_active_session(stub_gate, monkeypatch):
     """A by-hand build fired while a session is active (and spend well under the
     ceiling) still gets a full pair — the recent-activity guard is skipped. Fails
     for the daemon (operator=False) below, which is the point of the flag."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
-    assert pick_pair("CLAUDE", "CODEX", operator=True) != (None, None)
+    builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=True)
+    assert builder is not None
 
 
 def test_daemon_dispatch_still_respects_active_session(stub_gate, monkeypatch):
@@ -74,7 +95,8 @@ def test_daemon_dispatch_still_respects_active_session(stub_gate, monkeypatch):
     defers both pools, so no capacity this cycle."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
-    assert pick_pair("CLAUDE", "CODEX", operator=False) == (None, None)
+    builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
+    assert builder is None
 
 
 def test_operator_dispatch_still_honors_spend_ceiling(stub_gate, monkeypatch):
@@ -82,7 +104,8 @@ def test_operator_dispatch_still_honors_spend_ceiling(stub_gate, monkeypatch):
     even for a by-hand build."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "88")   # over the 40% ceiling
-    assert pick_pair("CLAUDE", "CODEX", operator=True) == (None, None)
+    builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=True)
+    assert builder is None
 
 
 @pytest.mark.parametrize("stdout,rc,expected", [

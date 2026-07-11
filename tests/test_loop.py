@@ -214,7 +214,7 @@ def test_dispatch_build_builds_guarded_from_the_brief(monkeypatch):
     # the Agent Brief in the issue body like every profile. Fails first if the guarded branch
     # still bails with "needs a frozen work order".
     monkeypatch.setattr(loop, "repo_profile", lambda wd: "guarded")
-    monkeypatch.setattr(loop, "pick_pair", lambda operator=False: (object(), object()))
+    monkeypatch.setattr(loop, "pick_pair", lambda operator=False: (object(), object(), ""))
     monkeypatch.setattr(loop, "_claim", lambda repo, n: None)
     monkeypatch.setattr(loop, "_release", lambda repo, n: None)
     seen = {}
@@ -229,6 +229,83 @@ def test_dispatch_build_builds_guarded_from_the_brief(monkeypatch):
     assert loop._dispatch_build(RepoConfig("o/r", "/tmp/x"), issue) == "#3: built"
     assert seen["profile"] == "guarded"
     assert "THE AGENT BRIEF BODY" in seen["prompt"]   # built from the Brief, not a work order
+
+
+def test_dispatch_build_emits_routing_log_before_session(monkeypatch):
+    """_log is called with 'routing → <tool> (build)' the instant a builder is chosen,
+    before the long session starts. Fails first if the log call is missing or comes after."""
+    class _FakeBuilder:
+        tool = "codex"
+
+    log_calls = []
+    brm_calls = []
+
+    def fake_brm(*a, **k):
+        brm_calls.append(list(log_calls))   # snapshot log state at session start
+        return "#7: built"
+
+    monkeypatch.setattr(loop, "repo_profile", lambda wd: "autonomous")
+    monkeypatch.setattr(loop, "pick_pair", lambda operator=False: (_FakeBuilder(), None, ""))
+    monkeypatch.setattr(loop, "_claim", lambda repo, n: None)
+    monkeypatch.setattr(loop, "_release", lambda repo, n: None)
+    monkeypatch.setattr(loop, "_build_review_merge", fake_brm)
+    issue = {"number": 7, "title": "t", "body": "b",
+             "labels": [{"name": "agentflow:complexity:standard"}]}
+    loop._dispatch_build(RepoConfig("o/r", "/tmp"), issue, _log=log_calls.append)
+    assert any("routing → codex (build)" in m for m in log_calls)
+    assert brm_calls and any("routing" in m for m in brm_calls[0])   # logged before session
+
+
+def test_dispatch_build_deferral_includes_block_reason(monkeypatch):
+    """When no pool has headroom the deferral message names the per-pool block reason."""
+    monkeypatch.setattr(loop, "pick_pair",
+                        lambda operator=False: (None, None, "codex: rate limited, claude: active session"))
+    issue = {"number": 9, "title": "t", "body": "b",
+             "labels": [{"name": "agentflow:complexity:standard"}]}
+    out = loop._dispatch_build(RepoConfig("o/r", "/tmp"), issue)
+    assert "codex: rate limited" in out
+    assert "claude: active session" in out
+    assert "deferring" in out
+
+
+def test_intake_once_emits_routing_log_before_session(monkeypatch):
+    """_log is called with 'routing → <tool> (intake)' before the intake session starts."""
+    class _FakeBuilder:
+        tool = "claude"
+        def __init__(self): pass
+
+    log_calls = []
+    intake_calls = []
+
+    class _FakeIntake:
+        def __init__(self, runner): pass
+        def intake(self, *a, **k):
+            intake_calls.append(list(log_calls))   # snapshot log state at session start
+            from agentflow.intake import IntakeResult, IntakeRoute
+            return IntakeResult(route=IntakeRoute.READY, body="scoped to ready")
+
+    issue = {"number": 5, "title": "t", "labels": [], "state": "OPEN"}
+    monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
+    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "pick_pair", lambda: (_FakeBuilder(), None, ""))
+    monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: None)
+    monkeypatch.setattr(loop, "Intake", _FakeIntake)
+    monkeypatch.setattr(loop, "apply_intake", lambda *a, **k: "scoped to ready")
+    loop.intake_once(RepoConfig("o/r", "/tmp"), _log=log_calls.append)
+    assert any("routing → claude (intake)" in m for m in log_calls)
+    assert intake_calls and any("routing" in m for m in intake_calls[0])   # logged before session
+
+
+def test_intake_once_deferral_includes_block_reason(monkeypatch):
+    """When no pool has headroom the intake deferral names the per-pool block reason."""
+    issue = {"number": 3, "title": "t", "labels": []}
+    monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
+    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "pick_pair", lambda: (None, None, "codex: busy, claude: you"))
+    out = loop.intake_once(RepoConfig("o/r", "/tmp"))
+    assert "codex: busy" in out and "claude: you" in out
+    assert "deferring" in out
 
 
 def _issue_view(monkeypatch, issue):
@@ -473,7 +550,7 @@ def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
             return True, "replied"
         def build(self, task): pytest.fail("responder must never build/open a PR")
 
-    monkeypatch.setattr(loop, "pick_pair", lambda: (_FakeRunner(), None))
+    monkeypatch.setattr(loop, "pick_pair", lambda: (_FakeRunner(), None, ""))
     monkeypatch.setattr(loop, "squash_merge", lambda *a: pytest.fail("responder must never merge"))
 
     out = respond_once(RepoConfig("o/r", "/tmp"))
@@ -485,7 +562,7 @@ def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
 def test_respond_once_noop_when_nothing_pending(monkeypatch):
     _pr_gh(monkeypatch, [{"number": 7, "headRefName": "agentflow/claude/issue-3-x"}],
            {7: [{"body": _PARK}]})   # our marker had the last word
-    monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))
+    monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))  # never returns
     assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
 
 
@@ -613,7 +690,7 @@ def _wire_survivor_merge(monkeypatch, *, reviewer_tool, ci_green, verdict):
 
     monkeypatch.setattr(loop, "Reviewer", _Reviewer)
     monkeypatch.setattr(loop, "pick_pair",
-                        lambda: (SimpleNamespace(tool="x"), SimpleNamespace(tool=reviewer_tool)))
+                        lambda: (SimpleNamespace(tool="x"), SimpleNamespace(tool=reviewer_tool), ""))
     monkeypatch.setattr(loop, "_issue_meta", lambda cfg, n: {"body": "", "labels": []})
     monkeypatch.setattr(loop, "ui_surfaces", lambda wd: [])
     monkeypatch.setattr(loop, "ui_evidence_gap", lambda repo, pr, s: False)
@@ -683,7 +760,7 @@ def _stub_intake_once(monkeypatch, result):
     loop._intake_infra_failures.clear()
     monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
     monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg: issue)
-    monkeypatch.setattr(loop, "pick_pair", lambda: (object(), None))
+    monkeypatch.setattr(loop, "pick_pair", lambda: (object(), None, ""))
     monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
     monkeypatch.setattr(loop, "_release_triage", lambda repo, n: None)
     monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
