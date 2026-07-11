@@ -110,9 +110,10 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
     # unescaped brace in the rubric would KeyError here and wedge every review — so this
     # both guards the bracing and locks ADR 0018's two always-on gates into the rubric,
     # without which the reviewer structurally can't block on them.
-    body = REVIEW_PROMPT.format(pr=42, acceptance="ships a thing")
+    body = REVIEW_PROMPT.format(pr=42, acceptance="ships a thing", surfaces="`agentflow/static/`")
     assert "#42" in body and "ships a thing" in body
     # the reviewer must actually fetch the body/files, not just the diff
     assert "headRefOid,files,body" in body
     assert "screenshot" in body.lower()                # UI-change evidence gate
     assert "framed for the human" in body.lower()      # plain-language / no-jargon gate
+    assert "agentflow/static/" in body                 # the repo's declared surfaces, not a hardcoded example

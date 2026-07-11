@@ -4,6 +4,7 @@ The tool-agnostic autonomous issue → PR → review pipeline. This repo **is** 
 engine, enrolled into its own fleet to dogfood it. Python, uv-managed.
 
 profile: reviewed
+ui-surfaces: agentflow/static/
 
 ## Repo facts
 - **Python, uv.** Install: `uv sync --group dev`. **Test / CI gate:** `uv run pytest -q`.
