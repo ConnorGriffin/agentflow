@@ -526,15 +526,26 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
 
 
 def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
-    """A `needs-grilling` issue whose latest comment is the maintainer's reply — return
-    it with their answer text so intake can resolve it (ADR 0019). `needs-mockup` resumes
-    via `/agentflow mockup`, not an unattended re-triage."""
-    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-              "--label", "agentflow:needs-grilling", "--json", "number,title,body,labels",
-              "--limit", "50"])
-    if r.returncode != 0:
-        return None
-    for issue in sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"]):
+    """A `needs-grilling` or `needs-mockup` issue whose latest comment is the maintainer's
+    reply — return it with their answer text so intake can resolve it (ADR 0019). A waiver
+    reply on a mockup-held issue ("skip the mockup, build it") promotes to ready; a locked-spec
+    reply ("here is the visual spec") does the same. Use `/agentflow pickup <N>` to drive
+    either interactively instead."""
+    issues: list[dict] = []
+    for label in ("agentflow:needs-grilling", "agentflow:needs-mockup"):
+        r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+                  "--label", label, "--json", "number,title,body,labels",
+                  "--limit", "50"])
+        if r.returncode != 0:
+            return None
+        issues.extend(json.loads(r.stdout or "[]"))
+    seen: set[int] = set()
+    deduped = []
+    for issue in sorted(issues, key=lambda i: i["number"]):
+        if issue["number"] not in seen:
+            seen.add(issue["number"])
+            deduped.append(issue)
+    for issue in deduped:
         if TRIAGING in {lbl["name"] for lbl in issue["labels"]}:
             continue   # a re-intake already owns this held issue
         cr = _run(["gh", "issue", "view", str(issue["number"]), "--repo", cfg.repo, "--json", "comments"])
