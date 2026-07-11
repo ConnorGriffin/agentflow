@@ -9,9 +9,11 @@ Properties:
   stopped instantly (`rm ~/.agentflow/enabled`). ADR 0011's kill switch.
 - **Crash-tolerant** — each cycle is independent; an exception is logged and the loop
   continues. State of record is GitHub, so a restart loses nothing.
-- **Single instance** — a lock dir prevents overlapping runs; the running daemon
-  heartbeats the lock each cycle so it is never seen as stale, and only a genuinely
-  stale lock (from a crashed run) is reclaimed. Single-instance is load-bearing:
+- **Single instance** — a lock dir (stamped with the owner's pid) prevents overlapping
+  runs; a background thread heartbeats the lock every ~60s so even a cycle longer than
+  the stale threshold is never seen as stale, and only a genuinely stale lock (from a
+  crashed run) is reclaimed — atomically, taking real ownership. Shutdown removes the
+  lock only if this process still owns it. Single-instance is load-bearing:
   dispatch dedup (the `agentflow:building` and `agentflow:triaging` claims) assumes one
   daemon — each is check-then-claim, not atomic, so it dedups within one serial daemon.
 
@@ -27,6 +29,8 @@ from __future__ import annotations
 import argparse
 import datetime
 import os
+import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +40,12 @@ STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentf
 ENABLE_FLAG = STATE_DIR / "enabled"
 LOCK = STATE_DIR / "daemon.lock"
 POLL_SECONDS = int(os.environ.get("AGENTFLOW_POLL_SECONDS", "300"))
+
+# The lock is heartbeated every ~60s by a background thread, so a lock older than this
+# means the owner is genuinely gone (crashed) — never merely mid-cycle. Keep the
+# threshold well above the heartbeat interval so a missed beat or two is tolerated.
+HEARTBEAT_SECONDS = 60
+STALE_SECONDS = 3 * 3600
 
 # One repo per entry; extend as repos are enrolled (each needs an AGENTS.md
 # `profile:` line, ready-for-agent + tier:* labels, and PR CI).
@@ -64,18 +74,70 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
             _log(f"{cfg.repo}: cycle error: {type(e).__name__}: {e}")
 
 
-def _acquire_lock() -> bool:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+def _try_claim() -> bool:
+    """Atomically create the lock dir and stamp our pid inside. `mkdir` is the atomic
+    step — exactly one racer can win it; the rest see FileExistsError and bow out."""
     try:
         LOCK.mkdir()
-        return True
     except FileExistsError:
-        # Reclaim a stale lock (>3h) from a crashed run.
-        age = time.time() - LOCK.stat().st_mtime
-        if age > 3 * 3600:
-            log("reclaiming stale lock")
-            return True
         return False
+    (LOCK / "pid").write_text(str(os.getpid()))
+    return True
+
+
+def _acquire_lock() -> bool:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if _try_claim():
+        return True
+    try:
+        age = time.time() - LOCK.stat().st_mtime
+    except OSError:
+        return _try_claim()  # lock vanished between checks — grab it fresh
+    if age <= STALE_SECONDS:
+        return False
+    # Stale lock from a crashed run: take real ownership. Rename the stale dir out of
+    # the way first — the rename is atomic, so if two starters race the reclaim exactly
+    # one wins it (the losers' rename fails because the source is already gone) and
+    # only the winner recreates + re-claims the lock.
+    stale = LOCK.with_name(f"{LOCK.name}.stale.{os.getpid()}")
+    try:
+        os.rename(LOCK, stale)
+    except OSError:
+        return False  # lost the reclaim race — another starter owns the lock now
+    log("reclaiming stale lock")
+    shutil.rmtree(stale, ignore_errors=True)
+    return _try_claim()
+
+
+def _owns_lock() -> bool:
+    """True only if the live lock carries our pid — so we never remove another daemon's."""
+    try:
+        return (LOCK / "pid").read_text().strip() == str(os.getpid())
+    except OSError:
+        return False
+
+
+def _release_lock() -> None:
+    if not _owns_lock():
+        return
+    try:
+        (LOCK / "pid").unlink()
+        LOCK.rmdir()
+    except OSError:
+        pass
+
+
+def _heartbeat(stop: threading.Event) -> None:
+    """Touch the lock every ~60s so a *healthy* daemon is never seen as stale — even
+    during a cycle longer than the stale threshold (one slow build+review+revise chain
+    across repos is realistic). Runs in the background so a long cycle can't freeze the
+    mtime; that frozen mtime is exactly what would let a second daemon reclaim a live
+    lock, clear this daemon's build claim, and run a duplicate build."""
+    while not stop.wait(HEARTBEAT_SECONDS):
+        try:
+            os.utime(LOCK, None)
+        except OSError:
+            return
 
 
 def main() -> None:
@@ -90,6 +152,9 @@ def main() -> None:
     if not _acquire_lock():
         log("another daemon is running; exiting")
         return
+    stop = threading.Event()
+    beat = threading.Thread(target=_heartbeat, args=(stop,), daemon=True)
+    beat.start()
     try:
         if args.once:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
@@ -97,11 +162,6 @@ def main() -> None:
             return
         log(f"daemon up — enable={ENABLE_FLAG}, poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}")
         while True:
-            # Heartbeat the lock so a *healthy* daemon is never seen as stale — else a
-            # second daemon reclaims the (frozen-mtime) lock, runs concurrently, and its
-            # reclaim clears this daemon's live build claim → a duplicate build. The lock
-            # is what makes dispatch dedup's single-instance assumption actually hold.
-            os.utime(LOCK, None)
             if ENABLE_FLAG.exists():
                 # Self-heal build claims stranded by a crash or a swallowed `gh` release,
                 # every cycle (serial builds mean none is live at the top of a cycle).
@@ -114,10 +174,8 @@ def main() -> None:
                 log(f"dormant (no {ENABLE_FLAG}); sleeping")
             time.sleep(POLL_SECONDS)
     finally:
-        try:
-            LOCK.rmdir()
-        except OSError:
-            pass
+        stop.set()
+        _release_lock()
 
 
 if __name__ == "__main__":
