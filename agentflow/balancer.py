@@ -33,6 +33,7 @@ class PoolStatus:
     tool: str
     clear: bool
     spent_pct: float   # 0..100; lower = more headroom
+    reason: str = ""   # gate's check output when blocked, stripped of "blocked: " prefix
 
 
 def parse_pct(stdout: str, returncode: int) -> float:
@@ -72,14 +73,16 @@ def _query_pool(tool: str, operator: bool = False) -> PoolStatus:
         sp = subprocess.run([_GATE, "spend"], env=env, text=True, capture_output=True, timeout=30)
         ck = subprocess.run([_GATE, "check"], env=env, text=True, capture_output=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
-        return PoolStatus(tool, False, 100.0)           # no gate → treat as no headroom
+        return PoolStatus(tool, False, 100.0, "gate unavailable")
     # Prefer the real spend %; fall back to `check`'s output if the gate is too old
     # to have `spend` mode — degrade gracefully, never crash.
     if sp.stdout.strip().startswith("spend:"):
         pct = parse_pct(sp.stdout, 0)
     else:
         pct = parse_pct(ck.stdout, ck.returncode)
-    return PoolStatus(tool, ck.returncode == 0, pct)
+    raw = ck.stdout.strip()
+    reason = raw[len("blocked: "):] if raw.startswith("blocked: ") else raw
+    return PoolStatus(tool, ck.returncode == 0, pct, reason)
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,
@@ -87,8 +90,20 @@ def pick_pair(claude: _WorktreeRunner | None = None,
               operator: bool = False) -> tuple:
     """Live: query both pools and choose the pair. See `choose_pair`. `operator=True`
     marks an explicit by-hand dispatch, which skips the pools' recent-activity guard
-    while still honoring their spend ceiling — the pair-vs-single decision is unchanged."""
+    while still honoring their spend ceiling — the pair-vs-single decision is unchanged.
+
+    Returns (builder, reviewer, block_msg). block_msg is "" when builder is not None;
+    when both pools are blocked it names each pool and its gate reason."""
     claude = claude or ClaudeRunner()
     codex = codex or CodexRunner()
-    return choose_pair(_query_pool("claude", operator), _query_pool("codex", operator),
-                       {"claude": claude, "codex": codex})
+    cs = _query_pool("claude", operator)
+    xs = _query_pool("codex", operator)
+    builder, reviewer = choose_pair(cs, xs, {"claude": claude, "codex": codex})
+    if builder is not None:
+        return builder, reviewer, ""
+    blocked = [s for s in (cs, xs) if not s.clear]
+    block_msg = ", ".join(
+        f"{s.tool}: {s.reason}" if s.reason else s.tool
+        for s in blocked
+    ) or "both at capacity"
+    return None, None, block_msg

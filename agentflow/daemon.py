@@ -71,7 +71,7 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
     """One pass over the repos. Each is isolated: an error in one never stops the rest."""
     for cfg in repos:
         try:
-            _log(f"{cfg.repo}: {run(cfg)}")
+            _log(f"{cfg.repo}: {run(cfg, _log=_log)}")
         except Exception as e:  # noqa: BLE001 — a bad cycle must not kill the daemon
             _log(f"{cfg.repo}: cycle error: {type(e).__name__}: {e}")
 

@@ -17,7 +17,7 @@ B = RepoConfig("owner/b", "/tmp/b")
 def test_cycle_runs_every_repo_and_isolates_errors():
     seen, logs = [], []
 
-    def run(cfg):
+    def run(cfg, _log=None):
         seen.append(cfg.repo)
         if cfg.repo == "owner/a":
             raise RuntimeError("boom")
@@ -31,8 +31,23 @@ def test_cycle_runs_every_repo_and_isolates_errors():
 
 def test_cycle_logs_result_per_repo():
     logs = []
-    cycle([B], run=lambda cfg: "no ready-for-agent issues", _log=logs.append)
+    cycle([B], run=lambda cfg, _log=None: "no ready-for-agent issues", _log=logs.append)
     assert logs == ["owner/b: no ready-for-agent issues"]
+
+
+def test_cycle_passes_log_into_run():
+    """_log is forwarded into run so dispatch-start lines emitted inside pipeline_once
+    use the same sink as the cycle's own per-repo result line."""
+    emitted = []
+
+    def run(cfg, _log=None):
+        if _log:
+            _log(f"{cfg.repo}: #5: routing → codex (build)")
+        return "build: ok"
+
+    cycle([B], run=run, _log=emitted.append)
+    assert any("routing → codex" in m for m in emitted)   # dispatch-start line appeared
+    assert any("build: ok" in m for m in emitted)          # result line also appeared
 
 
 def test_main_once_runs_one_cycle_and_exits(tmp_path):

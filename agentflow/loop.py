@@ -353,12 +353,12 @@ def _preserve_progress(cfg: RepoConfig, tool: str, n: int, sl: str) -> str | Non
     return r.stdout.strip() or None
 
 
-def run_once(cfg: RepoConfig) -> str:
+def run_once(cfg: RepoConfig, _log=None) -> str:
     """Pull the next ready issue and run it end to end. Returns a one-line result."""
     issue = _next_ready_issue(cfg)
     if not issue:
         return "no ready-for-agent issues"
-    return _dispatch_build(cfg, issue)
+    return _dispatch_build(cfg, issue, _log=_log)
 
 
 HELD_LABELS = {"agentflow:needs-grilling", "agentflow:needs-mockup"}
@@ -391,7 +391,8 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     return _dispatch_build(cfg, issue, operator=True)
 
 
-def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False) -> str:
+def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False,
+                    _log=None) -> str:
     """Build one already-selected ready issue end to end: gate on the complexity label,
     claim it, then build → cross-review → merge/park under the claim. Shared by the daemon's
     next-ready pull (`run_once`) and the by-hand `build <N>` (`build_issue`) so there is one
@@ -408,9 +409,11 @@ def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False) -> str
         return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
     effort = effort_from_labels(labels)
 
-    builder, reviewer_runner = pick_pair(operator=operator)   # ADR 0006: more headroom builds; other reviews
+    builder, reviewer_runner, block_msg = pick_pair(operator=operator)   # ADR 0006: more headroom builds; other reviews
     if builder is None:
-        return f"#{n}: no pool has headroom right now — deferring"
+        return f"#{n}: no pool has headroom ({block_msg}) — deferring"
+    if _log:
+        _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (build)")
     profile = repo_profile(cfg.workdir)
     surfaces = ui_surfaces(cfg.workdir)
     sl = slug(issue["title"])
@@ -600,7 +603,7 @@ def _handle_intake_infra_failure(cfg: RepoConfig, n: int, result: IntakeResult) 
     return f"#{n}: intake couldn't start ({result.detail}) — held after {INTAKE_MAX_INFRA_FAILURES} tries"
 
 
-def intake_once(cfg: RepoConfig) -> str:
+def intake_once(cfg: RepoConfig, _log=None) -> str:
     """Triage the next issue: a held issue the maintainer just answered (resume, ADR
     0019) or the oldest un-triaged one (ADR 0016). Ground, route, write to GitHub."""
     resumable = _next_resumable_issue(cfg)
@@ -608,9 +611,11 @@ def intake_once(cfg: RepoConfig) -> str:
     if not issue:
         return "no un-triaged issues"
     n = issue["number"]
-    builder, _ = pick_pair()   # intake needs one available tool, not a pair
+    builder, _, block_msg = pick_pair()   # intake needs one available tool, not a pair
     if builder is None:
-        return f"#{n}: no pool has headroom for intake — deferring"
+        return f"#{n}: no pool has headroom for intake ({block_msg}) — deferring"
+    if _log:
+        _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (intake)")
     _claim_triage(cfg.repo, n)   # own the issue before the long session (dispatch dedup)
     try:
         result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
@@ -662,7 +667,7 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
                  str(wt), f"origin/{branch}"]).returncode == 0
 
 
-def respond_once(cfg: RepoConfig) -> str:
+def respond_once(cfg: RepoConfig, _log=None) -> str:
     """Answer the next parked PR whose latest comment is an unanswered maintainer question:
     spawn a responder in the PR-branch worktree that replies in-thread, attaches requested
     evidence, and pushes small fixes to the same branch (issue #18). Never merges, never a
@@ -675,9 +680,11 @@ def respond_once(cfg: RepoConfig) -> str:
     if not m:
         return f"PR #{pr}: unrecognized branch {branch}"
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
-    builder, _ = pick_pair()   # a reply needs one available tool, not a pair
+    builder, _, block_msg = pick_pair()   # a reply needs one available tool, not a pair
     if builder is None:
-        return f"PR #{pr}: no pool has headroom to respond — deferring"
+        return f"PR #{pr}: no pool has headroom to respond ({block_msg}) — deferring"
+    if _log:
+        _log(f"{cfg.repo}: PR #{pr}: routing → {getattr(builder, 'tool', '?')} (respond)")
     wt = Path(_builder_worktree(cfg, tool, n, sl))
     if not _checkout_pr_branch(cfg, branch, wt):
         return f"PR #{pr}: could not check out {branch} to respond — retry next cycle"
@@ -809,7 +816,7 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     cross-tool review + green CI + clean verdict, ADR 0003/0009) and land it, or park for a
     human. Parks rather than churning a revise here (that's the build loop's job); never
     less safe than `reviewed`, since the same `decide_merge` gate governs the merge."""
-    builder, reviewer_runner = pick_pair()
+    builder, reviewer_runner, _ = pick_pair()
     reviewer_runner = reviewer_runner or builder
     if reviewer_runner is None:
         return "deferred"   # no headroom to re-review — try again next cycle
@@ -885,15 +892,15 @@ def recheck_once(cfg: RepoConfig) -> str:
     return "; ".join(results) if results else "no survivors to re-rebase"
 
 
-def pipeline_once(cfg: RepoConfig) -> str:
+def pipeline_once(cfg: RepoConfig, _log=None) -> str:
     """One full pass for a repo: triage one un-triaged issue, build one ready issue, answer
     one parked PR the maintainer commented on, and re-rebase any survivor whose base moved
     when a sibling merged (ADR 0016 — intake runs ahead of the build queue; issue #18 —
     parked PRs stay answered; ADR 0009 / issue #45 — survivors never go silently conflicting)."""
     for tool in ("claude", "codex"):
         prune_stale_worktrees(cfg.repo, cfg.workdir, tool)
-    return (f"intake: {intake_once(cfg)} · build: {run_once(cfg)} · "
-            f"respond: {respond_once(cfg)} · recheck: {recheck_once(cfg)}")
+    return (f"intake: {intake_once(cfg, _log=_log)} · build: {run_once(cfg, _log=_log)} · "
+            f"respond: {respond_once(cfg, _log=_log)} · recheck: {recheck_once(cfg)}")
 
 
 def _main_config(argv: list[str]) -> RepoConfig:
