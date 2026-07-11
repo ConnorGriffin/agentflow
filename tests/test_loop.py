@@ -8,13 +8,14 @@ import pytest
 
 from agentflow import loop
 from agentflow.intake import INTAKE_MARK, IntakeRoute
-from agentflow.loop import (BUILD_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, RepoConfig,
+from agentflow.loop import (BUILD_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, RebaseResult, RepoConfig,
                             _build_review_merge, _free_to_dispatch, _issues_in_flight,
                             _main_config, _next_pr_awaiting_reply, _next_ready_issue,
-                            _next_resumable_issue, _untriaged, build_issue, complexity_from_labels,
+                            _next_resumable_issue, _rebase_survivor, _untriaged, base_advanced,
+                            build_issue, complexity_from_labels, conflict_already_flagged,
                             effort_from_labels, held_build_result, intake_allowlist,
-                            issue_of_branch, pr_number, reclaim_claims, repo_profile, respond_once,
-                            slug, ui_surfaces)
+                            issue_of_branch, pr_number, reclaim_claims, recheck_once, repo_profile,
+                            respond_once, slug, ui_surfaces)
 from agentflow.reviewer import Verdict
 from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
 
@@ -486,6 +487,171 @@ def test_respond_once_noop_when_nothing_pending(monkeypatch):
            {7: [{"body": _PARK}]})   # our marker had the last word
     monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))
     assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
+
+
+# --- issue #45: re-rebase survivors after main advances (ADR 0009 merge-time floor) -----
+
+def test_base_advanced_only_when_main_moved_past_the_last_rebase():
+    # The pure predicate that keeps a survivor whose base hasn't moved UNTOUCHED: when the
+    # merge-base already IS main's tip the branch contains current main — no rebase, no
+    # needless force-push. It only fires once main has commits the branch lacks.
+    assert base_advanced("main123", "base456") is True      # main moved past the branch's base
+    assert base_advanced("same789", "same789") is False     # merge-base is main's tip — up to date
+    assert base_advanced("", "base456") is False            # a git blip → don't churn
+    assert base_advanced("main123", "") is False
+
+
+def test_conflict_already_flagged_pings_once_not_every_cycle():
+    from agentflow.loop import _CONFLICT_MARK
+    flagged = [{"body": "review"}, {"body": f"> *{_CONFLICT_MARK}.*\n\nrebase by hand"}]
+    assert conflict_already_flagged(flagged) is True                 # our notice had the last word
+    engaged = flagged + [{"body": "On it, thanks"}]                  # maintainer replied after
+    assert conflict_already_flagged(engaged) is False
+    assert conflict_already_flagged([]) is False
+
+
+def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed"):
+    """Drive _rebase_survivor with a canned rebase result; record park / merge side effects."""
+    events = {"parked": [], "merged": []}
+    monkeypatch.setattr(loop, "_builder_worktree", lambda cfg, tool, n, sl: "/tmp/wt")
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: rebase)
+    monkeypatch.setattr(loop, "_park_conflicted_survivor",
+                        lambda cfg, pr, n: events["parked"].append(pr))
+    monkeypatch.setattr(loop, "_merge_autonomous_survivor",
+                        lambda cfg, pr, n, sl, tool, branch: events["merged"].append(pr) or "merged")
+    return events
+
+
+def test_rebase_survivor_conflict_parks_and_pings_on_every_profile(monkeypatch):
+    # THE acceptance criterion: a survivor that now conflicts is re-rebased within one cycle
+    # and, still conflicting, parked-and-pinged — not left silent. Fails first if the conflict
+    # branch stays silent instead of calling _park_conflicted_survivor.
+    for profile in ("reviewed", "guarded", "autonomous"):
+        events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT, profile=profile)
+        out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", profile)
+        assert events["parked"] == [8], f"conflict must ping ({profile})"
+        assert events["merged"] == []
+        assert "parked" in out
+
+
+def test_rebase_survivor_reviewed_clean_never_merges(monkeypatch):
+    # A clean re-rebase on a reviewed repo just keeps the PR mergeable for the human — the
+    # pass must never merge on reviewed/guarded.
+    events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CLEAN, profile="reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed")
+    assert events["merged"] == [], "reviewed repo must never auto-merge a survivor"
+    assert "mergeable for the human" in out
+
+
+def test_rebase_survivor_autonomous_clean_reruns_the_merge_gate(monkeypatch):
+    events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CLEAN, profile="autonomous")
+    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/codex/issue-4-x", "autonomous")
+    assert events["merged"] == [8]
+    assert out.endswith(": merged")
+
+
+def _stub_recheck(monkeypatch, prs, *, advanced, profile, comments=None):
+    """Drive recheck_once: canned open-PR list, base-advanced verdicts, and per-PR routing."""
+    routed = []
+    monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: prs)
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun("", 0))   # fetch origin succeeds
+    monkeypatch.setattr(loop, "repo_profile", lambda wd: profile)
+    monkeypatch.setattr(loop, "_base_advanced_for", lambda wd, branch: advanced.get(branch))
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: (comments or {}).get(pr, []))
+
+    def fake_router(cfg, pr, branch, prof):
+        routed.append(pr)
+        # first PR merges (autonomous), rest would too if reached
+        return f"#{pr}: merged" if prof == "autonomous" else f"#{pr}: re-rebased clean"
+
+    monkeypatch.setattr(loop, "_rebase_survivor", fake_router)
+    return routed
+
+
+def test_recheck_leaves_untouched_survivors_whose_base_has_not_moved(monkeypatch):
+    # No force-push, no rebase, on a survivor whose base hasn't advanced (pure predicate says so).
+    prs = [(7, "agentflow/claude/issue-3-a")]
+    routed = _stub_recheck(monkeypatch, prs, advanced={"agentflow/claude/issue-3-a": False},
+                           profile="reviewed")
+    out = recheck_once(RepoConfig("o/r", "/tmp"))
+    assert routed == [], "a survivor whose base hasn't moved must be left untouched"
+    assert out == "no survivors to re-rebase"
+
+
+def test_recheck_serializes_autonomous_merges_one_per_cycle(monkeypatch):
+    # Two survivors both need a re-rebase; on autonomous only ONE lands per cycle — the rest
+    # re-rebase against the new main next cycle. Fails first if recheck merges both in a pass.
+    prs = [(7, "agentflow/claude/issue-3-a"), (8, "agentflow/codex/issue-4-b")]
+    routed = _stub_recheck(monkeypatch, prs,
+                           advanced={"agentflow/claude/issue-3-a": True,
+                                     "agentflow/codex/issue-4-b": True},
+                           profile="autonomous")
+    recheck_once(RepoConfig("o/r", "/tmp"))
+    assert routed == [7], "only one merge per cycle — stop after the first lands"
+
+
+def test_recheck_skips_an_already_flagged_or_answered_survivor(monkeypatch):
+    from agentflow.loop import _CONFLICT_MARK
+    prs = [(7, "agentflow/claude/issue-3-a"), (8, "agentflow/codex/issue-4-b")]
+    comments = {7: [{"body": f"> *{_CONFLICT_MARK}.*\n\nrebase by hand"}],   # we already pinged
+                8: [{"body": "> *agentflow: parked.*"}, {"body": "Why did this conflict?"}]}  # #18 owns it
+    routed = _stub_recheck(monkeypatch, prs,
+                           advanced={"agentflow/claude/issue-3-a": True,
+                                     "agentflow/codex/issue-4-b": True},
+                           profile="reviewed", comments=comments)
+    recheck_once(RepoConfig("o/r", "/tmp"))
+    assert routed == [], "a flagged or maintainer-answered survivor must not be re-handled"
+
+
+def _wire_survivor_merge(monkeypatch, *, reviewer_tool, ci_green, verdict):
+    """Wire _merge_autonomous_survivor's real gate: a fresh review + CI + decide_merge."""
+    from agentflow.loop import _merge_autonomous_survivor
+
+    class _Reviewer:
+        def __init__(self, runner): pass
+        def review(self, *a, **k): return verdict
+
+    monkeypatch.setattr(loop, "Reviewer", _Reviewer)
+    monkeypatch.setattr(loop, "pick_pair",
+                        lambda: (SimpleNamespace(tool="x"), SimpleNamespace(tool=reviewer_tool)))
+    monkeypatch.setattr(loop, "_issue_meta", lambda cfg, n: {"body": "", "labels": []})
+    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: [])
+    monkeypatch.setattr(loop, "ui_evidence_gap", lambda repo, pr, s: False)
+    monkeypatch.setattr(loop, "ci_is_green", lambda repo, pr: ci_green)
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [])
+    monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(loop.ratchet, "record", lambda *a, **k: None)
+    merged, parked = [], []
+    monkeypatch.setattr(loop, "squash_merge", lambda repo, pr: merged.append(pr) or True)
+    monkeypatch.setattr(loop, "park", lambda repo, pr, v, reason: parked.append(pr))
+    return _merge_autonomous_survivor, merged, parked
+
+
+def test_autonomous_survivor_merges_only_through_the_full_gate(monkeypatch):
+    # Never less safe than reviewed: a survivor lands only on independent review + green CI +
+    # a clean verdict; a same-tool review (no independence) parks even when CI is green.
+    fn, merged, parked = _wire_survivor_merge(monkeypatch, reviewer_tool="codex",
+                                              ci_green=True, verdict=Verdict(clean=True))
+    assert fn(RepoConfig("o/r", "/tmp"), 8, 8, "sl", "claude", "agentflow/claude/issue-8-sl") == "merged"
+    assert merged == [8] and parked == []
+
+    fn, merged, parked = _wire_survivor_merge(monkeypatch, reviewer_tool="claude",
+                                              ci_green=True, verdict=Verdict(clean=True))
+    assert fn(RepoConfig("o/r", "/tmp"), 8, 8, "sl", "claude", "agentflow/claude/issue-8-sl") == "parked"
+    assert merged == [] and parked == [8]   # same-tool review can't auto-merge (ADR 0003)
+
+
+def test_autonomous_survivor_parks_when_ci_is_red(monkeypatch):
+    fn, merged, parked = _wire_survivor_merge(monkeypatch, reviewer_tool="codex",
+                                              ci_green=False, verdict=Verdict(clean=True))
+    assert fn(RepoConfig("o/r", "/tmp"), 8, 8, "sl", "claude", "agentflow/claude/issue-8-sl") == "parked"
+    assert merged == [] and parked == [8]
+
+
+def test_recheck_defers_when_pr_listing_fails(monkeypatch):
+    # Unknown is not empty: a gh blip must defer, not read as 'no survivors'.
+    monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: None)
+    assert "deferring" in recheck_once(RepoConfig("o/r", "/tmp"))
 
 
 def test_main_config_parses_repo_and_workdir():
