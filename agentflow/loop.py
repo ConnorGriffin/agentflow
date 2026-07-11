@@ -290,15 +290,19 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
         return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"
     if not _free_to_dispatch(issue, in_flight):
         return f"#{n}: already claimed or in flight — a build already owns it"
-    return _dispatch_build(cfg, issue)
+    return _dispatch_build(cfg, issue, operator=True)
 
 
-def _dispatch_build(cfg: RepoConfig, issue: dict) -> str:
+def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False) -> str:
     """Build one already-selected ready issue end to end: gate on the complexity label,
     claim it, then build → cross-review → merge/park under the claim. Shared by the daemon's
     next-ready pull (`run_once`) and the by-hand `build <N>` (`build_issue`) so there is one
     builder path, not two. Every profile builds from the Agent Brief in the issue body (ADR
-    0022) — there is no separate work-order comment."""
+    0022) — there is no separate work-order comment.
+
+    `operator=True` (by-hand `build <N>`) skips the pools' recent-activity guard — the
+    operator is the live session and asked for this — while still deferring on a genuinely
+    rate-limited pool. The daemon's `run_once` leaves it False and keeps the full guard."""
     n = issue["number"]
     labels = [lbl["name"] for lbl in issue["labels"]]
     complexity = complexity_from_labels(labels)
@@ -306,7 +310,7 @@ def _dispatch_build(cfg: RepoConfig, issue: dict) -> str:
         return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
     effort = effort_from_labels(labels)
 
-    builder, reviewer_runner = pick_pair()   # ADR 0006: more headroom builds; other reviews
+    builder, reviewer_runner = pick_pair(operator=operator)   # ADR 0006: more headroom builds; other reviews
     if builder is None:
         return f"#{n}: no pool has headroom right now — deferring"
     profile = repo_profile(cfg.workdir)

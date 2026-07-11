@@ -171,7 +171,7 @@ def test_dispatch_build_builds_guarded_from_the_brief(monkeypatch):
     # the Agent Brief in the issue body like every profile. Fails first if the guarded branch
     # still bails with "needs a frozen work order".
     monkeypatch.setattr(loop, "repo_profile", lambda wd: "guarded")
-    monkeypatch.setattr(loop, "pick_pair", lambda: (object(), object()))
+    monkeypatch.setattr(loop, "pick_pair", lambda operator=False: (object(), object()))
     monkeypatch.setattr(loop, "_claim", lambda repo, n: None)
     monkeypatch.setattr(loop, "_release", lambda repo, n: None)
     seen = {}
@@ -198,8 +198,9 @@ def test_build_issue_dispatches_a_ready_free_issue(monkeypatch):
              "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "_dispatch_build", lambda cfg, iss: f"#{iss['number']}: dispatched")
-    assert build_issue(RepoConfig("o/r", "/tmp"), 5) == "#5: dispatched"
+    monkeypatch.setattr(loop, "_dispatch_build",
+                        lambda cfg, iss, operator=False: f"#{iss['number']}: dispatched op={operator}")
+    assert build_issue(RepoConfig("o/r", "/tmp"), 5) == "#5: dispatched op=True"
 
 
 def test_build_issue_refuses_a_held_issue_and_points_at_pickup(monkeypatch):
