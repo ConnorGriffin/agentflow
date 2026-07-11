@@ -20,8 +20,8 @@ marker the daemon keys resume off — keep it).
 
 ## Verbs
 
-`/agentflow <verb> <N>` in a repo enrolled in the fleet. `pickup`/`triage`/`scope` take an
-issue `<N>`; `revise` takes a **PR** (number or URL).
+`/agentflow <verb> <N>` in a repo enrolled in the fleet. `pickup`/`triage`/`scope`/`build`
+take an issue `<N>`; `revise` takes a **PR** (number or URL).
 
 ### `pickup <N>` — resume a held issue live
 The main verb — for a held *issue*. (A *parked PR* is the sibling case: use `revise <PR>`.)
@@ -47,6 +47,28 @@ a minor fix, label `agentflow:needs-mockup`.
 When the issue is already clear — because you just discussed it with the user, or they
 filed it well — write the Agent Brief and land it as ready **without** a grilling round.
 This is the "I'll just tell you what I want" path.
+
+### `build <N>` — build a ready issue on demand
+The by-hand trigger for an already-`ready-for-agent` issue (ADR 0022) — the replacement for
+the retired `/go`. It **drives agentflow's own build path** pinned to issue N, the same one
+the daemon runs: a separate builder implements it, opens the PR, cross-review runs, and it
+merges or parks per the repo's `profile:`. Do **not** re-implement the build in-session — kick
+the Python path so there is one builder, the reviewer stays a different model than the builder
+(ADR 0006), and the `agentflow:building` claim keeps it from colliding with the daemon:
+
+```bash
+uv run python - "$REPO" "$N" <<'PY'
+import sys
+from agentflow.loop import RepoConfig, build_issue
+repo, n = sys.argv[1], int(sys.argv[2])
+print(build_issue(RepoConfig(repo, WORKDIR), n))   # WORKDIR = the repo's local main checkout
+PY
+```
+
+`build_issue` **refuses and redirects** on anything not ready: a held issue points you at
+`pickup <N>`; an un-triaged one at `triage <N>` / `scope <N>`; one already claimed or in
+flight is left alone. Only a ready, free issue builds — `build` adds convenience, never
+authority (the skip invariant holds).
 
 ### `revise <PR>` — resume a parked PR live
 The PR-side sibling of `pickup` (which is issue-only). For an **open PR the daemon parked**
@@ -99,7 +121,7 @@ agentflow's own code so the shape is identical:
 
    (Pass the issue's current labels in `current_labels` so a promotion clears the old
    `needs-grilling`/`needs-mockup`.) The daemon's build queue picks it up from there — or
-   run `/go <N>` / `uv run python -m agentflow.loop` to build it now.
+   run `build <N>` (above) to build it now.
 
 ## Notes
 - **Don't invent labels or a brief format** — use `agentflow.intake` so the daemon and you

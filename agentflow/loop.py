@@ -28,24 +28,6 @@ def _pr_url(repo: str, pr: int) -> str:
     return f"https://github.com/{repo}/pull/{pr}"
 
 
-_OPEN_AS_RE = re.compile(r"(?m)^Open as:")
-
-
-def _work_order(repo: str, n: int) -> str | None:
-    """The latest frozen work-order comment on the issue (marked by an `Open as:`
-    line — the codex-go convention). None if there isn't one."""
-    r = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "comments"])
-    if r.returncode != 0:
-        return None
-    try:
-        comments = json.loads(r.stdout).get("comments", [])
-    except json.JSONDecodeError:
-        return None
-    for c in reversed(comments):
-        if _OPEN_AS_RE.search(c.get("body", "")):
-            return c["body"]
-    return None
-
 _COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
 _EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
@@ -115,8 +97,10 @@ BUILD_PROMPT = """Implement {repo} issue #{n}: {title}
 Effort budget: {effort}. Scope your work to match — don't gold-plate a low-effort
 issue or under-invest a high-effort one.
 
-You are in a fresh worktree on a new branch off origin/main. Implement the change,
-add or update tests, and make the suite green. Commit your work.
+You are in a fresh worktree on a new branch off origin/main. Implement the change and
+commit your work. Cover the new behavior with a test that **exercises it through the
+public interface** — and, where it fits, one that **failed first for the right reason**
+(the charter test standard) — then make the suite green.
 
 Before opening the PR, `git fetch origin` and rebase once onto `origin/main`, then
 rerun the tests. If the rebase conflicts (or tests fail post-rebase for a reason not
@@ -251,10 +235,46 @@ def _preserve_progress(cfg: RepoConfig, tool: str, n: int, sl: str) -> str | Non
 
 
 def run_once(cfg: RepoConfig) -> str:
-    """Pull one ready issue and run it end to end. Returns a one-line result."""
+    """Pull the next ready issue and run it end to end. Returns a one-line result."""
     issue = _next_ready_issue(cfg)
     if not issue:
         return "no ready-for-agent issues"
+    return _dispatch_build(cfg, issue)
+
+
+HELD_LABELS = {"agentflow:needs-grilling", "agentflow:needs-mockup"}
+
+
+def build_issue(cfg: RepoConfig, n: int) -> str:
+    """By-hand build of a *specific* ready issue (ADR 0022's `build <N>`). Fetches issue N,
+    **refuses and redirects** anything that isn't `ready-for-agent` (a held issue → `pickup`;
+    an un-triaged one → `triage`/`scope`), refuses one already claimed or in flight, then
+    drives the same build path as the daemon — one builder path, one `agentflow:building`
+    claim, cross-review and merge/park per the repo's profile."""
+    r = _run(["gh", "issue", "view", str(n), "--repo", cfg.repo,
+              "--json", "number,title,body,labels,state"])
+    if r.returncode != 0:
+        return f"#{n}: not found in {cfg.repo}"
+    issue = json.loads(r.stdout)
+    if issue.get("state") != "OPEN":
+        return f"#{n}: closed — nothing to build"
+    labels = {lbl["name"] for lbl in issue.get("labels", [])}
+    if "ready-for-agent" not in labels:
+        held = labels & HELD_LABELS
+        if held:
+            return f"#{n}: held — resume it with `/agentflow pickup {n}`, not build"
+        return f"#{n}: not ready — run `/agentflow triage {n}` (or `scope {n}`) first"
+    if not _free_to_dispatch(issue, _issues_in_flight(cfg)):
+        return f"#{n}: already claimed or in flight — a build already owns it"
+    return _dispatch_build(cfg, issue)
+
+
+def _dispatch_build(cfg: RepoConfig, issue: dict) -> str:
+    """Build one already-selected ready issue end to end: gate on the complexity label,
+    claim it, then build → cross-review → merge/park under the claim. Shared by the daemon's
+    next-ready pull (`run_once`) and the by-hand `build <N>` (`build_issue`) so there is one
+    builder path, not two. Every profile builds from the Agent Brief in the issue body (ADR
+    0022) — there is no separate work-order comment."""
     n = issue["number"]
     labels = [lbl["name"] for lbl in issue["labels"]]
     complexity = complexity_from_labels(labels)
@@ -267,14 +287,8 @@ def run_once(cfg: RepoConfig) -> str:
         return f"#{n}: no pool has headroom right now — deferring"
     profile = repo_profile(cfg.workdir)
     sl = slug(issue["title"])
-    if profile == "guarded":
-        # guarded builds from a frozen work order, never a self-scoped brief (ADR 0005).
-        build_prompt = _work_order(cfg.repo, n)
-        if not build_prompt:
-            return f"#{n}: guarded repo needs a frozen work order (ADR 0005); none found — skipping"
-    else:
-        build_prompt = BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
-                                           body=issue.get("body") or "", effort=effort.value)
+    build_prompt = BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
+                                       body=issue.get("body") or "", effort=effort.value)
     _claim(cfg.repo, n)   # an agent now owns this issue — no duplicate dispatch (dedup)
     try:
         return _build_review_merge(cfg, issue, n, sl, complexity, effort,
