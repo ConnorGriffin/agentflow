@@ -9,10 +9,10 @@ from agentflow import loop
 from agentflow.intake import IntakeRoute
 from agentflow.loop import (BUILD_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, RepoConfig,
                             _build_review_merge, _free_to_dispatch, _issues_in_flight,
-                            _next_pr_awaiting_reply, _next_ready_issue, _untriaged, build_issue,
-                            complexity_from_labels, effort_from_labels, held_build_result,
-                            issue_of_branch, pr_number, reclaim_claims, repo_profile,
-                            respond_once, slug, ui_surfaces)
+                            _main_config, _next_pr_awaiting_reply, _next_ready_issue, _untriaged,
+                            build_issue, complexity_from_labels, effort_from_labels,
+                            held_build_result, issue_of_branch, pr_number, reclaim_claims,
+                            repo_profile, respond_once, slug, ui_surfaces)
 from agentflow.reviewer import Verdict
 from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
 
@@ -397,3 +397,23 @@ def test_respond_once_noop_when_nothing_pending(monkeypatch):
            {7: [{"body": _PARK}]})   # our marker had the last word
     monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))
     assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
+
+
+def test_main_config_parses_repo_and_workdir():
+    # Entrypoint takes repo and optional workdir from argv — no hardcoded sandbox default.
+    cfg = _main_config(["owner/repo", "/some/path"])
+    assert cfg.repo == "owner/repo"
+    assert cfg.workdir == "/some/path"
+
+
+def test_main_config_derives_workdir_from_repo():
+    from pathlib import Path
+    cfg = _main_config(["owner/myrepo"])
+    assert cfg.repo == "owner/myrepo"
+    assert cfg.workdir == str(Path.home() / "Code" / "owner" / "myrepo")
+
+
+def test_main_config_requires_repo():
+    # Passing no args must exit with a usage message, not proceed with the old sandbox default.
+    with pytest.raises(SystemExit):
+        _main_config([])

@@ -637,7 +637,19 @@ def pipeline_once(cfg: RepoConfig) -> str:
     return f"intake: {intake_once(cfg)} · build: {run_once(cfg)} · respond: {respond_once(cfg)}"
 
 
-if __name__ == "__main__":  # entrypoint — the sandbox dogfood target
-    cfg = RepoConfig(repo="ConnorGriffin/agentflow-sandbox",
-                     workdir=str(Path.home() / "Code" / "ConnorGriffin" / "agentflow-sandbox"))
-    print(pipeline_once(cfg))
+def _main_config(argv: list[str]) -> RepoConfig:
+    """Parse CLI args: <owner/repo> [workdir]. Workdir defaults to ~/Code/<owner>/<name>."""
+    if not argv:
+        raise SystemExit("usage: python -m agentflow.loop <owner/repo> [workdir]")
+    repo = argv[0]
+    if len(argv) > 1:
+        workdir = argv[1]
+    else:
+        owner, name = (repo.split("/", 1) + ["repo"])[:2]
+        workdir = str(Path.home() / "Code" / owner / name)
+    return RepoConfig(repo=repo, workdir=workdir)
+
+
+if __name__ == "__main__":
+    import sys
+    print(pipeline_once(_main_config(sys.argv[1:])))
