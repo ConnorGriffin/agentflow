@@ -16,7 +16,8 @@ from pathlib import Path
 
 from agentflow import ratchet
 from agentflow.balancer import pick_pair
-from agentflow.gate import MAX_REVISES, MergeDecision, ci_is_green, decide_merge, park, squash_merge
+from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge, park,
+                            squash_merge, ui_evidence_gap)
 from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _DISCLAIMER,
                               apply_intake, awaiting_recheck, replies_since_intake)
 from agentflow.notify import notify
@@ -31,6 +32,7 @@ def _pr_url(repo: str, pr: int) -> str:
 _COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
 _EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
+_UI_SURFACES_RE = re.compile(r"^ui-surfaces:\s*(.+)$", re.MULTILINE)
 
 
 def repo_profile(workdir: str) -> str:
@@ -43,6 +45,27 @@ def repo_profile(workdir: str) -> str:
             if m:
                 return m.group(1)
     return "reviewed"
+
+
+def ui_surfaces(workdir: str) -> list[str]:
+    """The repo's declared user-facing surfaces from its AGENTS.md/CLAUDE.md
+    `ui-surfaces:` line — a comma-separated list of path prefixes (e.g.
+    `agentflow/static/, frontend/`), or `[]` when none is declared. A change under
+    one of these needs a before/after screenshot: the charter's UI-evidence gate
+    (ADR 0018) reads this per repo instead of a hardcoded example."""
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        p = Path(workdir) / name
+        if p.exists():
+            m = _UI_SURFACES_RE.search(p.read_text(errors="replace"))
+            if m:
+                return [s.strip() for s in m.group(1).split(",") if s.strip()]
+    return []
+
+
+def _surfaces_phrase(surfaces: list[str]) -> str:
+    """How to name the repo's UI surfaces to a builder/reviewer prompt."""
+    return ", ".join(f"`{s}`" for s in surfaces) if surfaces \
+        else "any user-facing surface (frontend, UI templates, etc.)"
 
 
 @dataclass(frozen=True)
@@ -109,9 +132,11 @@ forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the bo
 
 Write the PR body for the human who merges it — plain language: what changed, why, and
 what to check, in the app's own domain terms. No jargon: no file/function/test names or
-CSS/API specifics (ADR 0018). If the change touches a user-facing surface, you MUST attach
-before/after screenshots (headless Playwright) as proof it matches the locked mockup — the
-cross-review blocks a UI PR that has none. Both are charter gates, not style points.
+CSS/API specifics (ADR 0018). If the change touches a user-facing surface (this repo's are:
+{surfaces}), you MUST attach before/after screenshots (headless Playwright) as proof it
+matches the locked mockup — both light and dark themes where the app has them. A UI change
+with no screenshot cannot auto-merge (a mechanical gate parks it, ADR 0018), and a body full
+of jargon blocks at review. Both are charter gates, not style points.
 
 Keep the change minimal and match the surrounding code. If you hit a blocker you
 cannot safely resolve, post a comment prefixed `MISSING-CONTEXT:` and stop instead
@@ -119,6 +144,13 @@ of guessing."""
 
 REVISE_PROMPT = """Address the blocking review findings on PR #{n} in this worktree,
 push to the same branch, and keep the test suite green. Do NOT open a new PR.
+
+Do not degrade the two charter gates while revising (ADR 0018):
+- If the PR touches a user-facing surface (this repo's are: {surfaces}), keep before/after
+  screenshots attached — both light and dark themes where the app has them. A UI change with
+  no screenshot cannot auto-merge; a mechanical gate parks it regardless of the review.
+- Keep the PR body in plain app language for the human who merges — no file/function/test
+  names or CSS/API specifics.
 
 Blocking findings:
 {findings}"""
@@ -216,7 +248,8 @@ def _launch_revise(builder, cfg: RepoConfig, pr: int, n: int, sl: str,
                    complexity: Complexity, verdict: Verdict) -> None:
     """One builder pass addressing the blocking findings on the PR branch (ADR 0020)."""
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking) or "- (see review)"
-    builder.launch(REVISE_PROMPT.format(n=pr, findings=findings),
+    surfaces = _surfaces_phrase(ui_surfaces(cfg.workdir))
+    builder.launch(REVISE_PROMPT.format(n=pr, findings=findings, surfaces=surfaces),
                    cwd=_builder_worktree(cfg, builder.tool, n, sl),
                    model=builder.model_for(complexity))
 
@@ -314,9 +347,11 @@ def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False) -> str
     if builder is None:
         return f"#{n}: no pool has headroom right now — deferring"
     profile = repo_profile(cfg.workdir)
+    surfaces = ui_surfaces(cfg.workdir)
     sl = slug(issue["title"])
     build_prompt = BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
-                                       body=issue.get("body") or "", effort=effort.value)
+                                       body=issue.get("body") or "", effort=effort.value,
+                                       surfaces=_surfaces_phrase(surfaces))
     _claim(cfg.repo, n)   # an agent now owns this issue — no duplicate dispatch (dedup)
     try:
         return _build_review_merge(cfg, issue, n, sl, complexity, effort,
@@ -378,6 +413,8 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
 
     pr = pr_number(outcome.pr_url)
     head_branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
+    surfaces = ui_surfaces(cfg.workdir)
+    surfaces_phrase = _surfaces_phrase(surfaces)
     # Prefer cross-tool; if only one tool is free, review same-tool rather than stall
     # (ADR 0020). Same-tool never auto-merges — decide_merge parks it.
     reviewer_runner = reviewer_runner or builder
@@ -389,7 +426,8 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         # HUMAN merges (ADR 0002, 0020) — hand over a clean PR when we can.
         revises_used = 0
         while True:
-            verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity, acceptance=acceptance)
+            verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity,
+                                      acceptance=acceptance, surfaces=surfaces_phrase)
             if verdict.clean or not (verdict.parsed and verdict.blocking) or revises_used >= MAX_REVISES:
                 park(cfg.repo, pr, verdict, reason=f"is a `{profile}` repo — a human merges")
                 notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
@@ -400,10 +438,14 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
 
     revises_used = 0
     while True:
-        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity, acceptance=acceptance)
+        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity,
+                                  acceptance=acceptance, surfaces=surfaces_phrase)
+        # The UI-evidence gate is read from the diff + attachments, AFTER the review, so a
+        # reviewer's "not blocking" cannot clear a screenshot-less UI change (ADR 0018).
+        ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
         decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
                                 reviewer_tool=reviewer_runner.tool, builder_tool=builder.tool,
-                                revises_used=revises_used)
+                                revises_used=revises_used, ui_evidence_missing=ui_gap)
         if decision is MergeDecision.MERGE:
             ok = squash_merge(cfg.repo, pr)
             if ok:
@@ -418,7 +460,10 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
                    _pr_url(cfg.repo, pr))
             return f"#{n}: merge failed on PR #{pr}"
         if decision is MergeDecision.PARK:
-            park(cfg.repo, pr, verdict)
+            reason = ("touches a user-facing surface but has no before/after screenshot — the "
+                      "charter requires visual proof it matches the locked design, so it can't "
+                      "auto-merge unseen (ADR 0018)") if ui_gap else "could not be auto-merged after review"
+            park(cfg.repo, pr, verdict, reason=reason)
             ratchet.record(cfg.repo, "parked")
             notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",
                    _pr_url(cfg.repo, pr))

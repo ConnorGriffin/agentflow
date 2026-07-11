@@ -156,9 +156,9 @@ The issue's acceptance criteria — judge against THIS, not your own wishlist:
 ---
 
 First, prove you looked: run `gh pr view {pr} --json headRefOid,files,body` and
-`gh pr diff {pr}`. If any changed file is under a user-facing surface (e.g. `frontend/`),
-also run `gh pr view {pr} --json comments` to check for attached screenshots. Judge the
-PR as a merge-ready artifact — its body and evidence, not only its diff.
+`gh pr diff {pr}`. If any changed file is under a user-facing surface (this repo's are:
+{surfaces}), also run `gh pr view {pr} --json comments` to check for attached screenshots.
+Judge the PR as a merge-ready artifact — its body and evidence, not only its diff.
 
 BLOCKING (only these):
 - a real bug or security hole that breaks a stated acceptance criterion, or
@@ -167,8 +167,10 @@ BLOCKING (only these):
   - a **PR body not framed for the human who merges** — it leans on file / function /
     test names or CSS / API specifics instead of plain app behavior (ADR 0018);
   - a **user-facing change with no screenshot** — any PR whose files touch a
-    user-facing surface (e.g. `frontend/`) must attach before/after screenshots, in
-    the body or a comment; none is a blocking gap (ADR 0018). Backend-only PRs need none.
+    user-facing surface ({surfaces}) must attach before/after screenshots, in the body
+    or a comment, covering both light and dark themes where the app has them; none is a
+    blocking gap (ADR 0018). Backend-only PRs need none. (Note: a mechanical gate also
+    parks such a PR independent of your verdict — you cannot waive this one.)
 A correctness gap BEYOND the stated acceptance — an unhandled case the issue did not
 ask for — is a NIT, not blocking; note it so it can be filed as a follow-up.
 Style, naming, and minor perf are nits.
@@ -188,7 +190,8 @@ class Reviewer:
         self.runner = runner  # the tool that did NOT build this PR
 
     def review(self, repo: str, workdir: str, pr_number: int, pr_head_branch: str,
-               slug: str, issue_complexity: Complexity, acceptance: str = "") -> Verdict:
+               slug: str, issue_complexity: Complexity, acceptance: str = "",
+               surfaces: str = "any user-facing surface") -> Verdict:
         head_sha = self._head_sha(repo, pr_number)
         if not head_sha:
             return _unparseable("could not read PR head SHA")
@@ -202,7 +205,8 @@ class Reviewer:
 
         # The verdict is the reviewer's captured final message — read by US, not a
         # model-written file in the (untrusted) PR tree, so a builder cannot forge it.
-        prompt = REVIEW_PROMPT.format(pr=pr_number, acceptance=acceptance or "(none provided)")
+        prompt = REVIEW_PROMPT.format(pr=pr_number, acceptance=acceptance or "(none provided)",
+                                      surfaces=surfaces)
         # Review at the issue's own complexity — a correctness-sensitive build gets a
         # correctness-sensitive reviewer (ADR 0018; the old light floor is moot).
         model = self.runner.model_for(issue_complexity)
