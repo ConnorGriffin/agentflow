@@ -63,9 +63,9 @@ def _query_pool(tool: str) -> PoolStatus:
         # `spend` reports the REAL trailing-5h % even when the interactive-use gate
         # would block dispatch — so headroom is honest while you're active. `check`
         # is the separate dispatch-availability question (clear vs busy).
-        sp = subprocess.run([_GATE, "spend"], env=env, text=True, capture_output=True)
-        ck = subprocess.run([_GATE, "check"], env=env, text=True, capture_output=True)
-    except OSError:
+        sp = subprocess.run([_GATE, "spend"], env=env, text=True, capture_output=True, timeout=30)
+        ck = subprocess.run([_GATE, "check"], env=env, text=True, capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
         return PoolStatus(tool, False, 100.0)           # no gate → treat as no headroom
     # Prefer the real spend %; fall back to `check`'s output if the gate is too old
     # to have `spend` mode — degrade gracefully, never crash.

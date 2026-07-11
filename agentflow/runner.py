@@ -94,8 +94,12 @@ def classify_build(pr_url: str | None, new_marker_comments: list[str]) -> BuildO
     return BuildOutcome(BuildStatus.INCOMPLETE, detail="no PR and no bail marker")
 
 
-def _run(cmd: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
+    t = timeout if timeout is not None else int(os.environ.get("AGENTFLOW_GH_TIMEOUT", "120"))
+    try:
+        return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=t)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
 
 
 class _WorktreeRunner:
@@ -193,8 +197,9 @@ class ClaudeRunner(_WorktreeRunner):
         # Hazard-free autonomous build: skip permission prompts. A hazardous repo
         # would pass a tight --allowedTools instead (profile-driven, later).
         # `claude -p` prints the final assistant message to stdout — that's the message.
+        session_timeout = int(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
         r = _run(["claude", "-p", prompt, "--model", model,
-                  "--dangerously-skip-permissions"], cwd=cwd)
+                  "--dangerously-skip-permissions"], cwd=cwd, timeout=session_timeout)
         return r.returncode == 0, r.stdout
 
 
@@ -209,11 +214,12 @@ class CodexRunner(_WorktreeRunner):
         # is missing its `codex-code-mode-host` companion (e.g. an incomplete
         # Homebrew cask) and can't run shell commands.
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
+        session_timeout = int(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
         fd, outfile = tempfile.mkstemp(prefix="agentflow-codex-")
         os.close(fd)
         try:
             r = _run([codex_bin, "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
-                      "--skip-git-repo-check", "-o", outfile, prompt], cwd=cwd)
+                      "--skip-git-repo-check", "-o", outfile, prompt], cwd=cwd, timeout=session_timeout)
             try:
                 msg = Path(outfile).read_text()
             except OSError:

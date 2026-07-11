@@ -4,9 +4,13 @@ The one thing that must never happen: MERGE without independent review + green C
 + clean verdict.
 """
 
+import subprocess
+import time
+
 import pytest
 
-from agentflow.gate import MergeDecision, decide_merge
+import agentflow.gate as gate
+from agentflow.gate import MergeDecision, ci_is_green, decide_merge
 from agentflow.reviewer import Finding, Verdict
 
 CLEAN = Verdict(clean=True)
@@ -58,3 +62,24 @@ def test_unusable_review_parks_never_revises():
     # re-running the builder can't help, so park (don't waste a revise).
     unparsed = Verdict(clean=False, parsed=False, findings=(Finding("blocking", "no verdict"),))
     assert d(verdict=unparsed, revises_used=0) is MergeDecision.PARK
+
+
+def _fail(_cmd, **_kw):
+    return subprocess.CompletedProcess(_cmd, returncode=1, stdout="", stderr="pending")
+
+
+def _pass(_cmd, **_kw):
+    return subprocess.CompletedProcess(_cmd, returncode=0, stdout="", stderr="")
+
+
+def test_ci_poll_returns_false_at_deadline(monkeypatch):
+    """Checks that never complete return False once the deadline expires."""
+    monkeypatch.setattr(gate, "_run", _fail)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+    assert ci_is_green("o/r", 1, timeout=0) is False
+
+
+def test_ci_poll_returns_true_when_checks_pass(monkeypatch):
+    """Checks that pass on the first poll return True immediately."""
+    monkeypatch.setattr(gate, "_run", _pass)
+    assert ci_is_green("o/r", 1, timeout=30, interval=1) is True
