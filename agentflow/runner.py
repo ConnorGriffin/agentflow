@@ -116,7 +116,7 @@ class _WorktreeRunner:
         branch = f"agentflow/{self.tool}/issue-{task.issue}-{task.slug}"
         wt = Path(task.workdir) / ".agentflow" / "worktrees" / self.tool / f"issue-{task.issue}-{task.slug}"
         try:
-            self.prepare_worktree(task.workdir, branch, wt)
+            self.prepare_worktree(task.workdir, branch, wt, task.repo)
             self.provision(wt)
         except subprocess.CalledProcessError as e:
             return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
@@ -132,9 +132,15 @@ class _WorktreeRunner:
         return outcome
 
     # --- shared git/gh plumbing (reused by the reviewer) ------------------------
-    def prepare_worktree(self, workdir: str, branch: str, wt: Path) -> None:
+    def prepare_worktree(self, workdir: str, branch: str, wt: Path,
+                         repo: str | None = None) -> None:
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
+            if repo and not self._pr_for_branch(repo, branch):
+                # Reused worktree with no open PR — reset onto origin/main so stale
+                # branch state doesn't pollute the new build.
+                _run(["git", "-C", str(wt), "reset", "--hard", "origin/main"]).check_returncode()
+                _run(["git", "-C", str(wt), "clean", "-fdx"])
             return
         wt.parent.mkdir(parents=True, exist_ok=True)
         have_branch = _run(["git", "-C", workdir, "show-ref", "--quiet", f"refs/heads/{branch}"]).returncode == 0
@@ -164,7 +170,7 @@ class _WorktreeRunner:
 
     def _pr_for_branch(self, repo: str, branch: str) -> str | None:
         r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
-                  "--state", "all", "--json", "url", "-q", ".[0].url // \"\""])
+                  "--state", "open", "--json", "url", "-q", ".[0].url // \"\""])
         return r.stdout.strip() or None
 
     def _new_marker_comments(self, repo: str, issue: int, since: float) -> list[str]:
@@ -235,3 +241,38 @@ def _iso_to_epoch(s: str) -> float | None:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
     except ValueError:
         return None
+
+
+def _pr_state_for_branch(repo: str, branch: str) -> str | None:
+    """The current state of the most recent PR for this branch across all states
+    (OPEN, MERGED, or CLOSED), or None when no PR has ever been opened for it."""
+    r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
+              "--state", "all", "--json", "state", "-q", ".[0].state // \"\""])
+    return r.stdout.strip() or None
+
+
+def worktree_is_prunable(pr_state: str | None, is_clean: bool) -> bool:
+    """Pure: a builder worktree is safe to remove when its PR is done and the
+    working tree carries no uncommitted changes."""
+    return pr_state in ("MERGED", "CLOSED") and is_clean
+
+
+def prune_stale_worktrees(repo: str, workdir: str, tool: str) -> int:
+    """Remove builder worktrees for *tool* whose PR merged/closed and which are clean.
+    Never touches worktrees with an open PR or uncommitted local changes.
+    Returns the number of worktrees removed."""
+    wt_root = Path(workdir) / ".agentflow" / "worktrees" / tool
+    if not wt_root.exists():
+        return 0
+    removed = 0
+    for wt_dir in sorted(wt_root.iterdir()):
+        if not wt_dir.is_dir():
+            continue
+        branch = f"agentflow/{tool}/{wt_dir.name}"
+        pr_state = _pr_state_for_branch(repo, branch)
+        status = _run(["git", "-C", str(wt_dir), "status", "--porcelain"])
+        is_clean = status.returncode == 0 and not status.stdout.strip()
+        if worktree_is_prunable(pr_state, is_clean):
+            if _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt_dir)]).returncode == 0:
+                removed += 1
+    return removed

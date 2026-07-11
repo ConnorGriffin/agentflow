@@ -8,7 +8,8 @@ and that is what actually needs to be right.
 import subprocess
 from unittest.mock import patch
 
-from agentflow.runner import BuildStatus, ClaudeRunner, CodexRunner, Complexity, Effort, _run, classify_build
+from agentflow.runner import (BuildStatus, ClaudeRunner, CodexRunner, Complexity, Effort, _run,
+                              classify_build, worktree_is_prunable)
 
 
 def test_complexity_resolves_to_cost_appropriate_models():
@@ -72,3 +73,37 @@ def test_run_timeout_returns_nonzero_and_does_not_propagate():
         r = _run(["sleep", "100"], timeout=1)
     assert r.returncode != 0
     assert "timed out" in r.stderr
+
+
+def test_dead_pr_on_branch_classifies_as_no_pr():
+    # _pr_for_branch now filters to open PRs only, so a merged/closed PR returns
+    # None — the build classifies as INCOMPLETE (stuck handback), not PR_OPENED.
+    out = classify_build(None, [])
+    assert out.status is BuildStatus.INCOMPLETE
+    assert out.pr_url is None
+
+
+# --- worktree sweep predicate ------------------------------------------------
+
+def test_prunable_when_pr_merged_and_clean():
+    assert worktree_is_prunable("MERGED", is_clean=True)
+
+
+def test_prunable_when_pr_closed_and_clean():
+    assert worktree_is_prunable("CLOSED", is_clean=True)
+
+
+def test_not_prunable_when_pr_open():
+    assert not worktree_is_prunable("OPEN", is_clean=True)
+
+
+def test_not_prunable_when_no_pr():
+    assert not worktree_is_prunable(None, is_clean=True)
+
+
+def test_not_prunable_when_dirty_even_if_pr_merged():
+    assert not worktree_is_prunable("MERGED", is_clean=False)
+
+
+def test_not_prunable_when_dirty_even_if_pr_closed():
+    assert not worktree_is_prunable("CLOSED", is_clean=False)
