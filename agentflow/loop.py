@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, replace
+from enum import Enum
 from pathlib import Path
 
 from agentflow import ratchet
@@ -686,13 +687,213 @@ def respond_once(cfg: RepoConfig) -> str:
     return f"PR #{pr}: replied to the maintainer" if ok else f"PR #{pr}: responder session errored"
 
 
+# --- ADR 0009 merge-time floor: re-rebase survivors after main advances (issue #45) ---
+# When one PR merges, `main` moves and every other open agentflow PR that was parked
+# clean can silently go CONFLICTING. This pass re-rebases those survivors each cycle so a
+# conflicted one is never discovered by hand at merge time with no signal on the PR.
+
+# Our conflict notice on a survivor carries the PR marker so it reads as ours (not a
+# maintainer question, issue #18) and lets us ping a conflicted survivor once, not every
+# cycle — see `conflict_already_flagged`.
+_CONFLICT_MARK = "agentflow: parked — conflicts after main advanced"
+_CONFLICT_REASON = (
+    "`main` moved since this PR last rebased and it no longer merges cleanly. Rebase it by "
+    "hand (or close it) — agentflow won't force a conflicted merge.")
+
+# A survivor that re-rebased clean but still can't auto-merge (review not clean, CI red, or
+# an unanswered question) hands off to a human rather than churning a revise here.
+_SURVIVOR_PARK_REASON = ("was re-rebased after `main` advanced but still can't auto-merge — "
+                         "a human takes it from here")
+
+
+class RebaseResult(str, Enum):
+    CLEAN = "clean"        # re-rebased onto main and force-pushed to the same branch
+    NOOP = "noop"          # rebase replayed nothing — no force-push
+    CONFLICT = "conflict"  # rebase hit conflicts and was aborted; branch untouched
+    ERROR = "error"        # checkout / rebase / push plumbing failed
+
+
+def base_advanced(main_tip: str, merge_base: str) -> bool:
+    """Pure. True when `origin/main` has moved past the point the branch last rebased onto
+    — the merge-base is no longer main's tip, so the branch must re-rebase. False when the
+    merge-base already IS the tip (the branch contains current main; rebasing would be a
+    needless force-push) or when either SHA is missing (a git blip → don't churn). This is
+    ADR 0009's 'base advanced since last rebase' check, kept pure so a survivor whose base
+    hasn't moved is left untouched."""
+    return bool(main_tip) and bool(merge_base) and main_tip != merge_base
+
+
+def conflict_already_flagged(comments: list[dict]) -> bool:
+    """Pure. True when our conflict notice is the most recent comment on the PR — so a
+    still-conflicting survivor is pinged once, not re-pinged every cycle while its base
+    stays behind. A newer comment (a maintainer engaging) flips this False; from there the
+    comment responder owns the reply (issue #18)."""
+    for c in reversed(comments):
+        body = c.get("body", "")
+        if _CONFLICT_MARK in body:
+            return True
+        if body.strip():
+            return False
+    return False
+
+
+def _open_agentflow_prs(cfg: RepoConfig) -> list[tuple[int, str]] | None:
+    """Open agentflow PRs as (number, head_branch), oldest first. None on a `gh` blip —
+    unknown is not empty, so a listing failure defers the whole pass rather than reading as
+    'no survivors to re-rebase'."""
+    r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
+              "--json", "number,headRefName", "--limit", "100"])
+    if r.returncode != 0:
+        return None
+    prs = [(pr["number"], pr.get("headRefName", ""))
+           for pr in json.loads(r.stdout or "[]")
+           if issue_of_branch(pr.get("headRefName", "")) is not None]
+    return sorted(prs, key=lambda p: p[0])
+
+
+def _base_advanced_for(workdir: str, branch: str) -> bool | None:
+    """Live: has `origin/main` advanced past this branch's last rebase? Compares the
+    merge-base against main's tip (both read from the just-fetched remote refs). None when a
+    git command fails — caller skips rather than blind-rebases."""
+    tip = _run(["git", "-C", workdir, "rev-parse", "origin/main"])
+    mb = _run(["git", "-C", workdir, "merge-base", "origin/main", f"origin/{branch}"])
+    if tip.returncode != 0 or mb.returncode != 0:
+        return None
+    return base_advanced(tip.stdout.strip(), mb.stdout.strip())
+
+
+def _rebase_branch(cfg: RepoConfig, branch: str, wt: Path) -> RebaseResult:
+    """Re-rebase the PR branch onto `origin/main` in its worktree and force-push it back
+    (same branch, never a new one). A rebase that replays nothing is a no-op, not a
+    force-push; a conflicting rebase is aborted so the branch is left exactly as it was.
+    Live orchestration, not unit-tested (mirrors `_checkout_pr_branch`)."""
+    if not _checkout_pr_branch(cfg, branch, wt):
+        return RebaseResult.ERROR
+    before = _run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
+    if _run(["git", "-C", str(wt), "rebase", "origin/main"]).returncode != 0:
+        _run(["git", "-C", str(wt), "rebase", "--abort"])
+        return RebaseResult.CONFLICT
+    after = _run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
+    if after and after == before:
+        return RebaseResult.NOOP
+    if _run(["git", "-C", str(wt), "push", "--force-with-lease", "origin", branch]).returncode != 0:
+        return RebaseResult.ERROR
+    return RebaseResult.CLEAN
+
+
+def _park_conflicted_survivor(cfg: RepoConfig, pr: int, n: int) -> None:
+    """A survivor that no longer rebases clean: post one conflict notice (carrying our
+    marker) and ping, so a conflicted survivor is never silent."""
+    body = f"> *{_CONFLICT_MARK}.*\n\n{_CONFLICT_REASON}"
+    _run(["gh", "pr", "comment", str(pr), "--repo", cfg.repo, "--body", body])
+    ratchet.record(cfg.repo, "parked")
+    notify("agentflow needs you",
+           f"{cfg.repo} #{n}: PR #{pr} conflicts after main advanced — rebase by hand",
+           _pr_url(cfg.repo, pr))
+
+
+def _issue_meta(cfg: RepoConfig, n: int) -> dict:
+    """The originating issue's body + labels, for re-reviewing a survivor. {} on error."""
+    r = _run(["gh", "issue", "view", str(n), "--repo", cfg.repo, "--json", "body,labels"])
+    if r.returncode != 0:
+        return {}
+    try:
+        return json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+
+
+def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
+                               branch_tool: str, branch: str) -> str:
+    """A clean-rebased survivor on an `autonomous` repo: rerun the full merge gate (fresh
+    cross-tool review + green CI + clean verdict, ADR 0003/0009) and land it, or park for a
+    human. Parks rather than churning a revise here (that's the build loop's job); never
+    less safe than `reviewed`, since the same `decide_merge` gate governs the merge."""
+    builder, reviewer_runner = pick_pair()
+    reviewer_runner = reviewer_runner or builder
+    if reviewer_runner is None:
+        return "deferred"   # no headroom to re-review — try again next cycle
+    meta = _issue_meta(cfg, n)
+    complexity = complexity_from_labels([lbl["name"] for lbl in meta.get("labels", [])]) or Complexity.DEEP
+    surfaces = ui_surfaces(cfg.workdir)
+    verdict = Reviewer(reviewer_runner).review(cfg.repo, cfg.workdir, pr, branch, sl, complexity,
+                                               acceptance=meta.get("body") or "",
+                                               surfaces=_surfaces_phrase(surfaces))
+    ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
+    decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
+                            reviewer_tool=reviewer_runner.tool, builder_tool=branch_tool,
+                            revises_used=MAX_REVISES,   # park a still-imperfect survivor, don't churn
+                            ui_evidence_missing=ui_gap,
+                            reply_pending=reply_pending(_pr_comments(cfg.repo, pr)))
+    if decision is MergeDecision.MERGE and squash_merge(cfg.repo, pr):
+        ratchet.record(cfg.repo, ratchet.CLEAN_MERGE)
+        _run(["gh", "issue", "edit", str(n), "--repo", cfg.repo, "--remove-label", "ready-for-agent"])
+        return "merged"
+    park(cfg.repo, pr, verdict, reason=_SURVIVOR_PARK_REASON)
+    ratchet.record(cfg.repo, "parked")
+    notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} re-rebased but parked for you",
+           _pr_url(cfg.repo, pr))
+    return "parked"
+
+
+def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str:
+    """Re-rebase one survivor and route the outcome by the repo's profile. On conflict,
+    park-and-ping (every profile). On a clean re-rebase: `autonomous` reruns the merge gate
+    and lands one; `reviewed`/`guarded` just leave the PR mergeable again for the human —
+    never a merge (ADR 0002)."""
+    m = _BRANCH_RE.match(branch)
+    if not m:
+        return f"#{pr}: unrecognized branch {branch}"
+    tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
+    result = _rebase_branch(cfg, branch, Path(_builder_worktree(cfg, tool, n, sl)))
+    if result is RebaseResult.CONFLICT:
+        _park_conflicted_survivor(cfg, pr, n)
+        return f"#{pr}: conflict — parked for human"
+    if result is RebaseResult.ERROR:
+        return f"#{pr}: rebase plumbing failed — retry next cycle"
+    if result is RebaseResult.NOOP:
+        return f"#{pr}: nothing to replay"
+    if profile != "autonomous":
+        return f"#{pr}: re-rebased clean — mergeable for the human"
+    return f"#{pr}: {_merge_autonomous_survivor(cfg, pr, n, sl, tool, branch)}"
+
+
+def recheck_once(cfg: RepoConfig) -> str:
+    """Re-rebase every open agentflow PR whose base advanced since a sibling merged, and
+    reroute by profile (ADR 0009 merge-time floor; issue #45). Merges serialize — at most
+    one lands per cycle, so surviving siblings re-rebase against the new `main` before the
+    next is eligible. Skips a survivor whose base hasn't moved (no needless force-push) and
+    one already flagged / awaiting a maintainer reply (no re-ping, no fighting the responder
+    — issue #18). Never opens a new PR; never merges on a `reviewed`/`guarded` repo."""
+    prs = _open_agentflow_prs(cfg)
+    if prs is None:
+        return "couldn't list open PRs — deferring"
+    if _run(["git", "-C", cfg.workdir, "fetch", "origin", "--quiet"]).returncode != 0:
+        return "couldn't fetch origin — deferring"
+    profile = repo_profile(cfg.workdir)
+    results: list[str] = []
+    for pr, branch in prs:
+        if not _base_advanced_for(cfg.workdir, branch):
+            continue   # False or None — base hasn't moved (or unknown): leave it untouched
+        comments = _pr_comments(cfg.repo, pr)
+        if conflict_already_flagged(comments) or reply_pending(comments):
+            continue   # already pinged, or a maintainer question the responder owns
+        out = _rebase_survivor(cfg, pr, branch, profile)
+        results.append(out)
+        if out.endswith(": merged"):
+            break   # one merge per cycle — survivors re-rebase against the new main first
+    return "; ".join(results) if results else "no survivors to re-rebase"
+
+
 def pipeline_once(cfg: RepoConfig) -> str:
-    """One full pass for a repo: triage one un-triaged issue, build one ready issue, and
-    answer one parked PR the maintainer commented on (ADR 0016 — intake runs ahead of the
-    build queue; issue #18 — parked PRs stay answered)."""
+    """One full pass for a repo: triage one un-triaged issue, build one ready issue, answer
+    one parked PR the maintainer commented on, and re-rebase any survivor whose base moved
+    when a sibling merged (ADR 0016 — intake runs ahead of the build queue; issue #18 —
+    parked PRs stay answered; ADR 0009 / issue #45 — survivors never go silently conflicting)."""
     for tool in ("claude", "codex"):
         prune_stale_worktrees(cfg.repo, cfg.workdir, tool)
-    return f"intake: {intake_once(cfg)} · build: {run_once(cfg)} · respond: {respond_once(cfg)}"
+    return (f"intake: {intake_once(cfg)} · build: {run_once(cfg)} · "
+            f"respond: {respond_once(cfg)} · recheck: {recheck_once(cfg)}")
 
 
 def _main_config(argv: list[str]) -> RepoConfig:
