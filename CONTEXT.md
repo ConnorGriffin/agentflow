@@ -24,11 +24,12 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   sets a repo's position on the autonomy dial. High in `ciq-autotune` (medical),
   low in a vibe-code project.
 
-- **Complexity** — the per-issue model size intake stamps as a hard gate: `standard`
-  (sonnet/Terra) or `deep` (correctness-sensitive — opus/Sol). Tool-agnostic; each
-  runner resolves it to its tool's model. Orthogonal to the pool: pool = *which plan*
-  (by headroom), complexity = *how big a model within it*. (Supersedes the earlier
-  single `tier` dial; `light`/haiku dropped — ADR 0018.)
+- **Complexity** — the per-issue builder model size intake stamps as a hard gate:
+  `standard` (sonnet/Terra) or `deep` (correctness-sensitive — opus/Sol).
+  Tool-agnostic; each runner resolves it to its tool's model. Orthogonal to the pool:
+  pool = *which plan* (by headroom), complexity = *how big a builder model within
+  it*. Reviewers do not inherit this dial; every review uses the deep tier.
+  (Supersedes the earlier single `tier` dial; `light`/haiku dropped — ADR 0018.)
 
 - **Effort** — the second dial intake stamps alongside complexity: `low | medium |
   high | extra` — how much work the issue warrants, independent of model size.
@@ -40,8 +41,9 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Builder** — the runner that implements an issue and opens the PR. Self-reviews
   and flags uncertainties, but its own sign-off never gates a merge.
 
-- **Reviewer** — the runner that reviews the PR. Must be a *different model* than
-  the builder (see cross-tool review); its verdict is the one that counts.
+- **Reviewer** — the runner that reviews the PR at the deep tier (opus/Sol),
+  independently of builder complexity. Must be a *different model* than the builder
+  (see cross-tool review); its verdict is the one that counts.
 
 - **Cross-tool review** — a review performed by a different model than the one that
   built the diff (Codex→Claude or Claude→Codex). Independence from the builder is

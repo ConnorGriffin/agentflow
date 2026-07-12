@@ -6,9 +6,46 @@ Cases marked `# adversarial` are regressions for the refutation pass that harden
 this module (see reviewer.py docstring / git history).
 """
 
+from subprocess import CompletedProcess
+
 import pytest
 
-from agentflow.reviewer import REVIEW_PROMPT, Verdict, parse_verdict
+from agentflow.reviewer import REVIEW_PROMPT, Reviewer, Verdict, parse_verdict
+from agentflow.runner import Complexity
+
+
+class _RecordingRunner:
+    tool = "claude"
+
+    def __init__(self):
+        self.complexities = []
+        self.launched_model = ""
+
+    def prepare_worktree_detached(self, *_args):
+        pass
+
+    def provision(self, *_args):
+        pass
+
+    def model_for(self, complexity):
+        self.complexities.append(complexity)
+        return f"model-for-{complexity.value}"
+
+    def launch(self, _prompt, *, cwd, model):
+        self.launched_model = model
+        return True, '{"verdict":"PASS","reviewed_sha":"abc123","findings":[]}'
+
+
+def test_every_review_uses_deep_complexity_through_the_public_interface(monkeypatch, tmp_path):
+    monkeypatch.setattr("agentflow.reviewer._run",
+                        lambda *_args, **_kwargs: CompletedProcess([], 0, "abc123\n", ""))
+    runner = _RecordingRunner()
+
+    verdict = Reviewer(runner).review("owner/repo", str(tmp_path), 28, "feature", "issue-28")
+
+    assert verdict.clean is True
+    assert runner.complexities == [Complexity.DEEP]
+    assert runner.launched_model == "model-for-deep"
 
 
 def test_pass_with_no_findings_is_clean():

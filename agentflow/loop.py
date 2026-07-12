@@ -494,7 +494,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         # HUMAN merges (ADR 0002, 0020) — hand over a clean PR when we can.
         revises_used = 0
         while True:
-            verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity,
+            verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl,
                                       acceptance=acceptance, surfaces=surfaces_phrase)
             if verdict.clean or not (verdict.parsed and verdict.blocking) or revises_used >= MAX_REVISES:
                 # A human merges either way, but the mechanical UI-evidence gate still runs
@@ -511,7 +511,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
 
     revises_used = 0
     while True:
-        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl, complexity,
+        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl,
                                   acceptance=acceptance, surfaces=surfaces_phrase)
         # The UI-evidence gate is read from the diff + attachments, AFTER the review, so a
         # reviewer's "not blocking" cannot clear a screenshot-less UI change (ADR 0018).
@@ -821,9 +821,8 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     if reviewer_runner is None:
         return "deferred"   # no headroom to re-review — try again next cycle
     meta = _issue_meta(cfg, n)
-    complexity = complexity_from_labels([lbl["name"] for lbl in meta.get("labels", [])]) or Complexity.DEEP
     surfaces = ui_surfaces(cfg.workdir)
-    verdict = Reviewer(reviewer_runner).review(cfg.repo, cfg.workdir, pr, branch, sl, complexity,
+    verdict = Reviewer(reviewer_runner).review(cfg.repo, cfg.workdir, pr, branch, sl,
                                                acceptance=meta.get("body") or "",
                                                surfaces=_surfaces_phrase(surfaces))
     ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)

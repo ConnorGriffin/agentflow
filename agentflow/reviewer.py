@@ -190,7 +190,7 @@ class Reviewer:
         self.runner = runner  # the tool that did NOT build this PR
 
     def review(self, repo: str, workdir: str, pr_number: int, pr_head_branch: str,
-               slug: str, issue_complexity: Complexity, acceptance: str = "",
+               slug: str, acceptance: str = "",
                surfaces: str = "any user-facing surface") -> Verdict:
         head_sha = self._head_sha(repo, pr_number)
         if not head_sha:
@@ -207,9 +207,8 @@ class Reviewer:
         # model-written file in the (untrusted) PR tree, so a builder cannot forge it.
         prompt = REVIEW_PROMPT.format(pr=pr_number, acceptance=acceptance or "(none provided)",
                                       surfaces=surfaces)
-        # Review at the issue's own complexity — a correctness-sensitive build gets a
-        # correctness-sensitive reviewer (ADR 0018; the old light floor is moot).
-        model = self.runner.model_for(issue_complexity)
+        # Cross-review is always the deep safety net, independent of builder sizing.
+        model = self.runner.model_for(Complexity.DEEP)
         ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
         if not ok:
             return _unparseable("reviewer session errored (launch non-zero)")
