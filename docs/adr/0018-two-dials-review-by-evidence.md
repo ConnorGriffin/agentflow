@@ -15,9 +15,12 @@ server, which breaks unattended autonomy.
 
 Intake stamps **two dials**, tool-agnostic:
 
-- **complexity**: `standard | deep` → sonnet/Terra or opus/Sol. (Drops the unused
-  `light`/haiku — ciq's floor was always sonnet.)
+- **complexity**: `standard | deep` → sonnet/Terra or opus/Sol for the builder.
+  (Drops the unused `light`/haiku — ciq's builder floor was always sonnet.)
 - **effort**: `low | medium | high | extra`.
+
+Every reviewer runs at the `deep` tier, independently of builder complexity. The
+complexity dial continues to size builders and revisers only.
 
 The **`review:` dial is dropped.** Its intent is met by two *always-on* rules:
 

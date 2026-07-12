@@ -41,22 +41,23 @@ build runs without one.**
   picks the *tier* within it by complexity. A `light` issue runs haiku on the Claude
   pool, Luna on the Codex pool.
 
-### Reviewer tier — tracks the issue tier, floored at `standard`
+### Reviewer tier — always `deep`
 
-The cross-tool reviewer's tier **tracks the issue tier but never drops below
-`standard`**: a `light` issue is reviewed at `standard`, `standard` at `standard`,
-`deep` at `deep`. Review is the safety gate that permits unattended merge, so a
-light-tier (haiku/Luna) reviewer risks rubber-stamping and defeats the cross-tool
+The cross-tool reviewer always runs at `deep`, independently of the issue-sized
+builder tier. Review is the safety gate that permits unattended merge; sharing a
+cheaper builder tier risks sharing its blind spots and defeats the cross-tool
 argument ([ADR 0003](0003-cross-tool-review.md)/[0004](0004-auto-merge-gate.md)).
-Sized to the work, but with a competence floor.
+Review sessions are short relative to builds, so this spends deep-tier headroom on
+the safety net while preserving issue-sized builder cost.
 
 ## Alternatives considered
 
 - **Builder self-selects its tier.** Rejected: it was the deferred default and is not
   a guarantee — a model asked to size itself trends toward "use the big one." Intake
   sizing is explicit and auditable.
-- **One tier everywhere ("always deep, to be safe").** Rejected: the exact waste this
-  ADR exists to stop.
+- **One tier for every pipeline stage ("always deep, to be safe").** Rejected for
+  builders and other sessions: the exact waste this ADR exists to stop. Reviewers
+  are the deliberate exception because they are the merge safety net.
 
 ## Consequences
 
