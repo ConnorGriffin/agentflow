@@ -45,6 +45,17 @@ def _pr_comments(repo: str, pr: int) -> list[dict]:
         return []
 
 
+def _issue_comments(repo: str, n: int) -> list[dict]:
+    """The issue's comments, or [] if they can't be read. Impure."""
+    r = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "comments"])
+    if r.returncode != 0:
+        return []
+    try:
+        return json.loads(r.stdout or "{}").get("comments", [])
+    except json.JSONDecodeError:
+        return []
+
+
 _COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
 _EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
@@ -832,7 +843,20 @@ def produce_once(cfg: RepoConfig, _log=None) -> str:
         except subprocess.CalledProcessError as e:
             return f"#{n}: mockup worktree/provision failed ({e})"
         ok, _ = builder.launch(prompt, cwd=str(wt), model=builder.model_for(Complexity.DEEP))
-        return f"#{n}: drew mockup variants" if ok else f"#{n}: mockup session errored"
+        if not ok:
+            return f"#{n}: mockup session errored"
+        # Confirm what was actually posted — a successful exit alone doesn't prove a comment landed.
+        issue_url = f"https://github.com/{cfg.repo}/issues/{n}"
+        comments = _issue_comments(cfg.repo, n)
+        posted = next((c for c in comments if MOCKUP_MARK in c.get("body", "")), None)
+        if posted is None:
+            return f"#{n}: drew mockup variants"
+        if "MISSING-CONTEXT:" in posted.get("body", ""):
+            notify("agentflow needs you", f"{cfg.repo} #{n}: mockup is stuck — MISSING-CONTEXT",
+                   issue_url)
+            return f"#{n}: mockup stuck (MISSING-CONTEXT)"
+        notify("agentflow needs you", f"{cfg.repo} #{n}: mockup variants ready", issue_url)
+        return f"#{n}: drew mockup variants"
     finally:
         _release_mockup(cfg.repo, n)
 
