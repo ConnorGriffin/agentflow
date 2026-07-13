@@ -5,6 +5,7 @@ behind adapters; the *decision* of what a session outcome means is `classify_bui
 and that is what actually needs to be right.
 """
 
+import os
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
@@ -219,6 +220,20 @@ def test_public_session_lifecycle_bounds_registrations_across_every_lane(tmp_pat
     registered = _git(repo, "worktree", "list", "--porcelain")
     assert registered.count("worktree ") == 4  # main + dirty + unpushed + active
     assert foreign_wt.exists()
+
+
+def test_agent_launch_persists_the_child_pid_until_the_session_finishes(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-10-live"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-10-live")
+
+    with worktree_session(wt):
+        result = runner_mod._run_session(["sh", "-c", "exit 0"], str(wt), 5)
+        marker = runner_mod._active_marker(wt)
+        assert marker is not None
+        child_pid = int(marker.read_text())
+        assert result.returncode == 0 and child_pid != os.getpid()
+    assert not marker.exists()
 
 
 def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
