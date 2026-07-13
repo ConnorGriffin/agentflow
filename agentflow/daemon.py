@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import fcntl
 import os
+import signal
 import shutil
 import threading
 import time
@@ -107,24 +109,49 @@ def _acquire_lock() -> bool:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if _try_claim():
         return True
+
+    # Serialize the inspect-and-reclaim decision. `flock` is tied to this open file
+    # descriptor, so a crash releases it automatically without leaving another lock
+    # artifact behind. The lock dir itself remains the public ownership record.
+    guard = os.open(STATE_DIR, os.O_RDONLY)
     try:
-        age = time.time() - LOCK.stat().st_mtime
-    except OSError:
-        return _try_claim()  # lock vanished between checks — grab it fresh
-    if age <= STALE_SECONDS:
-        return False
-    # Stale lock from a crashed run: take real ownership. Rename the stale dir out of
-    # the way first — the rename is atomic, so if two starters race the reclaim exactly
-    # one wins it (the losers' rename fails because the source is already gone) and
-    # only the winner recreates + re-claims the lock.
-    stale = LOCK.with_name(f"{LOCK.name}.stale.{os.getpid()}")
-    try:
-        os.rename(LOCK, stale)
-    except OSError:
-        return False  # lost the reclaim race — another starter owns the lock now
-    log("reclaiming stale lock")
-    shutil.rmtree(stale, ignore_errors=True)
-    return _try_claim()
+        try:
+            fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+        if _try_claim():
+            return True  # lock vanished before the guarded check — grab it fresh
+        try:
+            age = time.time() - LOCK.stat().st_mtime
+        except OSError:
+            return _try_claim()
+        owner_is_dead = False
+        try:
+            owner_pid = int((LOCK / "pid").read_text().strip())
+            if owner_pid > 0:
+                try:
+                    os.kill(owner_pid, 0)
+                except ProcessLookupError:
+                    owner_is_dead = True
+                except OSError:
+                    pass  # permission denied or unknown means the owner may still be alive
+        except (OSError, ValueError):
+            pass  # malformed ownership is reclaimed only by the existing age backstop
+        if not owner_is_dead and age <= STALE_SECONDS:
+            return False
+        # Abandoned lock from a crashed run: take real ownership. Rename the old dir out
+        # of the way first — the rename is atomic, and the guard ensures only the process
+        # that inspected this lock can replace it.
+        stale = LOCK.with_name(f"{LOCK.name}.stale.{os.getpid()}")
+        try:
+            os.rename(LOCK, stale)
+        except OSError:
+            return False
+        log("reclaiming dead-owner lock" if owner_is_dead else "reclaiming stale lock")
+        shutil.rmtree(stale, ignore_errors=True)
+        return _try_claim()
+    finally:
+        os.close(guard)
 
 
 def _owns_lock() -> bool:
@@ -167,13 +194,37 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if not _acquire_lock():
-        log("another daemon is running; exiting")
-        return
     stop = threading.Event()
     beat = threading.Thread(target=_heartbeat, args=(stop,), daemon=True)
-    beat.start()
+    previous_handlers = {}
+    previous_mask = None
+    signals_blocked = False
+    shutdown_requested = False
+    acquired = False
+
+    def request_shutdown(_signum, _frame):
+        nonlocal shutdown_requested
+        if shutdown_requested:
+            return
+        shutdown_requested = True
+        raise SystemExit(0)
+
     try:
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous_handlers[signum] = signal.signal(signum, request_shutdown)
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, (signal.SIGTERM, signal.SIGINT)
+            )
+            signals_blocked = True
+        if not _acquire_lock():
+            log("another daemon is running; exiting")
+            return
+        acquired = True
+        if signals_blocked:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+            signals_blocked = False
+        beat.start()
         recover_worktrees(REPOS)
         if args.once:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
@@ -197,8 +248,14 @@ def main() -> None:
                     log(f"dormant (no {ENABLE_FLAG}); sleeping")
                 time.sleep(POLL_SECONDS)
     finally:
+        shutdown_requested = True
         stop.set()
-        _release_lock()
+        if acquired:
+            _release_lock()
+        if signals_blocked:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
 
 
 if __name__ == "__main__":

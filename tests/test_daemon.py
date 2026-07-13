@@ -2,7 +2,9 @@
 
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -35,6 +37,40 @@ def _wait_for_snapshot(port: int, timeout: float = 2) -> dict:
         except (OSError, urllib.error.URLError):
             time.sleep(0.01)
     raise AssertionError("daemon dashboard did not become reachable")
+
+
+def _wait_for_lock(lock, owner_pid: int, timeout: float = 2) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if (lock / "pid").read_text().strip() == str(owner_pid):
+                return
+        except OSError:
+            time.sleep(0.01)
+    raise AssertionError("daemon did not acquire its lock")
+
+
+def _start_daemon(state_dir):
+    env = os.environ | {
+        "AGENTFLOW_STATE": str(state_dir),
+        "AGENTFLOW_TEST_PORT": str(_unused_port()),
+    }
+    script = """
+import os
+from agentflow import daemon, server
+
+daemon.REPOS = []
+daemon.POLL_SECONDS = 60
+server.PORT = int(os.environ["AGENTFLOW_TEST_PORT"])
+daemon.main()
+"""
+    return subprocess.Popen(
+        [sys.executable, "-c", script],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
 
 
 def test_cycle_runs_every_repo_and_isolates_errors():
@@ -94,6 +130,27 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
     assert events == [("recover", [A, B]), ("cycle", [A, B])]
     start_dashboard.assert_not_called()
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit
+
+
+def test_sigterm_releases_lock_so_a_fresh_daemon_can_start(tmp_path):
+    """A supervised stop leaves the daemon ready to start again immediately."""
+    lock = tmp_path / "daemon.lock"
+    process = _start_daemon(tmp_path)
+    replacement = None
+    try:
+        _wait_for_lock(lock, process.pid)
+        process.send_signal(signal.SIGTERM)
+        output, _ = process.communicate(timeout=2)
+
+        assert process.returncode == 0, output
+        assert not lock.exists()
+        replacement = _start_daemon(tmp_path)
+        _wait_for_lock(lock, replacement.pid)
+    finally:
+        for child in (process, replacement):
+            if child is not None and child.poll() is None:
+                child.send_signal(signal.SIGTERM)
+                child.wait(2)
 
 
 def test_main_serves_live_dispatch_state_without_a_separate_dashboard(tmp_path):
@@ -187,6 +244,46 @@ def test_stale_lock_reclaim_is_exclusive(tmp_path):
 
     assert results.count(True) == 1  # exactly one starter reclaimed and proceeded
     assert lock.exists() and (lock / "pid").read_text().strip() == str(os.getpid())
+
+
+def test_fresh_lock_from_a_dead_daemon_is_reclaimed_on_startup(tmp_path):
+    """A crashed daemon restarts without waiting for the lock to age out."""
+    dead_owner = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead_owner.wait()
+    lock = tmp_path / "daemon.lock"
+    lock.mkdir()
+    (lock / "pid").write_text(str(dead_owner.pid))
+    process = _start_daemon(tmp_path)
+
+    try:
+        _wait_for_lock(lock, process.pid)
+    finally:
+        if process.poll() is None:
+            process.send_signal(signal.SIGTERM)
+            process.wait(2)
+
+
+def test_lock_from_a_live_daemon_is_refused_on_startup(tmp_path):
+    """A healthy owner keeps exclusive use of the daemon lock."""
+    live_owner = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(10)"]
+    )
+    lock = tmp_path / "daemon.lock"
+    lock.mkdir()
+    (lock / "pid").write_text(str(live_owner.pid))
+    contender = _start_daemon(tmp_path)
+
+    try:
+        output, _ = contender.communicate(timeout=2)
+        assert contender.returncode == 0, output
+        assert "another daemon is running; exiting" in output
+        assert (lock / "pid").read_text().strip() == str(live_owner.pid)
+    finally:
+        if contender.poll() is None:
+            contender.kill()
+            contender.wait()
+        live_owner.terminate()
+        live_owner.wait()
 
 
 def test_release_leaves_another_pids_lock_alone(tmp_path):
