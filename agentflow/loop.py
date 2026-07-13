@@ -790,7 +790,9 @@ edit the issue title, body, or labels; do not open a PR. The comment MUST:
   it for the maintainer's reply):
   {disclaimer}
 - Embed each variant's screenshot as a markdown image from its committed path on this branch,
-  e.g. `![Variant A](https://raw.githubusercontent.com/{repo}/{branch}/mockups/<file>.png)`.
+  using the `github.com/.../raw/refs/heads/` host (NOT `raw.githubusercontent.com`, which 404s on
+  private repos because it ignores the viewer's login):
+  `![Variant A](https://github.com/{repo}/raw/refs/heads/{branch}/mockups/<file>.png)`.
 - Name the variants A, B, C (and D), each with a ONE-LINE description of its concept.
 - End with a clear ask: reply on this issue with a pick ("B", "the second one", "A but with C's
   header") or an adjustment, and agentflow will lock the chosen design and start the build.
