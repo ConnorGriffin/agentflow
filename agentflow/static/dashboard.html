@@ -25,25 +25,60 @@
   body{margin:0;background:var(--bg);color:var(--fg);
     font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
     display:flex;flex-direction:column;overflow:hidden}
+  button,a{font:inherit}
+  button:focus-visible,a:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 
-  /* ---- header ---- */
-  header{display:flex;align-items:center;gap:14px;padding:12px 22px;
-    border-bottom:1px solid var(--border);flex:none}
+  /* ---- header: shipping structure + compact daemon truth ---- */
+  header{position:relative;z-index:10;display:flex;align-items:center;gap:12px;padding:12px 22px;
+    border-bottom:1px solid var(--border);flex:none;min-height:54px}
   header h1{margin:0;font-size:17px;letter-spacing:.5px}
   header .tag{color:var(--muted);font-size:11px;letter-spacing:.3px}
   .pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;
     padding:4px 10px;border-radius:20px;border:1px solid}
-  .pill .dot{width:7px;height:7px;border-radius:50%}
-  .pill.ok{color:var(--green);border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.08)}
-  .pill.ok .dot{background:var(--green)}
-  .pill.bad{color:var(--red);border-color:rgba(248,81,73,.4);background:rgba(248,81,73,.08)}
-  .pill.bad .dot{background:var(--red)}
+  .pill .dot{width:7px;height:7px;border-radius:50%;flex:none}
   .pill.warn{color:var(--amber);border-color:rgba(210,153,34,.4);background:rgba(210,153,34,.08)}
   .pill.warn .dot{background:var(--amber)}
   .pill.calm{color:var(--green);border-color:rgba(63,185,80,.35);background:rgba(63,185,80,.06)}
   .pill.calm .dot{background:var(--green)}
   .spacer{flex:1}
-  .updated{color:var(--muted);font-size:11px}
+  .updated{color:var(--muted);font-size:11px;white-space:nowrap}
+
+  .dispatch-wrap{position:relative}
+  .dispatch-trigger{display:inline-flex;align-items:center;gap:7px;height:29px;padding:4px 10px;
+    border:1px solid rgba(248,81,73,.55);border-radius:20px;color:#ff7b72;
+    background:rgba(248,81,73,.10);cursor:pointer;white-space:nowrap;font-size:12px;font-weight:600}
+  .dispatch-trigger.enabled{color:#56d364;border-color:rgba(63,185,80,.5);background:rgba(63,185,80,.08)}
+  .dispatch-trigger .state-mark{display:inline-grid;place-items:center;width:14px;height:14px;
+    font-size:10px;line-height:1;border:1px solid currentColor;border-radius:50%}
+  .dispatch-trigger .chev{font-size:10px;margin-left:2px;transition:transform .12s}
+  .dispatch-trigger[aria-expanded="true"] .chev{transform:rotate(180deg)}
+  .dispatch-pop{position:absolute;top:38px;left:0;width:390px;padding:0;
+    background:var(--panel);border:1px solid var(--border-2);border-radius:8px;
+    box-shadow:0 12px 34px rgba(0,0,0,.48);overflow:hidden}
+  .dispatch-pop[hidden]{display:none}
+  .pop-head{display:flex;align-items:center;gap:10px;padding:12px 14px;
+    background:rgba(248,81,73,.07);border-bottom:1px solid var(--border)}
+  .dispatch-pop.enabled .pop-head{background:rgba(63,185,80,.06)}
+  .pop-head .state-mark{display:grid;place-items:center;width:24px;height:24px;border-radius:50%;
+    color:#ff7b72;border:1px solid rgba(248,81,73,.55);flex:none;font-size:12px}
+  .dispatch-pop.enabled .pop-head .state-mark{color:#56d364;border-color:rgba(63,185,80,.5)}
+  .pop-head-copy{min-width:0}
+  .pop-kicker{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:#ff7b72;font-weight:700}
+  .dispatch-pop.enabled .pop-kicker{color:#56d364}
+  .pop-title{font-size:13px;font-weight:650;margin-top:1px}
+  .pop-close{margin-left:auto;border:0;background:transparent;color:var(--muted);cursor:pointer;
+    padding:4px 6px;border-radius:5px;font-size:16px;line-height:1}
+  .pop-close:hover{color:var(--fg);background:var(--panel-2)}
+  .pop-body{padding:12px 14px 13px}
+  .truth-row{display:grid;grid-template-columns:16px 108px 1fr;gap:7px;align-items:baseline;
+    padding:4px 0;font-size:12px}
+  .truth-row .yes{color:var(--green)}
+  .truth-row .no{color:var(--red)}
+  .truth-row b{font-weight:600;color:var(--fg)}
+  .truth-row span:last-child{color:#b1bac4}
+  .pop-explain{margin:9px 0 0;padding-top:10px;border-top:1px solid var(--border);
+    color:#b1bac4;font-size:12px;line-height:1.55;max-width:52ch}
+  .pop-foot{margin:8px 0 0;color:var(--muted);font-size:11px}
 
   /* ---- layout ---- */
   main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1.7fr) 344px;
@@ -154,6 +189,7 @@
     main{grid-template-columns:1fr;overflow-y:auto}
     .inbox{overflow:visible}
     .rail{overflow:visible}
+    .dispatch-pop{left:auto;right:0;width:min(390px,calc(100vw - 28px))}
   }
 </style>
 </head>
@@ -161,7 +197,33 @@
 <header>
   <h1>agentflow</h1>
   <span class="tag">over GitHub · read-only</span>
-  <span id="health"></span>
+  <div class="dispatch-wrap">
+    <button class="dispatch-trigger" id="dispatchTrigger" type="button"
+      aria-expanded="false" aria-controls="dispatchPop">
+      <span class="state-mark" id="triggerMark" aria-hidden="true">…</span>
+      <span id="triggerLabel" aria-live="polite">dispatch loading</span>
+      <span class="chev" aria-hidden="true">▾</span>
+    </button>
+    <section class="dispatch-pop" id="dispatchPop" aria-label="Daemon status disclosure" hidden>
+      <div class="pop-head">
+        <span class="state-mark" id="popMark" aria-hidden="true">…</span>
+        <div class="pop-head-copy">
+          <div class="pop-kicker" id="popKicker">Dispatch status</div>
+          <div class="pop-title" id="popTitle">Loading daemon state…</div>
+        </div>
+        <button class="pop-close" id="popClose" type="button"
+          aria-label="Close status disclosure">×</button>
+      </div>
+      <div class="pop-body">
+        <div class="truth-row"><span class="yes">✓</span><b>Console</b>
+          <span id="consoleTruth">live</span></div>
+        <div class="truth-row"><span class="no" id="dispatchTruthMark">Ⅱ</span><b>Dispatch</b>
+          <span id="dispatchTruth">checking state</span></div>
+        <p class="pop-explain" id="popExplain">Checking the daemon’s enable flag.</p>
+        <p class="pop-foot" id="popFoot"></p>
+      </div>
+    </section>
+  </div>
   <span id="needs"></span>
   <span class="spacer"></span>
   <span class="updated" id="updated">loading…</span>
@@ -183,6 +245,7 @@
 <script>
 /* ============================================================================
    agentflow — inbox variant. Binds the EXACT snapshot() shape:
+     dispatch {enabled}
      pools[]  {tool, clear, spent_pct, headroom_pct}
      repos[]  {repo, profile, in_flight[]{number,title,builder},
                recent_merges[]{number,title,merged_at},
@@ -373,16 +436,53 @@ function renderRail(snap, nowMs){
 }
 
 function renderHeader(snap, inbox){
-  const worst = Math.min(...snap.pools.map(p => p.headroom_pct));
-  const healthy = worst >= 15;
-  document.getElementById('health').outerHTML = healthy
-    ? `<span id="health" class="pill ok"><span class="dot"></span>fleet healthy</span>`
-    : `<span id="health" class="pill bad"><span class="dot"></span>rate-limited · ${worst}% headroom</span>`;
   document.getElementById('needs').outerHTML = inbox.length
     ? `<span id="needs" class="pill warn"><span class="dot"></span>${inbox.length} need you</span>`
     : `<span id="needs" class="pill calm"><span class="dot"></span>inbox zero</span>`;
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
+
+function renderDaemonState(dispatch){
+  const enabled = !!dispatch.enabled;
+  const trigger = document.getElementById('dispatchTrigger');
+  const pop = document.getElementById('dispatchPop');
+  trigger.classList.toggle('enabled', enabled);
+  pop.classList.toggle('enabled', enabled);
+  document.getElementById('triggerMark').textContent = enabled ? '✓' : 'Ⅱ';
+  document.getElementById('triggerLabel').textContent = enabled ? 'dispatch enabled' : 'dispatch dormant';
+  document.getElementById('popMark').textContent = enabled ? '✓' : 'Ⅱ';
+  document.getElementById('popKicker').textContent = enabled ? 'Dispatch enabled' : 'Dispatch dormant';
+  document.getElementById('popTitle').textContent = enabled
+    ? 'The console is live and the fleet can dispatch.'
+    : 'The console is live; new work is paused.';
+  document.getElementById('consoleTruth').textContent = `live on :${location.port}`;
+  const truthMark = document.getElementById('dispatchTruthMark');
+  truthMark.textContent = enabled ? '✓' : 'Ⅱ';
+  truthMark.className = enabled ? 'yes' : 'no';
+  document.getElementById('dispatchTruth').textContent = enabled
+    ? 'enabled · accepting new work'
+    : 'dormant · not starting new work';
+  document.getElementById('popExplain').textContent = enabled
+    ? 'The supervised daemon owns this console and may claim queued issues as pool headroom allows. The snapshot below remains the source of fleet detail.'
+    : 'The daemon’s enable flag is absent. This snapshot remains available for triage, but agentflow will not claim queued issues or start builders until dispatch is enabled.';
+  document.getElementById('popFoot').textContent = enabled
+    ? 'No operator action needed.'
+    : 'Restore the enable flag to resume the fleet.';
+}
+
+const dispatchTrigger = document.getElementById('dispatchTrigger');
+const dispatchPop = document.getElementById('dispatchPop');
+function setDisclosure(open){
+  dispatchPop.hidden = !open;
+  dispatchTrigger.setAttribute('aria-expanded', String(open));
+  if (!open) dispatchTrigger.focus();
+}
+dispatchTrigger.addEventListener('click', () =>
+  setDisclosure(dispatchTrigger.getAttribute('aria-expanded') !== 'true'));
+document.getElementById('popClose').addEventListener('click', () => setDisclosure(false));
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && !dispatchPop.hidden) setDisclosure(false);
+});
 
 /* ---- driver ---- */
 async function render(){
@@ -390,6 +490,7 @@ async function render(){
   try { snap = await (await fetch(SNAPSHOT_URL)).json(); }
   catch(e){ document.getElementById('updated').textContent = 'error: ' + e; return; }
   const inbox = deriveInbox(snap);
+  renderDaemonState(snap.dispatch);
   renderHeader(snap, inbox);
   renderInbox(inbox);
   renderRail(snap, Date.now());

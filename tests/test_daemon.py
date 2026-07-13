@@ -1,17 +1,40 @@
-"""The daemon's cycle isolation — one bad repo must not stop the others."""
+"""The daemon's public lifecycle: polling, dashboard, and cycle isolation."""
 
+import json
 import os
+import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from unittest import mock
 
-from agentflow import daemon
+from agentflow import daemon, server
 from agentflow.daemon import _acquire_lock, _release_lock, cycle, main
 from agentflow.loop import RepoConfig
 
 A = RepoConfig("owner/a", "/tmp/a")
 B = RepoConfig("owner/b", "/tmp/b")
+
+
+def _unused_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _wait_for_snapshot(port: int, timeout: float = 2) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/api/snapshot", timeout=0.2
+            ) as response:
+                return json.load(response)
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.01)
+    raise AssertionError("daemon dashboard did not become reachable")
 
 
 def test_cycle_runs_every_repo_and_isolates_errors():
@@ -62,13 +85,78 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
                    side_effect=lambda repos: events.append(("recover", list(repos)))),
         mock.patch("agentflow.daemon.cycle",
                    side_effect=lambda repos: events.append(("cycle", list(repos)))),
+        mock.patch("agentflow.daemon.dashboard") as start_dashboard,
         mock.patch("agentflow.daemon.log"),
         mock.patch.object(sys, "argv", ["daemon", "--once"]),
     ):
         main()
 
     assert events == [("recover", [A, B]), ("cycle", [A, B])]
+    start_dashboard.assert_not_called()
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit
+
+
+def test_main_serves_live_dispatch_state_without_a_separate_dashboard(tmp_path):
+    """The supervised daemon owns the console even while dispatch is dormant."""
+    port = _unused_port()
+    enabled = tmp_path / "enabled"
+    dispatch_started = threading.Event()
+    finish = threading.Event()
+
+    class StopDaemon(Exception):
+        pass
+
+    def stop_after_dispatch(_repos):
+        dispatch_started.set()
+        finish.wait(2)
+        raise StopDaemon
+
+    errors = []
+
+    def run_daemon():
+        try:
+            main()
+        except StopDaemon:
+            pass
+        except BaseException as exc:  # surfaced in the test thread below
+            errors.append(exc)
+
+    with (
+        mock.patch("agentflow.daemon.STATE_DIR", tmp_path),
+        mock.patch("agentflow.daemon.ENABLE_FLAG", enabled),
+        mock.patch("agentflow.daemon.LOCK", tmp_path / "daemon.lock"),
+        mock.patch("agentflow.daemon.POLL_SECONDS", 0.01),
+        mock.patch("agentflow.daemon.REPOS", []),
+        mock.patch("agentflow.daemon.recover_worktrees"),
+        mock.patch("agentflow.daemon.cycle", side_effect=stop_after_dispatch),
+        mock.patch("agentflow.daemon.log"),
+        mock.patch("agentflow.dashboard_data.pools", return_value=[]),
+        mock.patch.object(server, "PORT", port),
+        mock.patch.object(sys, "argv", ["daemon"]),
+    ):
+        thread = threading.Thread(target=run_daemon)
+        thread.start()
+        try:
+            dormant = _wait_for_snapshot(port)
+            assert dormant["dispatch"] == {"enabled": False}
+            assert not dispatch_started.is_set(), "dormant daemon claimed work"
+
+            enabled.touch()
+            assert dispatch_started.wait(2), "poll loop did not observe the enable flag"
+            active = _wait_for_snapshot(port)
+            assert active["dispatch"] == {"enabled": True}
+
+            enabled.unlink()
+            dormant_again = _wait_for_snapshot(port)
+            assert dormant_again["dispatch"] == {"enabled": False}
+        finally:
+            enabled.touch()
+            finish.set()
+            thread.join(3)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert not (tmp_path / "daemon.lock").exists()
 
 
 def test_stale_lock_reclaim_is_exclusive(tmp_path):
