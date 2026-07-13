@@ -210,6 +210,7 @@ def test_short_window_block_wins_while_weekly_window_is_below_pace(
     '{"windows":[]}',
     '{"windows":[{"used_percent":10,"window_minutes":60,"resets_at":1784566349}]}',
     '{"windows":[{"used_percent":"10","window_minutes":10080,"resets_at":1784566349}]}',
+    '{"windows":[{"used_percent":10,"window_minutes":1e309,"resets_at":1784566349}]}',
     '{"windows":[{"used_percent":10,"window_minutes":10080}]}',
 ])
 def test_unknown_codex_limit_facts_fail_closed(stub_gate, monkeypatch, facts):

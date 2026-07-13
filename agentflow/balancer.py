@@ -65,6 +65,8 @@ def _parse_codex_windows(stdout: str) -> tuple[RateLimitWindow, ...] | None:
                    for value in values):
                 return None
             used, raw_minutes, resets_at = map(float, values)
+            if not math.isfinite(raw_minutes):
+                return None
             minutes = int(raw_minutes)
             if (raw_minutes != minutes
                     or minutes not in (_SHORT_WINDOW_MIN, _WEEKLY_WINDOW_MIN)
