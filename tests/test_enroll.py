@@ -36,6 +36,7 @@ def test_enrollment_preserves_existing_ignore_content(tmp_path):
     _enroll(tmp_path, apply=True)
 
     assert ignore.read_text() == ".venv/\n*.log\n.agentflow/\n"
+    assert ignore.with_name(".gitignore.pre-agentflow").read_text() == ".venv/\n*.log\n"
 
 
 def test_repeated_enrollment_adds_agentflow_rule_exactly_once(tmp_path):

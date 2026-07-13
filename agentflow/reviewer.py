@@ -31,7 +31,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentflow.runner import Complexity, _WorktreeRunner, _run, remove_worktree_if_safe
+from agentflow.runner import Complexity, _WorktreeRunner, _run, worktree_session
 
 # Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
 # "blocker", "high", unknown) is treated as blocking — fail safe.
@@ -196,7 +196,7 @@ class Reviewer:
         if not head_sha:
             return _unparseable("could not read PR head SHA")
 
-        wt = Path(workdir) / ".agentflow" / "worktrees" / f"{self.runner.tool}-review" / f"pr-{pr_number}-{slug}"
+        wt = review_worktree(workdir, self.runner.tool, pr_number, slug)
         try:
             self.runner.prepare_worktree_detached(workdir, f"origin/{pr_head_branch}", wt)
             self.runner.provision(wt)
@@ -209,15 +209,19 @@ class Reviewer:
                                       surfaces=surfaces)
         # Cross-review is always the deep safety net, independent of builder sizing.
         model = self.runner.model_for(Complexity.DEEP)
-        ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
+        with worktree_session(wt):
+            ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
         if not ok:
             return _unparseable("reviewer session errored (launch non-zero)")
         v = parse_verdict(message, expected_sha=head_sha)
-        if v.parsed:
-            remove_worktree_if_safe(workdir, wt)
         return Verdict(v.clean, v.findings, v.parsed, v.detail, reviewer_tool=self.runner.tool)
 
     def _head_sha(self, repo: str, pr_number: int) -> str:
         r = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
                   "--json", "headRefOid", "-q", ".headRefOid"])
         return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def review_worktree(workdir: str, tool: str, pr_number: int, slug: str) -> Path:
+    return (Path(workdir) / ".agentflow" / "worktrees" / f"{tool}-review" /
+            f"pr-{pr_number}-{slug}")
