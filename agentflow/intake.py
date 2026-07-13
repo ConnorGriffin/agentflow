@@ -365,6 +365,15 @@ class Intake:
                        "answer or waiver: promote to ready if the issue is now settled (they answered "
                        "your questions, waived the visual spec requirement, or pointed at a locked spec), "
                        "else re-post ONLY what's still open. "
+                       "IF this issue was held for a MOCKUP and a variant round was already drawn (a "
+                       "comment on the issue naming variants A/B/C/D with screenshots), the reply may be "
+                       "a PICK — \"B\", \"the second one\", \"A but tighter\". In that case: read that "
+                       "mockup comment (it links the committed variant files on a mockup branch), map "
+                       "the pick to its variant, and route \"ready\" with a brief that references THAT "
+                       "chosen variant's committed file as the LOCKED visual spec the build must match "
+                       "(ADR 0018 — the build's screenshot is checked against the locked mockup, so name "
+                       "the exact file/branch). A request for a DIFFERENT or fresh set is NOT a pick — "
+                       "re-hold (route \"mockup\") as a follow-up; never auto-loop a new variant round. "
                        'If nothing genuinely open changed — the reply was chit-chat, or it didn\'t move '
                        'any open question — answer route "nothing-new" (no body) and I\'ll stay quiet '
                        "rather than restate myself.\n"

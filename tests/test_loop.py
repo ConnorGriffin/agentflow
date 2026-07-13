@@ -7,14 +7,16 @@ from types import SimpleNamespace
 import pytest
 
 from agentflow import loop
-from agentflow.intake import INTAKE_MARK, IntakeRoute
-from agentflow.loop import (BUILD_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, RebaseResult, RepoConfig,
+from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck
+from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
+                            REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
                             _build_review_merge, _free_to_dispatch, _issues_in_flight,
-                            _main_config, _next_pr_awaiting_reply, _next_ready_issue,
-                            _next_resumable_issue, _rebase_survivor, _untriaged, base_advanced,
-                            build_issue, complexity_from_labels, conflict_already_flagged,
-                            effort_from_labels, held_build_result, intake_allowlist,
-                            issue_of_branch, pr_number, reclaim_claims, recheck_once, repo_profile,
+                            _main_config, _mockup_eligible, _next_mockup_issue,
+                            _next_pr_awaiting_reply, _next_ready_issue, _next_resumable_issue,
+                            _rebase_survivor, _untriaged, base_advanced, build_issue,
+                            complexity_from_labels, conflict_already_flagged, effort_from_labels,
+                            held_build_result, intake_allowlist, issue_of_branch, pr_number,
+                            produce_once, reclaim_claims, recheck_once, repo_profile,
                             respond_once, slug, ui_surfaces)
 from agentflow.reviewer import Verdict
 from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
@@ -566,6 +568,136 @@ def test_respond_once_noop_when_nothing_pending(monkeypatch):
     assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
 
 
+# --- issue #29: the mockup-production phase --------------------------------------------
+
+# Intake's park/kickoff comment on a needs-mockup issue: carries INTAKE_MARK, no MOCKUP_MARK.
+_MOCKUP_PARK = f"{INTAKE_MARK} — let's mock this up.\n\nA `/ui-mockups` kickoff."
+# The produce phase's own variant-round comment: the disclaimer + embedded screenshots.
+_MOCKUP_VARIANTS = (f"{_MOCKUP_DISCLAIMER}\n\n"
+                    "**A** — inbox.\n![A](https://raw.githubusercontent.com/o/r/br/mockups/a.png)\n"
+                    "Reply with a pick.")
+
+
+def test_produce_disclaimer_carries_both_marks():
+    # The TRAP: the produced-variants comment must carry INTAKE_MARK so the daemon reads it as
+    # ours, and MOCKUP_MARK so the produce phase can tell a drawn round from intake's park.
+    assert INTAKE_MARK in _MOCKUP_DISCLAIMER
+    assert MOCKUP_MARK in _MOCKUP_DISCLAIMER
+
+
+def test_awaiting_recheck_false_right_after_our_variant_comment():
+    # THE self-trigger guard (AC): immediately after the produce comment — intake park, then our
+    # variant round — the daemon must NOT treat its own comment as a maintainer reply. Fails
+    # first if the variant disclaimer omits INTAKE_MARK.
+    comments = [{"body": _MOCKUP_PARK, "author": {"login": "o"}},
+                {"body": _MOCKUP_VARIANTS, "author": {"login": "o"}}]
+    assert awaiting_recheck(comments, {"o"}) is False
+    # ...and True only once the maintainer actually replies with a pick
+    comments.append({"body": "B please", "author": {"login": "o"}})
+    assert awaiting_recheck(comments, {"o"}) is True
+
+
+def test_mockup_eligible_picks_a_freshly_parked_issue():
+    # A needs-mockup issue with only intake's park comment (no variants drawn, no reply, no
+    # claim) is eligible for the produce phase.
+    issue = {"number": 5, "labels": [{"name": "agentflow:needs-mockup"}]}
+    comments = [{"body": _MOCKUP_PARK, "author": {"login": "o"}}]
+    assert _mockup_eligible(issue, comments, {"o"}) is True
+
+
+def test_mockup_eligible_skips_when_variants_already_drawn():
+    # One round per issue — a drawn issue (our MOCKUP_MARK comment) is never re-drawn.
+    issue = {"number": 5, "labels": [{"name": "agentflow:needs-mockup"}]}
+    comments = [{"body": _MOCKUP_PARK, "author": {"login": "o"}},
+                {"body": _MOCKUP_VARIANTS, "author": {"login": "o"}}]
+    assert _mockup_eligible(issue, comments, {"o"}) is False
+
+
+def test_mockup_eligible_skips_a_pending_reply_and_a_live_claim():
+    # A pending maintainer reply belongs to the resume path, not a re-draw; a live drawing claim
+    # means a session already owns it (no double-draw).
+    issue = {"number": 5, "labels": [{"name": "agentflow:needs-mockup"}]}
+    replied = [{"body": _MOCKUP_VARIANTS, "author": {"login": "o"}},
+               {"body": "the second one", "author": {"login": "o"}}]
+    assert _mockup_eligible(issue, replied, {"o"}) is False
+    claimed = {"number": 6, "labels": [{"name": "agentflow:needs-mockup"}, {"name": DRAWING}]}
+    assert _mockup_eligible(claimed, [{"body": _MOCKUP_PARK, "author": {"login": "o"}}], {"o"}) is False
+
+
+def test_next_mockup_issue_picks_the_fresh_parked_issue(monkeypatch):
+    # Regression (would fail before this change — the phase didn't exist): a needs-mockup issue
+    # with only intake's park comment is selected for a variant round.
+    issue = {"number": 11, "title": "t", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
+
+    def fake_run(cmd):
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return _FakeRun(json.dumps([issue]))
+        if cmd[:4] == ["gh", "issue", "view", "11"]:
+            return _FakeRun(json.dumps({"comments": [{"body": _MOCKUP_PARK, "author": {"login": "o"}}]}))
+        return _FakeRun("[]")
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop, "intake_allowlist", lambda repo, wd: {"o"})
+    found = _next_mockup_issue(RepoConfig("o/r", "."))
+    assert found is not None and found["number"] == 11
+
+
+def test_produce_prompt_drives_ui_mockups_headless_and_one_marked_comment():
+    # The produce session's marching orders: run /ui-mockups for the repo's surfaces, screenshot,
+    # commit variants to a branch, and post exactly ONE issue comment starting with the marker.
+    body = PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
+                                 branch="agentflow/claude/mockup-7-a-screen",
+                                 surfaces="`agentflow/static/`", disclaimer=_MOCKUP_DISCLAIMER)
+    assert "/ui-mockups" in body
+    assert "screenshot" in body.lower()
+    assert "agentflow/static/" in body
+    assert _MOCKUP_DISCLAIMER in body           # the marker line the comment must start with
+    assert "one comment" in body.lower()        # exactly one issue comment
+    assert "push" in body.lower()               # variant HTML preserved on a branch, not lost
+
+
+def test_produce_once_selects_claims_and_spawns(monkeypatch):
+    # The phase draws the selected issue: claims it, spawns a session with the produce prompt in a
+    # mockup worktree, and releases the claim afterward. Never opens a PR.
+    issue = {"number": 11, "title": "New panel", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
+
+    class _Builder:
+        tool = "claude"
+        def prepare_worktree(self, workdir, branch, wt, repo=None): pass
+        def provision(self, wt): pass
+        def model_for(self, c): return "opus"
+        def launch(self, prompt, cwd, model):
+            launched["prompt"] = prompt
+            return True, "drew"
+        def build(self, task): pytest.fail("produce must never build/open a PR")
+
+    launched, claimed, released = {}, [], []
+    monkeypatch.setattr(loop, "pick_pair", lambda: (_Builder(), None, ""))
+    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
+    monkeypatch.setattr(loop, "_claim_mockup", lambda repo, n: claimed.append(n))
+    monkeypatch.setattr(loop, "_release_mockup", lambda repo, n: released.append(n))
+    out = produce_once(RepoConfig("o/r", "/tmp"))
+    assert "11" in out and "drew mockup variants" in out
+    assert claimed == [11] and released == [11]
+    assert "/ui-mockups" in launched["prompt"]
+    assert _MOCKUP_DISCLAIMER in launched["prompt"]
+
+
+def test_produce_once_noop_when_nothing_parked(monkeypatch):
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: None)
+    monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("nothing to draw — don't spawn"))
+    assert produce_once(RepoConfig("o/r", ".")) == "no needs-mockup issues to draw"
+
+
+def test_produce_once_deferral_names_the_block_reason(monkeypatch):
+    issue = {"number": 3, "title": "t", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "pick_pair", lambda: (None, None, "codex: busy, claude: you"))
+    out = produce_once(RepoConfig("o/r", "/tmp"))
+    assert "codex: busy" in out and "deferring" in out
+
+
 # --- issue #45: re-rebase survivors after main advances (ADR 0009 merge-time floor) -----
 
 def test_base_advanced_only_when_main_moved_past_the_last_rebase():
@@ -729,6 +861,18 @@ def test_recheck_defers_when_pr_listing_fails(monkeypatch):
     # Unknown is not empty: a gh blip must defer, not read as 'no survivors'.
     monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: None)
     assert "deferring" in recheck_once(RepoConfig("o/r", "/tmp"))
+
+
+def test_pipeline_once_reports_the_mockup_phase(monkeypatch):
+    # AC: the produce phase's one-line result appears in the per-cycle log next to the others.
+    monkeypatch.setattr(loop, "prune_stale_worktrees", lambda *a: 0)
+    monkeypatch.setattr(loop, "intake_once", lambda cfg, _log=None: "nothing")
+    monkeypatch.setattr(loop, "run_once", lambda cfg, _log=None: "nothing")
+    monkeypatch.setattr(loop, "produce_once", lambda cfg, _log=None: "#9: drew mockup variants")
+    monkeypatch.setattr(loop, "respond_once", lambda cfg, _log=None: "nothing")
+    monkeypatch.setattr(loop, "recheck_once", lambda cfg: "nothing")
+    out = loop.pipeline_once(RepoConfig("o/r", "/tmp"))
+    assert "mockup: #9: drew mockup variants" in out
 
 
 def test_main_config_parses_repo_and_workdir():
