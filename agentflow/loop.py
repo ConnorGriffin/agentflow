@@ -22,7 +22,8 @@ from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merg
                             maintainer_comment, park, reply_pending, squash_merge,
                             ui_evidence_gap)
 from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _DISCLAIMER,
-                              apply_intake, awaiting_recheck, replies_since_intake)
+                              apply_intake, awaiting_recheck, intake_result_is_durable,
+                              replies_since_intake)
 from agentflow.notify import notify
 from agentflow.reviewer import Reviewer, Verdict, review_worktree
 from agentflow.runner import (BuildStatus, BuildTask, Complexity, Effort, _run,
@@ -35,17 +36,15 @@ def _pr_url(repo: str, pr: int) -> str:
     return f"https://github.com/{repo}/pull/{pr}"
 
 
-def _pr_comments(repo: str, pr: int) -> list[dict]:
-    """The PR's comments, or [] if they can't be read. Impure. A read failure reads as
-    'no maintainer question' — but `decide_merge` still needs independent review + green
-    CI + a clean verdict, so a `gh` blip never turns into an unsafe merge."""
+def _pr_comments(repo: str, pr: int) -> list[dict] | None:
+    """The PR's comments, or None when they cannot be verified."""
     r = _run(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "comments"])
     if r.returncode != 0:
-        return []
+        return None
     try:
         return json.loads(r.stdout or "{}").get("comments", [])
     except json.JSONDecodeError:
-        return []
+        return None
 
 
 def _issue_comments(repo: str, n: int) -> list[dict]:
@@ -326,8 +325,9 @@ def _builder_worktree(cfg: RepoConfig, tool: str, n: int, sl: str) -> str:
 
 def _finish_review(cfg: RepoConfig, reviewer_tool: str, pr: int, sl: str,
                    merged: bool = False) -> None:
-    durable = merged or any("agentflow: parked for human review" in c.get("body", "")
-                            for c in _pr_comments(cfg.repo, pr))
+    comments = _pr_comments(cfg.repo, pr)
+    durable = merged or (comments is not None and any(
+        "agentflow: parked for human review" in c.get("body", "") for c in comments))
     if durable:
         remove_worktree_if_safe(
             cfg.workdir, review_worktree(cfg.workdir, reviewer_tool, pr, sl))
@@ -552,7 +552,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
                                 reviewer_tool=reviewer_runner.tool, builder_tool=builder.tool,
                                 revises_used=revises_used, ui_evidence_missing=ui_gap,
-                                reply_pending=reply_pending(_pr_comments(cfg.repo, pr)))
+                                reply_pending=reply_pending(_pr_comments(cfg.repo, pr) or []))
         if decision is MergeDecision.MERGE:
             ok = squash_merge(cfg.repo, pr)
             if ok:
@@ -661,7 +661,7 @@ def intake_once(cfg: RepoConfig, _log=None) -> str:
         current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
         summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
         tool = getattr(builder, "tool", None)
-        if tool:
+        if tool and intake_result_is_durable(cfg.repo, n, result):
             wt = Path(cfg.workdir) / ".agentflow" / "worktrees" / f"{tool}-intake" / f"issue-{n}"
             remove_worktree_if_safe(cfg.workdir, wt)
     finally:
@@ -737,7 +737,8 @@ def respond_once(cfg: RepoConfig, _log=None) -> str:
         ok, _ = builder.launch(
             RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
             cwd=str(wt), model=builder.model_for(Complexity.DEEP))
-    replied = ok and not reply_pending(_pr_comments(cfg.repo, pr))
+    comments = _pr_comments(cfg.repo, pr)
+    replied = ok and comments is not None and not reply_pending(comments)
     if replied:
         remove_worktree_if_safe(cfg.workdir, wt)
     if replied:
@@ -992,11 +993,9 @@ def _rebase_branch(cfg: RepoConfig, branch: str, wt: Path) -> RebaseResult:
         return RebaseResult.CONFLICT
     after = _run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
     if after and after == before:
-        remove_worktree_if_safe(cfg.workdir, wt)
         return RebaseResult.NOOP
     if _run(["git", "-C", str(wt), "push", "--force-with-lease", "origin", branch]).returncode != 0:
         return RebaseResult.ERROR
-    remove_worktree_if_safe(cfg.workdir, wt)
     return RebaseResult.CLEAN
 
 
@@ -1042,7 +1041,7 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
                             reviewer_tool=reviewer_runner.tool, builder_tool=branch_tool,
                             revises_used=MAX_REVISES,   # park a still-imperfect survivor, don't churn
                             ui_evidence_missing=ui_gap,
-                            reply_pending=reply_pending(_pr_comments(cfg.repo, pr)))
+                            reply_pending=reply_pending(_pr_comments(cfg.repo, pr) or []))
     if decision is MergeDecision.MERGE and squash_merge(cfg.repo, pr):
         _finish_review(cfg, reviewer_runner.tool, pr, sl, merged=True)
         ratchet.record(cfg.repo, ratchet.CLEAN_MERGE)
@@ -1070,13 +1069,16 @@ def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str
         result = _rebase_branch(cfg, branch, wt)
     if result is RebaseResult.CONFLICT:
         _park_conflicted_survivor(cfg, pr, n)
-        if any(_CONFLICT_MARK in c.get("body", "") for c in _pr_comments(cfg.repo, pr)):
+        comments = _pr_comments(cfg.repo, pr)
+        if comments is not None and any(_CONFLICT_MARK in c.get("body", "") for c in comments):
             remove_worktree_if_safe(cfg.workdir, wt)
         return f"#{pr}: conflict — parked for human"
     if result is RebaseResult.ERROR:
         return f"#{pr}: rebase plumbing failed — retry next cycle"
     if result is RebaseResult.NOOP:
+        remove_worktree_if_safe(cfg.workdir, wt)
         return f"#{pr}: nothing to replay"
+    remove_worktree_if_safe(cfg.workdir, wt)
     if profile != "autonomous":
         return f"#{pr}: re-rebased clean — mergeable for the human"
     return f"#{pr}: {_merge_autonomous_survivor(cfg, pr, n, sl, tool, branch)}"
@@ -1100,6 +1102,8 @@ def recheck_once(cfg: RepoConfig) -> str:
         if not _base_advanced_for(cfg.workdir, branch):
             continue   # False or None — base hasn't moved (or unknown): leave it untouched
         comments = _pr_comments(cfg.repo, pr)
+        if comments is None:
+            continue
         if conflict_already_flagged(comments) or reply_pending(comments):
             continue   # already pinged, or a maintainer question the responder owns
         out = _rebase_survivor(cfg, pr, branch, profile)

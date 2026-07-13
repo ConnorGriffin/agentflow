@@ -14,6 +14,7 @@ import pytest
 from agentflow import runner as runner_mod
 from agentflow.runner import (BuildStatus, BuildTask, ClaudeRunner, CodexRunner, Complexity,
                               Effort, _run, classify_build, recover_stale_worktrees,
+                              remove_worktree_if_safe,
                               worktree_session)
 
 
@@ -173,6 +174,53 @@ def test_completed_build_sessions_are_removed_but_unpushed_progress_is_retained(
     assert "issue-3-session-3" in registered
 
 
+def test_public_session_lifecycle_bounds_registrations_across_every_lane(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    root = repo / ".agentflow" / "worktrees"
+    completed = [
+        root / "claude-intake" / "issue-1",
+        root / "codex-review" / "pr-2-reviewed",
+        root / "claude" / "issue-3-built",
+        root / "codex" / "mockup-4-drawn",
+        root / "claude" / "issue-5-responded",
+        root / "codex" / "issue-6-rebased",
+    ]
+    _detached_worktree(repo, completed[0])
+    _detached_worktree(repo, completed[1])
+    for path, branch in zip(completed[2:], [
+        "agentflow/claude/issue-3-built",
+        "agentflow/codex/mockup-4-drawn",
+        "agentflow/claude/issue-5-responded",
+        "agentflow/codex/issue-6-rebased",
+    ], strict=True):
+        _branch_worktree(repo, path, branch)
+
+    dirty = root / "claude" / "issue-7-dirty"
+    unpushed = root / "codex" / "issue-8-unpushed"
+    active = root / "claude" / "issue-9-active"
+    _branch_worktree(repo, dirty, "agentflow/claude/issue-7-dirty", dirty=True)
+    _branch_worktree(repo, unpushed, "agentflow/codex/issue-8-unpushed", push=False)
+    _branch_worktree(repo, active, "agentflow/claude/issue-9-active")
+
+    foreign_root = tmp_path / "foreign-lifecycle"
+    foreign_root.mkdir()
+    foreign = _repo_with_origin(foreign_root)
+    foreign_wt = root / "dotfiles" / "open-pr"
+    foreign_wt.parent.mkdir(parents=True, exist_ok=True)
+    _git(foreign, "worktree", "add", "-b", "codex/open-pr", str(foreign_wt), "origin/main")
+
+    assert all(remove_worktree_if_safe(str(repo), path) for path in completed)
+    assert remove_worktree_if_safe(str(repo), dirty) is False
+    assert remove_worktree_if_safe(str(repo), unpushed) is False
+    with worktree_session(active):
+        assert remove_worktree_if_safe(str(repo), active) is False
+    assert remove_worktree_if_safe(str(repo), foreign_wt) is False
+
+    registered = _git(repo, "worktree", "list", "--porcelain")
+    assert registered.count("worktree ") == 4  # main + dirty + unpushed + active
+    assert foreign_wt.exists()
+
+
 def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
     repo = _repo_with_origin(tmp_path)
     runner = ClaudeRunner()
@@ -275,6 +323,7 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
 
     monkeypatch.setattr(runner_mod, "_run", fake_run)
     with worktree_session(active_legacy):
+        runner_mod._ACTIVE_WORKTREES.clear()  # simulate a freshly started recovery process
         report = recover_stale_worktrees("owner/repo", str(repo))
 
     assert set(report.removed) == {

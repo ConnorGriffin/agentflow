@@ -31,7 +31,7 @@ from pathlib import Path
 # Stable bail markers a session posts as a comment when it hits a gap (ADR 0005).
 MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
 _MARKER_RE = re.compile(rf"^({'|'.join(MARKERS)}):")
-_ACTIVE_WORKTREES: set[str] = set()
+_ACTIVE_WORKTREES: dict[str, int] = {}
 
 
 class Complexity(str, Enum):
@@ -112,10 +112,43 @@ def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> 
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
 
 
+def _active_marker(wt: Path) -> Path | None:
+    r = _run(["git", "-C", str(wt), "rev-parse", "--git-path", "agentflow-active"])
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    marker = Path(r.stdout.strip())
+    return marker if marker.is_absolute() else wt / marker
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _worktree_is_active(wt: Path) -> bool:
+    path = os.path.realpath(wt)
+    if _ACTIVE_WORKTREES.get(path, 0):
+        return True
+    marker = _active_marker(wt)
+    if marker is None:
+        return False
+    try:
+        return _pid_is_alive(int(marker.read_text().strip()))
+    except (OSError, ValueError):
+        return False
+
+
 def _worktree_is_disposable(workdir: str, wt: Path) -> bool:
     target = os.path.realpath(wt)
     main = os.path.realpath(workdir)
     if target == main:
+        return False
+    if _worktree_is_active(wt):
         return False
     if not _worktree_is_registered(workdir, wt):
         return False
@@ -147,11 +180,24 @@ def remove_worktree_if_safe(workdir: str, wt: Path) -> bool:
 def worktree_session(wt: Path):
     """Mark a launched session active so an overlapping recovery pass retains it."""
     path = os.path.realpath(wt)
-    _ACTIVE_WORKTREES.add(path)
+    marker = _active_marker(wt)
+    _ACTIVE_WORKTREES[path] = _ACTIVE_WORKTREES.get(path, 0) + 1
+    if marker is not None:
+        marker.write_text(str(os.getpid()))
     try:
         yield
     finally:
-        _ACTIVE_WORKTREES.discard(path)
+        remaining = _ACTIVE_WORKTREES.get(path, 1) - 1
+        if remaining:
+            _ACTIVE_WORKTREES[path] = remaining
+        else:
+            _ACTIVE_WORKTREES.pop(path, None)
+            if marker is not None:
+                try:
+                    if marker.read_text().strip() == str(os.getpid()):
+                        marker.unlink()
+                except OSError:
+                    pass
 
 
 class _WorktreeRunner:
@@ -439,7 +485,7 @@ def recover_stale_worktrees(repo: str, workdir: str) -> WorktreeRecovery:
         if len(relative.parts) != 2:
             continue
         lane, name = relative.parts
-        if owned_path in _ACTIVE_WORKTREES:
+        if _worktree_is_active(Path(path)):
             retained.append(path)
             continue
         if not _completed_agentflow_session(repo, lane, name, branch):

@@ -581,6 +581,22 @@ def test_respond_once_noop_when_nothing_pending(monkeypatch):
     assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
 
 
+def test_responder_retains_worktree_when_reply_cannot_be_verified(monkeypatch):
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply",
+                        lambda cfg: (8, "agentflow/claude/issue-4-other", _MAINT))
+    monkeypatch.setattr(loop, "_checkout_pr_branch", lambda *a: True)
+    monkeypatch.setattr(loop, "_pr_comments", lambda *a: None)
+    monkeypatch.setattr(loop, "remove_worktree_if_safe",
+                        lambda *a: pytest.fail("unknown state must retain the worktree"))
+
+    runner = SimpleNamespace(tool="claude", provision=lambda wt: None,
+                             model_for=lambda c: "opus",
+                             launch=lambda *a, **k: (True, "done"))
+    monkeypatch.setattr(loop, "pick_pair", lambda: (runner, None, ""))
+
+    assert "retaining" in respond_once(RepoConfig("o/r", "/tmp"))
+
+
 def test_pr_branch_checkout_refuses_to_reset_recoverable_work(monkeypatch, tmp_path):
     wt = tmp_path / "worktree"
     wt.mkdir()
@@ -1027,6 +1043,7 @@ def _stub_intake_once(monkeypatch, result):
                         lambda builder: SimpleNamespace(intake=lambda *a, **k: result))
     monkeypatch.setattr(loop, "apply_intake",
                         lambda repo, n, title, labels, r: applied.append(r) or "applied")
+    monkeypatch.setattr(loop, "intake_result_is_durable", lambda repo, n, result: True)
     return applied
 
 
