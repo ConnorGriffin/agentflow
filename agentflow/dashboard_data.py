@@ -91,6 +91,10 @@ def repo_view(cfg: RepoConfig) -> dict:
     }
 
 
-def snapshot(repos: list[RepoConfig]) -> dict:
-    """The whole operator view: two-pool headroom + per-repo fleet state."""
-    return {"pools": pools(), "repos": [repo_view(c) for c in repos]}
+def snapshot(repos: list[RepoConfig], *, dispatch_enabled: bool) -> dict:
+    """The whole operator view, including whether the daemon may claim new work."""
+    return {
+        "dispatch": {"enabled": dispatch_enabled},
+        "pools": pools(),
+        "repos": [repo_view(c) for c in repos],
+    }

@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from agentflow.daemon import REPOS
 from agentflow.dashboard_data import snapshot
+from agentflow.loop import RepoConfig
 
 PORT = int(os.environ.get("AGENTFLOW_DASH_PORT", "8787"))
 _PAGE = (Path(__file__).parent / "static" / "dashboard.html").read_text()
@@ -24,7 +27,12 @@ _PAGE = (Path(__file__).parent / "static" / "dashboard.html").read_text()
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 — stdlib name
         if self.path.startswith("/api/snapshot"):
-            self._send(200, "application/json", json.dumps(snapshot(REPOS)).encode())
+            server = self.server
+            body = snapshot(
+                server.repos,
+                dispatch_enabled=server.dispatch_enabled(),
+            )
+            self._send(200, "application/json", json.dumps(body).encode())
         elif self.path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", _PAGE.encode())
         else:
@@ -41,9 +49,52 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class DashboardHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(
+        self,
+        address: tuple[str, int],
+        repos: list[RepoConfig],
+        dispatch_enabled: Callable[[], bool],
+    ) -> None:
+        self.repos = repos
+        self.dispatch_enabled = dispatch_enabled
+        super().__init__(address, Handler)
+
+
+@contextmanager
+def dashboard(
+    repos: list[RepoConfig],
+    dispatch_enabled: Callable[[], bool],
+    *,
+    port: int | None = None,
+) -> Iterator[tuple[str, int]]:
+    """Serve the console in the background and stop it when its owner exits."""
+    httpd = DashboardHTTPServer(
+        ("127.0.0.1", PORT if port is None else port), repos, dispatch_enabled
+    )
+    thread = threading.Thread(
+        target=httpd.serve_forever,
+        name="agentflow-dashboard",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield httpd.server_address
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join()
+
+
 def main() -> None:
-    print(f"agentflow dashboard on http://localhost:{PORT}", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    # Imported here so the reusable server has no dependency back on its daemon owner.
+    from agentflow.daemon import ENABLE_FLAG, REPOS
+
+    with dashboard(REPOS, lambda: ENABLE_FLAG.exists()) as (_, port):
+        print(f"agentflow dashboard on http://localhost:{port}", flush=True)
+        threading.Event().wait()
 
 
 if __name__ == "__main__":

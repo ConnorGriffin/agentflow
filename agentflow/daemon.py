@@ -36,6 +36,7 @@ from pathlib import Path
 
 from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims
 from agentflow.runner import recover_stale_worktrees
+from agentflow.server import dashboard
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 ENABLE_FLAG = STATE_DIR / "enabled"
@@ -178,19 +179,23 @@ def main() -> None:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
             cycle(REPOS)
             return
-        log(f"daemon up — enable={ENABLE_FLAG}, poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}")
-        while True:
-            if ENABLE_FLAG.exists():
-                # Self-heal build claims stranded by a crash or a swallowed `gh` release,
-                # every cycle (serial builds mean none is live at the top of a cycle).
-                for cfg in REPOS:
-                    cleared = reclaim_claims(cfg)
-                    if cleared:
-                        log(f"{cfg.repo}: reclaimed {cleared} stale build claim(s)")
-                cycle(REPOS)
-            else:
-                log(f"dormant (no {ENABLE_FLAG}); sleeping")
-            time.sleep(POLL_SECONDS)
+        with dashboard(REPOS, lambda: ENABLE_FLAG.exists()) as (host, port):
+            log(
+                f"daemon up — dashboard=http://{host}:{port}, enable={ENABLE_FLAG}, "
+                f"poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}"
+            )
+            while True:
+                if ENABLE_FLAG.exists():
+                    # Self-heal build claims stranded by a crash or a swallowed `gh` release,
+                    # every cycle (serial builds mean none is live at the top of a cycle).
+                    for cfg in REPOS:
+                        cleared = reclaim_claims(cfg)
+                        if cleared:
+                            log(f"{cfg.repo}: reclaimed {cleared} stale build claim(s)")
+                    cycle(REPOS)
+                else:
+                    log(f"dormant (no {ENABLE_FLAG}); sleeping")
+                time.sleep(POLL_SECONDS)
     finally:
         stop.set()
         _release_lock()
