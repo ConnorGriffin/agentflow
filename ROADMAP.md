@@ -98,8 +98,11 @@ blocker merges:
    land the **Fleet** table + **History** feed. *(blocked by 1)*
 4. **Controls** — POST + shared-secret auth, one verb per sub-slice (pause/resume →
    loosen → merge → pickup). The correctness/security-sensitive slice. *(blocked by 1)*
-5. **Headroom-governed concurrency** — drop the serial dispatch cap (amends
-   [ADR 0006](docs/adr/0006-two-pool-runner-assignment.md)); independent of the dashboard.
+5. **Headroom-governed concurrency + activity-adaptive ceiling** — drop the serial
+   dispatch cap (amends [ADR 0006](docs/adr/0006-two-pool-runner-assignment.md)) and
+   replace the hard interactive-activity stop with the yield-don't-stop ceiling
+   ([ADR 0025](docs/adr/0025-activity-adaptive-spend-ceiling.md): 85% idle / 50%
+   active, paced, per-pool). Independent of the dashboard.
 
 ## Rollout coupling (signed off)
 
