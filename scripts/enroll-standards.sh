@@ -81,8 +81,16 @@ wire_global() {
 
 enroll_repo() { # <dir>
   local dir; dir="$(cd "$1" && pwd -P)"
-  local ag="$dir/AGENTS.md" cl="$dir/CLAUDE.md"
+  local ag="$dir/AGENTS.md" cl="$dir/CLAUDE.md" ignore="$dir/.gitignore"
   echo "Per-repo enroll — $dir"
+
+  if [ -f "$ignore" ] && grep -qxF '.agentflow/' "$ignore"; then
+    note "ok:   .agentflow/ already ignored"
+  else
+    backup "$ignore"
+    do_or_show "add .agentflow/ to $ignore" \
+      bash -c 'if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then printf "\n" >> "$1"; fi; printf ".agentflow/\n" >> "$1"' _ "$ignore"
+  fi
 
   if [ -L "$cl" ] && [ "$(readlink "$cl")" = "AGENTS.md" ] && [ -f "$ag" ]; then
     note "ok:   already AGENTS.md + CLAUDE.md symlink"

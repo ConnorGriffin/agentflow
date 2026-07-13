@@ -492,6 +492,11 @@ def test_reviewed_path_parks_a_screenshotless_ui_change_on_the_gate(monkeypatch)
     monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
     monkeypatch.setattr(loop, "ui_evidence_gap", lambda repo, pr, surfaces: True)
     monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "_pr_comments",
+                        lambda repo, pr: [{"body": "> *agentflow: parked for human review.*"}])
+    removed = []
+    monkeypatch.setattr(loop, "remove_worktree_if_safe",
+                        lambda workdir, wt: removed.append(str(wt)) or True)
     parked = {}
     monkeypatch.setattr(loop, "park", lambda repo, pr, verdict, reason: parked.update(reason=reason))
 
@@ -499,6 +504,7 @@ def test_reviewed_path_parks_a_screenshotless_ui_change_on_the_gate(monkeypatch)
                              Complexity.STANDARD, Effort.MEDIUM, _Builder(),
                              reviewer_runner, "reviewed", "prompt")
     assert "screenshot" in parked["reason"].lower()
+    assert removed == ["/tmp/.agentflow/worktrees/codex-review/pr-7-x"]
 
 
 # --- issue #18: answering maintainer comments on parked PRs ---------------------
@@ -540,6 +546,12 @@ def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
     prs = [{"number": 8, "headRefName": "agentflow/claude/issue-4-other"}]
     _pr_gh(monkeypatch, prs, {8: [{"body": _PARK}, {"body": _MAINT}]})
     monkeypatch.setattr(loop, "_checkout_pr_branch", lambda cfg, branch, wt: True)
+    monkeypatch.setattr(loop, "_pr_comments",
+                        lambda repo, pr: [{"body": _PARK}, {"body": _MAINT},
+                                          {"body": loop._RESPOND_DISCLAIMER}])
+    removed = []
+    monkeypatch.setattr(loop, "remove_worktree_if_safe",
+                        lambda workdir, wt: removed.append(str(wt)) or True)
 
     launched = {}
 
@@ -559,6 +571,7 @@ def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
     assert "8" in out and "maintainer" in out.lower()
     assert _MAINT in launched["prompt"]              # answers what was asked
     assert "same branch" in launched["prompt"].lower()   # pushes fixes to the PR branch
+    assert removed == ["/tmp/.agentflow/worktrees/claude/issue-4-other"]
 
 
 def test_respond_once_noop_when_nothing_pending(monkeypatch):
@@ -566,6 +579,35 @@ def test_respond_once_noop_when_nothing_pending(monkeypatch):
            {7: [{"body": _PARK}]})   # our marker had the last word
     monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))  # never returns
     assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
+
+
+def test_responder_retains_worktree_when_reply_cannot_be_verified(monkeypatch):
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply",
+                        lambda cfg: (8, "agentflow/claude/issue-4-other", _MAINT))
+    monkeypatch.setattr(loop, "_checkout_pr_branch", lambda *a: True)
+    monkeypatch.setattr(loop, "_pr_comments", lambda *a: None)
+    monkeypatch.setattr(loop, "remove_worktree_if_safe",
+                        lambda *a: pytest.fail("unknown state must retain the worktree"))
+
+    runner = SimpleNamespace(tool="claude", provision=lambda wt: None,
+                             model_for=lambda c: "opus",
+                             launch=lambda *a, **k: (True, "done"))
+    monkeypatch.setattr(loop, "pick_pair", lambda: (runner, None, ""))
+
+    assert "retaining" in respond_once(RepoConfig("o/r", "/tmp"))
+
+
+def test_pr_branch_checkout_refuses_to_reset_recoverable_work(monkeypatch, tmp_path):
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    calls = []
+    monkeypatch.setattr(loop, "_worktree_is_registered", lambda *a: True)
+    monkeypatch.setattr(loop, "_worktree_is_disposable", lambda *a: False)
+    monkeypatch.setattr(loop, "_run",
+                        lambda cmd: calls.append(cmd) or _FakeRun("", 0))
+
+    assert loop._checkout_pr_branch(RepoConfig("o/r", str(tmp_path)), "branch", wt) is False
+    assert not any("reset" in cmd for cmd in calls)
 
 
 # --- issue #29: the mockup-production phase --------------------------------------------
@@ -730,6 +772,9 @@ def test_produce_once_notifies_when_variants_posted(monkeypatch):
     # Fails first if produce_once is silent after a real variant comment lands.
     pings = _stub_produce(monkeypatch, launch_ok=True,
                           comments=[{"body": f"{_MOCKUP_DISCLAIMER}\n\n## Variant A\n..."}])
+    removed = []
+    monkeypatch.setattr(loop, "remove_worktree_if_safe",
+                        lambda workdir, wt: removed.append(str(wt)) or True)
     out = produce_once(RepoConfig("o/r", "/tmp"))
     assert "drew mockup variants" in out
     assert len(pings) == 1
@@ -738,6 +783,7 @@ def test_produce_once_notifies_when_variants_posted(monkeypatch):
     assert "o/r" in msg and "11" in msg
     assert url == "https://github.com/o/r/issues/11"
     assert "MISSING-CONTEXT" not in msg
+    assert removed == ["/tmp/.agentflow/worktrees/claude/mockup-11-a-screen"]
 
 
 def test_produce_once_notifies_missing_context(monkeypatch):
@@ -812,6 +858,19 @@ def test_rebase_survivor_conflict_parks_and_pings_on_every_profile(monkeypatch):
         assert events["parked"] == [8], f"conflict must ping ({profile})"
         assert events["merged"] == []
         assert "parked" in out
+
+
+def test_conflict_rebase_disposes_only_after_the_notice_is_durable(monkeypatch):
+    _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT)
+    monkeypatch.setattr(loop, "_pr_comments",
+                        lambda repo, pr: [{"body": f"> *{loop._CONFLICT_MARK}.*"}])
+    removed = []
+    monkeypatch.setattr(loop, "remove_worktree_if_safe",
+                        lambda workdir, wt: removed.append(str(wt)) or True)
+
+    _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed")
+
+    assert removed == ["/tmp/wt"]
 
 
 def test_rebase_survivor_reviewed_clean_never_merges(monkeypatch):
@@ -936,7 +995,8 @@ def test_recheck_defers_when_pr_listing_fails(monkeypatch):
 
 def test_pipeline_once_reports_the_mockup_phase(monkeypatch):
     # AC: the produce phase's one-line result appears in the per-cycle log next to the others.
-    monkeypatch.setattr(loop, "prune_stale_worktrees", lambda *a: 0)
+    monkeypatch.setattr(loop, "recover_stale_worktrees",
+                        lambda *a: SimpleNamespace(removed=(), retained=()))
     monkeypatch.setattr(loop, "intake_once", lambda cfg, _log=None: "nothing")
     monkeypatch.setattr(loop, "run_once", lambda cfg, _log=None: "nothing")
     monkeypatch.setattr(loop, "produce_once", lambda cfg, _log=None: "#9: drew mockup variants")
@@ -975,7 +1035,7 @@ def _stub_intake_once(monkeypatch, result):
     loop._intake_infra_failures.clear()
     monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
     monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg: issue)
-    monkeypatch.setattr(loop, "pick_pair", lambda: (object(), None, ""))
+    monkeypatch.setattr(loop, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
     monkeypatch.setattr(loop, "_release_triage", lambda repo, n: None)
     monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
@@ -983,6 +1043,7 @@ def _stub_intake_once(monkeypatch, result):
                         lambda builder: SimpleNamespace(intake=lambda *a, **k: result))
     monkeypatch.setattr(loop, "apply_intake",
                         lambda repo, n, title, labels, r: applied.append(r) or "applied")
+    monkeypatch.setattr(loop, "intake_result_is_durable", lambda repo, n, result: True)
     return applied
 
 
@@ -1021,3 +1082,18 @@ def test_intake_clean_run_ends_the_infra_streak(monkeypatch):
     monkeypatch.setattr(loop, "Intake", lambda builder: SimpleNamespace(intake=lambda *a, **k: ok))
     loop.intake_once(cfg)
     assert loop._intake_infra_failures.get((cfg.repo, 5)) is None
+
+
+def test_intake_disposes_after_the_routing_is_applied(monkeypatch):
+    from agentflow.intake import IntakeResult
+
+    result = IntakeResult(IntakeRoute.READY, "brief", complexity=Complexity.DEEP,
+                          effort=Effort.MEDIUM)
+    applied = _stub_intake_once(monkeypatch, result)
+    removed = []
+    monkeypatch.setattr(loop, "remove_worktree_if_safe",
+                        lambda workdir, wt: removed.append((len(applied), str(wt))) or True)
+
+    loop.intake_once(RepoConfig("o/r", "/tmp"))
+
+    assert removed == [(1, "/tmp/.agentflow/worktrees/claude-intake/issue-5")]

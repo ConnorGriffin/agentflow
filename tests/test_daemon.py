@@ -52,19 +52,22 @@ def test_cycle_passes_log_into_run():
 
 def test_main_once_runs_one_cycle_and_exits(tmp_path):
     """--once runs exactly one cycle without entering the poll loop."""
-    cycle_calls = []
+    events = []
 
     with (
         mock.patch("agentflow.daemon.STATE_DIR", tmp_path),
         mock.patch("agentflow.daemon.LOCK", tmp_path / "daemon.lock"),
         mock.patch("agentflow.daemon.REPOS", [A, B]),
-        mock.patch("agentflow.daemon.cycle", side_effect=lambda repos: cycle_calls.append(list(repos))),
+        mock.patch("agentflow.daemon.recover_worktrees",
+                   side_effect=lambda repos: events.append(("recover", list(repos)))),
+        mock.patch("agentflow.daemon.cycle",
+                   side_effect=lambda repos: events.append(("cycle", list(repos)))),
         mock.patch("agentflow.daemon.log"),
         mock.patch.object(sys, "argv", ["daemon", "--once"]),
     ):
         main()
 
-    assert cycle_calls == [[A, B]]
+    assert events == [("recover", [A, B]), ("cycle", [A, B])]
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit
 
 

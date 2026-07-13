@@ -11,7 +11,8 @@ import pytest
 from agentflow import intake as intake_mod
 from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, apply_intake,
                               awaiting_recheck, compose_ready_body, intake_labels,
-                              parse_intake, replies_since_intake, sweep_legacy_labels)
+                              intake_result_is_durable, parse_intake, replies_since_intake,
+                              sweep_legacy_labels)
 from agentflow.runner import Complexity, Effort
 
 
@@ -253,6 +254,21 @@ def test_apply_intake_ready_writes_brief_to_body_and_a_short_comment(monkeypatch
     assert comment is not None and INTAKE_MARK in comment
     assert "the full grounded brief" not in comment          # not the wall
     assert comment.count("\n") <= 8                            # short
+
+
+def test_intake_result_must_be_visible_before_its_worktree_is_disposable(monkeypatch):
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", complexity=Complexity.DEEP,
+                          effort=Effort.MEDIUM)
+    issue = {"body": result.body,
+             "labels": [{"name": name} for name in intake_labels(result)],
+             "comments": [{"body": f"{INTAKE_MARK}\n\nReady."}]}
+    monkeypatch.setattr(intake_mod, "_run",
+                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(issue)))
+    assert intake_result_is_durable("owner/repo", 5, result) is True
+
+    monkeypatch.setattr(intake_mod, "_run",
+                        lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
+    assert intake_result_is_durable("owner/repo", 5, result) is False
 
 
 def test_apply_intake_grill_keeps_the_full_comment_and_never_touches_the_body(monkeypatch):

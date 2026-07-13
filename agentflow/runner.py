@@ -23,6 +23,7 @@ import re
 import subprocess
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -30,6 +31,7 @@ from pathlib import Path
 # Stable bail markers a session posts as a comment when it hits a gap (ADR 0005).
 MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
 _MARKER_RE = re.compile(rf"^({'|'.join(MARKERS)}):")
+_ACTIVE_WORKTREES: dict[str, int] = {}
 
 
 class Complexity(str, Enum):
@@ -78,6 +80,14 @@ class BuildOutcome:
     detail: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class WorktreeRecovery:
+    """What a recovery pass changed and which owned sessions it left for recovery."""
+
+    removed: tuple[str, ...]
+    retained: tuple[str, ...]
+
+
 def classify_build(pr_url: str | None, new_marker_comments: list[str]) -> BuildOutcome:
     """Classify a finished build session from what it left behind. Pure.
 
@@ -102,6 +112,110 @@ def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> 
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
 
 
+def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run an agent CLI while persisting its child PID for crash-safe recovery."""
+    process = subprocess.Popen(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+    marker = _active_marker(Path(cwd))
+    if marker is not None:
+        marker.write_text(str(process.pid))
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="",
+                                           stderr=f"timed out after {timeout}s")
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
+def _active_marker(wt: Path) -> Path | None:
+    r = _run(["git", "-C", str(wt), "rev-parse", "--git-path", "agentflow-active"])
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    marker = Path(r.stdout.strip())
+    return marker if marker.is_absolute() else wt / marker
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _worktree_is_active(wt: Path) -> bool:
+    path = os.path.realpath(wt)
+    if _ACTIVE_WORKTREES.get(path, 0):
+        return True
+    marker = _active_marker(wt)
+    if marker is None:
+        return False
+    try:
+        return _pid_is_alive(int(marker.read_text().strip()))
+    except (OSError, ValueError):
+        return False
+
+
+def _worktree_is_disposable(workdir: str, wt: Path) -> bool:
+    target = os.path.realpath(wt)
+    main = os.path.realpath(workdir)
+    if target == main:
+        return False
+    if _worktree_is_active(wt):
+        return False
+    if not _worktree_is_registered(workdir, wt):
+        return False
+    status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
+    if status.returncode != 0 or status.stdout.strip():
+        return False
+    head = _run(["git", "-C", str(wt), "rev-parse", "HEAD"])
+    if head.returncode != 0 or not head.stdout.strip():
+        return False
+    remote_refs = _run(["git", "-C", workdir, "for-each-ref", "--contains",
+                        head.stdout.strip(), "--format=%(refname)", "refs/remotes/origin/"])
+    return remote_refs.returncode == 0 and bool(remote_refs.stdout.strip())
+
+
+def remove_worktree_if_safe(workdir: str, wt: Path) -> bool:
+    """Remove a finished session only when Git proves all progress is durable.
+
+    The target must be a registered worktree owned by ``workdir``, clean, and at
+    a commit reachable from ``origin``. Unknown state fails closed. The force flag
+    removes ignored provisioning files only after those checks have passed.
+    """
+    if not _worktree_is_disposable(workdir, wt):
+        return False
+    removed = _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt)])
+    return removed.returncode == 0
+
+
+@contextmanager
+def worktree_session(wt: Path):
+    """Mark a launched session active so an overlapping recovery pass retains it."""
+    path = os.path.realpath(wt)
+    marker = _active_marker(wt)
+    _ACTIVE_WORKTREES[path] = _ACTIVE_WORKTREES.get(path, 0) + 1
+    if marker is not None:
+        marker.write_text(str(os.getpid()))
+    try:
+        yield
+    finally:
+        remaining = _ACTIVE_WORKTREES.get(path, 1) - 1
+        if remaining:
+            _ACTIVE_WORKTREES[path] = remaining
+        else:
+            _ACTIVE_WORKTREES.pop(path, None)
+            if marker is not None:
+                try:
+                    marker.unlink()
+                except OSError:
+                    pass
+
+
 class _WorktreeRunner:
     """Shared build orchestration; subclasses supply `tool`, `MODELS`, `_launch`."""
 
@@ -122,13 +236,16 @@ class _WorktreeRunner:
             return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
 
         started = time.time()
-        launched, _ = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.complexity))
+        with worktree_session(wt):
+            launched, _ = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.complexity))
 
         pr_url = self._pr_for_branch(task.repo, branch)
         markers = self._new_marker_comments(task.repo, task.issue, since=started)
         outcome = classify_build(pr_url, markers)
         if outcome.status is BuildStatus.INCOMPLETE and not launched:
             return BuildOutcome(BuildStatus.ERROR, detail="launch exited non-zero, no PR, no marker")
+        if outcome.status is BuildStatus.PR_OPENED:
+            remove_worktree_if_safe(task.workdir, wt)
         return outcome
 
     # --- shared git/gh plumbing (reused by the reviewer) ------------------------
@@ -136,12 +253,16 @@ class _WorktreeRunner:
                          repo: str | None = None) -> None:
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
-            if repo and not self._pr_for_branch(repo, branch):
-                # Reused worktree with no open PR — reset onto origin/main so stale
-                # branch state doesn't pollute the new build.
-                _run(["git", "-C", str(wt), "reset", "--hard", "origin/main"]).check_returncode()
-                _run(["git", "-C", str(wt), "clean", "-fdx"])
-            return
+            if not _worktree_is_registered(workdir, wt):
+                raise subprocess.CalledProcessError(1, ["git", "worktree", "list"])
+            verified, pr_url = self._open_pr_for_branch(repo, branch) if repo else (False, None)
+            if not verified:
+                raise subprocess.CalledProcessError(1, ["gh", "pr", "list"])
+            if pr_url:
+                return
+            if not remove_worktree_if_safe(workdir, wt):
+                raise subprocess.CalledProcessError(1, ["git", "worktree", "remove"])
+            _run(["git", "-C", workdir, "branch", "-f", branch, "origin/main"]).check_returncode()
         wt.parent.mkdir(parents=True, exist_ok=True)
         have_branch = _run(["git", "-C", workdir, "show-ref", "--quiet", f"refs/heads/{branch}"]).returncode == 0
         add = ["git", "-C", workdir, "worktree", "add"]
@@ -160,6 +281,10 @@ class _WorktreeRunner:
         """
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
+            if not _worktree_is_registered(workdir, wt):
+                raise subprocess.CalledProcessError(1, ["git", "worktree", "list"])
+            if not _worktree_is_disposable(workdir, wt):
+                raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
             # Freshen a reused worktree to the (possibly moved) ref — otherwise a
             # re-review after a revise push would inspect a stale checkout.
             _run(["git", "-C", str(wt), "reset", "--hard", ref]).check_returncode()
@@ -168,10 +293,13 @@ class _WorktreeRunner:
         wt.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
 
-    def _pr_for_branch(self, repo: str, branch: str) -> str | None:
+    def _open_pr_for_branch(self, repo: str, branch: str) -> tuple[bool, str | None]:
         r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
                   "--state", "open", "--json", "url", "-q", ".[0].url // \"\""])
-        return r.stdout.strip() or None
+        return r.returncode == 0, r.stdout.strip() or None
+
+    def _pr_for_branch(self, repo: str, branch: str) -> str | None:
+        return self._open_pr_for_branch(repo, branch)[1]
 
     def _new_marker_comments(self, repo: str, issue: int, since: float) -> list[str]:
         r = _run(["gh", "issue", "view", str(issue), "--repo", repo, "--json", "comments"])
@@ -204,8 +332,8 @@ class ClaudeRunner(_WorktreeRunner):
         # would pass a tight --allowedTools instead (profile-driven, later).
         # `claude -p` prints the final assistant message to stdout — that's the message.
         session_timeout = int(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
-        r = _run(["claude", "-p", prompt, "--model", model,
-                  "--dangerously-skip-permissions"], cwd=cwd, timeout=session_timeout)
+        r = _run_session(["claude", "-p", prompt, "--model", model,
+                          "--dangerously-skip-permissions"], cwd, session_timeout)
         return r.returncode == 0, r.stdout
 
 
@@ -224,8 +352,9 @@ class CodexRunner(_WorktreeRunner):
         fd, outfile = tempfile.mkstemp(prefix="agentflow-codex-")
         os.close(fd)
         try:
-            r = _run([codex_bin, "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
-                      "--skip-git-repo-check", "-o", outfile, prompt], cwd=cwd, timeout=session_timeout)
+            r = _run_session(
+                [codex_bin, "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
+                 "--skip-git-repo-check", "-o", outfile, prompt], cwd, session_timeout)
             try:
                 msg = Path(outfile).read_text()
             except OSError:
@@ -248,31 +377,140 @@ def _pr_state_for_branch(repo: str, branch: str) -> str | None:
     (OPEN, MERGED, or CLOSED), or None when no PR has ever been opened for it."""
     r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
               "--state", "all", "--json", "state", "-q", ".[0].state // \"\""])
-    return r.stdout.strip() or None
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 
-def worktree_is_prunable(pr_state: str | None, is_clean: bool) -> bool:
-    """Pure: a builder worktree is safe to remove when its PR is done and the
-    working tree carries no uncommitted changes."""
-    return pr_state in ("MERGED", "CLOSED") and is_clean
+def _pr_info(repo: str, pr: int) -> dict | None:
+    r = _run(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "state,comments"])
+    if r.returncode != 0:
+        return None
+    try:
+        value = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
 
 
-def prune_stale_worktrees(repo: str, workdir: str, tool: str) -> int:
-    """Remove builder worktrees for *tool* whose PR merged/closed and which are clean.
-    Never touches worktrees with an open PR or uncommitted local changes.
-    Returns the number of worktrees removed."""
-    wt_root = Path(workdir) / ".agentflow" / "worktrees" / tool
-    if not wt_root.exists():
-        return 0
-    removed = 0
-    for wt_dir in sorted(wt_root.iterdir()):
-        if not wt_dir.is_dir():
+def _issue_state(repo: str, issue: int) -> dict | None:
+    r = _run(["gh", "issue", "view", str(issue), "--repo", repo,
+              "--json", "state,labels,comments"])
+    if r.returncode != 0:
+        return None
+    try:
+        value = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _registered_worktrees(workdir: str) -> list[tuple[str, str | None]] | None:
+    listed = _run(["git", "-C", workdir, "worktree", "list", "--porcelain", "-z"])
+    if listed.returncode != 0:
+        return None
+    records: list[tuple[str, str | None]] = []
+    for raw in listed.stdout.split("\0\0"):
+        fields = raw.strip("\0").split("\0")
+        path = next((f.removeprefix("worktree ") for f in fields if f.startswith("worktree ")), "")
+        branch = next((f.removeprefix("branch refs/heads/") for f in fields
+                       if f.startswith("branch refs/heads/")), None)
+        if path:
+            records.append((path, branch))
+    return records
+
+
+def _worktree_is_registered(workdir: str, wt: Path) -> bool:
+    registered = _registered_worktrees(workdir)
+    if registered is None:
+        return False
+    target = os.path.realpath(wt)
+    return any(os.path.realpath(path) == target for path, _ in registered)
+
+
+def _completed_agentflow_session(repo: str, lane: str, name: str,
+                                 branch: str | None) -> bool:
+    intake = re.fullmatch(r"(?:claude|codex)-intake", lane)
+    issue_match = re.fullmatch(r"issue-(\d+)", name)
+    if intake and issue_match and branch is None:
+        state = _issue_state(repo, int(issue_match.group(1)))
+        if state is None:
+            return False
+        labels = {label.get("name") for label in state.get("labels", [])
+                  if isinstance(label, dict)}
+        return (state.get("state") == "CLOSED" or bool(labels & {
+            "ready-for-agent", "agentflow:needs-grilling", "agentflow:needs-mockup"
+        })) and "agentflow:triaging" not in labels
+
+    review = re.fullmatch(r"(?:claude|codex)-review", lane)
+    pr_match = re.fullmatch(r"pr-(\d+)-.+", name)
+    if review and pr_match and branch is None:
+        info = _pr_info(repo, int(pr_match.group(1)))
+        if info is None:
+            return False
+        return info.get("state") in ("MERGED", "CLOSED") or any(
+            "agentflow: parked for human review" in comment.get("body", "")
+            for comment in info.get("comments", []) if isinstance(comment, dict))
+
+    if lane not in ("claude", "codex") or branch is None:
+        return False
+    mockup = re.fullmatch(rf"agentflow/{lane}/mockup-(\d+)-.+", branch)
+    if mockup and name == branch.rsplit("/", 1)[-1]:
+        state = _issue_state(repo, int(mockup.group(1)))
+        if state is None:
+            return False
+        labels = {label.get("name") for label in state.get("labels", [])
+                  if isinstance(label, dict)}
+        if "agentflow:drawing-mockup" in labels:
+            return False
+        return any("mockup variants" in comment.get("body", "")
+                   for comment in state.get("comments", []) if isinstance(comment, dict))
+    current = re.fullmatch(rf"agentflow/{lane}/issue-(\d+)-.+", branch)
+    legacy = re.fullmatch(rf"{lane}/[^/]+", branch)
+    if current and name == branch.rsplit("/", 1)[-1]:
+        state = _issue_state(repo, int(current.group(1)))
+        if state is None:
+            return False
+        labels = {label.get("name") for label in state.get("labels", [])
+                  if isinstance(label, dict)}
+        if "agentflow:building" in labels:
+            return False
+        return _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED")
+    if legacy and name == branch.rsplit("/", 1)[-1]:
+        return _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED")
+    return False
+
+
+def recover_stale_worktrees(repo: str, workdir: str) -> WorktreeRecovery:
+    """Prune stale registrations and remove completed agentflow-owned sessions.
+
+    Git's registry establishes repository ownership; the path is used only after
+    ownership is known to recognize agentflow's current and legacy session names.
+    Completion lookups and the final clean/pushed checks all fail closed.
+    """
+    _run(["git", "-C", workdir, "worktree", "prune"])
+    registered = _registered_worktrees(workdir)
+    if registered is None:
+        return WorktreeRecovery((), ())
+    root = os.path.realpath(Path(workdir) / ".agentflow" / "worktrees")
+    removed: list[str] = []
+    retained: list[str] = []
+    for path, branch in registered:
+        owned_path = os.path.realpath(path)
+        try:
+            relative = Path(owned_path).relative_to(root)
+        except ValueError:
             continue
-        branch = f"agentflow/{tool}/{wt_dir.name}"
-        pr_state = _pr_state_for_branch(repo, branch)
-        status = _run(["git", "-C", str(wt_dir), "status", "--porcelain"])
-        is_clean = status.returncode == 0 and not status.stdout.strip()
-        if worktree_is_prunable(pr_state, is_clean):
-            if _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt_dir)]).returncode == 0:
-                removed += 1
-    return removed
+        if len(relative.parts) != 2:
+            continue
+        lane, name = relative.parts
+        if _worktree_is_active(Path(path)):
+            retained.append(path)
+            continue
+        if not _completed_agentflow_session(repo, lane, name, branch):
+            if lane.startswith(("claude", "codex")):
+                retained.append(path)
+            continue
+        if remove_worktree_if_safe(workdir, Path(path)):
+            removed.append(path)
+        else:
+            retained.append(path)
+    return WorktreeRecovery(tuple(removed), tuple(retained))

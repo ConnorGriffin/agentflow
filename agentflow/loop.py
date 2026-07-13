@@ -22,27 +22,29 @@ from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merg
                             maintainer_comment, park, reply_pending, squash_merge,
                             ui_evidence_gap)
 from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _DISCLAIMER,
-                              apply_intake, awaiting_recheck, replies_since_intake)
+                              apply_intake, awaiting_recheck, intake_result_is_durable,
+                              replies_since_intake)
 from agentflow.notify import notify
-from agentflow.reviewer import Reviewer, Verdict
-from agentflow.runner import BuildStatus, BuildTask, Complexity, Effort, _run, prune_stale_worktrees
+from agentflow.reviewer import Reviewer, Verdict, review_worktree
+from agentflow.runner import (BuildStatus, BuildTask, Complexity, Effort, _run,
+                              _worktree_is_disposable, _worktree_is_registered,
+                              recover_stale_worktrees,
+                              remove_worktree_if_safe, worktree_session)
 
 
 def _pr_url(repo: str, pr: int) -> str:
     return f"https://github.com/{repo}/pull/{pr}"
 
 
-def _pr_comments(repo: str, pr: int) -> list[dict]:
-    """The PR's comments, or [] if they can't be read. Impure. A read failure reads as
-    'no maintainer question' — but `decide_merge` still needs independent review + green
-    CI + a clean verdict, so a `gh` blip never turns into an unsafe merge."""
+def _pr_comments(repo: str, pr: int) -> list[dict] | None:
+    """The PR's comments, or None when they cannot be verified."""
     r = _run(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "comments"])
     if r.returncode != 0:
-        return []
+        return None
     try:
         return json.loads(r.stdout or "{}").get("comments", [])
     except json.JSONDecodeError:
-        return []
+        return None
 
 
 def _issue_comments(repo: str, n: int) -> list[dict]:
@@ -321,14 +323,31 @@ def _builder_worktree(cfg: RepoConfig, tool: str, n: int, sl: str) -> str:
     return str(Path(cfg.workdir) / ".agentflow" / "worktrees" / tool / f"issue-{n}-{sl}")
 
 
+def _finish_review(cfg: RepoConfig, reviewer_tool: str, pr: int, sl: str,
+                   merged: bool = False) -> None:
+    comments = _pr_comments(cfg.repo, pr)
+    durable = merged or (comments is not None and any(
+        "agentflow: parked for human review" in c.get("body", "") for c in comments))
+    if durable:
+        remove_worktree_if_safe(
+            cfg.workdir, review_worktree(cfg.workdir, reviewer_tool, pr, sl))
+
+
 def _launch_revise(builder, cfg: RepoConfig, pr: int, n: int, sl: str,
                    complexity: Complexity, verdict: Verdict) -> None:
     """One builder pass addressing the blocking findings on the PR branch (ADR 0020)."""
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking) or "- (see review)"
     surfaces = _surfaces_phrase(ui_surfaces(cfg.workdir))
-    builder.launch(REVISE_PROMPT.format(n=pr, findings=findings, surfaces=surfaces),
-                   cwd=_builder_worktree(cfg, builder.tool, n, sl),
-                   model=builder.model_for(complexity))
+    branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
+    wt = Path(_builder_worktree(cfg, builder.tool, n, sl))
+    if not _checkout_pr_branch(cfg, branch, wt):
+        return
+    builder.provision(wt)
+    with worktree_session(wt):
+        ok, _ = builder.launch(REVISE_PROMPT.format(n=pr, findings=findings, surfaces=surfaces),
+                               cwd=str(wt), model=builder.model_for(complexity))
+    if ok:
+        remove_worktree_if_safe(cfg.workdir, wt)
 
 
 def held_build_result(status: str, where: str) -> IntakeResult:
@@ -487,6 +506,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         apply_intake(cfg.repo, n, issue.get("title", ""),
                      [lbl["name"] for lbl in issue.get("labels", [])],
                      held_build_result(outcome.status.value, where))
+        remove_worktree_if_safe(cfg.workdir, Path(_builder_worktree(cfg, builder.tool, n, sl)))
         notify("agentflow needs you", f"{cfg.repo} #{n}: build {outcome.status.value} — {where}",
                draft or f"https://github.com/{cfg.repo}/issues/{n}")
         return f"#{n}: build {outcome.status.value} — {outcome.detail}; held for you ({where})"
@@ -515,6 +535,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
                 ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
                 reason = _UI_GAP_REASON if ui_gap else f"is a `{profile}` repo — a human merges"
                 park(cfg.repo, pr, verdict, reason=reason)
+                _finish_review(cfg, reviewer_runner.tool, pr, sl)
                 notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
                        _pr_url(cfg.repo, pr))
                 return f"#{n}: PR #{pr} reviewed ({profile}) — awaiting human merge"
@@ -531,10 +552,11 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
                                 reviewer_tool=reviewer_runner.tool, builder_tool=builder.tool,
                                 revises_used=revises_used, ui_evidence_missing=ui_gap,
-                                reply_pending=reply_pending(_pr_comments(cfg.repo, pr)))
+                                reply_pending=reply_pending(_pr_comments(cfg.repo, pr) or []))
         if decision is MergeDecision.MERGE:
             ok = squash_merge(cfg.repo, pr)
             if ok:
+                _finish_review(cfg, reviewer_runner.tool, pr, sl, merged=True)
                 ratchet.record(cfg.repo, ratchet.CLEAN_MERGE if revises_used == 0
                                else "merge_after_revise")
                 _run(["gh", "issue", "edit", str(n), "--repo", cfg.repo,
@@ -542,6 +564,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
                 return f"#{n}: MERGED PR #{pr}"
             park(cfg.repo, pr, verdict,
                  reason="could not be squash-merged (branch protection, conflict, or transient error)")
+            _finish_review(cfg, reviewer_runner.tool, pr, sl)
             ratchet.record(cfg.repo, "parked")
             notify("agentflow needs you",
                    f"{cfg.repo} #{n}: PR #{pr} merge failed — your action needed",
@@ -550,6 +573,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         if decision is MergeDecision.PARK:
             reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
             park(cfg.repo, pr, verdict, reason=reason)
+            _finish_review(cfg, reviewer_runner.tool, pr, sl)
             ratchet.record(cfg.repo, "parked")
             notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",
                    _pr_url(cfg.repo, pr))
@@ -636,6 +660,10 @@ def intake_once(cfg: RepoConfig, _log=None) -> str:
         _intake_infra_failures.pop((cfg.repo, n), None)   # a clean run ends the streak
         current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
         summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
+        tool = getattr(builder, "tool", None)
+        if tool and intake_result_is_durable(cfg.repo, n, result):
+            wt = Path(cfg.workdir) / ".agentflow" / "worktrees" / f"{tool}-intake" / f"issue-{n}"
+            remove_worktree_if_safe(cfg.workdir, wt)
     finally:
         _release_triage(cfg.repo, n)   # the state label dedups from here; drop the claim
     if result.route in (IntakeRoute.GRILL, IntakeRoute.MOCKUP):
@@ -673,6 +701,10 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
     if _run(["git", "-C", cfg.workdir, "fetch", "origin", "--quiet"]).returncode != 0:
         return False
     if wt.exists():
+        if not _worktree_is_registered(cfg.workdir, wt):
+            return False
+        if not _worktree_is_disposable(cfg.workdir, wt):
+            return False
         return _run(["git", "-C", str(wt), "reset", "--hard", f"origin/{branch}"]).returncode == 0
     wt.parent.mkdir(parents=True, exist_ok=True)
     return _run(["git", "-C", cfg.workdir, "worktree", "add", "-B", branch,
@@ -701,9 +733,19 @@ def respond_once(cfg: RepoConfig, _log=None) -> str:
     if not _checkout_pr_branch(cfg, branch, wt):
         return f"PR #{pr}: could not check out {branch} to respond — retry next cycle"
     builder.provision(wt)
-    ok, _ = builder.launch(RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
-                           cwd=str(wt), model=builder.model_for(Complexity.DEEP))
-    return f"PR #{pr}: replied to the maintainer" if ok else f"PR #{pr}: responder session errored"
+    with worktree_session(wt):
+        ok, _ = builder.launch(
+            RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
+            cwd=str(wt), model=builder.model_for(Complexity.DEEP))
+    comments = _pr_comments(cfg.repo, pr)
+    replied = ok and comments is not None and not reply_pending(comments)
+    if replied:
+        remove_worktree_if_safe(cfg.workdir, wt)
+    if replied:
+        return f"PR #{pr}: replied to the maintainer"
+    if ok:
+        return f"PR #{pr}: responder exited without a confirmed reply — retaining its worktree"
+    return f"PR #{pr}: responder session errored"
 
 
 # --- mockup phase: draw variants on a parked needs-mockup issue (issue #29) ------------
@@ -842,7 +884,8 @@ def produce_once(cfg: RepoConfig, _log=None) -> str:
             builder.provision(wt)
         except subprocess.CalledProcessError as e:
             return f"#{n}: mockup worktree/provision failed ({e})"
-        ok, _ = builder.launch(prompt, cwd=str(wt), model=builder.model_for(Complexity.DEEP))
+        with worktree_session(wt):
+            ok, _ = builder.launch(prompt, cwd=str(wt), model=builder.model_for(Complexity.DEEP))
         if not ok:
             return f"#{n}: mockup session errored"
         # Confirm what was actually posted — a successful exit alone doesn't prove a comment landed.
@@ -851,6 +894,7 @@ def produce_once(cfg: RepoConfig, _log=None) -> str:
         posted = next((c for c in comments if MOCKUP_MARK in c.get("body", "")), None)
         if posted is None:
             return f"#{n}: drew mockup variants"
+        remove_worktree_if_safe(cfg.workdir, wt)
         if "MISSING-CONTEXT:" in posted.get("body", ""):
             notify("agentflow needs you", f"{cfg.repo} #{n}: mockup is stuck — MISSING-CONTEXT",
                    issue_url)
@@ -997,12 +1041,14 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
                             reviewer_tool=reviewer_runner.tool, builder_tool=branch_tool,
                             revises_used=MAX_REVISES,   # park a still-imperfect survivor, don't churn
                             ui_evidence_missing=ui_gap,
-                            reply_pending=reply_pending(_pr_comments(cfg.repo, pr)))
+                            reply_pending=reply_pending(_pr_comments(cfg.repo, pr) or []))
     if decision is MergeDecision.MERGE and squash_merge(cfg.repo, pr):
+        _finish_review(cfg, reviewer_runner.tool, pr, sl, merged=True)
         ratchet.record(cfg.repo, ratchet.CLEAN_MERGE)
         _run(["gh", "issue", "edit", str(n), "--repo", cfg.repo, "--remove-label", "ready-for-agent"])
         return "merged"
     park(cfg.repo, pr, verdict, reason=_SURVIVOR_PARK_REASON)
+    _finish_review(cfg, reviewer_runner.tool, pr, sl)
     ratchet.record(cfg.repo, "parked")
     notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} re-rebased but parked for you",
            _pr_url(cfg.repo, pr))
@@ -1018,14 +1064,21 @@ def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str
     if not m:
         return f"#{pr}: unrecognized branch {branch}"
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
-    result = _rebase_branch(cfg, branch, Path(_builder_worktree(cfg, tool, n, sl)))
+    wt = Path(_builder_worktree(cfg, tool, n, sl))
+    with worktree_session(wt):
+        result = _rebase_branch(cfg, branch, wt)
     if result is RebaseResult.CONFLICT:
         _park_conflicted_survivor(cfg, pr, n)
+        comments = _pr_comments(cfg.repo, pr)
+        if comments is not None and any(_CONFLICT_MARK in c.get("body", "") for c in comments):
+            remove_worktree_if_safe(cfg.workdir, wt)
         return f"#{pr}: conflict — parked for human"
     if result is RebaseResult.ERROR:
         return f"#{pr}: rebase plumbing failed — retry next cycle"
     if result is RebaseResult.NOOP:
+        remove_worktree_if_safe(cfg.workdir, wt)
         return f"#{pr}: nothing to replay"
+    remove_worktree_if_safe(cfg.workdir, wt)
     if profile != "autonomous":
         return f"#{pr}: re-rebased clean — mergeable for the human"
     return f"#{pr}: {_merge_autonomous_survivor(cfg, pr, n, sl, tool, branch)}"
@@ -1049,6 +1102,8 @@ def recheck_once(cfg: RepoConfig) -> str:
         if not _base_advanced_for(cfg.workdir, branch):
             continue   # False or None — base hasn't moved (or unknown): leave it untouched
         comments = _pr_comments(cfg.repo, pr)
+        if comments is None:
+            continue
         if conflict_already_flagged(comments) or reply_pending(comments):
             continue   # already pinged, or a maintainer question the responder owns
         out = _rebase_survivor(cfg, pr, branch, profile)
@@ -1064,8 +1119,10 @@ def pipeline_once(cfg: RepoConfig, _log=None) -> str:
     re-rebase any survivor whose base moved when a sibling merged (ADR 0016 — intake runs ahead
     of the build queue; issue #29 — parked UI issues get their variants drawn; issue #18 — parked
     PRs stay answered; ADR 0009 / issue #45 — survivors never go silently conflicting)."""
-    for tool in ("claude", "codex"):
-        prune_stale_worktrees(cfg.repo, cfg.workdir, tool)
+    recovery = recover_stale_worktrees(cfg.repo, cfg.workdir)
+    if _log and (recovery.removed or recovery.retained):
+        _log(f"{cfg.repo}: worktree recovery removed {len(recovery.removed)}, "
+             f"retained {len(recovery.retained)} for recovery")
     return (f"intake: {intake_once(cfg, _log=_log)} · build: {run_once(cfg, _log=_log)} · "
             f"mockup: {produce_once(cfg, _log=_log)} · respond: {respond_once(cfg, _log=_log)} · "
             f"recheck: {recheck_once(cfg)}")

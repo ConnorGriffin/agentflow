@@ -5,11 +5,89 @@ behind adapters; the *decision* of what a session outcome means is `classify_bui
 and that is what actually needs to be right.
 """
 
+import os
 import subprocess
+from pathlib import Path
 from unittest.mock import patch
 
-from agentflow.runner import (BuildStatus, ClaudeRunner, CodexRunner, Complexity, Effort, _run,
-                              classify_build, worktree_is_prunable)
+import pytest
+
+from agentflow import runner as runner_mod
+from agentflow.runner import (BuildStatus, BuildTask, ClaudeRunner, CodexRunner, Complexity,
+                              Effort, _run, classify_build, recover_stale_worktrees,
+                              remove_worktree_if_safe,
+                              worktree_session)
+
+
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, text=True,
+                          capture_output=True).stdout.strip()
+
+
+def _repo_with_origin(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin.git"
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(repo)], check=True, capture_output=True)
+    _git(repo, "config", "user.email", "agentflow@example.com")
+    _git(repo, "config", "user.name", "agentflow test")
+    (repo / "README.md").write_text("start\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "start")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "push", "-u", "origin", "main")
+    _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
+    return repo
+
+
+class _LifecycleRunner(ClaudeRunner):
+    def __init__(self, *, push: bool = True):
+        self.push = push
+
+    def provision(self, wt):
+        pass
+
+    def launch(self, prompt, cwd, model):
+        wt = Path(cwd)
+        _git(wt, "config", "user.email", "agentflow@example.com")
+        _git(wt, "config", "user.name", "agentflow test")
+        (wt / "result.txt").write_text(prompt)
+        _git(wt, "add", "result.txt")
+        _git(wt, "commit", "-m", prompt)
+        if self.push:
+            _git(wt, "push", "-u", "origin", "HEAD")
+        return True, "done"
+
+    def _pr_for_branch(self, repo, branch):
+        return f"https://github.com/{repo}/pull/1"
+
+    def _new_marker_comments(self, repo, issue, since):
+        return []
+
+
+def _task(repo: Path, issue: int) -> BuildTask:
+    return BuildTask("owner/repo", str(repo), issue, f"session-{issue}", Complexity.STANDARD,
+                     Effort.MEDIUM, f"session {issue}")
+
+
+def _branch_worktree(repo: Path, path: Path, branch: str, *, push: bool = True,
+                     dirty: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "-b", branch, str(path), "origin/main")
+    _git(path, "config", "user.email", "agentflow@example.com")
+    _git(path, "config", "user.name", "agentflow test")
+    (path / "result.txt").write_text(branch)
+    _git(path, "add", "result.txt")
+    _git(path, "commit", "-m", branch)
+    if push:
+        _git(path, "push", "-u", "origin", branch)
+    if dirty:
+        (path / "result.txt").write_text("dirty")
+
+
+def _detached_worktree(repo: Path, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "--detach", str(path), "origin/main")
 
 
 def test_complexity_resolves_to_cost_appropriate_models():
@@ -83,27 +161,202 @@ def test_dead_pr_on_branch_classifies_as_no_pr():
     assert out.pr_url is None
 
 
-# --- worktree sweep predicate ------------------------------------------------
+def test_completed_build_sessions_are_removed_but_unpushed_progress_is_retained(tmp_path):
+    repo = _repo_with_origin(tmp_path)
 
-def test_prunable_when_pr_merged_and_clean():
-    assert worktree_is_prunable("MERGED", is_clean=True)
+    for issue in (1, 2):
+        assert _LifecycleRunner().build(_task(repo, issue)).status is BuildStatus.PR_OPENED
 
+    registered = _git(repo, "worktree", "list", "--porcelain")
+    assert registered.count("worktree ") == 1
 
-def test_prunable_when_pr_closed_and_clean():
-    assert worktree_is_prunable("CLOSED", is_clean=True)
-
-
-def test_not_prunable_when_pr_open():
-    assert not worktree_is_prunable("OPEN", is_clean=True)
-
-
-def test_not_prunable_when_no_pr():
-    assert not worktree_is_prunable(None, is_clean=True)
+    assert _LifecycleRunner(push=False).build(_task(repo, 3)).status is BuildStatus.PR_OPENED
+    registered = _git(repo, "worktree", "list", "--porcelain")
+    assert "issue-3-session-3" in registered
 
 
-def test_not_prunable_when_dirty_even_if_pr_merged():
-    assert not worktree_is_prunable("MERGED", is_clean=False)
+def test_public_session_lifecycle_bounds_registrations_across_every_lane(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    root = repo / ".agentflow" / "worktrees"
+    completed = [
+        root / "claude-intake" / "issue-1",
+        root / "codex-review" / "pr-2-reviewed",
+        root / "claude" / "issue-3-built",
+        root / "codex" / "mockup-4-drawn",
+        root / "claude" / "issue-5-responded",
+        root / "codex" / "issue-6-rebased",
+    ]
+    _detached_worktree(repo, completed[0])
+    _detached_worktree(repo, completed[1])
+    for path, branch in zip(completed[2:], [
+        "agentflow/claude/issue-3-built",
+        "agentflow/codex/mockup-4-drawn",
+        "agentflow/claude/issue-5-responded",
+        "agentflow/codex/issue-6-rebased",
+    ], strict=True):
+        _branch_worktree(repo, path, branch)
+
+    dirty = root / "claude" / "issue-7-dirty"
+    unpushed = root / "codex" / "issue-8-unpushed"
+    active = root / "claude" / "issue-9-active"
+    _branch_worktree(repo, dirty, "agentflow/claude/issue-7-dirty", dirty=True)
+    _branch_worktree(repo, unpushed, "agentflow/codex/issue-8-unpushed", push=False)
+    _branch_worktree(repo, active, "agentflow/claude/issue-9-active")
+
+    foreign_root = tmp_path / "foreign-lifecycle"
+    foreign_root.mkdir()
+    foreign = _repo_with_origin(foreign_root)
+    foreign_wt = root / "dotfiles" / "open-pr"
+    foreign_wt.parent.mkdir(parents=True, exist_ok=True)
+    _git(foreign, "worktree", "add", "-b", "codex/open-pr", str(foreign_wt), "origin/main")
+
+    assert all(remove_worktree_if_safe(str(repo), path) for path in completed)
+    assert remove_worktree_if_safe(str(repo), dirty) is False
+    assert remove_worktree_if_safe(str(repo), unpushed) is False
+    with worktree_session(active):
+        assert remove_worktree_if_safe(str(repo), active) is False
+    assert remove_worktree_if_safe(str(repo), foreign_wt) is False
+
+    registered = _git(repo, "worktree", "list", "--porcelain")
+    assert registered.count("worktree ") == 4  # main + dirty + unpushed + active
+    assert foreign_wt.exists()
 
 
-def test_not_prunable_when_dirty_even_if_pr_closed():
-    assert not worktree_is_prunable("CLOSED", is_clean=False)
+def test_agent_launch_persists_the_child_pid_until_the_session_finishes(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-10-live"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-10-live")
+
+    with worktree_session(wt):
+        result = runner_mod._run_session(["sh", "-c", "exit 0"], str(wt), 5)
+        marker = runner_mod._active_marker(wt)
+        assert marker is not None
+        child_pid = int(marker.read_text())
+        assert result.returncode == 0 and child_pid != os.getpid()
+    assert not marker.exists()
+
+
+def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    runner = ClaudeRunner()
+    branch = "agentflow/claude/issue-7-retry"
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-7-retry"
+    _branch_worktree(repo, wt, branch, push=False)
+    head = _git(wt, "rev-parse", "HEAD")
+
+    runner._open_pr_for_branch = lambda *_: (True, None)
+    with pytest.raises(subprocess.CalledProcessError):
+        runner.prepare_worktree(str(repo), branch, wt, "owner/repo")
+    assert wt.exists() and _git(wt, "rev-parse", "HEAD") == head
+
+    detached = repo / ".agentflow" / "worktrees" / "codex-intake" / "issue-8"
+    _detached_worktree(repo, detached)
+    _git(detached, "config", "user.email", "agentflow@example.com")
+    _git(detached, "config", "user.name", "agentflow test")
+    (detached / "recovery.txt").write_text("keep me")
+    _git(detached, "add", "recovery.txt")
+    _git(detached, "commit", "-m", "recoverable intake progress")
+    detached_head = _git(detached, "rev-parse", "HEAD")
+
+    with pytest.raises(subprocess.CalledProcessError):
+        runner.prepare_worktree_detached(str(repo), "origin/main", detached)
+    assert detached.exists() and _git(detached, "rev-parse", "HEAD") == detached_head
+
+    _git(wt, "push", "-u", "origin", branch)
+    runner._open_pr_for_branch = lambda *_: (False, None)
+    with pytest.raises(subprocess.CalledProcessError):
+        runner.prepare_worktree(str(repo), branch, wt, "owner/repo")
+    assert wt.exists() and _git(wt, "rev-parse", "HEAD") == head
+
+
+def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_foreign_work(
+        tmp_path, monkeypatch):
+    repo = _repo_with_origin(tmp_path)
+    root = repo / ".agentflow" / "worktrees"
+    completed = root / "codex" / "issue-10-done"
+    legacy = root / "codex" / "legacy-fix"
+    legacy_two = root / "codex" / "second-legacy-fix"
+    dirty = root / "codex" / "issue-11-dirty"
+    unpushed = root / "codex" / "issue-12-unpushed"
+    active = root / "codex" / "issue-13-active"
+    active_open_pr = root / "codex" / "issue-14-active-open-pr"
+    active_legacy = root / "codex" / "active-legacy"
+    intake = root / "claude-intake" / "issue-10"
+    intake_two = root / "claude-intake" / "issue-15"
+    intake_three = root / "codex-intake" / "issue-16"
+    review = root / "codex-review" / "pr-20-done"
+    review_two = root / "claude-review" / "pr-21-done"
+    _branch_worktree(repo, completed, "agentflow/codex/issue-10-done")
+    _branch_worktree(repo, legacy, "codex/legacy-fix")
+    _branch_worktree(repo, legacy_two, "codex/second-legacy-fix")
+    _branch_worktree(repo, dirty, "agentflow/codex/issue-11-dirty", dirty=True)
+    _branch_worktree(repo, unpushed, "agentflow/codex/issue-12-unpushed", push=False)
+    active.parent.mkdir(parents=True, exist_ok=True)
+    _git(repo, "worktree", "add", "-b", "agentflow/codex/issue-13-active", str(active),
+         "origin/main")
+    _branch_worktree(repo, active_open_pr, "agentflow/codex/issue-14-active-open-pr")
+    _branch_worktree(repo, active_legacy, "codex/active-legacy")
+    _detached_worktree(repo, intake)
+    _detached_worktree(repo, intake_two)
+    _detached_worktree(repo, intake_three)
+    _detached_worktree(repo, review)
+    _detached_worktree(repo, review_two)
+
+    foreign_root = tmp_path / "foreign"
+    foreign_root.mkdir()
+    foreign = _repo_with_origin(foreign_root)
+    foreign_wt = root / "dotfiles" / "foreign-open-pr"
+    foreign_wt.parent.mkdir(parents=True, exist_ok=True)
+    _git(foreign, "worktree", "add", "-b", "codex/foreign-open-pr", str(foreign_wt),
+         "origin/main")
+
+    original_run = runner_mod._run
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        if cmd[:3] == ["gh", "pr", "list"]:
+            branch = cmd[cmd.index("--head") + 1]
+            state = {
+                "agentflow/codex/issue-10-done": "OPEN",
+                "codex/legacy-fix": "MERGED",
+                "codex/second-legacy-fix": "MERGED",
+                "agentflow/codex/issue-11-dirty": "OPEN",
+                "agentflow/codex/issue-12-unpushed": "OPEN",
+                "agentflow/codex/issue-14-active-open-pr": "OPEN",
+                "codex/active-legacy": "OPEN",
+            }.get(branch, "")
+            return subprocess.CompletedProcess(cmd, 0, f"{state}\n" if state else "", "")
+        if cmd[:3] == ["gh", "pr", "view"]:
+            body = ('{"state":"OPEN","comments":['
+                    '{"body":"> *agentflow: parked for human review.*"}]}')
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        if cmd[:3] == ["gh", "issue", "view"]:
+            issue = int(cmd[3])
+            label = "agentflow:building" if issue == 14 else "ready-for-agent"
+            body = f'{{"state":"OPEN","labels":[{{"name":"{label}"}}],"comments":[]}}'
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        return original_run(cmd, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(runner_mod, "_run", fake_run)
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        with worktree_session(active_legacy):
+            marker = runner_mod._active_marker(active_legacy)
+            assert marker is not None
+            marker.write_text(str(child.pid))
+            runner_mod._ACTIVE_WORKTREES.clear()  # simulate a freshly started recovery process
+            report = recover_stale_worktrees("owner/repo", str(repo))
+    finally:
+        child.terminate()
+        child.wait()
+
+    assert set(report.removed) == {
+        str(completed), str(legacy), str(legacy_two), str(intake), str(intake_two),
+        str(intake_three), str(review), str(review_two),
+    }
+    assert len(report.removed) == 8
+    assert (dirty.exists() and unpushed.exists() and active.exists() and
+            active_open_pr.exists() and active_legacy.exists())
+    assert foreign_wt.exists()
+    registered = _git(repo, "worktree", "list", "--porcelain")
+    assert str(completed) not in registered and str(legacy) not in registered
+    assert str(foreign_wt) not in registered  # ownership comes from the foreign repo's metadata
