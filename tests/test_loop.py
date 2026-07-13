@@ -677,6 +677,8 @@ def test_produce_once_selects_claims_and_spawns(monkeypatch):
     monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
     monkeypatch.setattr(loop, "_claim_mockup", lambda repo, n: claimed.append(n))
     monkeypatch.setattr(loop, "_release_mockup", lambda repo, n: released.append(n))
+    monkeypatch.setattr(loop, "_issue_comments", lambda repo, n: [])
+    monkeypatch.setattr(loop, "notify", lambda title, msg, url="": None)
     out = produce_once(RepoConfig("o/r", "/tmp"))
     assert "11" in out and "drew mockup variants" in out
     assert claimed == [11] and released == [11]
@@ -696,6 +698,75 @@ def test_produce_once_deferral_names_the_block_reason(monkeypatch):
     monkeypatch.setattr(loop, "pick_pair", lambda: (None, None, "codex: busy, claude: you"))
     out = produce_once(RepoConfig("o/r", "/tmp"))
     assert "codex: busy" in out and "deferring" in out
+
+
+# --- issue #55: notify maintainer when produce_once posts a result ----------------------
+
+def _stub_produce(monkeypatch, *, launch_ok, comments):
+    """Drive produce_once with a canned launch result and issue comments; return recorded pings."""
+    issue = {"number": 11, "title": "A screen", "body": "b",
+             "labels": [{"name": "agentflow:needs-mockup"}]}
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
+
+    class _Builder:
+        tool = "claude"
+        def prepare_worktree(self, workdir, branch, wt, repo=None): pass
+        def provision(self, wt): pass
+        def model_for(self, c): return "opus"
+        def launch(self, prompt, cwd, model): return launch_ok, ""
+
+    monkeypatch.setattr(loop, "pick_pair", lambda: (_Builder(), None, ""))
+    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
+    monkeypatch.setattr(loop, "_claim_mockup", lambda repo, n: None)
+    monkeypatch.setattr(loop, "_release_mockup", lambda repo, n: None)
+    monkeypatch.setattr(loop, "_issue_comments", lambda repo, n: comments)
+    pings = []
+    monkeypatch.setattr(loop, "notify", lambda title, msg, url="": pings.append((title, msg, url)))
+    return pings
+
+
+def test_produce_once_notifies_when_variants_posted(monkeypatch):
+    # A confirmed variant-round comment triggers exactly 1 notification pointing at the issue.
+    # Fails first if produce_once is silent after a real variant comment lands.
+    pings = _stub_produce(monkeypatch, launch_ok=True,
+                          comments=[{"body": f"{_MOCKUP_DISCLAIMER}\n\n## Variant A\n..."}])
+    out = produce_once(RepoConfig("o/r", "/tmp"))
+    assert "drew mockup variants" in out
+    assert len(pings) == 1
+    title, msg, url = pings[0]
+    assert title == "agentflow needs you"
+    assert "o/r" in msg and "11" in msg
+    assert url == "https://github.com/o/r/issues/11"
+    assert "MISSING-CONTEXT" not in msg
+
+
+def test_produce_once_notifies_missing_context(monkeypatch):
+    # A MISSING-CONTEXT comment triggers a distinct notification, never the variants-ready one.
+    pings = _stub_produce(monkeypatch, launch_ok=True,
+                          comments=[{"body": f"{_MOCKUP_DISCLAIMER}\nMISSING-CONTEXT: no surface found"}])
+    out = produce_once(RepoConfig("o/r", "/tmp"))
+    assert "MISSING-CONTEXT" in out
+    assert len(pings) == 1
+    title, msg, url = pings[0]
+    assert title == "agentflow needs you"
+    assert "MISSING-CONTEXT" in msg or "stuck" in msg.lower()
+    assert url == "https://github.com/o/r/issues/11"
+
+
+def test_produce_once_no_notify_on_session_error(monkeypatch):
+    # A failed session (ok=False) causes 0 notifications — the issue stays eligible for retry.
+    pings = _stub_produce(monkeypatch, launch_ok=False, comments=[])
+    out = produce_once(RepoConfig("o/r", "/tmp"))
+    assert "errored" in out
+    assert pings == []
+
+
+def test_produce_once_no_notify_without_confirmed_post(monkeypatch):
+    # ok=True but no MOCKUP_MARK comment found — session exited without posting, no notification.
+    pings = _stub_produce(monkeypatch, launch_ok=True, comments=[])
+    out = produce_once(RepoConfig("o/r", "/tmp"))
+    assert "drew mockup variants" in out
+    assert pings == []
 
 
 # --- issue #45: re-rebase survivors after main advances (ADR 0009 merge-time floor) -----
