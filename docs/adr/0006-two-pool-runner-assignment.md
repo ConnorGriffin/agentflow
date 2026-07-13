@@ -11,11 +11,11 @@ open. The obvious axis — cost — does not apply here: both tools run on **pre
 flat-rate subscriptions** (a Claude plan and a Codex/ChatGPT plan). Marginal tokens
 are ~free, so "the cheaper tool" is meaningless.
 
-What *is* scarce is **rate-limit headroom** on each plan: a 5-hour rolling window
-plus a weekly cap, tracked per-plan. Idle headroom on either plan is capacity
-already paid for and wasted. `triage-gate.sh` already models this per agent
-(`TRIAGE_AGENT=claude|codex`: trailing-5h weighted spend vs a calibrated peak for
-Claude; `primary`/`secondary` `used_percent` for Codex).
+What *is* scarce is **rate-limit headroom** on each plan. Claude has a calibrated
+rolling window; Codex reports one or more windows whose shape can change with the
+plan. Idle headroom on either plan is capacity already paid for and wasted.
+`triage-gate.sh` is the adapter for these facts (`TRIAGE_AGENT=claude|codex`);
+agentflow owns the scheduling policy.
 
 ## Decision
 
@@ -35,6 +35,25 @@ is queued.
 - **Reserve headroom for interactive use.** The existing per-plan gate holds: a
   headless build yields when its plan is near an interactive session or over the
   reserve threshold. The balancer only spends a plan's *surplus*.
+
+## Amendment (2026-07-13) — Codex windows are dynamic; weekly use is paced
+
+Codex windows are classified by their reported duration, never by whether Codex
+calls one `primary` or `secondary`. Every reported known window is an independent
+dispatch constraint, and all of them must permit a new unattended session. A
+missing, malformed, or unknown fact makes that pool unavailable until fresh facts
+arrive.
+
+For a reported 10,080-minute window, unattended Codex allowance is released
+linearly from 0% at the window start to 80% immediately before reset:
+`min(80, 80 × elapsed / 10080)`. Reported usage must be strictly below the released
+allowance. The remaining 20% is reserved for interactive work. This gates new
+sessions only; work already in flight finishes.
+
+A reported 300-minute window continues to use the existing short-window policy.
+If both durations are present, that short-window decision and weekly pacing must
+both permit dispatch. The gate reports usage, duration, and reset facts; it does
+not duplicate the weekly pacing decision.
 
 ## Alternatives considered
 
