@@ -77,6 +77,30 @@ Claude; the design holds.
 Per-repo correction-rate metric + the loosen/tighten controls
 ([ADR 0007](docs/adr/0007-decisive-intake-graduated-autonomy.md)).
 
+### M5.5 — Dependency-aware dispatch ([ADR 0024](docs/adr/0024-dependency-aware-dispatch.md))
+A `Blocked by #N` marker gates the ready set so an ordered chain of slices builds in
+order and auto-advances. Small, independent — built first, because it's what lets M6
+be filed as one batch instead of one issue at a time.
+
+### M6 — Dashboard re-platform: interactive control plane ([ADR 0023](docs/adr/0023-dashboard-replatform-control-plane.md))
+The read-only stdlib dashboard fell behind the pipeline (no held/parked in the inbox,
+dead control buttons, no live-session view). Re-platform to a Svelte SPA + FastAPI
+interactive control plane against the locked spec `mockups/dashboard-v2-combined.html`.
+Vertical slices ([ADR 0012](docs/adr/0012-build-in-vertical-slices.md)), **filed as one
+`blocked-by` chain** (M5.5) — the head builds, each later slice auto-advances as its
+blocker merges:
+
+1. **Walking skeleton** — FastAPI serves `/api/snapshot`; a Vite/Svelte shell renders
+   the **Inbox** tab at parity with today's derivation. Proves the new stack end-to-end.
+2. **Live sessions** — the daemon writes a live-session state file (`running[]`); the
+   **Live** kanban reads it. *(blocked by 1)*
+3. **Held + parked** — extend `snapshot()`; thicken the Inbox with held/parked rows;
+   land the **Fleet** table + **History** feed. *(blocked by 1)*
+4. **Controls** — POST + shared-secret auth, one verb per sub-slice (pause/resume →
+   loosen → merge → pickup). The correctness/security-sensitive slice. *(blocked by 1)*
+5. **Headroom-governed concurrency** — drop the serial dispatch cap (amends
+   [ADR 0006](docs/adr/0006-two-pool-runner-assignment.md)); independent of the dashboard.
+
 ## Rollout coupling (signed off)
 
 The build sequence *is* the repo rollout: **M0–M3 harden on a new vibe-code repo

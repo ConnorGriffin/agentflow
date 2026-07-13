@@ -1,0 +1,525 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentflow · control plane</title>
+<!--
+  ============================================================================
+  LOCKED VISUAL SPEC — agentflow operator dashboard re-platform (2026-07-13).
+  Chosen by Connor over four explored variants; this synthesis is the binding
+  spec for the implementation. Target stack: Svelte SPA + FastAPI, polling-based
+  liveness (daemon writes a live-session state file; server caches gh ~15s; the
+  browser polls every ~3-5s). Interactive control plane (merge / loosen-ratchet /
+  pause-daemon / pickup) — the mock buttons here are the affordances to wire.
+
+  Craft gate (/impeccable audit) PASSED, ~18/20 (Excellent): contrast fully AA on
+  muted AND semantic text (5.16-7.5:1), theming is a clean token system, motion is
+  compositor-only with a full reduced-motion fallback, no anti-patterns. A11y
+  semantics folded in at lock (drawer role=dialog+aria-modal, tabs role=tab with
+  synced aria-selected, tabpanels, themed :focus-visible ring).
+  CARRY-FORWARD for the Svelte build (not fully wired in this static mock):
+    · drill-down drawer must trap focus, move focus in on open, and return it to
+      the invoking row on close (Esc-close is already wired).
+  ============================================================================
+
+  dashboard-v2 · COMBINED — the round-2 lock candidate for the operator dashboard
+  re-platform. This is a SYNTHESIS of four grounded variants, not a fresh design:
+
+    · SHELL   ← dashboard-v2-console  (tab bar Inbox/Live/Fleet/History with 1-4 +
+                j/k keys, the drill-down drawer + scrim, the CLI status bar, header)
+    · INBOX   ← dashboard-v2-queue    (ranked, numbered, one-action-per-row worklist)
+    · LIVE    ← dashboard-v2-live      (triaging→building→reviewing kanban of sessions)
+    · FLEET   ← dashboard-v2-grid      (repo×signals master table, expand-in-place)
+    · HISTORY ← console's flat reverse-chron merged/audit feed
+
+  Synthesis rules honored:
+    1. Console is the frame: global header (product · daemon+pause · two-pool
+       headroom) → 4-tab bar with live counts → active view → CLI status bar.
+       Inbox is the default landing tab.
+    2. Each tab gets the best-in-class body from its source variant (not console's
+       lighter stubs) — kept at full density.
+    3. Headroom lives ONCE, in the shell header (queue's rail-pools and grid's
+       pools-strip are dropped). Live adds a running-count CORRELATION strip — the
+       one place a pool's live occupancy is tied to its lanes (rule 4).
+    4. Concurrency is real: running[] holds 7 sessions across stages/tools; the
+       serial cap is gone, headroom is the governor. Live lanes are compact rows
+       with an always-visible per-stage count, and each pool shows running-count +
+       headroom so "claude running 4 · 29%" reads as the pool being drained.
+    5. The drawer is the shared drill-down for every tab (Enter opens, Esc closes).
+    6. Inbox stays primary — landing tab, most-urgent-first, one action per row.
+
+  Grounding (unchanged from the four sources): theme lifted verbatim from
+  agentflow/static/dashboard.html :root (dark-only, mono, radii 8-9px). PRODUCT.md
+  bans honored — NO side-stripe/border-left accents (state = leading glyph +
+  colored label + full-border selection + bg tint), rows/tables over cards, no
+  nested cards, no gradients / hero-metric / glassmorphism. State never by color
+  alone (always a label/glyph). Full prefers-reduced-motion fallback. Semantic
+  z-index scale. One screen, no horizontal body scroll; each view scrolls itself.
+  Data: fetch('./dashboard-v2.capture.json'). Chrome marked MOCK-ONLY is not part
+  of the real app.
+-->
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#e6edf3; --muted:#8b949e;
+    --green:#3fb950; --blue:#58a6ff; --amber:#d29922; --red:#f85149;
+    /* derived-only, for hover/tint depth */
+    --panel-2:#1a2029; --border-2:#3d444d;
+    /* semantic z-index scale (DESIGN.md): sticky header/nav → dropdown → scrim/drawer → toast */
+    --z-sticky:100; --z-dropdown:200; --z-scrim:290; --z-drawer:300; --z-toast:400;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+    display:flex;flex-direction:column;overflow:hidden}
+  button{font:inherit}
+  ::selection{background:rgba(88,166,255,.25)}
+
+  /* ---- shared inline tokens ---- */
+  .muted,.dim{color:var(--muted)}
+  .num{color:var(--muted);font-variant-numeric:tabular-nums}
+  .chk,.ok{color:var(--green)} .caution,.care{color:var(--amber)} .fail{color:var(--red)}
+  .repotag{color:var(--muted)}
+  .tool-claude{color:var(--amber)} .tool-codex{color:var(--blue)}
+  .badge{font-size:10px;padding:1px 7px;border-radius:20px;border:1px solid;letter-spacing:.3px}
+  .badge.claude{color:var(--amber);border-color:rgba(210,153,34,.5)}
+  .badge.codex{color:var(--blue);border-color:rgba(88,166,255,.5)}
+  .model{color:var(--muted);font-size:11px;margin-left:6px}
+  .mini-badge{font-size:10px;padding:1px 8px;border-radius:20px;border:1px solid;letter-spacing:.3px;white-space:nowrap}
+  .mini-badge.autonomous{color:var(--green);border-color:rgba(63,185,80,.5)}
+  .mini-badge.reviewed{color:var(--blue);border-color:rgba(88,166,255,.5)}
+  .mini-badge.guarded{color:var(--amber);border-color:rgba(210,153,34,.5)}
+  /* kind colors — shared by inbox glyphs/labels + drawer kickers (never color-alone) */
+  .k-guarded{color:var(--amber)} .k-reviewed{color:var(--blue)}
+  .k-held{color:var(--amber)} .k-parked{color:var(--red)} .k-loosen{color:var(--green)}
+
+  /* ---------- header ---------- */
+  header{display:flex;align-items:center;gap:14px;padding:9px 18px;
+    border-bottom:1px solid var(--border);flex:none;z-index:var(--z-sticky);background:var(--bg)}
+  .brand{display:flex;align-items:baseline;gap:8px}
+  .brand h1{margin:0;font-size:16px;letter-spacing:.5px}
+  .brand .v{color:var(--muted);font-size:11px}
+  .spacer{flex:1}
+  .tabnum{color:var(--muted);opacity:.7}
+
+  /* daemon status + pause/resume */
+  .daemon{display:inline-flex;align-items:center;gap:8px;font-size:12px;
+    border:1px solid var(--border);border-radius:20px;padding:3px 4px 3px 11px}
+  .daemon .dot{width:7px;height:7px;border-radius:50%}
+  .daemon.on{color:var(--green);border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.07)}
+  .daemon.on .dot{background:var(--green);animation:beat 2.4s ease-in-out infinite}
+  .daemon.off{color:var(--amber);border-color:rgba(210,153,34,.4);background:rgba(210,153,34,.07)}
+  .daemon.off .dot{background:var(--amber)}
+  .daemon .cyc{color:var(--muted);font-size:11px}
+  .daemon .toggle{font-size:11px;color:var(--fg);background:var(--panel-2);
+    border:1px solid var(--border);border-radius:14px;padding:2px 9px;cursor:pointer}
+  .daemon .toggle:hover{border-color:var(--border-2)}
+  @keyframes beat{0%,100%{opacity:1}50%{opacity:.35}}
+
+  /* header pool chips — the ONE home for two-pool headroom (dedup: rule 3) */
+  .poolchips{display:flex;gap:8px}
+  .pchip{display:inline-flex;align-items:center;gap:7px;font-size:12px;
+    border:1px solid var(--border);border-radius:7px;padding:3px 9px;background:var(--panel)}
+  .pchip .nm{font-weight:600}
+  .pchip .mini{width:44px;height:5px;background:#21262d;border-radius:3px;overflow:hidden}
+  .pchip .mini>i{display:block;height:100%;border-radius:3px}
+  .pchip .hr{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+
+  /* MOCK-ONLY state toggle */
+  .seg{display:flex;border:1px solid var(--border);border-radius:7px;overflow:hidden}
+  .seg button{font-size:11px;color:var(--muted);background:transparent;border:0;
+    padding:4px 10px;cursor:pointer}
+  .seg button.on{background:var(--panel-2);color:var(--fg)}
+  .seg button+button{border-left:1px solid var(--border)}
+  .mocktag{font-size:9px;letter-spacing:.6px;color:var(--muted);text-transform:uppercase;opacity:.7}
+
+  /* ---------- tab bar (nav) ---------- */
+  nav{display:flex;align-items:stretch;gap:2px;padding:0 12px;flex:none;
+    border-bottom:1px solid var(--border);z-index:var(--z-sticky);background:var(--bg)}
+  .tab{display:inline-flex;align-items:center;gap:8px;padding:9px 15px;cursor:pointer;
+    color:var(--muted);background:transparent;border:0;border-bottom:2px solid transparent;
+    margin-bottom:-1px;letter-spacing:.3px}
+  .tab:hover{color:var(--fg)}
+  .tab.active{color:var(--fg);border-bottom-color:var(--blue)}
+  .tab .cnt{font-size:11px;color:var(--fg);background:var(--panel-2);
+    border:1px solid var(--border);border-radius:20px;padding:0 7px;min-width:20px;text-align:center}
+  .tab.active .cnt{border-color:var(--border-2)}
+  .tab .cnt.alert{color:var(--amber);border-color:rgba(210,153,34,.5);background:rgba(210,153,34,.08)}
+  nav .navhint{margin-left:auto;align-self:center;font-size:11px;color:var(--muted);padding-right:6px}
+  nav .navhint kbd{color:var(--fg)}
+
+  /* ---------- main / views ---------- */
+  main{flex:1;min-height:0;position:relative;overflow:hidden}
+  .view{position:absolute;inset:0;overflow-y:auto;padding:16px 18px 18px;display:none}
+  .view.active{display:block}
+  .viewhead{display:flex;align-items:baseline;gap:10px;margin:0 2px 12px}
+  .viewhead h2{font-size:12px;text-transform:uppercase;letter-spacing:1.3px;color:var(--muted);margin:0}
+  .viewhead .cnt{font-size:11px;color:var(--fg);background:var(--panel-2);
+    border:1px solid var(--border);border-radius:20px;padding:1px 8px}
+  .viewhead .sub{font-size:11px;color:var(--muted);margin-left:auto}
+
+  /* ============================================================ INBOX (← queue) */
+  #view-inbox .list{border:1px solid var(--border);border-radius:9px;background:var(--panel);overflow:hidden}
+  #view-inbox .qrow{display:grid;grid-template-columns:30px 22px minmax(0,1fr) auto auto;gap:12px;
+    align-items:center;padding:12px 15px;border-top:1px solid var(--border);cursor:pointer;position:relative}
+  #view-inbox .qrow:first-child{border-top:0}
+  #view-inbox .qrow:hover{background:var(--panel-2)}
+  #view-inbox .qrow.parked{background:rgba(248,81,73,.045)}
+  #view-inbox .qrow.parked:hover{background:rgba(248,81,73,.09)}
+  #view-inbox .qrow.sel{box-shadow:inset 0 0 0 1.5px var(--blue)}
+  #view-inbox .qidx{color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums;text-align:right;letter-spacing:.5px}
+  #view-inbox .qglyph{font-size:15px;text-align:center;line-height:1}
+  #view-inbox .qbody{min-width:0}
+  #view-inbox .qtitle{font-size:14px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #view-inbox .qtitle .num{color:var(--muted)}
+  #view-inbox .qtitle .open{color:var(--muted);text-decoration:none;opacity:0;margin-left:3px}
+  #view-inbox .qrow:hover .qtitle .open{opacity:1}
+  #view-inbox .qmeta{margin-top:4px;font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #view-inbox .qmeta b{font-weight:600}
+  #view-inbox .qaside{font-size:11px;color:var(--muted);white-space:nowrap;text-align:right;font-variant-numeric:tabular-nums}
+  #view-inbox .qact{background:var(--blue);color:#0d1117;font:600 13px/1 ui-monospace,SFMono-Regular,Menlo,monospace;
+    border:0;border-radius:7px;padding:9px 14px;cursor:pointer;white-space:nowrap;
+    transition:filter .12s,transform .06s;min-width:104px;text-align:center}
+  #view-inbox .qact:hover{filter:brightness(1.09)} #view-inbox .qact:active{transform:translateY(1px)}
+  #view-inbox .qact.guarded{background:var(--amber)} #view-inbox .qact.held{background:var(--amber)}
+  #view-inbox .qact.loosen{background:var(--green)} #view-inbox .qact.parked{background:var(--red);color:#fff}
+  #view-inbox .qmuted{color:var(--muted)}
+  #view-inbox .qrow{animation:rowin .28s ease-out both;animation-delay:calc(var(--i,0)*22ms)}
+
+  /* ============================================================ LIVE (← live) */
+  #view-live.active{display:flex;flex-direction:column;overflow:hidden;padding:16px 18px 18px}
+  .board-head{display:flex;align-items:center;gap:16px;margin:0 2px 12px;flex-wrap:wrap}
+  .bh-title{font-size:12px;text-transform:uppercase;letter-spacing:1.3px;color:var(--muted);font-weight:600}
+  .flow{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+  .flow b{color:var(--fg);font-variant-numeric:tabular-nums;
+    background:var(--panel-2);border:1px solid var(--border);border-radius:20px;padding:0 7px;margin-left:2px}
+  .flow .arrow{color:var(--border-2)}
+  /* pool↔lane CORRELATION strip — running-count tied to headroom (rule 4). This is
+     the one place occupancy meets headroom; global headroom still lives in the header. */
+  .poolcorr{margin-left:auto;display:flex;gap:10px}
+  .pc{display:inline-flex;align-items:center;gap:7px;font-size:11.5px;
+    border:1px solid var(--border);border-radius:7px;padding:3px 10px;background:var(--panel)}
+  .pc .nm{font-weight:600}
+  .pc .run{color:var(--fg);font-variant-numeric:tabular-nums}
+  .pc .cap{width:40px;height:5px;background:#21262d;border-radius:3px;overflow:hidden}
+  .pc .cap>i{display:block;height:100%;border-radius:3px}
+  .pc .hr{color:var(--muted);font-variant-numeric:tabular-nums}
+
+  .lanes{flex:1;min-height:0;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+  .lane{min-width:0;min-height:0;display:flex;flex-direction:column;
+    background:var(--panel);border:1px solid var(--border);border-radius:9px}
+  .lane[data-stage="building"]{background:var(--panel-2);border-color:var(--border-2)}
+  .lane-head{display:flex;align-items:center;gap:8px;padding:11px 13px;
+    border-bottom:1px solid var(--border);flex:none}
+  .lane-glyph{color:var(--muted);font-size:14px}
+  .lane[data-stage="building"] .lane-glyph{color:var(--fg)}
+  .lane-name{font-size:12px;letter-spacing:.6px;color:var(--muted);text-transform:uppercase}
+  .lane[data-stage="building"] .lane-name{color:var(--fg);font-weight:600}
+  .lane-count{margin-left:auto;font-size:11px;font-variant-numeric:tabular-nums;color:var(--fg);
+    background:var(--bg);border:1px solid var(--border);border-radius:20px;padding:0 8px}
+  .lane-rows{flex:1;min-height:0;overflow-y:auto;padding:8px;display:flex;flex-direction:column;gap:8px}
+  .lane-empty{color:var(--muted);font-size:11.5px;text-align:center;padding:16px 0;opacity:.7}
+
+  /* a session = a ROW (not a card): full hairline border, no side-stripe accent */
+  .sess{display:flex;gap:10px;align-items:flex-start;cursor:pointer;
+    background:var(--bg);border:1px solid var(--border);border-radius:8px;
+    padding:10px 11px;transition:border-color .12s}
+  .lane[data-stage="building"] .sess{background:var(--panel)}
+  .sess:hover{border-color:var(--border-2)}
+  .sess.sel{box-shadow:inset 0 0 0 1.5px var(--blue);border-color:var(--blue)}
+  #view-live .pulse{width:9px;height:9px;border-radius:50%;background:var(--p);flex:none;margin-top:4px;position:relative}
+  #view-live .pulse::after{content:"";position:absolute;inset:0;border-radius:50%;background:var(--p);
+    opacity:.6;animation:pulse 2.2s ease-out infinite}
+  .sess-main{flex:1;min-width:0}
+  .sess-id{display:flex;align-items:baseline;gap:7px;flex-wrap:wrap}
+  .sess-id .repo{font-weight:600;font-size:13px}
+  .sess-id .num{font-size:12px}
+  .tbadge{font-size:10px;letter-spacing:.3px;padding:1px 7px;border-radius:20px;border:1px solid currentColor;white-space:nowrap}
+  .sess-title{margin-top:4px;font-size:13px;color:var(--fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .sess-foot{margin-top:5px;display:flex;align-items:baseline;gap:8px;font-size:11px;color:var(--muted)}
+  .sess-foot .branch{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
+  .sess-elapsed{flex:none;font-size:15px;font-variant-numeric:tabular-nums;color:var(--fg);
+    font-weight:600;min-width:44px;text-align:right;letter-spacing:.3px}
+
+  /* honest idle state — shows the 0/0/0 per-stage counts, not three empty boxes (rule 4) */
+  .board-idle{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;gap:10px;border:1px dashed var(--border);border-radius:10px;color:var(--muted);padding:40px}
+  .idle-mark{font-size:40px;color:var(--border-2);line-height:1}
+  .idle-counts{font-size:14px;color:var(--fg)}
+  .idle-counts b{color:var(--muted);font-weight:400}
+  .idle-p{font-size:12.5px;max-width:440px}
+
+  /* ============================================================ FLEET (← grid) */
+  #view-fleet.active{display:flex;flex-direction:column;overflow:hidden;padding:16px 18px 0}
+  .fleet-toolbar{display:flex;align-items:center;gap:14px;flex:none;margin:0 2px 10px}
+  #filterToggle{display:inline-flex;align-items:center;gap:7px;font:inherit;font-size:12.5px;
+    color:var(--fg);background:transparent;border:1px solid var(--border-2);border-radius:7px;
+    padding:5px 11px;cursor:pointer}
+  #filterToggle:hover{border-color:var(--blue)}
+  #filterToggle.on{border-color:var(--blue);background:rgba(88,166,255,.09);color:var(--blue)}
+  #filterToggle .fbox{font-size:13px}
+  .fcount{font-variant-numeric:tabular-nums;background:var(--panel-2);border:1px solid var(--border);
+    border-radius:20px;padding:0 7px;font-size:11px;color:var(--fg)}
+  #filterToggle.on .fcount{color:var(--blue);border-color:rgba(88,166,255,.4)}
+  #rowNote{color:var(--muted);font-size:11.5px}
+  .sorthint{color:var(--muted);font-size:11px}
+  .fleet-tablewrap{flex:1;min-height:0;overflow-y:auto;overflow-x:hidden;padding:0 4px 40px}
+  table.grid{width:100%;border-collapse:collapse;table-layout:fixed}
+  table.grid thead th{position:sticky;top:0;z-index:2;background:var(--bg);
+    text-align:left;font-size:10.5px;letter-spacing:.9px;text-transform:uppercase;
+    color:var(--muted);font-weight:600;padding:9px 10px;border-bottom:1px solid var(--border);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-variant-numeric:tabular-nums}
+  table.grid th.sortable{cursor:pointer;user-select:none}
+  table.grid th.sortable:hover{color:var(--fg)}
+  table.grid th.sorted{color:var(--fg)}
+  .scar{color:var(--blue)}
+  .c-caret{width:30px;text-align:center}
+  .c-repo{width:15%}
+  .c-prof{width:104px}
+  .c-run{width:19%}
+  .c-num{width:60px;text-align:right}
+  .c-flight{width:30%}
+  .c-rat{width:132px}
+  table.grid thead th.c-num{text-align:right}
+  table.grid tbody td,table.grid tbody th{padding:7px 10px;border-bottom:1px solid var(--border);
+    font-size:13px;font-weight:400;text-align:left;font-variant-numeric:tabular-nums;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
+  table.grid tbody th.c-repo{color:var(--fg)}
+  table.grid tbody td.c-num{text-align:right}
+  .drow{cursor:pointer}
+  .drow:hover td,.drow:hover th{background:var(--panel-2)}
+  /* needs-you row highlight: subtle full-row wash + leading glyph (NOT a side-stripe) */
+  .drow.needs td,.drow.needs th{background:rgba(210,153,34,.055)}
+  .drow.needs:hover td,.drow.needs:hover th{background:rgba(210,153,34,.09)}
+  .drow.exp td,.drow.exp th{background:var(--panel-2);border-bottom-color:transparent}
+  .drow.sel td,.drow.sel th{box-shadow:inset 0 1.5px 0 var(--blue),inset 0 -1.5px 0 var(--blue)}
+  .caret{background:transparent;border:0;color:var(--muted);cursor:pointer;font-size:12px;
+    padding:2px 4px;transition:transform .14s ease}
+  .caret.open{transform:rotate(90deg);color:var(--fg)}
+  .ndot{display:inline-block;width:12px;color:var(--muted)}
+  .ndot.on{color:var(--amber)}
+  .rname{font-weight:600}
+  #view-fleet .run{display:inline-flex;align-items:center;gap:6px;overflow:hidden}
+  #view-fleet .rstage{font-weight:600}
+  #view-fleet .pulse{width:7px;height:7px;border-radius:50%;flex:none;position:relative;background:var(--muted)}
+  #view-fleet .pulse.tool-claude{background:var(--amber);color:var(--amber)}
+  #view-fleet .pulse.tool-codex{background:var(--blue);color:var(--blue)}
+  #view-fleet .pulse::after{content:"";position:absolute;inset:-3px;border-radius:50%;
+    border:1px solid currentColor;opacity:.5;animation:ring 1.9s ease-out infinite}
+  .inflight{display:inline-flex;align-items:center;gap:7px;width:100%;overflow:hidden}
+  .inflight .num{flex:none}
+  .inflight .ttl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+  .ck{flex:none;font-size:12px}
+  .ck.ok{color:var(--green)} .ck.bad{color:var(--red)} .ck.muted{color:var(--muted)}
+  .ck.big{font-size:26px}
+  .mrg{flex:none;font:600 11.5px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#0d1117;
+    background:var(--blue);border:1px solid var(--blue);border-radius:6px;padding:4px 8px;cursor:pointer}
+  .mrg:hover{filter:brightness(1.08)} .mrg:active{transform:translateY(1px)}
+  .cnt-cell{font-weight:600}
+  .cnt-cell.held{color:var(--amber)}
+  .cnt-cell.parked{color:var(--red)}
+  .auto{color:var(--green)}
+  .rat{display:inline-flex;align-items:center;gap:7px}
+  .rbar{flex:none}
+  .loosen-pill{color:var(--green);font-size:11px;font-weight:600}
+  .rnum{font-size:11px;color:var(--muted)}
+  /* expand-in-place lane */
+  .lane-row td{padding:0;border-bottom:1px solid var(--border);background:var(--panel-2)}
+  .exlane{padding:14px 18px 18px 40px}
+  .exlane-top{display:flex;align-items:center;gap:11px;margin-bottom:12px;font-size:13px}
+  .exlane-top b{font-weight:600}
+  .lgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:16px 28px}
+  .lsec{min-width:0}
+  .lhead{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted);
+    padding-bottom:6px;margin-bottom:8px;border-bottom:1px solid var(--border)}
+  .lcount{color:var(--fg);background:#0d1117;border:1px solid var(--border);border-radius:20px;
+    padding:0 6px;font-size:10px;margin-left:3px}
+  .litem{padding:6px 0;font-size:12.5px}
+  .litem + .litem{border-top:1px solid rgba(48,54,61,.6)}
+  .lrow1{overflow:hidden;text-overflow:ellipsis}
+  .lmeta{font-size:11.5px;margin-top:3px;line-height:1.45;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lmeta.mono{font-size:11px}
+  .lacts{display:flex;align-items:center;gap:10px;margin-top:6px;flex-wrap:wrap}
+  .lempty{color:var(--muted);font-size:12px;padding:6px 0}
+  .tag2{font-size:10px;color:var(--muted);border:1px solid var(--border);border-radius:20px;padding:0 6px;margin-left:5px}
+  .tag2.alt{color:var(--fg)}
+  #view-fleet .badge{font-size:10px;border-radius:20px;padding:1px 7px;margin-left:6px;border:1px solid}
+  #view-fleet .badge.needs-grilling{color:var(--amber);border-color:rgba(210,153,34,.5);background:rgba(210,153,34,.08)}
+  #view-fleet .badge.needs-mockup{color:var(--blue);border-color:rgba(88,166,255,.5);background:rgba(88,166,255,.08)}
+  #view-fleet .badge.park{color:var(--red);border-color:rgba(248,81,73,.45);background:rgba(248,81,73,.08)}
+  .btn{font:600 11.5px/1 ui-monospace,SFMono-Regular,Menlo,monospace;color:#0d1117;
+    background:var(--blue);border:1px solid var(--blue);border-radius:6px;padding:5px 9px;cursor:pointer}
+  .btn:hover{filter:brightness(1.08)} .btn:active{transform:translateY(1px)}
+  .btn.ghost{background:transparent;color:var(--blue)}
+  .btn.ghost.green{color:var(--green);border-color:rgba(63,185,80,.55)}
+  .btn:disabled{opacity:.4;cursor:default;filter:none}
+  .lnk{color:var(--blue);text-decoration:none;font-size:11.5px;cursor:pointer}
+  .lnk:hover{text-decoration:underline}
+  .ratlane{display:flex;flex-direction:column;gap:7px;align-items:flex-start}
+  .allclear{display:flex;align-items:center;gap:16px;justify-content:center;text-align:left;
+    color:var(--muted);padding:44px 30px;max-width:640px;margin:0 auto}
+  .allclear b{color:var(--green)}
+
+  /* ============================================================ HISTORY (console) */
+  table.hist{width:100%;border-collapse:collapse;font-size:13px}
+  table.hist td{padding:10px;border-bottom:1px solid var(--border)}
+  table.hist tr:last-child td{border-bottom:0}
+  table.hist tr.hrow{cursor:pointer}
+  table.hist tr.hrow:hover td{background:var(--panel-2)}
+  table.hist tr.hrow.sel td{background:var(--panel-2);box-shadow:inset 0 1.5px 0 var(--blue),inset 0 -1.5px 0 var(--blue)}
+  table.hist .num{color:var(--muted)}
+  table.hist .htitle{color:var(--fg)}
+  table.hist .ago{color:var(--muted);text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .arrow{color:var(--muted)}
+
+  /* ---------- empty / calm states (shared) ---------- */
+  .zero{display:flex;flex-direction:column;align-items:center;justify-content:center;
+    text-align:center;gap:8px;border:1px dashed var(--border);border-radius:12px;
+    color:var(--muted);padding:52px 40px}
+  .zero .mark{width:50px;height:50px;border-radius:50%;display:grid;place-items:center;
+    border:1.5px solid rgba(63,185,80,.5);background:rgba(63,185,80,.07);margin-bottom:4px}
+  .zero h3{margin:0;font-size:16px;color:var(--green);letter-spacing:.3px}
+  .zero.idle .mark{border-color:var(--border-2);background:var(--panel)}
+  .zero.idle h3{color:var(--fg)}
+  .zero p{margin:0;font-size:12.5px;max-width:400px}
+
+  /* ---------- drill-down drawer (shared across every tab · rule 5) ---------- */
+  .scrim{position:absolute;inset:0;background:rgba(1,4,9,.55);z-index:var(--z-scrim);
+    opacity:0;pointer-events:none;transition:opacity .16s}
+  .scrim.open{opacity:1;pointer-events:auto}
+  .drawer{position:absolute;top:0;right:0;bottom:0;width:min(480px,86%);
+    background:var(--panel);border-left:1px solid var(--border-2);z-index:var(--z-drawer);
+    transform:translateX(100%);transition:transform .18s cubic-bezier(.22,1,.36,1);
+    display:flex;flex-direction:column;overflow:hidden}
+  .drawer.open{transform:translateX(0)}
+  .dhead{display:flex;align-items:flex-start;gap:10px;padding:16px 16px 14px;border-bottom:1px solid var(--border)}
+  .dhead .x{margin-left:auto;background:transparent;border:1px solid var(--border);color:var(--muted);
+    border-radius:6px;width:26px;height:26px;cursor:pointer;flex:none}
+  .dhead .x:hover{color:var(--fg);border-color:var(--border-2)}
+  .dkicker{font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--muted)}
+  .dtitle{font-size:15px;margin:5px 0 0;line-height:1.35}
+  .dtitle .num{color:var(--muted)}
+  .dbody{flex:1;overflow-y:auto;padding:14px 16px 18px}
+  /* drawer detail row — .ddrow (distinct from the Fleet table's tr.drow) */
+  .ddrow{display:flex;gap:10px;padding:9px 0;border-bottom:1px solid var(--border);font-size:13px}
+  .ddrow .lbl{color:var(--muted);width:96px;flex:none;font-size:11px;text-transform:uppercase;letter-spacing:.6px;padding-top:2px}
+  .ddrow .val{flex:1;min-width:0}
+  .dsection{margin-top:16px}
+  .dsection h4{margin:0 0 8px;font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--muted)}
+  .dsection h4 .il{font-size:9px;letter-spacing:.4px;color:var(--muted);opacity:.7;text-transform:none;margin-left:6px}
+  .finding{display:flex;gap:9px;padding:8px 10px;border:1px solid var(--border);border-radius:7px;
+    margin-bottom:7px;font-size:12.5px;background:var(--bg)}
+  .finding .g{flex:none}
+  .finding.pass .g{color:var(--green)} .finding.nit .g{color:var(--muted)}
+  .finding.block .g{color:var(--red)} .finding.warn .g{color:var(--amber)}
+  .checkline{display:flex;align-items:center;gap:8px;font-size:12.5px;padding:6px 0}
+  .dmeta{margin-top:4px;font-size:12px;color:var(--muted)}
+  .dfoot{border-top:1px solid var(--border);padding:14px 16px;display:flex;gap:10px;align-items:center;flex:none;background:var(--panel)}
+  .dfoot .act{font-weight:600;font-size:12.5px;padding:8px 13px;border-radius:7px;border:1px solid transparent;
+    cursor:pointer;white-space:nowrap;color:#0d1117;transition:filter .1s,transform .05s;flex:none}
+  .dfoot .act:hover{filter:brightness(1.09)} .dfoot .act:active{transform:translateY(1px)}
+  .dfoot .act.guarded{background:var(--amber)} .dfoot .act.reviewed{background:var(--blue)}
+  .dfoot .act.loosen{background:var(--green)} .dfoot .act.held{background:var(--amber)}
+  .dfoot .act.parked{background:var(--red);color:#fff}
+  .dfoot .act.ghost{background:transparent;color:var(--fg);border-color:var(--border-2)}
+  .dfoot .act.ghost:hover{background:var(--panel-2);filter:none}
+  .dfoot .open-ext{margin-left:auto;color:var(--muted);text-decoration:none;font-size:12px}
+  .dfoot .open-ext:hover{color:var(--blue)}
+  .worktree{font-size:12px;color:var(--muted);word-break:break-all;line-height:1.5}
+  .branchmono{color:var(--fg)}
+  /* the drawer reuses the live stage-pill for a session's stage */
+  .stage{display:inline-flex;align-items:center;gap:7px;font-size:11px;
+    border:1px solid var(--border);border-radius:20px;padding:2px 9px 2px 8px}
+  .stage .pulse{width:8px;height:8px;border-radius:50%;flex:none;animation:beat 1.6s ease-in-out infinite}
+  .stage.triaging{color:var(--amber);border-color:rgba(210,153,34,.4);background:rgba(210,153,34,.07)}
+  .stage.triaging .pulse{background:var(--amber)}
+  .stage.building{color:var(--blue);border-color:rgba(88,166,255,.4);background:rgba(88,166,255,.07)}
+  .stage.building .pulse{background:var(--blue)}
+  .stage.reviewing{color:var(--green);border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.07)}
+  .stage.reviewing .pulse{background:var(--green)}
+  .elapsed{font-variant-numeric:tabular-nums}
+
+  /* ---------- status bar (CLI-style) ---------- */
+  .statusbar{flex:none;display:flex;align-items:center;gap:16px;padding:5px 18px;
+    border-top:1px solid var(--border);background:var(--panel);font-size:11px;color:var(--muted);
+    z-index:var(--z-sticky)}
+  .statusbar kbd{color:var(--fg);background:var(--panel-2);border:1px solid var(--border);
+    border-radius:4px;padding:0 5px;font-size:10px}
+  .statusbar .sb-r{margin-left:auto;display:flex;gap:14px}
+
+  /* ---------- toast ---------- */
+  .toast{position:fixed;bottom:44px;left:50%;transform:translateX(-50%) translateY(12px);
+    background:var(--panel);border:1px solid var(--border-2);border-radius:8px;
+    padding:9px 15px;font-size:12.5px;z-index:var(--z-toast);opacity:0;pointer-events:none;
+    transition:opacity .16s,transform .16s;box-shadow:0 6px 20px rgba(1,4,9,.5)}
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+  .toast .g{color:var(--green);margin-right:7px}
+
+  /* ---------- keyboard focus ---------- */
+  /* Themed focus ring for keyboard nav; pointer clicks stay quiet (:focus-visible). */
+  a:focus-visible,button:focus-visible,[tabindex]:focus-visible,[role="button"]:focus-visible{
+    outline:2px solid var(--blue);outline-offset:2px;border-radius:6px}
+
+  /* ---------- motion ---------- */
+  @keyframes pulse{0%{transform:scale(1);opacity:.6}70%{transform:scale(2.6);opacity:0}100%{opacity:0}}
+  @keyframes ring{from{transform:scale(.7);opacity:.6}to{transform:scale(1.7);opacity:0}}
+  @keyframes rowin{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  /* FULL reduced-motion fallback: liveness pulses become static filled dots; the
+     elapsed counter (data, not CSS motion) still ticks. */
+  @media (prefers-reduced-motion: reduce){
+    *{transition:none !important;animation:none !important}
+    .drawer{transition:none !important}
+    #view-live .pulse::after,#view-fleet .pulse::after{display:none}
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><h1>agentflow</h1><span class="v">control plane · over GitHub</span></div>
+  <span id="daemon"></span>
+  <div class="poolchips" id="poolchips"></div>
+  <span class="spacer"></span>
+  <!-- MOCK-ONLY: reshapes the fetched capture client-side. Not part of the real app. -->
+  <span class="mocktag">mock state</span>
+  <div class="seg" id="stateToggle">
+    <button data-state="typical" class="on">typical</button>
+    <button data-state="quiet">quiet</button>
+    <button data-state="dense">dense</button>
+  </div>
+</header>
+
+<nav id="tabs" role="tablist" aria-label="Console views">
+  <button class="tab active" data-view="inbox" role="tab" aria-selected="true" aria-controls="view-inbox"><span class="tabnum">1</span> Inbox <span class="cnt" id="cnt-inbox">0</span></button>
+  <button class="tab" data-view="live" role="tab" aria-selected="false" aria-controls="view-live"><span class="tabnum">2</span> Live <span class="cnt" id="cnt-live">0</span></button>
+  <button class="tab" data-view="fleet" role="tab" aria-selected="false" aria-controls="view-fleet"><span class="tabnum">3</span> Fleet <span class="cnt" id="cnt-fleet">0</span></button>
+  <button class="tab" data-view="history" role="tab" aria-selected="false" aria-controls="view-history"><span class="tabnum">4</span> History <span class="cnt" id="cnt-history">0</span></button>
+  <span class="navhint"><kbd>1</kbd>–<kbd>4</kbd> views · <kbd>j</kbd>/<kbd>k</kbd> move · <kbd>⏎</kbd> open</span>
+</nav>
+
+<main>
+  <section class="view active" id="view-inbox" data-view="inbox" role="tabpanel" aria-label="Inbox"></section>
+  <section class="view" id="view-live" data-view="live" role="tabpanel" aria-label="Live"></section>
+  <section class="view" id="view-fleet" data-view="fleet" role="tabpanel" aria-label="Fleet"></section>
+  <section class="view" id="view-history" data-view="history" role="tabpanel" aria-label="History"></section>
+
+  <!-- drill-down: modal-tier z-index, over the active view -->
+  <div class="scrim" id="scrim"></div>
+  <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-hidden="true"></aside>
+</main>
+
+<div class="statusbar">
+  <span>agentflow console</span>
+  <span id="sb-view">inbox</span>
+  <span id="sb-daemon"></span>
+  <span class="sb-r">
+    <span id="sb-updated"></span>
+    <span><kbd>esc</kbd> close</span>
+  </span>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="./dashboard-v2-combined.js"></script>
+</body>
+</html>

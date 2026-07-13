@@ -59,3 +59,10 @@ then Context / Decision / Alternatives / Consequences.
 - [0022](0022-one-build-input-and-the-build-verb.md) — One build input (the Agent Brief)
   for every profile; `build <N>` triggers a ready issue by hand; personal `/go` +
   `/work-order` retired (amends 0005's mechanism).
+- [0023](0023-dashboard-replatform-control-plane.md) — Dashboard re-platform: an
+  interactive control plane (Svelte + FastAPI, polling liveness, controls over the
+  existing verbs); drop the serial dispatch cap for headroom-governed concurrency
+  (amends 0010's mechanism and 0006's serialization).
+- [0024](0024-dependency-aware-dispatch.md) — Dependency-aware dispatch: a
+  `Blocked by #N` marker gates the ready set, so an ordered batch of slices builds
+  in order and auto-advances (complements 0023's concurrency).
