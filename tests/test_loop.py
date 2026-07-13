@@ -540,6 +540,10 @@ def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
     prs = [{"number": 8, "headRefName": "agentflow/claude/issue-4-other"}]
     _pr_gh(monkeypatch, prs, {8: [{"body": _PARK}, {"body": _MAINT}]})
     monkeypatch.setattr(loop, "_checkout_pr_branch", lambda cfg, branch, wt: True)
+    monkeypatch.setattr(loop, "_pr_comments",
+                        lambda repo, pr: [{"body": _PARK}, {"body": _MAINT},
+                                          {"body": loop._RESPOND_DISCLAIMER}])
+    monkeypatch.setattr(loop, "remove_worktree_if_safe", lambda *a: True)
 
     launched = {}
 
@@ -936,7 +940,8 @@ def test_recheck_defers_when_pr_listing_fails(monkeypatch):
 
 def test_pipeline_once_reports_the_mockup_phase(monkeypatch):
     # AC: the produce phase's one-line result appears in the per-cycle log next to the others.
-    monkeypatch.setattr(loop, "prune_stale_worktrees", lambda *a: 0)
+    monkeypatch.setattr(loop, "recover_stale_worktrees",
+                        lambda *a: SimpleNamespace(removed=(), retained=()))
     monkeypatch.setattr(loop, "intake_once", lambda cfg, _log=None: "nothing")
     monkeypatch.setattr(loop, "run_once", lambda cfg, _log=None: "nothing")
     monkeypatch.setattr(loop, "produce_once", lambda cfg, _log=None: "#9: drew mockup variants")

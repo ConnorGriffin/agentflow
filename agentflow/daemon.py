@@ -35,6 +35,7 @@ import time
 from pathlib import Path
 
 from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims
+from agentflow.runner import recover_stale_worktrees
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 ENABLE_FLAG = STATE_DIR / "enabled"
@@ -76,6 +77,18 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
             _log(f"{cfg.repo}: {run(cfg, _log=_log)}")
         except Exception as e:  # noqa: BLE001 — a bad cycle must not kill the daemon
             _log(f"{cfg.repo}: cycle error: {type(e).__name__}: {e}")
+
+
+def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _log=log) -> None:
+    """Run the fail-closed worktree recovery pass once at daemon startup."""
+    for cfg in repos:
+        try:
+            report = sweep(cfg.repo, cfg.workdir)
+            if report.removed or report.retained:
+                _log(f"{cfg.repo}: startup worktree recovery removed {len(report.removed)}, "
+                     f"retained {len(report.retained)} for recovery")
+        except Exception as e:  # noqa: BLE001 — one repo cannot block daemon startup
+            _log(f"{cfg.repo}: startup worktree recovery error: {type(e).__name__}: {e}")
 
 
 def _try_claim() -> bool:
@@ -160,6 +173,7 @@ def main() -> None:
     beat = threading.Thread(target=_heartbeat, args=(stop,), daemon=True)
     beat.start()
     try:
+        recover_worktrees(REPOS)
         if args.once:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
             cycle(REPOS)

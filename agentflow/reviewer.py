@@ -31,7 +31,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentflow.runner import Complexity, _WorktreeRunner, _run
+from agentflow.runner import Complexity, _WorktreeRunner, _run, remove_worktree_if_safe
 
 # Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
 # "blocker", "high", unknown) is treated as blocking — fail safe.
@@ -213,6 +213,8 @@ class Reviewer:
         if not ok:
             return _unparseable("reviewer session errored (launch non-zero)")
         v = parse_verdict(message, expected_sha=head_sha)
+        if v.parsed:
+            remove_worktree_if_safe(workdir, wt)
         return Verdict(v.clean, v.findings, v.parsed, v.detail, reviewer_tool=self.runner.tool)
 
     def _head_sha(self, repo: str, pr_number: int) -> str:
