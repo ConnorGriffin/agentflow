@@ -66,3 +66,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0024](0024-dependency-aware-dispatch.md) — Dependency-aware dispatch: a
   `Blocked by #N` marker gates the ready set, so an ordered batch of slices builds
   in order and auto-advances (complements 0023's concurrency).
+- [0025](0025-activity-adaptive-spend-ceiling.md) — Activity-adaptive spend
+  ceiling: operator activity selects the daemon's ceiling (85% idle / 50% active,
+  paced) instead of hard-stopping dispatch; gate reports facts, balancer owns
+  policy (rides 0023's concurrency slice).
