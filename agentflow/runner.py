@@ -361,12 +361,24 @@ def _completed_agentflow_session(repo: str, lane: str, name: str,
         state = _issue_state(repo, int(mockup.group(1)))
         if state is None:
             return False
+        labels = {label.get("name") for label in state.get("labels", [])
+                  if isinstance(label, dict)}
+        if "agentflow:drawing-mockup" in labels:
+            return False
         return any("mockup variants" in comment.get("body", "")
                    for comment in state.get("comments", []) if isinstance(comment, dict))
-    current = re.fullmatch(rf"agentflow/{lane}/issue-\d+-.+", branch)
+    current = re.fullmatch(rf"agentflow/{lane}/issue-(\d+)-.+", branch)
     legacy = re.fullmatch(rf"{lane}/[^/]+", branch)
-    if ((current and name == branch.rsplit("/", 1)[-1]) or
-            (legacy and name == branch.rsplit("/", 1)[-1])):
+    if current and name == branch.rsplit("/", 1)[-1]:
+        state = _issue_state(repo, int(current.group(1)))
+        if state is None:
+            return False
+        labels = {label.get("name") for label in state.get("labels", [])
+                  if isinstance(label, dict)}
+        if "agentflow:building" in labels:
+            return False
+        return _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED")
+    if legacy and name == branch.rsplit("/", 1)[-1]:
         return _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED")
     return False
 

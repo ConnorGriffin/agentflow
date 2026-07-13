@@ -179,6 +179,7 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
     dirty = root / "codex" / "issue-11-dirty"
     unpushed = root / "codex" / "issue-12-unpushed"
     active = root / "codex" / "issue-13-active"
+    active_open_pr = root / "codex" / "issue-14-active-open-pr"
     intake = root / "claude-intake" / "issue-10"
     review = root / "codex-review" / "pr-20-done"
     _branch_worktree(repo, completed, "agentflow/codex/issue-10-done")
@@ -188,6 +189,7 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
     active.parent.mkdir(parents=True, exist_ok=True)
     _git(repo, "worktree", "add", "-b", "agentflow/codex/issue-13-active", str(active),
          "origin/main")
+    _branch_worktree(repo, active_open_pr, "agentflow/codex/issue-14-active-open-pr")
     _detached_worktree(repo, intake)
     _detached_worktree(repo, review)
 
@@ -209,12 +211,15 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
                 "codex/legacy-fix": "MERGED",
                 "agentflow/codex/issue-11-dirty": "OPEN",
                 "agentflow/codex/issue-12-unpushed": "OPEN",
+                "agentflow/codex/issue-14-active-open-pr": "OPEN",
             }.get(branch, "")
             return subprocess.CompletedProcess(cmd, 0, f"{state}\n" if state else "", "")
         if cmd[:3] == ["gh", "pr", "view"]:
             return subprocess.CompletedProcess(cmd, 0, "MERGED\n", "")
         if cmd[:3] == ["gh", "issue", "view"]:
-            body = '{"state":"OPEN","labels":[{"name":"ready-for-agent"}],"comments":[]}'
+            issue = int(cmd[3])
+            label = "agentflow:building" if issue == 14 else "ready-for-agent"
+            body = f'{{"state":"OPEN","labels":[{{"name":"{label}"}}],"comments":[]}}'
             return subprocess.CompletedProcess(cmd, 0, body, "")
         return original_run(cmd, cwd=cwd, timeout=timeout)
 
@@ -222,7 +227,7 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
     report = recover_stale_worktrees("owner/repo", str(repo))
 
     assert set(report.removed) == {str(completed), str(legacy), str(intake), str(review)}
-    assert dirty.exists() and unpushed.exists() and active.exists()
+    assert dirty.exists() and unpushed.exists() and active.exists() and active_open_pr.exists()
     assert foreign_wt.exists()
     registered = _git(repo, "worktree", "list", "--porcelain")
     assert str(completed) not in registered and str(legacy) not in registered
