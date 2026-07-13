@@ -112,6 +112,23 @@ def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> 
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
 
 
+def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
+    """Run an agent CLI while persisting its child PID for crash-safe recovery."""
+    process = subprocess.Popen(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE)
+    marker = _active_marker(Path(cwd))
+    if marker is not None:
+        marker.write_text(str(process.pid))
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        return subprocess.CompletedProcess(cmd, returncode=1, stdout="",
+                                           stderr=f"timed out after {timeout}s")
+    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
 def _active_marker(wt: Path) -> Path | None:
     r = _run(["git", "-C", str(wt), "rev-parse", "--git-path", "agentflow-active"])
     if r.returncode != 0 or not r.stdout.strip():
@@ -194,8 +211,7 @@ def worktree_session(wt: Path):
             _ACTIVE_WORKTREES.pop(path, None)
             if marker is not None:
                 try:
-                    if marker.read_text().strip() == str(os.getpid()):
-                        marker.unlink()
+                    marker.unlink()
                 except OSError:
                     pass
 
@@ -316,8 +332,8 @@ class ClaudeRunner(_WorktreeRunner):
         # would pass a tight --allowedTools instead (profile-driven, later).
         # `claude -p` prints the final assistant message to stdout — that's the message.
         session_timeout = int(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
-        r = _run(["claude", "-p", prompt, "--model", model,
-                  "--dangerously-skip-permissions"], cwd=cwd, timeout=session_timeout)
+        r = _run_session(["claude", "-p", prompt, "--model", model,
+                          "--dangerously-skip-permissions"], cwd, session_timeout)
         return r.returncode == 0, r.stdout
 
 
@@ -336,8 +352,9 @@ class CodexRunner(_WorktreeRunner):
         fd, outfile = tempfile.mkstemp(prefix="agentflow-codex-")
         os.close(fd)
         try:
-            r = _run([codex_bin, "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
-                      "--skip-git-repo-check", "-o", outfile, prompt], cwd=cwd, timeout=session_timeout)
+            r = _run_session(
+                [codex_bin, "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
+                 "--skip-git-repo-check", "-o", outfile, prompt], cwd, session_timeout)
             try:
                 msg = Path(outfile).read_text()
             except OSError:

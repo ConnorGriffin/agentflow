@@ -322,9 +322,17 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
         return original_run(cmd, cwd=cwd, timeout=timeout)
 
     monkeypatch.setattr(runner_mod, "_run", fake_run)
-    with worktree_session(active_legacy):
-        runner_mod._ACTIVE_WORKTREES.clear()  # simulate a freshly started recovery process
-        report = recover_stale_worktrees("owner/repo", str(repo))
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        with worktree_session(active_legacy):
+            marker = runner_mod._active_marker(active_legacy)
+            assert marker is not None
+            marker.write_text(str(child.pid))
+            runner_mod._ACTIVE_WORKTREES.clear()  # simulate a freshly started recovery process
+            report = recover_stale_worktrees("owner/repo", str(repo))
+    finally:
+        child.terminate()
+        child.wait()
 
     assert set(report.removed) == {
         str(completed), str(legacy), str(legacy_two), str(intake), str(intake_two),
