@@ -60,6 +60,8 @@ REPOS = [
                os.path.expanduser("~/Code/ConnorGriffin/agentflow")),
     RepoConfig("ConnorGriffin/homelab",  # reviewed: manual deploy, live DNS/tailnet
                os.path.expanduser("~/Code/ConnorGriffin/homelab")),
+    RepoConfig("ConnorGriffin/dotfiles",  # reviewed: install.sh mutates the live machine
+               os.path.expanduser("~/Code/ConnorGriffin/dotfiles")),
 ]
 
 
