@@ -1,6 +1,8 @@
 # ADR 0010 — The operator dashboard: one console over GitHub-as-source-of-truth
 
-- Status: Accepted
+- Status: Accepted — mechanism amended by [ADR 0023](0023-dashboard-replatform-control-plane.md)
+  (read-only → interactive, stdlib → Svelte + FastAPI, single screen → multi-view;
+  the read-over-GitHub stance and the needs-you set stand)
 - Date: 2026-07-09
 
 ## Context

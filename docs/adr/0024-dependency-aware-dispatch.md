@@ -1,0 +1,79 @@
+# ADR 0024 — Dependency-aware dispatch: `blocked-by`, so an ordered batch builds in order
+
+- Status: Accepted
+- Date: 2026-07-13
+
+## Context
+
+The dispatcher is dependency-blind. It picks the **oldest `ready-for-agent`
+issue** and builds it ([ADR 0006](0006-two-pool-runner-assignment.md) chooses the
+pool; [ADR 0021](0021-dispatch-dedup-build-claim.md) claims it), with no notion
+that one issue must land before another.
+
+But a big change — a refactor, a re-platform ([ADR 0023](0023-dashboard-replatform-control-plane.md)),
+a migration — decomposes into an **ordered chain of vertical slices**
+([ADR 0012](0012-build-in-vertical-slices.md)), where slice B builds on slice A's
+*merged* foundation. Today the only way to enforce that order is to **file one
+issue at a time and hand-advance** — babysitting the queue. And
+[ADR 0023](0023-dashboard-replatform-control-plane.md)'s headroom-governed
+concurrency makes it worse: more sessions dispatch in parallel, so an unordered
+batch is *more* likely to grab slice C before slice A exists.
+
+The dispatcher needs to respect a declared dependency.
+
+## Decision
+
+Model one relationship — **"blocked by"** — and gate dispatch on it.
+
+- **Declared in the issue body**: a `Blocked by #N` line (multiple allowed). This
+  keeps GitHub the source of truth and is parsed the way agentflow already parses
+  body markers (`MISSING-CONTEXT:`, the historical `Open as:`, the `agentflow:`
+  labels) — no new GitHub feature required.
+- **Filtered at dispatch**: `_free` / `_next` (for build *and* triage) exclude a
+  ready issue that has **any open blocker**. That predicate is the entire
+  behavioral change.
+- **Stateless, no release event.** Eligibility is recomputed every cycle, so the
+  moment a blocker closes (its PR merges), its dependents become dispatchable on
+  the next pass. Nothing to trigger, nothing to get stuck — the same
+  "GitHub is state of record, recompute each cycle" property the daemon already
+  relies on ([ADR 0011](0011-persistent-orchestrator.md)). Crash-safe by
+  construction.
+- **Orthogonal to readiness.** Intake still triages and marks the whole batch
+  `ready-for-agent`; the gate only holds the *dependent* ones until their turn. A
+  blocked issue is not a held issue ([ADR 0019](0019-human-re-entry.md)) — no human
+  input is pending, just an upstream merge.
+
+Together with [ADR 0023](0023-dashboard-replatform-control-plane.md)'s concurrency,
+the dispatcher becomes **parallel where work is independent, ordered where it's
+dependent** — the behavior you actually want from a fleet.
+
+## Alternatives considered
+
+- **File one issue at a time (status quo).** Rejected: it's manual queue-babysitting,
+  and concurrency makes it more error-prone, not less.
+- **A first-class epic / parent-child construct with an explicit release step.**
+  Rejected: heavier machinery for the same result. A `blocked-by` chain *is* an
+  ordered epic, with a stateless filter instead of a release event.
+- **GitHub sub-issues / task-list relations as the dependency source.** Reasonable
+  later, but it leans on a newer GitHub feature; the body marker needs nothing new
+  and matches existing parsing. Can be added as a second recognized source.
+- **One giant issue built across many commits/PRs.** Rejected: breaks
+  one-issue-one-PR and, more importantly, the **per-slice review gate** — the whole
+  point of vertical slices is that each closes the loop through review + merge.
+
+## Consequences
+
+- Dispatch gains a small, deep dependency filter (one predicate over the ready set;
+  a cheap per-candidate blocker-state check, batchable).
+- **A dependency chain can be filed once** — the head builds, and each later slice
+  unblocks automatically as its blocker merges. No babysitting. Generalizes past
+  refactors to any dependent work.
+- **[ADR 0012](0012-build-in-vertical-slices.md) still governs the *scoping*.** The
+  gate removes the *mechanical* cost of ordering; it does not license hard-freezing
+  downstream slice scopes. File the chain, but keep later issue bodies loose and
+  revise them before they unblock — slice 1 usually teaches you something. The gate
+  lets you *choose* how much to pre-commit.
+- A misdeclared cycle, or a blocker that never closes, **fails safe** (the
+  dependents simply never dispatch) and is visible/loggable — never a wrong build.
+- The dashboard ([ADR 0023](0023-dashboard-replatform-control-plane.md)) can later
+  surface a **blocked** chip in the queue so the ordering is legible.
