@@ -224,6 +224,24 @@ def test_unknown_codex_limit_facts_fail_closed(stub_gate, monkeypatch, facts):
     assert "limit facts unavailable" in block_msg
 
 
+@pytest.mark.parametrize("field", ["used_percent", "window_minutes", "resets_at"])
+def test_oversized_codex_limit_facts_fail_closed(stub_gate, monkeypatch, field):
+    monkeypatch.setenv("TEST_CLAUDE_BLOCKED", "1")
+    monkeypatch.setenv("TEST_CODEX_CLEAR", "1")
+    facts = {
+        "used_percent": 10,
+        "window_minutes": 10080,
+        "resets_at": 1784566349,
+    }
+    facts[field] = 10**1000
+    monkeypatch.setenv("TEST_LIMITS", json.dumps({"windows": [facts]}))
+
+    builder, _, block_msg = pick_pair("CLAUDE", "CODEX")
+
+    assert builder is None
+    assert "limit facts unavailable" in block_msg
+
+
 def test_temporally_impossible_short_window_fails_closed(stub_gate, monkeypatch):
     monkeypatch.setenv("TEST_CLAUDE_BLOCKED", "1")
     monkeypatch.setenv("TEST_CODEX_CLEAR", "1")

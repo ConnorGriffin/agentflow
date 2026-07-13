@@ -77,7 +77,7 @@ def _parse_codex_windows(stdout: str) -> tuple[RateLimitWindow, ...] | None:
         if len({window.window_minutes for window in windows}) != len(windows):
             return None
         return tuple(sorted(windows, key=lambda window: window.window_minutes))
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError):
         return None
 
 
