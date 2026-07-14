@@ -24,6 +24,7 @@ from pathlib import Path
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 LIVE_FILE = STATE_DIR / "live-sessions.json"
 DAEMON_FILE = STATE_DIR / "daemon-status.json"
+SNAPSHOT_FILE = STATE_DIR / "snapshot.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,3 +111,16 @@ def daemon_status() -> dict:
     """The daemon's last-cycle / poll status, or `{}` when it hasn't run a cycle yet."""
     data = _read(DAEMON_FILE, {})
     return data if isinstance(data, dict) else {}
+
+
+def write_snapshot(snap: dict) -> None:
+    """Publish the fleet snapshot the console serves. The daemon is the only writer,
+    once per tick — the whole reason the web server never queries GitHub (ADR 0026)."""
+    _write_atomic(SNAPSHOT_FILE, snap)
+
+
+def read_snapshot() -> dict | None:
+    """The last daemon-published snapshot, or None when no daemon has ever published
+    one (missing / partial / corrupt file — the console renders an empty fleet)."""
+    data = _read(SNAPSHOT_FILE, None)
+    return data if isinstance(data, dict) else None
