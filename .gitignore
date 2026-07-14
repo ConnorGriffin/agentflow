@@ -2,7 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-dist/
+/dist/
 *.egg-info/
 
 # ui-mockups captures (illustrative/real payloads — not committed)
