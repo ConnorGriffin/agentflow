@@ -12,11 +12,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from enum import Enum
 
 from agentflow.reviewer import Verdict
 from agentflow.runner import _run
+
+# Merges stay serialized even as builds run concurrently (ADR 0009 collision floor): two
+# PRs never squash-merge at the same instant. Concurrent dispatch (ADR 0023) multiplies
+# builds, never overlapping merges — this process-wide lock is where that floor is held.
+_MERGE_LOCK = threading.Lock()
 
 
 class MergeDecision(str, Enum):
@@ -172,23 +178,27 @@ def ci_is_green(repo: str, pr_number: int, *,
 
 
 def squash_merge(repo: str, pr_number: int) -> bool:
-    state = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
-                  "--json", "isDraft"])
-    if state.returncode != 0:
-        return False
-    try:
-        is_draft = json.loads(state.stdout or "{}").get("isDraft")
-    except (json.JSONDecodeError, AttributeError):
-        return False
-    if not isinstance(is_draft, bool):
-        return False
-    if is_draft:
-        ready = _run(["gh", "pr", "ready", str(pr_number), "--repo", repo])
-        if ready.returncode != 0:
+    # The merge lock serializes the actual land across all concurrent build chains and the
+    # survivor re-rebase pass, so merges never overlap (ADR 0009). Held only around the
+    # merge itself — never during CI polling — so it can't stall other builds.
+    with _MERGE_LOCK:
+        state = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
+                      "--json", "isDraft"])
+        if state.returncode != 0:
             return False
-    r = _run(["gh", "pr", "merge", str(pr_number), "--repo", repo,
-              "--squash", "--delete-branch"])
-    return r.returncode == 0
+        try:
+            is_draft = json.loads(state.stdout or "{}").get("isDraft")
+        except (json.JSONDecodeError, AttributeError):
+            return False
+        if not isinstance(is_draft, bool):
+            return False
+        if is_draft:
+            ready = _run(["gh", "pr", "ready", str(pr_number), "--repo", repo])
+            if ready.returncode != 0:
+                return False
+        r = _run(["gh", "pr", "merge", str(pr_number), "--repo", repo,
+                  "--squash", "--delete-branch"])
+        return r.returncode == 0
 
 
 def park(repo: str, pr_number: int, verdict: Verdict,

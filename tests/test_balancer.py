@@ -81,13 +81,12 @@ def test_neither_clear_is_no_capacity():
 def test_pick_pair_block_msg_names_blocked_pools(stub_gate, monkeypatch):
     """When both pools are blocked the third return value names each pool and its reason
     so callers can surface it in deferral log lines instead of a bare 'no headroom'."""
-    monkeypatch.setenv("TEST_ACTIVE", "1")
-    monkeypatch.setenv("TEST_SPEND_PCT", "19")   # activity gate fires; spend is fine
+    monkeypatch.setenv("TEST_SPEND_PCT", "88")   # both pools genuinely over the ceiling
     _, _, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
     assert "claude" in block_msg
     assert "codex" in block_msg
     # Each pool should carry something from the gate's check output
-    assert "session" in block_msg or "active" in block_msg
+    assert "spend" in block_msg or "trailing" in block_msg
 
 
 def test_pick_pair_block_msg_empty_when_headroom(stub_gate, monkeypatch):
@@ -258,6 +257,24 @@ def test_temporally_impossible_short_window_fails_closed(stub_gate, monkeypatch)
     assert "300-minute limit facts are stale" in block_msg
 
 
+def test_ceiling_policy_is_named_config():
+    """The idle/active ceilings and pace are the ADR 0025 policy dials — 85 / 50 / 1."""
+    assert balancer.IDLE_CEILING_PCT == 85.0
+    assert balancer.ACTIVE_CEILING_PCT == 50.0
+    assert balancer.ACTIVE_PACE == 1
+    assert balancer.ceiling_for(active=False) == 85.0
+    assert balancer.ceiling_for(active=True) == 50.0
+
+
+def test_idle_pool_reports_not_active(stub_gate, monkeypatch):
+    """With no operator activity a pool reports idle and dispatches under the 85% ceiling."""
+    monkeypatch.setenv("TEST_SPEND_PCT", "19")
+    status = balancer._query_pool("claude")
+    assert status.active is False
+    assert status.ceiling == 85.0
+    assert status.clear is True
+
+
 def test_operator_dispatch_ignores_active_session(stub_gate, monkeypatch):
     """A by-hand build fired while a session is active (and spend well under the
     ceiling) still gets a full pair — the recent-activity guard is skipped. Fails
@@ -284,13 +301,28 @@ def test_operator_dispatch_is_not_weekly_paced(stub_gate, monkeypatch):
     assert builder == "CODEX"
 
 
-def test_daemon_dispatch_still_respects_active_session(stub_gate, monkeypatch):
-    """Unattended dispatch (operator=False) keeps the full guard: an active session
-    defers both pools, so no capacity this cycle."""
+def test_active_operator_lowers_the_ceiling_but_does_not_stop_dispatch(stub_gate, monkeypatch):
+    """ADR 0025: an operator working interactively no longer hard-stops the daemon — it
+    yields to a lower ceiling. With spend well under the active ceiling, unattended dispatch
+    still gets a full pair, and each pool reports the operator-active fact."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
     builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
+    assert builder is not None
+    assert balancer._query_pool("claude").active is True
+
+
+def test_active_operator_defers_above_the_active_ceiling_yielding_not_stopping(
+        stub_gate, monkeypatch):
+    """Above the (lowered) active ceiling the daemon defers — but the reason says it is
+    yielding to the operator at the active ceiling, not a mute 'busy' (ADR 0025)."""
+    monkeypatch.setenv("TEST_ACTIVE", "1")
+    monkeypatch.setenv("TEST_SPEND_PCT", "19")
+    monkeypatch.setattr(balancer, "ACTIVE_CEILING_PCT", 10.0)   # push spend above it
+    builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
     assert builder is None
+    assert "yielding to operator" in block_msg
+    assert "ceiling 10%" in block_msg
 
 
 def test_operator_dispatch_still_honors_spend_ceiling(stub_gate, monkeypatch):

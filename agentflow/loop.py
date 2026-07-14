@@ -297,11 +297,21 @@ def _next_ready_issue(cfg: RepoConfig, _log=None) -> dict | None:
     return next((i for i in issues if _free_to_dispatch(cfg, i, in_flight, _log)), None)
 
 
+def _issues_with_live_session(repo: str) -> set[int]:
+    """Issue numbers with a session running *right now* on this repo (the live board). With
+    concurrent dispatch (ADR 0023) a build is live at the top of a cycle before it has opened
+    its PR — so "nothing is live at cycle start" no longer holds, and reclaim must key on real
+    session evidence, not just the open-PR check (issue #74)."""
+    return {s["number"] for s in live.running()
+            if s.get("repo") == repo and isinstance(s.get("number"), int)}
+
+
 def reclaim_claims(cfg: RepoConfig) -> int:
-    """Drop `agentflow:building` claims orphaned by a crash — a freshly-started daemon has
-    no live builds, so any claim without an open agentflow PR is stale. A stale claim is
-    fail-safe (the issue is skipped, never duplicated) but blocks that issue until cleared.
-    Returns how many it cleared."""
+    """Drop `agentflow:building` claims orphaned by a crash. A claim is stale only if no
+    session is building it right now (the live board) AND it has no open agentflow PR — under
+    concurrent dispatch a live build holds its claim before its PR exists, so we must not strip
+    it. A stale claim is fail-safe (the issue is skipped, never duplicated) but blocks that
+    issue until cleared. Returns how many it cleared."""
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--label", BUILDING, "--json", "number", "--limit", "100"])
     if r.returncode != 0:
@@ -309,7 +319,9 @@ def reclaim_claims(cfg: RepoConfig) -> int:
     in_flight = _issues_in_flight(cfg)
     if in_flight is None:
         return 0   # can't see what's in flight — a live claim must never be stripped
-    stale = [i["number"] for i in json.loads(r.stdout or "[]") if i["number"] not in in_flight]
+    live_now = _issues_with_live_session(cfg.repo)
+    stale = [i["number"] for i in json.loads(r.stdout or "[]")
+             if i["number"] not in in_flight and i["number"] not in live_now]
     for n in stale:
         _release(cfg.repo, n)
     return len(stale)
@@ -328,14 +340,16 @@ def _untriaged(issue: dict) -> bool:
     return not ({lbl["name"] for lbl in issue.get("labels", [])} & _TRIAGE_SKIP)
 
 
-def _next_untriaged_issue(cfg: RepoConfig) -> dict | None:
+def _next_untriaged_issue(cfg: RepoConfig, reserved: set[int] = frozenset()) -> dict | None:
     """The oldest open issue in the intake queue — none of intake's state labels and unclaimed
-    by a live grounding session (ADR 0016)."""
+    by a live grounding session (ADR 0016). `reserved` skips issues a concurrent triage fan-out
+    already claimed this cycle, before their `agentflow:triaging` label is visible."""
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--json", "number,title,body,labels", "--limit", "50"])
     if r.returncode != 0:
         return None
-    untriaged = [i for i in json.loads(r.stdout or "[]") if _untriaged(i)]
+    untriaged = [i for i in json.loads(r.stdout or "[]")
+                 if _untriaged(i) and i["number"] not in reserved]
     return min(untriaged, key=lambda i: i["number"]) if untriaged else None
 
 
@@ -407,12 +421,14 @@ def _preserve_progress(cfg: RepoConfig, tool: str, n: int, sl: str) -> str | Non
     return r.stdout.strip() or None
 
 
-def run_once(cfg: RepoConfig, _log=None) -> str:
-    """Pull the next ready issue and run it end to end. Returns a one-line result."""
+def run_once(cfg: RepoConfig, _log=None, slot=None) -> str:
+    """Pull the next ready issue and run it end to end. Returns a one-line result. `slot`
+    (the dispatch governor's handle) bounds build concurrency — a build defers when the
+    machine is at capacity or an active pool's pace is spent."""
     issue = _next_ready_issue(cfg, _log=_log)
     if not issue:
         return "no ready-for-agent issues"
-    return _dispatch_build(cfg, issue, _log=_log)
+    return _dispatch_build(cfg, issue, _log=_log, slot=slot)
 
 
 HELD_LABELS = {"agentflow:needs-grilling", "agentflow:needs-mockup"}
@@ -446,7 +462,7 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
 
 
 def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False,
-                    _log=None) -> str:
+                    _log=None, slot=None) -> str:
     """Build one already-selected ready issue end to end: gate on the complexity label,
     claim it, then build → cross-review → merge/park under the claim. Shared by the daemon's
     next-ready pull (`run_once`) and the by-hand `build <N>` (`build_issue`) so there is one
@@ -466,6 +482,8 @@ def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False,
     builder, reviewer_runner, block_msg = pick_pair(operator=operator)   # ADR 0006: more headroom builds; other reviews
     if builder is None:
         return f"#{n}: no pool has headroom ({block_msg}) — deferring"
+    if slot is not None and not slot.admit("build", builder.tool):
+        return f"#{n}: build deferred — machine at session capacity"
     if _log:
         _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (build)")
     profile = repo_profile(cfg.workdir)
@@ -480,6 +498,8 @@ def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False,
                                    builder, reviewer_runner, profile, build_prompt)
     finally:
         _release(cfg.repo, n)
+        if slot is not None:
+            slot.release("build")
 
 
 def _claim(repo: str, n: int) -> None:
@@ -666,20 +686,49 @@ def _handle_intake_infra_failure(cfg: RepoConfig, n: int, result: IntakeResult) 
     return f"#{n}: intake couldn't start ({result.detail}) — held after {INTAKE_MAX_INFRA_FAILURES} tries"
 
 
-def intake_once(cfg: RepoConfig, _log=None) -> str:
-    """Triage the next issue: a held issue the maintainer just answered (resume, ADR
-    0019) or the oldest un-triaged one (ADR 0016). Ground, route, write to GitHub."""
+def _next_intake_candidate(cfg: RepoConfig,
+                           reserved: set[int] = frozenset()) -> tuple[dict, str] | None:
+    """The next issue to triage — a held issue the maintainer just answered (resume, ADR
+    0019) or the oldest un-triaged one (ADR 0016) — with its resume text. Skips issues a
+    concurrent fan-out already claimed this cycle (`reserved`). None when the queue is empty."""
     resumable = _next_resumable_issue(cfg)
-    issue, extra = resumable if resumable else (_next_untriaged_issue(cfg), "")
-    if not issue:
+    if resumable and resumable[0]["number"] not in reserved:
+        return resumable
+    issue = _next_untriaged_issue(cfg, reserved)
+    return (issue, "") if issue else None
+
+
+def intake_once(cfg: RepoConfig, _log=None, slot=None) -> str:
+    """Triage the next issue: a held issue the maintainer just answered (resume, ADR
+    0019) or the oldest un-triaged one (ADR 0016). Ground, route, write to GitHub.
+
+    `slot` (the dispatch governor's admission handle) bounds triage concurrency: when the
+    machine is at capacity or an active pool's pace is spent, the triage defers to a later
+    cycle instead of starting."""
+    picked = _next_intake_candidate(cfg)
+    if not picked:
         return "no un-triaged issues"
+    issue, extra = picked
     n = issue["number"]
     builder, _, block_msg = pick_pair()   # intake needs one available tool, not a pair
     if builder is None:
         return f"#{n}: no pool has headroom for intake ({block_msg}) — deferring"
+    if slot is not None and not slot.admit("triage", builder.tool):
+        return f"#{n}: intake deferred — machine at session capacity"
     if _log:
         _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (intake)")
     _claim_triage(cfg.repo, n)   # own the issue before the long session (dispatch dedup)
+    try:
+        return _run_intake_session(cfg, issue, extra, builder)
+    finally:
+        if slot is not None:
+            slot.release("triage")
+
+
+def _run_intake_session(cfg: RepoConfig, issue: dict, extra: str, builder) -> str:
+    """Run one grounding session on an already-claimed issue: ground, route, write to GitHub,
+    drop the claim. Shared by `intake_once` and the daemon's concurrent triage fan-out."""
+    n = issue["number"]
     try:
         result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
         if result.infra_failed:
@@ -738,11 +787,11 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
                  str(wt), f"origin/{branch}"]).returncode == 0
 
 
-def respond_once(cfg: RepoConfig, _log=None) -> str:
+def respond_once(cfg: RepoConfig, _log=None, slot=None) -> str:
     """Answer the next parked PR whose latest comment is an unanswered maintainer question:
     spawn a responder in the PR-branch worktree that replies in-thread, attaches requested
     evidence, and pushes small fixes to the same branch (issue #18). Never merges, never a
-    new PR — same contract as a revise."""
+    new PR — same contract as a revise. `slot` bounds responder concurrency."""
     pending = _next_pr_awaiting_reply(cfg)
     if not pending:
         return "no parked PRs awaiting reply"
@@ -754,25 +803,31 @@ def respond_once(cfg: RepoConfig, _log=None) -> str:
     builder, _, block_msg = pick_pair()   # a reply needs one available tool, not a pair
     if builder is None:
         return f"PR #{pr}: no pool has headroom to respond ({block_msg}) — deferring"
+    if slot is not None and not slot.admit("respond", builder.tool):
+        return f"PR #{pr}: respond deferred — machine at session capacity"
     if _log:
         _log(f"{cfg.repo}: PR #{pr}: routing → {getattr(builder, 'tool', '?')} (respond)")
-    wt = Path(_builder_worktree(cfg, tool, n, sl))
-    if not _checkout_pr_branch(cfg, branch, wt):
-        return f"PR #{pr}: could not check out {branch} to respond — retry next cycle"
-    builder.provision(wt)
-    with worktree_session(wt):
-        ok, _ = builder.launch(
-            RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
-            cwd=str(wt), model=builder.model_for(Complexity.DEEP))
-    comments = _pr_comments(cfg.repo, pr)
-    replied = ok and comments is not None and not reply_pending(comments)
-    if replied:
-        remove_worktree_if_safe(cfg.workdir, wt)
-    if replied:
-        return f"PR #{pr}: replied to the maintainer"
-    if ok:
-        return f"PR #{pr}: responder exited without a confirmed reply — retaining its worktree"
-    return f"PR #{pr}: responder session errored"
+    try:
+        wt = Path(_builder_worktree(cfg, tool, n, sl))
+        if not _checkout_pr_branch(cfg, branch, wt):
+            return f"PR #{pr}: could not check out {branch} to respond — retry next cycle"
+        builder.provision(wt)
+        with worktree_session(wt):
+            ok, _ = builder.launch(
+                RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
+                cwd=str(wt), model=builder.model_for(Complexity.DEEP))
+        comments = _pr_comments(cfg.repo, pr)
+        replied = ok and comments is not None and not reply_pending(comments)
+        if replied:
+            remove_worktree_if_safe(cfg.workdir, wt)
+        if replied:
+            return f"PR #{pr}: replied to the maintainer"
+        if ok:
+            return f"PR #{pr}: responder exited without a confirmed reply — retaining its worktree"
+        return f"PR #{pr}: responder session errored"
+    finally:
+        if slot is not None:
+            slot.release("respond")
 
 
 # --- mockup phase: draw variants on a parked needs-mockup issue (issue #29) ------------
@@ -882,7 +937,7 @@ def _next_mockup_issue(cfg: RepoConfig) -> dict | None:
     return None
 
 
-def produce_once(cfg: RepoConfig, _log=None) -> str:
+def produce_once(cfg: RepoConfig, _log=None, slot=None) -> str:
     """Draw the next parked UI issue's variant round so it advances without a human session
     (issue #29). Pick the oldest `needs-mockup` issue with nothing drawn and no pending reply,
     claim it, and spawn a session that runs `/ui-mockups` headless for the repo's surfaces:
@@ -897,6 +952,8 @@ def produce_once(cfg: RepoConfig, _log=None) -> str:
     builder, _, block_msg = pick_pair()   # drawing needs one available tool, not a pair
     if builder is None:
         return f"#{n}: no pool has headroom to draw mockups ({block_msg}) — deferring"
+    if slot is not None and not slot.admit("mockup", builder.tool):
+        return f"#{n}: mockup deferred — machine at session capacity"
     if _log:
         _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (mockup)")
     sl = slug(issue["title"])
@@ -935,6 +992,8 @@ def produce_once(cfg: RepoConfig, _log=None) -> str:
         return f"#{n}: drew mockup variants"
     finally:
         _release_mockup(cfg.repo, n)
+        if slot is not None:
+            slot.release("mockup")
 
 
 # --- ADR 0009 merge-time floor: re-rebase survivors after main advances (issue #45) ---

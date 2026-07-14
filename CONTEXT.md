@@ -89,6 +89,18 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   maximally utilized in parallel: builder → the pool with more headroom, reviewer →
   the other tool/pool. Never leaves a prepaid plan idle while work is queued.
 
+- **Machine ceiling / per-stage caps** — the fleet runs many sessions at once, but bounded:
+  the *machine ceiling* is the most agent sessions that may run concurrently (of any kind),
+  and each kind has its own *cap* — triage is allowed more parallelism than builds, since
+  grounding sessions are short and cheap and a deep intake queue should drain fast. Merges
+  are the exception: they stay serialized so two never land at the same instant (ADR 0009).
+
+- **Activity-adaptive ceiling** — the daemon yields to a live operator instead of stopping
+  (ADR 0025). When the operator is working interactively on a pool, the daemon's spend
+  ceiling for that pool drops (≈50% instead of ≈85%) and new sessions on it are *paced* to
+  one per cycle; the other pool keeps running full. Already-running sessions finish; nothing
+  is killed. The ceiling ramps back up on its own as the operator goes idle.
+
 - **Intake** — the autonomous stage every new issue passes through (fires on any open
   issue with **no state label**): it grounds the request (reads code + a read-only data
   pull if the repo declares one), rewrites the title/description, stamps the dials, and

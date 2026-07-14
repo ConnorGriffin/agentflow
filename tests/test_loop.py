@@ -262,6 +262,22 @@ def test_reclaim_claims_strips_nothing_when_in_flight_unknown(monkeypatch):
     assert released == []
 
 
+def test_reclaim_keeps_a_claim_a_live_session_still_holds(monkeypatch):
+    # Concurrent dispatch means a build is live at the top of a cycle before its PR exists —
+    # so reclaim must key on real session evidence (the live board), not just the open-PR
+    # check, or it would strip a running build's claim and let a duplicate start (issue #74).
+    claimed = [{"number": 7}, {"number": 8}]
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(claimed)))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())   # neither has a PR yet
+    monkeypatch.setattr(loop.live, "running",
+                        lambda: [{"repo": "o/r", "number": 7, "stage": "building"}])
+    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(n))
+    # #7 has a live session → kept; #8 has neither PR nor session → genuinely stale.
+    assert reclaim_claims(RepoConfig("o/r", ".")) == 1
+    assert released == [8]
+
+
 def test_held_build_result_holds_instead_of_requeueing():
     # A stuck build hands the issue back held — still-`ready` means a fresh build, a
     # duplicate bail comment, and a duplicate ping every cycle, with the queue stalled.
@@ -395,7 +411,7 @@ def test_intake_once_emits_routing_log_before_session(monkeypatch):
 
     issue = {"number": 5, "title": "t", "labels": [], "state": "OPEN"}
     monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
-    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg, reserved=frozenset(): issue)
     monkeypatch.setattr(loop, "pick_pair", lambda: (_FakeBuilder(), None, ""))
     monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
     monkeypatch.setattr(loop, "_release_triage", lambda repo, n: None)
@@ -410,7 +426,7 @@ def test_intake_once_deferral_includes_block_reason(monkeypatch):
     """When no pool has headroom the intake deferral names the per-pool block reason."""
     issue = {"number": 3, "title": "t", "labels": []}
     monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
-    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg, reserved=frozenset(): issue)
     monkeypatch.setattr(loop, "pick_pair", lambda: (None, None, "codex: busy, claude: you"))
     out = loop.intake_once(RepoConfig("o/r", "/tmp"))
     assert "codex: busy" in out and "claude: you" in out
@@ -830,7 +846,7 @@ def test_produce_once_selects_claims_and_spawns(monkeypatch):
     # The phase draws the selected issue: claims it, spawns a session with the produce prompt in a
     # mockup worktree, and releases the claim afterward. Never opens a PR.
     issue = {"number": 11, "title": "New panel", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg, reserved=frozenset(): issue)
 
     class _Builder:
         tool = "claude"
@@ -864,7 +880,7 @@ def test_produce_once_noop_when_nothing_parked(monkeypatch):
 
 def test_produce_once_deferral_names_the_block_reason(monkeypatch):
     issue = {"number": 3, "title": "t", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg, reserved=frozenset(): issue)
     monkeypatch.setattr(loop, "pick_pair", lambda: (None, None, "codex: busy, claude: you"))
     out = produce_once(RepoConfig("o/r", "/tmp"))
     assert "codex: busy" in out and "deferring" in out
@@ -876,7 +892,7 @@ def _stub_produce(monkeypatch, *, launch_ok, comments):
     """Drive produce_once with a canned launch result and issue comments; return recorded pings."""
     issue = {"number": 11, "title": "A screen", "body": "b",
              "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg, reserved=frozenset(): issue)
 
     class _Builder:
         tool = "claude"
@@ -1162,7 +1178,7 @@ def _stub_intake_once(monkeypatch, result):
     applied = []
     loop._intake_infra_failures.clear()
     monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
-    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg, reserved=frozenset(): issue)
     monkeypatch.setattr(loop, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
     monkeypatch.setattr(loop, "_release_triage", lambda repo, n: None)
