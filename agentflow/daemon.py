@@ -9,6 +9,10 @@ Properties:
   stopped instantly (`rm ~/.agentflow/enabled`). ADR 0011's kill switch.
 - **Crash-tolerant** — each cycle is independent; an exception is logged and the loop
   continues. State of record is GitHub, so a restart loses nothing.
+- **Sole snapshot producer** — once per tick (dormant included) it publishes the
+  GitHub-backed fleet snapshot the console serves, so watching the dashboard costs
+  a bounded ~one production per poll interval no matter how many tabs are open
+  (ADR 0026). The web server (`agentflow-web`) only ever reads the published file.
 - **Single instance** — a lock dir (stamped with the owner's pid) prevents overlapping
   runs; a background thread heartbeats the lock every ~60s so even a cycle longer than
   the stale threshold is never seen as stale, and only a genuinely stale lock (from a
@@ -41,9 +45,9 @@ import time
 from pathlib import Path
 
 from agentflow import dispatch, live
+from agentflow.dashboard_data import snapshot
 from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims, recheck_once
 from agentflow.runner import _worktree_is_active, recover_stale_worktrees
-from agentflow.server import dashboard
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 ENABLE_FLAG = STATE_DIR / "enabled"
@@ -106,6 +110,17 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
     cycle(repos, run=_reclaim, _log=_log)
     dispatch.run_cycle(repos, _log=_log)
     cycle(repos, run=_recheck, _log=_log)
+
+
+def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> None:
+    """Produce the GitHub-backed fleet snapshot and publish it for the console — the
+    daemon is its only producer (ADR 0026), once per tick, dormant included (dormant is
+    exactly when the operator watches). A `gh` outage skips one publish, never the loop;
+    the console keeps serving the previous snapshot, honestly aged."""
+    try:
+        live.write_snapshot(produce(repos, dispatch_enabled=ENABLE_FLAG.exists()))
+    except Exception as e:  # noqa: BLE001 — a bad publish must not kill the daemon
+        _log(f"snapshot publish error: {type(e).__name__}: {e}")
 
 
 def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _log=log) -> None:
@@ -261,21 +276,25 @@ def main() -> None:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
             dispatch_cycle(REPOS)
             live.mark_cycle(POLL_SECONDS)
+            publish_snapshot(REPOS)
             return
-        with dashboard(REPOS, lambda: ENABLE_FLAG.exists()) as (host, port):
-            log(
-                f"daemon up — dashboard=http://{host}:{port}, enable={ENABLE_FLAG}, "
-                f"poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}"
-            )
-            while True:
-                if ENABLE_FLAG.exists():
-                    dispatch_cycle(REPOS)
-                else:
-                    log(f"dormant (no {ENABLE_FLAG}); sleeping")
-                # Stamp the daemon's status every tick (dormant or not) so the console's
-                # daemon block reflects a live, polling daemon even while it's paused.
-                live.mark_cycle(POLL_SECONDS)
-                time.sleep(POLL_SECONDS)
+        log(
+            f"daemon up — enable={ENABLE_FLAG}, "
+            f"poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}"
+        )
+        while True:
+            if ENABLE_FLAG.exists():
+                # Reclaim, concurrent dispatch, and merge re-rebase — reclaim now lives
+                # inside dispatch_cycle (ADR 0023 M6 slice 5), keyed on the live board.
+                dispatch_cycle(REPOS)
+            else:
+                log(f"dormant (no {ENABLE_FLAG}); sleeping")
+            # Stamp the daemon's status every tick (dormant or not) so the console's
+            # daemon block reflects a live, polling daemon even while it's paused —
+            # stamped BEFORE the publish so the snapshot carries this tick's status.
+            live.mark_cycle(POLL_SECONDS)
+            publish_snapshot(REPOS)
+            time.sleep(POLL_SECONDS)
     finally:
         shutdown_requested = True
         stop.set()

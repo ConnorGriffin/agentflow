@@ -3,7 +3,7 @@
   import Live from './Live.svelte';
   import Fleet from './Fleet.svelte';
   import History from './History.svelte';
-  import { deriveInbox, pct, headroomColor } from './lib/derive.js';
+  import { deriveInbox, pct, headroomColor, rel } from './lib/derive.js';
 
   const TABS = [
     { key: 'inbox', label: 'Inbox', n: 1 },
@@ -11,7 +11,7 @@
     { key: 'fleet', label: 'Fleet', n: 3 },
     { key: 'history', label: 'History', n: 4 },
   ];
-  const POLL_MS = 4000; // 3–5s browser refresh; the server reuses one gh round for ~15s
+  const POLL_MS = 4000; // 3–5s browser refresh; the server just re-reads the daemon's file
 
   let snap = $state(null);
   let view = $state('inbox');
@@ -37,7 +37,11 @@
       const res = await fetch('/api/snapshot');
       snap = await res.json();
       error = '';
-      updated = 'updated ' + new Date().toLocaleTimeString();
+      // The data's own age (when the daemon last read GitHub), not this fetch's
+      // clock — with the daemon down the stamp ages honestly instead of lying
+      // "just updated" about stale data (ADR 0026).
+      const fresh = snap?.daemon?.gh_fresh_at;
+      updated = fresh ? 'updated ' + rel(fresh, Date.now()) : 'no snapshot yet — daemon has not run';
     } catch (e) {
       error = String(e);
     }

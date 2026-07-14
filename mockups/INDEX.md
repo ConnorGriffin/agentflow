@@ -13,7 +13,7 @@ captured to `dashboard-v2.capture.json`. Both captures are gitignored.
 
 | surface | concept | status | implementation | file |
 |---|---|---|---|---|
-| dashboard | **inbox** (needs-you-first) + **stream**'s trust-ratchet bar/glow | `shipped` | `server.py` + `static/dashboard.html` — superseded by `dashboard-v2` | `dashboard-inbox.html` |
+| dashboard | **inbox** (needs-you-first) + **stream**'s trust-ratchet bar/glow | `retired` | was `server.py` + `static/dashboard.html`; superseded by `dashboard-v2`, deleted (ADR 0026) | `dashboard-inbox.html` |
 | dashboard-v2 | **console shell** + queue **Inbox** / live **Live** kanban / grid **Fleet** / **History** + shared drill-down | `locked` | re-platform → Svelte SPA + FastAPI, polling liveness, interactive controls (issue TBD) | `dashboard-v2-combined.html` |
 
 Losing variants — round 1 (`dashboard`): mission-control, pipeline, stream.

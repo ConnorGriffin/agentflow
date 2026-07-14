@@ -1,99 +1,43 @@
-"""The console server, exercised through its public surface (ADR 0023).
+"""The console server, exercised through its public surface (ADR 0026).
 
-Covers the two clocks: a fast poll must reuse one GitHub-backed snapshot for ~15s,
-and a concurrent burst must be single-flight (one production, not one per caller).
-`dashboard_data.snapshot()` is patched to a counter so "how many gh rounds happened"
-is directly observable through `/api/snapshot`.
+The server is a pure reader of the daemon-published snapshot: `/api/snapshot`
+serves exactly what the daemon last wrote, never queries GitHub, and renders a
+daemon that has never run as an empty fleet — not an error.
 """
 
 from __future__ import annotations
 
-import threading
-import time
-
 from fastapi.testclient import TestClient
 
-from agentflow import webapp
+from agentflow import live, webapp
 
 
-class FakeClock:
-    """A hand-advanced monotonic clock so TTL expiry is deterministic, not timed."""
-
-    def __init__(self) -> None:
-        self.t = 1000.0
-
-    def __call__(self) -> float:
-        return self.t
+def _client(read):
+    return TestClient(webapp.create_app(read))
 
 
-def _app(monkeypatch, clock, *, ttl=15.0):
-    calls = {"n": 0}
-
-    def fake_snapshot(repos, *, dispatch_enabled):
-        calls["n"] += 1
-        return {"dispatch": {"enabled": dispatch_enabled}, "pools": [], "repos": [],
-                "round": calls["n"]}
-
-    monkeypatch.setattr("agentflow.dashboard_data.snapshot", fake_snapshot)
-    app = webapp.create_app([], lambda: True, ttl=ttl, clock=clock)
-    return TestClient(app), calls
+def test_serves_the_daemon_published_snapshot():
+    published = {"dispatch": {"enabled": True}, "daemon": {"gh_fresh_at": "2026-07-13T00:00:00+00:00"},
+                 "pools": [], "running": [], "repos": [{"repo": "o/r"}]}
+    body = _client(lambda: published).get("/api/snapshot").json()
+    assert body == published, "the endpoint is the file's contents, verbatim"
 
 
-def test_burst_within_ttl_makes_one_gh_round(monkeypatch):
-    clock = FakeClock()
-    client, calls = _app(monkeypatch, clock)
-
-    bodies = [client.get("/api/snapshot").json() for _ in range(8)]
-
-    assert calls["n"] == 1, "a burst inside the cache window must hit gh exactly once"
-    assert all(b["round"] == 1 for b in bodies), "every caller sees the same snapshot"
-
-
-def test_snapshot_refreshes_after_ttl_expires(monkeypatch):
-    clock = FakeClock()
-    client, calls = _app(monkeypatch, clock, ttl=15.0)
-
-    assert client.get("/api/snapshot").json()["round"] == 1
-    clock.t += 20.0  # push past the TTL
-    assert client.get("/api/snapshot").json()["round"] == 2
-    assert calls["n"] == 2
-
-
-def test_snapshot_preserves_todays_contract(monkeypatch):
-    """The v2 endpoint returns the unchanged dispatch + pools + repos shape."""
-    monkeypatch.setattr(
-        "agentflow.dashboard_data.snapshot",
-        lambda repos, *, dispatch_enabled: {
-            "dispatch": {"enabled": dispatch_enabled}, "pools": [], "repos": []},
-    )
-    client = TestClient(webapp.create_app([], lambda: False))
-    body = client.get("/api/snapshot").json()
-    assert set(body) == {"dispatch", "pools", "repos"}
+def test_never_ran_daemon_reads_as_an_empty_fleet():
+    body = _client(lambda: None).get("/api/snapshot").json()
+    assert body["repos"] == [] and body["running"] == []
     assert body["dispatch"] == {"enabled": False}
+    assert body["daemon"]["gh_fresh_at"] is None, "no freshness stamp to lie with"
 
 
-def test_cache_is_single_flight_under_concurrency():
-    """Many threads that all miss together trigger exactly one slow production."""
-    calls = {"n": 0}
+def test_endpoint_reads_fresh_every_poll(tmp_path, monkeypatch):
+    """A new publish shows up on the next poll — the reader holds no cache of its own,
+    exercised end-to-end through the real state file the daemon writes."""
+    monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
+    client = _client(live.read_snapshot)
 
-    def slow_produce():
-        calls["n"] += 1
-        time.sleep(0.05)  # widen the miss window so racers pile up on the lock
-        return calls["n"]
-
-    cache = webapp.SnapshotCache(slow_produce, ttl=15.0, clock=FakeClock())
-    results: list[int] = []
-    barrier = threading.Barrier(12)
-
-    def worker():
-        barrier.wait()  # release all callers at once
-        results.append(cache.get())
-
-    threads = [threading.Thread(target=worker) for _ in range(12)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    assert calls["n"] == 1, "a concurrent burst must be single-flight"
-    assert results == [1] * 12
+    assert client.get("/api/snapshot").json()["repos"] == [], "missing file = empty fleet"
+    live.write_snapshot({"dispatch": {"enabled": True}, "repos": [{"repo": "o/r"}]})
+    assert client.get("/api/snapshot").json()["dispatch"] == {"enabled": True}
+    live.write_snapshot({"dispatch": {"enabled": False}, "repos": []})
+    assert client.get("/api/snapshot").json()["dispatch"] == {"enabled": False}

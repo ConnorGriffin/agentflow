@@ -35,6 +35,7 @@ def state(tmp_path, monkeypatch):
     """Point the live board at a throwaway state dir so tests never touch ~/.agentflow."""
     monkeypatch.setattr(live, "LIVE_FILE", tmp_path / "live-sessions.json")
     monkeypatch.setattr(live, "DAEMON_FILE", tmp_path / "daemon-status.json")
+    monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
     return tmp_path
 
 
@@ -105,3 +106,15 @@ def test_daemon_startup_sweep_drops_a_dead_pid_entry(state):
     daemon.recover_worktrees([], _log=lambda *a: None)      # no repos → only the live sweep
 
     assert live.running() == []
+
+
+def test_snapshot_roundtrips_and_fails_soft(state):
+    """The published snapshot reads back verbatim; before any daemon has published —
+    or after a corrupt write — the reader says None, never raises (ADR 0026)."""
+    assert live.read_snapshot() is None                      # no daemon ever ran
+
+    live.write_snapshot({"dispatch": {"enabled": True}, "repos": []})
+    assert live.read_snapshot() == {"dispatch": {"enabled": True}, "repos": []}
+
+    live.SNAPSHOT_FILE.write_text("{ this is not json")
+    assert live.read_snapshot() is None                      # corrupt → never an error
