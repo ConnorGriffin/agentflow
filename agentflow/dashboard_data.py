@@ -13,7 +13,15 @@ from datetime import datetime, timezone
 
 from agentflow import live, ratchet
 from agentflow.balancer import _query_pool
-from agentflow.loop import RepoConfig, repo_profile
+from agentflow.gate import reply_pending
+from agentflow.loop import (
+    _CONFLICT_MARK,
+    _UI_GAP_REASON,
+    HELD_LABELS,
+    RepoConfig,
+    _pr_comments,
+    repo_profile,
+)
 from agentflow.runner import _run
 
 
@@ -78,14 +86,108 @@ def _ready_issues(repo: str) -> list[dict]:
             for i in issues]
 
 
+# Why a `needs-grilling` / `needs-mockup` issue is held — the meaning of the label,
+# in the operator's own terms. Held issues carry this as their reason (the row + drawer
+# render it), keyed on the state label so it stays honest when intake's routes change.
+_HELD_REASON = {
+    "agentflow:needs-grilling": "a real fork the pipeline couldn't settle — needs your call",
+    "agentflow:needs-mockup": "a user-facing surface that needs a mockup before it's built",
+}
+
+# The disclaimer that opens every human-review park comment (`gate.park`), distinct from
+# the conflict-survivor marker (`loop._CONFLICT_MARK`). We classify from the posted marker,
+# never by re-running the pipeline (issue #71).
+_PARK_MARK = "agentflow: parked for human review"
+# The squash-merge-failed park reason (`loop`, the MERGE-then-failed branch).
+_SQUASH_FAIL = "could not be squash-merged"
+
+
+def _reviewer_of(builder: str) -> str:
+    """The tool that reviews a builder's PR — always the other tool (ADR 0003)."""
+    return "codex" if builder == "claude" else "claude"
+
+
+def park_reason(comments: list[dict]) -> str | None:
+    """Why an open agentflow PR is parked for a human, or None if it isn't. Pure (test
+    surface): reads the markers the pipeline already posted, one reason per PR.
+
+      open-question   — an unanswered maintainer question is the freshest word (issue #18)
+      failed-merge    — a squash-merge failed, or the branch conflicts after main advanced
+      ui-evidence     — a UI change with no before/after screenshot (ADR 0018)
+      drop-to-reviewed— the normal reviewed/guarded hand-off (or any other park)
+    """
+    if reply_pending(comments):
+        return "open-question"
+    for c in reversed(comments):  # the most recent park state wins
+        body = c.get("body", "")
+        if _CONFLICT_MARK in body:
+            return "failed-merge"
+        if _PARK_MARK in body:
+            if _UI_GAP_REASON in body:
+                return "ui-evidence"
+            if _SQUASH_FAIL in body:
+                return "failed-merge"
+            return "drop-to-reviewed"
+    return None
+
+
+def _park_since(comments: list[dict]) -> str | None:
+    """When the PR started waiting on you — the timestamp of its most recent comment
+    (the park notice, or the maintainer's question that stopped it)."""
+    for c in reversed(comments):
+        if c.get("body", "").strip():
+            return c.get("createdAt")
+    return None
+
+
+def _held_issues(repo: str) -> list[dict]:
+    """Open issues the pipeline is holding for you — labeled needs-grilling / needs-mockup
+    (no builder touches a held issue). `since` is the issue's last activity."""
+    out = []
+    for label in sorted(HELD_LABELS):
+        r = _run(["gh", "issue", "list", "--repo", repo, "--state", "open",
+                  "--label", label, "--json", "number,title,updatedAt", "--limit", "20"])
+        if r.returncode != 0:
+            continue
+        try:
+            issues = json.loads(r.stdout)
+        except json.JSONDecodeError:
+            continue
+        for i in issues:
+            out.append({"number": i["number"], "title": i["title"],
+                        "state": label.split(":")[-1], "reason": _HELD_REASON[label],
+                        "since": i.get("updatedAt")})
+    return out
+
+
+def _parked_prs(repo: str) -> list[dict]:
+    """Open agentflow PRs parked for a human — found by the park markers the pipeline
+    already posted, then classified into one reason (never by re-running the pipeline)."""
+    out = []
+    for p in _prs(repo, "open"):
+        comments = _pr_comments(repo, p["number"])
+        if comments is None:  # a `gh` blip reads as 'unknown', not 'not parked'
+            continue
+        reason = park_reason(comments)
+        if reason is None:
+            continue
+        builder = pr_stage(p.get("headRefName", ""))
+        out.append({"number": p["number"], "title": p["title"], "reason": reason,
+                    "builder": builder, "reviewer": _reviewer_of(builder),
+                    "since": _park_since(comments)})
+    return out
+
+
 def repo_view(cfg: RepoConfig) -> dict:
     return {
         "repo": cfg.repo,
         "profile": repo_profile(cfg.workdir),
         "ready": _ready_issues(cfg.repo),
+        "held": _held_issues(cfg.repo),
         "in_flight": [{"number": p["number"], "title": p["title"],
                        "builder": pr_stage(p.get("headRefName", ""))}
                       for p in _prs(cfg.repo, "open")],
+        "parked": _parked_prs(cfg.repo),
         "recent_merges": [{"number": p["number"], "title": p["title"],
                            "merged_at": p.get("mergedAt")}
                           for p in _prs(cfg.repo, "merged")][:10],

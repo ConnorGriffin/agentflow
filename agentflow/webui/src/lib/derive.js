@@ -1,16 +1,17 @@
-/* The needs-you worklist, derived from TODAY's snapshot contract (dispatch + pools
-   + repos). This is the current dashboard's derivation, lifted unchanged so the v2
-   console lands with identical Inbox behavior:
+/* The needs-you worklist, derived from the v2 snapshot contract (dispatch + pools +
+   repos, each repo carrying held[] + parked[]). Ranked most-urgent-first, exactly as the
+   locked spec derives:
 
-     - reviewed/guarded repos' in-flight PRs = awaiting your merge
-         guarded ranks first (weight 1), reviewed second (weight 2)
-     - a repo whose trust ratchet is ready to loosen = a loosen prompt (weight 3)
+     - reviewed/guarded in-flight PRs = awaiting your merge (guarded 1, reviewed 2)
+     - held issues: needs-grilling (3) outranks needs-mockup (4)
+     - parked PRs = a stalled build waiting on your decision (5)
+     - a repo whose trust ratchet is ready to loosen = a loosen prompt (6)
      - autonomous in-flight PRs auto-merge, so they NEVER enter the inbox
 
-   Ranked most-urgent-first. The proposed-v2 stage/checks/held/parked fields are NOT
-   read here — those arrive in later slices when the snapshot carries them. */
+   Within one weight, the oldest waiting item ranks first (it's waited longest). */
 
 export const reviewerOf = (builder) => (builder === 'claude' ? 'codex' : 'claude');
+const age = (iso) => (iso ? Date.parse(iso) : 0); // older `since` → smaller → ranks first
 
 export function deriveInbox(snap) {
   const items = [];
@@ -31,11 +32,40 @@ export function deriveInbox(snap) {
         });
       }
     }
+    for (const h of r.held || []) {
+      items.push({
+        kind: 'held',
+        accent: 'held',
+        weight: h.state === 'needs-grilling' ? 3 : 4,
+        repo: r.repo,
+        profile: r.profile,
+        number: h.number,
+        title: h.title,
+        state: h.state,
+        reason: h.reason,
+        since: h.since,
+      });
+    }
+    for (const p of r.parked || []) {
+      items.push({
+        kind: 'parked',
+        accent: 'parked',
+        weight: 5,
+        repo: r.repo,
+        profile: r.profile,
+        number: p.number,
+        title: p.title,
+        reason: p.reason,
+        builder: p.builder,
+        reviewer: p.reviewer || reviewerOf(p.builder),
+        since: p.since,
+      });
+    }
     if (r.ratchet && r.ratchet.ready_to_loosen) {
       items.push({
         kind: 'loosen',
         accent: 'loosen',
-        weight: 3,
+        weight: 6,
         repo: r.repo,
         profile: r.profile,
         samples: r.ratchet.samples,
@@ -43,21 +73,37 @@ export function deriveInbox(snap) {
       });
     }
   }
-  return items.sort((a, b) => a.weight - b.weight);
+  return items.sort((a, b) => a.weight - b.weight || age(a.since) - age(b.since));
 }
+
+/* parked reason → primary action + plain "why it stopped" (lifted from the locked spec) */
+export const PARKED = {
+  'drop-to-reviewed': { act: 'Review drop', why: 'builder wants to drop autonomy — your call' },
+  'failed-merge': { act: 'Retry merge', why: 'merge failed — needs a retry or a fix' },
+  'open-question': { act: 'Answer', why: 'an open question stopped the build' },
+  'ui-evidence': { act: 'Add proof', why: 'a UI change with no screenshot evidence' },
+};
+export const HELD = {
+  'needs-grilling': { act: 'Reply', label: 'needs grilling' },
+  'needs-mockup': { act: 'Mock up', label: 'needs mockup' },
+};
 
 export const short = (repo) => repo.split('/').pop();
 export const pct = (v) => Math.max(0, Math.min(100, v));
 export const headroomColor = (h) =>
   h > 40 ? 'var(--green)' : h > 15 ? 'var(--amber)' : 'var(--red)';
 
+/* trust-ratchet → bar width/color + a stat line. barW = corr% (how much corrected);
+   trustW = 100−corr% (the Fleet bar, so a trusted repo shows a FULL bar). 0 samples reads
+   as "earning trust". Lifted from the locked spec. */
 export function ratchetBar(rt) {
   const s = (rt && rt.samples) || 0;
   const corr = (rt && rt.correction_rate) || 0;
-  if (s === 0) return { barW: 0, barC: 'var(--muted)', stat: '0 samples · earning trust' };
+  if (s === 0)
+    return { barW: 0, trustW: 0, barC: 'var(--muted)', stat: '0 samples · earning trust', short: 'new' };
   const p = Math.round(corr * 100);
   const c = corr < 0.1 ? 'var(--green)' : corr < 0.25 ? 'var(--amber)' : 'var(--red)';
-  return { barW: p, barC: c, stat: `${s} decisions · ${p}% corrected` };
+  return { barW: p, trustW: 100 - p, barC: c, stat: `${s} decisions · ${p}% corrected`, short: p + '% corr' };
 }
 
 export function rel(iso, nowMs) {
