@@ -1,4 +1,4 @@
-"""The daemon's public lifecycle: polling, snapshot publishing, and cycle isolation."""
+"""The daemon's public lifecycle: two-clock polling, snapshot publishing, and cycle isolation."""
 
 import json
 import os
@@ -7,15 +7,26 @@ import subprocess
 import sys
 import threading
 import time
+import types
 from types import SimpleNamespace
 from unittest import mock
 
 from agentflow import daemon, live
-from agentflow.daemon import _acquire_lock, _release_lock, cycle, main
+from agentflow.daemon import PollLoop, _acquire_lock, _release_lock, cycle, main
 from agentflow.loop import RepoConfig
 
 A = RepoConfig("owner/a", "/tmp/a")
 B = RepoConfig("owner/b", "/tmp/b")
+
+
+def _loop(**kw):
+    """A PollLoop wired for deterministic tests: a synchronous 'spawn' so a full pass runs
+    inline, a stub clock, and recording sinks. Callers override what they're asserting on."""
+    kw.setdefault("dispatch_pass", lambda repos: None)
+    kw.setdefault("publish", lambda repos: None)
+    kw.setdefault("enabled", lambda: True)
+    kw.setdefault("spawn", lambda fn: fn())
+    return PollLoop([A], **kw)
 
 
 def _wait_for_lock(lock, owner_pid: int, timeout: float = 2) -> None:
@@ -35,7 +46,8 @@ def _start_daemon(state_dir):
 from agentflow import daemon
 
 daemon.REPOS = []
-daemon.POLL_SECONDS = 60
+daemon.FAST_TICK_SECONDS = 0.05
+daemon.FULL_PASS_SECONDS = 0.05
 daemon.publish_snapshot = lambda repos: None  # hermetic: no pool-gate subprocesses
 daemon.main()
 """
@@ -170,77 +182,188 @@ def test_sigterm_releases_lock_so_a_fresh_daemon_can_start(tmp_path):
                 child.wait(2)
 
 
-def test_main_publishes_the_console_snapshot_every_tick(tmp_path):
-    """The daemon is the console's only snapshot producer (ADR 0026): every tick —
-    dormant included, because dormant is when the operator watches — publishes a
-    snapshot that reflects the current dispatch state."""
-    enabled = tmp_path / "enabled"
-    dispatch_started = threading.Event()
-    stop = threading.Event()
+def _named_config_is_two_env_overridable_clocks():
+    """The fast tick and the heartbeat are both named, env-overridable config, with the fast
+    clock the shorter of the two — a single 300s clock can't satisfy this (issue #80)."""
+    import importlib
 
-    class StopDaemon(Exception):
-        pass
-
-    def fake_cycle(_repos):
-        dispatch_started.set()
-        if stop.is_set():
-            raise StopDaemon
-
-    errors = []
-
-    def run_daemon():
+    with mock.patch.dict(os.environ, {"AGENTFLOW_FAST_TICK_SECONDS": "7",
+                                      "AGENTFLOW_HEARTBEAT_SECONDS": "480"}):
+        reloaded = importlib.reload(daemon)
         try:
-            main()
-        except StopDaemon:
-            pass
-        except BaseException as exc:  # surfaced in the test thread below
-            errors.append(exc)
-
-    def wait_for_snapshot(predicate, timeout: float = 2) -> dict:
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            snap = live.read_snapshot()
-            if snap is not None and predicate(snap):
-                return snap
-            time.sleep(0.01)
-        raise AssertionError("expected snapshot was not published")
-
-    with (
-        mock.patch("agentflow.daemon.STATE_DIR", tmp_path),
-        mock.patch("agentflow.daemon.ENABLE_FLAG", enabled),
-        mock.patch("agentflow.daemon.LOCK", tmp_path / "daemon.lock"),
-        mock.patch("agentflow.daemon.POLL_SECONDS", 0.01),
-        mock.patch("agentflow.daemon.REPOS", []),
-        mock.patch("agentflow.daemon.recover_worktrees"),
-        mock.patch("agentflow.daemon.dispatch_cycle", side_effect=fake_cycle),
-        mock.patch("agentflow.daemon.log"),
-        mock.patch("agentflow.dashboard_data.pools", return_value=[]),
-        mock.patch.object(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json"),
-        mock.patch.object(live, "LIVE_FILE", tmp_path / "live-sessions.json"),
-        mock.patch.object(live, "DAEMON_FILE", tmp_path / "daemon-status.json"),
-        mock.patch.object(sys, "argv", ["daemon"]),
-    ):
-        thread = threading.Thread(target=run_daemon)
-        thread.start()
-        try:
-            dormant = wait_for_snapshot(lambda s: s["dispatch"] == {"enabled": False})
-            assert not dispatch_started.is_set(), "dormant daemon claimed work"
-            assert dormant["daemon"]["gh_fresh_at"], "snapshot carries its freshness stamp"
-
-            enabled.touch()
-            assert dispatch_started.wait(2), "poll loop did not observe the enable flag"
-            wait_for_snapshot(lambda s: s["dispatch"] == {"enabled": True})
-
-            enabled.unlink()
-            wait_for_snapshot(lambda s: s["dispatch"] == {"enabled": False})
+            assert reloaded.FAST_TICK_SECONDS == 7
+            assert reloaded.FULL_PASS_SECONDS == 480
+            assert reloaded.FAST_TICK_SECONDS < reloaded.FULL_PASS_SECONDS
         finally:
-            enabled.touch()
-            stop.set()
-            thread.join(3)
+            importlib.reload(daemon)   # restore module-level defaults for other tests
 
-    assert not thread.is_alive()
-    assert errors == []
-    assert not (tmp_path / "daemon.lock").exists()
+
+def test_fast_and_heartbeat_intervals_are_named_env_overridable_config():
+    _named_config_is_two_env_overridable_clocks()
+
+
+def test_probe_no_change_runs_no_full_pass_but_change_does(monkeypatch):
+    """Through the loop interface: a fast tick whose probe reports no change runs no dispatch
+    pass; a tick whose probe reports change runs exactly one. This is the whole point of the
+    cheap clock — react to real work, stay idle otherwise (issue #80 acceptance)."""
+    monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 10_000)   # heartbeat far away
+    monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
+    passes, publishes = [], []
+    answers = iter([True, False, False, True])   # startup heartbeat, then probe verdicts
+    probe = types.SimpleNamespace(changed=lambda: next(answers))
+    clock = iter([0, 1, 2, 3, 4])
+    loop = _loop(probe=probe, dispatch_pass=lambda repos: passes.append(repos),
+                 publish=lambda repos: publishes.append("snap"), clock=lambda: next(clock))
+
+    loop.tick()                       # t=0: startup heartbeat → one pass (probe not consulted)
+    assert len(passes) == 1
+    loop.tick()                       # t=1: probe True  → pass
+    loop.tick()                       # t=2: probe False → no pass
+    loop.tick()                       # t=3: probe False → no pass
+    loop.tick()                       # t=4: probe True  → pass
+    assert len(passes) == 3           # exactly the two change ticks plus the startup heartbeat
+    # Snapshot production rides the full pass, never the cheap no-change tick (issue #80).
+    assert len(publishes) == 3
+
+
+def test_newly_ready_issue_dispatches_within_a_fast_tick(monkeypatch):
+    """The reaction-latency guarantee (issue #80): a freshly-actionable issue surfaces in the
+    probe's search, so the very next fast tick runs a dispatch pass — and the fast clock is bound
+    well under the ~30s SLA, unlike the old single 300s clock."""
+    assert daemon.FAST_TICK_SECONDS <= 30                      # bound the reaction latency itself
+    monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 10_000)   # heartbeat far off — probe alone
+    monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
+    from agentflow.probe import ChangeProbe
+
+    # A fleet that was quiet, then a new ready-for-agent issue appears (its update is newer).
+    feed = iter([[], [{"number": 42, "updatedAt": "2026-07-14T10:00:00Z"}]])
+    probe = ChangeProbe([A], search=lambda repos, since: next(feed),
+                        now=lambda: "2026-07-14T09:59:00Z")
+    passes = []
+    clock = iter([0, 1, 16])   # startup pass, then two fast ticks well inside the heartbeat
+    loop = _loop(probe=probe, dispatch_pass=lambda repos: passes.append("pass"),
+                 clock=lambda: next(clock))
+
+    loop.tick()               # startup heartbeat consumes its slot; probe not consulted
+    loop.tick()               # t=1:  fleet still quiet → probe no change → no pass
+    assert passes == ["pass"]
+    loop.tick()               # t=16: the new issue is now visible → probe change → dispatch
+    assert passes == ["pass", "pass"]
+
+
+def test_heartbeat_runs_a_full_pass_even_when_the_probe_sees_no_change(monkeypatch):
+    """The slow clock is the backstop: a full pass runs on its own interval even while the probe
+    keeps reporting no change (covers search-index lag / probe blind spots)."""
+    monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 100)
+    monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
+    passes = []
+    probe = types.SimpleNamespace(changed=lambda: False)   # probe never reports change
+    clock = iter([0, 15, 30, 105, 120])
+    loop = _loop(probe=probe, dispatch_pass=lambda repos: passes.append("pass"),
+                 clock=lambda: next(clock))
+
+    loop.tick()   # t=0   heartbeat (startup)
+    loop.tick()   # t=15  no change, heartbeat not due
+    loop.tick()   # t=30  no change, heartbeat not due
+    loop.tick()   # t=105 heartbeat due again → pass despite no change
+    loop.tick()   # t=120 no change, heartbeat not due
+    assert len(passes) == 2   # the two heartbeats, nothing from the (never-changing) probe
+
+
+def test_dormant_fast_tick_makes_zero_calls_and_never_dispatches(monkeypatch):
+    """Dormant (no enable flag): the probe is never even asked and no dispatch runs, so a paused
+    fast tick costs zero network calls. Only the slow heartbeat republishes the console snapshot."""
+    monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 100)
+    monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
+    probe_calls, passes, publishes = [], [], []
+    probe = types.SimpleNamespace(changed=lambda: probe_calls.append(1) or True)
+    clock = iter([0, 15, 30])
+    loop = _loop(probe=probe, enabled=lambda: False,
+                 dispatch_pass=lambda repos: passes.append("pass"),
+                 publish=lambda repos: publishes.append("snap"),
+                 clock=lambda: next(clock))
+
+    loop.tick()   # t=0   heartbeat due, dormant → publish only, no probe, no dispatch
+    loop.tick()   # t=15  dormant fast tick → nothing at all
+    loop.tick()   # t=30  dormant fast tick → nothing at all
+    assert probe_calls == []      # the probe (its one API call) is never made while dormant
+    assert passes == []           # no dispatch pass while dormant
+    assert publishes == ["snap"]  # one republish on the heartbeat, so the paused board stays fresh
+
+
+def test_change_probe_costs_one_call_per_tick_for_the_whole_fleet():
+    """The probe's per-tick cost is a single cross-fleet search — the budget guarantee that makes
+    a 15s cadence affordable (a full pass is dozens of calls). Bounded at ≤2, this is one."""
+    from agentflow.probe import ChangeProbe
+
+    calls = []
+
+    def fake_search(repos, since):
+        calls.append((tuple(repos), since))
+        return [{"number": 5, "updatedAt": "2999-01-01T00:00:00Z"}]
+
+    probe = ChangeProbe([A, B], search=fake_search, now=lambda: "2000-01-01T00:00:00Z")
+    assert probe.changed() is True
+    assert len(calls) == 1                       # one search call for BOTH repos
+    assert calls[0][0] == ("owner/a", "owner/b")
+
+
+def test_change_probe_reports_change_only_when_something_moved():
+    """A fresh update past the watermark is a change; the same state seen again is not — so a
+    single burst of work triggers one pass, then the fleet converges back to quiet."""
+    from agentflow.probe import ChangeProbe
+
+    feed = iter([
+        [],                                                  # nothing new
+        [{"number": 5, "updatedAt": "2026-07-14T10:00:00Z"}],  # a new update → change
+        [{"number": 5, "updatedAt": "2026-07-14T10:00:00Z"}],  # same update seen again → no change
+        [{"number": 6, "updatedAt": "2026-07-14T10:05:00Z"}],  # a newer update → change
+    ])
+    probe = ChangeProbe([A], search=lambda repos, since: next(feed),
+                        now=lambda: "2026-07-14T09:00:00Z")
+    assert probe.changed() is False
+    assert probe.changed() is True
+    assert probe.changed() is False
+    assert probe.changed() is True
+
+
+def test_change_probe_treats_a_search_failure_as_no_change():
+    """A `gh` blip is unknown, not change: reporting change on failure would run a full pass every
+    tick through an outage — the opposite of the point. The heartbeat still backstops."""
+    from agentflow.probe import ChangeProbe
+
+    probe = ChangeProbe([A], search=lambda repos, since: None)
+    assert probe.changed() is False
+
+
+def test_fast_tick_returns_without_blocking_on_an_in_flight_pass():
+    """Dispatch-and-return: a full pass runs off the fast clock, so a long-running pass never
+    stalls the next probe tick — and a single-flight guard means an overlapping tick does not
+    launch a second pass (no double-dispatch, serial bookends preserved)."""
+    with mock.patch.object(live, "mark_cycle", lambda _s: None):
+        started = threading.Event()
+        release = threading.Event()
+        passes = []
+
+        def slow_pass(_repos):
+            passes.append("start")
+            started.set()
+            release.wait(2)
+
+        loop = _loop(probe=types.SimpleNamespace(changed=lambda: True),
+                     dispatch_pass=slow_pass, clock=lambda: 0,
+                     spawn=lambda fn: threading.Thread(target=fn, daemon=True).start())
+
+        t0 = time.monotonic()
+        loop.tick()                       # launches the slow pass in a worker
+        assert started.wait(2)
+        first_tick_and_second = time.monotonic()
+        loop.tick()                       # must NOT block on the in-flight pass, nor double it
+        assert time.monotonic() - first_tick_and_second < 1, "fast tick blocked on the pass"
+        release.set()
+        time.sleep(0.05)
+        assert passes == ["start"]        # single-flight: the second tick launched no second pass
+        assert time.monotonic() - t0 < 2
 
 
 def test_stale_lock_reclaim_is_exclusive(tmp_path):
