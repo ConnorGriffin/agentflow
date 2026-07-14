@@ -253,17 +253,38 @@ def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
 
 
 BUILDING = "agentflow:building"   # dispatch claim — an agent is building this issue
+_BLOCKED_BY_RE = re.compile(r"^Blocked by #(\d+)\s*$", re.MULTILINE)
 
 
-def _free_to_dispatch(issue: dict, in_flight: set[int]) -> bool:
-    """A ready issue is free only if no agent already owns it — no `agentflow:building`
-    claim (set before the build, closing the no-PR-yet window) and no open agentflow PR
-    (the parked-in-review window, which outlives the claim). Pure (test surface)."""
-    return (issue["number"] not in in_flight
-            and BUILDING not in {lbl["name"] for lbl in issue.get("labels", [])})
+def _free_to_dispatch(cfg: RepoConfig, issue: dict, in_flight: set[int], _log=None) -> bool:
+    """A ready issue is free only if no agent owns it and every declared blocker is closed.
+
+    Blocker state is read from the same repository on every selection pass. Unknown is not
+    closed: a missing issue, `gh` failure, or malformed response skips the dependent until a
+    later pass can verify it safely. Shared by queue selection and by-hand builds."""
+    if (issue["number"] in in_flight
+            or BUILDING in {lbl["name"] for lbl in issue.get("labels", [])}):
+        return False
+
+    blockers = dict.fromkeys(int(n) for n in _BLOCKED_BY_RE.findall(issue.get("body") or ""))
+    for blocker in blockers:
+        r = _run(["gh", "issue", "view", str(blocker), "--repo", cfg.repo,
+                  "--json", "state"])
+        try:
+            data = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+            state = data.get("state") if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            state = None
+        if state != "CLOSED":
+            if _log:
+                reason = f"open blocker #{blocker}" if state == "OPEN" \
+                    else f"blocker #{blocker} whose state could not be determined"
+                _log(f"{cfg.repo}: #{issue['number']}: skipped — {reason}")
+            return False
+    return True
 
 
-def _next_ready_issue(cfg: RepoConfig) -> dict | None:
+def _next_ready_issue(cfg: RepoConfig, _log=None) -> dict | None:
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--label", "ready-for-agent", "--json", "number,title,body,labels",
               "--limit", "50"])
@@ -272,9 +293,8 @@ def _next_ready_issue(cfg: RepoConfig) -> dict | None:
     in_flight = _issues_in_flight(cfg)
     if in_flight is None:
         return None   # can't see what's in flight — fail closed, dispatch next cycle
-    issues = sorted((i for i in json.loads(r.stdout or "[]") if _free_to_dispatch(i, in_flight)),
-                    key=lambda i: i["number"])
-    return issues[0] if issues else None
+    issues = sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"])
+    return next((i for i in issues if _free_to_dispatch(cfg, i, in_flight, _log)), None)
 
 
 def reclaim_claims(cfg: RepoConfig) -> int:
@@ -386,7 +406,7 @@ def _preserve_progress(cfg: RepoConfig, tool: str, n: int, sl: str) -> str | Non
 
 def run_once(cfg: RepoConfig, _log=None) -> str:
     """Pull the next ready issue and run it end to end. Returns a one-line result."""
-    issue = _next_ready_issue(cfg)
+    issue = _next_ready_issue(cfg, _log=_log)
     if not issue:
         return "no ready-for-agent issues"
     return _dispatch_build(cfg, issue, _log=_log)
@@ -417,8 +437,8 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     in_flight = _issues_in_flight(cfg)
     if in_flight is None:
         return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"
-    if not _free_to_dispatch(issue, in_flight):
-        return f"#{n}: already claimed or in flight — a build already owns it"
+    if not _free_to_dispatch(cfg, issue, in_flight):
+        return f"#{n}: not dispatchable — already claimed, in flight, or waiting on a blocker"
     return _dispatch_build(cfg, issue, operator=True)
 
 

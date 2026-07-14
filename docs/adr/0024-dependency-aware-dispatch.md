@@ -29,19 +29,20 @@ Model one relationship — **"blocked by"** — and gate dispatch on it.
   keeps GitHub the source of truth and is parsed the way agentflow already parses
   body markers (`MISSING-CONTEXT:`, the historical `Open as:`, the `agentflow:`
   labels) — no new GitHub feature required.
-- **Filtered at dispatch**: `_free` / `_next` (for build *and* triage) exclude a
-  ready issue that has **any open blocker**. That predicate is the entire
-  behavioral change.
+- **Filtered only at build dispatch**: a ready issue is not selected for a build
+  while any declared blocker is open or its state cannot be verified. Intake and
+  grounding do not apply this gate; they still prepare the whole batch up front.
+  That build-eligibility rule is the entire behavioral change.
 - **Stateless, no release event.** Eligibility is recomputed every cycle, so the
   moment a blocker closes (its PR merges), its dependents become dispatchable on
   the next pass. Nothing to trigger, nothing to get stuck — the same
   "GitHub is state of record, recompute each cycle" property the daemon already
   relies on ([ADR 0011](0011-persistent-orchestrator.md)). Crash-safe by
   construction.
-- **Orthogonal to readiness.** Intake still triages and marks the whole batch
-  `ready-for-agent`; the gate only holds the *dependent* ones until their turn. A
-  blocked issue is not a held issue ([ADR 0019](0019-human-re-entry.md)) — no human
-  input is pending, just an upstream merge.
+- **Orthogonal to readiness.** Intake still grounds and marks the whole batch
+  `ready-for-agent`; only build dispatch holds the *dependent* ones until their
+  turn. A blocked issue is not a held issue ([ADR 0019](0019-human-re-entry.md)) —
+  no human input is pending, just an upstream merge.
 
 Together with [ADR 0023](0023-dashboard-replatform-control-plane.md)'s concurrency,
 the dispatcher becomes **parallel where work is independent, ordered where it's
@@ -63,8 +64,9 @@ dependent** — the behavior you actually want from a fleet.
 
 ## Consequences
 
-- Dispatch gains a small, deep dependency filter (one predicate over the ready set;
-  a cheap per-candidate blocker-state check, batchable).
+- Build dispatch gains a small, deep dependency filter (one predicate over the
+  ready set; a cheap per-candidate blocker-state check, batchable). Intake and
+  grounding remain unchanged.
 - **A dependency chain can be filed once** — the head builds, and each later slice
   unblocks automatically as its blocker merges. No babysitting. Generalizes past
   refactors to any dependent work.
