@@ -1,17 +1,25 @@
 """The persistent orchestrator daemon (ADR 0011) — brain persistent, hands ephemeral.
 
-Polls each repo and runs one full pass per cycle through the pipeline
-(`loop.pipeline_once`: triage one un-triaged issue, then build one ready issue —
-balancing the pool per ADR 0006 and spawning an ephemeral worktree session).
+Two clocks (issue #80). A **fast tick** (~15s) asks a cheap cross-fleet change-probe one
+question — a single API call for the whole fleet — and pays for a full dispatch pass only when
+something actually moved, so newly-ready or newly-unblocked work reacts in ~15-30s instead of
+up to ~5min, without running dozens of `gh` calls every 15s. A slow **heartbeat** (~5min) runs
+a full pass unconditionally as the backstop for whatever the probe misses (GitHub's search
+index lags a labelling/close). A full pass runs in a worker so a fast tick never blocks behind
+a long build (dispatch-and-return), and a single-flight guard means an in-flight pass is never
+doubled — so the serial reclaim/recheck bookends and the single-daemon claim dedup still hold.
 Properties:
 
 - **Dormant by default** — does nothing unless the enable flag exists, so it can be
-  stopped instantly (`rm ~/.agentflow/enabled`). ADR 0011's kill switch.
+  stopped instantly (`rm ~/.agentflow/enabled`). ADR 0011's kill switch. Dormant is genuinely
+  free on the fast clock: the probe isn't even asked, so a paused daemon makes zero network calls
+  between heartbeats.
 - **Crash-tolerant** — each cycle is independent; an exception is logged and the loop
   continues. State of record is GitHub, so a restart loses nothing.
-- **Sole snapshot producer** — once per tick (dormant included) it publishes the
-  GitHub-backed fleet snapshot the console serves, so watching the dashboard costs
-  a bounded ~one production per poll interval no matter how many tabs are open
+- **Sole snapshot producer** — it publishes the GitHub-backed fleet snapshot the console serves
+  on the slow heartbeat clock (dormant included, so a paused board still refreshes) and after any
+  full pass — never on the cheap fast tick, which must stay within its call budget. So watching
+  the dashboard costs a bounded ~one production per heartbeat no matter how many tabs are open
   (ADR 0026). The web server (`agentflow-web`) only ever reads the published file.
 - **Single instance** — a lock dir (stamped with the owner's pid) prevents overlapping
   runs; a background thread heartbeats the lock every ~60s so even a cycle longer than
@@ -47,12 +55,22 @@ from pathlib import Path
 from agentflow import dispatch, live
 from agentflow.dashboard_data import snapshot
 from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims, recheck_once
+from agentflow.probe import ChangeProbe
 from agentflow.runner import _worktree_is_active, recover_stale_worktrees
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 ENABLE_FLAG = STATE_DIR / "enabled"
 LOCK = STATE_DIR / "daemon.lock"
-POLL_SECONDS = int(os.environ.get("AGENTFLOW_POLL_SECONDS", "300"))
+
+# Two clocks (issue #80). The fast tick runs a cheap cross-fleet change-probe every
+# FAST_TICK_SECONDS — one API call for the whole fleet — and only pays for a full dispatch
+# pass when the probe reports change, so newly-ready work reacts in ~15-30s instead of ~5min
+# without hammering the GraphQL budget. FULL_PASS_SECONDS is the heartbeat: a full pass runs
+# unconditionally on that slower clock as the backstop for whatever the probe misses (search-
+# index lag). AGENTFLOW_POLL_SECONDS is still honoured as the heartbeat default for back-compat.
+FAST_TICK_SECONDS = int(os.environ.get("AGENTFLOW_FAST_TICK_SECONDS", "15"))
+FULL_PASS_SECONDS = int(os.environ.get(
+    "AGENTFLOW_HEARTBEAT_SECONDS", os.environ.get("AGENTFLOW_POLL_SECONDS", "300")))
 
 # The lock is heartbeated every ~60s by a background thread, so a lock older than this
 # means the owner is genuinely gone (crashed) — never merely mid-cycle. Keep the
@@ -138,6 +156,75 @@ def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _l
     dropped = live.reap(lambda wt: _worktree_is_active(Path(wt)))
     if dropped:
         _log(f"startup: dropped {len(dropped)} dead session(s) from the live board")
+
+
+class PollLoop:
+    """The two-clock poll loop (issue #80). Each fast tick asks the change-probe one cheap
+    question; a full dispatch pass runs only on change, or when the slow heartbeat clock is due.
+    The full pass runs in a background worker so a fast tick never blocks behind a long build
+    (dispatch-and-return) — and a single-flight guard means an in-flight pass is never doubled by
+    a later tick, so the serial reclaim/recheck bookends and per-issue claim dedup still hold.
+
+    Dormant (no enable flag) is genuinely free: the probe is not even asked, so a paused daemon
+    makes zero network calls on the fast clock — it only republishes the console snapshot on the
+    slow heartbeat, so the operator watching a paused fleet still sees a freshly-aged board."""
+
+    def __init__(self, repos, *, probe=None, dispatch_pass=None, publish=None,
+                 enabled=None, clock=time.monotonic, spawn=None, _log=log) -> None:
+        self._repos = repos
+        self._probe = probe if probe is not None else ChangeProbe(repos)
+        self._dispatch = dispatch_pass or dispatch_cycle
+        self._publish = publish or publish_snapshot
+        self._enabled = enabled or ENABLE_FLAG.exists
+        self._clock = clock
+        self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
+        self._log = _log
+        self._running = threading.Lock()   # single-flight: at most one full pass at a time
+        self._last_full = None             # monotonic start of the last full pass, or None
+
+    def _heartbeat_due(self, now: float) -> bool:
+        return self._last_full is None or (now - self._last_full) >= FULL_PASS_SECONDS
+
+    def _start_full_pass(self) -> None:
+        """Dispatch-and-return: run one full pass in a worker so the fast clock keeps ticking.
+        If a pass from an earlier tick is still running, skip — it already covers this tick, and
+        overlapping passes would race the serial bookends and the single-daemon claim dedup."""
+        if not self._running.acquire(blocking=False):
+            self._log("full pass still running from an earlier tick — skipping this one")
+            return
+
+        def work():
+            try:
+                self._dispatch(self._repos)
+                self._publish(self._repos)
+            finally:
+                self._running.release()
+
+        self._spawn(work)
+
+    def tick(self) -> None:
+        """One fast tick. Enabled: probe (one call) and run a full pass on change or heartbeat.
+        Dormant: never probe; only republish on the heartbeat so a paused board stays fresh."""
+        now = self._clock()
+        heartbeat_due = self._heartbeat_due(now)
+        if self._enabled():
+            # Heartbeat is the unconditional clock; the probe is the opportunistic one — so on a
+            # heartbeat tick we skip the probe call entirely (it would run a full pass anyway).
+            if heartbeat_due or self._probe.changed():
+                self._last_full = now
+                self._start_full_pass()
+        elif heartbeat_due:
+            self._last_full = now
+            self._publish(self._repos)
+        # Stamp liveness every tick (local, no network) so the console sees a live, fast-polling
+        # daemon even while it's dormant or between full passes.
+        live.mark_cycle(FAST_TICK_SECONDS)
+
+    def run(self, stop: threading.Event | None = None) -> None:
+        stop = stop or threading.Event()
+        while not stop.is_set():
+            self.tick()
+            stop.wait(FAST_TICK_SECONDS)
 
 
 def _try_claim() -> bool:
@@ -275,26 +362,14 @@ def main() -> None:
         if args.once:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
             dispatch_cycle(REPOS)
-            live.mark_cycle(POLL_SECONDS)
+            live.mark_cycle(FAST_TICK_SECONDS)
             publish_snapshot(REPOS)
             return
         log(
-            f"daemon up — enable={ENABLE_FLAG}, "
-            f"poll={POLL_SECONDS}s, repos={[c.repo for c in REPOS]}"
+            f"daemon up — enable={ENABLE_FLAG}, fast={FAST_TICK_SECONDS}s, "
+            f"heartbeat={FULL_PASS_SECONDS}s, repos={[c.repo for c in REPOS]}"
         )
-        while True:
-            if ENABLE_FLAG.exists():
-                # Reclaim, concurrent dispatch, and merge re-rebase — reclaim now lives
-                # inside dispatch_cycle (ADR 0023 M6 slice 5), keyed on the live board.
-                dispatch_cycle(REPOS)
-            else:
-                log(f"dormant (no {ENABLE_FLAG}); sleeping")
-            # Stamp the daemon's status every tick (dormant or not) so the console's
-            # daemon block reflects a live, polling daemon even while it's paused —
-            # stamped BEFORE the publish so the snapshot carries this tick's status.
-            live.mark_cycle(POLL_SECONDS)
-            publish_snapshot(REPOS)
-            time.sleep(POLL_SECONDS)
+        PollLoop(REPOS).run()
     finally:
         shutdown_requested = True
         stop.set()
