@@ -333,6 +333,26 @@ TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns 
 _TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING}
 
 
+def reclaim_triage_claims(cfg: RepoConfig) -> int:
+    """Drop `agentflow:triaging` claims stranded when a daemon is killed mid-grounding (issue
+    #74). Intake opens no PR, so its only outcome signal is a state label — a claim is stale
+    only when intake has stamped none of them AND no session is grounding it right now (the
+    live board), symmetric to the build path keying on the open-PR check plus live sessions.
+    If the listing fails, reclaim nothing — a live claim must never be stripped. Returns how
+    many it cleared."""
+    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+              "--label", TRIAGING, "--json", "number,labels", "--limit", "100"])
+    if r.returncode != 0:
+        return 0
+    live_now = _issues_with_live_session(cfg.repo)
+    stale = [i["number"] for i in json.loads(r.stdout or "[]")
+             if i["number"] not in live_now
+             and not ({lbl["name"] for lbl in i.get("labels", [])} & set(STATE_LABELS))]
+    for n in stale:
+        _release_triage(cfg.repo, n)
+    return len(stale)
+
+
 def _untriaged(issue: dict) -> bool:
     """An issue is in the intake queue only if it is not a wayfinder planning artifact and
     nothing has resolved or claimed it — none of intake's state labels and no
@@ -533,8 +553,8 @@ def _claim_triage(repo: str, n: int) -> None:
 def _release_triage(repo: str, n: int) -> None:
     """Drop the intake claim once routing is written (the state label dedups from here) or the
     session ended. A crash *before* this strands the claim: fail-safe (the issue is skipped,
-    never double-triaged), cleared by hand — intake opens no PR, so there's no liveness signal
-    for a safe auto-reclaim like builds have."""
+    never double-triaged), auto-reclaimed next cycle by `reclaim_triage_claims` — the missing
+    state label is intake's stale signal, standing in for the open-PR check builds have."""
     _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", TRIAGING])
 
 
