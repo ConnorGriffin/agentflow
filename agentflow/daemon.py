@@ -36,8 +36,9 @@ import threading
 import time
 from pathlib import Path
 
+from agentflow import live
 from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims
-from agentflow.runner import recover_stale_worktrees
+from agentflow.runner import _worktree_is_active, recover_stale_worktrees
 from agentflow.server import dashboard
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
@@ -83,7 +84,9 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
 
 
 def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _log=log) -> None:
-    """Run the fail-closed worktree recovery pass once at daemon startup."""
+    """Run the fail-closed worktree recovery pass once at daemon startup, then sweep the live
+    board of any session whose worktree is no longer alive — a crashed run's phantom sessions,
+    dropped with the same liveness signal the worktree recovery just used."""
     for cfg in repos:
         try:
             report = sweep(cfg.repo, cfg.workdir)
@@ -92,6 +95,9 @@ def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _l
                      f"retained {len(report.retained)} for recovery")
         except Exception as e:  # noqa: BLE001 — one repo cannot block daemon startup
             _log(f"{cfg.repo}: startup worktree recovery error: {type(e).__name__}: {e}")
+    dropped = live.reap(lambda wt: _worktree_is_active(Path(wt)))
+    if dropped:
+        _log(f"startup: dropped {len(dropped)} dead session(s) from the live board")
 
 
 def _try_claim() -> bool:
@@ -229,6 +235,7 @@ def main() -> None:
         if args.once:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
             cycle(REPOS)
+            live.mark_cycle(POLL_SECONDS)
             return
         with dashboard(REPOS, lambda: ENABLE_FLAG.exists()) as (host, port):
             log(
@@ -246,6 +253,9 @@ def main() -> None:
                     cycle(REPOS)
                 else:
                     log(f"dormant (no {ENABLE_FLAG}); sleeping")
+                # Stamp the daemon's status every tick (dormant or not) so the console's
+                # daemon block reflects a live, polling daemon even while it's paused.
+                live.mark_cycle(POLL_SECONDS)
                 time.sleep(POLL_SECONDS)
     finally:
         shutdown_requested = True

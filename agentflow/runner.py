@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from agentflow import live
+
 # Stable bail markers a session posts as a comment when it hits a gap (ADR 0005).
 MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
 _MARKER_RE = re.compile(rf"^({'|'.join(MARKERS)}):")
@@ -70,6 +72,7 @@ class BuildTask:
     complexity: Complexity  # model-size dial from intake — no build without one
     effort: Effort   # effort dial from intake — how much work the issue warrants
     prompt: str      # the work order / self-scoped brief handed to the agent
+    title: str = ""  # the issue's human title, for the live board's session row
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,16 +197,23 @@ def remove_worktree_if_safe(workdir: str, wt: Path) -> bool:
 
 
 @contextmanager
-def worktree_session(wt: Path):
-    """Mark a launched session active so an overlapping recovery pass retains it."""
+def worktree_session(wt: Path, session: live.Session | None = None):
+    """Mark a launched session active so an overlapping recovery pass retains it — and, when
+    a session descriptor is given, record it on the live board on entry and remove it on exit.
+    This one seam spans every agent session (build / review / triage / revise / mockup), so the
+    live-board write lives here once, with each call site supplying its own stage."""
     path = os.path.realpath(wt)
     marker = _active_marker(wt)
     _ACTIVE_WORKTREES[path] = _ACTIVE_WORKTREES.get(path, 0) + 1
     if marker is not None:
         marker.write_text(str(os.getpid()))
+    if session is not None:
+        live.record(session, path)
     try:
         yield
     finally:
+        if session is not None:
+            live.remove(path)
         remaining = _ACTIVE_WORKTREES.get(path, 1) - 1
         if remaining:
             _ACTIVE_WORKTREES[path] = remaining
@@ -236,8 +246,11 @@ class _WorktreeRunner:
             return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
 
         started = time.time()
-        with worktree_session(wt):
-            launched, _ = self.launch(task.prompt, cwd=str(wt), model=self.model_for(task.complexity))
+        model = self.model_for(task.complexity)
+        session = live.Session(repo=task.repo, number=task.issue, title=task.title,
+                               stage="building", tool=self.tool, model=model, branch=branch)
+        with worktree_session(wt, session):
+            launched, _ = self.launch(task.prompt, cwd=str(wt), model=model)
 
         pr_url = self._pr_for_branch(task.repo, branch)
         markers = self._new_marker_comments(task.repo, task.issue, since=started)

@@ -68,3 +68,23 @@ export function rel(iso, nowMs) {
   if (d < 86400) return Math.floor(d / 3600) + 'h ago';
   return Math.floor(d / 86400) + 'd ago';
 }
+
+/* Compact elapsed (no "ago") for a live session's ticking timer — lifted from the locked
+   mockup so a row reads 12s → 5m → 1h 3m as it runs. */
+export function elapsed(iso, nowMs) {
+  if (!iso) return '—';
+  const d = Math.max(0, Math.floor((nowMs - Date.parse(iso)) / 1000));
+  if (d < 60) return d + 's';
+  const m = Math.floor(d / 60);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  return rem ? `${h}h ${rem}m` : `${h}h`;
+}
+
+/* The live pipeline in flow order (glyph = a "filling clock" through the pipe). */
+export const STAGES = [
+  { key: 'triaging', label: 'triaging', glyph: '◔' },
+  { key: 'building', label: 'building', glyph: '◑' },
+  { key: 'reviewing', label: 'reviewing', glyph: '◕' },
+];

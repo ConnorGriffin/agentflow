@@ -8,8 +8,10 @@ test surface; the gh queries are orchestration exercised live.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from datetime import datetime, timezone
 
-from agentflow import ratchet
+from agentflow import live, ratchet
 from agentflow.balancer import _query_pool
 from agentflow.loop import RepoConfig, repo_profile
 from agentflow.runner import _run
@@ -92,9 +94,27 @@ def repo_view(cfg: RepoConfig) -> dict:
 
 
 def snapshot(repos: list[RepoConfig], *, dispatch_enabled: bool) -> dict:
-    """The whole operator view, including whether the daemon may claim new work."""
+    """The whole operator view: whether the daemon may claim new work, the sessions running
+    right now (from the daemon's live-session file), and a daemon status block. Per-pool
+    running counts are DERIVED from `running[]` so a pool's count always equals its sessions
+    in the list. A missing/corrupt live file reads as fleet idle, never an error."""
+    running = live.running()
+    per_pool = Counter(s.get("tool") for s in running)
+    pool_list = pools()
+    for p in pool_list:
+        p["running"] = per_pool.get(p["tool"], 0)
+    status = live.daemon_status()
     return {
         "dispatch": {"enabled": dispatch_enabled},
-        "pools": pools(),
+        "daemon": {
+            "enabled": dispatch_enabled,
+            "last_cycle_at": status.get("last_cycle_at"),
+            "poll_seconds": status.get("poll_seconds"),
+            # How fresh this snapshot's GitHub reads are — stamped as they're produced here,
+            # then held by the server's ~15s cache (ADR 0023's two clocks).
+            "gh_fresh_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "pools": pool_list,
+        "running": running,
         "repos": [repo_view(c) for c in repos],
     }

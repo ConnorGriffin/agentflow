@@ -1,5 +1,6 @@
 <script>
   import Inbox from './Inbox.svelte';
+  import Live from './Live.svelte';
   import Stub from './Stub.svelte';
   import { deriveInbox, pct, headroomColor } from './lib/derive.js';
 
@@ -90,7 +91,7 @@
     >
       <span class="tabnum">{t.n}</span> {t.label}
       <span class="cnt" class:alert={t.key === 'inbox' && items.length > 0}>
-        {t.key === 'inbox' ? items.length : 0}
+        {t.key === 'inbox' ? items.length : t.key === 'live' ? (snap?.running || []).length : 0}
       </span>
     </button>
   {/each}
@@ -103,8 +104,8 @@
       <Inbox {items} {selected} />
     </section>
   {:else if view === 'live'}
-    <section class="view" role="tabpanel" aria-label="Live">
-      <Stub title="Live" blurb="Running sessions as a triaging→building→reviewing board land in a later slice." />
+    <section class="view live" role="tabpanel" aria-label="Live">
+      <Live {snap} />
     </section>
   {:else if view === 'fleet'}
     <section class="view" role="tabpanel" aria-label="Fleet">
