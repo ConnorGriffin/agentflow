@@ -376,6 +376,24 @@ class CodexRunner(_WorktreeRunner):
         finally:
             Path(outfile).unlink(missing_ok=True)
 
+    def probe(self) -> bool:
+        """Run one minimal Codex session whose only job is to land a fresh rate-limit
+        fact (issue #75) — no branch, no PR, no review. It runs from a throwaway
+        directory under the `.agentflow/worktrees/` marker so the gate reads it as an
+        agentflow hand, never operator activity. Bounded by its own short timeout;
+        returns whether it exited cleanly (the caller re-reads facts either way)."""
+        codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
+        model = self.MODELS[Complexity.STANDARD]
+        timeout = int(os.environ.get("AGENTFLOW_CODEX_PROBE_TIMEOUT", "120"))
+        with tempfile.TemporaryDirectory(prefix="agentflow-codex-probe-") as tmp:
+            cwd = Path(tmp) / ".agentflow" / "worktrees" / "codex-probe"
+            cwd.mkdir(parents=True, exist_ok=True)
+            r = _run([codex_bin, "exec", "-m", model,
+                      "--dangerously-bypass-approvals-and-sandbox",
+                      "--skip-git-repo-check", "reply with: ok"],
+                     cwd=str(cwd), timeout=timeout)
+            return r.returncode == 0
+
 
 def _iso_to_epoch(s: str) -> float | None:
     from datetime import datetime
