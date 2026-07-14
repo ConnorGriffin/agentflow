@@ -334,16 +334,21 @@ _TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING}
 
 
 def _untriaged(issue: dict) -> bool:
-    """An issue is in the intake queue only if nothing has resolved or claimed it — none of
-    intake's state labels and no `agentflow:triaging` claim (set before the grounding session,
-    closing intake's no-label-yet window, symmetric to `_free_to_dispatch`). Pure (test surface)."""
-    return not ({lbl["name"] for lbl in issue.get("labels", [])} & _TRIAGE_SKIP)
+    """An issue is in the intake queue only if it is not a wayfinder planning artifact and
+    nothing has resolved or claimed it — none of intake's state labels and no
+    `agentflow:triaging` claim (set before the grounding session, closing intake's
+    no-label-yet window, symmetric to `_free_to_dispatch`). Pure (test surface)."""
+    labels = {lbl["name"] for lbl in issue.get("labels", [])}
+    if any(label.startswith("wayfinder:") for label in labels):
+        return False
+    return not (labels & _TRIAGE_SKIP)
 
 
 def _next_untriaged_issue(cfg: RepoConfig, reserved: set[int] = frozenset()) -> dict | None:
-    """The oldest open issue in the intake queue — none of intake's state labels and unclaimed
-    by a live grounding session (ADR 0016). `reserved` skips issues a concurrent triage fan-out
-    already claimed this cycle, before their `agentflow:triaging` label is visible."""
+    """The oldest open issue in the intake queue — excluding wayfinder planning artifacts,
+    with none of intake's state labels and unclaimed by a live grounding session (ADR 0016).
+    `reserved` skips issues a concurrent triage fan-out already claimed this cycle, before
+    their `agentflow:triaging` label is visible."""
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--json", "number,title,body,labels", "--limit", "50"])
     if r.returncode != 0:

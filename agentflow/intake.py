@@ -1,6 +1,7 @@
 """Intake — the autonomous front of the pipe (ADR 0016).
 
-Every open issue with no state label passes through here before it can be built.
+Every open issue with no state label passes through here before it can be built, except
+`wayfinder:*` planning artifacts, which stay upstream until wayfinder files build tickets.
 Intake *grounds* the request (reads the code, and pulls a read-only real-data snapshot
 if the repo declares one), *rewrites* it into something specific, and *routes* it to
 exactly one outcome:

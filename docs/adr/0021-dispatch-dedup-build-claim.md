@@ -42,8 +42,9 @@ serial single-instance daemon; the *observed* double-summary on an issue was a d
 — fixed separately by making the session's only output its JSON decision.)
 
 - `intake_once` applies **`agentflow:triaging`** *before* the grounding session and releases
-  it in a `finally`. `_untriaged` (the pure selector predicate) skips the state labels **and**
-  the claim; `_next_resumable_issue` skips a held issue already being re-triaged.
+  it in a `finally`. `_untriaged` (the pure selector predicate) skips upstream
+  `wayfinder:*` planning artifacts, the state labels, **and** the claim;
+  `_next_resumable_issue` skips a held issue already being re-triaged.
 - **One asymmetry from the build claim: no `reclaim_claims` equivalent.** A build proves
   liveness with its open PR, so a claim without one is safely stale. **Intake opens no PR** —
   no liveness signal — and the case it guards *is* a manual triage racing the daemon, so a

@@ -71,3 +71,5 @@ then Context / Decision / Alternatives / Consequences.
   ceiling: operator activity selects the daemon's ceiling (85% idle / 50% active,
   paced) instead of hard-stopping dispatch; gate reports facts, balancer owns
   policy (rides 0023's concurrency slice).
+- [0027](0027-wayfinder-planning-boundary.md) — Wayfinder planning artifacts stay
+  upstream of intake; only the build tickets wayfinder files enter agentflow.

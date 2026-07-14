@@ -16,7 +16,8 @@ pipe is missing. This is the biggest real gap in what's built.
 ## Decision
 
 **Intake is a real, autonomous pipeline stage** that fires on every open issue with
-**no state label**. It:
+**no state label**, except upstream `wayfinder:*` planning artifacts as established by
+[ADR 0027](0027-wayfinder-planning-boundary.md). It:
 
 1. **Grounds** — reads the code deeply, and if the repo declares a read-only
    data-fetch (the *grounding fetch*, e.g. ciq's `ciq-pull-db` → `ciq.readonly.db`),
@@ -57,8 +58,8 @@ does **not** shell out to the external `/triage` skill; that dependency is dropp
 
 ## Consequences
 
-- The daemon grows a second scan: the **intake queue** (unlabeled issues) runs before
-  the build queue (`ready-for-agent`).
+- The daemon grows a second scan: the **intake queue** (unlabeled build issues, excluding
+  `wayfinder:*` planning artifacts) runs before the build queue (`ready-for-agent`).
 - Staged decisions stay legible (retitle note + `Verified:` + brief) so the merge gate
   can catch a mis-scope and the trust ratchet (ADR 0007) has a signal.
 - Grilling questions post in the maintainer's voice (ADR 0019).
