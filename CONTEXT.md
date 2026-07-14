@@ -118,6 +118,12 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   fleet overview, two-pool headroom, the needs-you inbox, a recently-merged audit
   feed, and ratchet state; offers control actions (merge, ratchet, pause, jump).
 
+- **Snapshot** — the one fleet-wide view the dashboard shows: dispatch state, pool
+  headroom, running sessions, and every repo's queue/in-flight/parked/merged state.
+  Produced only by the daemon, once per cycle (even dormant); the dashboard serves
+  the latest one and shows its age honestly — it never asks GitHub itself
+  (ADR 0026). With the daemon down you see the last snapshot, aged, not an error.
+
 - **Needs-you inbox** — the operator's action list: `guarded` merges awaiting,
   drop-to-reviewed parks, and intent-gap grillings. The same set ntfy pings.
 

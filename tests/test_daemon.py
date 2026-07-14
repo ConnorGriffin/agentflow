@@ -1,42 +1,19 @@
-"""The daemon's public lifecycle: polling, dashboard, and cycle isolation."""
+"""The daemon's public lifecycle: polling, snapshot publishing, and cycle isolation."""
 
-import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from unittest import mock
 
-from agentflow import daemon, server
+from agentflow import daemon, live
 from agentflow.daemon import _acquire_lock, _release_lock, cycle, main
 from agentflow.loop import RepoConfig
 
 A = RepoConfig("owner/a", "/tmp/a")
 B = RepoConfig("owner/b", "/tmp/b")
-
-
-def _unused_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def _wait_for_snapshot(port: int, timeout: float = 2) -> dict:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/api/snapshot", timeout=0.2
-            ) as response:
-                return json.load(response)
-        except (OSError, urllib.error.URLError):
-            time.sleep(0.01)
-    raise AssertionError("daemon dashboard did not become reachable")
 
 
 def _wait_for_lock(lock, owner_pid: int, timeout: float = 2) -> None:
@@ -51,17 +28,13 @@ def _wait_for_lock(lock, owner_pid: int, timeout: float = 2) -> None:
 
 
 def _start_daemon(state_dir):
-    env = os.environ | {
-        "AGENTFLOW_STATE": str(state_dir),
-        "AGENTFLOW_TEST_PORT": str(_unused_port()),
-    }
+    env = os.environ | {"AGENTFLOW_STATE": str(state_dir)}
     script = """
-import os
-from agentflow import daemon, server
+from agentflow import daemon
 
 daemon.REPOS = []
 daemon.POLL_SECONDS = 60
-server.PORT = int(os.environ["AGENTFLOW_TEST_PORT"])
+daemon.publish_snapshot = lambda repos: None  # hermetic: no pool-gate subprocesses
 daemon.main()
 """
     return subprocess.Popen(
@@ -121,14 +94,14 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
                    side_effect=lambda repos: events.append(("recover", list(repos)))),
         mock.patch("agentflow.daemon.cycle",
                    side_effect=lambda repos: events.append(("cycle", list(repos)))),
-        mock.patch("agentflow.daemon.dashboard") as start_dashboard,
+        mock.patch("agentflow.daemon.publish_snapshot",
+                   side_effect=lambda repos: events.append(("publish", list(repos)))),
         mock.patch("agentflow.daemon.log"),
         mock.patch.object(sys, "argv", ["daemon", "--once"]),
     ):
         main()
 
-    assert events == [("recover", [A, B]), ("cycle", [A, B])]
-    start_dashboard.assert_not_called()
+    assert events == [("recover", [A, B]), ("cycle", [A, B]), ("publish", [A, B])]
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit
 
 
@@ -153,20 +126,21 @@ def test_sigterm_releases_lock_so_a_fresh_daemon_can_start(tmp_path):
                 child.wait(2)
 
 
-def test_main_serves_live_dispatch_state_without_a_separate_dashboard(tmp_path):
-    """The supervised daemon owns the console even while dispatch is dormant."""
-    port = _unused_port()
+def test_main_publishes_the_console_snapshot_every_tick(tmp_path):
+    """The daemon is the console's only snapshot producer (ADR 0026): every tick —
+    dormant included, because dormant is when the operator watches — publishes a
+    snapshot that reflects the current dispatch state."""
     enabled = tmp_path / "enabled"
     dispatch_started = threading.Event()
-    finish = threading.Event()
+    stop = threading.Event()
 
     class StopDaemon(Exception):
         pass
 
-    def stop_after_dispatch(_repos):
+    def fake_cycle(_repos):
         dispatch_started.set()
-        finish.wait(2)
-        raise StopDaemon
+        if stop.is_set():
+            raise StopDaemon
 
     errors = []
 
@@ -178,6 +152,15 @@ def test_main_serves_live_dispatch_state_without_a_separate_dashboard(tmp_path):
         except BaseException as exc:  # surfaced in the test thread below
             errors.append(exc)
 
+    def wait_for_snapshot(predicate, timeout: float = 2) -> dict:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            snap = live.read_snapshot()
+            if snap is not None and predicate(snap):
+                return snap
+            time.sleep(0.01)
+        raise AssertionError("expected snapshot was not published")
+
     with (
         mock.patch("agentflow.daemon.STATE_DIR", tmp_path),
         mock.patch("agentflow.daemon.ENABLE_FLAG", enabled),
@@ -185,33 +168,30 @@ def test_main_serves_live_dispatch_state_without_a_separate_dashboard(tmp_path):
         mock.patch("agentflow.daemon.POLL_SECONDS", 0.01),
         mock.patch("agentflow.daemon.REPOS", []),
         mock.patch("agentflow.daemon.recover_worktrees"),
-        mock.patch("agentflow.daemon.cycle", side_effect=stop_after_dispatch),
+        mock.patch("agentflow.daemon.cycle", side_effect=fake_cycle),
         mock.patch("agentflow.daemon.log"),
         mock.patch("agentflow.dashboard_data.pools", return_value=[]),
-        mock.patch.object(server, "PORT", port),
-        # This test watches dispatch state *change*; the reuse window trades that
-        # latency for GraphQL quota (ADR 0026) and is not what's under test here.
-        mock.patch.object(server, "SNAPSHOT_TTL", 0.0),
+        mock.patch.object(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json"),
+        mock.patch.object(live, "LIVE_FILE", tmp_path / "live-sessions.json"),
+        mock.patch.object(live, "DAEMON_FILE", tmp_path / "daemon-status.json"),
         mock.patch.object(sys, "argv", ["daemon"]),
     ):
         thread = threading.Thread(target=run_daemon)
         thread.start()
         try:
-            dormant = _wait_for_snapshot(port)
-            assert dormant["dispatch"] == {"enabled": False}
+            dormant = wait_for_snapshot(lambda s: s["dispatch"] == {"enabled": False})
             assert not dispatch_started.is_set(), "dormant daemon claimed work"
+            assert dormant["daemon"]["gh_fresh_at"], "snapshot carries its freshness stamp"
 
             enabled.touch()
             assert dispatch_started.wait(2), "poll loop did not observe the enable flag"
-            active = _wait_for_snapshot(port)
-            assert active["dispatch"] == {"enabled": True}
+            wait_for_snapshot(lambda s: s["dispatch"] == {"enabled": True})
 
             enabled.unlink()
-            dormant_again = _wait_for_snapshot(port)
-            assert dormant_again["dispatch"] == {"enabled": False}
+            wait_for_snapshot(lambda s: s["dispatch"] == {"enabled": False})
         finally:
             enabled.touch()
-            finish.set()
+            stop.set()
             thread.join(3)
 
     assert not thread.is_alive()
