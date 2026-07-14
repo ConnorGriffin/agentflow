@@ -101,8 +101,9 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   one per cycle; the other pool keeps running full. Already-running sessions finish; nothing
   is killed. The ceiling ramps back up on its own as the operator goes idle.
 
-- **Intake** — the autonomous stage every new issue passes through (fires on any open
-  issue with **no state label**): it grounds the request (reads code + a read-only data
+- **Intake** — the autonomous stage every new build issue passes through (fires on any open
+  issue with **no state label**, except upstream `wayfinder:*` planning artifacts): it
+  grounds the request (reads code + a read-only data
   pull if the repo declares one), rewrites the title/description, stamps the dials, and
   routes to one outcome — `ready-for-agent`, `needs-mockup`, or `needs-grilling`. Not a
   tollbooth: it scopes anything it can pin down confidently and holds only an

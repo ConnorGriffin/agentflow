@@ -106,6 +106,14 @@ def test_untriaged_skips_state_labels_and_triage_claim():
     assert _untriaged(routed) is False     # already has a state label
 
 
+def test_untriaged_skips_wayfinder_issues():
+    map_issue = {"number": 4, "labels": [{"name": "wayfinder:map"}]}
+    decision_ticket = {"number": 5, "labels": [{"name": "wayfinder:research"}]}
+
+    assert _untriaged(map_issue) is False
+    assert _untriaged(decision_ticket) is False
+
+
 def test_repo_profile_reads_the_dial(tmp_path):
     (tmp_path / "AGENTS.md").write_text("# repo\n\nprofile: autonomous\n\n## facts\n")
     assert repo_profile(str(tmp_path)) == "autonomous"
