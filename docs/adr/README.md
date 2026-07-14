@@ -24,7 +24,8 @@ then Context / Decision / Alternatives / Consequences.
 - [0005](0005-spec-rigor-rides-the-dial.md) — Spec rigor rides the dial:
   self-scoped brief vs frozen work order.
 - [0006](0006-two-pool-runner-assignment.md) — Runner assignment: a two-pool
-  headroom load balancer.
+  headroom load balancer; Codex windows are classified by duration and weekly
+  unattended use is paced to 80%.
 - [0007](0007-decisive-intake-graduated-autonomy.md) — Decisive intake and
   graduated autonomy (decide-then-review + the trust ratchet).
 - [0008](0008-conservatism-knob.md) — "How conservative" is the autonomy profile,

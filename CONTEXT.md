@@ -79,9 +79,11 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   plausible-wrong guess is the expensive failure). Retained as a per-level safety.
 
 - **Pool / headroom** — each prepaid plan (Claude, Codex) is a *pool* of rate-limit
-  capacity: a 5-hour rolling window plus a weekly cap. *Headroom* is the unspent
-  remainder. The scarce resource the scheduler optimizes — cost is not, since both
-  plans are flat-rate. Idle headroom while work is queued is wasted sunk cost.
+  capacity. A pool can report multiple windows, such as a 300-minute window and a
+  weekly window; reported windows may appear or disappear as plan limits change.
+  *Headroom* is the unspent remainder. The scarce resource the scheduler optimizes
+  — cost is not, since both plans are flat-rate. Idle headroom while work is queued
+  is wasted sunk cost.
 
 - **Two-pool load balancer** — the scheduler that assigns builds to keep both pools
   maximally utilized in parallel: builder → the pool with more headroom, reviewer →

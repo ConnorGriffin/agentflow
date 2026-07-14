@@ -36,6 +36,11 @@ Per pool, per cycle:
 
 The operator has **no ceiling** — it's their plan; only the daemon self-limits.
 
+Codex weekly pacing from [ADR 0006](0006-two-pool-runner-assignment.md)'s 2026-07-13
+amendment is an additional unattended-dispatch constraint. It follows a reported
+10,080-minute window independently of the activity-adaptive short-window ceiling;
+the 85% idle / 50% active decision here is unchanged.
+
 Consequences that fall out for free:
 - **Per-pool asymmetry**: driving Claude interactively throttles only the claude
   pool; the balancer (builder = more usable headroom) naturally shifts builds
