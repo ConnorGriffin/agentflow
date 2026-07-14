@@ -1,4 +1,4 @@
-"""The two-pool headroom balancer (ADR 0006) — pick the builder/reviewer pair.
+"""The two-pool headroom balancer (ADR 0006, 0025) — pick the builder/reviewer pair.
 
 Both plans are prepaid, so the scarce resource is rate-limit headroom. The builder
 goes to the pool with more headroom right now; the reviewer is the *other* tool
@@ -9,6 +9,18 @@ source): that adapter reports Claude's calibrated trailing-5h spend and Codex's
 reported rate-limit windows. If only one pool has headroom, the builder runs there
 and the reviewer is None: the caller must NOT auto-merge (single-tool fallback,
 ADR 0003). If neither has headroom, no capacity this cycle.
+
+**Activity-adaptive ceiling (ADR 0025).** The gate no longer *hard-stops* dispatch when
+the operator is working interactively — that guard now only *selects the ceiling*. Facts
+live in the gate (trailing-5h spend, operator active/idle); the policy lives here: an idle
+pool dispatches up to `IDLE_CEILING_PCT` spent, an operator-active pool only up to
+`ACTIVE_CEILING_PCT` and paced to `ACTIVE_PACE` new sessions/cycle (the pace is enforced
+by the dispatcher, which counts per cycle — see `agentflow.dispatch`). Until the gate
+grows an explicit activity fact, activity is *derived* from the gate's own check: a block
+that clears once the recent-activity guard is skipped was an activity block, so it lowers
+the ceiling instead of stopping the pool; any other block (genuine no-capacity) still
+defers. Unknown facts fail toward the idle ceiling. The gate keeps excluding agentflow's
+own sessions (`AGENTFLOW_WT_MARK`) so the fleet never reads *itself* as the operator.
 
 `pick_pair` is the public dispatch test surface; `choose_pair` and `parse_pct`
 remain pure compatibility interfaces.
@@ -34,6 +46,19 @@ _SHORT_WINDOW_MIN = 300
 _WEEKLY_WINDOW_MIN = 10080
 _WEEKLY_UNATTENDED_PCT = 80.0
 
+# ADR 0025 spend-ceiling policy (named config, env-overridable). An idle pool dispatches
+# until it is this % spent; an operator-active pool yields down to the lower ceiling and
+# the dispatcher paces new sessions on it to ACTIVE_PACE per cycle.
+IDLE_CEILING_PCT = float(os.environ.get("AGENTFLOW_IDLE_CEILING_PCT", "85"))
+ACTIVE_CEILING_PCT = float(os.environ.get("AGENTFLOW_ACTIVE_CEILING_PCT", "50"))
+ACTIVE_PACE = int(os.environ.get("AGENTFLOW_ACTIVE_PACE", "1"))
+
+
+def ceiling_for(active: bool) -> float:
+    """The spend ceiling a pool dispatches under, given whether the operator is active on
+    it (ADR 0025). Pure — the one place the idle/active policy lives."""
+    return ACTIVE_CEILING_PCT if active else IDLE_CEILING_PCT
+
 
 @dataclass(frozen=True)
 class RateLimitWindow:
@@ -49,6 +74,8 @@ class PoolStatus:
     spent_pct: float   # 0..100; lower = more headroom
     reason: str = ""   # gate's check output when blocked, stripped of "blocked: " prefix
     windows: tuple[RateLimitWindow, ...] | None = ()
+    active: bool = False           # operator working interactively on this pool (ADR 0025)
+    ceiling: float = IDLE_CEILING_PCT   # the spend ceiling this pool dispatched under
 
 
 def _parse_codex_windows(stdout: str) -> tuple[RateLimitWindow, ...] | None:
@@ -117,6 +144,8 @@ def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
         status.spent_pct,
         status.reason if not status.clear else pace_reason,
         status.windows,
+        status.active,
+        status.ceiling,
     )
 
 
@@ -142,42 +171,65 @@ def choose_pair(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
     return runners[builder.tool], runners[other.tool]
 
 
+def _gate_facts(env: dict, operator: bool) -> tuple[bool, bool, str, str]:
+    """Report the gate's dispatch facts for a pool (ADR 0025):
+    `(blocked, active, reason, check_stdout)`.
+
+    `active` is the operator-activity fact, derived (until the gate exposes it directly)
+    by re-running `check` with the recent-activity guard skipped: a block that clears is
+    an activity block, which no longer stops the pool — it lowers the ceiling. `blocked`
+    is any *other* (genuine no-capacity) block that still defers. A by-hand `operator` run
+    skips the activity guard outright — the operator IS the live session and asked for it —
+    so it reports no activity. Raises through to the caller's fail-closed handling on error."""
+    ck = subprocess.run([_GATE, "check"], env=env, text=True, capture_output=True, timeout=30)
+    raw = ck.stdout.strip()
+    reason = raw[len("blocked: "):] if raw.startswith("blocked: ") else raw
+    if ck.returncode == 0 or operator:
+        return ck.returncode != 0, False, reason, ck.stdout
+    skip = subprocess.run([_GATE, "check"], env={**env, "TRIAGE_SKIP_ACTIVITY": "1"},
+                          text=True, capture_output=True, timeout=30)
+    if skip.returncode == 0:
+        return False, True, "", ck.stdout   # the block was purely the operator being active
+    return True, False, reason, ck.stdout    # a real block remains once activity is skipped
+
+
 def _query_pool(tool: str, operator: bool = False) -> PoolStatus:
     env = {**os.environ, "TRIAGE_AGENT": tool}
     if operator:
-        # By-hand dispatch: the operator IS the live session and asked for this
-        # run, so tell the gate to skip its recent-activity block. The spend
-        # ceiling still applies — `check` keeps failing when a pool is genuinely
-        # rate-limited, so the gate stays the single source of truth for it.
         env["TRIAGE_SKIP_ACTIVITY"] = "1"
     try:
-        # `spend` reports the REAL trailing-5h % even when the interactive-use gate
-        # would block dispatch — so headroom is honest while you're active. `check`
-        # is the separate dispatch-availability question (clear vs busy).
+        # `spend` reports the REAL trailing-5h % even when the interactive-use guard
+        # would block dispatch — so headroom is honest while you're active.
         sp = subprocess.run([_GATE, "spend"], env=env, text=True, capture_output=True, timeout=30)
-        ck = subprocess.run([_GATE, "check"], env=env, text=True, capture_output=True, timeout=30)
         limits = (subprocess.run([_GATE, "limits"], env=env, text=True,
                                  capture_output=True, timeout=30)
                   if tool == "codex" else None)
+        blocked, active, block_reason, ck_stdout = _gate_facts(env, operator)
     except (OSError, subprocess.TimeoutExpired):
         return PoolStatus(tool, False, 100.0, "gate unavailable")
+    ceiling = ceiling_for(active)
+    yield_reason = f"yielding to operator · ceiling {ceiling:.0f}%"
     # Known legacy spend/check text remains compatible. Structured Codex facts are
     # mandatory for unattended dispatch; an older adapter therefore fails closed.
-    raw = ck.stdout.strip()
-    reason = raw[len("blocked: "):] if raw.startswith("blocked: ") else raw
     if tool == "codex":
         windows = (_parse_codex_windows(limits.stdout)
                    if limits is not None and limits.returncode == 0 else None)
         if windows is not None:
-            return PoolStatus(tool, ck.returncode == 0, _codex_spent_pct(windows),
-                              reason, windows)
+            pct = _codex_spent_pct(windows)
+            under = pct < ceiling
+            reason = block_reason if blocked else (yield_reason if active and not under else "")
+            return PoolStatus(tool, (not blocked) and under, pct, reason,
+                              windows, active, ceiling)
 
-    legacy = sp.stdout if sp.stdout.strip().startswith("spend:") else ck.stdout
-    pct = parse_pct(legacy, ck.returncode)
+    legacy = sp.stdout if sp.stdout.strip().startswith("spend:") else ck_stdout
+    pct = parse_pct(legacy, 0)
     parsed = _PCT_RE.search(legacy) is not None
-    return PoolStatus(tool, ck.returncode == 0 and parsed, pct,
-                      reason if parsed or ck.returncode != 0 else "limit facts unavailable",
-                      None if tool == "codex" else ())
+    under = parsed and pct < ceiling
+    reason = (block_reason if blocked else
+              ("limit facts unavailable" if not parsed else
+               (yield_reason if active and not under else "")))
+    return PoolStatus(tool, (not blocked) and under, pct, reason,
+                      None if tool == "codex" else (), active, ceiling)
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,

@@ -19,10 +19,14 @@ Properties:
   crashed run) is reclaimed — atomically, taking real ownership. Shutdown removes the
   lock only if this process still owns it. Single-instance is load-bearing:
   dispatch dedup (the `agentflow:building` and `agentflow:triaging` claims) assumes one
-  daemon — each is check-then-claim, not atomic, so it dedups within one serial daemon.
+  daemon — each is check-then-claim, not atomic. Concurrent dispatch keeps that safe by
+  selecting-and-claiming serially (builds are one-per-repo; the triage fan-out reserves each
+  issue in memory before choosing the next), so two sessions never grab the same issue.
 
-M1 is serial (one issue per repo per cycle). Concurrent dispatch across pools
-(ADR 0006) is a later refinement — not a silent cap.
+Dispatch is now concurrent (ADR 0023 M6 slice 5): each cycle reclaims stale claims, then
+dispatches every repo's ready work at once — multiple builds across repos, several triages
+within a deep queue — bounded by the machine ceiling, per-stage caps, and the activity-
+adaptive ceiling/pacing (ADR 0025). Merges stay serialized (ADR 0009). See `agentflow.dispatch`.
 
 Requires a working `codex` (see AGENTFLOW_CODEX_BIN) and `claude`, `gh`, `git`, `uv`
 on PATH, and — since it spawns tool sessions — an unsandboxed environment.
@@ -40,9 +44,9 @@ import threading
 import time
 from pathlib import Path
 
-from agentflow import live
+from agentflow import dispatch, live
 from agentflow.dashboard_data import snapshot
-from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims
+from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims, recheck_once
 from agentflow.runner import _worktree_is_active, recover_stale_worktrees
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
@@ -79,12 +83,33 @@ def log(msg: str) -> None:
 
 
 def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
-    """One pass over the repos. Each is isolated: an error in one never stops the rest."""
+    """One serial pass over the repos, running `run` per repo. Each is isolated: an error in
+    one never stops the rest. Used for the passes that MUST stay serial — reclaim and the
+    merge-time re-rebase (ADR 0009) — while concurrent build/triage dispatch runs in between."""
     for cfg in repos:
         try:
             _log(f"{cfg.repo}: {run(cfg, _log=_log)}")
         except Exception as e:  # noqa: BLE001 — a bad cycle must not kill the daemon
             _log(f"{cfg.repo}: cycle error: {type(e).__name__}: {e}")
+
+
+def _reclaim(cfg: RepoConfig, _log=None) -> str:
+    cleared = reclaim_claims(cfg)
+    return f"reclaimed {cleared} stale build claim(s)" if cleared else "no stale claims"
+
+
+def _recheck(cfg: RepoConfig, _log=None) -> str:
+    return f"recheck: {recheck_once(cfg)}"
+
+
+def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
+    """One full dispatch cycle: reclaim stale claims (serial, keyed on live sessions), then
+    dispatch every repo's ready work CONCURRENTLY (bounded by the governor + activity ceiling),
+    then re-rebase merge survivors SERIALLY — merges never overlap (ADR 0009). The two serial
+    passes bookend the concurrent one; each isolates per-repo errors via `cycle`."""
+    cycle(repos, run=_reclaim, _log=_log)
+    dispatch.run_cycle(repos, _log=_log)
+    cycle(repos, run=_recheck, _log=_log)
 
 
 def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> None:
@@ -249,7 +274,7 @@ def main() -> None:
         recover_worktrees(REPOS)
         if args.once:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
-            cycle(REPOS)
+            dispatch_cycle(REPOS)
             live.mark_cycle(POLL_SECONDS)
             publish_snapshot(REPOS)
             return
@@ -259,13 +284,9 @@ def main() -> None:
         )
         while True:
             if ENABLE_FLAG.exists():
-                # Self-heal build claims stranded by a crash or a swallowed `gh` release,
-                # every cycle (serial builds mean none is live at the top of a cycle).
-                for cfg in REPOS:
-                    cleared = reclaim_claims(cfg)
-                    if cleared:
-                        log(f"{cfg.repo}: reclaimed {cleared} stale build claim(s)")
-                cycle(REPOS)
+                # Reclaim, concurrent dispatch, and merge re-rebase — reclaim now lives
+                # inside dispatch_cycle (ADR 0023 M6 slice 5), keyed on the live board.
+                dispatch_cycle(REPOS)
             else:
                 log(f"dormant (no {ENABLE_FLAG}); sleeping")
             # Stamp the daemon's status every tick (dormant or not) so the console's
