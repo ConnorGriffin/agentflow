@@ -146,7 +146,7 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     return not has_image_evidence(evidence)
 
 
-# --- gh actions (exercised live, not unit-tested) ------------------------------
+# --- gh actions ----------------------------------------------------------------
 def ci_is_green(repo: str, pr_number: int, *,
                 timeout: int | None = None,
                 interval: int | None = None) -> bool:
@@ -172,6 +172,20 @@ def ci_is_green(repo: str, pr_number: int, *,
 
 
 def squash_merge(repo: str, pr_number: int) -> bool:
+    state = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
+                  "--json", "isDraft"])
+    if state.returncode != 0:
+        return False
+    try:
+        is_draft = json.loads(state.stdout or "{}").get("isDraft")
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    if not isinstance(is_draft, bool):
+        return False
+    if is_draft:
+        ready = _run(["gh", "pr", "ready", str(pr_number), "--repo", repo])
+        if ready.returncode != 0:
+            return False
     r = _run(["gh", "pr", "merge", str(pr_number), "--repo", repo,
               "--squash", "--delete-branch"])
     return r.returncode == 0
