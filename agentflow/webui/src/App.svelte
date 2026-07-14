@@ -1,7 +1,8 @@
 <script>
   import Inbox from './Inbox.svelte';
   import Live from './Live.svelte';
-  import Stub from './Stub.svelte';
+  import Fleet from './Fleet.svelte';
+  import History from './History.svelte';
   import { deriveInbox, pct, headroomColor } from './lib/derive.js';
 
   const TABS = [
@@ -20,6 +21,16 @@
 
   let items = $derived(snap ? deriveInbox(snap) : []);
   let dispatchOn = $derived(!!(snap && snap.dispatch && snap.dispatch.enabled));
+  let historyCount = $derived(
+    (snap?.repos || []).reduce((n, r) => n + (r.recent_merges || []).length, 0),
+  );
+
+  function tabCount(key) {
+    if (key === 'inbox') return items.length;
+    if (key === 'live') return (snap?.running || []).length;
+    if (key === 'fleet') return (snap?.repos || []).length;
+    return historyCount;
+  }
 
   async function poll() {
     try {
@@ -91,7 +102,7 @@
     >
       <span class="tabnum">{t.n}</span> {t.label}
       <span class="cnt" class:alert={t.key === 'inbox' && items.length > 0}>
-        {t.key === 'inbox' ? items.length : t.key === 'live' ? (snap?.running || []).length : 0}
+        {tabCount(t.key)}
       </span>
     </button>
   {/each}
@@ -108,12 +119,12 @@
       <Live {snap} />
     </section>
   {:else if view === 'fleet'}
-    <section class="view" role="tabpanel" aria-label="Fleet">
-      <Stub title="Fleet" blurb="The repo × signals table with expand-in-place lands in a later slice." />
+    <section class="view fleet" role="tabpanel" aria-label="Fleet">
+      <Fleet {snap} />
     </section>
   {:else}
     <section class="view" role="tabpanel" aria-label="History">
-      <Stub title="History" blurb="The merged & auto-merged audit trail lands in a later slice." />
+      <History {snap} />
     </section>
   {/if}
 </main>

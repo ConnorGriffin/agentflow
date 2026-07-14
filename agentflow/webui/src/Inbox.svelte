@@ -1,10 +1,20 @@
 <script>
-  import { short } from './lib/derive.js';
+  import { short, elapsed, PARKED, HELD } from './lib/derive.js';
 
   // items: the derived worklist; selected: j/k highlight index (-1 = none)
   let { items, selected } = $props();
 
   const pad = (i) => String(i + 1).padStart(2, '0');
+
+  // A once-a-second tick so a held/parked row's "waiting" timer counts up on its own.
+  let now = $state(Date.now());
+  $effect(() => {
+    const id = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(id);
+  });
+
+  const heldAct = (it) => (HELD[it.state] || { act: 'Pickup', label: it.state });
+  const parkAct = (it) => (PARKED[it.reason] || { act: 'Resume', why: it.reason });
 </script>
 
 <div class="viewhead">
@@ -22,8 +32,8 @@
       </svg>
     </div>
     <h3>Inbox zero</h3>
-    <p>Nothing awaits your merge and no dial is ready to loosen. The fleet is running
-      itself — check Live for what it's doing now.</p>
+    <p>Nothing awaits your merge, nothing's held or parked, no dial is ready to
+      loosen. The fleet is running itself — check Live for what it's doing now.</p>
   </div>
 {:else}
   <div class="list">
@@ -47,6 +57,29 @@
             {/if}
           </div>
           <button class="qact {it.accent}" aria-label="Merge #{it.number} in {short(it.repo)}">Merge #{it.number}</button>
+        {:else if it.kind === 'held'}
+          {@const a = heldAct(it)}
+          <div class="qglyph k-held">?</div>
+          <div class="qbody">
+            <div class="qtitle"><span class="num">#{it.number}</span> {it.title}</div>
+            <div class="qmeta">
+              <b class="k-held">held</b> · {a.label} · {short(it.repo)} · {it.reason}
+            </div>
+          </div>
+          <div class="qaside">held <span>{elapsed(it.since, now)}</span></div>
+          <button class="qact held" aria-label="{a.act} on #{it.number} in {short(it.repo)}">{a.act}</button>
+        {:else if it.kind === 'parked'}
+          {@const p = parkAct(it)}
+          <div class="qglyph k-parked">‖</div>
+          <div class="qbody">
+            <div class="qtitle"><span class="num">#{it.number}</span> {it.title}</div>
+            <div class="qmeta">
+              <b class="k-parked">parked</b> · {it.reason} · {short(it.repo)} ·
+              <span class="tool-{it.builder}">{it.builder}</span>→<span class="tool-{it.reviewer}">{it.reviewer}</span> · {p.why}
+            </div>
+          </div>
+          <div class="qaside">parked <span>{elapsed(it.since, now)}</span></div>
+          <button class="qact parked" aria-label="{p.act} on #{it.number} in {short(it.repo)}">{p.act}</button>
         {:else}
           <div class="qglyph k-loosen">◉</div>
           <div class="qbody">
