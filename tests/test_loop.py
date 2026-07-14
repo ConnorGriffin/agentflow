@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from agentflow import loop
-from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck
+from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body
 from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
                             REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
                             _build_review_merge, _free_to_dispatch, _issues_in_flight,
@@ -81,11 +81,20 @@ def test_issue_of_branch_is_none_for_non_agentflow_branches():
 
 
 def test_free_to_dispatch_skips_claimed_or_in_flight():
+    cfg = RepoConfig("o/r", ".")
     ready = {"number": 5, "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
-    assert _free_to_dispatch(ready, set()) is True
-    assert _free_to_dispatch(ready, {5}) is False   # an open agentflow PR already owns it
+    assert _free_to_dispatch(cfg, ready, set()) is True
+    assert _free_to_dispatch(cfg, ready, {5}) is False   # an open agentflow PR already owns it
     claimed = {"number": 6, "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}]}
-    assert _free_to_dispatch(claimed, set()) is False   # claimed — an agent is building it
+    assert _free_to_dispatch(cfg, claimed, set()) is False   # claimed — an agent is building it
+
+
+def test_free_to_dispatch_ignores_blocked_by_in_incidental_prose(monkeypatch):
+    issue = {"number": 5, "body": "This may be Blocked by #41 after the next review.",
+             "labels": [{"name": "ready-for-agent"}]}
+    monkeypatch.setattr(loop, "_run", lambda cmd: pytest.fail("prose is not a declaration"))
+
+    assert _free_to_dispatch(RepoConfig("o/r", "."), issue, set()) is True
 
 
 def test_untriaged_skips_state_labels_and_triage_claim():
@@ -141,6 +150,104 @@ def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
     # sanity: same listing dispatches once in-flight is actually known
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 5
+
+
+def _ready_dispatch_run(ready, blocker_states):
+    def fake_run(cmd):
+        if cmd[1:3] == ["issue", "list"]:
+            return _FakeRun(json.dumps(ready))
+        if cmd[1:3] == ["issue", "view"]:
+            state = blocker_states.get(int(cmd[3]))
+            if state is None:
+                return _FakeRun(returncode=1)
+            return _FakeRun(json.dumps({"state": state}))
+        raise AssertionError(cmd)
+
+    return fake_run
+
+
+def test_next_ready_issue_skips_an_issue_blocked_by_an_open_issue(monkeypatch):
+    ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
+              "labels": [{"name": "ready-for-agent"}]}]
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", ".")) is None
+
+
+def test_next_ready_issue_logs_blocked_skip_and_selects_next_issue(monkeypatch):
+    ready = [
+        {"number": 43, "title": "independent", "body": "",
+         "labels": [{"name": "ready-for-agent"}]},
+        {"number": 42, "title": "dependent", "body": "Blocked by #41",
+         "labels": [{"name": "ready-for-agent"}]},
+    ]
+    logs = []
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    selected = _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append)
+
+    assert selected["number"] == 43
+    assert any("#42" in message and "#41" in message for message in logs)
+
+
+def test_next_ready_issue_rechecks_all_blockers_each_pass(monkeypatch):
+    ready = [{"number": 42, "title": "dependent",
+              "body": "Blocked by #40\n\nBlocked by #41",
+              "labels": [{"name": "ready-for-agent"}]}]
+    blocker_states = {40: "CLOSED", 41: "OPEN"}
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, blocker_states))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    cfg = RepoConfig("o/r", ".")
+
+    assert _next_ready_issue(cfg) is None
+    blocker_states[41] = "CLOSED"
+    assert _next_ready_issue(cfg)["number"] == 42
+
+
+def test_next_ready_issue_fails_closed_when_blocker_state_is_unknown(monkeypatch):
+    ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
+              "labels": [{"name": "ready-for-agent"}]}]
+    logs = []
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: None}))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append) is None
+    assert any("#42" in message and "#41" in message
+               and "could not be determined" in message for message in logs)
+
+
+def test_next_ready_issue_fails_closed_on_malformed_blocker_state(monkeypatch):
+    ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
+              "labels": [{"name": "ready-for-agent"}]}]
+    logs = []
+
+    def fake_run(cmd):
+        if cmd[1:3] == ["issue", "list"]:
+            return _FakeRun(json.dumps(ready))
+        if cmd[1:4] == ["issue", "view", "41"]:
+            return _FakeRun("[]")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append) is None
+    assert any("#42" in message and "#41" in message
+               and "could not be determined" in message for message in logs)
+
+
+def test_next_ready_issue_sees_blocker_preserved_by_intake(monkeypatch):
+    body = compose_ready_body("## Agent Brief\nBuild the dependent slice.",
+                              "Original request.\n\nBlocked by #41")
+    ready = [{"number": 42, "title": "dependent", "body": body,
+              "labels": [{"name": "ready-for-agent"}]}]
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert "Blocked by #41" in body
+    assert _next_ready_issue(RepoConfig("o/r", ".")) is None
 
 
 def test_reclaim_claims_strips_nothing_when_in_flight_unknown(monkeypatch):
@@ -323,6 +430,27 @@ def test_build_issue_dispatches_a_ready_free_issue(monkeypatch):
     monkeypatch.setattr(loop, "_dispatch_build",
                         lambda cfg, iss, operator=False: f"#{iss['number']}: dispatched op={operator}")
     assert build_issue(RepoConfig("o/r", "/tmp"), 5) == "#5: dispatched op=True"
+
+
+def test_build_issue_refuses_an_open_blocker(monkeypatch):
+    issue = {"number": 42, "state": "OPEN", "title": "dependent", "body": "Blocked by #41",
+             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+
+    def fake_run(cmd):
+        if cmd[1:4] == ["issue", "view", "42"]:
+            return _FakeRun(json.dumps(issue))
+        if cmd[1:4] == ["issue", "view", "41"]:
+            return _FakeRun(json.dumps({"state": "OPEN"}))
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    monkeypatch.setattr(loop, "_dispatch_build",
+                        lambda *a, **k: pytest.fail("must not bypass the blocker"))
+
+    out = build_issue(RepoConfig("o/r", "/tmp"), 42)
+
+    assert "blocker" in out.lower()
 
 
 def test_build_issue_refuses_a_held_issue_and_points_at_pickup(monkeypatch):
