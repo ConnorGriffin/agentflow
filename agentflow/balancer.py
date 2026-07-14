@@ -35,6 +35,7 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from agentflow.runner import ClaudeRunner, CodexRunner, _WorktreeRunner
 
@@ -52,6 +53,17 @@ _WEEKLY_UNATTENDED_PCT = 80.0
 IDLE_CEILING_PCT = float(os.environ.get("AGENTFLOW_IDLE_CEILING_PCT", "85"))
 ACTIVE_CEILING_PCT = float(os.environ.get("AGENTFLOW_ACTIVE_CEILING_PCT", "50"))
 ACTIVE_PACE = int(os.environ.get("AGENTFLOW_ACTIVE_PACE", "1"))
+
+# Codex learns its limits passively, from sessions it runs. When the only thing
+# blocking the pool is weekly pacing or a fact that has aged past its own window, and
+# nothing else can start a Codex session to refresh it, the pool can lock itself out
+# indefinitely (issue #75). This window is both the minimum fact age worth refreshing
+# and the minimum spacing between refresh probes, so a genuinely-exhausted pool is
+# pinged at most once per window. Default 6 hours.
+CODEX_LIMIT_REFRESH_SECONDS = float(
+    os.environ.get("AGENTFLOW_CODEX_LIMIT_REFRESH_SECONDS", "21600"))
+_STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
+_PROBE_STATE = _STATE_DIR / "codex-refresh.json"
 
 
 def ceiling_for(active: bool) -> float:
@@ -76,10 +88,16 @@ class PoolStatus:
     windows: tuple[RateLimitWindow, ...] | None = ()
     active: bool = False           # operator working interactively on this pool (ADR 0025)
     ceiling: float = IDLE_CEILING_PCT   # the spend ceiling this pool dispatched under
+    observed_at: float | None = None    # when the latest limit fact was seen (Codex)
+    refreshable: bool = False      # blocked purely by pacing/staleness — worth a probe
 
 
-def _parse_codex_windows(stdout: str) -> tuple[RateLimitWindow, ...] | None:
-    """Parse the gate adapter's structured facts. Unknown shapes fail closed."""
+def _parse_codex_facts(
+        stdout: str) -> tuple[tuple[RateLimitWindow, ...], float | None] | None:
+    """Parse the gate adapter's structured facts into `(windows, observed_at)`.
+    Unknown shapes fail closed (None). `observed_at` is when the newest fact was seen;
+    an older adapter omits it (None — the pool then simply never actively refreshes),
+    but a present-yet-malformed value fails the whole parse closed."""
     try:
         raw = json.loads(stdout)
         facts = raw["windows"]
@@ -103,7 +121,14 @@ def _parse_codex_windows(stdout: str) -> tuple[RateLimitWindow, ...] | None:
             windows.append(RateLimitWindow(used, minutes, resets_at))
         if len({window.window_minutes for window in windows}) != len(windows):
             return None
-        return tuple(sorted(windows, key=lambda window: window.window_minutes))
+        observed_at = raw.get("observed_at")
+        if observed_at is not None:
+            if (isinstance(observed_at, bool)
+                    or not isinstance(observed_at, (int, float))
+                    or not math.isfinite(observed_at) or observed_at <= 0):
+                return None
+            observed_at = float(observed_at)
+        return tuple(sorted(windows, key=lambda window: window.window_minutes)), observed_at
     except (KeyError, TypeError, ValueError, OverflowError, json.JSONDecodeError):
         return None
 
@@ -138,6 +163,9 @@ def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
     if status.windows is None:
         return PoolStatus(status.tool, False, 100.0, "limit facts unavailable", None)
     paced, pace_reason = _codex_pacing(status.windows, now)
+    # A block is *refreshable* only when the pool was otherwise clear (no operator
+    # activity, no short-window capacity block, valid facts) and pacing/staleness is the
+    # sole reason it can't dispatch — the one case an active fact refresh can unstick.
     return PoolStatus(
         status.tool,
         status.clear and paced,
@@ -146,6 +174,8 @@ def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
         status.windows,
         status.active,
         status.ceiling,
+        status.observed_at,
+        refreshable=status.clear and not paced,
     )
 
 
@@ -212,14 +242,15 @@ def _query_pool(tool: str, operator: bool = False) -> PoolStatus:
     # Known legacy spend/check text remains compatible. Structured Codex facts are
     # mandatory for unattended dispatch; an older adapter therefore fails closed.
     if tool == "codex":
-        windows = (_parse_codex_windows(limits.stdout)
-                   if limits is not None and limits.returncode == 0 else None)
-        if windows is not None:
+        facts = (_parse_codex_facts(limits.stdout)
+                 if limits is not None and limits.returncode == 0 else None)
+        if facts is not None:
+            windows, observed_at = facts
             pct = _codex_spent_pct(windows)
             under = pct < ceiling
             reason = block_reason if blocked else (yield_reason if active and not under else "")
             return PoolStatus(tool, (not blocked) and under, pct, reason,
-                              windows, active, ceiling)
+                              windows, active, ceiling, observed_at)
 
     legacy = sp.stdout if sp.stdout.strip().startswith("spend:") else ck_stdout
     pct = parse_pct(legacy, 0)
@@ -230,6 +261,37 @@ def _query_pool(tool: str, operator: bool = False) -> PoolStatus:
                (yield_reason if active and not under else "")))
     return PoolStatus(tool, (not blocked) and under, pct, reason,
                       None if tool == "codex" else (), active, ceiling)
+
+
+def _last_probe_at() -> float:
+    """When the last Codex refresh probe was attempted, persisted across daemon restarts.
+    Absent or malformed state reads as never (0.0), so a first probe is always allowed."""
+    try:
+        return float(json.loads(_PROBE_STATE.read_text())["last_probe_at"])
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return 0.0
+
+
+def _record_probe_attempt(now: float) -> None:
+    """Stamp a probe attempt *before* it runs, so a failed or hung probe is still bounded
+    by the cooldown. Best-effort — an unwritable state dir must not stop dispatch."""
+    try:
+        _PROBE_STATE.parent.mkdir(parents=True, exist_ok=True)
+        _PROBE_STATE.write_text(json.dumps({"last_probe_at": now}))
+    except OSError:
+        pass
+
+
+def _should_refresh_codex(status: PoolStatus, now: float) -> bool:
+    """Whether a blocked Codex pool warrants one active fact refresh. Fail-closed: only a
+    pure pacing/staleness block, with facts at least the refresh age old and no probe
+    within the cooldown, qualifies. Activity, capacity, and invalid facts never do."""
+    if (status.clear or status.active or not status.refreshable
+            or status.observed_at is None):
+        return False
+    if now - status.observed_at < CODEX_LIMIT_REFRESH_SECONDS:
+        return False
+    return now - _last_probe_at() >= CODEX_LIMIT_REFRESH_SECONDS
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,
@@ -246,7 +308,15 @@ def pick_pair(claude: _WorktreeRunner | None = None,
     cs = _query_pool("claude", operator)
     xs = _query_pool("codex", operator)
     if not operator:
-        xs = _codex_dispatch_status(xs, time.time())
+        now = time.time()
+        xs = _codex_dispatch_status(xs, now)
+        # If pacing/staleness is the *only* thing blocking Codex and its facts are old,
+        # run one cheap marked probe to land a fresh fact, then re-decide from it. The
+        # probe is bounded to one per refresh window and never re-enters pick_pair.
+        if _should_refresh_codex(xs, now):
+            _record_probe_attempt(now)
+            codex.probe()
+            xs = _codex_dispatch_status(_query_pool("codex", operator), time.time())
     builder, reviewer = choose_pair(cs, xs, {"claude": claude, "codex": codex})
     if builder is not None:
         return builder, reviewer, ""
