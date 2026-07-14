@@ -1,11 +1,13 @@
 """The daemon's public lifecycle: polling, snapshot publishing, and cycle isolation."""
 
+import json
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from unittest import mock
 
 from agentflow import daemon, live
@@ -80,6 +82,48 @@ def test_cycle_passes_log_into_run():
     cycle([B], run=run, _log=emitted.append)
     assert any("routing → codex" in m for m in emitted)   # dispatch-start line appeared
     assert any("build: ok" in m for m in emitted)          # result line also appeared
+
+
+def test_reclaim_cycle_clears_a_stranded_triaging_claim(monkeypatch):
+    # The daemon's reclaim pass runs at the top of every cycle. A claim left by a daemon killed
+    # mid-grounding — carrying no intake state label — must be cleared here and logged distinctly
+    # from a build reclaim, so the stalled issue re-enters the intake queue (issue #74).
+    from agentflow import loop
+
+    stranded = {"number": 69, "labels": [{"name": "agentflow:triaging"}]}
+
+    def fake_run(cmd):
+        if "--label" in cmd and "agentflow:triaging" in cmd:
+            return SimpleNamespace(stdout=json.dumps([stranded]), returncode=0)
+        return SimpleNamespace(stdout="[]", returncode=0)   # no build claims
+
+    released = []
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
+
+    logs = []
+    cycle([A], run=daemon._reclaim, _log=logs.append)
+
+    assert released == [69]
+    assert any("reclaimed 1 stale triaging claim(s)" in m for m in logs)
+
+
+def test_reclaim_cycle_strips_nothing_on_github_error(monkeypatch):
+    # Fail closed: a `gh` blip during the cycle must reclaim neither build nor triaging claims.
+    from agentflow import loop
+
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(stdout="", returncode=1))
+    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(("build", n)))
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(("triage", n)))
+
+    logs = []
+    cycle([A], run=daemon._reclaim, _log=logs.append)
+
+    assert released == []
+    assert any("no stale claims" in m for m in logs)
 
 
 def test_main_once_runs_one_cycle_and_exits(tmp_path):
