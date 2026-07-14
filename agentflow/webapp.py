@@ -6,7 +6,10 @@ console and one read-only endpoint, `GET /api/snapshot`, whose body is exactly w
 `server.py` dashboard keeps running untouched until parity is reached.
 
 Two clocks (ADR 0023): the browser polls every few seconds, but every GitHub-backed
-snapshot is reused for ~15s so a fast poll never multiplies `gh` calls. That reuse is
+snapshot is reused for ~120s so a fast poll never multiplies `gh` calls — one
+production is ~6 GraphQL queries per enrolled repo, and the hourly GraphQL quota is
+5,000, so the reuse window is what keeps a watched console from starving the
+pipeline's own `gh` reads (see ADR 0026 for the durable shape). That reuse is
 the whole point of `SnapshotCache`, whose one method hides the TTL, the timestamp, and
 the single-flight lock behind `get()`.
 
@@ -37,7 +40,7 @@ class SnapshotCache:
         self,
         produce: Callable[[], Any],
         *,
-        ttl: float = 15.0,
+        ttl: float = 120.0,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._produce = produce
@@ -60,7 +63,7 @@ def create_app(
     repos: list,
     dispatch_enabled: Callable[[], bool],
     *,
-    ttl: float = 15.0,
+    ttl: float = 120.0,
     clock: Callable[[], float] = time.monotonic,
     dist: Path = DIST,
 ):

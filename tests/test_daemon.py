@@ -189,6 +189,9 @@ def test_main_serves_live_dispatch_state_without_a_separate_dashboard(tmp_path):
         mock.patch("agentflow.daemon.log"),
         mock.patch("agentflow.dashboard_data.pools", return_value=[]),
         mock.patch.object(server, "PORT", port),
+        # This test watches dispatch state *change*; the reuse window trades that
+        # latency for GraphQL quota (ADR 0026) and is not what's under test here.
+        mock.patch.object(server, "SNAPSHOT_TTL", 0.0),
         mock.patch.object(sys, "argv", ["daemon"]),
     ):
         thread = threading.Thread(target=run_daemon)

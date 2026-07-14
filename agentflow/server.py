@@ -19,20 +19,18 @@ from pathlib import Path
 
 from agentflow.dashboard_data import snapshot
 from agentflow.loop import RepoConfig
+from agentflow.webapp import SnapshotCache
 
 PORT = int(os.environ.get("AGENTFLOW_DASH_PORT", "8787"))
+SNAPSHOT_TTL = 120.0  # seconds a produced snapshot is reused (ADR 0026 hotfix)
 _PAGE = (Path(__file__).parent / "static" / "dashboard.html").read_text()
 
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802 — stdlib name
         if self.path.startswith("/api/snapshot"):
-            server = self.server
-            body = snapshot(
-                server.repos,
-                dispatch_enabled=server.dispatch_enabled(),
-            )
-            self._send(200, "application/json", json.dumps(body).encode())
+            self._send(200, "application/json",
+                       json.dumps(self.server.snapshot_cache.get()).encode())
         elif self.path in ("/", "/index.html"):
             self._send(200, "text/html; charset=utf-8", _PAGE.encode())
         else:
@@ -60,6 +58,13 @@ class DashboardHTTPServer(ThreadingHTTPServer):
     ) -> None:
         self.repos = repos
         self.dispatch_enabled = dispatch_enabled
+        # A watched tab polls every few seconds; without this reuse window every poll
+        # pays the full ~6-GraphQL-queries-per-repo price and one open tab can exhaust
+        # the hourly quota by itself (ADR 0026).
+        self.snapshot_cache = SnapshotCache(
+            lambda: snapshot(repos, dispatch_enabled=dispatch_enabled()),
+            ttl=SNAPSHOT_TTL,
+        )
         super().__init__(address, Handler)
 
 
