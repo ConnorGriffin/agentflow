@@ -16,7 +16,8 @@ from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, 
                             _rebase_survivor, _untriaged, base_advanced, build_issue,
                             complexity_from_labels, conflict_already_flagged, effort_from_labels,
                             held_build_result, intake_allowlist, issue_of_branch, pr_number,
-                            produce_once, reclaim_claims, recheck_once, repo_profile,
+                            produce_once, reclaim_claims, reclaim_triage_claims,
+                            recheck_once, repo_profile,
                             respond_once, slug, ui_surfaces)
 from agentflow.reviewer import Verdict
 from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
@@ -284,6 +285,62 @@ def test_reclaim_keeps_a_claim_a_live_session_still_holds(monkeypatch):
     # #7 has a live session → kept; #8 has neither PR nor session → genuinely stale.
     assert reclaim_claims(RepoConfig("o/r", ".")) == 1
     assert released == [8]
+
+
+def _triaging(number: int, *state_labels: str) -> dict:
+    return {"number": number,
+            "labels": [{"name": "agentflow:triaging"}] + [{"name": s} for s in state_labels]}
+
+
+def test_reclaim_triage_frees_a_stranded_claim_for_the_intake_queue(monkeypatch):
+    # A daemon killed mid-grounding leaves the triaging claim on the issue with no state label
+    # stamped yet — the queue then skips it forever. The cycle must clear it so it re-enters.
+    stranded = _triaging(69)
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([stranded])))
+    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
+
+    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 1
+    assert released == [69]
+    # Dropping the claim (its only queue-excluding label) makes the issue selectable again.
+    assert _untriaged({"number": 69, "labels": []})
+
+
+def test_reclaim_triage_keeps_a_claim_with_an_intake_outcome(monkeypatch):
+    # A claim alongside a state label is a genuinely-triaged issue (or a rarer double failure,
+    # out of scope) — the no-outcome reclaim must not touch it.
+    resolved = _triaging(70, "ready-for-agent")
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([resolved])))
+    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
+
+    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 0
+    assert released == []
+
+
+def test_reclaim_triage_keeps_a_claim_a_live_session_still_holds(monkeypatch):
+    # An intake genuinely in flight this cycle has no state label yet — the live board, not
+    # cycle position, is what keeps its claim (the seam for concurrent dispatch, issue #74).
+    stranded, live_now = _triaging(69), _triaging(70)
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([stranded, live_now])))
+    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: {70})
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
+
+    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 1
+    assert released == [69]
+
+
+def test_reclaim_triage_strips_nothing_when_listing_errors(monkeypatch):
+    # Fail closed, exactly as the build path does: a `gh` blip must never strip a live claim.
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(returncode=1))
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
+
+    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 0
+    assert released == []
 
 
 def test_held_build_result_holds_instead_of_requeueing():

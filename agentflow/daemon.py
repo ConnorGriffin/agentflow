@@ -54,7 +54,8 @@ from pathlib import Path
 
 from agentflow import dispatch, live
 from agentflow.dashboard_data import snapshot
-from agentflow.loop import RepoConfig, pipeline_once, reclaim_claims, recheck_once
+from agentflow.loop import (RepoConfig, pipeline_once, reclaim_claims,
+                            reclaim_triage_claims, recheck_once)
 from agentflow.probe import ChangeProbe
 from agentflow.runner import _worktree_is_active, recover_stale_worktrees
 
@@ -112,8 +113,14 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
 
 
 def _reclaim(cfg: RepoConfig, _log=None) -> str:
-    cleared = reclaim_claims(cfg)
-    return f"reclaimed {cleared} stale build claim(s)" if cleared else "no stale claims"
+    builds = reclaim_claims(cfg)
+    triaging = reclaim_triage_claims(cfg)
+    parts = []
+    if builds:
+        parts.append(f"reclaimed {builds} stale build claim(s)")
+    if triaging:
+        parts.append(f"reclaimed {triaging} stale triaging claim(s)")
+    return ", ".join(parts) if parts else "no stale claims"
 
 
 def _recheck(cfg: RepoConfig, _log=None) -> str:
