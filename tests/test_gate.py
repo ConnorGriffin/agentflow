@@ -11,7 +11,8 @@ import pytest
 
 import agentflow.gate as gate
 from agentflow.gate import (MergeDecision, ci_is_green, decide_merge, has_image_evidence,
-                            maintainer_comment, reply_pending, touches_ui_surface)
+                            maintainer_comment, reply_pending, squash_merge,
+                            touches_ui_surface)
 from agentflow.reviewer import Finding, Verdict
 
 CLEAN = Verdict(clean=True)
@@ -84,6 +85,58 @@ def test_ci_poll_returns_true_when_checks_pass(monkeypatch):
     """Checks that pass on the first poll return True immediately."""
     monkeypatch.setattr(gate, "_run", _pass)
     assert ci_is_green("o/r", 1, timeout=30, interval=1) is True
+
+
+_VIEW_DRAFT = ["gh", "pr", "view", "7", "--repo", "o/r", "--json", "isDraft"]
+_MARK_READY = ["gh", "pr", "ready", "7", "--repo", "o/r"]
+_SQUASH_MERGE = [
+    "gh", "pr", "merge", "7", "--repo", "o/r", "--squash", "--delete-branch",
+]
+
+
+def _record_commands(monkeypatch, *responses):
+    commands = []
+    results = iter(responses)
+
+    def run(cmd):
+        commands.append(cmd)
+        returncode, stdout = next(results)
+        return subprocess.CompletedProcess(
+            cmd, returncode=returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(gate, "_run", run)
+    return commands
+
+
+def test_squash_merge_marks_a_draft_ready_before_merging(monkeypatch):
+    commands = _record_commands(
+        monkeypatch, (0, '{"isDraft": true}'), (0, ""), (0, ""))
+
+    assert squash_merge("o/r", 7) is True
+    assert commands == [_VIEW_DRAFT, _MARK_READY, _SQUASH_MERGE]
+
+
+def test_squash_merge_merges_an_already_ready_pr(monkeypatch):
+    commands = _record_commands(monkeypatch, (0, '{"isDraft": false}'), (0, ""))
+
+    assert squash_merge("o/r", 7) is True
+    assert commands == [_VIEW_DRAFT, _SQUASH_MERGE]
+
+
+@pytest.mark.parametrize("response", [(1, ""), (0, "{}"), (0, "not json")])
+def test_squash_merge_does_not_merge_when_draft_state_cannot_be_determined(
+        monkeypatch, response):
+    commands = _record_commands(monkeypatch, response)
+
+    assert squash_merge("o/r", 7) is False
+    assert commands == [_VIEW_DRAFT]
+
+
+def test_squash_merge_does_not_merge_when_marking_ready_fails(monkeypatch):
+    commands = _record_commands(monkeypatch, (0, '{"isDraft": true}'), (1, ""))
+
+    assert squash_merge("o/r", 7) is False
+    assert commands == [_VIEW_DRAFT, _MARK_READY]
 
 
 # --- the mechanical UI-evidence gate (ADR 0018) --------------------------------
