@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
-from agentflow import ratchet
+from agentflow import live, ratchet
 from agentflow.balancer import pick_pair
 from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
                             maintainer_comment, park, reply_pending, squash_merge,
@@ -354,7 +354,7 @@ def _finish_review(cfg: RepoConfig, reviewer_tool: str, pr: int, sl: str,
 
 
 def _launch_revise(builder, cfg: RepoConfig, pr: int, n: int, sl: str,
-                   complexity: Complexity, verdict: Verdict) -> None:
+                   complexity: Complexity, verdict: Verdict, title: str = "") -> None:
     """One builder pass addressing the blocking findings on the PR branch (ADR 0020)."""
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking) or "- (see review)"
     surfaces = _surfaces_phrase(ui_surfaces(cfg.workdir))
@@ -363,9 +363,12 @@ def _launch_revise(builder, cfg: RepoConfig, pr: int, n: int, sl: str,
     if not _checkout_pr_branch(cfg, branch, wt):
         return
     builder.provision(wt)
-    with worktree_session(wt):
+    model = builder.model_for(complexity)
+    session = live.Session(repo=cfg.repo, number=n, title=title, stage="building",
+                           tool=builder.tool, model=model, branch=branch)
+    with worktree_session(wt, session):
         ok, _ = builder.launch(REVISE_PROMPT.format(n=pr, findings=findings, surfaces=surfaces),
-                               cwd=str(wt), model=builder.model_for(complexity))
+                               cwd=str(wt), model=model)
     if ok:
         remove_worktree_if_safe(cfg.workdir, wt)
 
@@ -515,7 +518,8 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
                         build_prompt: str) -> str:
     """Build the issue, then cross-review -> merge/park. Runs under run_once's
     `agentflow:building` claim (dispatch dedup)."""
-    task = BuildTask(cfg.repo, cfg.workdir, n, sl, complexity, effort, prompt=build_prompt)
+    task = BuildTask(cfg.repo, cfg.workdir, n, sl, complexity, effort, prompt=build_prompt,
+                     title=issue.get("title", ""))
     outcome = builder.build(task)
     if outcome.status is not BuildStatus.PR_OPENED:
         # Stuck (a bail marker, or ran with no PR). Preserve the work as a draft PR so
@@ -540,6 +544,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
     reviewer_runner = reviewer_runner or builder
     reviewer = Reviewer(reviewer_runner)
     acceptance = issue.get("body") or ""
+    title = issue.get("title", "")
 
     if profile != "autonomous":
         # reviewed / guarded: revise until the review is clean (or we bail), then a
@@ -547,7 +552,8 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
         revises_used = 0
         while True:
             verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl,
-                                      acceptance=acceptance, surfaces=surfaces_phrase)
+                                      acceptance=acceptance, surfaces=surfaces_phrase,
+                                      issue_number=n, title=title)
             if verdict.clean or not (verdict.parsed and verdict.blocking) or revises_used >= MAX_REVISES:
                 # A human merges either way, but the mechanical UI-evidence gate still runs
                 # (ADR 0018): a screenshot-less UI change must park with the missing-screenshot
@@ -559,13 +565,14 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
                 notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
                        _pr_url(cfg.repo, pr))
                 return f"#{n}: PR #{pr} reviewed ({profile}) — awaiting human merge"
-            _launch_revise(builder, cfg, pr, n, sl, complexity, verdict)
+            _launch_revise(builder, cfg, pr, n, sl, complexity, verdict, title=title)
             revises_used += 1
 
     revises_used = 0
     while True:
         verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl,
-                                  acceptance=acceptance, surfaces=surfaces_phrase)
+                                  acceptance=acceptance, surfaces=surfaces_phrase,
+                                  issue_number=n, title=title)
         # The UI-evidence gate is read from the diff + attachments, AFTER the review, so a
         # reviewer's "not blocking" cannot clear a screenshot-less UI change (ADR 0018).
         ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
@@ -598,7 +605,7 @@ def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexit
             notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",
                    _pr_url(cfg.repo, pr))
             return f"#{n}: parked PR #{pr} for human review"
-        _launch_revise(builder, cfg, pr, n, sl, complexity, verdict)
+        _launch_revise(builder, cfg, pr, n, sl, complexity, verdict, title=title)
         revises_used += 1
 
 
@@ -906,8 +913,11 @@ def produce_once(cfg: RepoConfig, _log=None) -> str:
             builder.provision(wt)
         except subprocess.CalledProcessError as e:
             return f"#{n}: mockup worktree/provision failed ({e})"
-        with worktree_session(wt):
-            ok, _ = builder.launch(prompt, cwd=str(wt), model=builder.model_for(Complexity.DEEP))
+        model = builder.model_for(Complexity.DEEP)
+        session = live.Session(repo=cfg.repo, number=n, title=issue["title"], stage="triaging",
+                               tool=builder.tool, model=model, branch=branch)
+        with worktree_session(wt, session):
+            ok, _ = builder.launch(prompt, cwd=str(wt), model=model)
         if not ok:
             return f"#{n}: mockup session errored"
         # Confirm what was actually posted — a successful exit alone doesn't prove a comment landed.

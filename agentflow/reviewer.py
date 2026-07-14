@@ -31,6 +31,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from agentflow import live
 from agentflow.runner import Complexity, _WorktreeRunner, _run, worktree_session
 
 # Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
@@ -191,7 +192,8 @@ class Reviewer:
 
     def review(self, repo: str, workdir: str, pr_number: int, pr_head_branch: str,
                slug: str, acceptance: str = "",
-               surfaces: str = "any user-facing surface") -> Verdict:
+               surfaces: str = "any user-facing surface",
+               issue_number: int | None = None, title: str = "") -> Verdict:
         head_sha = self._head_sha(repo, pr_number)
         if not head_sha:
             return _unparseable("could not read PR head SHA")
@@ -209,7 +211,10 @@ class Reviewer:
                                       surfaces=surfaces)
         # Cross-review is always the deep safety net, independent of builder sizing.
         model = self.runner.model_for(Complexity.DEEP)
-        with worktree_session(wt):
+        session = live.Session(repo=repo, number=issue_number if issue_number is not None else pr_number,
+                               title=title, stage="reviewing", tool=self.runner.tool,
+                               model=model, branch=pr_head_branch)
+        with worktree_session(wt, session):
             ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
         if not ok:
             return _unparseable("reviewer session errored (launch non-zero)")

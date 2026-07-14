@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from agentflow import live
 from agentflow.runner import Complexity, Effort, _WorktreeRunner, _run, worktree_session
 
 _FENCE_RE = re.compile(r"```[a-zA-Z]*\s*\n(.*?)\n```", re.DOTALL)
@@ -379,9 +380,11 @@ class Intake:
                        "rather than restate myself.\n"
                        f"---\n{extra}\n---")
         # Ground at the capable tier — a cheap model that mis-scopes is the expensive miss.
-        with worktree_session(wt):
-            ok, message = self.runner.launch(
-                prompt, cwd=str(wt), model=self.runner.model_for(Complexity.DEEP))
+        model = self.runner.model_for(Complexity.DEEP)
+        session = live.Session(repo=repo, number=n, title=issue.get("title", ""),
+                               stage="triaging", tool=self.runner.tool, model=model, branch=None)
+        with worktree_session(wt, session):
+            ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
         if not ok:
             return _infra_failed("intake session errored (launch non-zero)")
         return parse_intake(message)
