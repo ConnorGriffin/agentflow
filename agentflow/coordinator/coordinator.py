@@ -1,46 +1,33 @@
 """The deep session coordinator (ADR 0030) — one owner for one logical stage session.
 
-Stage orchestration submits the facts for one logical stage and later consumes its
-completed outcome or human hold. Everything hard lives behind that seam: the continuation
-record and its four states, the waiting queue and ADR 0028 ordering, the attempt budget,
-the reviewed five-permit admission matrix, atomic permit accounting on the running-record
-ledger, the crash-safe provider start handshake, outcome-first classification, and
-reconciliation. SQLite, admission demand, attempt numbers, and provider observations are
-private implementation details — the public control surface is only ``submit`` /
-``submit_stage`` and ``cycle``.
+Stage orchestration ``submit_stage``s the facts for one logical stage and later ``cycle``s a
+pool to collect the completed stage outcomes and human holds that reconciliation produced.
+Those two calls are the whole public surface. Everything hard lives behind them: the
+continuation record and its four states, the waiting queue and ADR 0028 ordering, the
+attempt budget, the reviewed five-permit admission matrix, the atomic permit reservation on
+the running-record ledger, the crash-safe provider start handshake, outcome-first
+classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
+provider observations are private implementation details.
 
-This slice is intentionally dormant: no production pipeline stage submits work here yet. It
-makes the later Build tracer small enough to review while proving the interface and the
-crash boundaries with executable fake providers. The internal transitions
-(``_begin_start`` … ``_finish``) are the mechanics ``cycle`` composes; the historical replay
-harness drives them white-box to prove the policy, but production callers never touch them.
+This slice is intentionally dormant: no production pipeline stage submits work here yet, so
+the current legacy pipeline behavior cannot change. It makes the later Build tracer small
+enough to review while proving the interface and the crash boundaries with an injected
+launcher, gate, and observer.
 """
 
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
-from pathlib import Path
 
 from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, MODEL_FOR, PERMIT_BUDGET, STAGE_NATIVE_HANDOFF,
     admission_demand, normalize_stage)
 from agentflow.coordinator.launcher import (
     NOT_STARTED, STARTED, LocalLauncher, pid_family_alive)
+from agentflow.coordinator.providers import ProviderObservation
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
-from agentflow.coordinator.store import Store
-
-
-@dataclass(frozen=True)
-class Gates:
-    """The independent preconditions that must all pass for one provider start (ADR 0029):
-    current headroom, the machine ceiling, the per-stage cap, and operator pacing. Permits
-    compose *with* these, they do not replace them."""
-
-    headroom: bool = True
-    machine: bool = True
-    stage: bool = True
-    pace: bool = True
+from agentflow.coordinator.store import Store, default_store_path
 
 
 @dataclass(frozen=True)
@@ -62,21 +49,40 @@ class Submission:
     builder_lineage: str | None = None
 
 
-class Coordinator:
-    """One logical-stage session owner backed by a private, versioned SQLite store.
+@dataclass(frozen=True)
+class StageOutcome:
+    """A terminal fact ``cycle`` returns for stage orchestration to consume: a stage that
+    completed or a human hold. Nothing about the record's private state crosses the seam."""
 
-    Construct it against a store path; a fresh instance over the same path reconstructs the
-    working set, which is how the crash boundaries are recovered. ``submit`` is idempotent
-    for a stage identity; ``cycle`` reconciles, then admits eligible continuations ahead of
-    cold work with strict head-of-line blocking, starting each through the crash-safe
-    launcher. If the store is unreadable it raises ``StoreUnavailable`` and the caller starts
-    nothing and clears no claim (fail-closed).
+    identity: str
+    stage: str
+    status: str                    # completed | held
+    handoff: str | None = None     # the stage-native human handoff kind, for a hold
+
+
+class Coordinator:
+    """One logical-stage session owner backed by a private, versioned SQLite store under the
+    agentflow state directory (``AGENTFLOW_STATE``).
+
+    A fresh instance over the same state directory reconstructs the working set, which is how
+    the crash boundaries are recovered. ``submit_stage`` is idempotent for a stage identity.
+    ``cycle`` reconciles first — returning the completed outcomes and holds that reconciliation
+    settled — then admits eligible continuations ahead of cold work with strict head-of-line
+    blocking, starting each through the crash-safe launcher. If the store is unreadable the
+    constructor raises and the caller starts nothing and clears no claim (fail-closed).
+
+    The launcher, admission gate, provider observer, and family-liveness probe are injected so
+    the crash boundaries can be exercised with fakes; production uses the real spawning
+    launcher and pid liveness.
     """
 
-    def __init__(self, store_path: Path | str, *, launcher: LocalLauncher | None = None,
+    def __init__(self, *, launcher=None, gate=None, observe=None, verify=None,
                  is_alive=pid_family_alive) -> None:
-        self._store = Store(store_path)
+        self._store = Store(default_store_path())
         self._launcher = launcher or LocalLauncher()
+        self._gate = gate or (lambda record: True)
+        self._observe = observe or (lambda record: ProviderObservation())
+        self._verify = verify or (lambda record, obs: False)
         self._is_alive = is_alive
         self._lock = threading.RLock()
         self.records: dict[str, Record] = self._store.load()
@@ -97,17 +103,19 @@ class Coordinator:
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
             lineage=submission.pool if stage in CODE_WRITING else None)
-        self.submit(record)
+        with self._lock:
+            existing = self.records.setdefault(identity, record)
+            if existing is record:
+                self._persist(record)
         return identity
 
-    def cycle(self, pool: str, *, now: int = 0,
-              gates_by_id: dict[str, Gates] | None = None) -> list[str]:
-        """Reconcile, then admit eligible continuations first with strict head-of-line
-        blocking, starting each through the launcher. Returns the identities started this
-        cycle; terminal outcomes are read from the reconciled records."""
+    def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
+        """Reconcile, returning the stage outcomes and holds settled this cycle, then admit
+        eligible continuations first with strict head-of-line blocking, starting each through
+        the launcher. Newly started attempts run beyond this cycle and surface as outcomes in
+        a later cycle's reconciliation."""
         with self._lock:
-            gates_by_id = gates_by_id or {}
-            self.reconcile()
+            outcomes = self._reconcile()
             waiting = [r for r in self.records.values()
                        if r.pool == pool and r.state == WAITING and not r.hold_pending]
             continuations = sorted(
@@ -115,97 +123,91 @@ class Coordinator:
                 key=lambda r: (r.eligible_at, r.created_at, r.identity))
             cold = sorted((r for r in waiting if not r.continuation),
                           key=lambda r: r.identity)
-            admitted: list[str] = []
             for record in continuations:
-                if not self._start(record, gates_by_id.get(record.identity, Gates())):
-                    return admitted  # first blocked continuation stops the pool this cycle
-                admitted.append(record.identity)
+                if not self._admit(record):
+                    return outcomes  # first blocked continuation stops the pool this cycle
             for record in cold:
-                if self._start(record, gates_by_id.get(record.identity, Gates())):
-                    admitted.append(record.identity)
-            return admitted
-
-    def reconcile(self) -> None:
-        """Resolve every ambiguous running record from its durable start fact and family
-        liveness (ADR 0028/0030). A committed reservation with ``not_started`` returns to
-        ``waiting`` without consuming an attempt; a ``started`` family always counts and is
-        classified incomplete once it is no longer alive. An unresolved reservation fails
-        closed — it keeps its permits until the process is proven ended."""
-        with self._lock:
-            for record in list(self.records.values()):
-                if record.state != RUNNING:
-                    continue
-                if record.start_fact == NOT_STARTED:
-                    self._release(record)
-                    record.state = WAITING
-                    self._persist(record)
-                elif record.start_fact is None:
-                    # The launcher never durably recorded a start, so no provider family can
-                    # exist (it records `started` before replacing itself). If nothing is
-                    # alive, this is `not_started`: release and preserve the attempt count. A
-                    # still-alive launcher family fails closed and keeps its permits.
-                    if not self._is_alive(record.family):
-                        self._release(record)
-                        record.state = WAITING
-                        self._persist(record)
-                elif record.start_fact == STARTED and record.family is not None:
-                    # A durable `started` always consumes its one attempt, even if the daemon
-                    # died before the live commit could count it. Then only a proven-dead
-                    # family may be downgraded; an unknown-liveness family fails closed and
-                    # keeps its permits until the process is proven ended.
-                    was_committed = record.attempt_committed
-                    self._consume_attempt(record)
-                    alive = self._is_alive(record.family)
-                    if not alive:
-                        record.process_alive = False
-                        self._finish(record, provider="incomplete", outcome=False)
-                    elif not was_committed:
-                        self._persist(record)
+                self._admit(record)
+            return outcomes
 
     def permits(self, pool: str) -> int:
         """Read-only projection of the permits in use on ``pool`` (the running-record ledger).
         Like the live board, this is a projection of running records, never a control knob."""
         return self._store.permits_used(pool)
 
-    # --- white-box mechanics (private; the replay harness drives these) -----------------
+    # --- reconciliation -----------------------------------------------------------------
 
-    def submit(self, record: Record) -> Record:
-        with self._lock:
-            existing = self.records.setdefault(record.identity, record)
-            if existing is record:
+    def _reconcile(self) -> list[StageOutcome]:
+        """Resolve every ambiguous running record from its durable start fact and family
+        liveness (ADR 0028/0030), returning the outcomes that terminated this cycle. The
+        working set is reloaded first so a child's cross-process ``started`` write and any
+        concurrent instance's writes are observed. A committed reservation with no durable
+        start whose family is dead returns to ``waiting`` without consuming an attempt; a
+        ``started`` family always counts and is classified once it is no longer alive. An
+        unresolved reservation fails closed — it keeps its permits until the process ends."""
+        self.records = self._store.load()
+        outcomes: list[StageOutcome] = []
+        for record in list(self.records.values()):
+            if record.state != RUNNING:
+                continue
+            if record.start_fact == NOT_STARTED:
+                self._release(record)
+                record.state = WAITING
                 self._persist(record)
-            return existing
+            elif record.start_fact is None:
+                # The launcher never durably recorded a start, so no provider family can
+                # exist (the child records `started` before replacing itself). If nothing is
+                # alive, this is not-started: release and preserve the attempt count.
+                if not self._is_alive(record.family):
+                    self._release(record)
+                    record.state = WAITING
+                    self._persist(record)
+            elif record.start_fact == STARTED and record.family is not None:
+                # A durable `started` always consumes its one attempt, even if the daemon
+                # died before the live commit could count it. Then only a proven-dead family
+                # is classified; an unknown-liveness family fails closed and keeps its permits.
+                was_committed = record.attempt_committed
+                self._consume_attempt(record)
+                if not self._is_alive(record.family):
+                    outcome = self._finalize(record)
+                    if outcome is not None:
+                        outcomes.append(outcome)
+                elif not was_committed:
+                    self._persist(record)
+        return outcomes
 
-    def _permits_used(self, pool: str) -> int:
-        return self._store.permits_used(pool)
+    # --- admission ----------------------------------------------------------------------
 
-    def _start(self, record: Record, gates: Gates) -> bool:
-        if not self._begin_start(record, gates):
+    def _admit(self, record: Record) -> bool:
+        if not self._begin_start(record):
             return False
-        result = self._launcher.start(record, self._persist)
+        result = self._launcher.start(record, self._store)
         self._commit_start(record, result.fact, result.family)
         return result.fact == STARTED
 
-    def _begin_start(self, record: Record, gates: Gates = Gates()) -> bool:
-        with self._lock:
-            if (record.state != WAITING or record.hold_pending
-                    or record.attempts >= ATTEMPT_BUDGET):
-                return False
-            if record.pool not in {"claude", "codex"}:
-                return False  # no permit ledger to charge an unknown pool (ADR 0029)
-            if record.stage in CODE_WRITING and record.pool != record.lineage:
-                return False
-            if not all((gates.headroom, gates.machine, gates.stage, gates.pace)):
-                return False
-            if self._permits_used(record.pool) + record.demand > PERMIT_BUDGET:
-                return False
-            record.state = RUNNING
+    def _begin_start(self, record: Record) -> bool:
+        if (record.state != WAITING or record.hold_pending
+                or record.attempts >= ATTEMPT_BUDGET):
+            return False
+        if record.pool not in {"claude", "codex"}:
+            return False  # no permit ledger to charge an unknown pool (ADR 0029)
+        if record.stage in CODE_WRITING and record.pool != record.lineage:
+            return False  # a code-writing stage may not silently leave its pinned lineage
+        if not self._gate(record):
+            return False  # an independent admission gate (headroom, ceiling, cap, pacing)
+        # Flip to a reservation and atomically claim the demand on the ledger; the store
+        # reads availability and writes the running row under one lock, so concurrent
+        # instances cannot push a pool past its five-permit budget (ADR 0029/0030).
+        record.state = RUNNING
+        record.start_fact = None
+        record.family = None
+        record.process_alive = False
+        record.attempt_committed = False  # a fresh attempt has not been consumed yet
+        if not self._store.reserve(record, PERMIT_BUDGET):
+            record.state = WAITING  # the pool cannot fit this demand right now
             record.start_fact = None
-            record.family = None
-            record.process_alive = False
-            record.attempt_committed = False  # a fresh attempt has not been consumed yet
-            self._persist(record)
-            return True
+            return False
+        return True
 
     def _commit_start(self, record: Record, fact: str, family: str | None = None) -> None:
         assert record.state == RUNNING
@@ -228,89 +230,48 @@ class Coordinator:
             record.attempt_committed = True
         record.process_alive = True
 
-    def _recover_start(self, record: Record, fact: str, *, process_alive: bool) -> None:
-        if record.start_fact is None:
-            self._commit_start(record, fact)
-        if fact == NOT_STARTED:
-            return
-        record.process_alive = process_alive
-        self._persist(record)
-        if not process_alive:
-            self._finish(record, provider="incomplete", outcome=False)
+    # --- outcome-first classification ---------------------------------------------------
 
-    def _add_descendant(self, record: Record, family_id: str) -> None:
-        record.descendants.add(family_id)
-        self._persist(record)
-
-    def _finish(self, record: Record, *, provider: str, outcome: bool,
-                eligible_at: int | None = None) -> None:
-        assert record.state == RUNNING
+    def _finalize(self, record: Record) -> StageOutcome | None:
+        """Classify an ended provider family and release its reservation atomically (ADR
+        0028 precedence): a verified stage outcome completes it; a permanent provider
+        condition holds it; a recoverable, incomplete, or unknown ending waits when budget
+        remains and holds when it is exhausted. Returns the terminal outcome, if any."""
+        obs = self._observe(record)
         self._release(record)
-        if outcome:
+        if self._verify(record, obs):
             record.state = COMPLETED
             self._persist(record)
-            return
-        if provider in {"bail", "permanent"}:
+            return StageOutcome(record.identity, record.stage, "completed")
+        label = obs.classification()
+        if label == "permanent":
             self._hold(record)
-            return
-        if record.attempts < ATTEMPT_BUDGET:
+        elif record.attempts < ATTEMPT_BUDGET:
             record.state = WAITING
             record.continuation = True
-            record.eligible_at = eligible_at or 0
+            record.eligible_at = obs.reset_at or 0
             self._persist(record)
-            return
-        self._hold(record)
-
-    def _route(self, record: Record, available: dict[str, bool], safe: set[str]) -> str | None:
-        if record.stage in CODE_WRITING:
-            candidates = [record.lineage] if record.lineage else []
+            return None
         else:
-            candidates = [record.pool, *sorted(set(available) - {record.pool})]
-        for pool in candidates:
-            if pool not in safe or not available.get(pool, False):
-                continue
-            model = MODEL_FOR[(pool, record.complexity)]
-            demand = admission_demand(
-                record.stage, pool, model, record.complexity, record.effort)
-            if demand is None:
-                continue
-            record.pool = pool
-            record.model = model
-            record.demand = demand
-            if record.stage == "review":
-                record.auto_merge_allowed = record.builder_lineage != pool
-            self._persist(record)
-            return pool
-        return None
+            self._hold(record)
+        # The dormant slice owns the human handoff itself; a real stage adapter proves it in
+        # the live pipeline. Finalizing it here is idempotent and crash-safe.
+        return self._finalize_hold(record)
 
-    def _finalize_hold(self, record: Record, *, crash_after_proof: bool = False) -> None:
+    def _finalize_hold(self, record: Record) -> StageOutcome | None:
         if not record.hold_pending:
-            return
+            return None
         if record.handoff_proof is None:
             record.handoffs = 1
             record.handoff_kind = STAGE_NATIVE_HANDOFF[record.stage]
             record.handoff_proof = f"proof:{record.identity}:{record.handoff_kind}"
             record.notifications = 1
             self._persist(record)
-        if crash_after_proof:
-            return
         record.state = HELD
         record.hold_pending = False
         record.claim = False
         self._persist(record)
-
-    def _finalize_completion(self, record: Record, *, next_record: Record | None = None,
-                             external_boundary_proven: bool = False) -> None:
-        if record.state != COMPLETED or record.retired:
-            return
-        if next_record is not None:
-            next_record.claim = True
-            self.submit(next_record)
-        elif not external_boundary_proven:
-            return
-        record.claim = False
-        record.retired = True
-        self._persist(record)
+        return StageOutcome(record.identity, record.stage, "held", record.handoff_kind)
 
     # --- internal helpers ---------------------------------------------------------------
 

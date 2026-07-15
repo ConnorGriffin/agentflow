@@ -1,18 +1,30 @@
-"""The continuation store creates itself atomically and otherwise fails closed (ADR 0030).
+"""The continuation store creates itself atomically, reserves atomically, and otherwise
+fails closed (ADR 0030).
 
-These exercise the store through its interface: an absent store is created versioned; a
+These exercise the private store adapter directly: an absent store is created versioned; a
 corrupt, newer-schema, or otherwise unreadable store raises ``StoreUnavailable`` so the
-coordinator starts nothing and clears no claim.
+coordinator starts nothing and clears no claim; and a permit reservation reads availability
+and writes the running row under one lock, so instances racing on the same file can never
+push a pool past its budget.
 """
 
 from __future__ import annotations
 
 import sqlite3
+import threading
 
 import pytest
 
-from agentflow.coordinator import Coordinator, Record, StoreUnavailable
-from agentflow.coordinator.store import SCHEMA_VERSION, Store
+from agentflow.coordinator import Coordinator
+from agentflow.coordinator.record import Record
+from agentflow.coordinator.store import (
+    SCHEMA_VERSION, Store, StoreUnavailable, default_store_path)
+
+
+def test_default_store_lives_under_the_state_directory(coord_state):
+    # coord_state points AGENTFLOW_STATE at an isolated directory; the store is placed there,
+    # never at a caller-supplied path.
+    assert default_store_path().is_relative_to(coord_state)
 
 
 def test_absent_store_is_created_versioned_and_round_trips(tmp_path):
@@ -32,6 +44,36 @@ def test_absent_store_is_created_versioned_and_round_trips(tmp_path):
     loaded = reopened.load()
     assert loaded["R1"].stage == "review"
     assert reopened.permits_used("claude") == 1
+
+
+def test_reserve_is_atomic_across_instances(tmp_path):
+    """Many instances racing to reserve demand-2 reviews on one pool reserve at most two
+    (four permits) between them — availability and the running write share one critical
+    section, so a sixth permit is impossible."""
+    path = tmp_path / "coord.db"
+    Store(path).close()  # initialize the schema once
+
+    records = [Record(f"R{i}", "review", "codex", 2, state="running") for i in range(8)]
+    barrier = threading.Barrier(len(records))
+    reserved: list[str] = []
+    lock = threading.Lock()
+
+    def race(record):
+        store = Store(path)  # a distinct instance/connection per racer
+        barrier.wait()
+        if store.reserve(record, budget=5):
+            with lock:
+                reserved.append(record.identity)
+        store.close()
+
+    threads = [threading.Thread(target=race, args=(r,)) for r in records]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(reserved) == 2
+    assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
 
 
 def test_newer_schema_fails_closed(tmp_path):
@@ -54,11 +96,12 @@ def test_corrupt_store_fails_closed(tmp_path):
         Store(path)
 
 
-def test_coordinator_over_unreadable_store_starts_nothing(tmp_path):
+def test_coordinator_over_unreadable_store_starts_nothing(coord_state):
     """A coordinator cannot be constructed on an unreadable store, so no cycle can run —
     the fail-closed guarantee: no provider starts and no claim is cleared."""
-    path = tmp_path / "coord.db"
+    path = default_store_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(b"corrupt")
 
     with pytest.raises(StoreUnavailable):
-        Coordinator(path)
+        Coordinator()
