@@ -10,9 +10,10 @@ admission, and outcome rules accepted in ADRs 0028--0030.
 
 The provider lifecycle is scripted through the injected :class:`FakeSession` (a started and
 alive family, then a specific ending); ``cycle`` returns only the terminal outcomes stage
-orchestration consumes. Behaviors that belong to later slices — cross-pool routing of a
-read-only continuation and next-stage claim transfer — are out of this dormant slice and are
-not exercised here.
+orchestration consumes. The suite exercises continuation priority, gate composition, permit
+conservation, tool-lineage rules (cross-pool review and the code-writing pin), descendant
+reservation sharing, next-stage claim transfer, and fail-closed recovery. Only true cross-pool
+*re-routing* of a read-only continuation onto the other pool mid-life remains a later slice.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pytest
-from conftest import FakeSession, starts_until_held
+from conftest import FakeSession, permits, record_of, starts_until_held
 
 from agentflow.coordinator import Submission
 from agentflow.coordinator.admission import (
@@ -96,13 +97,13 @@ def test_same_snapshot_historical_stampede_is_bounded_atomically(make_coord):
     deep = submit_root(coord, "claude-deep-build")       # demand 5
 
     assert coord.cycle("claude") == []
-    assert coord.permits("claude") == 5                  # 4 + 1 admitted; the 5 is deferred
+    assert permits(coord, "claude") == 5                  # 4 + 1 admitted; the 5 is deferred
 
     fake.end(medium, success=True)
     fake.end(intake, success=True)
     completed = {o.identity for o in coord.cycle("claude")}
     assert completed == {medium, intake}                 # exactly the two that were admitted
-    assert coord.permits("claude") == 5                  # now the deferred build (5) runs
+    assert permits(coord, "claude") == 5                  # now the deferred build (5) runs
     assert coord.cycle("claude") == []                   # deep is running, nothing terminal
     fake.kill(deep)                                       # (leave the store clean)
 
@@ -114,14 +115,14 @@ def test_two_writers_cannot_share_one_five_permit_pool(make_coord):
     second = submit_root(coord, "claude-revise", suffix="-2")  # demand 3
 
     coord.cycle("claude")
-    assert coord.permits("claude") == 3                       # only one writer fits (3 + 3 > 5)
+    assert permits(coord, "claude") == 3                       # only one writer fits (3 + 3 > 5)
 
     done: set[str] = set()
     for _ in range(4):
         fake.end(first, success=True)   # completes whichever writer is currently running
         fake.end(second, success=True)
         done.update(o.identity for o in coord.cycle("claude"))
-        assert coord.permits("claude") <= 3                   # never both writers at once
+        assert permits(coord, "claude") <= 3                   # never both writers at once
     assert done == {first, second}                            # each ran, one after the other
 
 
@@ -133,7 +134,7 @@ def test_near_exclusive_writer_keeps_useful_short_stage_concurrency(make_coord):
     submit_root(coord, "claude-revise")                      # demand 3, cannot fit
 
     coord.cycle("claude")
-    assert coord.permits("claude") == 5   # a 4-permit writer still leaves room for a 1 review
+    assert permits(coord, "claude") == 5   # a 4-permit writer still leaves room for a 1 review
 
 
 def test_continuation_head_of_line_blocks_bypass_without_preempting_live_work(make_coord):
@@ -145,15 +146,15 @@ def test_continuation_head_of_line_blocks_bypass_without_preempting_live_work(ma
 
     live = submit_root(coord, "claude-intake")               # demand 1
     assert coord.cycle("claude", now=0) == []                # big not eligible yet; live runs
-    assert coord.permits("claude") == 1
+    assert permits(coord, "claude") == 1
 
     cold = submit_root(coord, "claude-review")               # demand 1, could fit beside live
     assert coord.cycle("claude", now=100) == []              # big is eligible but cannot fit
-    assert coord.permits("claude") == 1                      # cold did NOT bypass the blocked big
+    assert permits(coord, "claude") == 1                      # cold did NOT bypass the blocked big
 
     fake.end(live, success=True)
     assert {o.identity for o in coord.cycle("claude", now=100)} == {live}
-    assert coord.permits("claude") == 5                      # big (continuation) admitted first
+    assert permits(coord, "claude") == 5                      # big (continuation) admitted first
     assert coord.cycle("claude", now=100) == []              # cold still waits behind big
     fake.kill(big)
 
@@ -167,13 +168,13 @@ def test_future_capacity_reset_controls_eligibility_without_hot_looping(make_coo
 
     cold = submit_root(coord, "claude-intake")
     assert coord.cycle("claude", now=49) == []               # paused deferred; cold admitted
-    assert coord.permits("claude") == 1                      # only the cold intake is running
+    assert permits(coord, "claude") == 1                      # only the cold intake is running
     fake.end(cold, success=True)
     assert {o.identity for o in coord.cycle("claude", now=49)} == {cold}
     assert coord.cycle("claude", now=49) == []               # paused still not eligible
-    assert coord.permits("claude") == 0
+    assert permits(coord, "claude") == 0
     assert coord.cycle("claude", now=50) == []               # reset reached — paused restarts
-    assert coord.permits("claude") == 1
+    assert permits(coord, "claude") == 1
 
 
 def test_a_closed_gate_defers_without_permits_or_attempts(make_coord):
@@ -183,7 +184,7 @@ def test_a_closed_gate_defers_without_permits_or_attempts(make_coord):
     identity = submit_root(coord, "claude-intake")
 
     assert coord.cycle("claude") == []
-    assert coord.permits("claude") == 0                      # a failed gate reserves nothing
+    assert permits(coord, "claude") == 0                      # a failed gate reserves nothing
 
     fake.gate_open = True
     # No permit and no attempt were spent, so the full three-attempt budget remains.
@@ -196,7 +197,7 @@ def test_permit_deferral_consumes_neither_permit_nor_attempt(make_coord):
     live = submit_root(coord, "claude-medium-build")         # demand 4
     deferred = submit_root(coord, "claude-revise")           # demand 3, cannot fit beside live
     coord.cycle("claude")
-    assert coord.permits("claude") == 4                      # only the writer started
+    assert permits(coord, "claude") == 4                      # only the writer started
 
     fake.end(live, success=True)                             # free the pool
     # The deferred writer never spent an attempt while blocked, so it keeps its full budget.
@@ -216,7 +217,7 @@ def test_non_terminal_endings_wait_when_the_outcome_is_missing(make_coord, cause
     fake.end(identity, cause=cause)
 
     assert coord.cycle("claude") == []                       # no terminal outcome
-    assert coord.permits("claude") == 0                      # reservation released, waiting
+    assert permits(coord, "claude") == 0                      # reservation released, waiting
 
 
 def test_a_verified_outcome_completes_the_stage(make_coord):
@@ -262,7 +263,7 @@ def test_exhaustion_creates_exactly_one_stage_native_handoff(make_coord, stage, 
                 held = outcome
         if held is not None:
             break
-        if coord.permits(pool) > 0:
+        if permits(coord, pool) > 0:
             starts += 1
             fake.end(identity, cause=ProviderCause.UNKNOWN)
     assert held is not None and held.handoff == expected
@@ -276,4 +277,76 @@ def test_submission_is_idempotent_so_one_logical_stage_cannot_duplicate_work(mak
     duplicate = submit_root(coord, "claude-medium-build")
     assert duplicate == first
     coord.cycle("claude")
-    assert coord.permits("claude") == 4                      # one reservation, not two
+    assert permits(coord, "claude") == 4                      # one reservation, not two
+
+
+def test_descendants_share_the_root_reservation_without_new_permits(make_coord):
+    """A running root reserves once; its subagents inherit that reservation and never reserve
+    independently, so nested work cannot push the pool past budget (ADR 0030). When the root
+    completes, its descendants retire with it rather than lingering as waiting work."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    root = submit_root(coord, "claude-medium-build")             # demand 4
+    coord.cycle("claude")
+    assert permits(coord, "claude") == 4
+
+    for i in range(2):  # two subagents of the running root, each nominally demand 4
+        coord.submit_stage(Submission(
+            repo="o/r", subject=HISTORICAL_ROOTS["claude-medium-build"].synthetic_id,
+            stage="build", pool="claude", complexity="standard", effort="medium",
+            target=f"sub-{i}", descendant_of=root))
+    assert coord.cycle("claude") == []
+    assert permits(coord, "claude") == 4                        # descendants reserved nothing
+
+    fake.end(root, success=True)
+    assert {o.identity for o in coord.cycle("claude")} == {root}  # only the root is terminal
+    assert permits(coord, "claude") == 0                        # released; descendants retired
+
+
+def test_a_completed_stage_transfers_its_claim_to_the_next_stage(make_coord):
+    """A completed stage keeps its GitHub claim until the next stage assumes it, then releases
+    it — so a crash between stages can never drop ownership or double-claim (ADR 0030)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    review = coord.submit_stage(Submission(repo="o/r", subject="T", stage="review", pool="claude"))
+    coord.cycle("claude")
+    fake.end(review, success=True)
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+    assert record_of(coord, review).claim is True               # kept until the transfer lands
+
+    revise = coord.submit_stage(Submission(
+        repo="o/r", subject="T", stage="revise", pool="claude", transfer_from=review))
+    assert record_of(coord, review).claim is False              # released to the next stage
+    assert record_of(coord, revise).claim is True               # revise now owns the claim
+
+
+def test_a_read_only_review_routes_cross_pool_and_lineage_governs_auto_merge(make_coord):
+    """A read-only review is unpinned: it runs on either pool. Whether it may auto-merge turns
+    on lineage — a review by the same tool that built the diff cannot, a cross-tool one can
+    (ADR 0028)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    cross = coord.submit_stage(Submission(repo="o/r", subject="X", stage="review",
+                                          pool="codex", builder_lineage="claude"))
+    same = coord.submit_stage(Submission(repo="o/r", subject="Y", stage="review",
+                                         pool="claude", builder_lineage="claude"))
+    assert record_of(coord, cross).auto_merge_allowed is True    # a different tool reviewed it
+    assert record_of(coord, same).auto_merge_allowed is False    # a same-tool review cannot merge
+
+    # Both admit on their own pool — the read-only review was free to route cross-pool.
+    assert coord.cycle("codex") == [] and permits(coord, "codex") == 2
+    assert coord.cycle("claude") == [] and permits(coord, "claude") == 1
+    fake.kill(cross)
+    fake.kill(same)
+
+
+def test_a_code_writing_stage_cannot_leave_its_builder_lineage(make_coord):
+    """A code-writing stage is pinned to the tool that built its diff. A revise of a
+    claude-built diff submitted onto codex is an illegal cross-pool move: it never admits and
+    reserves nothing, failing closed rather than silently switching tools (ADR 0028)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    coord.submit_stage(Submission(repo="o/r", subject="Z", stage="revise", pool="codex",
+                                  builder_lineage="claude", complexity="deep"))
+    assert coord.cycle("codex") == []
+    assert permits(coord, "codex") == 0

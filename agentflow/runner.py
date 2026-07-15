@@ -389,6 +389,14 @@ class ClaudeRunner(_WorktreeRunner):
         ], cwd, session_timeout)
         return r.returncode == 0, r.stdout
 
+    def structured_argv(self, prompt: str, model: str) -> list[str]:
+        """The structured-session variant of ``launch`` (ADR 0030). Same session, but Claude
+        emits its machine-readable event stream (one JSON object per line) so the coordinator's
+        provider adapter can preserve the full observation set instead of only a final string."""
+        return ["claude", "-p", prompt, "--model", model,
+                "--output-format", "stream-json", "--verbose",
+                "--dangerously-skip-permissions"]
+
 
 class CodexRunner(_WorktreeRunner):
     tool = "codex"
@@ -424,6 +432,23 @@ class CodexRunner(_WorktreeRunner):
             return r.returncode == 0, msg
         finally:
             Path(outfile).unlink(missing_ok=True)
+
+    _CLI_MODEL = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra"}
+
+    def structured_argv(self, prompt: str, model: str) -> list[str]:
+        """The structured-session variant of ``launch`` (ADR 0030): ``codex exec --json`` emits
+        machine-readable events. Per ADR, that prose is never a diagnosis — the coordinator's
+        Codex adapter distinguishes capacity from a permanent plan problem only from the typed
+        account/rate-limit surface, so this argv exists to run the session, not to classify it."""
+        codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
+        return [codex_bin, "exec", "-m", self._CLI_MODEL.get(model, model), "--json",
+                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", prompt]
+
+    def account_fact(self) -> dict | None:
+        """The typed account/rate-limit fact used to distinguish capacity from a permanent
+        plan problem after an ambiguous Codex failure (ADR 0030). No typed surface is wired in
+        this slice, so it returns ``None`` and an untyped failure stays a bounded ``unknown``."""
+        return None
 
     def probe(self) -> bool:
         """Run one minimal Codex session whose only job is to land a fresh rate-limit

@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from uuid import uuid4
 
 from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, MODEL_FOR, PERMIT_BUDGET, STAGE_NATIVE_HANDOFF,
     admission_demand, normalize_stage)
-from agentflow.coordinator.launcher import (
-    NOT_STARTED, STARTED, LocalLauncher, pid_family_alive)
-from agentflow.coordinator.providers import ProviderObservation
+from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
+from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
 from agentflow.coordinator.store import Store, default_store_path
 
@@ -47,6 +47,8 @@ class Submission:
     pool: str = "claude"            # allowed pool or pinned lineage
     input_ptr: str | None = None
     builder_lineage: str | None = None
+    descendant_of: str | None = None  # a subagent shares this root stage's one reservation
+    transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
 
 
 @dataclass(frozen=True)
@@ -71,21 +73,22 @@ class Coordinator:
     blocking, starting each through the crash-safe launcher. If the store is unreadable the
     constructor raises and the caller starts nothing and clears no claim (fail-closed).
 
-    The launcher, admission gate, provider observer, and family-liveness probe are injected so
-    the crash boundaries can be exercised with fakes; production uses the real spawning
-    launcher and pid liveness.
+    It depends on three cohesive collaborators, injected only so the crash boundaries can be
+    exercised with fakes: a **launcher** that starts a provider family and reports its
+    liveness, an admission **gate** (the composed headroom/ceiling/cap/pacing check), and a
+    stage **adapter** that observes an ended family and verifies its stage outcome. Production
+    uses the real spawning launcher with pid liveness; the gate and adapter default to
+    permissive/never-verified stubs until the live stages supply them. None of these is a
+    public operation — the only public surface is ``submit_stage`` and ``cycle``.
     """
 
-    def __init__(self, *, launcher=None, gate=None, observe=None, verify=None,
-                 is_alive=pid_family_alive) -> None:
+    def __init__(self, *, launcher=None, gate=None, adapter=None) -> None:
         self._store = Store(default_store_path())
         self._launcher = launcher or LocalLauncher()
-        self._gate = gate or (lambda record: True)
-        self._observe = observe or (lambda record: ProviderObservation())
-        self._verify = verify or (lambda record, obs: False)
-        self._is_alive = is_alive
+        self._gate = gate or _admit_everything
+        self._adapter = adapter or _DefaultAdapter()
         self._lock = threading.RLock()
-        self.records: dict[str, Record] = self._store.load()
+        self._records: dict[str, Record] = self._store.load()
 
     # --- public interface ---------------------------------------------------------------
 
@@ -97,17 +100,51 @@ class Coordinator:
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target)
+        # A code-writing stage is pinned to the tool that built its diff (or, first time, its
+        # own pool) and cannot silently cross pools; a read-only stage is unpinned and may run
+        # on either pool. A review by the same tool that built the diff cannot auto-merge
+        # (ADR 0028 lineage rules).
+        lineage = (submission.builder_lineage or submission.pool
+                   if stage in CODE_WRITING else None)
+        auto_merge = not (submission.builder_lineage is not None
+                          and submission.pool == submission.builder_lineage)
         record = Record(
             identity=identity, stage=stage, pool=submission.pool,
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
-            lineage=submission.pool if stage in CODE_WRITING else None)
+            input_ptr=submission.input_ptr, lineage=lineage,
+            auto_merge_allowed=auto_merge, root=submission.descendant_of)
         with self._lock:
-            existing = self.records.setdefault(identity, record)
+            existing = self._records.setdefault(identity, record)
             if existing is record:
+                self._register_descendant(record)
+                self._transfer_claim(record, submission.transfer_from)
                 self._persist(record)
         return identity
+
+    def _register_descendant(self, record: Record) -> None:
+        """A descendant/subagent shares its root's single reservation and is never admitted or
+        reserved independently (ADR 0030). Recording the lineage on the root lets the root's
+        terminal outcome retire it, so nested work can never push a pool past its budget."""
+        if record.root is None:
+            return
+        root = self._records.get(record.root)
+        if root is not None:
+            root.descendants.add(record.identity)
+            self._persist(root)
+
+    def _transfer_claim(self, record: Record, prior_identity: str | None) -> None:
+        """Assume the GitHub claim from a completed prior stage (ADR 0030 claim transfer). A
+        completed record keeps its claim until this transfer is durable — so a crash between
+        stages cannot drop ownership — then releases it and retires as the next stage takes over."""
+        if prior_identity is None:
+            return
+        prior = self._records.get(prior_identity)
+        if prior is not None and prior.state == COMPLETED:
+            prior.claim = False
+            prior.retired = True
+            self._persist(prior)
 
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
         """Reconcile, returning the stage outcomes and holds settled this cycle, then admit
@@ -116,8 +153,9 @@ class Coordinator:
         a later cycle's reconciliation."""
         with self._lock:
             outcomes = self._reconcile()
-            waiting = [r for r in self.records.values()
-                       if r.pool == pool and r.state == WAITING and not r.hold_pending]
+            waiting = [r for r in self._records.values()
+                       if r.pool == pool and r.state == WAITING and not r.hold_pending
+                       and r.root is None]  # descendants share the root's reservation, never admit
             continuations = sorted(
                 (r for r in waiting if r.continuation and r.eligible_at <= now),
                 key=lambda r: (r.eligible_at, r.created_at, r.identity))
@@ -130,11 +168,6 @@ class Coordinator:
                 self._admit(record)
             return outcomes
 
-    def permits(self, pool: str) -> int:
-        """Read-only projection of the permits in use on ``pool`` (the running-record ledger).
-        Like the live board, this is a projection of running records, never a control knob."""
-        return self._store.permits_used(pool)
-
     # --- reconciliation -----------------------------------------------------------------
 
     def _reconcile(self) -> list[StageOutcome]:
@@ -145,9 +178,9 @@ class Coordinator:
         start whose family is dead returns to ``waiting`` without consuming an attempt; a
         ``started`` family always counts and is classified once it is no longer alive. An
         unresolved reservation fails closed — it keeps its permits until the process ends."""
-        self.records = self._store.load()
+        self._records = self._store.load()
         outcomes: list[StageOutcome] = []
-        for record in list(self.records.values()):
+        for record in list(self._records.values()):
             if record.state != RUNNING:
                 continue
             if record.start_fact == NOT_STARTED:
@@ -158,7 +191,7 @@ class Coordinator:
                 # The launcher never durably recorded a start, so no provider family can
                 # exist (the child records `started` before replacing itself). If nothing is
                 # alive, this is not-started: release and preserve the attempt count.
-                if not self._is_alive(record.family):
+                if not self._launcher.is_alive(record.family):
                     self._release(record)
                     record.state = WAITING
                     self._persist(record)
@@ -168,7 +201,7 @@ class Coordinator:
                 # is classified; an unknown-liveness family fails closed and keeps its permits.
                 was_committed = record.attempt_committed
                 self._consume_attempt(record)
-                if not self._is_alive(record.family):
+                if not self._launcher.is_alive(record.family):
                     outcome = self._finalize(record)
                     if outcome is not None:
                         outcomes.append(outcome)
@@ -197,9 +230,13 @@ class Coordinator:
             return False  # an independent admission gate (headroom, ceiling, cap, pacing)
         # Flip to a reservation and atomically claim the demand on the ledger; the store
         # reads availability and writes the running row under one lock, so concurrent
-        # instances cannot push a pool past its five-permit budget (ADR 0029/0030).
+        # instances cannot push a pool past its five-permit budget (ADR 0029/0030). The fresh
+        # launch token binds this reservation to exactly one bootstrap child: only a child
+        # holding it may record `started`, so a timed-out launch disowned back to waiting can
+        # never be adopted by an uncancelled child (ADR 0030 handshake boundary).
         record.state = RUNNING
         record.start_fact = None
+        record.launch_token = uuid4().hex
         record.family = None
         record.process_alive = False
         record.attempt_committed = False  # a fresh attempt has not been consumed yet
@@ -237,11 +274,12 @@ class Coordinator:
         0028 precedence): a verified stage outcome completes it; a permanent provider
         condition holds it; a recoverable, incomplete, or unknown ending waits when budget
         remains and holds when it is exhausted. Returns the terminal outcome, if any."""
-        obs = self._observe(record)
+        obs = self._adapter.observe(record)
         self._release(record)
-        if self._verify(record, obs):
+        if self._adapter.verify(record, obs):
             record.state = COMPLETED
             self._persist(record)
+            self._retire_descendants(record)
             return StageOutcome(record.identity, record.stage, "completed")
         label = obs.classification()
         if label == "permanent":
@@ -271,9 +309,21 @@ class Coordinator:
         record.hold_pending = False
         record.claim = False
         self._persist(record)
+        self._retire_descendants(record)
         return StageOutcome(record.identity, record.stage, "held", record.handoff_kind)
 
     # --- internal helpers ---------------------------------------------------------------
+
+    def _retire_descendants(self, record: Record) -> None:
+        """A root's terminal outcome retires its subagents: they shared its one reservation, so
+        they are done when it is and never linger as waiting work or a second outcome."""
+        for identity in record.descendants:
+            child = self._records.get(identity)
+            if child is not None and not child.retired:
+                child.state = COMPLETED
+                child.retired = True
+                child.claim = False
+                self._persist(child)
 
     def _hold(self, record: Record) -> None:
         record.state = WAITING
@@ -289,3 +339,9 @@ class Coordinator:
 
 def _identity(repo: str, subject: str, stage: str, target: str | None) -> str:
     return "|".join((repo, str(subject), stage, target or "-"))
+
+
+def _admit_everything(record: Record) -> bool:
+    """The default admission gate for the dormant slice: the permit ledger is the only limit
+    until the live stages supply the composed headroom/ceiling/cap/pacing gate (ADR 0030)."""
+    return True

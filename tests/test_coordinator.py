@@ -7,7 +7,7 @@ nothing here is wired into the daemon yet.
 
 from __future__ import annotations
 
-from conftest import FakeSession, NeverStartsLauncher
+from conftest import FakeSession, NeverStartsLauncher, permits
 
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.providers import ProviderCause
@@ -31,10 +31,10 @@ def test_legacy_lane_alias_never_turns_revise_into_build(make_coord):
     # Build (deep, no effort) reserves the exclusive five; revise reserves three. If the alias
     # had collapsed revise into build the pool could not have fit both — it fits exactly.
     assert coord.cycle("claude") == []
-    assert coord.permits("claude") == 5  # build 5 admitted; revise deferred, pool full
+    assert permits(coord, "claude") == 5  # build 5 admitted; revise deferred, pool full
     fake.end(build, success=True)
     assert [o.stage for o in coord.cycle("claude")] == ["build"]
-    assert coord.permits("claude") == 3  # now revise (3) admitted — proving it stayed revise
+    assert permits(coord, "claude") == 3  # now revise (3) admitted — proving it stayed revise
 
 
 def test_cycle_admits_intake_and_charges_one_permit(make_coord):
@@ -43,11 +43,11 @@ def test_cycle_admits_intake_and_charges_one_permit(make_coord):
     identity = coord.submit_stage(Submission(repo="o/r", subject="1", stage="intake",
                                              pool="claude"))
     assert coord.cycle("claude") == []       # admitted; its outcome is not terminal this cycle
-    assert coord.permits("claude") == 1
+    assert permits(coord, "claude") == 1
     assert coord.cycle("codex") == []        # the other pool has no work
     fake.end(identity, success=True)
     assert [o.status for o in coord.cycle("claude")] == ["completed"]
-    assert coord.permits("claude") == 0
+    assert permits(coord, "claude") == 0
 
 
 def test_unknown_pool_submission_is_inadmissible(make_coord):
@@ -55,7 +55,7 @@ def test_unknown_pool_submission_is_inadmissible(make_coord):
     coord.submit_stage(Submission(repo="o/r", subject="2", stage="review", pool="gemini"))
     # No ledger to charge an unknown pool, so it never starts and never yields an outcome.
     assert coord.cycle("gemini") == []
-    assert coord.permits("gemini") == 0
+    assert permits(coord, "gemini") == 0
 
 
 def test_capacity_reset_defers_a_continuation_until_it_is_eligible(make_coord):
@@ -64,23 +64,23 @@ def test_capacity_reset_defers_a_continuation_until_it_is_eligible(make_coord):
     identity = coord.submit_stage(Submission(repo="o/r", subject="3", stage="review",
                                              pool="claude"))
     assert coord.cycle("claude", now=0) == []
-    assert coord.permits("claude") == 1
+    assert permits(coord, "claude") == 1
 
     # A capacity interruption with a future reset returns the stage to waiting and defers it.
     fake.end(identity, cause=ProviderCause.CAPACITY, reset_at=50)
     assert coord.cycle("claude", now=49) == []          # reconciled to waiting, permits freed
-    assert coord.permits("claude") == 0
+    assert permits(coord, "claude") == 0
     assert coord.cycle("claude", now=49) == []          # still not eligible, not restarted
-    assert coord.permits("claude") == 0
+    assert permits(coord, "claude") == 0
     assert coord.cycle("claude", now=50) == []          # reset reached, restarted
-    assert coord.permits("claude") == 1                 # a second attempt is now running
+    assert permits(coord, "claude") == 1                 # a second attempt is now running
 
 
 def test_never_started_launch_consumes_no_permit(make_coord):
     coord = make_coord(FakeSession(), launcher=NeverStartsLauncher())
     coord.submit_stage(Submission(repo="o/r", subject="4", stage="review", pool="claude"))
     assert coord.cycle("claude") == []
-    assert coord.permits("claude") == 0  # a launch that never started reserves nothing
+    assert permits(coord, "claude") == 0  # a launch that never started reserves nothing
 
 
 def test_permit_ledger_is_shared_across_coordinator_instances(make_coord):
@@ -95,9 +95,9 @@ def test_permit_ledger_is_shared_across_coordinator_instances(make_coord):
     b.submit_stage(Submission(repo="o/r", subject="b1", stage="review", pool="codex"))
 
     a.cycle("codex")                     # a reserves two (four permits)
-    assert a.permits("codex") == 4
+    assert permits(a, "codex") == 4
     b.cycle("codex")                     # b sees the shared ledger is full and reserves none
-    assert b.permits("codex") == 4
+    assert permits(b, "codex") == 4
 
 
 def test_coordinator_module_is_dormant_no_daemon_wiring():
@@ -117,3 +117,15 @@ def test_stage_outcome_is_the_only_terminal_fact_that_crosses_the_seam():
     """cycle returns typed terminal outcomes, not the mutable record and not started ids."""
     assert StageOutcome("id", "review", "completed").status == "completed"
     assert not hasattr(Coordinator, "reconcile")  # reconciliation is private to cycle
+
+
+def test_public_surface_is_exactly_submit_stage_and_cycle(make_coord):
+    """ADR 0030's deep two-call seam: submit_stage and cycle are the only public operations.
+    Permit accounting, the working-set map, and reconciliation are private — no third
+    operation, no mutable records map, and no lifecycle/policy control knob is exposed."""
+    coord = make_coord(FakeSession())
+    public = {name for name in dir(coord)
+              if not name.startswith("_") and callable(getattr(coord, name))}
+    assert public == {"submit_stage", "cycle"}
+    assert not hasattr(coord, "permits")      # permit accounting is an internal invariant
+    assert not hasattr(coord, "records")      # the working set is private (_records)

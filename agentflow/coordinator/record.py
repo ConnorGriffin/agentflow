@@ -17,6 +17,12 @@ RUNNING = "running"
 COMPLETED = "completed"
 HELD = "held"
 
+# The durable launcher-handshake results (ADR 0030). Defined here, beside the record they are
+# written onto, so the store can guard on them without importing the launcher (which imports
+# the store); the launcher re-exports them.
+STARTED = "started"
+NOT_STARTED = "not_started"
+
 
 @dataclass
 class Record:
@@ -37,7 +43,9 @@ class Record:
     state: str = WAITING
     claim: bool = True           # holds the GitHub dedup claim while the stage is owned
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move
+    input_ptr: str | None = None # durable pointer the provider adapter rebuilds the prompt from
     start_fact: str | None = None        # durable launcher handshake result: started | not_started
+    launch_token: str | None = None      # nonce a reservation stamps; only the child holding it may record `started`
     family: str | None = None            # the provider process-family identity a `started` carries
     process_alive: bool = False          # whether that family is still executing
     descendants: set[str] = field(default_factory=set)  # subagents charged to the root reservation
@@ -49,3 +57,4 @@ class Record:
     retired: bool = False
     builder_lineage: str | None = None   # who built the diff — a same-tool review cannot auto-merge
     auto_merge_allowed: bool = True
+    root: str | None = None              # the root stage this descends from; it shares the root's reservation

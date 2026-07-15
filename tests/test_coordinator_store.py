@@ -76,6 +76,47 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
 
 
+def test_zero_byte_store_from_a_crashed_create_is_healed_not_bricked(tmp_path):
+    """The real store is published by an atomic rename, so a crash mid-creation can only ever
+    leave a zero-byte final path — never a half-written schema. Opening over that zero-byte
+    file builds a fresh versioned store rather than failing closed as if it were corrupt."""
+    path = tmp_path / "coord.db"
+    path.write_bytes(b"")  # what a crash before the atomic publish would leave behind
+
+    store = Store(path)
+    assert path.stat().st_size > 0  # healed into a real, non-empty database
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    conn.close()
+    store.upsert(Record("R1", "review", "claude", 1, state="running"))
+    assert store.permits_used("claude") == 1
+    store.close()
+
+
+def test_child_start_and_disown_are_mutually_exclusive(tmp_path):
+    """The launcher handshake's two atomic halves never both win. A child that records
+    ``started`` under its token wins, and a later timeout disown yields that same start. A
+    launch disowned first rotates the token, so a still-running child's late write is refused
+    and it must not become a provider — closing the timeout race (ADR 0030)."""
+    from agentflow.coordinator.record import NOT_STARTED, STARTED
+    path = tmp_path / "coord.db"
+    store = Store(path)
+
+    # The child wins the race: it records started before the coordinator gives up.
+    store.upsert(Record("R-win", "review", "codex", 2, state="running", launch_token="T1"))
+    assert store.child_start("R-win", "T1", 4242) is True
+    assert store.disown_launch("R-win", "T1") == (STARTED, "4242")
+
+    # The timeout wins the race: disown rotates the token first, so an uncancelled child's
+    # late guarded write is refused and no unreserved, uncounted provider can start.
+    store.upsert(Record("R-lose", "review", "codex", 2, state="running", launch_token="T2"))
+    assert store.disown_launch("R-lose", "T2") == (NOT_STARTED, None)
+    assert store.child_start("R-lose", "T2", 5252) is False
+    reread = store.record_of("R-lose")
+    assert reread.start_fact != STARTED and reread.family is None
+    store.close()
+
+
 def test_newer_schema_fails_closed(tmp_path):
     path = tmp_path / "coord.db"
     Store(path).close()

@@ -23,8 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-STARTED = "started"
-NOT_STARTED = "not_started"
+from agentflow.coordinator.record import NOT_STARTED, STARTED  # re-exported for callers
 
 # Bounded wait for the spawned child to durably record `started` before we treat the launch
 # as one that never produced a provider family.
@@ -55,26 +54,37 @@ class LocalLauncher:
     """Spawns a provider through the crash-safe child bootstrap (ADR 0030).
 
     ``start`` forks the bootstrap child, which records ``started`` with its own pid before
-    ``exec``-replacing itself with the provider argv, then waits (bounded) for that durable
-    fact to appear or for the child to die without it. ``provider_command`` maps a record to
-    the argv the child ``exec``s; the dormant slice supplies a no-op provider because no live
-    pipeline stage routes here yet.
+    ``exec``-replacing itself with the provider (which redirects its structured stream and
+    exit to durable per-attempt artifacts), then waits (bounded) for that durable fact to
+    appear or for the child to die without it. ``provider_command`` maps a record to the argv
+    the child runs; the default builds the real Claude/Codex session command for a record that
+    carries a prompt and a no-op for one that does not — the dormant slice, where no live stage
+    has submitted work yet.
     """
 
     def __init__(self, provider_command=None, *, timeout: float = _HANDSHAKE_TIMEOUT_S) -> None:
-        self._provider_command = provider_command or _dormant_provider_command
+        from agentflow.coordinator.providers import provider_command as real_command
+        self._provider_command = provider_command or real_command
         self._timeout = timeout
 
+    @staticmethod
+    def is_alive(family: str | None) -> bool:
+        """Whether the recorded provider family is still executing. The launcher owns the
+        family it started, so it also answers the liveness the coordinator reconciles on."""
+        return pid_family_alive(family)
+
     def start(self, record, store) -> StartResult:
+        token = record.launch_token
         argv = [str(a) for a in self._provider_command(record)]
         try:
             child = subprocess.Popen(
                 [sys.executable, "-m", "agentflow.coordinator._launch_child",
-                 str(store.path), record.identity, *argv])
+                 str(store.path), record.identity, str(token), *argv])
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence
         # The intermediate exits at once; reap it so it does not linger. The provider
-        # grandchild it forked records `started` with its own pid as the family.
+        # grandchild it forked records `started` with its own pid as the family, but only
+        # while it still holds this reservation's launch token.
         try:
             child.wait(timeout=self._timeout)
         except subprocess.TimeoutExpired:
@@ -82,14 +92,12 @@ class LocalLauncher:
         deadline = time.monotonic() + self._timeout
         while time.monotonic() <= deadline:
             reserved = store.record_of(record.identity)
-            if reserved is not None and reserved.start_fact == STARTED:
+            if (reserved is not None and reserved.start_fact == STARTED
+                    and reserved.launch_token == token):
                 return StartResult(STARTED, reserved.family)
             time.sleep(0.01)
-        return StartResult(NOT_STARTED)  # the child never durably recorded a start
-
-
-def _dormant_provider_command(record) -> list[str]:
-    """No live pipeline stage routes through the coordinator yet (ADR 0030's dormant slice),
-    so the provider is a no-op that starts and exits; a real stage supplies the Claude or
-    Codex argv when Build is the next slice."""
-    return [sys.executable, "-c", ""]
+        # The child never durably recorded a start in time. Atomically disown this launch:
+        # unless the child already won under this token, its token is rotated so any late
+        # guarded write is refused and no unreserved, uncounted provider can start.
+        fact, family = store.disown_launch(record.identity, token)
+        return StartResult(fact, family)

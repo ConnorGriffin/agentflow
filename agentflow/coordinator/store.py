@@ -22,8 +22,9 @@ import sqlite3
 import threading
 from dataclasses import fields
 from pathlib import Path
+from uuid import uuid4
 
-from agentflow.coordinator.record import RUNNING, Record
+from agentflow.coordinator.record import NOT_STARTED, RUNNING, STARTED, Record
 
 SCHEMA_VERSION = 1
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
@@ -68,24 +69,22 @@ class Store:
         self._conn = self._connect()
 
     def _connect(self) -> sqlite3.Connection:
-        created = not self.path.exists()
-        if not created and self.path.stat().st_size == 0:
-            created = True  # an empty file is a not-yet-initialized store, not a corrupt one
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        # A fully-initialized store is published atomically: it is built in a private temp
+        # file under the same directory, then renamed into place. The final path therefore
+        # only ever appears as a complete, versioned database — a crash mid-creation leaves a
+        # temp file behind, never a zero-byte final path that a later open would misread as a
+        # fresh not-yet-initialized store (ADR 0030 fail-closed). Only an absent or zero-byte
+        # final path triggers creation; a populated store is never overwritten.
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            self._create_atomically()
         try:
-            # Autocommit mode (isolation_level=None) so the reservation can hold a single
-            # explicit BEGIN IMMEDIATE across its read and its write.
-            conn = sqlite3.connect(self.path, timeout=_BUSY_TIMEOUT_MS / 1000,
-                                   isolation_level=None, check_same_thread=False)
-            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+            conn = self._open(self.path)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            if version == 0 and self._is_empty(conn):
-                self._initialize(conn)
-            elif version > SCHEMA_VERSION:
+            if version > SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(
                     f"store schema {version} is newer than supported {SCHEMA_VERSION}")
-            elif version != SCHEMA_VERSION:
+            if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
         except sqlite3.DatabaseError as e:  # corrupt file, locked-beyond-wait, unreadable
@@ -93,11 +92,36 @@ class Store:
         return conn
 
     @staticmethod
-    def _is_empty(conn: sqlite3.Connection) -> bool:
-        row = conn.execute(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='records'"
-        ).fetchone()
-        return row[0] == 0
+    def _open(path: Path) -> sqlite3.Connection:
+        # Autocommit mode (isolation_level=None) so the reservation can hold a single
+        # explicit BEGIN IMMEDIATE across its read and its write.
+        conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT_MS / 1000,
+                               isolation_level=None, check_same_thread=False)
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        return conn
+
+    def _create_atomically(self) -> None:
+        """Build a complete, versioned store in a temp file and publish it with one atomic
+        rename. A crash before the rename leaves only the temp file under the state directory;
+        the final path is only ever an absent or a fully-initialized store, never a half-built
+        zero-byte file that later opens would treat as fresh absence."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.parent / f".{self.path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        try:
+            conn = self._open(tmp)
+            try:
+                self._initialize(conn)
+            finally:
+                conn.close()
+            _fsync_path(tmp)
+            os.replace(tmp, self.path)          # atomic publish over absent/zero-byte only
+            _fsync_path(self.path.parent)
+        except sqlite3.DatabaseError as e:
+            _unlink(tmp)
+            raise StoreUnavailable(f"cannot create continuation store: {e}") from e
+        except BaseException:
+            _unlink(tmp)
+            raise
 
     @staticmethod
     def _initialize(conn: sqlite3.Connection) -> None:
@@ -190,6 +214,61 @@ class Store:
                 raise StoreUnavailable(f"cannot read continuation store: {e}") from e
         return self._decode(row[0]) if row is not None else None
 
+    def child_start(self, identity: str, token: str, pid: int) -> bool:
+        """The launched child's guarded ``started`` write (ADR 0030). Atomically records
+        ``started`` with ``pid`` as the family *only if* the record is still the ``running``
+        reservation that stamped ``token``. If the coordinator already disowned this launch on
+        a handshake timeout (rotating the token) or returned the record to ``waiting``, the
+        write is refused and the caller must not become a provider — this is what stops an
+        uncancelled bootstrap from starting an unreserved, uncounted provider."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (identity,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record = self._decode(row[0])
+                if record.state != RUNNING or record.launch_token != token:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record.start_fact = STARTED
+                record.family = str(pid)
+                record.process_alive = True
+                self._write(record)
+                self._conn.execute("COMMIT")
+                return True
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot record child start: {e}") from e
+
+    def disown_launch(self, identity: str, token: str) -> tuple[str, str | None]:
+        """The coordinator's atomic timeout finalize (ADR 0030). If the child already won —
+        durably recorded ``started`` under ``token`` — return ``(started, family)`` and leave
+        it. Otherwise rotate the reservation's launch token so any still-running child's late
+        guarded write is refused, and return ``(not_started, None)``. Exactly one of this and
+        :meth:`child_start` can win, so a launch never both times out and starts a provider."""
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (identity,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return (NOT_STARTED, None)
+                record = self._decode(row[0])
+                if record.start_fact == STARTED and record.launch_token == token:
+                    self._conn.execute("ROLLBACK")
+                    return (STARTED, record.family)
+                record.launch_token = uuid4().hex  # any late child write can no longer match
+                self._write(record)
+                self._conn.execute("COMMIT")
+                return (NOT_STARTED, None)
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot disown launch: {e}") from e
+
     def permits_used(self, pool: str) -> int:
         """The permits in use on ``pool``, derived from the durable running rows. There is
         no second counter — this is the ledger (ADR 0030)."""
@@ -207,6 +286,25 @@ class Store:
     def close(self) -> None:
         self._conn.close()
 
+    def _write(self, record: Record) -> None:
+        """The one INSERT-or-update statement, shared by every writer. The caller owns the
+        transaction and lock, so this is safe to use inside a ``BEGIN IMMEDIATE`` section."""
+        self._conn.execute(
+            "INSERT INTO records (identity, pool, state, demand, data)"
+            " VALUES (?, ?, ?, ?, ?)"
+            " ON CONFLICT(identity) DO UPDATE SET"
+            " pool=excluded.pool, state=excluded.state,"
+            " demand=excluded.demand, data=excluded.data",
+            (record.identity, record.pool, record.state, record.demand,
+             self._encode(record)),
+        )
+
+    def _rollback_quietly(self) -> None:
+        try:
+            self._conn.execute("ROLLBACK")
+        except sqlite3.DatabaseError:
+            pass
+
     @staticmethod
     def _encode(record: Record) -> str:
         data = {}
@@ -222,3 +320,26 @@ class Store:
             if name in data:
                 data[name] = set(data[name])
         return Record(**{k: v for k, v in data.items() if k in _COLUMNS})
+
+
+def _fsync_path(path: Path) -> None:
+    """Best-effort durability: flush the temp file (and, when it is a directory, the rename
+    itself) so the atomic publish survives power loss. Platforms that refuse a directory
+    fsync are tolerated — the rename is still atomic."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def _unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass

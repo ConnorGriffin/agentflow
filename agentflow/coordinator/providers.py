@@ -15,8 +15,12 @@ by a Codex-specific policy in the coordinator.
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 from enum import Enum
+
+from agentflow.coordinator.session import read_session
+from agentflow.coordinator.store import default_store_path
 
 
 class ProviderCause(str, Enum):
@@ -153,3 +157,93 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
         cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
         timed_out=timed_out, final_message=final_message, family=family,
         process_alive=process_alive)
+
+
+# --- the two production provider adapters (ADR 0030) ------------------------------------
+#
+# Each adapter builds the real structured-session command for a launched attempt and, once the
+# family ends, reconstructs the full observation from that attempt's durable session artifacts
+# (`agentflow.coordinator.session`) through the pure classifiers above. They extract facts
+# only: `verify` always returns False because provider success can never stand in for a stage
+# outcome — that check belongs to the stage adapter (ADR 0030 completion locality).
+
+
+class ClaudeProviderAdapter:
+    """Launches a structured Claude session and observes its durable events + exit."""
+
+    def __init__(self, prompt_of=None) -> None:
+        self._prompt_of = prompt_of or (lambda record: record.input_ptr or "")
+
+    def command(self, record) -> list[str]:
+        from agentflow.runner import ClaudeRunner
+        return ClaudeRunner().structured_argv(self._prompt_of(record), record.model)
+
+    def observe(self, record) -> ProviderObservation:
+        session = read_session(default_store_path(), record.launch_token)
+        return classify_claude(
+            session.events, exit_status=session.exit_status,
+            family=record.family, process_alive=record.process_alive)
+
+    def verify(self, record, obs) -> bool:
+        return False
+
+
+class CodexProviderAdapter:
+    """Launches a structured Codex session; classifies only from the typed account fact and the
+    exit status — never the `codex exec --json` prose, which is preserved but never diagnoses."""
+
+    def __init__(self, prompt_of=None, account_of=None) -> None:
+        self._prompt_of = prompt_of or (lambda record: record.input_ptr or "")
+        self._account_of = account_of
+
+    def command(self, record) -> list[str]:
+        from agentflow.runner import CodexRunner
+        return CodexRunner().structured_argv(self._prompt_of(record), record.model)
+
+    def observe(self, record) -> ProviderObservation:
+        session = read_session(default_store_path(), record.launch_token)
+        account = self._account_of(record) if self._account_of else None
+        return classify_codex(
+            account_fact=account, exit_status=session.exit_status,
+            final_message=session.partial_output,
+            family=record.family, process_alive=record.process_alive)
+
+    def verify(self, record, obs) -> bool:
+        return False
+
+
+_ADAPTERS = {"claude": ClaudeProviderAdapter, "codex": CodexProviderAdapter}
+
+
+def _dormant_provider_command(record) -> list[str]:
+    """A no-op provider that starts and exits, for a record that carries no prompt to run —
+    the dormant slice, where no live stage has submitted work yet (ADR 0030)."""
+    return [sys.executable, "-c", ""]
+
+
+def provider_command(record) -> list[str]:
+    """The real provider argv for a launched attempt, dispatched on its pool. A record with no
+    durable input pointer has no prompt to run, so it falls back to the no-op provider: the
+    path is fully wired for real Claude/Codex sessions yet stays dormant until a stage submits
+    one. An unknown pool never reaches a launch (it has no permit ledger)."""
+    adapter = _ADAPTERS.get(record.pool)
+    if adapter is None or not record.input_ptr:
+        return _dormant_provider_command(record)
+    return adapter().command(record)
+
+
+class ProviderObserver:
+    """The coordinator's default stage adapter: it reconstructs a launched attempt's
+    observation through the pool's provider adapter and never verifies a stage outcome (that
+    is the live stage's job). This is what makes a bare ``Coordinator()`` the real wired path
+    rather than a stub — a launched Claude or Codex family is observed from its durable
+    artifacts, not guessed at."""
+
+    def observe(self, record) -> ProviderObservation:
+        adapter = _ADAPTERS.get(record.pool)
+        if adapter is None:
+            return ProviderObservation()
+        return adapter().observe(record)
+
+    def verify(self, record, obs) -> bool:
+        return False

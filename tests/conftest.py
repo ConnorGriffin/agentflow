@@ -99,7 +99,7 @@ def starts_until_held(coord, fake, identity, pool, cause=ProviderCause.UNKNOWN):
         outcomes = coord.cycle(pool)
         if any(o.identity == identity and o.status == "held" for o in outcomes):
             return starts
-        if coord.permits(pool) > 0:  # a provider is running this cycle
+        if permits(coord, pool) > 0:  # a provider is running this cycle
             starts += 1
             fake.end(identity, cause=cause)
     raise AssertionError("record never reached a hold")
@@ -111,6 +111,23 @@ class NeverStartsLauncher:
 
     def start(self, record, store) -> StartResult:
         return StartResult(NOT_STARTED)
+
+    def is_alive(self, family: str | None) -> bool:
+        return False  # nothing ever started, so no family is ever alive
+
+
+def permits(coord, pool: str) -> int:
+    """Test-only read of the coordinator's private permit ledger (the durable running rows).
+    Permit accounting is an internal invariant, not a public operation, so the tests observe
+    it through the store rather than a coordinator method (ADR 0030's two-call seam)."""
+    return coord._store.permits_used(pool)
+
+
+def record_of(coord, identity: str):
+    """Test-only read of one durable record — white-box *observation* of ownership facts (the
+    GitHub claim, tool lineage, auto-merge eligibility) that never cross the terminal seam,
+    without driving any private transition."""
+    return coord._store.load()[identity]
 
 
 @pytest.fixture
@@ -128,10 +145,10 @@ def make_coord(coord_state):
     daemon crash over the same durable store."""
     def _make(fake=None, **kwargs):
         if fake is not None:
+            # The one fake plays all three collaborators: launcher (start + is_alive), stage
+            # adapter (observe + verify), and admission gate.
             kwargs.setdefault("launcher", fake)
-            kwargs.setdefault("is_alive", fake.is_alive)
-            kwargs.setdefault("observe", fake.observe)
-            kwargs.setdefault("verify", fake.verify)
+            kwargs.setdefault("adapter", fake)
             kwargs.setdefault("gate", fake.gate)
         return Coordinator(**kwargs)
     return _make

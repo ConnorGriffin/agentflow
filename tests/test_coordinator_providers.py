@@ -96,3 +96,34 @@ def test_classification_labels_bridge_to_coordinator_vocabulary():
     assert classify_claude([{"type": "error", "subtype": "capacity"}]).classification() == "recoverable"
     assert classify_claude([{"type": "error", "subtype": "billing"}]).classification() == "permanent"
     assert classify_codex(exit_status=1).classification() == "unknown"
+
+
+def test_provider_adapters_observe_from_durable_session_artifacts(tmp_path, monkeypatch):
+    """Each production adapter reconstructs the full observation from a launched attempt's
+    durable events + exit artifacts. Claude reads its structured stream; Codex reads only its
+    typed account fact and exit — its `--json` prose is preserved but never diagnoses."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.coordinator.session import events_path, exit_path
+    from agentflow.coordinator.store import default_store_path
+
+    def artifacts(token, events_text, exit_text):
+        ev = events_path(default_store_path(), token)
+        ev.parent.mkdir(parents=True, exist_ok=True)
+        ev.write_text(events_text)
+        exit_path(default_store_path(), token).write_text(exit_text)
+
+    artifacts("tok-1", '{"type": "assistant", "text": "hi"}\n'
+                       '{"type": "error", "subtype": "capacity", "reset_at": 42}\n', "0\n")
+    claude_rec = Record("i", "review", "claude", 1, launch_token="tok-1", family="123")
+    obs = ClaudeProviderAdapter().observe(claude_rec)
+    assert obs.cause is ProviderCause.CAPACITY and obs.reset_at == 42 and obs.exit_status == 0
+    assert any(e.get("type") == "assistant" for e in obs.events)  # events preserved
+
+    artifacts("tok-2", "I am rate limited, sorry\n", "1\n")  # prose, not structured
+    codex_rec = Record("j", "review", "codex", 2, launch_token="tok-2")
+    assert CodexProviderAdapter().observe(codex_rec).cause is ProviderCause.UNKNOWN
+    typed = lambda record: {"kind": "rate_limited", "reset_at": 99}
+    typed_obs = CodexProviderAdapter(account_of=typed).observe(codex_rec)
+    assert typed_obs.cause is ProviderCause.CAPACITY and typed_obs.reset_at == 99

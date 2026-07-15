@@ -15,10 +15,11 @@ import time
 
 import pytest
 
-from conftest import FakeSession, NeverStartsLauncher, starts_until_held
+from conftest import FakeSession, NeverStartsLauncher, permits, starts_until_held
 
 from agentflow.coordinator import Coordinator, Submission
 from agentflow.coordinator.launcher import LocalLauncher
+from agentflow.coordinator.providers import ProviderCause
 
 
 def review(subject: str = "7", pool: str = "codex") -> Submission:
@@ -32,7 +33,7 @@ def test_reservation_that_never_started_recovers_with_the_full_budget(make_coord
     identity = crashed.submit_stage(review())
     with pytest.raises(RuntimeError):
         crashed.cycle("codex")
-    assert crashed.permits("codex") == 2  # ambiguous running reservation fails closed
+    assert permits(crashed, "codex") == 2  # ambiguous running reservation fails closed
 
     fake.crash_start = False
     recovered = make_coord(fake)
@@ -60,9 +61,9 @@ def test_durable_started_and_alive_recovery_keeps_the_reservation(make_coord):
 
     recovered = make_coord(fake)
     assert recovered.cycle("codex") == []       # a live family is neither released nor duplicated
-    assert recovered.permits("codex") == 2
+    assert permits(recovered, "codex") == 2
     assert recovered.cycle("codex") == []       # idempotent across repeated reconciliation
-    assert recovered.permits("codex") == 2
+    assert permits(recovered, "codex") == 2
 
 
 def test_launch_that_never_creates_a_family_records_not_started(make_coord):
@@ -70,7 +71,7 @@ def test_launch_that_never_creates_a_family_records_not_started(make_coord):
     coord = make_coord(fake, launcher=NeverStartsLauncher())
     identity = coord.submit_stage(review())
     assert coord.cycle("codex") == []
-    assert coord.permits("codex") == 0  # nothing started, so nothing reserved and no attempt
+    assert permits(coord, "codex") == 0  # nothing started, so nothing reserved and no attempt
 
 
 def test_real_launcher_spawns_a_provider_and_the_start_is_durable(coord_state):
@@ -80,12 +81,12 @@ def test_real_launcher_spawns_a_provider_and_the_start_is_durable(coord_state):
     coord = Coordinator(launcher=LocalLauncher(alive_provider, timeout=5))
     identity = coord.submit_stage(review(pool="claude"))
     assert coord.cycle("claude") == []
-    assert coord.permits("claude") == 1  # a real provider family is alive and reserved
+    assert permits(coord, "claude") == 1  # a real provider family is alive and reserved
 
     # A fresh coordinator over the same store reconciles the durable start and real liveness.
     recovered = Coordinator(launcher=LocalLauncher(alive_provider, timeout=5))
     assert recovered.cycle("claude") == []
-    assert recovered.permits("claude") == 1
+    assert permits(recovered, "claude") == 1
 
 
 def test_real_launcher_releases_when_the_spawned_provider_exits(coord_state):
@@ -96,9 +97,40 @@ def test_real_launcher_releases_when_the_spawned_provider_exits(coord_state):
                         gate=lambda record: gate["open"])
     coord.submit_stage(review(pool="claude"))
     assert coord.cycle("claude") == []
-    assert coord.permits("claude") == 1  # started
+    assert permits(coord, "claude") == 1  # started
 
     time.sleep(0.5)                      # the provider exits
     gate["open"] = False                 # do not immediately re-admit the continuation
     coord.cycle("claude")
-    assert coord.permits("claude") == 0  # the dead family's reservation is released
+    assert permits(coord, "claude") == 0  # the dead family's reservation is released
+
+
+def test_launched_session_is_observed_from_its_durable_artifacts(coord_state):
+    """The wired provider path is real, not a no-op: a launched Claude family redirects its
+    structured stream and exit to durable per-attempt artifacts, and the default provider
+    observer reconstructs the full observation from them — a typed capacity cause with its
+    reset, not a guess — which then drives the seam's continuation decision (ADR 0030)."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.store import Store, default_store_path
+
+    emitted = [{"type": "assistant", "text": "working"},
+               {"type": "error", "subtype": "capacity", "reset_at": 900}]
+    script = ("import json,sys\n"
+              + "\n".join(f"print(json.dumps({e!r}))" for e in emitted) + "\nsys.exit(0)\n")
+    provider = lambda record: [sys.executable, "-c", script]
+
+    coord = Coordinator(launcher=LocalLauncher(provider, timeout=5))
+    identity = coord.submit_stage(Submission(repo="o/r", subject="obs", stage="review",
+                                             pool="claude", input_ptr="a-brief"))
+    assert coord.cycle("claude") == []       # launched; a real family recorded started
+    time.sleep(0.5)                          # the provider emits its events and exits
+
+    record = Store(default_store_path()).load()[identity]
+    obs = ClaudeProviderAdapter().observe(record)
+    assert obs.cause is ProviderCause.CAPACITY and obs.reset_at == 900
+    assert any(e.get("type") == "assistant" for e in obs.events)   # events preserved
+    assert obs.exit_status == 0
+
+    # The same observation, through the seam, defers the stage as an eligible continuation.
+    assert coord.cycle("claude", now=0) == []
+    assert permits(coord, "claude") == 0     # released, waiting for its reset
