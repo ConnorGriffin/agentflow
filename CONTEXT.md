@@ -85,10 +85,11 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   — cost is not, since both plans are flat-rate. Idle headroom while work is queued
   is wasted sunk cost.
 
-- **Capacity permit / admission demand** — a capacity permit is one unit of concurrent
-  demand available within a pool; a session's *admission demand* is the permits it reserves
-  until it ends. Permits prevent simultaneous sessions from racing on the same headroom
-  fact; they are not a measure of spent headroom.
+- **Capacity permit / permit budget / admission demand** — a capacity permit is one unit
+  of concurrent demand within a pool; the pool's *permit budget* is the fixed number it can
+  lend at once, and a session's *admission demand* is the permits it reserves until it ends.
+  Permits prevent simultaneous sessions from racing on the same headroom fact; they are not
+  a measure of spent headroom.
   *Avoid:* points (which does not name what is being bounded).
 
 - **Admission matrix** — the reviewed mapping from a session's stage, model, complexity,
