@@ -85,6 +85,17 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   — cost is not, since both plans are flat-rate. Idle headroom while work is queued
   is wasted sunk cost.
 
+- **Capacity permit / admission demand** — a capacity permit is one unit of concurrent
+  demand available within a pool; a session's *admission demand* is the permits it reserves
+  until it ends. Permits prevent simultaneous sessions from racing on the same headroom
+  fact; they are not a measure of spent headroom.
+  *Avoid:* points (which does not name what is being bounded).
+
+- **Admission matrix** — the reviewed mapping from a session's stage, model, complexity,
+  and effort to its admission demand. It is calibrated from completed session history and
+  remains static while the fleet runs.
+  *Avoid:* adaptive scheduler, learned weights.
+
 - **Two-pool load balancer** — the scheduler that assigns builds to keep both pools
   maximally utilized in parallel: builder → the pool with more headroom, reviewer →
   the other tool/pool. Never leaves a prepaid plan idle while work is queued.
@@ -112,6 +123,26 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Held issue** — an issue parked at `needs-grilling` or `needs-mockup`: inert to
   agents until the maintainer replies in a comment (which auto-advances it) or drives it
   with `/agentflow pickup` (ADR 0019). No builder touches a held issue.
+
+- **Recoverable interruption** — a pipeline session ending because of a temporary
+  capacity or execution condition, rather than because the work itself cannot proceed.
+  Rate limits, session timeouts, CLI crashes, and transient provider/network failures are
+  recoverable interruptions; a fresh runner may continue the same owned work.
+  *Avoid:* build failure, error (both blur temporary interruption with a real hold).
+
+- **Continuation** — a fresh runner attempt that carries a pipeline stage forward from
+  its durable state after a recoverable interruption. Worktree-owning stages continue
+  their existing changes; read-only stages restart from their durable source state.
+  *Avoid:* retry (which suggests discarding the earlier attempt and starting over).
+
+- **Tool lineage** — the runner identity retained across every code-writing attempt on
+  one change. A continuation stays in its original Claude or Codex lineage so the other
+  tool remains independent for cross-tool review.
+  *Avoid:* current runner, last runner (both lose the change's authorship history).
+
+- **Bail** — a deliberate runner stop because continuing would require guessing missing
+  intent, expanding scope, or crossing an integration collision. A bail needs a human
+  decision and is not a recoverable interruption.
 
 - **Grounding fetch** — a per-repo, **read-only** pull of real data intake runs to check
   facts before scoping (ciq: `ciq-pull-db` → `ciq.readonly.db`). Declared once in the
