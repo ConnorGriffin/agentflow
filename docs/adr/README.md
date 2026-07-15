@@ -73,3 +73,6 @@ then Context / Decision / Alternatives / Consequences.
   policy (rides 0023's concurrency slice).
 - [0027](0027-wayfinder-planning-boundary.md) — Wayfinder planning artifacts stay
   upstream of intake; only the build tickets wayfinder files enter agentflow.
+- [0028](0028-stage-scoped-continuations.md) — Continuations are durable,
+  stage-scoped fresh sessions with bounded attempts, retained claims and tool lineage,
+  scheduler-owned waits, and stage-native human holds.

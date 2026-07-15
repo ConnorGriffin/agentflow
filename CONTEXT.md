@@ -135,6 +135,14 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   their existing changes; read-only stages restart from their durable source state.
   *Avoid:* retry (which suggests discarding the earlier attempt and starting over).
 
+- **Stage outcome** — the durable fact a pipeline stage must produce before the pipeline
+  can advance, such as an intake route, opened PR, or review verdict. A clean process exit
+  without that fact is incomplete, not success; a human hold is a separate terminal handoff.
+
+- **Continuation budget** — the bounded allowance of fresh runner attempts available to
+  one logical stage after its initial attempt. A later stage receives its own budget; an
+  exhausted budget turns the current stage into a human hold.
+
 - **Tool lineage** — the runner identity retained across every code-writing attempt on
   one change. A continuation stays in its original Claude or Codex lineage so the other
   tool remains independent for cross-tool review.
