@@ -160,6 +160,29 @@ def test_codex_launch_confines_the_session_to_its_assigned_worktree(tmp_path, mo
     assert str(wt.resolve()) in prompt and branch in prompt
 
 
+def test_codex_probe_uses_the_same_workspace_sandbox(monkeypatch):
+    launched = {}
+    original_run = runner_mod._run
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        if cmd[0] == "codex":
+            launched.update(cmd=cmd, cwd=cwd, timeout=timeout)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return original_run(cmd, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(runner_mod, "_run", fake_run)
+    assert CodexRunner().probe() is True
+
+    cmd = launched["cmd"]
+    assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+    assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+    assert cmd[cmd.index("--cd") + 1] == str(Path(launched["cwd"]).resolve())
+    assert "--ignore-user-config" in cmd and "--ephemeral" in cmd
+    assert 'approval_policy="never"' in cmd
+    assert "sandbox_workspace_write.network_access=true" in cmd
+    assert str(Path(launched["cwd"]).resolve()) in cmd[-1]
+
+
 def test_effort_has_four_levels():
     assert [e.value for e in Effort] == ["low", "medium", "high", "extra"]
 

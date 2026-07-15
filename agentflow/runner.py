@@ -438,8 +438,11 @@ class CodexRunner(_WorktreeRunner):
             cwd = Path(tmp) / ".agentflow" / "worktrees" / "codex-probe"
             cwd.mkdir(parents=True, exist_ok=True)
             r = _run([codex_bin, "exec", "-m", model,
-                      "--dangerously-bypass-approvals-and-sandbox",
-                      "--skip-git-repo-check", "reply with: ok"],
+                      "--sandbox", "workspace-write", "--cd", str(cwd.resolve()),
+                      "--ignore-user-config", "--ephemeral",
+                      "-c", 'approval_policy="never"',
+                      "-c", "sandbox_workspace_write.network_access=true",
+                      "--skip-git-repo-check", _bounded_prompt("reply with: ok", str(cwd))],
                      cwd=str(cwd), timeout=timeout)
             return r.returncode == 0
 
