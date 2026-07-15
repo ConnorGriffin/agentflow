@@ -46,6 +46,8 @@ _PCT_RE = re.compile(r"at (\d+(?:\.\d+)?)% of (?:peak|limit)")
 _SHORT_WINDOW_MIN = 300
 _WEEKLY_WINDOW_MIN = 10080
 _WEEKLY_UNATTENDED_PCT = 80.0
+_DAY_SECONDS = 24 * 60 * 60
+_WEEKLY_DAYS = _WEEKLY_WINDOW_MIN * 60 // _DAY_SECONDS
 
 # ADR 0025 spend-ceiling policy (named config, env-overridable). An idle pool dispatches
 # until it is this % spent; an operator-active pool yields down to the lower ceiling and
@@ -141,10 +143,8 @@ def _codex_pacing(windows: tuple[RateLimitWindow, ...], now: float) -> tuple[boo
         if window.window_minutes != _WEEKLY_WINDOW_MIN:
             continue
         elapsed = now - starts_at
-        released = min(
-            _WEEKLY_UNATTENDED_PCT,
-            _WEEKLY_UNATTENDED_PCT * elapsed / (window.window_minutes * 60),
-        )
+        day = min(int(elapsed // _DAY_SECONDS), _WEEKLY_DAYS - 1)
+        released = _WEEKLY_UNATTENDED_PCT * (day + 1) / _WEEKLY_DAYS
         if window.used_percent >= released:
             return False, (
                 f"weekly spend at {window.used_percent:g}% exceeds "
