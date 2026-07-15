@@ -79,3 +79,6 @@ then Context / Decision / Alternatives / Consequences.
 - [0029](0029-static-per-pool-admission.md) — Each provider pool has five static,
   review-controlled permits; conservative 1–5 demand bands preserve short-stage
   concurrency while preventing two code-writing sessions from sharing a pool.
+- [0030](0030-session-coordinator-seam.md) — One session coordinator owns durable
+  continuation, classification, and atomic admission; provider adapters extract facts
+  while stage adapters retain completion and recovery locality.
