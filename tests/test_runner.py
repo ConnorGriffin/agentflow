@@ -5,6 +5,7 @@ behind adapters; the *decision* of what a session outcome means is `classify_bui
 and that is what actually needs to be right.
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -102,6 +103,61 @@ def test_every_complexity_maps_for_every_tool():
     for runner in (ClaudeRunner(), CodexRunner()):
         for complexity in Complexity:
             assert runner.model_for(complexity)  # no complexity left unmapped
+
+
+def test_claude_launch_confines_the_session_to_its_assigned_worktree(tmp_path, monkeypatch):
+    repo = _repo_with_origin(tmp_path)
+    branch = "agentflow/claude/issue-7-owned"
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-7-owned"
+    _branch_worktree(repo, wt, branch)
+    launched = {}
+
+    def fake_session(cmd, cwd, timeout):
+        launched.update(cmd=cmd, cwd=cwd, timeout=timeout)
+        return subprocess.CompletedProcess(cmd, 0, "done", "")
+
+    monkeypatch.setattr(runner_mod, "_run_session", fake_session)
+    assert ClaudeRunner().launch("build it", str(wt), "sonnet") == (True, "done")
+
+    cmd = launched["cmd"]
+    settings = json.loads(cmd[cmd.index("--settings") + 1])
+    assert launched["cwd"] == str(wt)
+    assert cmd[cmd.index("--setting-sources") + 1] == "project"
+    assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
+    assert "--dangerously-skip-permissions" not in cmd
+    assert settings["sandbox"]["enabled"] is True
+    assert settings["sandbox"]["failIfUnavailable"] is True
+    assert settings["sandbox"]["allowUnsandboxedCommands"] is False
+    assert settings["sandbox"]["enableWeakerNetworkIsolation"] is True
+    prompt = cmd[cmd.index("-p") + 1]
+    assert str(wt.resolve()) in prompt and branch in prompt
+
+
+def test_codex_launch_confines_the_session_to_its_assigned_worktree(tmp_path, monkeypatch):
+    repo = _repo_with_origin(tmp_path)
+    branch = "agentflow/codex/issue-8-owned"
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-8-owned"
+    _branch_worktree(repo, wt, branch)
+    launched = {}
+
+    def fake_session(cmd, cwd, timeout):
+        Path(cmd[cmd.index("-o") + 1]).write_text("done")
+        launched.update(cmd=cmd, cwd=cwd, timeout=timeout)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(runner_mod, "_run_session", fake_session)
+    assert CodexRunner().launch("build it", str(wt), "gpt-5.6-terra") == (True, "done")
+
+    cmd = launched["cmd"]
+    assert launched["cwd"] == str(wt)
+    assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
+    assert cmd[cmd.index("--cd") + 1] == str(wt.resolve())
+    assert "--ignore-user-config" in cmd and "--ephemeral" in cmd
+    assert 'approval_policy="never"' in cmd
+    assert "sandbox_workspace_write.network_access=true" in cmd
+    assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
+    prompt = cmd[-1]
+    assert str(wt.resolve()) in prompt and branch in prompt
 
 
 def test_effort_has_four_levels():
