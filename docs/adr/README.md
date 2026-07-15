@@ -76,3 +76,6 @@ then Context / Decision / Alternatives / Consequences.
 - [0028](0028-stage-scoped-continuations.md) — Continuations are durable,
   stage-scoped fresh sessions with bounded attempts, retained claims and tool lineage,
   scheduler-owned waits, and stage-native human holds.
+- [0029](0029-static-per-pool-admission.md) — Each provider pool has five static,
+  review-controlled permits; conservative 1–5 demand bands preserve short-stage
+  concurrency while preventing two code-writing sessions from sharing a pool.
