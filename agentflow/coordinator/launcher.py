@@ -2,7 +2,7 @@
 
 A provider is started through a small local launcher that spawns a child process. That
 child durably records ``started`` with its own process-family identity *before* it
-``exec``-replaces itself with the provider, so the start fact and the family exist on the
+spawns the provider beneath itself, so the start fact and the family exist on the
 durable record even if the provider exits immediately or the daemon dies before reading
 it. A launch that never records that fact consumes no attempt. The coordinator consumes an
 attempt if and only if the durable result is ``started``.
@@ -28,6 +28,7 @@ from agentflow.coordinator.record import NOT_STARTED, STARTED  # re-exported for
 # Bounded wait for the spawned child to durably record `started` before we treat the launch
 # as one that never produced a provider family.
 _HANDSHAKE_TIMEOUT_S = float(os.environ.get("AGENTFLOW_COORD_HANDSHAKE_S", "10"))
+_SESSION_TIMEOUT_S = float(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
 
 
 @dataclass(frozen=True)
@@ -54,18 +55,20 @@ class LocalLauncher:
     """Spawns a provider through the crash-safe child bootstrap (ADR 0030).
 
     ``start`` forks the bootstrap child, which records ``started`` with its own pid before
-    ``exec``-replacing itself with the provider (which redirects its structured stream and
-    exit to durable per-attempt artifacts), then waits (bounded) for that durable fact to
+    supervising the provider (whose structured stream and terminal facts go to durable
+    per-attempt artifacts), then waits (bounded) for that durable fact to
     appear or for the child to die without it. ``provider_command`` maps a record to the argv
     the child runs; the default builds the real Claude/Codex session command for a record that
     carries a prompt and a no-op for one that does not — the dormant slice, where no live stage
     has submitted work yet.
     """
 
-    def __init__(self, provider_command=None, *, timeout: float = _HANDSHAKE_TIMEOUT_S) -> None:
+    def __init__(self, provider_command=None, *, timeout: float = _HANDSHAKE_TIMEOUT_S,
+                 session_timeout: float = _SESSION_TIMEOUT_S) -> None:
         from agentflow.coordinator.providers import provider_command as real_command
         self._provider_command = provider_command or real_command
         self._timeout = timeout
+        self._session_timeout = session_timeout
 
     @staticmethod
     def is_alive(family: str | None) -> bool:
@@ -79,7 +82,8 @@ class LocalLauncher:
         try:
             child = subprocess.Popen(
                 [sys.executable, "-m", "agentflow.coordinator._launch_child",
-                 str(store.path), record.identity, str(token), *argv])
+                 str(store.path), record.identity, str(token), str(self._session_timeout),
+                 record.source or "", *argv])
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence
         # The intermediate exits at once; reap it so it does not linger. The provider

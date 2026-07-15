@@ -389,13 +389,14 @@ class ClaudeRunner(_WorktreeRunner):
         ], cwd, session_timeout)
         return r.returncode == 0, r.stdout
 
-    def structured_argv(self, prompt: str, model: str) -> list[str]:
+    def structured_argv(self, prompt: str, model: str, cwd: str) -> list[str]:
         """The structured-session variant of ``launch`` (ADR 0030). Same session, but Claude
         emits its machine-readable event stream (one JSON object per line) so the coordinator's
         provider adapter can preserve the full observation set instead of only a final string."""
-        return ["claude", "-p", prompt, "--model", model,
+        return ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
                 "--output-format", "stream-json", "--verbose",
-                "--dangerously-skip-permissions"]
+                "--permission-mode", "acceptEdits", "--setting-sources", "project",
+                "--settings", _CLAUDE_AUTONOMOUS_SETTINGS]
 
 
 class CodexRunner(_WorktreeRunner):
@@ -435,19 +436,52 @@ class CodexRunner(_WorktreeRunner):
 
     _CLI_MODEL = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra"}
 
-    def structured_argv(self, prompt: str, model: str) -> list[str]:
+    def structured_argv(self, prompt: str, model: str, cwd: str) -> list[str]:
         """The structured-session variant of ``launch`` (ADR 0030): ``codex exec --json`` emits
         machine-readable events. Per ADR, that prose is never a diagnosis — the coordinator's
         Codex adapter distinguishes capacity from a permanent plan problem only from the typed
         account/rate-limit surface, so this argv exists to run the session, not to classify it."""
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
+        worktree = os.path.realpath(cwd)
+        common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
+                       "--git-common-dir"])
+        writable_roots = json.dumps([common.stdout.strip()]) if common.returncode == 0 else "[]"
         return [codex_bin, "exec", "-m", self._CLI_MODEL.get(model, model), "--json",
-                "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", prompt]
+                "--sandbox", "workspace-write", "--cd", worktree,
+                "--ignore-user-config", "--ephemeral", "-c", 'approval_policy="never"',
+                "-c", "sandbox_workspace_write.network_access=true",
+                "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
+                "--skip-git-repo-check", _bounded_prompt(prompt, cwd)]
 
     def account_fact(self) -> dict | None:
-        """The typed account/rate-limit fact used to distinguish capacity from a permanent
-        plan problem after an ambiguous Codex failure (ADR 0030). No typed surface is wired in
-        this slice, so it returns ``None`` and an untyped failure stays a bounded ``unknown``."""
+        """Read the existing typed Codex limit companion. It establishes capacity only when a
+        reported window is exhausted; unavailable or unsupported account diagnoses remain
+        ``None`` so provider prose can never be promoted into a cause (ADR 0030)."""
+        gate = os.environ.get(
+            "AGENTFLOW_TRIAGE_GATE",
+            os.path.expanduser("~/Code/ConnorGriffin/dotfiles/scripts/triage-gate.sh"))
+        try:
+            result = subprocess.run(
+                [gate, "limits"], env={**os.environ, "TRIAGE_AGENT": "codex"},
+                text=True, capture_output=True, timeout=30)
+            if result.returncode != 0:
+                return None
+            payload = json.loads(result.stdout)
+            windows = payload.get("windows")
+            if not isinstance(windows, list):
+                return None
+            exhausted = [window for window in windows
+                         if isinstance(window, dict)
+                         and isinstance(window.get("used_percent"), (int, float))
+                         and not isinstance(window.get("used_percent"), bool)
+                         and window["used_percent"] >= 100
+                         and isinstance(window.get("resets_at"), (int, float))
+                         and not isinstance(window.get("resets_at"), bool)]
+            if exhausted:
+                return {"kind": "rate_limited",
+                        "reset_at": min(window["resets_at"] for window in exhausted)}
+        except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, ValueError):
+            return None
         return None
 
     def probe(self) -> bool:

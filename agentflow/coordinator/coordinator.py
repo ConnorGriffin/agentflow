@@ -113,7 +113,7 @@ class Coordinator:
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
-            input_ptr=submission.input_ptr, lineage=lineage,
+            source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of)
         with self._lock:
             existing = self._records.setdefault(identity, record)
@@ -202,6 +202,7 @@ class Coordinator:
                 was_committed = record.attempt_committed
                 self._consume_attempt(record)
                 if not self._launcher.is_alive(record.family):
+                    record.process_alive = False
                     outcome = self._finalize(record)
                     if outcome is not None:
                         outcomes.append(outcome)

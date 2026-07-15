@@ -43,6 +43,7 @@ class Record:
     state: str = WAITING
     claim: bool = True           # holds the GitHub dedup claim while the stage is owned
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move
+    source: str | None = None    # durable working-directory/worktree pointer for provider launch
     input_ptr: str | None = None # durable pointer the provider adapter rebuilds the prompt from
     start_fact: str | None = None        # durable launcher handshake result: started | not_started
     launch_token: str | None = None      # nonce a reservation stamps; only the child holding it may record `started`

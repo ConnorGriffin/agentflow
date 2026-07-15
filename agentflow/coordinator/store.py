@@ -70,12 +70,12 @@ class Store:
 
     def _connect(self) -> sqlite3.Connection:
         # A fully-initialized store is published atomically: it is built in a private temp
-        # file under the same directory, then renamed into place. The final path therefore
+        # file under the same directory, then linked into place without replacement. The final path therefore
         # only ever appears as a complete, versioned database — a crash mid-creation leaves a
         # temp file behind, never a zero-byte final path that a later open would misread as a
-        # fresh not-yet-initialized store (ADR 0030 fail-closed). Only an absent or zero-byte
-        # final path triggers creation; a populated store is never overwritten.
-        if not self.path.exists() or self.path.stat().st_size == 0:
+        # fresh not-yet-initialized store (ADR 0030 fail-closed). Only an absent final path
+        # triggers creation; an existing empty/corrupt file fails closed.
+        if not self.path.exists():
             self._create_atomically()
         try:
             conn = self._open(self.path)
@@ -101,10 +101,12 @@ class Store:
         return conn
 
     def _create_atomically(self) -> None:
-        """Build a complete, versioned store in a temp file and publish it with one atomic
-        rename. A crash before the rename leaves only the temp file under the state directory;
+        """Build a complete, versioned store in a temp file and publish it with one atomic,
+        no-clobber hard link. A crash before publication leaves only the temp file;
         the final path is only ever an absent or a fully-initialized store, never a half-built
-        zero-byte file that later opens would treat as fresh absence."""
+        zero-byte file that later opens would treat as fresh absence. Concurrent creators all
+        open the one winning inode; no initialized store is ever replaced underneath an
+        already-open connection."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.parent / f".{self.path.name}.{os.getpid()}.{uuid4().hex}.tmp"
         try:
@@ -114,7 +116,11 @@ class Store:
             finally:
                 conn.close()
             _fsync_path(tmp)
-            os.replace(tmp, self.path)          # atomic publish over absent/zero-byte only
+            try:
+                os.link(tmp, self.path)         # atomic create-if-absent; never replaces a winner
+            except FileExistsError:
+                pass                            # another creator published the shared ledger
+            _unlink(tmp)
             _fsync_path(self.path.parent)
         except sqlite3.DatabaseError as e:
             _unlink(tmp)

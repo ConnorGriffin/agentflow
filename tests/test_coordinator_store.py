@@ -76,21 +76,43 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
 
 
-def test_zero_byte_store_from_a_crashed_create_is_healed_not_bricked(tmp_path):
-    """The real store is published by an atomic rename, so a crash mid-creation can only ever
-    leave a zero-byte final path — never a half-written schema. Opening over that zero-byte
-    file builds a fresh versioned store rather than failing closed as if it were corrupt."""
+def test_existing_zero_byte_store_fails_closed(tmp_path):
+    """Only absence means fresh state. An existing empty file is ambiguous and must not be
+    replaced as though no coordinator had ever owned the path."""
     path = tmp_path / "coord.db"
-    path.write_bytes(b"")  # what a crash before the atomic publish would leave behind
+    path.write_bytes(b"")
 
-    store = Store(path)
-    assert path.stat().st_size > 0  # healed into a real, non-empty database
-    conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
-    conn.close()
-    store.upsert(Record("R1", "review", "claude", 1, state="running"))
-    assert store.permits_used("claude") == 1
-    store.close()
+    with pytest.raises(StoreUnavailable):
+        Store(path)
+
+
+def test_concurrent_first_openers_share_one_store_inode(tmp_path):
+    """Coordinators racing on an absent path all write through the one published ledger.
+    No late creator may replace the database underneath an earlier open connection."""
+    path = tmp_path / "coord.db"
+    count = 16
+    start = threading.Barrier(count)
+    opened = threading.Barrier(count)
+    errors: list[BaseException] = []
+
+    def open_and_write(index):
+        try:
+            start.wait()
+            store = Store(path)
+            opened.wait()
+            store.upsert(Record(f"R{index}", "review", "codex", 1))
+            store.close()
+        except BaseException as error:  # surfaced after every thread joins
+            errors.append(error)
+
+    threads = [threading.Thread(target=open_and_write, args=(i,)) for i in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    assert set(Store(path).load()) == {f"R{i}" for i in range(count)}
 
 
 def test_child_start_and_disown_are_mutually_exclusive(tmp_path):

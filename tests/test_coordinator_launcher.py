@@ -18,7 +18,7 @@ import pytest
 from conftest import FakeSession, NeverStartsLauncher, permits, starts_until_held
 
 from agentflow.coordinator import Coordinator, Submission
-from agentflow.coordinator.launcher import LocalLauncher
+from agentflow.coordinator.launcher import LocalLauncher, pid_family_alive
 from agentflow.coordinator.providers import ProviderCause
 
 
@@ -134,3 +134,65 @@ def test_launched_session_is_observed_from_its_durable_artifacts(coord_state):
     # The same observation, through the seam, defers the stage as an eligible continuation.
     assert coord.cycle("claude", now=0) == []
     assert permits(coord, "claude") == 0     # released, waiting for its reset
+
+
+def test_real_supervisor_preserves_partial_output_signal_and_timeout(coord_state):
+    """The production path, not a fixture classifier, retains output written before a
+    deadline and records both the supervisor timeout and the terminating signal."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.store import Store, default_store_path
+
+    script = (
+        "import sys,time\n"
+        "print('partial stdout', flush=True)\n"
+        "print('partial stderr', file=sys.stderr, flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, session_timeout=0.1))
+    identity = coord.submit_stage(review(subject="timed-out", pool="claude"))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        record = Store(default_store_path()).load()[identity]
+        if not pid_family_alive(record.family):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("provider supervisor did not finish after its timeout")
+
+    observation = ClaudeProviderAdapter().observe(record)
+    assert observation.timed_out is True
+    assert observation.signal in {15, 9}
+    assert "partial stdout" in observation.partial_output
+    assert "partial stderr" in observation.partial_output
+    assert observation.cause is ProviderCause.TIMEOUT
+
+
+def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tmp_path):
+    """The path named in the boundary is also the provider process's real working directory,
+    which is what the Claude project settings and OS workspace sandbox confine."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.store import Store, default_store_path
+
+    source = tmp_path / "owned-worktree"
+    source.mkdir()
+    provider = lambda record: [sys.executable, "-c", "import os; print(os.getcwd())"]
+    coord = Coordinator(launcher=LocalLauncher(provider, timeout=5))
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject="cwd", stage="review", pool="claude", source=str(source)))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        record = Store(default_store_path()).load()[identity]
+        if not pid_family_alive(record.family):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("provider supervisor did not finish")
+
+    observation = ClaudeProviderAdapter().observe(record)
+    assert observation.partial_output == str(source)

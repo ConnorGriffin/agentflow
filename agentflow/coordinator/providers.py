@@ -85,7 +85,7 @@ _CLAUDE_KNOWN_TYPES = {"assistant", "result", "error"}
 
 
 def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
-                    family=None, process_alive=False) -> ProviderObservation:
+                    partial_output="", family=None, process_alive=False) -> ProviderObservation:
     """Extract facts from Claude's structured stream. A recognized ``error`` subtype gives a
     typed cause; a supervisor timeout or a non-zero exit without one is a recoverable process
     interruption; a clean exit leaves the cause to the stage outcome. Unrecognized event
@@ -119,7 +119,8 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
             cause = ProviderCause.PROCESS
     return ProviderObservation(
         cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
-        timed_out=timed_out, final_message=final_message, events=events,
+        timed_out=timed_out, final_message=final_message, partial_output=partial_output,
+        events=events,
         unrecognized=tuple(unrecognized), family=family, process_alive=process_alive)
 
 
@@ -135,7 +136,8 @@ _CODEX_ACCOUNT_CAUSES = {
 
 
 def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_out=False,
-                   final_message="", family=None, process_alive=False) -> ProviderObservation:
+                   final_message="", partial_output="", events=(), family=None,
+                   process_alive=False) -> ProviderObservation:
     """Extract facts from a Codex attempt. Only a typed ``account_fact`` (from the account/
     rate-limit surface) may establish capacity vs. a permanent plan problem; the model's
     prose is captured as ``final_message`` but never diagnoses. An untyped failure — even a
@@ -153,10 +155,16 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
             cause = ProviderCause.TIMEOUT
         elif signal is not None or (exit_status not in (None, 0)):
             cause = ProviderCause.UNKNOWN  # a bare Codex exit is never diagnostic (ADR 0030)
+    events = tuple(events)
+    for event in events:
+        item = event.get("item") if isinstance(event, dict) else None
+        if (event.get("type") == "item.completed" and isinstance(item, dict)
+                and item.get("type") == "agent_message"):
+            final_message = item.get("text", final_message)
     return ProviderObservation(
         cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
-        timed_out=timed_out, final_message=final_message, family=family,
-        process_alive=process_alive)
+        timed_out=timed_out, final_message=final_message, partial_output=partial_output,
+        events=events, unrecognized=events, family=family, process_alive=process_alive)
 
 
 # --- the two production provider adapters (ADR 0030) ------------------------------------
@@ -176,12 +184,14 @@ class ClaudeProviderAdapter:
 
     def command(self, record) -> list[str]:
         from agentflow.runner import ClaudeRunner
-        return ClaudeRunner().structured_argv(self._prompt_of(record), record.model)
+        return ClaudeRunner().structured_argv(
+            self._prompt_of(record), record.model, record.source)
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
         return classify_claude(
-            session.events, exit_status=session.exit_status,
+            session.events, exit_status=session.exit_status, signal=session.signal,
+            timed_out=session.timed_out, partial_output=session.partial_output,
             family=record.family, process_alive=record.process_alive)
 
     def verify(self, record, obs) -> bool:
@@ -198,14 +208,20 @@ class CodexProviderAdapter:
 
     def command(self, record) -> list[str]:
         from agentflow.runner import CodexRunner
-        return CodexRunner().structured_argv(self._prompt_of(record), record.model)
+        return CodexRunner().structured_argv(
+            self._prompt_of(record), record.model, record.source)
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
-        account = self._account_of(record) if self._account_of else None
+        if self._account_of:
+            account = self._account_of(record)
+        else:
+            from agentflow.runner import CodexRunner
+            account = CodexRunner().account_fact()
         return classify_codex(
-            account_fact=account, exit_status=session.exit_status,
-            final_message=session.partial_output,
+            account_fact=account, exit_status=session.exit_status, signal=session.signal,
+            timed_out=session.timed_out, partial_output=session.partial_output,
+            events=session.events,
             family=record.family, process_alive=record.process_alive)
 
     def verify(self, record, obs) -> bool:
@@ -227,7 +243,7 @@ def provider_command(record) -> list[str]:
     path is fully wired for real Claude/Codex sessions yet stays dormant until a stage submits
     one. An unknown pool never reaches a launch (it has no permit ledger)."""
     adapter = _ADAPTERS.get(record.pool)
-    if adapter is None or not record.input_ptr:
+    if adapter is None or not record.input_ptr or not record.source:
         return _dormant_provider_command(record)
     return adapter().command(record)
 

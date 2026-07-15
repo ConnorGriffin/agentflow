@@ -123,7 +123,27 @@ def test_provider_adapters_observe_from_durable_session_artifacts(tmp_path, monk
 
     artifacts("tok-2", "I am rate limited, sorry\n", "1\n")  # prose, not structured
     codex_rec = Record("j", "review", "codex", 2, launch_token="tok-2")
-    assert CodexProviderAdapter().observe(codex_rec).cause is ProviderCause.UNKNOWN
+    assert CodexProviderAdapter(account_of=lambda record: None).observe(codex_rec).cause is ProviderCause.UNKNOWN
     typed = lambda record: {"kind": "rate_limited", "reset_at": 99}
     typed_obs = CodexProviderAdapter(account_of=typed).observe(codex_rec)
     assert typed_obs.cause is ProviderCause.CAPACITY and typed_obs.reset_at == 99
+
+
+def test_default_codex_adapter_queries_the_typed_limit_companion(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    from agentflow.coordinator.providers import CodexProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.coordinator.session import write_result
+    from agentflow.coordinator.store import default_store_path
+    from agentflow.runner import CodexRunner
+
+    monkeypatch.setattr(
+        CodexRunner, "account_fact",
+        lambda self: {"kind": "rate_limited", "reset_at": 77})
+    write_result(default_store_path(), "tok", exit_status=1,
+                 signal=None, timed_out=False)
+
+    observation = CodexProviderAdapter().observe(
+        Record("codex", "review", "codex", 2, launch_token="tok"))
+    assert observation.cause is ProviderCause.CAPACITY
+    assert observation.reset_at == 77
