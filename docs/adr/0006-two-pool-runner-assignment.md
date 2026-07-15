@@ -44,11 +44,12 @@ dispatch constraint, and all of them must permit a new unattended session. A
 missing, malformed, or unknown fact makes that pool unavailable until fresh facts
 arrive.
 
-For a reported 10,080-minute window, unattended Codex allowance is released
-linearly from 0% at the window start to 80% immediately before reset:
-`min(80, 80 × elapsed / 10080)`. Reported usage must be strictly below the released
-allowance. The remaining 20% is reserved for interactive work. This gates new
-sessions only; work already in flight finishes.
+For a reported 10,080-minute window, unattended Codex allowance is released in
+seven equal daily steps measured from the window's own start. The first `80 / 7`
+percent is available immediately, another `80 / 7` percent is released at each
+24-hour boundary, and the seventh day allows the full 80%. Reported usage must be
+strictly below the released allowance. The remaining 20% is reserved for
+interactive work. This gates new sessions only; work already in flight finishes.
 
 A reported 300-minute window continues to use the existing short-window policy.
 If both durations are present, that short-window decision and weekly pacing must

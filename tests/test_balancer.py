@@ -139,7 +139,7 @@ def test_weekly_only_codex_ahead_of_pace_cannot_start_unattended_work(
     assert builder is None
     assert reviewer is None
     assert "codex" in block_msg
-    assert "3.2% released" in block_msg
+    assert "11.4% released" in block_msg
 
 
 def test_weekly_pacing_does_not_replace_dashboard_raw_usage(stub_gate, monkeypatch):
@@ -162,16 +162,17 @@ def test_weekly_pacing_does_not_replace_dashboard_raw_usage(stub_gate, monkeypat
     }
 
 
-@pytest.mark.parametrize(("elapsed", "used_percent", "eligible"), [
-    (0.25, 19, True),
-    (0.25, 20, False),
-    (0.50, 39, True),
-    (0.50, 40, False),
-    (1.00 - 1e-9, 79, True),
-    (1.00 - 1e-9, 80, False),
+@pytest.mark.parametrize(("elapsed_days", "used_percent", "eligible"), [
+    (0, 10, True),
+    (0, 80 / 7, False),
+    (1 - 1 / 86400, 11.43, False),
+    (1, 11.43, True),
+    (1, 160 / 7, False),
+    (6, 79, True),
+    (6, 80, False),
 ])
 def test_weekly_codex_dispatch_stays_below_released_allowance(
-        stub_gate, monkeypatch, elapsed, used_percent, eligible):
+        stub_gate, monkeypatch, elapsed_days, used_percent, eligible):
     resets_at = 1784566349
     duration = 10080 * 60
     monkeypatch.setenv("TEST_CLAUDE_BLOCKED", "1")
@@ -181,7 +182,8 @@ def test_weekly_codex_dispatch_stays_below_released_allowance(
         "window_minutes": 10080,
         "resets_at": resets_at,
     }]}))
-    monkeypatch.setattr(time, "time", lambda: resets_at - duration + elapsed * duration)
+    monkeypatch.setattr(
+        time, "time", lambda: resets_at - duration + elapsed_days * 24 * 60 * 60)
 
     builder, _, _ = pick_pair("CLAUDE", "CODEX")
 
@@ -191,10 +193,10 @@ def test_weekly_codex_dispatch_stays_below_released_allowance(
 @pytest.mark.parametrize("windows", [
     [
         {"used_percent": 10, "window_minutes": 300, "resets_at": 1784281949},
-        {"used_percent": 40, "window_minutes": 10080, "resets_at": 1784566349},
+        {"used_percent": 46, "window_minutes": 10080, "resets_at": 1784566349},
     ],
     [
-        {"used_percent": 40, "window_minutes": 10080, "resets_at": 1784566349},
+        {"used_percent": 46, "window_minutes": 10080, "resets_at": 1784566349},
         {"used_percent": 10, "window_minutes": 300, "resets_at": 1784281949},
     ],
 ])
