@@ -22,6 +22,7 @@ worktrees, following the same live-orchestration path the legacy builder and rev
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,8 +31,8 @@ import time
 from pathlib import Path
 
 from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter, MODE_COORDINATED, Phase,
-                                   ReviewStageAdapter, ReviseStageAdapter, Rollout, StageRouter,
-                                   tracer)
+                                   RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter, Rollout,
+                                   StageRouter, tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
@@ -159,6 +160,33 @@ def revise_submission(review_record, complexity, findings="", *, surfaces=""):
         source=build_worktree, claim=True, input_ptr=brief,
         builder_lineage=review_record.builder_lineage, builder_complexity=complexity,
         round=review_record.round, transfer_from=review_record.identity)
+
+
+def respond_submission(cfg, pr_number, branch, comment, target, baseline):
+    """Translate one unanswered maintainer comment on an existing agentflow PR into a single
+    Respond stage submission — the minimal facts the coordinator needs (ADR 0030). Respond adopts
+    the change's *original tool lineage* and its retained PR branch/worktree — both recovered from
+    the branch name (``agentflow/<tool>/issue-<n>-<slug>``), so capacity on the other pool can never
+    silently switch this code-writing continuation — is bound to the maintainer comment it answers
+    (its immutable ``target``, so a later comment opens a genuinely new Respond with a fresh budget),
+    and holds the ``building`` change claim while it waits. Pure: the mapping is the test surface
+    (ADR 0020). The durable prompt carries the PR head observed before Respond so completion can
+    verify a requested push actually advanced that baseline. Returns ``None`` when the branch is
+    not an agentflow PR branch or either immutable target is missing."""
+    from agentflow.coordinator import Submission
+    from agentflow.gate import respond_reply_disclaimer
+    from agentflow.loop import _BRANCH_RE, RESPOND_PROMPT, _builder_worktree
+    m = _BRANCH_RE.match(branch or "")
+    if m is None or not target or not baseline:
+        return None
+    tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
+    brief = RESPOND_PROMPT.format(
+        n=pr_number, comment=comment, baseline=baseline,
+        disclaimer=respond_reply_disclaimer(str(target)))
+    return Submission(
+        repo=cfg.repo, subject=str(n), stage="respond", target=str(target),
+        pool=tool, complexity="deep", source=_builder_worktree(cfg, tool, n, sl),
+        claim=True, input_ptr=brief, builder_lineage=tool)
 
 
 def revise_round_budget_remains(records, repo, subject) -> bool:
@@ -311,12 +339,13 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's coordinator for Intake, Build, Review, and Revise (issues #103–#106). Its
-    Build adapter verifies the real PR outcome and reuses the retained worktree; its Review adapter
-    verifies a durable verdict for the exact PR head SHA and recreates the read-only checkout; its
-    Revise adapter verifies a pushed revision on the same branch and reuses that retained worktree;
-    and its admission gate keeps Mockup and Respond queued. One :class:`StageRouter` dispatches
-    each adapter call on the record's stage."""
+    """The daemon's coordinator for Intake, Build, Review, Revise, and Respond (issues #103–#107).
+    Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
+    adapter verifies a durable verdict for the exact PR head SHA and recreates the read-only
+    checkout; its Revise adapter verifies a pushed revision on the same branch and reuses that
+    retained worktree; its Respond adapter verifies the marked reply plus any pushed change on that
+    same branch and releases the change claim on completion; and its admission gate keeps Mockup
+    queued. One :class:`StageRouter` dispatches each adapter call on the record's stage."""
     from agentflow import coordinated_intake
     intake = IntakeStageAdapter(
         worktree_reset=coordinated_intake.reset_worktree,
@@ -330,7 +359,11 @@ def build_coordinator(_log=None) -> Coordinator:
         verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr)
     revise = ReviseStageAdapter(
         revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
-    router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise})
+    respond = RespondStageAdapter(
+        reply_ready=_reply_ready, worktree_ready=_worktree_ready, handoff=_park_respond,
+        settle=_settle_respond)
+    router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
+                          "respond": respond})
     return Coordinator(adapter=router, gate=_production_gate(),
                        log=_log or (lambda _line: None))
 
@@ -360,7 +393,8 @@ class _ProductionGate:
     def reservation_limits(record) -> ReservationLimits:
         """The global limits the store enforces with the running-row reservation."""
         from agentflow import dispatch
-        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build"}
+        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build",
+                "respond": "respond"}
         stage_lane = lane.get(record.stage, record.stage)
         return ReservationLimits(
             machine_ceiling=dispatch.MACHINE_CEILING,
@@ -411,9 +445,9 @@ def _source_facts(record):
 def _worktree_ready(record) -> bool:
     """Prepare the record's owned branch/worktree before admission (ADR 0030). An existing
     worktree is reused *as it is* — a continuation must keep its local changes, so it is never
-    rebuilt — and an absent one is created fresh off ``origin/main`` on the branch the record
-    owns. Any git failure returns False, so admission is skipped with no permit and no attempt
-    consumed. Live orchestration, not unit-tested (ADR 0020)."""
+    rebuilt. An absent Build worktree may start a new branch from ``origin/main``; a continuation
+    stage may only recover the existing branch from its local or remote PR ref. Any git failure
+    returns False, so admission is skipped with no permit and no attempt consumed."""
     from agentflow.loop import _run
     from agentflow.runner import ClaudeRunner, CodexRunner, _worktree_is_registered
     parsed = _source_facts(record)
@@ -438,7 +472,17 @@ def _worktree_ready(record) -> bool:
     have = _run(["git", "-C", workdir, "show-ref", "--quiet",
                  f"refs/heads/{branch}"]).returncode == 0
     add = ["git", "-C", workdir, "worktree", "add"]
-    add += [str(wt), branch] if have else ["-b", branch, str(wt), "origin/main"]
+    if have:
+        add += [str(wt), branch]
+    else:
+        remote = _run(["git", "-C", workdir, "show-ref", "--quiet",
+                       f"refs/remotes/origin/{branch}"]).returncode == 0
+        if remote:
+            add += ["-b", branch, str(wt), f"origin/{branch}"]
+        elif record.stage == "build":
+            add += ["-b", branch, str(wt), "origin/main"]
+        else:
+            return False
     if _run(add).returncode != 0:
         return False
     try:
@@ -610,6 +654,45 @@ def _park_pr(record) -> str | None:
     return url
 
 
+def _park_respond(record) -> str | None:
+    """Create Respond's record-specific park proof and idempotent phone notification.
+
+    A generic Review park may already be present on the PR, so it cannot prove that this exact
+    maintainer-comment target exhausted its Respond budget. The stable ntfy sequence id closes the
+    crash window between posting the durable comment and recording completion locally: a replay
+    replaces the same notification instead of multiplying it.
+    """
+    from agentflow.loop import _pr_comments, _run
+    from agentflow.notify import notify
+
+    pr = _park_pr_number(record)
+    if pr is None or not record.target:
+        return None
+    proof = f"<!-- agentflow-respond-park-target:{record.target} -->"
+    comments = _pr_comments(record.repo, pr)
+    if comments is None:
+        return None
+    already = any(proof in comment.get("body", "") for comment in comments)
+    if not already:
+        body = ("> *agentflow: Respond parked for human review.*\n"
+                f"{proof}\n\n"
+                f"Respond could not finish answering maintainer comment `{record.target}` "
+                "within its continuation budget. The PR branch and local work were retained.")
+        posted = _run(["gh", "pr", "comment", str(pr), "--repo", record.repo,
+                       "--body", body])
+        if posted.returncode != 0:
+            return None
+    proved = _pr_comments(record.repo, pr)
+    if proved is None or not any(proof in comment.get("body", "") for comment in proved):
+        return None
+    url = f"https://github.com/{record.repo}/pull/{pr}"
+    sequence = "respond-" + hashlib.sha256(record.identity.encode()).hexdigest()[:24]
+    notify("agentflow needs you",
+           f"{record.repo} PR #{pr}: Respond parked for maintainer comment {record.target}",
+           url, sequence_id=sequence)
+    return url
+
+
 # --- Revise stage: pushed-revision outcome on the retained branch (live; ADR 0020) ------
 
 def _revision_ready(record, obs) -> bool:
@@ -678,6 +761,99 @@ def _round_evidence(comment: dict, opened_at: int) -> bool:
         return True
     created = _iso_to_epoch(comment.get("createdAt", "") or "")
     return created is not None and created > opened_at
+
+
+# --- Respond stage: posted-reply outcome on the retained PR branch (live; ADR 0020) ------
+
+def _reply_ready(record, obs) -> bool:
+    """The Respond outcome is the marked agentflow reply to the maintainer comment this record
+    answers, plus any branch change verified pushed (ADR 0028, issue #107) — read from GitHub
+    independently of how the responder exited:
+
+    - the reply: a marked agentflow comment names this record's immutable maintainer-comment
+      target, so another reply or generic agentflow comment cannot satisfy it; and
+    - verified pushed: the retained PR-branch worktree holds no commit absent from the pushed remote
+      branch head *and* no uncommitted change at all. A responder that committed a small fix but
+      never pushed it left the remote branch unchanged; one that edited a file but never committed it
+      (a modified tracked file, a staged change, or an untracked new file) never turned that change
+      into a pushed commit either. Both leave the stage incomplete so it continues on that same
+      retained worktree.
+
+    A record without that exact targeted reply stays incomplete. Live orchestration; exercised
+    through the Coordinator/Respond adapter seam in ``tests/test_respond_tracer.py``."""
+    from agentflow.gate import respond_reply_change, respond_reply_posted
+    from agentflow.loop import _pr_comments, _run
+    parsed = _source_facts(record)
+    if parsed is None:
+        return False
+    _workdir, branch, wt = parsed
+    pr = _open_pr_for_branch(record.repo, branch)
+    if pr is None:
+        return False
+    comments = _pr_comments(record.repo, pr.get("number"))
+    if comments is None or not respond_reply_posted(comments, record.target or ""):
+        return False   # no durable reply bound to this record's maintainer-comment target
+    change = respond_reply_change(comments, record.target or "")
+    baseline_match = re.search(r"agentflow-respond-baseline:([^\s>]+)", record.input_ptr or "")
+    baseline = baseline_match.group(1) if baseline_match is not None else ""
+    if not change or not baseline:
+        return False
+    # A reply exists. The owned worktree is mandatory evidence: without it there is no way to
+    # prove that a requested branch change was either pushed or never left locally. Fail closed and
+    # let preparation recover the PR branch before another attempt.
+    if not wt.exists():
+        return False
+    head = pr.get("headRefOid") or ""
+    if change != "none" and (change == baseline or change != head):
+        return False
+    fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
+    if fetched.returncode != 0:
+        return False
+    if change != "none":
+        ancestry = _run(["git", "-C", str(wt), "merge-base", "--is-ancestor",
+                         baseline, head])
+        if ancestry.returncode != 0:
+            return False
+    ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
+    if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
+        return False
+    # An unpushed change need not be a local commit: a responder can post the reply and leave
+    # the requested edit uncommitted in the worktree. Any dirty tracked file, staged change, or
+    # untracked new file is such a change that never became a pushed commit, so the stage is not
+    # complete. A dirty (or unreadable) worktree keeps it incomplete to resume on that worktree.
+    status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
+    if status.returncode != 0 or status.stdout.strip():
+        return False
+    return True
+
+
+def _settle_respond(record) -> str | None:
+    """Release Respond's change claim once the reply is durable, retiring the record with no
+    successor and no human handoff (issue #107). Drops the ``building`` claim label so the answered
+    PR returns to the normal merge pipeline, proves the label is gone, then returns the PR (or issue)
+    URL as the durable proof. Idempotent and crash-safe: removing an already-removed label is a
+    no-op, so a repeat re-proves the same release. Returns ``None`` when the issue is unreadable or
+    the label is still present, so settlement retries next cycle rather than retiring over a claim it
+    never released. Live orchestration, not unit-tested (ADR 0020)."""
+    from agentflow.loop import BUILDING, _run
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return None
+    _run(["gh", "issue", "edit", str(number), "--repo", record.repo, "--remove-label", BUILDING])
+    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo, "--json", "labels,url"])
+    if proved.returncode != 0:
+        return None
+    try:
+        state = json.loads(proved.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if BUILDING in {label.get("name") for label in state.get("labels", [])}:
+        return None   # the claim label is still present — retry rather than retire over it
+    pr = _park_pr_number(record)
+    if pr is not None:
+        return f"https://github.com/{record.repo}/pull/{pr}"
+    return state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
 
 
 def _open_pr_for_branch(repo: str, branch: str) -> dict | None:

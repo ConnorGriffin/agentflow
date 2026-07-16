@@ -19,8 +19,8 @@ from pathlib import Path
 from agentflow import live, ratchet
 from agentflow.balancer import pick_pair
 from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
-                            maintainer_comment, park, reply_pending, squash_merge,
-                            ui_evidence_gap)
+                            maintainer_comment, maintainer_comment_id, park, reply_pending, squash_merge,
+                            respond_reply_disclaimer, respond_reply_posted, ui_evidence_gap)
 from agentflow.intake import (INTAKE_MARK, Intake, IntakeResult, IntakeRoute, STATE_LABELS,
                               _DISCLAIMER, _strip_quoted_lines,
                               apply_intake, awaiting_recheck, intake_result_is_durable,
@@ -208,14 +208,22 @@ Do not degrade the two charter gates while revising (ADR 0018):
 Blocking findings:
 {findings}"""
 
-# The responder's reply disclaimer — carries the PR marker (`agentflow:`) so the next
-# cycle can tell it apart from the maintainer's comment (see gate.reply_pending).
-_RESPOND_DISCLAIMER = "> *agentflow: reply from the build agent.*"
-
 RESPOND_PROMPT = """A maintainer left a comment on PR #{n} in this worktree and it is
 still unanswered. Read the full conversation first (`gh pr view {n} --json comments`),
-then answer their latest comment. This is a REPLY, not a fresh review — answer what they
-actually asked, nothing more.
+then answer the maintainer comment named below. This is a REPLY, not a fresh review —
+answer what they actually asked, nothing more.
+
+The PR head when this Respond began was {baseline}.
+<!-- agentflow-respond-baseline:{baseline} -->
+
+Before doing anything, inspect both the conversation and the branch. This prompt may be a
+continuation after a partial outcome:
+- If the exact targeted reply marker below already exists, do not post the reply again. If its
+  outcome marker is missing or stale after you finish the branch work, edit that existing reply in
+  place to carry the final marker.
+- If the requested branch change is already committed and pushed beyond the baseline, do not
+  make or push it again; finish only the still-missing reply.
+- If the reply exists but local work remains, finish and push that work without replying again.
 
 Their comment:
 ---
@@ -225,6 +233,11 @@ Their comment:
 Reply conversationally in a PR comment that STARTS with this exact line, so we can tell
 your reply apart from theirs:
 {disclaimer}
+
+The same comment must contain exactly one durable outcome marker:
+- `<!-- agentflow-respond-change:none -->` only when the maintainer requested no branch change.
+- `<!-- agentflow-respond-change:<pushed-head-sha> -->` when a branch change was requested,
+  after pushing it. Use the PR's current pushed head SHA; it must differ from the baseline.
 
 - Answer in plain language, in the app's own terms — no code symbols or file paths.
 - If they asked for evidence (e.g. "show me a screenshot"), produce it and ATTACH it to
@@ -799,25 +812,29 @@ def _run_intake_session(cfg: RepoConfig, issue: dict, extra: str, builder) -> st
     return f"#{n}: {summary}{' (resumed)' if extra else ''}"
 
 
-def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str] | None:
-    """The next open agentflow PR whose latest comment is the maintainer's unanswered
-    question — returns (pr_number, head_branch, their_comment). Skips a PR where our own
-    marker had the last word (a park notice, or a reply we already posted) so the responder
-    never wakes on its own comments (issue #18)."""
+def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str, str, str] | None:
+    """The next open agentflow PR with an unanswered maintainer comment.
+
+    Returns ``(pr_number, head_branch, comment, comment_target, baseline_head)`` for the oldest
+    unanswered target. A target-aware reply removes only that comment, so later comments become
+    fresh Respond stages instead of being collapsed into one run. Generic legacy markers retain
+    their old run-level meaning, and the responder never wakes on its own comments (#18/#107)."""
     r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
-              "--json", "number,headRefName", "--limit", "100"])
+              "--json", "number,headRefName,headRefOid", "--limit", "100"])
     if r.returncode != 0:
         return None
     for pr in sorted(json.loads(r.stdout or "[]"), key=lambda p: p.get("number", 0)):
         branch = pr.get("headRefName", "")
-        if issue_of_branch(branch) is None:
+        baseline = pr.get("headRefOid", "")
+        if issue_of_branch(branch) is None or not baseline:
             continue   # not an agentflow PR — a human's own branch
         cr = _run(["gh", "pr", "view", str(pr["number"]), "--repo", cfg.repo, "--json", "comments"])
         if cr.returncode != 0:
             continue
         comments = json.loads(cr.stdout or "{}").get("comments", [])
         if reply_pending(comments):
-            return pr["number"], branch, maintainer_comment(comments)
+            return (pr["number"], branch, maintainer_comment(comments),
+                    maintainer_comment_id(comments), baseline)
     return None
 
 
@@ -839,14 +856,14 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
 
 
 def respond_once(cfg: RepoConfig, _log=None, slot=None) -> str:
-    """Answer the next parked PR whose latest comment is an unanswered maintainer question:
+    """Answer the next parked PR with an unanswered maintainer comment:
     spawn a responder in the PR-branch worktree that replies in-thread, attaches requested
     evidence, and pushes small fixes to the same branch (issue #18). Never merges, never a
     new PR — same contract as a revise. `slot` bounds responder concurrency."""
     pending = _next_pr_awaiting_reply(cfg)
     if not pending:
         return "no parked PRs awaiting reply"
-    pr, branch, comment = pending
+    pr, branch, comment, target, baseline = pending
     m = _BRANCH_RE.match(branch)
     if not m:
         return f"PR #{pr}: unrecognized branch {branch}"
@@ -865,10 +882,12 @@ def respond_once(cfg: RepoConfig, _log=None, slot=None) -> str:
         builder.provision(wt)
         with worktree_session(wt):
             ok, _ = builder.launch(
-                RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
+                RESPOND_PROMPT.format(n=pr, comment=comment,
+                                      baseline=baseline,
+                                      disclaimer=respond_reply_disclaimer(target)),
                 cwd=str(wt), model=builder.model_for(Complexity.DEEP))
         comments = _pr_comments(cfg.repo, pr)
-        replied = ok and comments is not None and not reply_pending(comments)
+        replied = ok and comments is not None and respond_reply_posted(comments, target)
         if replied:
             remove_worktree_if_safe(cfg.workdir, wt)
         if replied:

@@ -40,35 +40,105 @@ MAX_REVISES = 2
 # same discipline intake uses on issues (INTAKE_MARK). The bot posts as the maintainer,
 # so we key on the marker, not authorship.
 PR_MARK = "agentflow:"
+_RESPOND_TARGET_PREFIX = "agentflow-respond-target:"
+_RESPOND_TARGET_RE = re.compile(r"<!--\s*agentflow-respond-target:([^>]+?)\s*-->")
+_RESPOND_PARK_TARGET_RE = re.compile(r"<!--\s*agentflow-respond-park-target:([^>]+?)\s*-->")
+_RESPOND_CHANGE_RE = re.compile(r"<!--\s*agentflow-respond-change:([^>]+?)\s*-->")
+
+
+def respond_reply_disclaimer(target: str) -> str:
+    """The human-readable Respond marker plus its immutable maintainer-comment target.
+
+    GitHub posts agentflow comments as the maintainer account, so the visible disclaimer keeps
+    authorship distinguishable while the hidden target binds completion to the exact comment one
+    durable Respond record owns.
+    """
+    return ("> *agentflow: reply from the build agent.*\n"
+            f"<!-- {_RESPOND_TARGET_PREFIX}{target} -->")
+
+
+def respond_change_marker(result: str) -> str:
+    """Durable Respond outcome claim: ``none`` or the pushed PR head SHA."""
+    return f"<!-- agentflow-respond-change:{result} -->"
+
+
+def _respond_reply_target(body: str) -> str:
+    match = _RESPOND_TARGET_RE.search(body)
+    return match.group(1).strip() if match is not None else ""
+
+
+def respond_reply_posted(comments: list[dict], target: str) -> bool:
+    """Whether agentflow durably posted the reply for this exact Respond target."""
+    return bool(target) and any(
+        PR_MARK in comment.get("body", "")
+        and _respond_reply_target(comment.get("body", "")) == str(target)
+        for comment in comments
+    )
+
+
+def respond_reply_change(comments: list[dict], target: str) -> str:
+    """The unique targeted reply's declared branch outcome, or empty when unproved.
+
+    Requiring exactly one targeted reply makes duplicate posting visible and fail-closed instead
+    of accepting whichever duplicate happens to appear last.
+    """
+    matches = [comment.get("body", "") for comment in comments
+               if _respond_reply_target(comment.get("body", "")) == str(target)]
+    if len(matches) != 1:
+        return ""
+    changes = _RESPOND_CHANGE_RE.findall(matches[0])
+    return changes[0].strip() if len(changes) == 1 else ""
+
+
+def _unanswered_maintainer_comments(comments: list[dict]) -> list[tuple[str, str]]:
+    """Return unanswered maintainer comments in arrival order, one durable target each.
+
+    A target-aware Respond reply removes only the comment it answered, so a second maintainer
+    comment that arrived before that reply remains pending with its own budget. Legacy generic
+    agentflow replies retain their old run-level meaning and answer everything before them.
+    """
+    pending: dict[str, str] = {}
+    for index, comment in enumerate(comments):
+        body = comment.get("body", "").strip()
+        if not body:
+            continue
+        answered = _respond_reply_target(body)
+        if answered:
+            pending.pop(answered, None)
+            continue
+        parked = _RESPOND_PARK_TARGET_RE.search(body)
+        if parked is not None:
+            pending.pop(parked.group(1).strip(), None)
+            continue
+        if PR_MARK in body:
+            pending.clear()
+            continue
+        target = str(comment.get("id") or comment.get("url") or "")
+        pending.setdefault(target or f"__agentflow_missing_target_{index}", body)
+    return list(pending.items())
 
 
 def reply_pending(comments: list[dict]) -> bool:
-    """True when a PR's most recent non-empty comment is the maintainer's — an open
-    question from the human who merges, still unanswered. False when our own marker had
-    the last word (a park notice or an earlier reply), or there are no comments. Pure
+    """True when at least one maintainer comment has no matching agentflow reply. Pure
     (test surface).
 
     On an `autonomous` repo this BLOCKS auto-merge: nothing merges while a maintainer
     question hangs (issue #18). Mirrors intake's `awaiting_recheck`, keyed on our marker."""
-    for c in reversed(comments):
-        body = c.get("body", "").strip()
-        if not body:
-            continue
-        return PR_MARK not in body
-    return False
+    return bool(_unanswered_maintainer_comments(comments))
+
+
+def maintainer_comment_id(comments: list[dict]) -> str:
+    """The oldest unanswered comment id — one immutable coordinated Respond target."""
+    pending = _unanswered_maintainer_comments(comments)
+    if not pending or pending[0][0].startswith("__agentflow_missing_target_"):
+        return ""
+    return pending[0][0]
 
 
 def maintainer_comment(comments: list[dict]) -> str:
-    """The maintainer's comment text since our last PR marker — what the responder must
-    answer. Pure (test surface)."""
-    tail = []
-    for c in reversed(comments):
-        if PR_MARK in c.get("body", ""):
-            break
-        body = c.get("body", "").strip()
-        if body:
-            tail.append(body)
-    return "\n\n".join(reversed(tail))
+    """The oldest unanswered maintainer comment text — exactly what one Respond answers."""
+    pending = _unanswered_maintainer_comments(comments)
+    return pending[0][1] if pending else ""
 
 
 def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,

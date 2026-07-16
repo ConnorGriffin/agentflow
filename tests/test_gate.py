@@ -11,7 +11,8 @@ import pytest
 
 import agentflow.gate as gate
 from agentflow.gate import (MergeDecision, ci_is_green, decide_merge, has_image_evidence,
-                            maintainer_comment, reply_pending, squash_merge,
+                            maintainer_comment, maintainer_comment_id, reply_pending,
+                            respond_reply_disclaimer, squash_merge,
                             touches_ui_surface)
 from agentflow.reviewer import Finding, Verdict
 
@@ -224,7 +225,38 @@ def test_reply_pending_ignores_trailing_blank_comments():
     assert reply_pending([_PARK, _MAINT, {"body": "   "}]) is True
 
 
-def test_maintainer_comment_is_text_since_our_last_marker():
-    comments = [_PARK, {"body": "First follow-up"}, {"body": "Show me a screenshot please?"}]
-    assert maintainer_comment(comments) == "First follow-up\n\nShow me a screenshot please?"
+def test_each_unanswered_comment_keeps_its_own_target_until_its_reply():
+    comments = [
+        _PARK,
+        {"body": "First follow-up", "id": "IC_1"},
+        {"body": "Show me a screenshot please?", "id": "IC_2"},
+    ]
+    assert maintainer_comment(comments) == "First follow-up"
+    assert maintainer_comment_id(comments) == "IC_1"
+
+    comments.append({"body": respond_reply_disclaimer("IC_1") + "\n\nDone."})
+    assert reply_pending(comments) is True
+    assert maintainer_comment(comments) == "Show me a screenshot please?"
+    assert maintainer_comment_id(comments) == "IC_2"
+
+    comments.append({"body": respond_reply_disclaimer("IC_2") + "\n\nAlso done."})
+    assert reply_pending(comments) is False
+    assert maintainer_comment(comments) == ""
+    assert maintainer_comment_id(comments) == ""
+
+
+def test_legacy_generic_agentflow_reply_answers_the_pending_run():
     assert maintainer_comment([_MAINT, _REPLY]) == ""   # our reply was the last word
+
+
+def test_respond_park_closes_only_its_target_and_leaves_later_comment_pending():
+    comments = [
+        _PARK,
+        {"body": "First follow-up", "id": "IC_1"},
+        {"body": "Second follow-up", "id": "IC_2"},
+        {"body": ("> *agentflow: Respond parked for human review.*\n"
+                  "<!-- agentflow-respond-park-target:IC_1 -->")},
+    ]
+    assert reply_pending(comments) is True
+    assert maintainer_comment_id(comments) == "IC_2"
+    assert maintainer_comment(comments) == "Second follow-up"
