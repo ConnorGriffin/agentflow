@@ -235,11 +235,15 @@ class Store:
                 raise
 
     def submit(self, record: Record,
-               prior_identity: str | None = None) -> tuple[Record, Record | None, bool]:
+               prior_identity: str | None = None
+               ) -> tuple[Record, Record | None, bool, Record | None]:
         """Persist an idempotent stage submission. When ``prior_identity`` is supplied, the
         successor insert and completed predecessor's claim transfer are one transaction.
-        Returns the durable successor, predecessor (if any), and whether this call transferred
-        ownership. Any missing or ineligible predecessor aborts without exposing a successor."""
+        Returns the durable successor, predecessor (if any), whether this call transferred
+        ownership, and the updated root (for a descendant). Successor creation, claim transfer,
+        and descendant registration share one transaction; no crash or concurrent root write can
+        expose an orphaned descendant. Any missing or ineligible predecessor/root aborts without
+        exposing a successor."""
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -247,6 +251,7 @@ class Store:
                     "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
                 successor = self._decode(successor_row[0]) if successor_row is not None else record
                 prior = None
+                root = None
                 transferred = False
                 if prior_identity is not None:
                     prior_row = self._conn.execute(
@@ -270,8 +275,18 @@ class Store:
                 if successor_row is None or transferred:
                     successor.revision += 1
                     self._write(successor)
+                if successor.root is not None:
+                    root_row = self._conn.execute(
+                        "SELECT data FROM records WHERE identity = ?", (successor.root,)).fetchone()
+                    if root_row is None:
+                        raise StoreUnavailable("cannot register descendant: root is missing")
+                    root = self._decode(root_row[0])
+                    if successor.identity not in root.descendants:
+                        root.descendants.add(successor.identity)
+                        root.revision += 1
+                        self._write(root)
                 self._conn.execute("COMMIT")
-                return successor, prior, transferred
+                return successor, prior, transferred, root
             except sqlite3.DatabaseError as e:
                 self._rollback_quietly()
                 raise StoreUnavailable(f"cannot submit continuation: {e}") from e

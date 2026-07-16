@@ -149,11 +149,13 @@ class Coordinator:
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             created_at=int(time.time()))
         with self._lock:
-            successor, prior, transferred = self._store.submit(record, submission.transfer_from)
+            successor, prior, transferred, root = self._store.submit(
+                record, submission.transfer_from)
             self._records[identity] = successor
             if prior is not None:
                 self._records[prior.identity] = prior
-            self._register_descendant(successor)
+            if root is not None:
+                self._records[root.identity] = root
             if transferred and prior is not None:
                 self._emit(prior, f"attempt {prior.attempts}/{ATTEMPT_BUDGET} completed — "
                            f"{_OUTCOME_LABEL.get(prior.stage, prior.stage)}; "
@@ -183,17 +185,6 @@ class Coordinator:
                 self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no "
                                   f"next stage remains — parking for human; claim released")
             return self._finalize_hold(record)
-
-    def _register_descendant(self, record: Record) -> None:
-        """A descendant/subagent shares its root's single reservation and is never admitted or
-        reserved independently (ADR 0030). Recording the lineage on the root lets the root's
-        terminal outcome retire it, so nested work can never push a pool past its budget."""
-        if record.root is None:
-            return
-        root = self._records.get(record.root)
-        if root is not None:
-            root.descendants.add(record.identity)
-            self._persist(root)
 
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
         """Reconcile, returning the stage outcomes and holds settled this cycle, then admit

@@ -301,17 +301,20 @@ def test_hold_finalization_has_one_cross_coordinator_owner(make_coord):
     assert durable.claim is False and durable.handoff_proof == "hold-proof"
 
 
-def test_delayed_launch_timeout_cannot_disown_a_newer_attempt(make_coord):
-    """A timeout callback retained by attempt T1 runs only after public ``cycle`` has admitted
-    T2. Its old token must not rotate T2 or release its live reservation."""
+def test_delayed_launcher_result_cannot_disown_a_newer_attempt(make_coord):
+    """T1's launcher disowns its token, but before it returns, another public ``cycle`` recovers
+    that no-start and admits T2. T1's delayed result must not release the newer live attempt."""
     fake = FakeSession()
-    delayed = []
+    newer = []
 
     class FirstLauncher:
         def start(self, record, store):
             token = record.launch_token
-            delayed.append(lambda: store.disown_launch(record.identity, token))
             from agentflow.coordinator.launcher import NOT_STARTED, StartResult
+            assert store.disown_launch(record.identity, token) == (NOT_STARTED, None)
+            concurrent = make_coord(fake)
+            concurrent.cycle("claude")
+            newer.append(record_of(concurrent, record.identity))
             return StartResult(NOT_STARTED)
 
         def is_alive(self, family):
@@ -321,18 +324,51 @@ def test_delayed_launch_timeout_cannot_disown_a_newer_attempt(make_coord):
     identity = first.submit_stage(Submission(
         repo="o/r", subject="launch-generation", stage="review", pool="claude"))
     first.cycle("claude")
-    assert record_of(first, identity).state == "waiting"
-
-    current = make_coord(fake)
-    current.cycle("claude")
-    before = record_of(current, identity)
-    assert before.state == "running" and fake.is_alive(before.family)
-    assert delayed.pop()() == ("not_started", None)
-
-    after = record_of(current, identity)
-    assert after.state == "running" and after.launch_token == before.launch_token
+    before = newer.pop()
+    after = record_of(first, identity)
+    assert before.state == after.state == "running"
+    assert after.launch_token == before.launch_token
     assert after.family == before.family and fake.is_alive(after.family)
-    assert permits(current, "claude") == before.demand
+    assert permits(first, "claude") == before.demand
+
+
+def test_concurrent_descendant_submissions_are_atomically_registered(make_coord):
+    """Two public submissions racing on one root both survive its revision changes, and the
+    root's completion retires both children that share its reservation."""
+    fake = FakeSession()
+    seed = make_coord(fake)
+    root = seed.submit_stage(Submission(
+        repo="o/r", subject="root", stage="review", pool="claude"))
+    barrier = threading.Barrier(2)
+    children = []
+    errors = []
+    lock = threading.Lock()
+
+    def submit(subject):
+        try:
+            coord = make_coord(fake)
+            barrier.wait()
+            child = coord.submit_stage(Submission(
+                repo="o/r", subject=subject, stage="respond", pool="claude",
+                descendant_of=root))
+            with lock:
+                children.append(child)
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=submit, args=(subject,))
+               for subject in ("child-a", "child-b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == [] and len(children) == 2
+    assert record_of(seed, root).descendants == set(children)
+    seed.cycle("claude")
+    fake.end(root, success=True)
+    assert [outcome.identity for outcome in seed.cycle("claude")] == [root]
+    assert all(record_of(seed, child).retired for child in children)
 
 
 def test_schema_v1_record_without_revision_advances_through_public_cycle(make_coord):
