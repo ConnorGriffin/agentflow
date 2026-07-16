@@ -129,7 +129,7 @@ def test_unprojected_completed_intake_keeps_rollback_draining(make_coord):
     coord.cycle("claude")
 
     assert record_of(coord, identity).state == "completed"
-    assert tracer.coordinator_active(coord._store.load().values()) is True
+    assert tracer.owned_issues(coord._store.load().values(), "o/r", lane="triaging") == {7}
 
 
 def test_unparsed_success_uses_three_started_attempts_then_one_hold(make_coord):

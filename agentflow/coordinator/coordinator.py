@@ -183,7 +183,8 @@ class Coordinator:
                 if not self._persist(record):
                     return None
                 self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no "
-                                  f"next stage remains — parking for human; claim released")
+                                  f"next stage remains — parking for human; claim retained "
+                                  f"pending durable handoff")
             return self._finalize_hold(record)
 
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
@@ -418,6 +419,10 @@ class Coordinator:
 
     def _settle_completed(self, record: Record) -> bool:
         """Project a completed stage at its durable boundary behind the ``cycle`` seam."""
+        prepare = getattr(self._adapter, "prepare_completed", None)
+        if prepare is not None and not prepare(record):
+            return False
+
         def settle(current: Record) -> bool:
             if current.state != COMPLETED or current.retired:
                 return False
@@ -467,7 +472,7 @@ class Coordinator:
             if not self._hold(record):
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
-                              f"permanent; held for human; claim released")
+                              f"permanent; handoff pending; claim retained")
         elif record.attempts < ATTEMPT_BUDGET:
             record.state = WAITING
             record.continuation = True
@@ -485,8 +490,8 @@ class Coordinator:
             if not self._hold(record):
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
-                              f"({cause}) — continuation budget exhausted; held for human; "
-                              f"claim released")
+                              f"({cause}) — continuation budget exhausted; handoff pending; "
+                              f"claim retained")
         # The stage adapter proves a live external handoff; the coordinator then finalizes it
         # idempotently and crash-safely.
         return self._finalize_hold(record)
@@ -517,6 +522,8 @@ class Coordinator:
         if held is None:
             return None
         self._records[held.identity] = held
+        self._emit(held, f"attempt {held.attempts}/{ATTEMPT_BUDGET} held for human — "
+                         "durable handoff proved; claim released")
         return StageOutcome(held.identity, held.stage, "held", held.handoff_kind)
 
     # --- internal helpers ---------------------------------------------------------------

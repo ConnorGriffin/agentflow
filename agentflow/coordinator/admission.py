@@ -12,6 +12,8 @@ coordinator, store, or provider (see tests/test_coordinator_admission.py).
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 # Each pool has an independent five-permit budget; a session reserves its whole demand
 # atomically. Every stage gets one initial attempt plus at most two continuations.
 PERMIT_BUDGET = 5
@@ -19,7 +21,7 @@ ATTEMPT_BUDGET = 3
 
 # Stages that own a branch/worktree. Their tool lineage is pinned across continuations
 # and they cannot silently move to the other pool (ADR 0028).
-CODE_WRITING = {"build", "revise", "mockup", "respond"}
+CODE_WRITING = frozenset({"build", "revise", "mockup", "respond"})
 
 # The one durable human handoff each stage creates when its budget is exhausted or a
 # permanent condition holds it (ADR 0028's exhaustion table).
@@ -43,7 +45,7 @@ _STAGE_ALIASES = {
 
 # The exact reviewed rows from ADR 0029. Any known-pool row that is missing falls back to
 # the full five permits (exclusive fallback); an unknown pool has no ledger to charge.
-ADMISSION_MATRIX = {
+_ADMISSION_ROWS = {
     ("intake", "claude", "opus", "deep", None): 1,
     ("intake", "codex", "sol", "deep", None): 1,
     ("review", "claude", "opus", "deep", None): 1,
@@ -64,16 +66,17 @@ for _pool, _model, _complexity, _demands in (
     ("codex", "sol", "deep", (5, 5, 5, 5)),
 ):
     for _effort, _demand in zip(("low", "medium", "high", "extra"), _demands, strict=True):
-        ADMISSION_MATRIX[("build", _pool, _model, _complexity, _effort)] = _demand
+        _ADMISSION_ROWS[("build", _pool, _model, _complexity, _effort)] = _demand
+ADMISSION_MATRIX = MappingProxyType(_ADMISSION_ROWS)
 
 # The concrete model each pool runs for a given complexity — a validation of the model the
 # runner selected, not a second sizing dial (ADR 0029).
-MODEL_FOR = {
+MODEL_FOR = MappingProxyType({
     ("claude", "deep"): "opus",
     ("claude", "standard"): "sonnet",
     ("codex", "deep"): "sol",
     ("codex", "standard"): "terra",
-}
+})
 
 
 def normalize_stage(stage: str) -> str:

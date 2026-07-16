@@ -1,12 +1,7 @@
-"""The Runner seam — spawn one isolated agent session and classify its outcome.
+"""Provider command and worktree adapters for the session coordinator.
 
-A deep module. Callers say `runner.build(task)` and get back a classified
-`BuildOutcome`. Hidden behind that one call: creating a git worktree off fresh
-`origin/main`, provisioning its environment, invoking the tool-specific CLI at the
-issue's cost tier (`claude -p --model …` vs `codex exec -m …`), and classifying
-what happened by inspecting the resulting PR and marker comments. The two tools
-differ *only* inside their adapters (`_launch` + the tier→model map); the worktree
-choreography and the classification are shared.
+The coordinator is the only launch owner. Runners provide model mapping, structured command
+construction, provisioning, and git plumbing; they do not orchestrate a Build lifecycle.
 
 Ported and generalized from the dotfiles `codex-go` wrapper (Codex-only) into a
 two-tool abstraction — the "unified runner" the reuse map flagged as net-new.
@@ -21,14 +16,10 @@ import json
 import os
 import re
 import subprocess
-import tempfile
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-
-from agentflow import live
 
 # Stable bail markers a session posts as a comment when it hits a gap (ADR 0005).
 MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
@@ -129,28 +120,13 @@ def classify_build(pr_url: str | None, new_marker_comments: list[str]) -> BuildO
 
 
 def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
+    if cmd and Path(str(cmd[0])).name in {"claude", "codex"}:
+        raise RuntimeError("provider commands may only be executed by the coordinator launcher")
     t = timeout if timeout is not None else int(os.environ.get("AGENTFLOW_GH_TIMEOUT", "120"))
     try:
         return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=t)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
-
-
-def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
-    """Run an agent CLI while persisting its child PID for crash-safe recovery."""
-    process = subprocess.Popen(cmd, cwd=cwd, text=True, stdout=subprocess.PIPE,
-                               stderr=subprocess.PIPE)
-    marker = _active_marker(Path(cwd))
-    if marker is not None:
-        marker.write_text(str(process.pid))
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
-        return subprocess.CompletedProcess(cmd, returncode=1, stdout="",
-                                           stderr=f"timed out after {timeout}s")
-    return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
 
 
 def _bounded_prompt(prompt: str, cwd: str) -> str:
@@ -233,23 +209,20 @@ def remove_worktree_if_safe(workdir: str, wt: Path) -> bool:
 
 
 @contextmanager
-def worktree_session(wt: Path, session: live.Session | None = None):
-    """Mark a launched session active so an overlapping recovery pass retains it — and, when
-    a session descriptor is given, record it on the live board on entry and remove it on exit.
-    This one seam spans every agent session (build / review / triage / revise / mockup), so the
-    live-board write lives here once, with each call site supplying its own stage."""
+def worktree_session(wt: Path):
+    """Mark local git work active so an overlapping worktree cleanup retains it.
+
+    This marker is local recovery evidence only. The live-session console file is generated
+    separately from durable coordinator running records.
+    """
     path = os.path.realpath(wt)
     marker = _active_marker(wt)
     _ACTIVE_WORKTREES[path] = _ACTIVE_WORKTREES.get(path, 0) + 1
     if marker is not None:
         marker.write_text(str(os.getpid()))
-    if session is not None:
-        live.record(session, path)
     try:
         yield
     finally:
-        if session is not None:
-            live.remove(path)
         remaining = _ACTIVE_WORKTREES.get(path, 1) - 1
         if remaining:
             _ACTIVE_WORKTREES[path] = remaining
@@ -263,7 +236,7 @@ def worktree_session(wt: Path, session: live.Session | None = None):
 
 
 class _WorktreeRunner:
-    """Shared build orchestration; subclasses supply `tool`, `MODELS`, `_launch`."""
+    """Shared provider/worktree plumbing; subclasses supply tool commands and model maps."""
 
     tool: str = "?"
     MODELS: dict[Complexity, str] = {}
@@ -272,32 +245,7 @@ class _WorktreeRunner:
         """Resolve a tool-agnostic complexity to this tool's concrete model."""
         return self.MODELS[complexity]
 
-    def build(self, task: BuildTask) -> BuildOutcome:
-        branch = f"agentflow/{self.tool}/issue-{task.issue}-{task.slug}"
-        wt = Path(task.workdir) / ".agentflow" / "worktrees" / self.tool / f"issue-{task.issue}-{task.slug}"
-        try:
-            self.prepare_worktree(task.workdir, branch, wt, task.repo)
-            self.provision(wt)
-        except subprocess.CalledProcessError as e:
-            return BuildOutcome(BuildStatus.ERROR, detail=f"worktree/provision failed: {e}")
-
-        started = time.time()
-        model = self.model_for(task.complexity)
-        session = live.Session(repo=task.repo, number=task.issue, title=task.title,
-                               stage="building", tool=self.tool, model=model, branch=branch)
-        with worktree_session(wt, session):
-            launched, _ = self.launch(task.prompt, cwd=str(wt), model=model)
-
-        pr_url = self._pr_for_branch(task.repo, branch)
-        markers = self._new_marker_comments(task.repo, task.issue, since=started)
-        outcome = classify_build(pr_url, markers)
-        if outcome.status is BuildStatus.INCOMPLETE and not launched:
-            return BuildOutcome(BuildStatus.ERROR, detail="launch exited non-zero, no PR, no marker")
-        if outcome.status is BuildStatus.PR_OPENED:
-            remove_worktree_if_safe(task.workdir, wt)
-        return outcome
-
-    # --- shared git/gh plumbing (reused by the reviewer) ------------------------
+    # --- shared git/gh plumbing used by coordinated stage preparation ------------------------
     def prepare_worktree(self, workdir: str, branch: str, wt: Path,
                          repo: str | None = None) -> None:
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
@@ -365,34 +313,12 @@ class _WorktreeRunner:
                 out.append(c.get("body", ""))
         return out
 
-    def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
-        """Run a session; return (ok, final_message). The message is captured by
-        us — used by the reviewer to read the verdict without trusting a
-        model-written file in the (untrusted) PR tree."""
-        raise NotImplementedError
-
-
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
 
-    def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
-        # Claude's sandbox confines Bash (and its children) to the assigned worktree;
-        # normal edit permissions enforce the same project boundary for file tools.
-        # Loading project settings but not user settings also keeps a machine-global
-        # hook from injecting paths to a different checkout into an autonomous session.
-        session_timeout = int(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
-        r = _run_session([
-            "claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
-            "--permission-mode", "acceptEdits", "--setting-sources", "project",
-            "--settings", _CLAUDE_AUTONOMOUS_SETTINGS,
-        ], cwd, session_timeout)
-        return r.returncode == 0, r.stdout
-
     def structured_argv(self, prompt: str, model: str, cwd: str) -> list[str]:
-        """The structured-session variant of ``launch`` (ADR 0030). Same session, but Claude
-        emits its machine-readable event stream (one JSON object per line) so the coordinator's
-        provider adapter can preserve the full observation set instead of only a final string."""
+        """Build the structured Claude command run only by the coordinator launcher."""
         return ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
@@ -404,43 +330,10 @@ class CodexRunner(_WorktreeRunner):
     # TODO(verify): gpt-5.6-sol confirmed working; confirm the terra ID.
     MODELS = {Complexity.STANDARD: "gpt-5.6-terra", Complexity.DEEP: "gpt-5.6-sol"}
 
-    def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
-        # `-o <file>` writes Codex's final message to a file we control.
-        # AGENTFLOW_CODEX_BIN overrides the binary — needed when the PATH `codex`
-        # is missing its `codex-code-mode-host` companion (e.g. an incomplete
-        # Homebrew cask) and can't run shell commands.
-        codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
-        session_timeout = int(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
-        fd, outfile = tempfile.mkstemp(prefix="agentflow-codex-")
-        os.close(fd)
-        try:
-            worktree = os.path.realpath(cwd)
-            common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
-                           "--git-common-dir"])
-            writable_roots = json.dumps([common.stdout.strip()]) if common.returncode == 0 else "[]"
-            r = _run_session(
-                [codex_bin, "exec", "-m", model, "--sandbox", "workspace-write",
-                 "--cd", worktree, "--ignore-user-config", "--ephemeral",
-                 "-c", 'approval_policy="never"',
-                 "-c", "sandbox_workspace_write.network_access=true",
-                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
-                 "--skip-git-repo-check", "-o", outfile, _bounded_prompt(prompt, cwd)],
-                cwd, session_timeout)
-            try:
-                msg = Path(outfile).read_text()
-            except OSError:
-                msg = r.stdout
-            return r.returncode == 0, msg
-        finally:
-            Path(outfile).unlink(missing_ok=True)
-
     _CLI_MODEL = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra"}
 
     def structured_argv(self, prompt: str, model: str, cwd: str) -> list[str]:
-        """The structured-session variant of ``launch`` (ADR 0030): ``codex exec --json`` emits
-        machine-readable events. Per ADR, that prose is never a diagnosis — the coordinator's
-        Codex adapter distinguishes capacity from a permanent plan problem only from the typed
-        account/rate-limit surface, so this argv exists to run the session, not to classify it."""
+        """Build the structured Codex command run only by the coordinator launcher."""
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
         worktree = os.path.realpath(cwd)
         common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
@@ -483,28 +376,6 @@ class CodexRunner(_WorktreeRunner):
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, ValueError):
             return None
         return None
-
-    def probe(self) -> bool:
-        """Run one minimal Codex session whose only job is to land a fresh rate-limit
-        fact (issue #75) — no branch, no PR, no review. It runs from a throwaway
-        directory under the `.agentflow/worktrees/` marker so the gate reads it as an
-        agentflow hand, never operator activity. Bounded by its own short timeout;
-        returns whether it exited cleanly (the caller re-reads facts either way)."""
-        codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
-        model = self.MODELS[Complexity.STANDARD]
-        timeout = int(os.environ.get("AGENTFLOW_CODEX_PROBE_TIMEOUT", "120"))
-        with tempfile.TemporaryDirectory(prefix="agentflow-codex-probe-") as tmp:
-            cwd = Path(tmp) / ".agentflow" / "worktrees" / "codex-probe"
-            cwd.mkdir(parents=True, exist_ok=True)
-            r = _run([codex_bin, "exec", "-m", model,
-                      "--sandbox", "workspace-write", "--cd", str(cwd.resolve()),
-                      "--ignore-user-config", "--ephemeral",
-                      "-c", 'approval_policy="never"',
-                      "-c", "sandbox_workspace_write.network_access=true",
-                      "--skip-git-repo-check", _bounded_prompt("reply with: ok", str(cwd))],
-                     cwd=str(cwd), timeout=timeout)
-            return r.returncode == 0
-
 
 def _iso_to_epoch(s: str) -> float | None:
     from datetime import datetime

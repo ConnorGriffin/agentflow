@@ -16,20 +16,16 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from agentflow import live, ratchet
+from agentflow import ratchet
 from agentflow.balancer import pick_pair
-from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
-                            maintainer_comment, maintainer_comment_id, park, reply_pending, squash_merge,
-                            respond_reply_disclaimer, respond_reply_posted, ui_evidence_gap)
-from agentflow.intake import (INTAKE_MARK, Intake, IntakeResult, IntakeRoute, STATE_LABELS,
-                              _DISCLAIMER, _strip_quoted_lines,
-                              apply_intake, awaiting_recheck, intake_result_is_durable,
+from agentflow.gate import (maintainer_comment, maintainer_comment_id, park, reply_pending)
+from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, STATE_LABELS,
+                              _DISCLAIMER, _strip_quoted_lines, awaiting_recheck,
                               replies_since_intake)
 from agentflow.notify import notify
-from agentflow.reviewer import Reviewer, Verdict, review_worktree
-from agentflow.runner import (BuildStatus, BuildTask, Complexity, Effort, _run,
+from agentflow.reviewer import Verdict, review_worktree
+from agentflow.runner import (Complexity, Effort, _run,
                               _worktree_is_disposable, _worktree_is_registered,
-                              recover_stale_worktrees,
                               remove_worktree_if_safe, worktree_session)
 
 
@@ -256,8 +252,8 @@ def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
     would re-build it every cycle (a second PR on a different tool).
 
     Returns None when the listing itself failed — unknown is NOT empty. Treating a `gh`
-    blip as "nothing in flight" would both re-dispatch every in-review issue and let
-    `reclaim_claims` strip live claims; callers fail closed (skip, retry next cycle)."""
+    blip as "nothing in flight" would re-dispatch every in-review issue; callers fail closed
+    (skip, retry next cycle)."""
     r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
               "--json", "headRefName", "--limit", "100"])
     if r.returncode != 0:
@@ -311,66 +307,10 @@ def _next_ready_issue(cfg: RepoConfig, _log=None) -> dict | None:
     return next((i for i in issues if _free_to_dispatch(cfg, i, in_flight, _log)), None)
 
 
-def _issues_with_live_session(repo: str) -> set[int]:
-    """Issue numbers with a session running *right now* on this repo (the live board). With
-    concurrent dispatch (ADR 0023) a build is live at the top of a cycle before it has opened
-    its PR — so "nothing is live at cycle start" no longer holds, and reclaim must key on real
-    session evidence, not just the open-PR check (issue #74)."""
-    return {s["number"] for s in live.running()
-            if s.get("repo") == repo and isinstance(s.get("number"), int)}
-
-
-def reclaim_claims(cfg: RepoConfig, coordinator_owned: set[int] = frozenset()) -> int:
-    """Drop `agentflow:building` claims orphaned by a crash. A claim is stale only if no
-    session is building it right now (the live board) AND it has no open agentflow PR — under
-    concurrent dispatch a live build holds its claim before its PR exists, so we must not strip
-    it. A stale claim is fail-safe (the issue is skipped, never duplicated) but blocks that
-    issue until cleared. Returns how many it cleared.
-
-    `coordinator_owned` are the issues a session-coordinator record still owns (ADR 0028): a
-    claim can legitimately outlive its provider process now, so reclamation must never strip one
-    — that would clear coordinator ownership and let a duplicate build in (issue #103)."""
-    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-              "--label", BUILDING, "--json", "number", "--limit", "100"])
-    if r.returncode != 0:
-        return 0
-    in_flight = _issues_in_flight(cfg)
-    if in_flight is None:
-        return 0   # can't see what's in flight — a live claim must never be stripped
-    live_now = _issues_with_live_session(cfg.repo)
-    stale = [i["number"] for i in json.loads(r.stdout or "[]")
-             if i["number"] not in in_flight and i["number"] not in live_now
-             and i["number"] not in coordinator_owned]
-    for n in stale:
-        _release(cfg.repo, n)
-    return len(stale)
-
-
 TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns this issue
 
 # Out of the intake queue: a resolved state label, or a live triaging claim.
 _TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING}
-
-
-def reclaim_triage_claims(cfg: RepoConfig, coordinator_owned: set[int] = frozenset()) -> int:
-    """Drop `agentflow:triaging` claims stranded when a daemon is killed mid-grounding (issue
-    #74). Intake opens no PR, so its only outcome signal is a state label — a claim is stale
-    only when intake has stamped none of them AND no session is grounding it right now (the
-    live board), symmetric to the build path keying on the open-PR check plus live sessions.
-    If the listing fails, reclaim nothing — a live claim must never be stripped. Returns how
-    many it cleared."""
-    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-              "--label", TRIAGING, "--json", "number,labels", "--limit", "100"])
-    if r.returncode != 0:
-        return 0
-    live_now = _issues_with_live_session(cfg.repo)
-    stale = [i["number"] for i in json.loads(r.stdout or "[]")
-             if i["number"] not in live_now
-             and i["number"] not in coordinator_owned
-             and not ({lbl["name"] for lbl in i.get("labels", [])} & set(STATE_LABELS))]
-    for n in stale:
-        _release_triage(cfg.repo, n)
-    return len(stale)
 
 
 def _untriaged(issue: dict) -> bool:
@@ -412,26 +352,6 @@ def _finish_review(cfg: RepoConfig, reviewer_tool: str, pr: int, sl: str,
             cfg.workdir, review_worktree(cfg.workdir, reviewer_tool, pr, sl))
 
 
-def _launch_revise(builder, cfg: RepoConfig, pr: int, n: int, sl: str,
-                   complexity: Complexity, verdict: Verdict, title: str = "") -> None:
-    """One builder pass addressing the blocking findings on the PR branch (ADR 0020)."""
-    findings = "\n".join(f"- {f.summary}" for f in verdict.blocking) or "- (see review)"
-    surfaces = _surfaces_phrase(ui_surfaces(cfg.workdir))
-    branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
-    wt = Path(_builder_worktree(cfg, builder.tool, n, sl))
-    if not _checkout_pr_branch(cfg, branch, wt):
-        return
-    builder.provision(wt)
-    model = builder.model_for(complexity)
-    session = live.Session(repo=cfg.repo, number=n, title=title, stage="building",
-                           tool=builder.tool, model=model, branch=branch)
-    with worktree_session(wt, session):
-        ok, _ = builder.launch(REVISE_PROMPT.format(n=pr, findings=findings, surfaces=surfaces),
-                               cwd=str(wt), model=model)
-    if ok:
-        remove_worktree_if_safe(cfg.workdir, wt)
-
-
 def held_build_result(status: str, where: str) -> IntakeResult:
     """The hold a stuck build hands back — routes the issue to `needs-grilling` instead of
     leaving it `ready-for-agent`, where the loop would re-pick it every cycle: a fresh build
@@ -445,37 +365,6 @@ def held_build_result(status: str, where: str) -> IntakeResult:
     return IntakeResult(IntakeRoute.GRILL, body)
 
 
-def _preserve_progress(cfg: RepoConfig, tool: str, n: int, sl: str) -> str | None:
-    """A stuck build's commits live in its worktree but aren't on GitHub. If there are
-    any, push the branch and open a DRAFT PR so nothing is lost; else None. Returns the
-    draft PR url. Live orchestration, not unit-tested (ADR 0020)."""
-    wt = _builder_worktree(cfg, tool, n, sl)
-    branch = f"agentflow/{tool}/issue-{n}-{sl}"
-    ahead = _run(["git", "-C", wt, "rev-list", "--count", "origin/main..HEAD"])
-    if ahead.returncode != 0 or ahead.stdout.strip() in ("", "0"):
-        return None
-    if _run(["git", "-C", wt, "push", "-u", "origin", branch]).returncode != 0:
-        return None
-    existing = _run(["gh", "pr", "list", "--repo", cfg.repo, "--head", branch,
-                     "--state", "all", "--json", "url", "-q", '.[0].url // ""']).stdout.strip()
-    if existing:
-        return existing
-    r = _run(["gh", "pr", "create", "--repo", cfg.repo, "--draft", "--head", branch,
-              "--title", f"[draft] #{n} — handed back (build did not finish)",
-              "--body", f"> *agentflow: build stopped early; progress saved for you.*\n\nCloses #{n} when finished."])
-    return r.stdout.strip() or None
-
-
-def run_once(cfg: RepoConfig, _log=None, slot=None) -> str:
-    """Pull the next ready issue and run it end to end. Returns a one-line result. `slot`
-    (the dispatch governor's handle) bounds build concurrency — a build defers when the
-    machine is at capacity or an active pool's pace is spent."""
-    issue = _next_ready_issue(cfg, _log=_log)
-    if not issue:
-        return "no ready-for-agent issues"
-    return _dispatch_build(cfg, issue, _log=_log, slot=slot)
-
-
 HELD_LABELS = {"agentflow:needs-grilling", "agentflow:needs-mockup"}
 
 
@@ -483,8 +372,8 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     """By-hand build of a *specific* ready issue (ADR 0022's `build <N>`). Fetches issue N,
     **refuses and redirects** anything that isn't `ready-for-agent` (a held issue → `pickup`;
     an un-triaged one → `triage`/`scope`), refuses one already claimed or in flight, then
-    drives the same build path as the daemon — one builder path, one `agentflow:building`
-    claim, cross-review and merge/park per the repo's profile."""
+    submits the same durable Build record as the daemon. Provider launch, review, continuation,
+    and permits remain behind the coordinator."""
     r = _run(["gh", "issue", "view", str(n), "--repo", cfg.repo,
               "--json", "number,title,body,labels,state"])
     if r.returncode != 0:
@@ -503,48 +392,19 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
         return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"
     if not _free_to_dispatch(cfg, issue, in_flight):
         return f"#{n}: not dispatchable — already claimed, in flight, or waiting on a blocker"
-    return _dispatch_build(cfg, issue, operator=True)
-
-
-def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False,
-                    _log=None, slot=None) -> str:
-    """Build one already-selected ready issue end to end: gate on the complexity label,
-    claim it, then build → cross-review → merge/park under the claim. Shared by the daemon's
-    next-ready pull (`run_once`) and the by-hand `build <N>` (`build_issue`) so there is one
-    builder path, not two. Every profile builds from the Agent Brief in the issue body (ADR
-    0022) — there is no separate work-order comment.
-
-    `operator=True` (by-hand `build <N>`) skips the pools' recent-activity guard — the
-    operator is the live session and asked for this — while still deferring on a genuinely
-    rate-limited pool. The daemon's `run_once` leaves it False and keeps the full guard."""
-    n = issue["number"]
-    labels = [lbl["name"] for lbl in issue["labels"]]
-    complexity = complexity_from_labels(labels)
-    if complexity is None:
-        return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
-    effort = effort_from_labels(labels)
-
-    builder, reviewer_runner, block_msg = pick_pair(operator=operator)   # ADR 0006: more headroom builds; other reviews
+    from agentflow import coordinated_build
+    builder, _reviewer, block_msg = pick_pair(operator=True)
     if builder is None:
         return f"#{n}: no pool has headroom ({block_msg}) — deferring"
-    if slot is not None and not slot.admit("build", builder.tool):
-        return f"#{n}: build deferred — machine at session capacity"
-    if _log:
-        _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (build)")
-    profile = repo_profile(cfg.workdir)
-    surfaces = ui_surfaces(cfg.workdir)
-    sl = slug(issue["title"])
-    build_prompt = BUILD_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
-                                       body=issue.get("body") or "", effort=effort.value,
-                                       surfaces=_surfaces_phrase(surfaces))
-    _claim(cfg.repo, n)   # an agent now owns this issue — no duplicate dispatch (dedup)
-    try:
-        return _build_review_merge(cfg, issue, n, sl, complexity, effort,
-                                   builder, reviewer_runner, profile, build_prompt)
-    finally:
-        _release(cfg.repo, n)
-        if slot is not None:
-            slot.release("build")
+    submission = coordinated_build.build_submission(cfg, issue, builder.tool)
+    if submission is None:
+        return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
+    if not _claim(cfg.repo, n):
+        return f"#{n}: could not claim Build — refusing coordinator submission"
+    coordinator = coordinated_build.build_coordinator()
+    coordinator.submit_stage(submission)
+    coordinated_build.reconcile_and_project(coordinator)
+    return f"#{n}: submitted to coordinator → {builder.tool} (build)"
 
 
 def _claim(repo: str, n: int) -> bool:
@@ -579,9 +439,8 @@ def _claim_triage(repo: str, n: int) -> bool:
 
 def _release_triage(repo: str, n: int) -> bool:
     """Drop the intake claim once routing is written (the state label dedups from here) or the
-    session ended. A crash *before* this strands the claim: fail-safe (the issue is skipped,
-    never double-triaged), auto-reclaimed next cycle by `reclaim_triage_claims` — the missing
-    state label is intake's stale signal, standing in for the open-PR check builds have.
+    session ended. Only the owning Intake finalizer releases it; an unreadable coordinator store
+    therefore clears nothing.
     Returns durable proof that GitHub no longer carries the claim."""
     def claim_present() -> bool | None:
         viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
@@ -605,102 +464,6 @@ def _release_triage(repo: str, n: int) -> bool:
     if removed.returncode != 0:
         return False
     return claim_present() is False
-
-
-def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexity: Complexity,
-                        effort: Effort, builder, reviewer_runner, profile: str,
-                        build_prompt: str) -> str:
-    """Build the issue, then cross-review -> merge/park. Runs under run_once's
-    `agentflow:building` claim (dispatch dedup)."""
-    task = BuildTask(cfg.repo, cfg.workdir, n, sl, complexity, effort, prompt=build_prompt,
-                     title=issue.get("title", ""))
-    outcome = builder.build(task)
-    if outcome.status is not BuildStatus.PR_OPENED:
-        # Stuck (a bail marker, or ran with no PR). Preserve the work as a draft PR so
-        # nothing is lost, then hand the issue back HELD — still-`ready` would be
-        # re-dispatched every cycle (see held_build_result).
-        draft = _preserve_progress(cfg, builder.tool, n, sl)
-        where = f"draft PR {draft}" if draft else "the build session's comment on the issue"
-        apply_intake(cfg.repo, n, issue.get("title", ""),
-                     [lbl["name"] for lbl in issue.get("labels", [])],
-                     held_build_result(outcome.status.value, where))
-        remove_worktree_if_safe(cfg.workdir, Path(_builder_worktree(cfg, builder.tool, n, sl)))
-        notify("agentflow needs you", f"{cfg.repo} #{n}: build {outcome.status.value} — {where}",
-               draft or f"https://github.com/{cfg.repo}/issues/{n}")
-        return f"#{n}: build {outcome.status.value} — {outcome.detail}; held for you ({where})"
-
-    pr = pr_number(outcome.pr_url)
-    head_branch = f"agentflow/{builder.tool}/issue-{n}-{sl}"
-    surfaces = ui_surfaces(cfg.workdir)
-    surfaces_phrase = _surfaces_phrase(surfaces)
-    # Prefer cross-tool; if only one tool is free, review same-tool rather than stall
-    # (ADR 0020). Same-tool never auto-merges — decide_merge parks it.
-    reviewer_runner = reviewer_runner or builder
-    reviewer = Reviewer(reviewer_runner)
-    acceptance = issue.get("body") or ""
-    title = issue.get("title", "")
-
-    if profile != "autonomous":
-        # reviewed / guarded: revise until the review is clean (or we bail), then a
-        # HUMAN merges (ADR 0002, 0020) — hand over a clean PR when we can.
-        revises_used = 0
-        while True:
-            verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl,
-                                      acceptance=acceptance, surfaces=surfaces_phrase,
-                                      issue_number=n, title=title)
-            if verdict.clean or not (verdict.parsed and verdict.blocking) or revises_used >= MAX_REVISES:
-                # A human merges either way, but the mechanical UI-evidence gate still runs
-                # (ADR 0018): a screenshot-less UI change must park with the missing-screenshot
-                # reason, so the human isn't handed one that silently fails the charter gate.
-                ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
-                reason = _UI_GAP_REASON if ui_gap else f"is a `{profile}` repo — a human merges"
-                park(cfg.repo, pr, verdict, reason=reason)
-                _finish_review(cfg, reviewer_runner.tool, pr, sl)
-                notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} reviewed ({profile}) — your merge",
-                       _pr_url(cfg.repo, pr))
-                return f"#{n}: PR #{pr} reviewed ({profile}) — awaiting human merge"
-            _launch_revise(builder, cfg, pr, n, sl, complexity, verdict, title=title)
-            revises_used += 1
-
-    revises_used = 0
-    while True:
-        verdict = reviewer.review(cfg.repo, cfg.workdir, pr, head_branch, sl,
-                                  acceptance=acceptance, surfaces=surfaces_phrase,
-                                  issue_number=n, title=title)
-        # The UI-evidence gate is read from the diff + attachments, AFTER the review, so a
-        # reviewer's "not blocking" cannot clear a screenshot-less UI change (ADR 0018).
-        ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
-        decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
-                                reviewer_tool=reviewer_runner.tool, builder_tool=builder.tool,
-                                revises_used=revises_used, ui_evidence_missing=ui_gap,
-                                reply_pending=reply_pending(_pr_comments(cfg.repo, pr) or []))
-        if decision is MergeDecision.MERGE:
-            ok = squash_merge(cfg.repo, pr)
-            if ok:
-                _finish_review(cfg, reviewer_runner.tool, pr, sl, merged=True)
-                ratchet.record(cfg.repo, ratchet.CLEAN_MERGE if revises_used == 0
-                               else "merge_after_revise")
-                _run(["gh", "issue", "edit", str(n), "--repo", cfg.repo,
-                      "--remove-label", "ready-for-agent"])
-                return f"#{n}: MERGED PR #{pr}"
-            park(cfg.repo, pr, verdict,
-                 reason="could not be squash-merged (branch protection, conflict, or transient error)")
-            _finish_review(cfg, reviewer_runner.tool, pr, sl)
-            ratchet.record(cfg.repo, "parked")
-            notify("agentflow needs you",
-                   f"{cfg.repo} #{n}: PR #{pr} merge failed — your action needed",
-                   _pr_url(cfg.repo, pr))
-            return f"#{n}: merge failed on PR #{pr}"
-        if decision is MergeDecision.PARK:
-            reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
-            park(cfg.repo, pr, verdict, reason=reason)
-            _finish_review(cfg, reviewer_runner.tool, pr, sl)
-            ratchet.record(cfg.repo, "parked")
-            notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} parked after review",
-                   _pr_url(cfg.repo, pr))
-            return f"#{n}: parked PR #{pr} for human review"
-        _launch_revise(builder, cfg, pr, n, sl, complexity, verdict, title=title)
-        revises_used += 1
 
 
 def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
@@ -743,15 +506,6 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
     return None
 
 
-def _handle_intake_infra_failure(cfg: RepoConfig, n: int, result: IntakeResult) -> str:
-    """A legacy Intake setup failure stays quiet and free until coordinated mode owns it.
-
-    The durable coordinator is the sole retry/hold budget. The temporary rollback path must
-    not keep a second in-memory streak whose count resets on restart.
-    """
-    return f"#{n}: intake couldn't start ({result.detail}) — retrying silently"
-
-
 def _next_intake_candidate(cfg: RepoConfig,
                            reserved: set[int] = frozenset()) -> tuple[dict, str] | None:
     """The next issue to triage — a held issue the maintainer just answered (resume, ADR
@@ -762,55 +516,6 @@ def _next_intake_candidate(cfg: RepoConfig,
         return resumable
     issue = _next_untriaged_issue(cfg, reserved)
     return (issue, "") if issue else None
-
-
-def intake_once(cfg: RepoConfig, _log=None, slot=None) -> str:
-    """Triage the next issue: a held issue the maintainer just answered (resume, ADR
-    0019) or the oldest un-triaged one (ADR 0016). Ground, route, write to GitHub.
-
-    `slot` (the dispatch governor's admission handle) bounds triage concurrency: when the
-    machine is at capacity or an active pool's pace is spent, the triage defers to a later
-    cycle instead of starting."""
-    picked = _next_intake_candidate(cfg)
-    if not picked:
-        return "no un-triaged issues"
-    issue, extra = picked
-    n = issue["number"]
-    builder, _, block_msg = pick_pair()   # intake needs one available tool, not a pair
-    if builder is None:
-        return f"#{n}: no pool has headroom for intake ({block_msg}) — deferring"
-    if slot is not None and not slot.admit("triage", builder.tool):
-        return f"#{n}: intake deferred — machine at session capacity"
-    if _log:
-        _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (intake)")
-    _claim_triage(cfg.repo, n)   # own the issue before the long session (dispatch dedup)
-    try:
-        return _run_intake_session(cfg, issue, extra, builder)
-    finally:
-        if slot is not None:
-            slot.release("triage")
-
-
-def _run_intake_session(cfg: RepoConfig, issue: dict, extra: str, builder) -> str:
-    """Run one grounding session on an already-claimed issue: ground, route, write to GitHub,
-    drop the claim. Shared by `intake_once` and the daemon's concurrent triage fan-out."""
-    n = issue["number"]
-    try:
-        result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
-        if result.infra_failed:
-            return _handle_intake_infra_failure(cfg, n, result)
-        current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
-        summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
-        tool = getattr(builder, "tool", None)
-        if tool and intake_result_is_durable(cfg.repo, n, result):
-            wt = Path(cfg.workdir) / ".agentflow" / "worktrees" / f"{tool}-intake" / f"issue-{n}"
-            remove_worktree_if_safe(cfg.workdir, wt)
-    finally:
-        _release_triage(cfg.repo, n)   # the state label dedups from here; drop the claim
-    if result.route in (IntakeRoute.GRILL, IntakeRoute.MOCKUP):
-        notify("agentflow needs you", f"{cfg.repo} #{n}: {result.route.value}",
-               f"https://github.com/{cfg.repo}/issues/{n}")
-    return f"#{n}: {summary}{' (resumed)' if extra else ''}"
 
 
 def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str, str, str] | None:
@@ -854,51 +559,6 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
     wt.parent.mkdir(parents=True, exist_ok=True)
     return _run(["git", "-C", cfg.workdir, "worktree", "add", "-B", branch,
                  str(wt), f"origin/{branch}"]).returncode == 0
-
-
-def respond_once(cfg: RepoConfig, _log=None, slot=None) -> str:
-    """Answer the next parked PR with an unanswered maintainer comment:
-    spawn a responder in the PR-branch worktree that replies in-thread, attaches requested
-    evidence, and pushes small fixes to the same branch (issue #18). Never merges, never a
-    new PR — same contract as a revise. `slot` bounds responder concurrency."""
-    pending = _next_pr_awaiting_reply(cfg)
-    if not pending:
-        return "no parked PRs awaiting reply"
-    pr, branch, comment, target, baseline = pending
-    m = _BRANCH_RE.match(branch)
-    if not m:
-        return f"PR #{pr}: unrecognized branch {branch}"
-    tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
-    builder, _, block_msg = pick_pair()   # a reply needs one available tool, not a pair
-    if builder is None:
-        return f"PR #{pr}: no pool has headroom to respond ({block_msg}) — deferring"
-    if slot is not None and not slot.admit("respond", builder.tool):
-        return f"PR #{pr}: respond deferred — machine at session capacity"
-    if _log:
-        _log(f"{cfg.repo}: PR #{pr}: routing → {getattr(builder, 'tool', '?')} (respond)")
-    try:
-        wt = Path(_builder_worktree(cfg, tool, n, sl))
-        if not _checkout_pr_branch(cfg, branch, wt):
-            return f"PR #{pr}: could not check out {branch} to respond — retry next cycle"
-        builder.provision(wt)
-        with worktree_session(wt):
-            ok, _ = builder.launch(
-                RESPOND_PROMPT.format(n=pr, comment=comment,
-                                      baseline=baseline,
-                                      disclaimer=respond_reply_disclaimer(target)),
-                cwd=str(wt), model=builder.model_for(Complexity.DEEP))
-        comments = _pr_comments(cfg.repo, pr)
-        replied = ok and comments is not None and respond_reply_posted(comments, target)
-        if replied:
-            remove_worktree_if_safe(cfg.workdir, wt)
-        if replied:
-            return f"PR #{pr}: replied to the maintainer"
-        if ok:
-            return f"PR #{pr}: responder exited without a confirmed reply — retaining its worktree"
-        return f"PR #{pr}: responder session errored"
-    finally:
-        if slot is not None:
-            slot.release("respond")
 
 
 # --- mockup phase: draw variants on a parked needs-mockup issue (issue #29) ------------
@@ -979,25 +639,6 @@ def _release_mockup(repo: str, n: int) -> None:
     _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", DRAWING])
 
 
-def reclaim_mockup_claims(cfg: RepoConfig, coordinator_owned: set[int] = frozenset()) -> int:
-    """Drop orphaned drawing claims without stealing a live or coordinated Mockup.
-
-    Mockup opens no PR, so the only safe liveness facts are the live-session board and the
-    durable continuation store supplied by the daemon. An unreadable GitHub listing clears
-    nothing; an unreadable continuation store prevents the daemon from calling this function.
-    """
-    listed = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-                   "--label", DRAWING, "--json", "number", "--limit", "100"])
-    if listed.returncode != 0:
-        return 0
-    live_now = _issues_with_live_session(cfg.repo)
-    stale = [issue["number"] for issue in json.loads(listed.stdout or "[]")
-             if issue["number"] not in live_now and issue["number"] not in coordinator_owned]
-    for number in stale:
-        _release_mockup(cfg.repo, number)
-    return len(stale)
-
-
 def _has_mockup_variants(comments: list[dict]) -> bool:
     """Pure. True once we've posted the variant round on this issue (a comment carrying
     MOCKUP_MARK) — so the produce phase draws exactly one round, never a re-draw. Distinct from
@@ -1033,65 +674,6 @@ def _next_mockup_issue(cfg: RepoConfig) -> dict | None:
         if _mockup_eligible(issue, comments, allowlist):
             return issue
     return None
-
-
-def produce_once(cfg: RepoConfig, _log=None, slot=None) -> str:
-    """Draw the next parked UI issue's variant round so it advances without a human session
-    (issue #29). Pick the oldest `needs-mockup` issue with nothing drawn and no pending reply,
-    claim it, and spawn a session that runs `/ui-mockups` headless for the repo's surfaces:
-    3-4 wildly-different variants, screenshots posted in ONE issue comment carrying the intake
-    marker (so it never reads as a maintainer reply), variant HTML committed to a branch. The
-    maintainer's pick reply resumes through intake, which locks the choice and promotes to ready.
-    Returns a one-line result. Never opens a PR, never chooses the winner."""
-    issue = _next_mockup_issue(cfg)
-    if not issue:
-        return "no needs-mockup issues to draw"
-    n = issue["number"]
-    builder, _, block_msg = pick_pair()   # drawing needs one available tool, not a pair
-    if builder is None:
-        return f"#{n}: no pool has headroom to draw mockups ({block_msg}) — deferring"
-    if slot is not None and not slot.admit("mockup", builder.tool):
-        return f"#{n}: mockup deferred — machine at session capacity"
-    if _log:
-        _log(f"{cfg.repo}: #{n}: routing → {getattr(builder, 'tool', '?')} (mockup)")
-    sl = slug(issue["title"])
-    branch = f"agentflow/{builder.tool}/mockup-{n}-{sl}"
-    wt = Path(cfg.workdir) / ".agentflow" / "worktrees" / builder.tool / f"mockup-{n}-{sl}"
-    surfaces = ui_surfaces(cfg.workdir)
-    prompt = PRODUCE_PROMPT.format(repo=cfg.repo, n=n, title=issue["title"],
-                                   body=issue.get("body") or "", branch=branch,
-                                   surfaces=_surfaces_phrase(surfaces), disclaimer=_MOCKUP_DISCLAIMER)
-    _claim_mockup(cfg.repo, n)   # own the issue before the long session — no double-draw
-    try:
-        try:
-            builder.prepare_worktree(cfg.workdir, branch, wt, cfg.repo)
-            builder.provision(wt)
-        except subprocess.CalledProcessError as e:
-            return f"#{n}: mockup worktree/provision failed ({e})"
-        model = builder.model_for(Complexity.DEEP)
-        session = live.Session(repo=cfg.repo, number=n, title=issue["title"], stage="triaging",
-                               tool=builder.tool, model=model, branch=branch)
-        with worktree_session(wt, session):
-            ok, _ = builder.launch(prompt, cwd=str(wt), model=model)
-        if not ok:
-            return f"#{n}: mockup session errored"
-        # Confirm what was actually posted — a successful exit alone doesn't prove a comment landed.
-        issue_url = f"https://github.com/{cfg.repo}/issues/{n}"
-        comments = _issue_comments(cfg.repo, n)
-        posted = next((c for c in comments if MOCKUP_MARK in c.get("body", "")), None)
-        if posted is None:
-            return f"#{n}: drew mockup variants"
-        remove_worktree_if_safe(cfg.workdir, wt)
-        if "MISSING-CONTEXT:" in posted.get("body", ""):
-            notify("agentflow needs you", f"{cfg.repo} #{n}: mockup is stuck — MISSING-CONTEXT",
-                   issue_url)
-            return f"#{n}: mockup stuck (MISSING-CONTEXT)"
-        notify("agentflow needs you", f"{cfg.repo} #{n}: mockup variants ready", issue_url)
-        return f"#{n}: drew mockup variants"
-    finally:
-        _release_mockup(cfg.repo, n)
-        if slot is not None:
-            slot.release("mockup")
 
 
 # --- ADR 0009 merge-time floor: re-rebase survivors after main advances (issue #45) ---
@@ -1199,49 +781,41 @@ def _park_conflicted_survivor(cfg: RepoConfig, pr: int, n: int) -> None:
            _pr_url(cfg.repo, pr))
 
 
-def _issue_meta(cfg: RepoConfig, n: int) -> dict:
-    """The originating issue's body + labels, for re-reviewing a survivor. {} on error."""
-    r = _run(["gh", "issue", "view", str(n), "--repo", cfg.repo, "--json", "body,labels"])
-    if r.returncode != 0:
-        return {}
+def _issue_acceptance(cfg: RepoConfig, number: int) -> str | None:
+    """The current issue body anchoring a survivor re-review; unreadable fails closed."""
+    viewed = _run(["gh", "issue", "view", str(number), "--repo", cfg.repo, "--json", "body"])
+    if viewed.returncode != 0:
+        return None
     try:
-        return json.loads(r.stdout or "{}")
+        body = json.loads(viewed.stdout or "{}").get("body")
     except json.JSONDecodeError:
-        return {}
+        return None
+    return body if isinstance(body, str) else None
 
 
 def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
                                branch_tool: str, branch: str) -> str:
-    """A clean-rebased survivor on an `autonomous` repo: rerun the full merge gate (fresh
-    cross-tool review + green CI + clean verdict, ADR 0003/0009) and land it, or park for a
-    human. Parks rather than churning a revise here (that's the build loop's job); never
-    less safe than `reviewed`, since the same `decide_merge` gate governs the merge."""
-    builder, reviewer_runner, _ = pick_pair()
-    reviewer_runner = reviewer_runner or builder
-    if reviewer_runner is None:
-        return "deferred"   # no headroom to re-review — try again next cycle
-    meta = _issue_meta(cfg, n)
-    surfaces = ui_surfaces(cfg.workdir)
-    verdict = Reviewer(reviewer_runner).review(cfg.repo, cfg.workdir, pr, branch, sl,
-                                               acceptance=meta.get("body") or "",
-                                               surfaces=_surfaces_phrase(surfaces))
-    ui_gap = ui_evidence_gap(cfg.repo, pr, surfaces)
-    decision = decide_merge(verdict=verdict, ci_green=ci_is_green(cfg.repo, pr),
-                            reviewer_tool=reviewer_runner.tool, builder_tool=branch_tool,
-                            revises_used=MAX_REVISES,   # park a still-imperfect survivor, don't churn
-                            ui_evidence_missing=ui_gap,
-                            reply_pending=reply_pending(_pr_comments(cfg.repo, pr) or []))
-    if decision is MergeDecision.MERGE and squash_merge(cfg.repo, pr):
-        _finish_review(cfg, reviewer_runner.tool, pr, sl, merged=True)
-        ratchet.record(cfg.repo, ratchet.CLEAN_MERGE)
-        _run(["gh", "issue", "edit", str(n), "--repo", cfg.repo, "--remove-label", "ready-for-agent"])
-        return "merged"
-    park(cfg.repo, pr, verdict, reason=_SURVIVOR_PARK_REASON)
-    _finish_review(cfg, reviewer_runner.tool, pr, sl)
-    ratchet.record(cfg.repo, "parked")
-    notify("agentflow needs you", f"{cfg.repo} #{n}: PR #{pr} re-rebased but parked for you",
-           _pr_url(cfg.repo, pr))
-    return "parked"
+    """Submit the rebased exact head as a fresh durable Review; never launch one directly."""
+    from agentflow import coordinated_build
+
+    head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
+    if head.returncode != 0 or not head.stdout.strip():
+        return "review head unreadable"
+    reviewer_tool = "codex" if branch_tool == "claude" else "claude"
+    acceptance = _issue_acceptance(cfg, n)
+    if acceptance is None:
+        return "issue acceptance unreadable"
+    submission = coordinated_build.survivor_review_submission(
+        cfg, issue=n, slug=sl, builder_tool=branch_tool, head_sha=head.stdout.strip(),
+        reviewer_tool=reviewer_tool, pr_number=pr, acceptance=acceptance)
+    if submission is None:
+        return "review submission unavailable"
+    if not _claim(cfg.repo, n):
+        return "could not claim survivor Review"
+    coordinator = coordinated_build.build_coordinator()
+    coordinator.submit_stage(submission)
+    coordinated_build.reconcile_and_project(coordinator)
+    return "review submitted"
 
 
 def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str:
@@ -1300,36 +874,3 @@ def recheck_once(cfg: RepoConfig) -> str:
         if out.endswith(": merged"):
             break   # one merge per cycle — survivors re-rebase against the new main first
     return "; ".join(results) if results else "no survivors to re-rebase"
-
-
-def pipeline_once(cfg: RepoConfig, _log=None) -> str:
-    """One full pass for a repo: triage one un-triaged issue, build one ready issue, draw one
-    parked UI issue's mockup variants, answer one parked PR the maintainer commented on, and
-    re-rebase any survivor whose base moved when a sibling merged (ADR 0016 — intake runs ahead
-    of the build queue; issue #29 — parked UI issues get their variants drawn; issue #18 — parked
-    PRs stay answered; ADR 0009 / issue #45 — survivors never go silently conflicting)."""
-    recovery = recover_stale_worktrees(cfg.repo, cfg.workdir)
-    if _log and (recovery.removed or recovery.retained):
-        _log(f"{cfg.repo}: worktree recovery removed {len(recovery.removed)}, "
-             f"retained {len(recovery.retained)} for recovery")
-    return (f"intake: {intake_once(cfg, _log=_log)} · build: {run_once(cfg, _log=_log)} · "
-            f"mockup: {produce_once(cfg, _log=_log)} · respond: {respond_once(cfg, _log=_log)} · "
-            f"recheck: {recheck_once(cfg)}")
-
-
-def _main_config(argv: list[str]) -> RepoConfig:
-    """Parse CLI args: <owner/repo> [workdir]. Workdir defaults to ~/Code/<owner>/<name>."""
-    if not argv:
-        raise SystemExit("usage: python -m agentflow.loop <owner/repo> [workdir]")
-    repo = argv[0]
-    if len(argv) > 1:
-        workdir = argv[1]
-    else:
-        owner, name = (repo.split("/", 1) + ["repo"])[:2]
-        workdir = str(Path.home() / "Code" / owner / name)
-    return RepoConfig(repo=repo, workdir=workdir)
-
-
-if __name__ == "__main__":
-    import sys
-    print(pipeline_once(_main_config(sys.argv[1:])))

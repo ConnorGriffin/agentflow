@@ -522,32 +522,6 @@ def test_apply_intake_still_posts_a_genuinely_new_question(monkeypatch):
     assert any("comment" in c for c in spy.calls), "a new question must still post"
 
 
-def _fake_runner(launch):
-    return SimpleNamespace(tool="claude", model="m", model_for=lambda c: "m",
-                           prepare_worktree_detached=lambda workdir, ref, wt: None,
-                           provision=lambda wt: None, launch=launch)
-
-
-def test_intake_marks_a_launch_failure_as_infra_not_a_hold(tmp_path):
-    runner = _fake_runner(lambda prompt, cwd, model: (False, "boom"))
-    r = intake_mod.Intake(runner).intake("owner/repo", str(tmp_path),
-                                         {"number": 5, "title": "t", "body": "b"})
-    assert r.infra_failed is True and r.route is IntakeRoute.GRILL
-
-
-def test_intake_marks_a_worktree_failure_as_infra(tmp_path, monkeypatch):
-    import subprocess
-
-    def boom(workdir, ref, wt):
-        raise subprocess.CalledProcessError(1, "git worktree add")
-
-    runner = _fake_runner(lambda *a, **k: (True, "{}"))
-    runner.prepare_worktree_detached = boom
-    r = intake_mod.Intake(runner).intake("owner/repo", str(tmp_path),
-                                         {"number": 5, "title": "t", "body": "b"})
-    assert r.infra_failed is True
-
-
 # --- dial label cleanup on re-route (issue #27) ----------------------------------
 
 def _label_edit_cmd(rec: _GhRecorder) -> list[str]:

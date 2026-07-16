@@ -26,7 +26,6 @@ from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, Revise
                                     StageRouter, Submission, tracer)
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import Record
-from agentflow.coordinator.rollout import COORDINATED
 from agentflow.gate import MAX_REVISES
 from agentflow.reviewer import Finding, Verdict
 
@@ -110,12 +109,12 @@ class _Live:
                 [{"number": self.number, "headRefOid": self.head}]))
         if "view" in cmd:               # gh issue view <n> --json labels
             return SimpleNamespace(returncode=0, stdout=json.dumps(
-                {"labels": [{"name": name} for name in self.labels]}))
+                {"labels": [{"name": name} for name in self.labels],
+                 "body": "Issue acceptance"}))
         return SimpleNamespace(returncode=0, stdout="")
 
     def step(self):
-        return coordinated_build.reconcile_and_project(
-            self.coord, SimpleNamespace(name=COORDINATED))
+        return coordinated_build.reconcile_and_project(self.coord)
 
     def run_stage(self, identity, *, head=None):
         """Admit and start the one waiting stage, then end its provider and reconcile so its
@@ -153,6 +152,7 @@ def test_reconcile_opens_each_transition_and_transfers_the_claim_at_every_hop(ma
     r = record_of(coord, review)
     assert r.claim is True and r.pool == "codex" and r.builder_lineage == "claude"
     assert r.target == "sha-a"
+    assert "Issue acceptance" in r.input_ptr
     assert tracer.owned_issues(_records(coord), "o/r") == {7}
 
     live.step()                                          # Review admitted and started (codex)

@@ -55,6 +55,23 @@ def record(repo: str, outcome: str, path: Path = STATE) -> None:
     tmp.replace(path)
 
 
+def record_once(repo: str, outcome: str, event: str, path: Path = STATE) -> None:
+    """Record one crash-replayed terminal event at most once."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _load(path)
+    seen = data.get("_seen") if isinstance(data.get("_seen"), list) else []
+    key = f"{repo}:{event}"
+    if key in seen:
+        return
+    hist = (data.get(repo) or [])[-(_MAX - 1):]
+    hist.append(outcome)
+    data[repo] = hist
+    data["_seen"] = (seen + [key])[-1000:]
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
 def status(repo: str, path: Path = STATE) -> dict:
     hist = _load(path).get(repo) or []
     return {"repo": repo, "samples": len(hist),

@@ -30,3 +30,11 @@ def test_record_and_status_roundtrip(tmp_path):
     st = ratchet.status("owner/r", path=p)
     assert st["repo"] == "owner/r" and st["samples"] == 12
     assert 0.0 < st["correction_rate"] < 0.2
+
+
+def test_record_once_is_idempotent_across_crash_replay(tmp_path):
+    path = tmp_path / "ratchet.json"
+    ratchet.record_once("owner/r", "clean_merge", "review-7", path=path)
+    ratchet.record_once("owner/r", "clean_merge", "review-7", path=path)
+
+    assert ratchet.status("owner/r", path=path)["samples"] == 1

@@ -11,11 +11,26 @@ import json
 import sqlite3
 import threading
 
+import pytest
+
 from conftest import FakeSession, NeverStartsLauncher, permits, record_of
 
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
+from agentflow.coordinator.admission import ADMISSION_MATRIX, PERMIT_BUDGET, admission_demand
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.store import ReservationLimits
+
+
+def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_PERMIT_BUDGET", "99")
+    monkeypatch.setenv("AGENTFLOW_REVIEW_DEMAND", "0")
+
+    assert PERMIT_BUDGET == 5
+    assert admission_demand("review", "claude", "opus", "deep") == 1
+    assert admission_demand("future", "claude", "opus", "deep") == 5
+    assert admission_demand("review", "future", "opus", "deep") is None
+    with pytest.raises(TypeError):
+        ADMISSION_MATRIX[("review", "claude", "opus", "deep", None)] = 0
 
 
 def test_submit_stage_is_idempotent_on_the_logical_stage_identity(make_coord):
@@ -507,19 +522,14 @@ def test_schema_v1_record_without_revision_advances_through_public_cycle(make_co
     assert durable.attempts == 1 and fake.is_alive(durable.family)
 
 
-def test_only_build_is_wired_behind_the_coordinator():
-    """Guardrail for issue #103: Build — and only Build — has moved behind the coordinator.
-    Dispatch routes it through the rollout; the legacy provider surface (`runner`) and the other
-    six logical stages' orchestration (`loop`) still never import the coordinator, so nothing
-    else submits work there."""
+def test_all_production_dispatch_is_wired_behind_the_coordinator():
+    """The daemon and by-hand Build route durable work through the coordinator."""
     import agentflow.dispatch
     import agentflow.loop
-    import agentflow.runner
     dispatch_source = agentflow.dispatch.__loader__.get_source("agentflow.dispatch") or ""
-    assert "coordinated_build" in dispatch_source  # Build is wired
-    for module in (agentflow.loop, agentflow.runner):
-        source = module.__loader__.get_source(module.__name__) or ""
-        assert "agentflow.coordinator" not in source
+    loop_source = agentflow.loop.__loader__.get_source("agentflow.loop") or ""
+    assert "coordinated_build" in dispatch_source
+    assert "coordinator.submit_stage" in loop_source
 
 
 def test_stage_outcome_is_the_only_terminal_fact_that_crosses_the_seam():

@@ -229,3 +229,20 @@ outcome has no consumer, and the coordinator turns it into the same idempotent, 
 human hold a budget exhaustion produces, through the stage adapter's own `finalize_hold`.
 Classification, attempt accounting, and the hold lifecycle stay behind the seam; the call
 adds a product-policy fact, not a policy engine.
+
+## Amendment (2026-07-16) — coordinator-only production (issue #109)
+
+All six logical stages now use this seam in production. The chain-long Governor, direct
+stage-to-provider calls, Intake failure streak, and legacy rollout execution mode are deleted.
+The provider-refresh probe that formerly started a minimal Codex session from the balancer is
+also deleted; routing may observe typed headroom/window facts but may never create provider work.
+The live-session file is replaced from durable running records and is never an ownership or
+recovery input. The operator enable flag is now only pause/drain: disabled means no cold
+submissions, while reconciliation, continuation, durable holds, and claim settlement continue.
+
+Visible GitHub claims are reconciled only after an outcome-first coordinator pass. A readable
+store with no non-retired continuation record proves an orphan because every provider family is
+born from a running record; unreadable coordinator or GitHub state clears nothing. The admission
+matrix and each pool's five-permit budget are immutable production data. Runtime configuration
+may still set the machine/stage ceilings and provider timeouts, but cannot weaken a matrix row,
+admit an unknown pool, or change the conservative full-budget fallback.
