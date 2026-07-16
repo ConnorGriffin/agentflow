@@ -173,29 +173,48 @@ class Store:
             except sqlite3.DatabaseError as e:
                 raise StoreUnavailable(f"cannot write continuation store: {e}") from e
 
-    def upsert_with_claim_transfer(self, record: Record, prior_identity: str) -> Record | None:
-        """Persist a successor and retire its completed predecessor in one transaction.
-
-        The predecessor remains the owner unless the successor row can be written. Repeating
-        the transaction is safe after a restart: an already-retired predecessor and its stable
-        successor identity are simply written again without creating another record.
-        """
+    def submit(self, record: Record,
+               prior_identity: str | None = None) -> tuple[Record, Record | None, bool]:
+        """Persist an idempotent stage submission. When ``prior_identity`` is supplied, the
+        successor insert and completed predecessor's claim transfer are one transaction.
+        Returns the durable successor, predecessor (if any), and whether this call transferred
+        ownership. Any missing or ineligible predecessor aborts without exposing a successor."""
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
-                row = self._conn.execute(
-                    "SELECT data FROM records WHERE identity = ?", (prior_identity,)).fetchone()
-                prior = self._decode(row[0]) if row is not None else None
-                self._write(record)
-                if prior is not None and prior.state == COMPLETED:
-                    prior.claim = False
-                    prior.retired = True
-                    self._write(prior)
+                successor_row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
+                successor = self._decode(successor_row[0]) if successor_row is not None else record
+                prior = None
+                transferred = False
+                if prior_identity is not None:
+                    prior_row = self._conn.execute(
+                        "SELECT data FROM records WHERE identity = ?", (prior_identity,)).fetchone()
+                    if prior_row is None:
+                        raise StoreUnavailable("cannot transfer claim: predecessor is missing")
+                    prior = self._decode(prior_row[0])
+                    already_transferred = (
+                        prior.state == COMPLETED and prior.retired and not prior.claim
+                        and successor_row is not None and successor.claim)
+                    if not already_transferred:
+                        if prior.state != COMPLETED or prior.retired or not prior.claim:
+                            raise StoreUnavailable(
+                                "cannot transfer claim: predecessor does not own a completed stage")
+                        successor.claim = True
+                        prior.claim = False
+                        prior.retired = True
+                        self._write(prior)
+                        transferred = True
+                if successor_row is None or transferred:
+                    self._write(successor)
                 self._conn.execute("COMMIT")
-                return prior
+                return successor, prior, transferred
             except sqlite3.DatabaseError as e:
                 self._rollback_quietly()
-                raise StoreUnavailable(f"cannot transfer stage claim: {e}") from e
+                raise StoreUnavailable(f"cannot submit continuation: {e}") from e
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     def reserve(self, record: Record, budget: int) -> bool:
         """Atomically reserve ``record``'s demand on its pool, or refuse. Availability is read
