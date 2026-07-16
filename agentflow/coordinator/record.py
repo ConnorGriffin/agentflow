@@ -37,7 +37,8 @@ class Record:
     target: str | None = None  # immutable target (head SHA / comment id), part of the identity
     continuation: bool = False   # eligible ahead of cold work on its pool (ADR 0028 order)
     eligible_at: int = 0         # when a paused continuation may be admitted again
-    created_at: int = 0          # tie-breaker after eligible_at in the continuation queue
+    created_at: int = 0          # epoch of first submission: continuation-queue tie-breaker, and
+                                 # the anchor a Revise binds its non-code evidence to (issue #118)
     model: str = "opus"
     complexity: str = "deep"
     effort: str | None = None
@@ -62,5 +63,10 @@ class Record:
     hold_pending: bool = False           # classified as a hold, awaiting its durable handoff
     retired: bool = False
     builder_lineage: str | None = None   # who built the diff — a same-tool review cannot auto-merge
+    builder_complexity: str | None = None  # the original builder complexity, carried so a later
+                                           # Revise never re-reads a mutable issue label (ADR 0018)
+    round: int = 0                       # completed auto-revise rounds behind this stage; part of
+                                         # the identity so an evidence-only revision's re-review at
+                                         # the same head SHA is still a fresh stage
     auto_merge_allowed: bool = True
     root: str | None = None              # the root stage this descends from; it shares the root's reservation

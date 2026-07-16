@@ -184,11 +184,12 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
     the fleet comes from running every repo's `_dispatch_repo` at once. Merges are handled
     serially by the caller after these settle (ADR 0009).
 
-    The rollout gates every provider launch (issues #103, #104): `legacy` keeps today's paths;
-    `coordinated` submits one durable Build stage (a completed Build then opens its Review behind
-    the coordinator) and leaves Intake, Mockup, Respond, and Revise queued; `draining` launches
-    nothing new while existing work finishes. Only Build and Review have moved behind the
-    coordinator, so no other legacy stage may bypass that dormant gate."""
+    The rollout gates every provider launch (issues #103, #104, #105): `legacy` keeps today's
+    paths; `coordinated` submits one durable Build stage (a completed Build opens its Review, a
+    blocking Review opens its Revise, and a completed Revise opens its next Review, all behind the
+    coordinator) and leaves Intake, Mockup, and Respond queued; `draining` launches nothing new
+    while existing work finishes. Only Build, Review, and Revise have moved behind the coordinator,
+    so no other legacy stage may bypass that dormant gate."""
     threads: list[threading.Thread] = []
     if phase.launch_legacy:
         threads = _triage_fanout(cfg, slot, _log)

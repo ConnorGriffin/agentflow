@@ -216,3 +216,16 @@ is proven.
   start.
 - Historical replay remains #94. This decision neither validates the policy against
   history nor chooses implementation slices or persistence technology.
+
+## Amendment (2026-07-15) — a third call for product-policy dead ends (issue #105)
+
+The two-call surface assumed every completed stage has a successor to assume its claim.
+Revise surfaced a completed outcome with none: a blocking review whose auto-revise rounds
+are spent (or whose record lacks the lineage facts a revise needs) has no revise, review,
+or merge stage to transfer to, and the coordinator alone cannot know that — the verdict and
+round budget are stage-orchestration facts. The interface therefore gains one deliberate
+third call, `park_completed(identity)`: stage orchestration reports that a completed stage's
+outcome has no consumer, and the coordinator turns it into the same idempotent, notify-once
+human hold a budget exhaustion produces, through the stage adapter's own `finalize_hold`.
+Classification, attempt accounting, and the hold lifecycle stay behind the seam; the call
+adds a product-policy fact, not a policy engine.

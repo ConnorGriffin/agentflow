@@ -9,7 +9,9 @@ coordinator.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -440,6 +442,132 @@ def test_production_reconciliation_recovers_completed_build_handoff_after_restar
     assert list(fake.family_of).count(review) == 1
     assert len([r for r in _records(restarted_again) if r.stage == "review"]) == 1
     assert len(calls) == 2
+
+
+# --- the production Review adapter wiring (issue #120) -----------------------------------
+
+class _ReviewerObserver:
+    """The injected provider edge: the reviewer's captured final message, exactly what the
+    production observer reconstructs from the attempt's durable session artifacts."""
+
+    def __init__(self):
+        self.final_message = ""
+
+    def observe(self, record):
+        return ProviderObservation(cause=ProviderCause.PROCESS,
+                                   final_message=self.final_message)
+
+
+def test_production_verdict_wiring_completes_only_on_the_exact_reviewed_sha(make_coord):
+    """The PRODUCTION verdict edge (issue #120): ``coordinated_build._verdict_ready`` wired as the
+    Review adapter's verifier and driven through ``submit_stage``/``cycle`` — not a direct private
+    call. A durable verdict naming another SHA keeps the review incomplete; the exact reviewed SHA
+    completes it even on a bad provider exit (ADR 0028 outcome-first)."""
+    fake = FakeSession()
+    reviewer = _ReviewerObserver()
+    adapter = ReviewStageAdapter(verdict_ready=coordinated_build._verdict_ready,
+                                 worktree_reset=lambda r: True, observer=reviewer)
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_review(target="sha-a"))
+    coord.cycle("claude")
+    reviewer.final_message = '{"verdict": "PASS", "reviewed_sha": "sha-b", "findings": []}'
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert coord.cycle("claude") == []                # a verdict for another SHA is not this one's
+    assert record_of(coord, ident).continuation
+
+    reviewer.final_message = '{"verdict": "PASS", "reviewed_sha": "sha-a", "findings": []}'
+    fake.end(ident, cause=ProviderCause.PROCESS)      # bad exit; the exact-SHA verdict is durable
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+
+
+def _git(cwd, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True, text=True,
+                          capture_output=True).stdout.strip()
+
+
+def _repo_with_origin(tmp_path: Path) -> Path:
+    origin = tmp_path / "origin.git"
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(origin), str(repo)], check=True, capture_output=True)
+    _git(repo, "config", "user.email", "agentflow@example.com")
+    _git(repo, "config", "user.name", "agentflow test")
+    (repo / "README.md").write_text("start\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "start")
+    _git(repo, "branch", "-M", "main")
+    _git(repo, "push", "-u", "origin", "main")
+    return repo
+
+
+def test_production_checkout_recreation_rebuilds_read_only_at_the_exact_sha(make_coord, tmp_path):
+    """The PRODUCTION checkout edge (issue #120): ``coordinated_build._review_worktree_reset``
+    wired as the Review adapter's prepare and driven through admission over a real git repo. It
+    creates the read-only checkout detached at the record's immutable target SHA, and a
+    continuation discards stale state and rebuilds at the SAME SHA even after the branch moved."""
+    repo = _repo_with_origin(tmp_path)
+    reviewed_sha = _git(repo, "rev-parse", "HEAD")
+    wt = repo / ".agentflow" / "worktrees" / "codex-review" / "pr-42-x"
+    fake = FakeSession()
+    adapter = ReviewStageAdapter(verdict_ready=lambda r, o: False,
+                                 worktree_reset=coordinated_build._review_worktree_reset,
+                                 observer=fake)
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_review(target=reviewed_sha, source=str(wt)))
+    coord.cycle("claude")                              # admission runs the production prepare
+    assert record_of(coord, ident).state == "running"
+    assert _git(wt, "rev-parse", "HEAD") == reviewed_sha   # the exact reviewed SHA
+    assert _git(wt, "branch", "--show-current") == ""      # detached — review holds no branch
+
+    # The checkout goes stale and the branch moves on; the continuation's prepare discards the
+    # leftover state and rebuilds at the same immutable target SHA — never the moved head.
+    (wt / "stale.txt").write_text("leftover")
+    (repo / "README.md").write_text("moved\n")
+    _git(repo, "commit", "-am", "branch moves on")
+    _git(repo, "push", "origin", "main")
+    fake.end(ident, cause=ProviderCause.PROCESS)       # interrupted with no verdict → continuation
+    coord.cycle("claude")                              # re-admission re-runs the production prepare
+    assert record_of(coord, ident).attempts == 2
+    assert _git(wt, "rev-parse", "HEAD") == reviewed_sha
+    assert not (wt / "stale.txt").exists()             # stale state was discarded, not kept
+
+
+def test_production_park_resolves_the_pr_from_the_review_worktree_and_parks_once(make_coord,
+                                                                                 monkeypatch):
+    """The PRODUCTION park edge (issue #120): ``coordinated_build._park_pr`` wired as the Review
+    adapter's handoff and driven to exhaustion through ``cycle``. The PR number comes from the
+    review worktree path (no GitHub lookup); the park comment is the durable proof, so a restart
+    re-observes it and never parks or notifies twice."""
+    parked, notified, pr_comments = [], [], []
+
+    def _park(repo, pr, verdict, *, reason):
+        parked.append((repo, pr))
+        pr_comments.append({"body": "> *agentflow: parked for human review.*"})
+
+    monkeypatch.setattr("agentflow.gate.park", _park)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(pr_comments))
+    monkeypatch.setattr("agentflow.notify.notify", lambda *a, **k: notified.append(a))
+
+    fake = FakeSession()
+    adapter = ReviewStageAdapter(verdict_ready=lambda r, o: False, worktree_reset=lambda r: True,
+                                 observer=fake, handoff=coordinated_build._park_pr)
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_review(source="/w/.agentflow/worktrees/codex-review/pr-42-x"))
+    outcome = None
+    for _ in range(8):
+        settled = coord.cycle("claude")
+        if settled:
+            outcome = settled[0]
+            break
+        fake.end(ident, cause=ProviderCause.PROCESS)
+    assert outcome is not None and outcome.status == "held" and outcome.handoff == "pr:parked"
+    assert parked == [("o/r", 42)] and len(notified) == 1   # parked and notified exactly once
+    rec = record_of(coord, ident)
+    assert rec.state == "held" and rec.claim is False and rec.handoffs == 1
+
+    # Idempotent across a restart: the durable park comment is the proof — no second park/notify.
+    assert make_coord(fake, adapter=adapter).cycle("claude") == []
+    assert parked == [("o/r", 42)] and len(notified) == 1
 
 
 # --- build and review are the only enabled stages ----------------------------------------
