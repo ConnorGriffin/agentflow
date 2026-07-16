@@ -153,11 +153,12 @@ def test_forward_rollout_preserves_build_claims_for_drain_evidence(tmp_path, mon
     monkeypatch.setattr(daemon, "recheck_once", lambda cfg: "nothing")
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",
-                        lambda repos, rollout=None, _log=None: seen.append(rollout.mode))
+                        lambda repos, rollout=None, rollout_mode=None, _log=None:
+                        seen.append((rollout.mode, rollout_mode)))
 
     daemon.dispatch_cycle([A], _log=lambda _line: None)
 
-    assert seen == ["coordinated"]
+    assert seen == [("coordinated", "coordinated")]
 
 
 def test_main_once_runs_one_cycle_and_exits(tmp_path):

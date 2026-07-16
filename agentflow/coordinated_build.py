@@ -142,15 +142,21 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
     return tuple(dict.fromkeys(evidence))
 
 
-def resolve_phase(rollout: Rollout, repos, live_sessions, *, store_path=None) -> Phase:
+def resolve_phase(rollout: Rollout, repos, live_sessions, *, store_path=None,
+                  requested_mode: str | None = None) -> Phase:
     """Derive this cycle's phase from the durable rollout mode and the observed world, without
     ever creating a store that never existed. In the steady legacy state (no coordinator has run)
     this is a cheap ``legacy`` with no filesystem or GitHub reads."""
     path = Path(store_path or default_store_path())
     records = tracer.load_records(path) if path.exists() else []
-    if rollout.mode == MODE_COORDINATED:
-        return rollout.phase(legacy_evidence=activation_evidence(repos, live_sessions, records))
-    return rollout.phase(coordinator_active=tracer.coordinator_active(records))
+    mode = rollout.mode if requested_mode is None else requested_mode
+    if mode == MODE_COORDINATED:
+        return rollout.phase(
+            legacy_evidence=activation_evidence(repos, live_sessions, records),
+            requested_mode=mode,
+        )
+    return rollout.phase(
+        coordinator_active=tracer.coordinator_active(records), requested_mode=mode)
 
 
 def owned_issues(cfg, *, store_path=None) -> set[int]:

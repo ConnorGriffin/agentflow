@@ -223,13 +223,14 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
     return f"#{issue['number']}: submitted to coordinator → {builder.tool} (build)"
 
 
-def _resolve_phase(rollout, repos, _log) -> Phase:
+def _resolve_phase(rollout, repos, _log, requested_mode=None) -> Phase:
     """This cycle's Build rollout phase. Any ambiguous rollout, live-session, coordinator,
     claim, or worktree read fails closed into a named drain; it can never re-enable legacy
     launching or activate coordinated Build by guessing."""
     try:
         sessions = live.running_strict()
-        return coordinated_build.resolve_phase(rollout or Rollout(log=_log), repos, sessions)
+        return coordinated_build.resolve_phase(
+            rollout or Rollout(log=_log), repos, sessions, requested_mode=requested_mode)
     except Exception as e:  # noqa: BLE001 — ambiguity drains Build, not the whole cycle
         reason = f"rollout state unreadable ({type(e).__name__}: {e})"
         _log(f"rollout: {reason} — draining")
@@ -237,7 +238,7 @@ def _resolve_phase(rollout, repos, _log) -> Phase:
 
 
 def run_cycle(repos, governor: Governor | None = None, *, rollout=None,
-              coordinator=None, _log=None) -> None:
+              rollout_mode=None, coordinator=None, _log=None) -> None:
     """One concurrent dispatch pass over the fleet (ADR 0023 M6 slice 5). Reads each pool's
     activity and the Build rollout phase, then dispatches every repo's ready work at once —
     governed by the machine ceiling, per-stage caps, and per-pool pacing. When Build is behind
@@ -248,7 +249,7 @@ def run_cycle(repos, governor: Governor | None = None, *, rollout=None,
     gov = governor if governor is not None else Governor()
     gov.begin_cycle()
     slot = _Slot(gov, _pool_activity(_log))
-    phase = _resolve_phase(rollout, repos, _log)
+    phase = _resolve_phase(rollout, repos, _log, rollout_mode)
     coord = None
     if not phase.launch_legacy:  # coordinated or draining — the coordinator owns Build now
         coord = coordinator if coordinator is not None else coordinated_build.build_coordinator(_log)

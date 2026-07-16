@@ -101,7 +101,8 @@ class Rollout:
 
     # --- derived phase ------------------------------------------------------------------
 
-    def phase(self, *, legacy_evidence=(), coordinator_active: bool = False) -> Phase:
+    def phase(self, *, legacy_evidence=(), coordinator_active: bool = False,
+              requested_mode: str | None = None) -> Phase:
         """Derive this cycle's phase from the durable mode and the observed world.
 
         - Rolling forward (``coordinated``) waits while any current-format session, claim, PID
@@ -113,7 +114,10 @@ class Rollout:
           Only once no coordinator record owns work does it reach ``legacy``.
         """
         evidence = tuple(legacy_evidence)
-        if self.mode == MODE_COORDINATED:
+        mode = self.mode if requested_mode is None else requested_mode
+        if mode not in _MODES:
+            raise ValueError(f"invalid rollout mode: {mode}")
+        if mode == MODE_COORDINATED:
             if evidence:
                 self._log("rollout: draining to coordinated — waiting on "
                           + "; ".join(evidence))

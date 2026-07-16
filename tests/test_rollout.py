@@ -73,6 +73,16 @@ def test_no_phase_ever_launches_both_sides(tmp_path):
                 assert not (phase.launch_legacy and phase.submit_coordinated)
 
 
+def test_cycle_can_pin_the_intent_it_read_before_reclaim(tmp_path):
+    roll = _rollout(tmp_path)
+    roll.request_coordinated()
+    # Even if the durable file is toggled after the cycle's first read, cleanup and dispatch use
+    # the same pinned intent. The new request takes effect on the next cycle.
+    roll.request_legacy()
+    phase = roll.phase(requested_mode=MODE_COORDINATED)
+    assert phase.name == COORDINATED
+
+
 def test_corrupt_durable_file_refuses_to_guess_a_mode(tmp_path):
     path = tmp_path / "rollout.json"
     path.write_text("{not json")

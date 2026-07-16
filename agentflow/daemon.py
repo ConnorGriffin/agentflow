@@ -137,8 +137,10 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
 
     rollout = Rollout(log=_log)
     try:
-        preserve_builds = rollout.mode == MODE_COORDINATED
+        rollout_mode = rollout.mode
+        preserve_builds = rollout_mode == MODE_COORDINATED
     except Exception as e:  # noqa: BLE001 — ambiguous intent must preserve possible ownership
+        rollout_mode = None
         preserve_builds = True
         _log(f"rollout: state unreadable before reclaim ({type(e).__name__}: {e}) — "
              "preserving Build claims")
@@ -148,7 +150,7 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
             cfg, _log=_log, preserve_builds=preserve_builds),
         _log=_log,
     )
-    dispatch.run_cycle(repos, rollout=rollout, _log=_log)
+    dispatch.run_cycle(repos, rollout=rollout, rollout_mode=rollout_mode, _log=_log)
     cycle(repos, run=_recheck, _log=_log)
 
 
