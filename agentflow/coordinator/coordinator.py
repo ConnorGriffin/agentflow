@@ -178,9 +178,10 @@ class Coordinator:
             if not record.hold_pending:
                 record.hold_pending = True
                 record.hold_reason = "completed stage has no successor"
+                if not self._persist(record):
+                    return None
                 self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no "
                                   f"next stage remains — parking for human; claim released")
-                self._persist(record)
             return self._finalize_hold(record)
 
     def _register_descendant(self, record: Record) -> None:
@@ -353,6 +354,8 @@ class Coordinator:
         # launch token binds this reservation to exactly one bootstrap child: only a child
         # holding it may record `started`, so a timed-out launch disowned back to waiting can
         # never be adopted by an uncancelled child (ADR 0030 handshake boundary).
+        expected_launch_token = record.launch_token
+        expected_revision = record.revision
         record.state = RUNNING
         record.start_fact = None
         record.launch_token = uuid4().hex
@@ -363,14 +366,24 @@ class Coordinator:
         record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
         reservation_limits = getattr(self._gate, "reservation_limits", None)
         limits = reservation_limits(record) if reservation_limits is not None else None
-        if not self._store.reserve(record, PERMIT_BUDGET, limits):
+        if not self._store.reserve(
+                record, PERMIT_BUDGET, limits,
+                expected_launch_token=expected_launch_token,
+                expected_revision=expected_revision):
             record.state = WAITING  # the pool cannot fit this demand right now
             record.start_fact = None
             return False
         return True
 
     def _commit_start(self, record: Record, fact: str, family: str | None = None) -> None:
-        assert record.state == RUNNING
+        # The bootstrap child may have advanced the durable row while the parent waited for its
+        # handshake. Continue from that exact revision; never overwrite the child's start fact
+        # with the older reservation snapshot.
+        durable = self._store.record_of(record.identity)
+        if durable is None or durable.state != RUNNING:
+            return
+        record = durable
+        self._records[record.identity] = record
         assert fact in {STARTED, NOT_STARTED}
         record.start_fact = fact
         if fact == NOT_STARTED:
@@ -381,7 +394,8 @@ class Coordinator:
         record.family = family or record.family
         was_continuation = record.continuation
         self._consume_attempt(record)
-        self._persist(record)
+        if not self._persist(record):
+            return
         started = getattr(self._gate, "started", None)
         if started is not None:
             started(record)
@@ -404,16 +418,24 @@ class Coordinator:
 
     def _settle_completed(self, record: Record) -> bool:
         """Project a completed stage at its durable boundary behind the ``cycle`` seam."""
-        finalize = getattr(self._adapter, "finalize_completed", None)
-        proof = finalize(record) if finalize is not None else None
-        if proof is None:
+        def settle(current: Record) -> bool:
+            if current.state != COMPLETED or current.retired:
+                return False
+            finalize = getattr(self._adapter, "finalize_completed", None)
+            proof = finalize(current) if finalize is not None else None
+            if proof is None:
+                return False
+            current.handoff_proof = proof
+            current.claim = False
+            current.retired = True
+            return True
+
+        settled = self._store.transition(record, settle)
+        if settled is None:
             return False
-        record.handoff_proof = proof
-        record.claim = False
-        record.retired = True
-        self._persist(record)
-        self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} settled — "
-                          f"{_OUTCOME_LABEL.get(record.stage, record.stage)}; claim released")
+        self._records[settled.identity] = settled
+        self._emit(settled, f"attempt {settled.attempts}/{ATTEMPT_BUDGET} settled — "
+                          f"{_OUTCOME_LABEL.get(settled.stage, settled.stage)}; claim released")
         return True
 
     def _finalize(self, record: Record) -> StageOutcome | None:
@@ -427,10 +449,12 @@ class Coordinator:
         outcome = capture(record, obs) if capture is not None else None
         if outcome is not None:
             record.outcome = outcome
-            self._persist(record)  # parsed outcome precedes any external projection
+            if not self._persist(record):  # parsed outcome precedes any external projection
+                return None
         if outcome is not None or self._adapter.verify(record, obs):
             record.state = COMPLETED
-            self._persist(record)
+            if not self._persist(record):
+                return None
             self._retire_descendants(record)
             # A completed stage keeps its claim until the next stage transfers it (ADR 0028);
             # the transfer line is emitted when that next stage is submitted.
@@ -441,14 +465,16 @@ class Coordinator:
         cause = obs.cause.value
         if label == "permanent":
             record.hold_reason = f"permanent provider condition ({cause})"
-            self._hold(record)
+            if not self._hold(record):
+                return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
                               f"permanent; held for human; claim released")
         elif record.attempts < ATTEMPT_BUDGET:
             record.state = WAITING
             record.continuation = True
             record.eligible_at = obs.reset_at or 0
-            self._persist(record)
+            if not self._persist(record):
+                return None
             done = record.attempts  # continuations begun after this interruption
             when = f"at {record.eligible_at}" if record.eligible_at else "next cycle"
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
@@ -457,7 +483,8 @@ class Coordinator:
             return None
         else:
             record.hold_reason = "continuation budget exhausted"
-            self._hold(record)
+            if not self._hold(record):
+                return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
                               f"({cause}) — continuation budget exhausted; held for human; "
                               f"claim released")
@@ -468,23 +495,31 @@ class Coordinator:
     def _finalize_hold(self, record: Record) -> StageOutcome | None:
         if not record.hold_pending:
             return None
-        if record.handoff_proof is None:
-            finalize = getattr(self._adapter, "finalize_hold", None)
-            proof = finalize(record) if finalize is not None else (
-                f"proof:{record.identity}:{STAGE_NATIVE_HANDOFF[record.stage]}")
-            if proof is None:
-                return None  # the external handoff is not durable yet; retry next cycle
-            record.handoffs = 1
-            record.handoff_kind = STAGE_NATIVE_HANDOFF[record.stage]
-            record.handoff_proof = proof
-            record.notifications = 1
-            self._persist(record)
-        record.state = HELD
-        record.hold_pending = False
-        record.claim = False
-        self._persist(record)
-        self._retire_descendants(record)
-        return StageOutcome(record.identity, record.stage, "held", record.handoff_kind)
+
+        def hold(current: Record) -> bool:
+            if not current.hold_pending or current.state not in {WAITING, COMPLETED}:
+                return False
+            if current.handoff_proof is None:
+                finalize = getattr(self._adapter, "finalize_hold", None)
+                proof = finalize(current) if finalize is not None else (
+                    f"proof:{current.identity}:{STAGE_NATIVE_HANDOFF[current.stage]}")
+                if proof is None:
+                    return False
+                current.handoffs = 1
+                current.handoff_kind = STAGE_NATIVE_HANDOFF[current.stage]
+                current.handoff_proof = proof
+                current.notifications = 1
+            current.state = HELD
+            current.hold_pending = False
+            current.claim = False
+            return True
+
+        held = self._store.transition(record, hold)
+        if held is None:
+            return None
+        self._records[held.identity] = held
+        self._retire_descendants(held)
+        return StageOutcome(held.identity, held.stage, "held", held.handoff_kind)
 
     # --- internal helpers ---------------------------------------------------------------
 
@@ -499,16 +534,24 @@ class Coordinator:
                 child.claim = False
                 self._persist(child)
 
-    def _hold(self, record: Record) -> None:
+    def _hold(self, record: Record) -> bool:
         record.state = WAITING
         record.hold_pending = True
-        self._persist(record)
+        return self._persist(record)
 
     def _release(self, record: Record) -> None:
         record.process_alive = False
 
-    def _persist(self, record: Record) -> None:
-        self._store.upsert(record)
+    def _persist(self, record: Record) -> bool:
+        if self._store.upsert(record):
+            self._records[record.identity] = record
+            return True
+        # Another coordinator advanced this identity. Refresh the working set and let the
+        # current pass stop at the lost compare-and-set instead of overwriting the winner.
+        durable = self._store.record_of(record.identity)
+        if durable is not None:
+            self._records[record.identity] = durable
+        return False
 
     def _emit(self, record: Record, tail: str) -> None:
         """One stable ADR 0028 operational line: ``{repo}: {subject}: {stage}: {tail}``. The

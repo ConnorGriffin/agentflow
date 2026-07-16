@@ -7,6 +7,8 @@ nothing here is wired into the daemon yet.
 
 from __future__ import annotations
 
+import threading
+
 from conftest import FakeSession, NeverStartsLauncher, permits, record_of
 
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
@@ -129,6 +131,172 @@ def test_global_stage_limit_is_enforced_through_the_coordinator_seam(make_coord)
 
     assert record_of(second, build).state == "running"
     assert record_of(second, review).state == "waiting"
+
+
+def test_stale_waiting_generation_cannot_reset_a_newer_attempt(make_coord):
+    """Two public ``cycle`` calls overlap one record. The first pauses after loading the old
+    waiting generation; the second starts and durably returns attempt 1 to waiting. Resuming the
+    stale cycle must lose the token CAS and preserve the newer attempt budget/state."""
+    fake = FakeSession()
+    seed = make_coord(fake)
+    identity = seed.submit_stage(Submission(
+        repo="o/r", subject="cas", stage="review", pool="claude"))
+    entered = threading.Event()
+    resume = threading.Event()
+
+    class BlockingAdapter:
+        def prepare(self, record):
+            entered.set()
+            assert resume.wait(timeout=5)
+            return True
+
+        def observe(self, record):
+            return fake.observe(record)
+
+        def verify(self, record, obs):
+            return fake.verify(record, obs)
+
+    stale = make_coord(fake, adapter=BlockingAdapter())
+    current = make_coord(fake)
+    errors = []
+
+    def run_stale_cycle():
+        try:
+            stale.cycle("claude", now=0)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=run_stale_cycle)
+    thread.start()
+    assert entered.wait(timeout=5)
+
+    current.cycle("claude", now=0)
+    winning_token = record_of(current, identity).launch_token
+    fake.end(identity, cause=ProviderCause.CAPACITY, reset_at=100)
+    current.cycle("claude", now=0)
+    advanced = record_of(current, identity)
+    assert advanced.state == "waiting" and advanced.attempts == 1
+
+    resume.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive() and errors == []
+    durable = record_of(current, identity)
+    assert durable.state == "waiting" and durable.attempts == 1
+    assert durable.launch_token == winning_token and durable.eligible_at == 100
+    assert permits(current, "claude") == 0
+
+
+def test_completed_settlement_has_one_cross_coordinator_owner(make_coord):
+    """The external completion projection runs once even when two public cycles race it."""
+    fake = FakeSession()
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Adapter:
+        def observe(self, record):
+            return fake.observe(record)
+
+        def verify(self, record, obs):
+            return fake.verify(record, obs)
+
+        def finalize_completed(self, record):
+            calls.append(record.identity)
+            entered.set()
+            assert release.wait(timeout=5)
+            return "durable-proof"
+
+    adapter = Adapter()
+    seed = make_coord(fake, adapter=adapter)
+    identity = seed.submit_stage(Submission(
+        repo="o/r", subject="settle-race", stage="review", pool="claude"))
+    seed.cycle("claude")
+    fake.end(identity, success=True)
+    assert [o.status for o in seed.cycle("claude")] == ["completed"]
+
+    first = make_coord(fake, adapter=adapter)
+    second = make_coord(fake, adapter=adapter)
+    errors = []
+
+    def cycle(coord):
+        try:
+            coord.cycle("claude")
+        except BaseException as error:
+            errors.append(error)
+
+    one = threading.Thread(target=cycle, args=(first,))
+    two = threading.Thread(target=cycle, args=(second,))
+    one.start()
+    assert entered.wait(timeout=5)
+    two.start()
+    release.set()
+    one.join(timeout=5)
+    two.join(timeout=5)
+
+    assert not one.is_alive() and not two.is_alive() and errors == []
+    assert calls == [identity]
+    durable = record_of(first, identity)
+    assert durable.state == "completed" and durable.retired is True
+    assert durable.claim is False and durable.handoff_proof == "durable-proof"
+
+
+def test_hold_finalization_has_one_cross_coordinator_owner(make_coord):
+    """A pending hold's external handoff is serialized across two public cycles."""
+    fake = FakeSession()
+    enabled = [False]
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class Adapter:
+        def observe(self, record):
+            return fake.observe(record)
+
+        def verify(self, record, obs):
+            return False
+
+        def finalize_hold(self, record):
+            if not enabled[0]:
+                return None
+            calls.append(record.identity)
+            entered.set()
+            assert release.wait(timeout=5)
+            return "hold-proof"
+
+    adapter = Adapter()
+    seed = make_coord(fake, adapter=adapter)
+    identity = seed.submit_stage(Submission(
+        repo="o/r", subject="hold-race", stage="review", pool="claude"))
+    seed.cycle("claude")
+    fake.end(identity, cause=ProviderCause.PERMANENT)
+    assert seed.cycle("claude") == []
+    assert record_of(seed, identity).hold_pending is True
+    enabled[0] = True
+
+    first = make_coord(fake, adapter=adapter)
+    second = make_coord(fake, adapter=adapter)
+    errors = []
+
+    def cycle(coord):
+        try:
+            coord.cycle("claude")
+        except BaseException as error:
+            errors.append(error)
+
+    one = threading.Thread(target=cycle, args=(first,))
+    two = threading.Thread(target=cycle, args=(second,))
+    one.start()
+    assert entered.wait(timeout=5)
+    two.start()
+    release.set()
+    one.join(timeout=5)
+    two.join(timeout=5)
+
+    assert not one.is_alive() and not two.is_alive() and errors == []
+    assert calls == [identity]
+    durable = record_of(first, identity)
+    assert durable.state == "held" and durable.hold_pending is False
+    assert durable.claim is False and durable.handoff_proof == "hold-proof"
 
 
 def test_only_build_is_wired_behind_the_coordinator():

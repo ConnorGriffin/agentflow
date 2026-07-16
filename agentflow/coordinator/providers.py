@@ -110,6 +110,34 @@ _CLAUDE_RESULT_CAUSES = {
 _CLAUDE_KNOWN_TYPES = {"assistant", "result", "rate_limit_event"}
 
 
+def _claude_result_error(event: dict):
+    """Classify the Agent SDK ``ResultMessage`` error surface.
+
+    A result may retain ``subtype=success`` while reporting an API failure through
+    ``is_error``/``api_error_status``/``errors``. Status is the only typed fact used here:
+    429 is capacity, authentication/payment/permission statuses are permanent, and 5xx
+    (including Anthropic's 529 overload) are server interruptions. Other shaped failures stay
+    unknown and are preserved by the caller rather than guessed from prose.
+    """
+    status = event.get("api_error_status")
+    try:
+        status = int(status) if not isinstance(status, bool) else None
+    except (TypeError, ValueError):
+        status = None
+    errors = event.get("errors")
+    has_errors = isinstance(errors, (list, tuple)) and bool(errors)
+    has_error = event.get("is_error") is True or status is not None or has_errors
+    if not has_error:
+        return None, False
+    if status == 429:
+        return ProviderCause.CAPACITY, True
+    if status in {401, 402, 403}:
+        return ProviderCause.PERMANENT, True
+    if status is not None and 500 <= status <= 599:
+        return ProviderCause.SERVER, True
+    return ProviderCause.UNKNOWN, True
+
+
 def _claude_assistant_text(event: dict) -> str | None:
     """Extract text from Claude's ``assistant.message.content`` blocks (SDKAssistantMessage)."""
     message = event.get("message")
@@ -199,7 +227,15 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
             if isinstance(result, str):
                 final_message = result
             subtype = event.get("subtype")
-            if subtype and subtype != "success":
+            result_cause, has_result_error = _claude_result_error(event)
+            if has_result_error:
+                if (cause is ProviderCause.NONE
+                        or (cause is ProviderCause.UNKNOWN
+                            and result_cause is not ProviderCause.UNKNOWN)):
+                    cause = result_cause
+                if result_cause is ProviderCause.UNKNOWN:
+                    unrecognized.append(dict(event))
+            elif subtype and subtype != "success":
                 mapped = _CLAUDE_RESULT_CAUSES.get(subtype)
                 if mapped is not None:
                     if cause is ProviderCause.NONE:

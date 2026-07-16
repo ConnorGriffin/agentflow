@@ -115,8 +115,11 @@ def apply_route(record, result: IntakeResult) -> str | None:
         return None
     issue = json.loads(viewed.stdout or "{}")
     labels = [label.get("name", "") for label in issue.get("labels", [])]
-    apply_intake(record.repo, number, issue.get("title", snapshot.get("title", "")), labels, result)
-    if not intake_result_is_durable(record.repo, number, result):
+    source_title = snapshot.get("title", "")
+    source_body = snapshot.get("body", "")
+    apply_intake(record.repo, number, issue.get("title", source_title), labels, result,
+                 source_title, source_body)
+    if not intake_result_is_durable(record.repo, number, result, source_title, source_body):
         return None
     if not _release_triage(record.repo, number):
         return None

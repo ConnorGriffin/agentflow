@@ -81,6 +81,34 @@ def test_claude_terminal_result_subtype_failures_are_process_interruptions():
     ).cause is ProviderCause.PROCESS
 
 
+@pytest.mark.parametrize(
+    ("status", "cause"),
+    [
+        (429, ProviderCause.CAPACITY),
+        ("429", ProviderCause.CAPACITY),
+        (500, ProviderCause.SERVER),
+        (529, ProviderCause.SERVER),
+        (401, ProviderCause.PERMANENT),
+        (402, ProviderCause.PERMANENT),
+        (403, ProviderCause.PERMANENT),
+    ],
+)
+def test_claude_result_api_errors_override_a_success_subtype(status, cause):
+    obs = classify_claude([{
+        "type": "result", "subtype": "success", "is_error": True,
+        "api_error_status": status, "errors": ["request failed"],
+    }])
+    assert obs.cause is cause
+
+
+def test_claude_untyped_result_errors_are_unknown_and_preserved():
+    event = {"type": "result", "subtype": "success", "is_error": True,
+             "errors": ["new SDK failure shape"]}
+    obs = classify_claude([event])
+    assert obs.cause is ProviderCause.UNKNOWN
+    assert obs.unrecognized == (event,)
+
+
 def test_claude_timeout_and_process_come_from_supervisor_and_exit():
     assert classify_claude([], timed_out=True).cause is ProviderCause.TIMEOUT
     assert classify_claude([], exit_status=1).cause is ProviderCause.PROCESS

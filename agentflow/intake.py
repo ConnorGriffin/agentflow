@@ -152,11 +152,6 @@ def parse_intake(payload: str) -> IntakeResult:
                 return _held("intake decision carried no body")
             title = str(data.get("title", "")).strip()
             if route is IntakeRoute.READY:
-                if not title:
-                    # A ready build MUST carry a rewritten title (the prompt demands one); an
-                    # empty title is a malformed decision, not a valid ready. Hold rather than
-                    # promote a titleless build (a wrong build is the expensive miss).
-                    return _held("ready decision carried no title")
                 complexity = _enum_or_none(Complexity, data.get("complexity")) or Complexity.DEEP
                 effort = _enum_or_none(Effort, data.get("effort")) or Effort.MEDIUM
                 return IntakeResult(route, body, title, complexity, effort)
@@ -479,7 +474,9 @@ def _result_comment_exists(repo: str, issue_number: int,
 
 
 def apply_intake(repo: str, issue_number: int, current_title: str,
-                 current_labels: list[str], result: IntakeResult) -> str:
+                 current_labels: list[str], result: IntakeResult,
+                 source_title: str | None = None,
+                 source_body: str | None = None) -> str:
     """Write the decision to GitHub, then set the one state label + dials (clearing any
     other state label). Impure; returns a one-line summary.
 
@@ -495,7 +492,8 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
         return "nothing new — nothing to post"
 
     labels = intake_labels(result)
-    retitled_from = current_title if (result.title and result.title != current_title) else None
+    target_title = result.title or source_title or ""
+    retitled_from = current_title if (target_title and target_title != current_title) else None
     comment = _result_comment(result)
     if retitled_from is not None:
         comment = f'> Retitled from: "{retitled_from}"\n\n{comment}'
@@ -515,12 +513,14 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
         if current_body is None:
             # Fail closed: we cannot compose the brief without the original to preserve.
             return f"routed -> {result.route.value} deferred (body unreadable)"
-        if _ORIGINAL_MARK in current_body and not _ready_body_has_envelope(current_body):
+        if (source_body is None and _ORIGINAL_MARK in current_body
+                and not _ready_body_has_envelope(current_body)):
             return f"routed -> {result.route.value} deferred (body envelope malformed)"
-        # Body is done only when it is EXACTLY the canonical composed body — the brief over the
-        # preserved original — not merely when the brief appears somewhere in it. `compose` is
-        # idempotent, so re-composing the already-composed body reproduces it byte-for-byte.
-        body_done = (current_body == compose_ready_body(result.body, current_body)
+        # Coordinated Intake projects from its immutable submission snapshot. Legacy callers
+        # without that source retain the old idempotent behavior over the live body.
+        body_source = source_body if source_body is not None else current_body
+        expected_body = compose_ready_body(result.body, body_source)
+        body_done = (current_body == expected_body
                      and _ready_body_is_canonical(current_body, result.body))
     else:
         current_body = ""
@@ -530,10 +530,10 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
         return f"unchanged -> {result.route.value} (already posted)"
 
     if retitled_from is not None:
-        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", result.title])
+        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", target_title])
     if result.route is IntakeRoute.READY:
-        body = compose_ready_body(result.body, current_body)
-        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--body", body])
+        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo,
+              "--body", expected_body])
     if not comment_done:
         _run(["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", comment])
 
@@ -554,7 +554,9 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
     return f"routed -> {result.route.value}{tail}"
 
 
-def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult) -> bool:
+def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult,
+                             source_title: str | None = None,
+                             source_body: str | None = None) -> bool:
     """Verify that the routing decision is visible on GitHub before disposal."""
     if result.route is IntakeRoute.NOTHING_NEW:
         return True
@@ -576,7 +578,8 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult)
     if any(any(name.startswith(prefix) for prefix in _DIAL_PREFIXES)
            and name not in required for name in labels):
         return False
-    if result.title and issue.get("title") != result.title:
+    expected_title = result.title or source_title
+    if expected_title is not None and issue.get("title") != expected_title:
         return False
     comments = [comment.get("body", "") for comment in issue.get("comments", [])
                 if isinstance(comment, dict)]
@@ -586,10 +589,12 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult)
         # Prove the EXACT canonical composed body — the brief over the preserved original —
         # not just that the brief appears somewhere. `compose_ready_body` is idempotent on an
         # already-composed body, so the durable body must equal composing the brief over itself.
-        if not result.title:
-            return False
         body = issue.get("body") or ""
-        return _ready_body_is_canonical(body, result.body)
+        if not _ready_body_is_canonical(body, result.body):
+            return False
+        if source_body is not None:
+            return body == compose_ready_body(result.body, source_body)
+        return True
     return True
 
 

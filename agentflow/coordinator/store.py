@@ -22,7 +22,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 from uuid import uuid4
 
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
@@ -173,21 +173,66 @@ class Store:
                 raise StoreUnavailable(f"cannot read continuation store: {e}") from e
         return {r.identity: r for r in (self._decode(row[0]) for row in rows)}
 
-    def upsert(self, record: Record) -> None:
-        """Persist one record's current state. Called after every coordinator transition."""
-        payload = self._encode(record)
+    def upsert(self, record: Record) -> bool:
+        """Persist one record only if its durable revision is still current.
+
+        The caller's object is advanced to the committed revision. A stale writer returns
+        ``False`` without changing durable state, so an old cycle can never replace a newer
+        continuation or terminal transition.
+        """
         with self._lock:
             try:
-                self._conn.execute(
-                    "INSERT INTO records (identity, pool, state, demand, data)"
-                    " VALUES (?, ?, ?, ?, ?)"
-                    " ON CONFLICT(identity) DO UPDATE SET"
-                    " pool=excluded.pool, state=excluded.state,"
-                    " demand=excluded.demand, data=excluded.data",
-                    (record.identity, record.pool, record.state, record.demand, payload),
-                )
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
+                if row is not None and self._decode(row[0]).revision != record.revision:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                if row is None and record.revision != 0:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record.revision += 1
+                self._write(record)
+                self._conn.execute("COMMIT")
+                return True
             except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
                 raise StoreUnavailable(f"cannot write continuation store: {e}") from e
+
+    def transition(self, expected: Record,
+                   operation: Callable[[Record], bool]) -> Record | None:
+        """Serialize one externally-backed terminal transition.
+
+        The durable revision is claimed under ``BEGIN IMMEDIATE`` before ``operation`` runs.
+        Therefore only one coordinator may perform the external finalization for a generation.
+        A process crash releases SQLite's transaction; the stage adapter's idempotent durable
+        proof can then be retried by a fresh coordinator. Returning false rolls back cleanly.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (expected.identity,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                current = self._decode(row[0])
+                if current.revision != expected.revision:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                if not operation(current):
+                    self._conn.execute("ROLLBACK")
+                    return None
+                current.revision += 1
+                self._write(current)
+                self._conn.execute("COMMIT")
+                return current
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot transition continuation store: {e}") from e
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     def submit(self, record: Record,
                prior_identity: str | None = None) -> tuple[Record, Record | None, bool]:
@@ -219,9 +264,11 @@ class Store:
                         successor.claim = True
                         prior.claim = False
                         prior.retired = True
+                        prior.revision += 1
                         self._write(prior)
                         transferred = True
                 if successor_row is None or transferred:
+                    successor.revision += 1
                     self._write(successor)
                 self._conn.execute("COMMIT")
                 return successor, prior, transferred
@@ -233,7 +280,9 @@ class Store:
                 raise
 
     def reserve(self, record: Record, budget: int,
-                limits: ReservationLimits | None = None) -> bool:
+                limits: ReservationLimits | None = None,
+                expected_launch_token: str | None = None,
+                expected_revision: int | None = None) -> bool:
         """Atomically reserve ``record``'s demand on its pool, or refuse. Availability is read
         and the running row is written under one ``BEGIN IMMEDIATE``, so two coordinator
         instances racing on the same file serialize on the write lock and can never push a
@@ -242,13 +291,13 @@ class Store:
         different pools cannot exceed either global cap. Returns whether the reservation was
         taken; on refusal nothing is written.
 
-        The write is a same-identity compare-and-set: an existing row must still be ``waiting``.
+        The write is a same-identity compare-and-set: an existing row must still be ``waiting``
+        at the launch-token generation the caller loaded.
         Two coordinator instances that both loaded the
         same ``waiting`` record and each flipped it to ``running`` with its own fresh launch token
         serialize on the write lock — the first commits its reservation, and the second finds the
         row already advanced and refuses instead of clobbering the winner's token or terminal
         outcome. Exactly one running reservation and one launch token survive the race."""
-        payload = self._encode(record)
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -256,10 +305,14 @@ class Store:
                     "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
                 if existing_row is not None:
                     existing = self._decode(existing_row[0])
-                    if existing.state != WAITING:
+                    if (existing.state != WAITING
+                            or existing.launch_token != expected_launch_token
+                            or (expected_revision is not None
+                                and existing.revision != expected_revision)):
                         # Reservation is a WAITING -> RUNNING compare-and-set. Any other durable
-                        # state means another instance already advanced this identity; never
-                        # overwrite its token, completion, or hold with a stale waiting view.
+                        # state or token means another instance already advanced this identity;
+                        # never overwrite newer attempts, completion, or hold state with a stale
+                        # waiting generation.
                         self._conn.execute("ROLLBACK")
                         return False
                 if limits is not None:
@@ -287,14 +340,8 @@ class Store:
                 if int(row[0]) + record.demand > budget:
                     self._conn.execute("ROLLBACK")
                     return False
-                self._conn.execute(
-                    "INSERT INTO records (identity, pool, state, demand, data)"
-                    " VALUES (?, ?, ?, ?, ?)"
-                    " ON CONFLICT(identity) DO UPDATE SET"
-                    " pool=excluded.pool, state=excluded.state,"
-                    " demand=excluded.demand, data=excluded.data",
-                    (record.identity, record.pool, record.state, record.demand, payload),
-                )
+                record.revision = (existing.revision + 1 if existing_row is not None else 1)
+                self._write(record)
                 self._conn.execute("COMMIT")
                 return True
             except sqlite3.DatabaseError as e:
@@ -338,6 +385,7 @@ class Store:
                 record.start_fact = STARTED
                 record.family = str(pid)
                 record.process_alive = True
+                record.revision += 1
                 self._write(record)
                 self._conn.execute("COMMIT")
                 return True
@@ -364,6 +412,7 @@ class Store:
                     self._conn.execute("ROLLBACK")
                     return (STARTED, record.family)
                 record.launch_token = uuid4().hex  # any late child write can no longer match
+                record.revision += 1
                 self._write(record)
                 self._conn.execute("COMMIT")
                 return (NOT_STARTED, None)

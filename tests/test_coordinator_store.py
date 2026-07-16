@@ -108,6 +108,21 @@ def test_reserve_never_overwrites_a_terminal_same_identity(tmp_path):
     store.close()
 
 
+def test_reserve_requires_the_loaded_waiting_token_generation(tmp_path):
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    store.upsert(Record("R", "review", "claude", 1, state="waiting",
+                        launch_token="newer", attempts=1, eligible_at=100))
+
+    stale = Record("R", "review", "claude", 1, state="running",
+                   launch_token="stale", attempts=0)
+    assert store.reserve(stale, budget=5, expected_launch_token=None) is False
+    durable = store.record_of("R")
+    assert durable.attempts == 1 and durable.launch_token == "newer"
+    assert durable.eligible_at == 100
+    store.close()
+
+
 def test_two_processes_racing_one_waiting_record_yield_one_reservation(tmp_path):
     """Two coordinator instances that both loaded the same waiting record and each flipped it to
     running with its own fresh launch token race to reserve. Exactly one wins; the surviving

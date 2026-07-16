@@ -35,11 +35,13 @@ def test_ready_missing_effort_defaults_medium():
         '{"route": "ready", "title": "t", "body": "b", "complexity": "deep"}').effort is Effort.MEDIUM
 
 
-def test_ready_without_a_title_holds():
-    # A ready build MUST carry a rewritten title; a titleless ready is malformed, not a build.
-    assert parse_intake('{"route": "ready", "body": "brief", "complexity": "deep"}').parsed is False
+def test_ready_without_a_title_preserves_the_ready_route():
+    # Title rewriting is optional routing output; coordinated projection preserves the durable
+    # filed title when it is omitted.
+    titleless = parse_intake('{"route": "ready", "body": "brief", "complexity": "deep"}')
+    assert titleless.parsed is True and titleless.route is IntakeRoute.READY
     assert parse_intake(
-        '{"route": "ready", "title": "   ", "body": "brief"}').route is IntakeRoute.GRILL
+        '{"route": "ready", "title": "   ", "body": "brief"}').route is IntakeRoute.READY
 
 
 def test_grill_and_mockup_routes():
@@ -239,6 +241,12 @@ class _GhRecorder:
                 return c[c.index("--body") + 1]
         return None
 
+    def _edit_title(self):
+        for c in self.calls:
+            if "edit" in c and "--title" in c:
+                return c[c.index("--title") + 1]
+        return None
+
     def _comment(self):
         for c in self.calls:
             if "comment" in c and "--body" in c:
@@ -262,6 +270,19 @@ def test_apply_intake_ready_writes_brief_to_body_and_a_short_comment(monkeypatch
     assert comment is not None and INTAKE_MARK in comment
     assert "the full grounded brief" not in comment          # not the wall
     assert comment.count("\n") <= 8                            # short
+
+
+def test_coordinated_ready_projects_title_and_original_from_durable_source(monkeypatch):
+    rec = _GhRecorder(current_body="later mutable body")
+    monkeypatch.setattr(intake_mod, "_run", rec)
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "",
+                          Complexity.DEEP, Effort.MEDIUM)
+
+    apply_intake("owner/repo", 16, "later mutable title", [], result,
+                 "Filed title", "original as filed")
+
+    assert rec._edit_title() == "Filed title"
+    assert rec._edit_body() == compose_ready_body(result.body, "original as filed")
 
 
 def test_intake_result_must_be_visible_before_its_worktree_is_disposable(monkeypatch):
@@ -327,6 +348,25 @@ def test_ready_durability_requires_the_exact_composed_body_not_a_substring(monke
     monkeypatch.setattr(intake_mod, "_run",
                         lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(canonical)))
     assert intake_result_is_durable("owner/repo", 5, result) is True
+
+
+def test_ready_durability_binds_original_body_and_title_to_the_submission(monkeypatch):
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "",
+                          Complexity.DEEP, Effort.MEDIUM)
+    base = {"title": "Filed title",
+            "labels": [{"name": name} for name in intake_labels(result)],
+            "comments": [{"body": intake_mod._READY_COMMENT}]}
+    wrong_original = dict(base, body=compose_ready_body(result.body, "different text"))
+    monkeypatch.setattr(intake_mod, "_run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=json.dumps(wrong_original)))
+    assert intake_result_is_durable(
+        "owner/repo", 5, result, source_title="Filed title", source_body="as filed") is False
+
+    exact = dict(base, body=compose_ready_body(result.body, "as filed"))
+    monkeypatch.setattr(intake_mod, "_run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=json.dumps(exact)))
+    assert intake_result_is_durable(
+        "owner/repo", 5, result, source_title="Filed title", source_body="as filed") is True
 
 
 def test_apply_intake_ready_defers_and_preserves_original_when_body_unreadable(monkeypatch):
