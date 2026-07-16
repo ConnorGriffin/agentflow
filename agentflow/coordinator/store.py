@@ -286,10 +286,14 @@ class Store:
                     if root_row is None:
                         raise StoreUnavailable("cannot register descendant: root is missing")
                     root = self._decode(root_row[0])
-                    if root.state != RUNNING or root.retired or root.hold_pending:
+                    already_registered = (
+                        successor_row is not None
+                        and successor.identity in root.descendants)
+                    if (not already_registered
+                            and (root.state != RUNNING or root.retired or root.hold_pending)):
                         raise StoreUnavailable(
                             "cannot register descendant: root is not actively running")
-                    if successor.identity not in root.descendants:
+                    if not already_registered:
                         root.descendants.add(successor.identity)
                         root.revision += 1
                         self._write(root)

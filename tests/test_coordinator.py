@@ -459,6 +459,28 @@ def test_crash_after_root_completion_commit_cannot_orphan_descendant(make_coord)
     assert durable_child.claim is False
 
 
+def test_existing_descendant_submission_is_idempotent_after_root_completion(make_coord):
+    """A lost submit response may be retried after the root becomes terminal. The exact existing
+    child is returned without reopening it; only a genuinely new late child is rejected."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    root = coord.submit_stage(Submission(
+        repo="o/r", subject="idempotent-root", stage="review", pool="claude"))
+    coord.cycle("claude")
+    submission = Submission(
+        repo="o/r", subject="idempotent-child", stage="respond", pool="claude",
+        descendant_of=root)
+    child = coord.submit_stage(submission)
+    fake.end(root, success=True)
+    coord.cycle("claude")
+    assert record_of(coord, child).retired is True
+
+    restarted = make_coord(fake)
+    assert restarted.submit_stage(submission) == child
+    durable = record_of(restarted, child)
+    assert durable.retired is True and durable.claim is False
+
+
 def test_schema_v1_record_without_revision_advances_through_public_cycle(make_coord):
     """A pre-revision schema-v1 payload decodes at generation zero and can be admitted by the
     public coordinator seam after an upgrade."""
