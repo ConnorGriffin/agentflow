@@ -112,9 +112,9 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
             _log(f"{cfg.repo}: cycle error: {type(e).__name__}: {e}")
 
 
-def _reclaim(cfg: RepoConfig, _log=None) -> str:
+def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False) -> str:
     from agentflow import coordinated_build
-    builds = reclaim_claims(cfg, coordinated_build.owned_issues(cfg))
+    builds = 0 if preserve_builds else reclaim_claims(cfg, coordinated_build.owned_issues(cfg))
     triaging = reclaim_triage_claims(cfg)
     parts = []
     if builds:
@@ -133,8 +133,22 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
     dispatch every repo's ready work CONCURRENTLY (bounded by the governor + activity ceiling),
     then re-rebase merge survivors SERIALLY — merges never overlap (ADR 0009). The two serial
     passes bookend the concurrent one; each isolates per-repo errors via `cycle`."""
-    cycle(repos, run=_reclaim, _log=_log)
-    dispatch.run_cycle(repos, _log=_log)
+    from agentflow.coordinator import MODE_COORDINATED, Rollout
+
+    rollout = Rollout(log=_log)
+    try:
+        preserve_builds = rollout.mode == MODE_COORDINATED
+    except Exception as e:  # noqa: BLE001 — ambiguous intent must preserve possible ownership
+        preserve_builds = True
+        _log(f"rollout: state unreadable before reclaim ({type(e).__name__}: {e}) — "
+             "preserving Build claims")
+    cycle(
+        repos,
+        run=lambda cfg, _log=None: _reclaim(
+            cfg, _log=_log, preserve_builds=preserve_builds),
+        _log=_log,
+    )
+    dispatch.run_cycle(repos, rollout=rollout, _log=_log)
     cycle(repos, run=_recheck, _log=_log)
 
 
