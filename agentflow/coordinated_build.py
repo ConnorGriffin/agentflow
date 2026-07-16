@@ -719,8 +719,11 @@ def _reply_ready(record, obs) -> bool:
     - the reply: the PR's latest comment now carries our marker, so the maintainer's question is no
       longer the last word — a reply we posted (told apart by the marker, never the maintainer's); and
     - verified pushed: the retained PR-branch worktree holds no commit absent from the pushed remote
-      branch head. A responder that committed a small fix but never pushed it left the remote branch
-      unchanged, so the stage stays incomplete and continues on that same retained worktree.
+      branch head *and* no uncommitted change at all. A responder that committed a small fix but
+      never pushed it left the remote branch unchanged; one that edited a file but never committed it
+      (a modified tracked file, a staged change, or an untracked new file) never turned that change
+      into a pushed commit either. Both leave the stage incomplete so it continues on that same
+      retained worktree.
 
     A PR whose latest comment is still the maintainer's posted no reply and stays incomplete. Live
     orchestration; exercised with faked GitHub/worktree reads in ``tests/test_respond_tracer.py``."""
@@ -745,6 +748,13 @@ def _reply_ready(record, obs) -> bool:
         _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
         ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
         if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
+            return False
+        # An unpushed change need not be a local commit: a responder can post the reply and leave
+        # the requested edit uncommitted in the worktree. Any dirty tracked file, staged change, or
+        # untracked new file is such a change that never became a pushed commit, so the stage is not
+        # complete. A dirty (or unreadable) worktree keeps it incomplete to resume on that worktree.
+        status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
+        if status.returncode != 0 or status.stdout.strip():
             return False
     return True
 

@@ -223,6 +223,62 @@ def test_reply_ready_completes_only_once_our_marked_reply_has_the_last_word(monk
     assert coordinated_build._reply_ready(rec, None) is True
 
 
+def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0):
+    """Wire ``_reply_ready`` against a real retained worktree that exists on disk (so the pushed-
+    change reads run) with our marked reply already the last word. ``ahead``/``status`` fake the
+    ``git rev-list`` and ``git status --porcelain`` reads, and the record is returned so the caller
+    just asserts the outcome."""
+    from agentflow.gate import PR_MARK
+    wt = tmp_path / ".agentflow/worktrees/claude/issue-7-fix"
+    wt.mkdir(parents=True)
+    rec = Record(identity="o/r|7|respond|cid", stage="respond", pool="claude", demand=3,
+                 repo="o/r", subject="7", lineage="claude", source=str(wt))
+
+    def _run(cmd, *a, **k):
+        if "pr" in cmd and "list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"number": 42, "headRefOid": "h"}]))
+        if "rev-list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=ahead)
+        if "status" in cmd:
+            return SimpleNamespace(returncode=status_rc, stdout=status)
+        return SimpleNamespace(returncode=0, stdout="")               # fetch and anything else
+
+    monkeypatch.setattr("agentflow.loop._run", _run)
+    monkeypatch.setattr("agentflow.loop._pr_comments",
+                        lambda repo, pr: [{"body": f"{PR_MARK} reply from the build agent: done"}])
+    return rec
+
+
+def test_reply_ready_rejects_an_uncommitted_tracked_edit(monkeypatch, tmp_path):
+    # The reply is posted and no commit is ahead of the remote head, but the requested edit is left
+    # modified-but-uncommitted in the worktree: that change never became a pushed commit, so the
+    # stage must stay incomplete rather than retire over unpushed work.
+    rec = _reply_read(monkeypatch, tmp_path, ahead="0", status=" M agentflow/copy.py\n")
+    assert coordinated_build._reply_ready(rec, None) is False
+
+
+def test_reply_ready_rejects_an_untracked_new_file(monkeypatch, tmp_path):
+    # The reply is posted and nothing is ahead of the remote head, but the responder left an
+    # untracked new file — an uncommitted, unpushed change all the same — so the stage stays open.
+    rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="?? agentflow/new_helper.py\n")
+    assert coordinated_build._reply_ready(rec, None) is False
+
+
+def test_reply_ready_treats_an_unreadable_worktree_as_incomplete(monkeypatch, tmp_path):
+    # A failed status read cannot prove the worktree is clean, so completion is withheld.
+    rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="", status_rc=1)
+    assert coordinated_build._reply_ready(rec, None) is False
+
+
+def test_reply_ready_completes_on_a_posted_reply_with_a_clean_pushed_worktree(monkeypatch, tmp_path):
+    # Reply posted, nothing ahead of the remote head, and a clean worktree: the change is genuinely
+    # pushed, so the stage completes — and completion is a stable read (restart idempotence: a
+    # repeat over the same durable state re-proves the same result without posting a second reply).
+    rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="")
+    assert coordinated_build._reply_ready(rec, None) is True
+    assert coordinated_build._reply_ready(rec, None) is True
+
+
 def test_settle_respond_releases_the_building_claim_and_proves_it(monkeypatch):
     rec = _respond_record()
     labels = ["agentflow:building"]
