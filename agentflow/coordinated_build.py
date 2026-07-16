@@ -1,20 +1,23 @@
-"""Build and Review behind the session coordinator, wired into the daemon's dispatch (issues
-#103, #104).
+"""Build, Review, and Revise behind the session coordinator, wired into the daemon's dispatch
+(issues #103, #104, #105).
 
 This is the seam that turns the rollout phase into action. In **legacy** phase the daemon's
-existing build path is untouched; in **draining** phase no new provider stage of either kind
+existing build path is untouched; in **draining** phase no new provider stage of any kind
 launches, but the coordinator keeps reconciling the records that still own work; in
 **coordinated** phase a ready issue becomes exactly one Build submission, a completed Build opens
-exactly one Review bound to the PR head SHA (transferring the claim before Build retires), the
-coordinator owns their continuation, admission, and completion, and the live board becomes a
-projection of its running records.
+exactly one Review bound to the PR head SHA, a blocking Review opens exactly one Revise on the
+builder's retained branch, and a completed Revise opens exactly one new Review bound to the new
+head SHA — each transferring the change claim before the prior record retires, so there is no
+ownership gap. The coordinator owns their continuation, admission, and completion, and the live
+board becomes a projection of its running records.
 
-The pure parts — mapping a ready issue to a Build submission and a completed Build to a Review
-submission, deriving the phase without disturbing a never-created store, spotting the
-current-format sessions a drain must wait on, and projecting running records — are exercised
-directly. The production factory wires the coordinator's stage adapters to the real GitHub PR
-check, verdict parse, and worktrees, following the same live-orchestration path the legacy
-builder and reviewer use (not unit-tested, ADR 0020).
+The pure parts — mapping a ready issue to a Build submission, a completed Build to a Review, a
+blocking Review to a Revise, and a completed Revise back to a Review; the single-round product
+policy that keeps continuation attempts from expanding it; deriving the phase without disturbing a
+never-created store; spotting the current-format sessions a drain must wait on; and projecting
+running records — are exercised directly. The production factory wires the coordinator's stage
+adapters to the real GitHub PR check, verdict parse, branch head, and worktrees, following the same
+live-orchestration path the legacy builder and reviewer use (not unit-tested, ADR 0020).
 """
 
 from __future__ import annotations
@@ -27,9 +30,11 @@ import time
 from pathlib import Path
 
 from agentflow.coordinator import (BuildStageAdapter, Coordinator, MODE_COORDINATED, Phase,
-                                   ReviewStageAdapter, Rollout, StageRouter, tracer)
+                                   ReviewStageAdapter, ReviseStageAdapter, Rollout, StageRouter,
+                                   tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
 from agentflow.coordinator.store import default_store_path
+from agentflow.gate import MAX_REVISES
 
 BUILD_POOLS = ("claude", "codex")
 
@@ -98,6 +103,62 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=brief, builder_lineage=build_record.pool,
         transfer_from=build_record.identity)
+
+
+def _revise_builder_source(review_record):
+    """The ``(build_worktree, pr_number)`` a Revise adopts from a blocking Review record. The
+    revise reuses the *builder's* retained branch/worktree — ``.../<builder_lineage>/issue-<subject>
+    -<slug>`` — which the review source (``.../<tool>-review/pr-<pr>-<slug>``) and the record's
+    builder lineage together recover, so no second durable field is needed. ``None`` if unreadable."""
+    if (not review_record.source or "/.agentflow/worktrees/" not in review_record.source
+            or not review_record.builder_lineage):
+        return None
+    workdir, tail = review_record.source.split("/.agentflow/worktrees/", 1)
+    parts = tail.split("/")
+    if len(parts) != 2 or not parts[0].endswith("-review"):
+        return None
+    match = re.match(r"pr-(\d+)-(.+)$", parts[1])
+    if match is None:
+        return None
+    pr_number, slug = int(match.group(1)), match.group(2)
+    build_worktree = (f"{workdir}/.agentflow/worktrees/{review_record.builder_lineage}/"
+                      f"issue-{review_record.subject}-{slug}")
+    return build_worktree, pr_number
+
+
+def revise_submission(review_record, complexity, findings="", *, surfaces=""):
+    """Translate a blocking Review into one Revise stage submission — the minimal facts the
+    coordinator needs (ADR 0030). The revise adopts the original builder's retained PR branch and
+    worktree, stays pinned to the builder's tool lineage and its original complexity, is bound to
+    the reviewed head SHA it must supersede (its immutable target — so a later blocking review at a
+    new head SHA is a genuinely fresh revise stage), and assumes the Review's change claim. Pure:
+    the mapping is the test surface (ADR 0020). Returns ``None`` if the builder worktree cannot be
+    reconstructed or the reviewed SHA is missing."""
+    from agentflow.coordinator import Submission
+    from agentflow.loop import REVISE_PROMPT
+    facts = _revise_builder_source(review_record)
+    if facts is None or not review_record.target:
+        return None
+    build_worktree, pr_number = facts
+    brief = REVISE_PROMPT.format(
+        n=pr_number, findings=findings or "- (see review)",
+        surfaces=surfaces or "any user-facing surface")
+    return Submission(
+        repo=review_record.repo, subject=review_record.subject, stage="revise",
+        target=review_record.target, pool=review_record.builder_lineage, complexity=complexity,
+        source=build_worktree, claim=True, input_ptr=brief,
+        builder_lineage=review_record.builder_lineage, transfer_from=review_record.identity)
+
+
+def revise_round_budget_remains(records, repo, subject) -> bool:
+    """Whether the single auto-revise product round (ADR 0018) is still available for this issue —
+    at most ``MAX_REVISES`` *logical* Revise records exist for it, regardless of how many
+    continuation attempts each one used. This keeps the per-stage continuation budget separate from
+    the product loop: continuation attempts never reset or expand the one-round policy. Pure — the
+    test surface (ADR 0020)."""
+    rounds = sum(1 for r in records
+                 if r.stage == "revise" and r.repo == repo and str(r.subject) == str(subject))
+    return rounds < MAX_REVISES
 
 
 def legacy_evidence(live_sessions, coordinator_sources) -> tuple[str, ...]:
@@ -228,17 +289,20 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's one coordinator for Build and Review (issues #103, #104). Its Build adapter
-    verifies the real PR outcome and reuses the retained worktree; its Review adapter verifies a
-    durable verdict for the exact PR head SHA and recreates the read-only checkout; and its
-    admission gate enables Build and Review alone, so every other logical stage stays queued. One
-    :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    """The daemon's one coordinator for Build, Review, and Revise (issues #103, #104, #105). Its
+    Build adapter verifies the real PR outcome and reuses the retained worktree; its Review adapter
+    verifies a durable verdict for the exact PR head SHA and recreates the read-only checkout; its
+    Revise adapter verifies a pushed revision on the same branch and reuses that retained worktree;
+    and its admission gate enables Build, Review, and Revise alone, so every other logical stage
+    stays queued. One :class:`StageRouter` dispatches each adapter call on the record's stage."""
     build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
     review = ReviewStageAdapter(
         verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr)
-    router = StageRouter({"build": build, "review": review})
-    return Coordinator(adapter=router, gate=tracer.build_and_review_gate,
+    revise = ReviseStageAdapter(
+        revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
+    router = StageRouter({"build": build, "review": review, "revise": revise})
+    return Coordinator(adapter=router, gate=tracer.build_review_revise_gate,
                        log=_log or (lambda _line: None))
 
 
@@ -445,6 +509,30 @@ def _park_pr(record) -> str | None:
     return url
 
 
+# --- Revise stage: pushed-revision outcome on the retained branch (live; ADR 0020) ------
+
+def _revision_ready(record, obs) -> bool:
+    """The Revise outcome is a verified pushed revision on the same PR branch: its head SHA has
+    moved past the reviewed SHA the revise was opened against (``record.target``), read from GitHub
+    independently of how the reviser exited (ADR 0028). A branch whose head still equals the
+    reviewed SHA pushed nothing and stays incomplete. Live orchestration, not unit-tested (ADR
+    0020)."""
+    from agentflow.loop import _run
+    parsed = _source_facts(record)
+    if parsed is None or not record.target:
+        return False
+    _workdir, branch, _wt = parsed
+    r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch, "--state", "open",
+              "--json", "headRefOid", "--limit", "1"])
+    if r.returncode != 0:
+        raise RuntimeError(f"cannot verify Revise outcome for {record.repo}:{branch}")
+    prs = json.loads(r.stdout or "[]")
+    if not prs:
+        return False
+    head = prs[0].get("headRefOid", "")
+    return bool(head) and head != record.target
+
+
 def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> None:
     """A completed Build opens exactly one waiting Review for the exact PR head SHA and transfers
     the change claim before the Build record retires — no ownership gap (ADR 0028). Submission is
@@ -474,18 +562,104 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
         coord.submit_stage(submission)
 
 
+def _review_verdict(review):
+    """Re-parse the completed Review's durable verdict for its exact reviewed SHA — read from the
+    reviewer's captured final message, never a file in the PR tree (ADR 0018/0028). Live, not
+    unit-tested (ADR 0020); the parse itself is covered in the reviewer tests."""
+    from agentflow.coordinator.providers import ProviderObserver
+    from agentflow.reviewer import parse_verdict
+    obs = ProviderObserver().observe(review)
+    return parse_verdict(obs.final_message or "", expected_sha=review.target)
+
+
+def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) -> None:
+    """A completed Review whose verdict blocks opens exactly one waiting Revise on the builder's
+    retained branch/worktree and transfers the change claim before the Review record retires — no
+    ownership gap (ADR 0028). A clean verdict is the merge path, not a revise. The single
+    auto-revise product round (ADR 0018) is unchanged: once it is used, a further blocking review
+    parks on its own exhaustion rather than looping. Submission is idempotent on the revise identity
+    (repo, subject, revise, reviewed SHA), so a repeat or restart never opens a second revise. Live,
+    not unit-tested (ADR 0020) — its mapping is covered through :func:`revise_submission`."""
+    from agentflow.loop import _run, complexity_from_labels
+    records = {record.identity: record for record in tracer.load_records()}
+    review = records.get(review_identity)
+    if review is None or review.stage != "review" or not review.target:
+        return
+    if not revise_round_budget_remains(records.values(), review.repo, review.subject):
+        return  # the one auto-revise round is spent; the merge/park policy owns what happens next
+    verdict = _review_verdict(review)
+    if verdict.clean or not verdict.blocking:
+        return  # a clean (or non-blocking) verdict is not a revise trigger
+    facts = _revise_builder_source(review)
+    if facts is None:
+        return
+    _build_worktree, _pr = facts
+    viewed = _run(["gh", "issue", "view", str(review.subject), "--repo", review.repo,
+                   "--json", "labels"])
+    if viewed.returncode != 0:
+        return
+    try:
+        labels = [lbl.get("name", "") for lbl in json.loads(viewed.stdout or "{}").get("labels", [])]
+    except json.JSONDecodeError:
+        return
+    complexity = complexity_from_labels(labels)
+    if complexity is None:
+        return
+    findings = "\n".join(f"- {f.summary}" for f in verdict.blocking)
+    submission = revise_submission(review, complexity.value, findings)
+    if submission is not None:
+        coord.submit_stage(submission)
+
+
+def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -> None:
+    """A completed Revise opens exactly one waiting Review bound to the *new* PR head SHA and
+    transfers the change claim before the Revise record retires — no ownership gap (ADR 0028). The
+    new head SHA is a genuinely new review stage with a fresh review budget; the prior SHA's review
+    cannot be reused. Submission is idempotent on the new review identity, so a repeat or restart
+    never opens a second review. Live, not unit-tested (ADR 0020) — its mapping is covered through
+    :func:`review_submission`."""
+    from agentflow.loop import _run
+    records = {record.identity: record for record in tracer.load_records()}
+    revise = records.get(revise_identity)
+    if revise is None or revise.stage != "revise":
+        return
+    facts = _source_facts(revise)  # revise reuses the builder worktree, so this parses its branch
+    if facts is None:
+        return
+    _workdir, branch, _wt = facts
+    listed = _run(["gh", "pr", "list", "--repo", revise.repo, "--head", branch, "--state", "open",
+                   "--json", "number,headRefOid", "--limit", "1"])
+    if listed.returncode != 0:
+        return
+    prs = json.loads(listed.stdout or "[]")
+    if not prs:
+        return
+    reviewer_tool = "codex" if revise.builder_lineage == "claude" else "claude"
+    submission = review_submission(
+        revise, prs[0].get("headRefOid", ""), reviewer_tool, prs[0].get("number"))
+    if submission is not None:
+        coord.submit_stage(submission)
+
+
 def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> list:
-    """Reconcile every Build/Review pool and republish the live board as a projection of the
-    running records (ADR 0030). A completed Build opens its Review before the projection, so the
-    claim transfers with no ownership gap. Returns the terminal outcomes settled this cycle."""
+    """Reconcile every Build/Review/Revise pool and republish the live board as a projection of the
+    running records (ADR 0030). A completed Build opens its Review, a blocking Review opens its
+    Revise, and a completed Revise opens its next Review — each before the projection, so the claim
+    transfers with no ownership gap. Returns the terminal outcomes settled this cycle."""
     from agentflow import live
     outcomes = []
     now = int(time.time())
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
     for outcome in outcomes:
-        if outcome.stage == "build" and outcome.status == "completed":
+        if outcome.status != "completed":
+            continue
+        if outcome.stage == "build":
             _open_review_on_completed_build(coord, outcome.identity)
+        elif outcome.stage == "review":
+            _open_revise_on_blocking_review(coord, outcome.identity)
+        elif outcome.stage == "revise":
+            _open_review_on_completed_revise(coord, outcome.identity)
     records = tracer.load_records()
     owned = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     live.replace_projection(
