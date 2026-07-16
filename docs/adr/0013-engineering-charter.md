@@ -1,6 +1,6 @@
 # ADR 0013 — Engineering standards: one canonical charter, both tools, enforced at review
 
-- Status: Accepted
+- Status: Superseded by ADR 0032
 - Date: 2026-07-09
 
 ## Context

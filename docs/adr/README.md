@@ -86,3 +86,6 @@ then Context / Decision / Alternatives / Consequences.
   durable legacy→draining→coordinated rollout: activation waits for a fleet-wide legacy
   drain and refuses ambiguous state, Build is the only enabled stage, and rollback is a
   drain that never converts a coordinator record back into a legacy retry.
+- [0032](0032-shared-global-agent-instructions.md) — Claude and Codex share one
+  machine-global instruction file; the engineering charter remains canonical and
+  referenced by both.

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
-# enroll-standards.sh — wire the agentflow engineering charter into BOTH tools
-# (Claude + Codex) with zero drift. See docs/adr/0013-engineering-charter.md.
+# enroll-standards.sh — wire shared global instructions and the engineering
+# charter into BOTH tools with zero drift. See ADRs 0013 and 0032.
 #
-# The charter is ONE canonical file; both tools read the same bytes:
-#   - Claude global (~/.claude/CLAUDE.md, itself a symlink into dotfiles) @imports it
-#   - Codex  global (~/.codex/AGENTS.md) is a symlink to it
-#   - per repo:      AGENTS.md is canonical, CLAUDE.md is a symlink to AGENTS.md
+# Each concern has one canonical file:
+#   - machine global: dotfiles/agents/AGENTS.md is canonical; both tools symlink it
+#   - engineering charter: both tools follow the global's charter reference
+#   - per repo: AGENTS.md is canonical; CLAUDE.md symlinks to it
 #
 # SAFE BY DEFAULT: prints a plan and changes nothing unless --apply is passed.
 # Never clobbers a non-empty file — backs it up to <file>.pre-agentflow first.
@@ -18,16 +18,18 @@
 #   enroll-standards.sh <repo-dir>         # dry-run: show a repo's enroll plan
 #   enroll-standards.sh --apply <repo-dir> # enroll a repo (AGENTS.md + CLAUDE.md symlink)
 #
-# VERIFY before --apply (unproven assumptions, flagged honestly):
-#   - that Claude honors an `@<path>` import line in dotfiles/claude/CLAUDE.md
-#   - that Codex reads a *symlinked* ~/.codex/AGENTS.md as its global instructions
-# Both are cheap to confirm with a throwaway session; do that first.
+# Verified compatibility facts:
+#   - that Claude honors an `@<path>` import line in the shared global file
+#   - that Codex reads a *symlinked* ~/.codex/AGENTS.md and follows referenced docs
+# Codex reference traversal was smoke-tested in an ephemeral read-only session.
 
 set -euo pipefail
 
 CHARTER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/standards/CHARTER.md"
+SHARED_GLOBAL="$HOME/Code/ConnorGriffin/dotfiles/agents/AGENTS.md"
 CLAUDE_GLOBAL="$HOME/.claude/CLAUDE.md"
 CODEX_GLOBAL="$HOME/.codex/AGENTS.md"
+RETIRED_CLAUDE_GLOBAL="$HOME/Code/ConnorGriffin/dotfiles/claude/CLAUDE.md"
 IMPORT_LINE="@$CHARTER"
 
 APPLY=0; REPO=""
@@ -53,30 +55,43 @@ backup() { # back up a real (non-symlink, non-empty) file once
     && do_or_show "back up $f -> $f.pre-agentflow" cp -p "$f" "$f.pre-agentflow" || true
 }
 
-wire_global() {
-  echo "Global charter wiring — canonical: $CHARTER"
+wire_global_link() { # <tool> <target> <retired-link-source>
+  local tool="$1" target="$2" retired_src="$3"
 
-  # Claude: append the @import to the (dotfiles-backed) global, if absent.
-  local target="$CLAUDE_GLOBAL"
-  [ -L "$target" ] && target="$(readlink "$target")"  # edit the real dotfiles file
-  if [ -f "$target" ] && grep -qF "$IMPORT_LINE" "$target"; then
-    note "ok:   Claude global already imports the charter ($target)"
-  else
+  if [ -L "$target" ] && [ "$(readlink "$target")" = "$SHARED_GLOBAL" ]; then
+    note "ok:   $tool global already symlinks the shared global"
+  elif [ -L "$target" ] && [ "$(readlink "$target")" = "$retired_src" ]; then
+    do_or_show "migrate $tool global -> shared global" ln -sfn "$SHARED_GLOBAL" "$target"
+  elif [ -e "$target" ] && [ -s "$target" ]; then
     backup "$target"
-    do_or_show "append charter @import to $target" \
-      bash -c 'printf "\n# --- agentflow engineering charter (managed) ---\n%s\n" "$1" >> "$2"' _ "$IMPORT_LINE" "$target"
+    note "WARN: $target is non-empty — review $target.pre-agentflow; refusing to clobber it."
+  elif [ -L "$target" ]; then
+    note "WARN: $target points to an unknown source — refusing to clobber it."
+  else
+    do_or_show "create $tool config directory" mkdir -p "$(dirname "$target")"
+    do_or_show "symlink $tool global -> shared global" ln -sfn "$SHARED_GLOBAL" "$target"
+  fi
+}
+
+wire_global() {
+  echo "Global instruction wiring — canonical: $SHARED_GLOBAL"
+
+  if [ ! -f "$SHARED_GLOBAL" ]; then
+    note "ERROR: shared global is missing: $SHARED_GLOBAL"
+    return 1
   fi
 
-  # Codex: ~/.codex/AGENTS.md should be a symlink to the charter.
-  if [ -L "$CODEX_GLOBAL" ] && [ "$(readlink "$CODEX_GLOBAL")" = "$CHARTER" ]; then
-    note "ok:   Codex global already symlinks the charter"
-  elif [ -e "$CODEX_GLOBAL" ] && [ -s "$CODEX_GLOBAL" ] && [ ! -L "$CODEX_GLOBAL" ]; then
-    backup "$CODEX_GLOBAL"
-    note "WARN: $CODEX_GLOBAL is a non-empty real file — review $CODEX_GLOBAL.pre-agentflow,"
-    note "      then re-run; refusing to clobber hand-written Codex global instructions."
+  # Keep the charter canonical and referenced by the shared global.
+  if grep -qF "$IMPORT_LINE" "$SHARED_GLOBAL"; then
+    note "ok:   shared global already imports the charter ($SHARED_GLOBAL)"
   else
-    do_or_show "symlink $CODEX_GLOBAL -> charter" ln -sfn "$CHARTER" "$CODEX_GLOBAL"
+    backup "$SHARED_GLOBAL"
+    do_or_show "append charter @import to $SHARED_GLOBAL" \
+      bash -c 'printf "\n# --- agentflow engineering charter (managed) ---\n%s\n" "$1" >> "$2"' _ "$IMPORT_LINE" "$SHARED_GLOBAL"
   fi
+
+  wire_global_link "Claude" "$CLAUDE_GLOBAL" "$RETIRED_CLAUDE_GLOBAL"
+  wire_global_link "Codex" "$CODEX_GLOBAL" "$CHARTER"
 }
 
 enroll_repo() { # <dir>
