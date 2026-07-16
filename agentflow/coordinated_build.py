@@ -565,7 +565,8 @@ def _mockup_outcome_ready(record, obs) -> bool:
             or not local.stdout.strip() or local.stdout.strip() != remote.stdout.strip()
             or status.stdout.strip()):
         return False
-    changed = _run(["git", "-C", str(wt), "diff", "--name-only", "origin/main...HEAD"])
+    changed = _run(["git", "-C", str(wt), "diff", "--name-only", "--diff-filter=ACMRT",
+                    "origin/main...HEAD"])
     if changed.returncode != 0:
         return False
     paths = [path for path in changed.stdout.splitlines() if path.startswith("mockups/")]
@@ -678,15 +679,26 @@ def _hold_mockup(record) -> str | None:
                     and "MISSING-CONTEXT:" in comment.get("body", "")), None)
     proof = "<!-- agentflow-mockup-hold:" + hashlib.sha256(
         record.identity.encode()).hexdigest()[:24] + " -->"
+    explanation = ("Mockup exhausted its continuation budget before completing the visual round. "
+                   "The branch and local worktree are retained for a human to continue.")
     existing = marked or next((comment for comment in comments
                                if proof in comment.get("body", "")), None)
     if existing is None:
-        body = (f"{_MOCKUP_DISCLAIMER}\n{proof}\n\n"
-                "Mockup exhausted its continuation budget before completing the visual round. "
-                "The branch and local worktree are retained for a human to continue.")
+        body = f"{_MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}"
         posted = _run(["gh", "issue", "comment", str(number), "--repo", record.repo,
                        "--body", body])
         if posted.returncode != 0:
+            return None
+    elif missing is None and proof not in existing.get("body", ""):
+        comment_id = existing.get("id")
+        if not comment_id:
+            return None
+        body = f"{existing.get('body', '').rstrip()}\n\n{proof}\n\n{explanation}"
+        mutation = ("mutation($id:ID!,$body:String!){updateIssueComment("
+                    "input:{id:$id,body:$body}){issueComment{id}}}")
+        edited = _run(["gh", "api", "graphql", "-f", f"query={mutation}",
+                       "-f", f"id={comment_id}", "-f", f"body={body}"])
+        if edited.returncode != 0:
             return None
     _run(["gh", "issue", "edit", str(number), "--repo", record.repo,
           "--add-label", "agentflow:needs-mockup", "--remove-label", DRAWING])
@@ -700,9 +712,11 @@ def _hold_mockup(record) -> str | None:
         return None
     labels = {label.get("name") for label in state.get("labels", [])}
     final_comments = state.get("comments", [])
-    has_proof = any(MOCKUP_MARK in comment.get("body", "")
-                    or proof in comment.get("body", "")
-                    for comment in final_comments)
+    has_proof = any(
+        proof in comment.get("body", "")
+        or (MOCKUP_MARK in comment.get("body", "")
+            and "MISSING-CONTEXT:" in comment.get("body", ""))
+        for comment in final_comments)
     if DRAWING in labels or "agentflow:needs-mockup" not in labels or not has_proof:
         return None
     url = state.get("url") or f"https://github.com/{record.repo}/issues/{number}"

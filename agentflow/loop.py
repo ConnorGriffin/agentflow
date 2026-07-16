@@ -724,8 +724,9 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
             seen.add(issue["number"])
             deduped.append(issue)
     for issue in deduped:
-        if TRIAGING in {lbl["name"] for lbl in issue["labels"]}:
-            continue   # a re-intake already owns this held issue
+        claims = {lbl["name"] for lbl in issue["labels"]}
+        if TRIAGING in claims or DRAWING in claims:
+            continue   # Intake or the current Mockup round already owns this held issue
         cr = _run(["gh", "issue", "view", str(issue["number"]), "--repo", cfg.repo, "--json", "comments"])
         if cr.returncode != 0:
             continue

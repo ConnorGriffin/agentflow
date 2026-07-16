@@ -113,7 +113,7 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
 
 
 def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False,
-             preserve_triage: bool = False) -> str:
+             preserve_triage: bool = False, preserve_mockups: bool = False) -> str:
     from agentflow import coordinated_build
     # Each reclamation pass is scoped to the claim type it reconciles: code-change stages own
     # `building`, Intake owns `triaging`, and Mockup owns `drawing`. Passing the matching lane
@@ -123,8 +123,8 @@ def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False,
     triaging = (0 if preserve_triage
                 else reclaim_triage_claims(
                     cfg, coordinated_build.owned_issues(cfg, lane="triaging")))
-    drawings = reclaim_mockup_claims(
-        cfg, coordinated_build.owned_issues(cfg, lane="drawing"))
+    drawings = (0 if preserve_mockups else reclaim_mockup_claims(
+        cfg, coordinated_build.owned_issues(cfg, lane="drawing")))
     parts = []
     if builds:
         parts.append(f"reclaimed {builds} stale build claim(s)")
@@ -151,17 +151,19 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
         rollout_mode = rollout.mode
         preserve_builds = rollout_mode == MODE_COORDINATED
         preserve_triage = rollout_mode == MODE_COORDINATED
+        preserve_mockups = rollout_mode == MODE_COORDINATED
     except Exception as e:  # noqa: BLE001 — ambiguous intent must preserve possible ownership
         rollout_mode = None
         preserve_builds = True
         preserve_triage = True
+        preserve_mockups = True
         _log(f"rollout: state unreadable before reclaim ({type(e).__name__}: {e}) — "
-             "preserving Build and Intake claims")
+             "preserving Build, Intake, and Mockup claims")
     cycle(
         repos,
         run=lambda cfg, _log=None: _reclaim(
             cfg, _log=_log, preserve_builds=preserve_builds,
-            preserve_triage=preserve_triage),
+            preserve_triage=preserve_triage, preserve_mockups=preserve_mockups),
         _log=_log,
     )
     dispatch.run_cycle(repos, rollout=rollout, rollout_mode=rollout_mode, _log=_log)
