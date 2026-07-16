@@ -22,6 +22,7 @@ observer collaborators.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -146,7 +147,8 @@ class Coordinator:
             claim=submission.claim, builder_lineage=submission.builder_lineage,
             builder_complexity=submission.builder_complexity, round=submission.round,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
-            auto_merge_allowed=auto_merge, root=submission.descendant_of)
+            auto_merge_allowed=auto_merge, root=submission.descendant_of,
+            created_at=int(time.time()))
         with self._lock:
             existing = self._records.setdefault(identity, record)
             if existing is record:

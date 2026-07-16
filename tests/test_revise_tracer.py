@@ -33,6 +33,11 @@ from agentflow.reviewer import Finding, Verdict
 BUILD_WT = "/w/.agentflow/worktrees/claude/issue-7-x"
 REVIEW_WT = "/w/.agentflow/worktrees/codex-review/pr-42-x"
 
+# Comment timestamps around a revise record's durable submission time (``created_at``, stamped at
+# submission with the real clock): one that predates any record a test submits, one that postdates.
+BEFORE_ROUND = "2001-01-01T00:00:00Z"
+AFTER_ROUND = "2999-01-01T00:00:00Z"
+
 
 def _revise_sub(subject="9", *, pool="claude", target="sha-a", source=None):
     return Submission(repo="o/r", subject=subject, stage="revise", pool=pool, complexity="deep",
@@ -317,16 +322,89 @@ def test_revise_completes_on_durable_non_code_evidence_with_no_pushed_head(make_
 
     coord.cycle("claude")
     comments[0] = [{"body": "the maintainer drops a screenshot but with no agentflow marker "
-                            "![shot](https://user-images.githubusercontent.com/1/x.png)"}]
+                            "![shot](https://user-images.githubusercontent.com/1/x.png)",
+                    "createdAt": AFTER_ROUND}]
     fake.end(ident, cause=ProviderCause.PROCESS)          # head unchanged, only an UNMARKED image
     assert coord.cycle("claude") == []                    # not our proof → continues, does not park
     assert record_of(coord, ident).continuation
 
     # The reviser answers the finding with an attached screenshot on an agentflow-marked comment.
     comments[0] = [{"body": "> *agentflow: reply from the build agent.*\n\n"
-                            "![before/after](https://user-images.githubusercontent.com/1/x.png)"}]
+                            "![before/after](https://user-images.githubusercontent.com/1/x.png)",
+                    "createdAt": AFTER_ROUND}]
     fake.end(ident, cause=ProviderCause.PROCESS)          # a bad exit cannot undo a durable outcome
     assert [o.status for o in coord.cycle("claude")] == ["completed"]
+
+
+def test_evidence_predating_the_revise_round_cannot_complete_it(make_coord, monkeypatch):
+    """Issue #118: an agentflow-marked image comment that already existed before this revise round
+    opened (left during the Build or a prior round) is not this round's proof — the evidence must
+    have been created after the revise record's durable submission time. Only a marked evidence
+    comment postdating the round completes it."""
+    stale = {"body": "> *agentflow: reply from the build agent.*\n\n"
+                     "![old shot](https://user-images.githubusercontent.com/1/old.png)",
+             "createdAt": BEFORE_ROUND}
+    comments = [[stale]]                                  # the stale proof already sits on the PR
+    def _gh(cmd, *a, **k):                                # gh pr list → head is unchanged (== target)
+        if "list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                [{"headRefOid": "sha-a", "number": 42}]))
+        return SimpleNamespace(returncode=0, stdout="")
+    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+
+    fake = FakeSession()
+    revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
+                                worktree_ready=lambda r: True, observer=fake)
+    coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT, target="sha-a"))
+
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.PROCESS)          # only the pre-round evidence exists
+    assert coord.cycle("claude") == []                    # stale proof → continues, not completed
+    assert record_of(coord, ident).continuation
+
+    # The reviser answers THIS round: a marked evidence comment created after the round opened.
+    comments[0] = [stale,
+                   {"body": "> *agentflow: reply from the build agent.*\n\n"
+                            "![before/after](https://user-images.githubusercontent.com/1/new.png)",
+                    "createdAt": AFTER_ROUND}]
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+
+
+def test_restart_between_evidence_and_completion_still_completes_exactly_once(make_coord,
+                                                                              monkeypatch):
+    """Issue #118: the evidence anchor is the record's durable ``created_at`` and the proof is the
+    PR comment itself, so a daemon death after the evidence appeared but before the completion pass
+    changes nothing — the restarted coordinator reads both from the store and GitHub and completes
+    the revise exactly once, never a second time on re-observing the same comment."""
+    comments = [[{"body": "> *agentflow: reply from the build agent.*\n\n"
+                          "![before/after](https://user-images.githubusercontent.com/1/x.png)",
+                  "createdAt": AFTER_ROUND}]]
+    def _gh(cmd, *a, **k):                                # gh pr list → head is unchanged (== target)
+        if "list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                [{"headRefOid": "sha-a", "number": 42}]))
+        return SimpleNamespace(returncode=0, stdout="")
+    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+
+    fake = FakeSession()
+    revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
+                                worktree_ready=lambda r: True, observer=fake)
+    coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT, target="sha-a"))
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.PROCESS)          # evidence durable; daemon dies here
+
+    restarted = make_coord(fake, adapter=StageRouter({"revise": revise}))
+    assert [o.status for o in restarted.cycle("claude")] == ["completed"]
+    assert record_of(restarted, ident).state == "completed"
+
+    # Re-observing the same evidence — same pass or another restart — creates no second completion.
+    assert restarted.cycle("claude") == []
+    assert make_coord(fake, adapter=StageRouter({"revise": revise})).cycle("claude") == []
 
 
 def test_evidence_only_completion_opens_a_fresh_review_at_the_unchanged_head(make_coord,

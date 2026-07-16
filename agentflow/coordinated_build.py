@@ -554,12 +554,13 @@ def _revision_ready(record, obs) -> bool:
       commit never counts; or
     - the required non-code proof: a durable agentflow-marked PR comment carrying attached evidence
       (e.g. a before/after screenshot), the way a finding that asks to *show* something is answered
-      without a code change.
+      without a code change. The comment must be *created after this revise record was submitted*
+      (its durable ``created_at``, which survives a restart) — a marked screenshot left during the
+      Build or a prior revise round predates this round and cannot complete it (issue #118).
 
     A branch whose head still equals the reviewed SHA and carries no such evidence comment pushed
     and proved nothing, so it stays incomplete and continues. Live orchestration; exercised with
     faked GitHub reads in ``tests/test_revise_tracer.py``."""
-    from agentflow.gate import PR_MARK, has_image_evidence
     from agentflow.loop import _pr_comments, _run
     parsed = _source_facts(record)
     if parsed is None or not record.target:
@@ -585,12 +586,31 @@ def _revision_ready(record, obs) -> bool:
                  record.target, head]).returncode == 0:
             return True
     # No new code, but an evidence-only revision still completes on its durable non-code proof: an
-    # agentflow-authored PR comment (our marker, never the maintainer's) that attaches evidence.
+    # agentflow-authored PR comment (our marker, never the maintainer's) that attaches evidence
+    # and postdates this revise round.
     comments = _pr_comments(record.repo, prs[0].get("number"))
     if comments is None:
         return False
-    return any(PR_MARK in (c.get("body", "") or "") and has_image_evidence(c.get("body", "") or "")
-               for c in comments)
+    return any(_round_evidence(c, record.created_at) for c in comments)
+
+
+def _round_evidence(comment: dict, opened_at: int) -> bool:
+    """Whether one PR comment is the current revise round's durable non-code proof: agentflow-
+    marked, carrying attached image evidence, and created strictly after the revise record's
+    durable submission time — so evidence left before this round opened can never complete it,
+    however many times it is re-observed (issue #118). A record from before submission times were
+    stamped carries ``created_at == 0`` and keeps the unanchored behavior; a comment whose
+    ``createdAt`` is missing or unparseable cannot be proven to postdate the round, so it fails
+    closed."""
+    from agentflow.gate import PR_MARK, has_image_evidence
+    from agentflow.runner import _iso_to_epoch
+    body = comment.get("body", "") or ""
+    if PR_MARK not in body or not has_image_evidence(body):
+        return False
+    if not opened_at:
+        return True
+    created = _iso_to_epoch(comment.get("createdAt", "") or "")
+    return created is not None and created > opened_at
 
 
 def _open_pr_for_branch(repo: str, branch: str) -> dict | None:

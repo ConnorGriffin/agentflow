@@ -37,7 +37,8 @@ class Record:
     target: str | None = None  # immutable target (head SHA / comment id), part of the identity
     continuation: bool = False   # eligible ahead of cold work on its pool (ADR 0028 order)
     eligible_at: int = 0         # when a paused continuation may be admitted again
-    created_at: int = 0          # tie-breaker after eligible_at in the continuation queue
+    created_at: int = 0          # epoch of first submission: continuation-queue tie-breaker, and
+                                 # the anchor a Revise binds its non-code evidence to (issue #118)
     model: str = "opus"
     complexity: str = "deep"
     effort: str | None = None
