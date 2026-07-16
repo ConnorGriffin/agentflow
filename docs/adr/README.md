@@ -92,3 +92,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0033](0033-project-workspace-state-and-control-plane.md) — The daemon alone owns
   local Project/Conversation/Proposal state and projections; GitHub and default-branch
   git remain authoritative for published artifacts.
+- [0034](0034-methodology-session-orchestration.md) — A Conversation turn is a coordinated
+  logical stage behind the existing session coordinator; skills stage candidate artifacts in
+  isolated working state, the daemon adopts accepted turns into immutable Proposals, and only
+  an explicit operator approval + Publication crosses the promotion boundary.
