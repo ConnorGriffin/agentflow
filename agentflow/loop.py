@@ -20,7 +20,7 @@ from agentflow import live, ratchet
 from agentflow.balancer import pick_pair
 from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
                             maintainer_comment, maintainer_comment_id, park, reply_pending, squash_merge,
-                            ui_evidence_gap)
+                            respond_reply_disclaimer, respond_reply_posted, ui_evidence_gap)
 from agentflow.intake import (INTAKE_MARK, Intake, IntakeResult, IntakeRoute, STATE_LABELS,
                               _DISCLAIMER, _strip_quoted_lines,
                               apply_intake, awaiting_recheck, intake_result_is_durable,
@@ -214,8 +214,8 @@ _RESPOND_DISCLAIMER = "> *agentflow: reply from the build agent.*"
 
 RESPOND_PROMPT = """A maintainer left a comment on PR #{n} in this worktree and it is
 still unanswered. Read the full conversation first (`gh pr view {n} --json comments`),
-then answer their latest comment. This is a REPLY, not a fresh review — answer what they
-actually asked, nothing more.
+then answer the maintainer comment named below. This is a REPLY, not a fresh review —
+answer what they actually asked, nothing more.
 
 Their comment:
 ---
@@ -800,12 +800,12 @@ def _run_intake_session(cfg: RepoConfig, issue: dict, extra: str, builder) -> st
 
 
 def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str, str] | None:
-    """The next open agentflow PR whose latest comment is the maintainer's unanswered
-    question — returns (pr_number, head_branch, their_comment, comment_target). The target is
-    the stable id of that unanswered comment (`maintainer_comment_id`), so one maintainer
-    comment maps to one Respond identity and a later comment becomes a new target. Skips a PR
-    where our own marker had the last word (a park notice, or a reply we already posted) so the
-    responder never wakes on its own comments (issue #18)."""
+    """The next open agentflow PR with an unanswered maintainer comment.
+
+    Returns ``(pr_number, head_branch, comment, comment_target)`` for the oldest unanswered
+    target. A target-aware reply removes only that comment, so later comments become fresh Respond
+    stages instead of being collapsed into one run. Generic legacy markers retain their old
+    run-level meaning, and the responder never wakes on its own comments (issues #18/#107)."""
     r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
               "--json", "number,headRefName", "--limit", "100"])
     if r.returncode != 0:
@@ -842,14 +842,14 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
 
 
 def respond_once(cfg: RepoConfig, _log=None, slot=None) -> str:
-    """Answer the next parked PR whose latest comment is an unanswered maintainer question:
+    """Answer the next parked PR with an unanswered maintainer comment:
     spawn a responder in the PR-branch worktree that replies in-thread, attaches requested
     evidence, and pushes small fixes to the same branch (issue #18). Never merges, never a
     new PR — same contract as a revise. `slot` bounds responder concurrency."""
     pending = _next_pr_awaiting_reply(cfg)
     if not pending:
         return "no parked PRs awaiting reply"
-    pr, branch, comment, _target = pending
+    pr, branch, comment, target = pending
     m = _BRANCH_RE.match(branch)
     if not m:
         return f"PR #{pr}: unrecognized branch {branch}"
@@ -868,10 +868,11 @@ def respond_once(cfg: RepoConfig, _log=None, slot=None) -> str:
         builder.provision(wt)
         with worktree_session(wt):
             ok, _ = builder.launch(
-                RESPOND_PROMPT.format(n=pr, comment=comment, disclaimer=_RESPOND_DISCLAIMER),
+                RESPOND_PROMPT.format(n=pr, comment=comment,
+                                      disclaimer=respond_reply_disclaimer(target)),
                 cwd=str(wt), model=builder.model_for(Complexity.DEEP))
         comments = _pr_comments(cfg.repo, pr)
-        replied = ok and comments is not None and not reply_pending(comments)
+        replied = ok and comments is not None and respond_reply_posted(comments, target)
         if replied:
             remove_worktree_if_safe(cfg.workdir, wt)
         if replied:

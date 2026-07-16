@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from agentflow import loop
+from agentflow.gate import respond_reply_disclaimer
 from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body
 from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
                             REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
@@ -803,6 +804,22 @@ def test_next_pr_awaiting_reply_picks_the_unanswered_one(monkeypatch):
         8, "agentflow/codex/issue-4-other", _MAINT, "IC_8")
 
 
+def test_next_pr_awaiting_reply_advances_one_comment_target_at_a_time(monkeypatch):
+    branch = "agentflow/claude/issue-4-other"
+    comments = [
+        {"body": _PARK},
+        {"body": "First question", "id": "IC_1"},
+        {"body": "Second question", "id": "IC_2"},
+    ]
+    _pr_gh(monkeypatch, [{"number": 8, "headRefName": branch}], {8: comments})
+    assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (
+        8, branch, "First question", "IC_1")
+
+    comments.append({"body": respond_reply_disclaimer("IC_1") + "\n\nAnswered."})
+    assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (
+        8, branch, "Second question", "IC_2")
+
+
 def test_next_pr_awaiting_reply_ignores_human_branches(monkeypatch):
     # A maintainer's own branch is not an agentflow PR — never spawn a responder on it.
     prs = [{"number": 9, "headRefName": "my-hotfix"}]
@@ -814,11 +831,11 @@ def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
     # The responder's contract: a marker-prefixed reply, same branch, never a merge and
     # never a new PR. Fails first if respond_once touches squash_merge or opens a PR.
     prs = [{"number": 8, "headRefName": "agentflow/claude/issue-4-other"}]
-    _pr_gh(monkeypatch, prs, {8: [{"body": _PARK}, {"body": _MAINT}]})
+    _pr_gh(monkeypatch, prs, {8: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"}]})
     monkeypatch.setattr(loop, "_checkout_pr_branch", lambda cfg, branch, wt: True)
     monkeypatch.setattr(loop, "_pr_comments",
-                        lambda repo, pr: [{"body": _PARK}, {"body": _MAINT},
-                                          {"body": loop._RESPOND_DISCLAIMER}])
+                        lambda repo, pr: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"},
+                                          {"body": respond_reply_disclaimer("IC_8")}])
     removed = []
     monkeypatch.setattr(loop, "remove_worktree_if_safe",
                         lambda workdir, wt: removed.append(str(wt)) or True)

@@ -22,6 +22,7 @@ worktrees, following the same live-orchestration path the legacy builder and rev
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -172,12 +173,14 @@ def respond_submission(cfg, pr_number, branch, comment, target):
     (ADR 0020). Returns ``None`` when the branch is not an agentflow PR branch or the comment target
     is missing."""
     from agentflow.coordinator import Submission
-    from agentflow.loop import _BRANCH_RE, _RESPOND_DISCLAIMER, RESPOND_PROMPT, _builder_worktree
+    from agentflow.gate import respond_reply_disclaimer
+    from agentflow.loop import _BRANCH_RE, RESPOND_PROMPT, _builder_worktree
     m = _BRANCH_RE.match(branch or "")
     if m is None or not target:
         return None
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
-    brief = RESPOND_PROMPT.format(n=pr_number, comment=comment, disclaimer=_RESPOND_DISCLAIMER)
+    brief = RESPOND_PROMPT.format(
+        n=pr_number, comment=comment, disclaimer=respond_reply_disclaimer(str(target)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="respond", target=str(target),
         pool=tool, complexity="deep", source=_builder_worktree(cfg, tool, n, sl),
@@ -355,7 +358,7 @@ def build_coordinator(_log=None) -> Coordinator:
     revise = ReviseStageAdapter(
         revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
     respond = RespondStageAdapter(
-        reply_ready=_reply_ready, worktree_ready=_worktree_ready, handoff=_park_pr,
+        reply_ready=_reply_ready, worktree_ready=_worktree_ready, handoff=_park_respond,
         settle=_settle_respond)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond})
@@ -440,9 +443,9 @@ def _source_facts(record):
 def _worktree_ready(record) -> bool:
     """Prepare the record's owned branch/worktree before admission (ADR 0030). An existing
     worktree is reused *as it is* — a continuation must keep its local changes, so it is never
-    rebuilt — and an absent one is created fresh off ``origin/main`` on the branch the record
-    owns. Any git failure returns False, so admission is skipped with no permit and no attempt
-    consumed. Live orchestration, not unit-tested (ADR 0020)."""
+    rebuilt. An absent Build worktree may start a new branch from ``origin/main``; a continuation
+    stage may only recover the existing branch from its local or remote PR ref. Any git failure
+    returns False, so admission is skipped with no permit and no attempt consumed."""
     from agentflow.loop import _run
     from agentflow.runner import ClaudeRunner, CodexRunner, _worktree_is_registered
     parsed = _source_facts(record)
@@ -467,7 +470,17 @@ def _worktree_ready(record) -> bool:
     have = _run(["git", "-C", workdir, "show-ref", "--quiet",
                  f"refs/heads/{branch}"]).returncode == 0
     add = ["git", "-C", workdir, "worktree", "add"]
-    add += [str(wt), branch] if have else ["-b", branch, str(wt), "origin/main"]
+    if have:
+        add += [str(wt), branch]
+    else:
+        remote = _run(["git", "-C", workdir, "show-ref", "--quiet",
+                       f"refs/remotes/origin/{branch}"]).returncode == 0
+        if remote:
+            add += ["-b", branch, str(wt), f"origin/{branch}"]
+        elif record.stage == "build":
+            add += ["-b", branch, str(wt), "origin/main"]
+        else:
+            return False
     if _run(add).returncode != 0:
         return False
     try:
@@ -639,6 +652,45 @@ def _park_pr(record) -> str | None:
     return url
 
 
+def _park_respond(record) -> str | None:
+    """Create Respond's record-specific park proof and idempotent phone notification.
+
+    A generic Review park may already be present on the PR, so it cannot prove that this exact
+    maintainer-comment target exhausted its Respond budget. The stable ntfy sequence id closes the
+    crash window between posting the durable comment and recording completion locally: a replay
+    replaces the same notification instead of multiplying it.
+    """
+    from agentflow.loop import _pr_comments, _run
+    from agentflow.notify import notify
+
+    pr = _park_pr_number(record)
+    if pr is None or not record.target:
+        return None
+    proof = f"<!-- agentflow-respond-park-target:{record.target} -->"
+    comments = _pr_comments(record.repo, pr)
+    if comments is None:
+        return None
+    already = any(proof in comment.get("body", "") for comment in comments)
+    if not already:
+        body = ("> *agentflow: Respond parked for human review.*\n"
+                f"{proof}\n\n"
+                f"Respond could not finish answering maintainer comment `{record.target}` "
+                "within its continuation budget. The PR branch and local work were retained.")
+        posted = _run(["gh", "pr", "comment", str(pr), "--repo", record.repo,
+                       "--body", body])
+        if posted.returncode != 0:
+            return None
+    proved = _pr_comments(record.repo, pr)
+    if proved is None or not any(proof in comment.get("body", "") for comment in proved):
+        return None
+    url = f"https://github.com/{record.repo}/pull/{pr}"
+    sequence = "respond-" + hashlib.sha256(record.identity.encode()).hexdigest()[:24]
+    notify("agentflow needs you",
+           f"{record.repo} PR #{pr}: Respond parked for maintainer comment {record.target}",
+           url, sequence_id=sequence)
+    return url
+
+
 # --- Revise stage: pushed-revision outcome on the retained branch (live; ADR 0020) ------
 
 def _revision_ready(record, obs) -> bool:
@@ -716,8 +768,8 @@ def _reply_ready(record, obs) -> bool:
     answers, plus any branch change verified pushed (ADR 0028, issue #107) — read from GitHub
     independently of how the responder exited:
 
-    - the reply: the PR's latest comment now carries our marker, so the maintainer's question is no
-      longer the last word — a reply we posted (told apart by the marker, never the maintainer's); and
+    - the reply: a marked agentflow comment names this record's immutable maintainer-comment
+      target, so another reply or generic agentflow comment cannot satisfy it; and
     - verified pushed: the retained PR-branch worktree holds no commit absent from the pushed remote
       branch head *and* no uncommitted change at all. A responder that committed a small fix but
       never pushed it left the remote branch unchanged; one that edited a file but never committed it
@@ -725,9 +777,9 @@ def _reply_ready(record, obs) -> bool:
       into a pushed commit either. Both leave the stage incomplete so it continues on that same
       retained worktree.
 
-    A PR whose latest comment is still the maintainer's posted no reply and stays incomplete. Live
-    orchestration; exercised with faked GitHub/worktree reads in ``tests/test_respond_tracer.py``."""
-    from agentflow.gate import reply_pending
+    A record without that exact targeted reply stays incomplete. Live orchestration; exercised
+    through the Coordinator/Respond adapter seam in ``tests/test_respond_tracer.py``."""
+    from agentflow.gate import respond_reply_posted
     from agentflow.loop import _pr_comments, _run
     parsed = _source_facts(record)
     if parsed is None:
@@ -737,25 +789,27 @@ def _reply_ready(record, obs) -> bool:
     if pr is None:
         return False
     comments = _pr_comments(record.repo, pr.get("number"))
-    if comments is None or reply_pending(comments):
-        return False   # the maintainer still has the last word — no reply posted yet
-    # A reply exists. Any branch change the responder made must be verified pushed: the retained
-    # worktree must hold no local commit that is absent from the PR's remote branch head. A
-    # responder that committed a small fix but never pushed it leaves a commit here that the fetched
-    # remote head does not contain, so the stage stays incomplete and continues.
-    if wt.exists():
-        head = pr.get("headRefOid") or ""
-        _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
-        ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
-        if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
-            return False
-        # An unpushed change need not be a local commit: a responder can post the reply and leave
-        # the requested edit uncommitted in the worktree. Any dirty tracked file, staged change, or
-        # untracked new file is such a change that never became a pushed commit, so the stage is not
-        # complete. A dirty (or unreadable) worktree keeps it incomplete to resume on that worktree.
-        status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
-        if status.returncode != 0 or status.stdout.strip():
-            return False
+    if comments is None or not respond_reply_posted(comments, record.target or ""):
+        return False   # no durable reply bound to this record's maintainer-comment target
+    # A reply exists. The owned worktree is mandatory evidence: without it there is no way to
+    # prove that a requested branch change was either pushed or never left locally. Fail closed and
+    # let preparation recover the PR branch before another attempt.
+    if not wt.exists():
+        return False
+    head = pr.get("headRefOid") or ""
+    fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
+    if fetched.returncode != 0:
+        return False
+    ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
+    if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
+        return False
+    # An unpushed change need not be a local commit: a responder can post the reply and leave
+    # the requested edit uncommitted in the worktree. Any dirty tracked file, staged change, or
+    # untracked new file is such a change that never became a pushed commit, so the stage is not
+    # complete. A dirty (or unreadable) worktree keeps it incomplete to resume on that worktree.
+    status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
+    if status.returncode != 0 or status.stdout.strip():
+        return False
     return True
 
 
