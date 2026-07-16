@@ -9,9 +9,11 @@ the running-record ledger, the crash-safe provider start handshake, outcome-firs
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
 
-Build is the first production stage behind this coordinator (issue #103); every other logical
-stage remains queued behind the admission gate until its own tracer lands. The interface and
-crash boundaries remain exercised with injected launcher, gate, and observer collaborators.
+Build and Review are the production stages behind this coordinator (issues #103, #104); every
+other logical stage remains queued behind the admission gate until its own tracer lands. Review
+is read-only, so an eligible continuation may move to the other pool when its home pool cannot
+fit it. The interface and crash boundaries remain exercised with injected launcher, gate, and
+observer collaborators.
 """
 
 from __future__ import annotations
@@ -193,6 +195,11 @@ class Coordinator:
                     return outcomes
             for record in cold:
                 self._admit(record, now)
+            # A read-only Review continuation whose home pool cannot fit it may move here (ADR
+            # 0028). It is best-effort and never blocks the pool head-of-line: a move that cannot
+            # reserve reverts, leaving the record on its home pool for that pool's own cycle.
+            for record in self._migratable_reviews(pool, now):
+                self._admit_migration(record, pool, now)
             return outcomes
 
     # --- reconciliation -----------------------------------------------------------------
@@ -266,6 +273,44 @@ class Coordinator:
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
+
+    def _migratable_reviews(self, pool: str, now: int) -> list[Record]:
+        """Eligible read-only Review continuations whose home pool cannot currently fit their
+        demand and that review safety lets move onto ``pool`` (ADR 0028). Ordered like any
+        continuation queue. A code-writing stage is pinned to its builder lineage and never
+        appears here; a review whose home pool still has room is left for that pool's cycle."""
+        candidates = [
+            r for r in self._records.values()
+            if r.state == WAITING and not r.hold_pending and r.root is None
+            and r.continuation and r.eligible_at <= now
+            and r.pool != pool and self._review_may_move(r)
+            and self._store.permits_used(r.pool) + r.demand > PERMIT_BUDGET]
+        return sorted(candidates, key=lambda r: (r.eligible_at, r.created_at, r.identity))
+
+    @staticmethod
+    def _review_may_move(record: Record) -> bool:
+        """Review safety for a cross-pool move: a read-only review is unpinned (no code-writing
+        lineage), so it may run on either pool. A same-tool review that moves onto the builder's
+        pool may still finish, but the coordinator strips its auto-merge eligibility (ADR 0028)."""
+        return record.stage == "review" and record.lineage is None
+
+    def _admit_migration(self, record: Record, dest_pool: str, now: int) -> None:
+        """Move a Review continuation to ``dest_pool``, recomputing its admission demand and
+        model for the destination and re-deriving auto-merge (a review by the builder's own tool
+        can finish but never auto-merges — ADR 0028). A move that does not start reverts every
+        moved field, so a record that could not reserve is never stranded off its home pool."""
+        home = (record.pool, record.model, record.demand, record.auto_merge_allowed)
+        record.pool = dest_pool
+        record.model = MODEL_FOR.get((dest_pool, record.complexity), "opus")
+        demand = admission_demand(
+            record.stage, dest_pool, record.model, record.complexity, record.effort)
+        record.demand = demand if demand is not None else PERMIT_BUDGET
+        record.auto_merge_allowed = not (record.builder_lineage is not None
+                                         and dest_pool == record.builder_lineage)
+        if self._admit(record, now) != STARTED:
+            (record.pool, record.model, record.demand, record.auto_merge_allowed) = home
+            record.state = WAITING
+            self._persist(record)
 
     def _begin_start(self, record: Record, now: int) -> bool:
         if (record.state != WAITING or record.hold_pending

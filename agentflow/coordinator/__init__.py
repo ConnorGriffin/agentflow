@@ -13,10 +13,13 @@ while every other logical stage stays queued and dormant.
 
 from agentflow.coordinator.build_stage import BuildStageAdapter
 from agentflow.coordinator.coordinator import Coordinator, StageOutcome, Submission
+from agentflow.coordinator.review_stage import ReviewStageAdapter
 from agentflow.coordinator.rollout import (COORDINATED, DRAINING, LEGACY,
                                            MODE_COORDINATED, MODE_LEGACY, Phase, Rollout)
+from agentflow.coordinator.stage_router import StageRouter
 
 __all__ = [
-    "Coordinator", "StageOutcome", "Submission", "BuildStageAdapter", "Rollout", "Phase",
+    "Coordinator", "StageOutcome", "Submission", "BuildStageAdapter", "ReviewStageAdapter",
+    "StageRouter", "Rollout", "Phase",
     "LEGACY", "DRAINING", "COORDINATED", "MODE_LEGACY", "MODE_COORDINATED",
 ]
