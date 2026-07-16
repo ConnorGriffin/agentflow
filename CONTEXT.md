@@ -5,7 +5,95 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 
 ## Terms
 
-- **Pipeline** — the end-to-end path a unit of work travels: issue → triage/scope
+- **Project** — the durable planning and operating workspace for exactly one
+  enrolled repository. Enrollment materializes the repository's single project;
+  removal from the fleet archives it rather than deleting it. Decision maps and
+  milestones express separate efforts within the project.
+
+- **Conversation** — a bounded, resumable exploration inside one project, centered
+  on one question or intended outcome. It may stage related proposals,
+  but remains working history rather than authoritative project knowledge. It closes
+  only when that outcome is resolved or abandoned, and reopens only for the same outcome.
+
+- **Proposal** — one complete, atomic candidate change staged by a conversation for
+  explicit approval. It creates or updates one primary durable artifact, plus only
+  inseparable attachments. It moves `staged → approved → published` or `staged →
+  discarded`; changing content requires a new staged version, while a publication
+  error remains approved for retry.
+  *Avoid:* candidate artifact, draft.
+
+- **Wayfinder** — the interactive planning capability that explores uncertainty
+  through conversations and stages proposals for the operator's approval. It decides
+  what should become durable work; it does not build or merge that work.
+
+- **Ask** — begin a conversation with Wayfinder for open-ended exploration. An Ask
+  may stage a direct proposal or discover that a decision map is required.
+
+- **Chart** — begin a conversation with Wayfinder intending to stage a decision map.
+  A Chart may instead stage a direct proposal when no consequential uncertainty remains.
+
+- **Decision map** — the durable record of a bounded, temporary deciding effort
+  around one desired outcome. It contains decision tickets and their dependencies,
+  and closes once no unresolved decision blocks downstream work; an independently
+  cleared branch may produce build issues before the whole map closes. A map may
+  produce standalone build issues or create or reshape one or more milestones. Its
+  states are `active`, `resolved`, and `abandoned`; a resolved map reopens only when
+  the same outcome encounters new blocking uncertainty before its standalone work
+  lands or its affected milestones are achieved.
+  *Avoid:* trail, roadmap, plan.
+
+- **Decision ticket** — one bounded question or prerequisite inside a decision map.
+  It is resolved through its own conversation with the whole map loaded as context.
+  Its states are `open`, `resolved`, and `discarded`; `blocked` is derived from open
+  prerequisite tickets rather than stored as a state. Resolution requires a durable
+  answer and required outputs, but the ticket itself never enters the build pipeline.
+
+- **Build issue** — one approved, independently buildable change that enters intake.
+  It may come directly from a proposal or from a cleared decision map, and belongs
+  to at most one milestone.
+
+- **Publication** — the successful durable creation or update authorized by an
+  approved proposal. A publication error leaves the proposal approved and retryable.
+
+- **Artifact provenance** — the links from a published artifact to its originating
+  proposal, conversation, and any related decision ticket, decision map, milestone,
+  or visual specification. Provenance provides traceability; the artifact must still
+  stand alone without following those links.
+
+- **Build handoff** — the publication of a build issue in a form eligible for
+  agentflow intake. The same approval authorizes both publication and handoff.
+
+- **Dispatch** — the scheduler launching an eligible pipeline stage when capacity
+  permits. Dispatch is not a second operator approval after build handoff.
+
+- **Landed change** — a build issue whose pull request has merged into the default
+  branch. Landing does not imply that the change was released, deployed, or shipped
+  to users.
+  *Avoid:* shipped change, released change.
+
+- **Milestone** — a durable, observable product outcome inside one project, delivered
+  through one or more build issues. It is achieved only when acceptance evidence
+  demonstrates the outcome, not merely when its issues close. Its states are `planned`,
+  `active`, `achieved`, and `abandoned`; it becomes active when its first build issue
+  enters the pipeline. Wayfinder stages achievement as a proposal backed by the
+  evidence; the operator approves the state change.
+  *Avoid:* sprint, deadline, release bucket, phase.
+
+- **Mockup** — one disposable interactive candidate used to explore a user-interface
+  direction, belonging to its originating decision ticket or proposal. Selecting a
+  mockup promotes it into a visual specification; unselected variants remain
+  exploration history.
+
+- **Visual specification** — an approved mockup together with its required behavior
+  and acceptance notes for one product outcome. One or more implementing build issues
+  reference the same specification and accumulate acceptance evidence against it.
+
+- **Acceptance evidence** — durable, inspectable proof that a build issue or milestone
+  meets its stated acceptance criteria. It may include tests, CI results, screenshots
+  against a visual specification, or captured behavior; an agent's assertion is not
+  evidence.
+
+- **Pipeline** — the end-to-end path a unit of work travels: build issue → triage/scope
   → build → PR → review → merge. One pipeline serves every repo; behavior varies
   only by the repo's autonomy profile.
 
@@ -122,8 +210,10 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   *outcome-changing* fork it can't settle from code/data (ADR 0016).
 
 - **Held issue** — an issue parked at `needs-grilling` or `needs-mockup`: inert to
-  agents until the maintainer replies in a comment (which auto-advances it) or drives it
-  with `/agentflow pickup` (ADR 0019). No builder touches a held issue.
+  agents until its missing input is durably supplied. It remains a build issue;
+  Wayfinder may resolve the hold through a conversation and issue-update proposal, or
+  link a decision map when several dependent decisions are required. No builder touches
+  a held issue.
 
 - **Recoverable interruption** — a pipeline session ending because of a temporary
   capacity or execution condition, rather than because the work itself cannot proceed.
