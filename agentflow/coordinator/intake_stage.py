@@ -31,14 +31,18 @@ def decode_result(payload: str) -> IntakeResult:
 class IntakeStageAdapter:
     """Rebuild Intake's read-only source, capture its parsed route, and apply it once durable."""
 
-    def __init__(self, *, worktree_reset, apply_route, observer=None, handoff=None) -> None:
+    def __init__(self, *, worktree_reset, apply_route, claim_ready=None,
+                 observer=None, handoff=None) -> None:
         self._worktree_reset = worktree_reset
         self._apply_route = apply_route
+        self._claim_ready = claim_ready or (lambda _record: True)
         self._observer = observer or ProviderObserver()
         self._handoff = handoff
 
     def prepare(self, record) -> bool:
-        return bool(self._worktree_reset(record))
+        # Rebuild first, then prove the GitHub claim immediately before admission. A removed or
+        # unreadable claim fails closed without consuming a permit or attempt.
+        return bool(self._worktree_reset(record) and self._claim_ready(record))
 
     def observe(self, record):
         return self._observer.observe(record)

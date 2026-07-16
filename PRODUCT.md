@@ -21,7 +21,7 @@ issue → PR → review pipeline. It reads GitHub + scheduler state and answers,
 glance: *is the fleet healthy, and what needs me?* It shows two-pool rate-limit
 headroom (idle-while-queued = wasted prepaid capacity), each repo's autonomy
 profile and in-flight work, what's awaiting a human merge, an audit feed of what
-shipped, and the trust-ratchet state. Success = the operator sees fleet health
+landed, and the trust-ratchet state. Success = the operator sees fleet health
 and their next action in one sweep, trusts what merged without watching it, and
 is pinged only for what genuinely needs them.
 

@@ -22,10 +22,11 @@ def _build_args(title: str, message: str, url: str, ntfy_url: str) -> list[str]:
     return args
 
 
-def notify(title: str, message: str, url: str = "") -> None:
-    """Best-effort ntfy push. Never raises."""
+def notify(title: str, message: str, url: str = "") -> bool:
+    """Best-effort ntfy push. Never raises; reports whether ntfy accepted the request."""
     try:
-        subprocess.run(_build_args(title, message, url, NTFY_URL),
-                       capture_output=True, timeout=15)
+        completed = subprocess.run(_build_args(title, message, url, NTFY_URL),
+                                   capture_output=True, timeout=15)
+        return completed.returncode == 0
     except Exception:  # noqa: BLE001 — notifications must never break a run
-        pass
+        return False

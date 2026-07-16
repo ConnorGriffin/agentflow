@@ -1,5 +1,6 @@
 """The dispatch governor and cycle — the concurrency/pacing decision surface (ADR 0023 / 0025)."""
 
+import subprocess
 import threading
 import time
 from collections import Counter
@@ -288,6 +289,8 @@ def test_coordinated_phase_claims_and_submits_intake_before_build(monkeypatch):
     claims = []
     monkeypatch.setattr(loop, "_claim_triage",
                         lambda repo, number: claims.append((repo, number)) or True)
+    monkeypatch.setattr(loop, "_run", lambda cmd: subprocess.CompletedProcess(
+        cmd, 0, "source-sha\n", ""))
     submitted = []
     coord = type("C", (), {"submit_stage": lambda self, sub: submitted.append(sub)})()
     monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])

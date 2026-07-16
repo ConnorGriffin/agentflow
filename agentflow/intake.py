@@ -414,19 +414,34 @@ def _issue_body(repo: str, issue_number: int) -> str:
         return ""
 
 
-def _latest_comment(repo: str, issue_number: int) -> str:
-    """The issue's most recent non-empty comment body, or "" if none / unreadable. Impure."""
+def _result_comment(result: IntakeResult) -> str:
+    """The stable comment payload for one route, excluding an optional retitle preface."""
+    return _READY_COMMENT if result.route is IntakeRoute.READY else result.body
+
+
+def _comment_matches_result(body: str, result: IntakeResult) -> bool:
+    """Whether a durable issue comment is this route's output.
+
+    The first projection may include the old title as a conversational preface. A retry after
+    the title mutation can no longer reconstruct that old title, so match the stable payload at
+    the end while still requiring the generated retitle preface shape.
+    """
+    actual = body.strip()
+    expected = _result_comment(result).strip()
+    return actual == expected or (
+        actual.startswith('> Retitled from: "') and actual.endswith(f"\n\n{expected}"))
+
+
+def _result_comment_exists(repo: str, issue_number: int, result: IntakeResult) -> bool:
     r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"])
     if r.returncode != 0:
-        return ""
+        return False
     try:
         comments = json.loads(r.stdout or "{}").get("comments", [])
     except ValueError:
-        return ""
-    for c in reversed(comments):
-        if c.get("body", "").strip():
-            return c["body"].strip()
-    return ""
+        return False
+    return any(_comment_matches_result(c.get("body", ""), result)
+               for c in comments if isinstance(c, dict))
 
 
 def apply_intake(repo: str, issue_number: int, current_title: str,
@@ -447,27 +462,31 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
 
     labels = intake_labels(result)
     retitled_from = current_title if (result.title and result.title != current_title) else None
-    comment = _READY_COMMENT if result.route is IntakeRoute.READY else result.body
+    comment = _result_comment(result)
     if retitled_from is not None:
         comment = f'> Retitled from: "{retitled_from}"\n\n{comment}'
 
-    # Idempotent: if our last word on this issue already says the same thing, changing
-    # nothing (no comment, no label churn) is the whole point — don't re-post it.
+    # Idempotent across partial writes: once this route's comment exists, retries finish any
+    # remaining title/body/label mutations without posting it again.
+    comment_done = _result_comment_exists(repo, issue_number, result)
     exact_labels = set(labels).issubset(current_labels)
     stale_state = any(name in current_labels and name not in set(labels) for name in STATE_LABELS)
     stale_dials = any(any(name.startswith(p) for p in _DIAL_PREFIXES)
                       and name not in set(labels) for name in current_labels)
     title_done = not retitled_from
-    if (INTAKE_MARK in comment and comment.strip() == _latest_comment(repo, issue_number)
-            and exact_labels and not stale_state and not stale_dials and title_done):
+    current_body = _issue_body(repo, issue_number) if result.route is IntakeRoute.READY else ""
+    body_done = result.route is not IntakeRoute.READY or result.body in current_body
+    if (comment_done and exact_labels and not stale_state and not stale_dials
+            and title_done and body_done):
         return f"unchanged -> {result.route.value} (already posted)"
 
     if retitled_from is not None:
         _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", result.title])
     if result.route is IntakeRoute.READY:
-        body = compose_ready_body(result.body, _issue_body(repo, issue_number))
+        body = compose_ready_body(result.body, current_body)
         _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--body", body])
-    _run(["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", comment])
+    if not comment_done:
+        _run(["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", comment])
 
     for name in labels:
         _ensure_label(repo, name)
@@ -491,7 +510,7 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult)
     if result.route is IntakeRoute.NOTHING_NEW:
         return True
     r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo,
-              "--json", "body,labels,comments"])
+              "--json", "title,body,labels,comments"])
     if r.returncode != 0:
         return False
     try:
@@ -500,13 +519,23 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult)
         return False
     labels = {label.get("name") for label in issue.get("labels", [])
               if isinstance(label, dict)}
-    if not set(intake_labels(result)).issubset(labels):
+    required = set(intake_labels(result))
+    if not required.issubset(labels):
+        return False
+    if any(name in labels and name not in required for name in STATE_LABELS):
+        return False
+    if any(any(name.startswith(prefix) for prefix in _DIAL_PREFIXES)
+           and name not in required for name in labels):
+        return False
+    if result.title and issue.get("title") != result.title:
         return False
     comments = [comment.get("body", "") for comment in issue.get("comments", [])
                 if isinstance(comment, dict)]
+    if not any(_comment_matches_result(comment, result) for comment in comments):
+        return False
     if result.route is IntakeRoute.READY:
-        return result.body in (issue.get("body") or "") and any(INTAKE_MARK in c for c in comments)
-    return any(result.body in comment for comment in comments)
+        return result.body in (issue.get("body") or "")
+    return True
 
 
 def sweep_legacy_labels(repo: str) -> list[str]:

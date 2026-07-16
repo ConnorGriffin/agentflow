@@ -62,6 +62,7 @@ class Record:
     notifications: int = 0
     handoff_proof: str | None = None     # proof the stage-native human handoff exists (crash-safe)
     hold_pending: bool = False           # classified as a hold, awaiting its durable handoff
+    hold_reason: str | None = None       # exhaustion, permanent cause, or no-successor boundary
     retired: bool = False
     builder_lineage: str | None = None   # who built the diff — a same-tool review cannot auto-merge
     builder_complexity: str | None = None  # the original builder complexity, carried so a later

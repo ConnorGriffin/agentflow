@@ -374,6 +374,31 @@ def test_forward_activation_excludes_coordinator_owned_claim_and_worktree(tmp_pa
     assert evidence == ()
 
 
+def test_forward_activation_names_legacy_intake_claim_and_worktree(tmp_path, monkeypatch):
+    from agentflow import loop, runner
+
+    cfg = RepoConfig("o/r", str(tmp_path))
+    wt = tmp_path / ".agentflow" / "worktrees" / "codex-intake" / "issue-8"
+    wt.mkdir(parents=True)
+    monkeypatch.setattr(runner, "_registered_worktrees",
+                        lambda workdir: [(str(wt), None)])
+    monkeypatch.setattr(runner, "_active_marker", lambda path: None)
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        if cmd[:3] == ["gh", "api", "--paginate"]:
+            body = '[[{"number": 8}]]' if "labels=agentflow:triaging" in cmd else "[[]]"
+            return subprocess.CompletedProcess(cmd, 0, body, "")
+        if cmd[:3] == ["git", "-C", str(wt)]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    evidence = coordinated_build.activation_evidence([cfg], [], [])
+
+    assert "o/r#8 legacy triaging claim" in evidence
+    assert any(str(wt) in item and "ambiguous" in item for item in evidence)
+
+
 def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
         tmp_path, monkeypatch):
     from agentflow import loop, runner

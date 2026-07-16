@@ -37,6 +37,7 @@ from agentflow.coordinator.store import StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
 
 BUILD_POOLS = ("claude", "codex")
+LEGACY_SESSION_POOLS = BUILD_POOLS + tuple(f"{tool}-intake" for tool in BUILD_POOLS)
 
 
 def build_submission(cfg, issue: dict, tool: str):
@@ -190,35 +191,36 @@ def legacy_evidence(live_sessions, coordinator_sources) -> tuple[str, ...]:
 def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
     """Name every current-format fact that prevents a safe forward activation.
 
-    The live board is only one fact. A legacy Build may also have left its GitHub claim, an
-    active PID marker, or a registered/unregistered Build worktree. Coordinator-owned sources
+    The live board is only one fact. A legacy Build or Intake may also have left its GitHub
+    claim, active PID marker, or registered/unregistered worktree. Coordinator-owned sources
     and claims are excluded; everything else is named rather than cleared or guessed at.
     """
-    from agentflow.loop import BUILDING, _run
+    from agentflow.loop import BUILDING, TRIAGING, _run
     from agentflow.runner import _active_marker, _registered_worktrees
 
     sources = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     evidence = list(legacy_evidence(live_sessions, sources))
     owned_by_repo = {cfg.repo: tracer.owned_issues(records, cfg.repo) for cfg in repos}
     for cfg in repos:
-        claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
-                       f"repos/{cfg.repo}/issues", "-f", "state=open",
-                       "-f", f"labels={BUILDING}", "-f", "per_page=100"])
-        if claims.returncode != 0:
-            evidence.append(f"{cfg.repo} building claims unreadable")
-        else:
+        for claim_label, lane in ((BUILDING, "building"), (TRIAGING, "triaging")):
+            claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
+                           f"repos/{cfg.repo}/issues", "-f", "state=open",
+                           "-f", f"labels={claim_label}", "-f", "per_page=100"])
+            if claims.returncode != 0:
+                evidence.append(f"{cfg.repo} {lane} claims unreadable")
+                continue
             try:
                 pages = json.loads(claims.stdout or "[]")
             except json.JSONDecodeError:
-                evidence.append(f"{cfg.repo} building claims unreadable")
-            else:
-                if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-                    evidence.append(f"{cfg.repo} building claims unreadable")
-                    pages = []
-                for issue in (item for page in pages for item in page):
-                    number = issue.get("number")
-                    if isinstance(number, int) and number not in owned_by_repo[cfg.repo]:
-                        evidence.append(f"{cfg.repo}#{number} legacy building claim")
+                evidence.append(f"{cfg.repo} {lane} claims unreadable")
+                continue
+            if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+                evidence.append(f"{cfg.repo} {lane} claims unreadable")
+                continue
+            for issue in (item for page in pages for item in page):
+                number = issue.get("number")
+                if isinstance(number, int) and number not in owned_by_repo[cfg.repo]:
+                    evidence.append(f"{cfg.repo}#{number} legacy {lane} claim")
 
         root = Path(cfg.workdir) / ".agentflow" / "worktrees"
         registered = _registered_worktrees(cfg.workdir)
@@ -232,9 +234,10 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
                 rel = path.resolve().relative_to(root.resolve())
             except (OSError, ValueError):
                 continue
-            if len(rel.parts) >= 2 and rel.parts[0] in BUILD_POOLS and rel.parts[1].startswith("issue-"):
+            if (len(rel.parts) >= 2 and rel.parts[0] in LEGACY_SESSION_POOLS
+                    and rel.parts[1].startswith("issue-")):
                 candidates[os.path.realpath(path)] = path
-        for tool in BUILD_POOLS:
+        for tool in LEGACY_SESSION_POOLS:
             for path in (root / tool).glob("issue-*") if (root / tool).exists() else ():
                 candidates.setdefault(os.path.realpath(path), path)
 
@@ -310,6 +313,7 @@ def build_coordinator(_log=None) -> Coordinator:
     intake = IntakeStageAdapter(
         worktree_reset=coordinated_intake.reset_worktree,
         apply_route=coordinated_intake.apply_route,
+        claim_ready=coordinated_intake.intake_claim_ready,
         handoff=coordinated_intake.hold_intake)
     build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
@@ -811,9 +815,6 @@ def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> lis
         if (record.state == COMPLETED and not record.retired and record.claim
                 and not record.hold_pending):  # a pending park is already retried by reconcile
             opener = _OPENERS.get(record.stage)
-            if record.stage == "intake":
-                coord.settle_completed(record.identity)
-                continue
             if opener is not None:
                 try:
                     opener(coord, record.identity)

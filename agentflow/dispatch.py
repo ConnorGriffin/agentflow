@@ -241,6 +241,8 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
             return ("; ".join(submitted) if submitted else
                     f"#{issue['number']}: no pool has headroom ({block_msg}) — deferring")
         submission = coordinated_intake.intake_submission(cfg, issue, extra, builder.tool)
+        if submission is None:
+            return f"#{issue['number']}: Intake source unreadable — deferring"
         # Claim first. If the store then fails, reconciliation fails closed and leaves this
         # visible ownership in place for repair; no legacy path may start a duplicate.
         if not loop._claim_triage(cfg.repo, issue["number"]):

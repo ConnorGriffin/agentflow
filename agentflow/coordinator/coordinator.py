@@ -177,33 +177,11 @@ class Coordinator:
                 return None
             if not record.hold_pending:
                 record.hold_pending = True
+                record.hold_reason = "completed stage has no successor"
                 self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no "
                                   f"next stage remains — parking for human; claim released")
                 self._persist(record)
             return self._finalize_hold(record)
-
-    def settle_completed(self, identity: str) -> bool:
-        """Project a completed stage to its durable external boundary, then release its claim.
-
-        Stage-native outcome data is already persisted before this is callable. The adapter's
-        projection must be idempotent and return durable proof; a missing proof leaves ownership
-        intact so reconciliation can safely drive it again after a restart.
-        """
-        with self._lock:
-            record = self._records.get(identity)
-            if record is None or record.retired:
-                return bool(record and not record.claim)
-            if record.state != COMPLETED:
-                return False
-            finalize = getattr(self._adapter, "finalize_completed", None)
-            proof = finalize(record) if finalize is not None else None
-            if proof is None:
-                return False
-            record.handoff_proof = proof
-            record.claim = False
-            record.retired = True
-            self._persist(record)
-            return True
 
     def _register_descendant(self, record: Record) -> None:
         """A descendant/subagent shares its root's single reservation and is never admitted or
@@ -263,6 +241,9 @@ class Coordinator:
                 outcome = self._finalize_hold(record)
                 if outcome is not None:
                     outcomes.append(outcome)
+                continue
+            if record.state == COMPLETED and not record.retired:
+                self._settle_completed(record)
                 continue
             if record.state != RUNNING:
                 continue
@@ -419,6 +400,18 @@ class Coordinator:
 
     # --- outcome-first classification ---------------------------------------------------
 
+    def _settle_completed(self, record: Record) -> bool:
+        """Project a completed stage at its durable boundary behind the ``cycle`` seam."""
+        finalize = getattr(self._adapter, "finalize_completed", None)
+        proof = finalize(record) if finalize is not None else None
+        if proof is None:
+            return False
+        record.handoff_proof = proof
+        record.claim = False
+        record.retired = True
+        self._persist(record)
+        return True
+
     def _finalize(self, record: Record) -> StageOutcome | None:
         """Classify an ended provider family and release its reservation atomically (ADR
         0028 precedence): a verified stage outcome completes it; a permanent provider
@@ -443,6 +436,7 @@ class Coordinator:
         label = obs.classification()
         cause = obs.cause.value
         if label == "permanent":
+            record.hold_reason = f"permanent provider condition ({cause})"
             self._hold(record)
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
                               f"permanent; held for human; claim released")
@@ -458,6 +452,7 @@ class Coordinator:
                               f"{when}; claim retained")
             return None
         else:
+            record.hold_reason = "continuation budget exhausted"
             self._hold(record)
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
                               f"({cause}) — continuation budget exhausted; held for human; "
