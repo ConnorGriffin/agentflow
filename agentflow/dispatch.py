@@ -184,21 +184,22 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
     the fleet comes from running every repo's `_dispatch_repo` at once. Merges are handled
     serially by the caller after these settle (ADR 0009).
 
-    Build alone is gated by the rollout phase (issue #103): `legacy` keeps the existing build
-    path; `coordinated` submits one durable Build stage to the coordinator instead of launching;
-    `draining` launches no new build of either kind while existing records finish. Mockup,
-    respond, and triage stay on the legacy path — only Build has moved behind the coordinator."""
-    threads = _triage_fanout(cfg, slot, _log)
+    The rollout gates every provider launch (issue #103): `legacy` keeps today's paths;
+    `coordinated` submits one durable Build stage and leaves Intake, Mockup, Respond, Review,
+    and Revise queued; `draining` launches nothing new while existing work finishes. Only Build
+    has moved behind the coordinator, so no other legacy stage may bypass that dormant gate."""
+    threads: list[threading.Thread] = []
     if phase.launch_legacy:
+        threads = _triage_fanout(cfg, slot, _log)
         threads.append(_spawn(lambda: _run_and_log(
             cfg, "build", lambda: loop.run_once(cfg, _log=_log, slot=slot), _log)))
+        threads.append(_spawn(lambda: _run_and_log(
+            cfg, "mockup", lambda: loop.produce_once(cfg, _log=_log, slot=slot), _log)))
+        threads.append(_spawn(lambda: _run_and_log(
+            cfg, "respond", lambda: loop.respond_once(cfg, _log=_log, slot=slot), _log)))
     elif phase.submit_coordinated and coordinator is not None:
         _run_and_log(cfg, "build",
                      lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
-    threads.append(_spawn(lambda: _run_and_log(
-        cfg, "mockup", lambda: loop.produce_once(cfg, _log=_log, slot=slot), _log)))
-    threads.append(_spawn(lambda: _run_and_log(
-        cfg, "respond", lambda: loop.respond_once(cfg, _log=_log, slot=slot), _log)))
     for thread in threads:
         thread.join()
 

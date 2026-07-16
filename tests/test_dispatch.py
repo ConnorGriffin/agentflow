@@ -246,6 +246,12 @@ def test_coordinated_phase_submits_to_the_coordinator_and_skips_the_legacy_build
     from agentflow.coordinator import COORDINATED, Phase
     _idle_pools(monkeypatch)
     _no_triage_no_mockup_no_respond(monkeypatch)
+    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: pytest.fail(
+        "Intake must stay queued while Build is coordinated"))
+    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
+        "Mockup must stay queued while Build is coordinated"))
+    monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
+        "Respond must stay queued while Build is coordinated"))
     monkeypatch.setattr(loop, "run_once", lambda *a, **k: pytest.fail(
         "legacy build must not launch while Build is coordinated"))
     monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
@@ -269,13 +275,18 @@ def test_coordinated_phase_submits_to_the_coordinator_and_skips_the_legacy_build
     assert projected  # running records were projected back onto the live board
 
 
-def test_draining_phase_launches_no_new_build_of_either_kind(monkeypatch):
-    """A drain (either direction) stops new Build launches while existing records finish: the
-    legacy launcher is not called and no submission is made, but the coordinator still runs to
-    reconcile whatever it already owns (issue #103)."""
+def test_draining_phase_launches_no_new_provider_stage(monkeypatch):
+    """A drain stops every new legacy provider stage and makes no coordinated submission, while
+    the coordinator keeps reconciling whatever it already owns (issue #103)."""
     from agentflow.coordinator import DRAINING, Phase
     _idle_pools(monkeypatch)
     _no_triage_no_mockup_no_respond(monkeypatch)
+    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: pytest.fail(
+        "no new Intake during a drain"))
+    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
+        "no new Mockup during a drain"))
+    monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
+        "no new Respond during a drain"))
     monkeypatch.setattr(loop, "run_once", lambda *a, **k: pytest.fail(
         "no new legacy build during a drain"))
     monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: pytest.fail(
