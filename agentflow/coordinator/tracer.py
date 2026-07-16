@@ -30,10 +30,11 @@ from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import Store, default_store_path
 
 
-# The logical stages enabled behind the coordinator today (issues #103, #104, #105). Every other
-# stage may be submitted and sit visibly ``waiting``, but the gate never admits it, so it
-# consumes neither a permit nor an attempt.
-ENABLED_STAGES = ("building", "reviewing", "revising")
+# The logical stages enabled behind the coordinator today (issues #103, #104, #105) — the one
+# source :func:`build_review_revise_gate` consumes. Every other stage may be submitted and sit
+# visibly ``waiting``, but the gate never admits it, so it consumes neither a permit nor an
+# attempt.
+ENABLED_STAGES = ("build", "review", "revise")
 
 
 def build_only_gate(record: Record) -> bool:
@@ -49,10 +50,10 @@ def build_and_review_gate(record: Record) -> bool:
 
 
 def build_review_revise_gate(record: Record) -> bool:
-    """The coordinated-mode admission gate: admit Build, Review, and Revise, refuse every other
-    logical stage. A refused stage stays ``waiting`` and reserves nothing — no permit, no attempt —
-    so Intake, Respond, and Mockup remain visibly queued until their own slices land."""
-    return record.stage in ("build", "review", "revise")
+    """The coordinated-mode admission gate: admit exactly :data:`ENABLED_STAGES`, refuse every
+    other logical stage. A refused stage stays ``waiting`` and reserves nothing — no permit, no
+    attempt — so Intake, Respond, and Mockup remain visibly queued until their own slices land."""
+    return record.stage in ENABLED_STAGES
 
 
 def _issue_number(record: Record) -> int | None:
