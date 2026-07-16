@@ -42,6 +42,8 @@ MAX_REVISES = 2
 PR_MARK = "agentflow:"
 _RESPOND_TARGET_PREFIX = "agentflow-respond-target:"
 _RESPOND_TARGET_RE = re.compile(r"<!--\s*agentflow-respond-target:([^>]+?)\s*-->")
+_RESPOND_PARK_TARGET_RE = re.compile(r"<!--\s*agentflow-respond-park-target:([^>]+?)\s*-->")
+_RESPOND_CHANGE_RE = re.compile(r"<!--\s*agentflow-respond-change:([^>]+?)\s*-->")
 
 
 def respond_reply_disclaimer(target: str) -> str:
@@ -53,6 +55,11 @@ def respond_reply_disclaimer(target: str) -> str:
     """
     return ("> *agentflow: reply from the build agent.*\n"
             f"<!-- {_RESPOND_TARGET_PREFIX}{target} -->")
+
+
+def respond_change_marker(result: str) -> str:
+    """Durable Respond outcome claim: ``none`` or the pushed PR head SHA."""
+    return f"<!-- agentflow-respond-change:{result} -->"
 
 
 def _respond_reply_target(body: str) -> str:
@@ -67,6 +74,20 @@ def respond_reply_posted(comments: list[dict], target: str) -> bool:
         and _respond_reply_target(comment.get("body", "")) == str(target)
         for comment in comments
     )
+
+
+def respond_reply_change(comments: list[dict], target: str) -> str:
+    """The unique targeted reply's declared branch outcome, or empty when unproved.
+
+    Requiring exactly one targeted reply makes duplicate posting visible and fail-closed instead
+    of accepting whichever duplicate happens to appear last.
+    """
+    matches = [comment.get("body", "") for comment in comments
+               if _respond_reply_target(comment.get("body", "")) == str(target)]
+    if len(matches) != 1:
+        return ""
+    change = _RESPOND_CHANGE_RE.search(matches[0])
+    return change.group(1).strip() if change is not None else ""
 
 
 def _unanswered_maintainer_comments(comments: list[dict]) -> list[tuple[str, str]]:
@@ -84,6 +105,10 @@ def _unanswered_maintainer_comments(comments: list[dict]) -> list[tuple[str, str
         answered = _respond_reply_target(body)
         if answered:
             pending.pop(answered, None)
+            continue
+        parked = _RESPOND_PARK_TARGET_RE.search(body)
+        if parked is not None:
+            pending.pop(parked.group(1).strip(), None)
             continue
         if PR_MARK in body:
             pending.clear()

@@ -247,3 +247,16 @@ def test_each_unanswered_comment_keeps_its_own_target_until_its_reply():
 
 def test_legacy_generic_agentflow_reply_answers_the_pending_run():
     assert maintainer_comment([_MAINT, _REPLY]) == ""   # our reply was the last word
+
+
+def test_respond_park_closes_only_its_target_and_leaves_later_comment_pending():
+    comments = [
+        _PARK,
+        {"body": "First follow-up", "id": "IC_1"},
+        {"body": "Second follow-up", "id": "IC_2"},
+        {"body": ("> *agentflow: Respond parked for human review.*\n"
+                  "<!-- agentflow-respond-park-target:IC_1 -->")},
+    ]
+    assert reply_pending(comments) is True
+    assert maintainer_comment_id(comments) == "IC_2"
+    assert maintainer_comment(comments) == "Second follow-up"

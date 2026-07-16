@@ -32,7 +32,8 @@ RESPOND_WT = "/w/.agentflow/worktrees/claude/issue-7-x"
 def _respond_sub(subject="7", *, pool="claude", target="cid-1", source=None):
     return Submission(repo="o/r", subject=subject, stage="respond", pool=pool, complexity="deep",
                       target=target, builder_lineage=pool,
-                      source=source or f"/w/.agentflow/worktrees/{pool}/issue-{subject}-x")
+                      source=source or f"/w/.agentflow/worktrees/{pool}/issue-{subject}-x",
+                      input_ptr="<!-- agentflow-respond-baseline:base-head -->")
 
 
 def _respond_adapter(fake, *, reply, prep=None, handoff=None, settle=None):
@@ -202,7 +203,7 @@ def test_respond_completes_on_a_posted_reply_even_after_a_bad_exit_then_releases
 def test_public_respond_seam_requires_targeted_reply_and_clean_pushed_worktree(
         make_coord, monkeypatch, tmp_path):
     """Drive the production reply verifier through Coordinator + RespondStageAdapter."""
-    from agentflow.gate import respond_reply_disclaimer
+    from agentflow.gate import respond_change_marker, respond_reply_disclaimer
     from agentflow.loop import _run as real_run
 
     fake = FakeSession()
@@ -225,7 +226,8 @@ def test_public_respond_seam_requires_targeted_reply_and_clean_pushed_worktree(
     monkeypatch.setattr("agentflow.loop._run", external_read)
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
-        {"body": respond_reply_disclaimer("cid-1") + "\n\nDone."},
+        {"body": (respond_reply_disclaimer("cid-1") + "\n" +
+                  respond_change_marker("none") + "\n\nDone.")},
     ])
     adapter = RespondStageAdapter(
         reply_ready=coordinated_build._reply_ready,
@@ -247,7 +249,7 @@ def test_public_respond_seam_requires_targeted_reply_and_clean_pushed_worktree(
 
 def test_public_respond_seam_fails_closed_when_owned_worktree_is_missing(
         make_coord, monkeypatch, tmp_path):
-    from agentflow.gate import respond_reply_disclaimer
+    from agentflow.gate import respond_change_marker, respond_reply_disclaimer
 
     fake = FakeSession()
     missing = tmp_path / ".agentflow/worktrees/claude/issue-7-missing"
@@ -255,7 +257,8 @@ def test_public_respond_seam_fails_closed_when_owned_worktree_is_missing(
         returncode=0, stdout=json.dumps([{"number": 42, "headRefOid": "remote-head"}])))
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
-        {"body": respond_reply_disclaimer("cid-1") + "\n\nDone."},
+        {"body": (respond_reply_disclaimer("cid-1") + "\n" +
+                  respond_change_marker("none") + "\n\nDone.")},
     ])
     adapter = RespondStageAdapter(
         reply_ready=coordinated_build._reply_ready,
@@ -272,7 +275,7 @@ def test_public_respond_seam_fails_closed_when_owned_worktree_is_missing(
 
 def test_public_respond_seam_rejects_a_reply_for_a_different_comment_target(
         make_coord, monkeypatch, tmp_path):
-    from agentflow.gate import respond_reply_disclaimer
+    from agentflow.gate import respond_change_marker, respond_reply_disclaimer
 
     fake = FakeSession()
     wt = tmp_path / ".agentflow/worktrees/claude/issue-7-x"
@@ -289,7 +292,8 @@ def test_public_respond_seam_rejects_a_reply_for_a_different_comment_target(
     monkeypatch.setattr("agentflow.loop._run", external_read)
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
         {"body": "first question", "id": "cid-1"},
-        {"body": respond_reply_disclaimer("cid-2") + "\n\nAnswered another question."},
+        {"body": (respond_reply_disclaimer("cid-2") + "\n" +
+                  respond_change_marker("none") + "\n\nAnswered another question.")},
     ])
     adapter = RespondStageAdapter(
         reply_ready=coordinated_build._reply_ready,
@@ -396,7 +400,8 @@ def test_respond_submission_adopts_the_branch_lineage_and_holds_the_claim():
     from agentflow.gate import respond_reply_disclaimer
     cfg = SimpleNamespace(repo="o/r", workdir="/home/w")
     sub = coordinated_build.respond_submission(
-        cfg, 42, "agentflow/claude/issue-7-fix-thing", "please tweak the copy", "cid-9")
+        cfg, 42, "agentflow/claude/issue-7-fix-thing", "please tweak the copy", "cid-9",
+        "base-sha")
     assert sub is not None
     assert sub.stage == "respond" and sub.subject == "7" and sub.target == "cid-9"
     assert sub.pool == "claude" and sub.builder_lineage == "claude"   # the change's original lineage
@@ -404,10 +409,18 @@ def test_respond_submission_adopts_the_branch_lineage_and_holds_the_claim():
     assert sub.source == "/home/w/.agentflow/worktrees/claude/issue-7-fix-thing"  # retained PR-branch wt
     assert "please tweak the copy" in sub.input_ptr and "#42" in sub.input_ptr
     assert respond_reply_disclaimer("cid-9") in sub.input_ptr
+    assert "agentflow-respond-baseline:base-sha" in sub.input_ptr
+    prompt = " ".join(sub.input_ptr.lower().split())
+    assert "do not post the reply again" in prompt
+    assert "edit that existing reply in place" in prompt
+    assert "do not make or push it again" in prompt
     # A non-agentflow branch or a missing comment target yields no submission.
-    assert coordinated_build.respond_submission(cfg, 42, "feature/x", "c", "cid-9") is None
     assert coordinated_build.respond_submission(
-        cfg, 42, "agentflow/claude/issue-7-fix-thing", "c", "") is None
+        cfg, 42, "feature/x", "c", "cid-9", "base-sha") is None
+    assert coordinated_build.respond_submission(
+        cfg, 42, "agentflow/claude/issue-7-fix-thing", "c", "", "base-sha") is None
+    assert coordinated_build.respond_submission(
+        cfg, 42, "agentflow/claude/issue-7-fix-thing", "c", "cid-9", "") is None
 
 
 # --- live reads: the marked reply and the claim release (faked GitHub/worktree, ADR 0020) --
@@ -429,20 +442,23 @@ def test_reply_ready_rejects_a_generic_reply_that_is_not_bound_to_its_target(
     assert coordinated_build._reply_ready(rec, None) is False
 
 
-def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0):
+def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
+                change="none", head="h", baseline="h"):
     """Wire ``_reply_ready`` against a real retained worktree that exists on disk (so the pushed-
     change reads run) with our marked reply already the last word. ``ahead``/``status`` fake the
     ``git rev-list`` and ``git status --porcelain`` reads, and the record is returned so the caller
     just asserts the outcome."""
-    from agentflow.gate import respond_reply_disclaimer
+    from agentflow.gate import respond_change_marker, respond_reply_disclaimer
     wt = tmp_path / ".agentflow/worktrees/claude/issue-7-fix"
     wt.mkdir(parents=True)
     rec = Record(identity="o/r|7|respond|cid", stage="respond", pool="claude", demand=3,
-                 repo="o/r", subject="7", target="cid", lineage="claude", source=str(wt))
+                 repo="o/r", subject="7", target="cid", lineage="claude", source=str(wt),
+                 input_ptr=f"<!-- agentflow-respond-baseline:{baseline} -->")
 
     def _run(cmd, *a, **k):
         if "pr" in cmd and "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"number": 42, "headRefOid": "h"}]))
+            return SimpleNamespace(returncode=0, stdout=json.dumps([
+                {"number": 42, "headRefOid": head}]))
         if "rev-list" in cmd:
             return SimpleNamespace(returncode=0, stdout=ahead)
         if "status" in cmd:
@@ -453,7 +469,8 @@ def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0):
     monkeypatch.setattr("agentflow.loop._pr_comments",
                         lambda repo, pr: [
                             {"body": "please tweak the copy", "id": "cid"},
-                            {"body": respond_reply_disclaimer("cid") + "\n\nDone."},
+                            {"body": (respond_reply_disclaimer("cid") + "\n" +
+                                      respond_change_marker(change) + "\n\nDone.")},
                         ])
     return rec
 
@@ -486,6 +503,23 @@ def test_reply_ready_completes_on_a_posted_reply_with_a_clean_pushed_worktree(mo
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="")
     assert coordinated_build._reply_ready(rec, None) is True
     assert coordinated_build._reply_ready(rec, None) is True
+
+
+def test_reply_ready_verifies_the_pushed_head_named_by_the_reply(monkeypatch, tmp_path):
+    rec = _reply_read(monkeypatch, tmp_path, change="new-head", head="new-head",
+                      baseline="old-head")
+    assert coordinated_build._reply_ready(rec, None) is True
+
+
+def test_reply_ready_rejects_a_pushed_head_proof_that_did_not_advance_or_match(
+        monkeypatch, tmp_path):
+    unchanged = _reply_read(monkeypatch, tmp_path / "unchanged", change="old-head",
+                            head="old-head", baseline="old-head")
+    assert coordinated_build._reply_ready(unchanged, None) is False
+
+    mismatch = _reply_read(monkeypatch, tmp_path / "mismatch", change="claimed-head",
+                           head="different-head", baseline="old-head")
+    assert coordinated_build._reply_ready(mismatch, None) is False
 
 
 def test_settle_respond_releases_the_building_claim_and_proves_it(monkeypatch):

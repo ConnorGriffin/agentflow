@@ -319,7 +319,8 @@ def test_coordinated_run_cycle_discovers_claims_and_submits_one_respond(monkeypa
         if argv[:3] == ["gh", "pr", "list"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps([
                 {"number": 42,
-                 "headRefName": "agentflow/claude/issue-7-fix-thing"}]), "")
+                 "headRefName": "agentflow/claude/issue-7-fix-thing",
+                 "headRefOid": "head-42"}]), "")
         if argv[:3] == ["gh", "pr", "view"]:
             return subprocess.CompletedProcess(argv, 0, json.dumps({"comments": [
                 {"body": "> *agentflow: parked for human review.*"},
@@ -341,6 +342,29 @@ def test_coordinated_run_cycle_discovers_claims_and_submits_one_respond(monkeypa
     submitted = events[1][1]
     assert submitted.stage == "respond" and submitted.target == "IC_42"
     assert submitted.pool == "claude" and "please tweak it" in submitted.input_ptr
+    assert "agentflow-respond-baseline:head-42" in submitted.input_ptr
+
+
+def test_coordinated_run_cycle_defers_next_comment_until_prior_respond_settles(monkeypatch):
+    """One issue-level building claim cannot be released underneath a later Respond."""
+    from agentflow.coordinator import COORDINATED, Phase
+    _idle_pools(monkeypatch)
+    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
+                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
+    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
+        42, "agentflow/claude/issue-7-fix-thing", "second question", "IC_2", "head-42"))
+    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
+                        lambda cfg, lane=None: {7})
+    claims, submitted = [], []
+    monkeypatch.setattr(loop, "_claim", lambda *a: claims.append(a) or True)
+    coord = type("C", (), {"submit_stage": lambda self, sub: submitted.append(sub)})()
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
+
+    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
+                       _log=lambda _m: None)
+    assert claims == [] and submitted == []
 
 
 def test_draining_phase_launches_no_new_provider_stage(monkeypatch):

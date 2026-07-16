@@ -239,11 +239,15 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
     pending = loop._next_pr_awaiting_reply(cfg)
     if not pending:
         return "no PRs awaiting reply"
-    pr, branch, comment, target = pending
-    submission = coordinated_build.respond_submission(cfg, pr, branch, comment, target)
+    pr, branch, comment, target, baseline = pending
+    submission = coordinated_build.respond_submission(
+        cfg, pr, branch, comment, target, baseline)
     if submission is None:
         return f"PR #{pr}: not a resolvable agentflow respond target — skipping"
     number = int(submission.subject)
+    if number in coordinated_build.owned_issues(cfg, lane="building"):
+        return (f"#{number}: prior change stage still owns the building claim — "
+                "deferring Respond")
     if not loop._claim(cfg.repo, number):
         return f"#{number}: could not claim Respond — refusing coordinator submission"
     coordinator.submit_stage(submission)

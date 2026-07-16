@@ -794,14 +794,16 @@ def _pr_gh(monkeypatch, prs, comments_by_pr):
 
 
 def test_next_pr_awaiting_reply_picks_the_unanswered_one(monkeypatch):
-    prs = [{"number": 7, "headRefName": "agentflow/claude/issue-3-do-thing"},
-           {"number": 8, "headRefName": "agentflow/codex/issue-4-other"}]
+    prs = [{"number": 7, "headRefName": "agentflow/claude/issue-3-do-thing",
+            "headRefOid": "head-7"},
+           {"number": 8, "headRefName": "agentflow/codex/issue-4-other",
+            "headRefOid": "head-8"}]
     comments = {7: [{"body": _PARK}],                                    # our marker last — answered
                 8: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"}]}    # maintainer last — pending
     _pr_gh(monkeypatch, prs, comments)
     # The fourth element is the stable id of the unanswered comment — the Respond target (issue #107).
     assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (
-        8, "agentflow/codex/issue-4-other", _MAINT, "IC_8")
+        8, "agentflow/codex/issue-4-other", _MAINT, "IC_8", "head-8")
 
 
 def test_next_pr_awaiting_reply_advances_one_comment_target_at_a_time(monkeypatch):
@@ -811,13 +813,14 @@ def test_next_pr_awaiting_reply_advances_one_comment_target_at_a_time(monkeypatc
         {"body": "First question", "id": "IC_1"},
         {"body": "Second question", "id": "IC_2"},
     ]
-    _pr_gh(monkeypatch, [{"number": 8, "headRefName": branch}], {8: comments})
+    _pr_gh(monkeypatch, [{"number": 8, "headRefName": branch, "headRefOid": "head-8"}],
+           {8: comments})
     assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (
-        8, branch, "First question", "IC_1")
+        8, branch, "First question", "IC_1", "head-8")
 
     comments.append({"body": respond_reply_disclaimer("IC_1") + "\n\nAnswered."})
     assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (
-        8, branch, "Second question", "IC_2")
+        8, branch, "Second question", "IC_2", "head-8")
 
 
 def test_next_pr_awaiting_reply_ignores_human_branches(monkeypatch):
@@ -830,7 +833,8 @@ def test_next_pr_awaiting_reply_ignores_human_branches(monkeypatch):
 def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
     # The responder's contract: a marker-prefixed reply, same branch, never a merge and
     # never a new PR. Fails first if respond_once touches squash_merge or opens a PR.
-    prs = [{"number": 8, "headRefName": "agentflow/claude/issue-4-other"}]
+    prs = [{"number": 8, "headRefName": "agentflow/claude/issue-4-other",
+            "headRefOid": "head-8"}]
     _pr_gh(monkeypatch, prs, {8: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"}]})
     monkeypatch.setattr(loop, "_checkout_pr_branch", lambda cfg, branch, wt: True)
     monkeypatch.setattr(loop, "_pr_comments",
@@ -862,7 +866,8 @@ def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
 
 
 def test_respond_once_noop_when_nothing_pending(monkeypatch):
-    _pr_gh(monkeypatch, [{"number": 7, "headRefName": "agentflow/claude/issue-3-x"}],
+    _pr_gh(monkeypatch, [{"number": 7, "headRefName": "agentflow/claude/issue-3-x",
+                          "headRefOid": "head-7"}],
            {7: [{"body": _PARK}]})   # our marker had the last word
     monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))  # never returns
     assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
@@ -870,7 +875,8 @@ def test_respond_once_noop_when_nothing_pending(monkeypatch):
 
 def test_responder_retains_worktree_when_reply_cannot_be_verified(monkeypatch):
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply",
-                        lambda cfg: (8, "agentflow/claude/issue-4-other", _MAINT, "IC_8"))
+                        lambda cfg: (8, "agentflow/claude/issue-4-other", _MAINT,
+                                     "IC_8", "head-8"))
     monkeypatch.setattr(loop, "_checkout_pr_branch", lambda *a: True)
     monkeypatch.setattr(loop, "_pr_comments", lambda *a: None)
     monkeypatch.setattr(loop, "remove_worktree_if_safe",

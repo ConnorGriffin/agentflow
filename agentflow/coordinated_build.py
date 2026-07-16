@@ -162,7 +162,7 @@ def revise_submission(review_record, complexity, findings="", *, surfaces=""):
         round=review_record.round, transfer_from=review_record.identity)
 
 
-def respond_submission(cfg, pr_number, branch, comment, target):
+def respond_submission(cfg, pr_number, branch, comment, target, baseline):
     """Translate one unanswered maintainer comment on an existing agentflow PR into a single
     Respond stage submission — the minimal facts the coordinator needs (ADR 0030). Respond adopts
     the change's *original tool lineage* and its retained PR branch/worktree — both recovered from
@@ -170,17 +170,19 @@ def respond_submission(cfg, pr_number, branch, comment, target):
     silently switch this code-writing continuation — is bound to the maintainer comment it answers
     (its immutable ``target``, so a later comment opens a genuinely new Respond with a fresh budget),
     and holds the ``building`` change claim while it waits. Pure: the mapping is the test surface
-    (ADR 0020). Returns ``None`` when the branch is not an agentflow PR branch or the comment target
-    is missing."""
+    (ADR 0020). The durable prompt carries the PR head observed before Respond so completion can
+    verify a requested push actually advanced that baseline. Returns ``None`` when the branch is
+    not an agentflow PR branch or either immutable target is missing."""
     from agentflow.coordinator import Submission
     from agentflow.gate import respond_reply_disclaimer
     from agentflow.loop import _BRANCH_RE, RESPOND_PROMPT, _builder_worktree
     m = _BRANCH_RE.match(branch or "")
-    if m is None or not target:
+    if m is None or not target or not baseline:
         return None
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
     brief = RESPOND_PROMPT.format(
-        n=pr_number, comment=comment, disclaimer=respond_reply_disclaimer(str(target)))
+        n=pr_number, comment=comment, baseline=baseline,
+        disclaimer=respond_reply_disclaimer(str(target)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="respond", target=str(target),
         pool=tool, complexity="deep", source=_builder_worktree(cfg, tool, n, sl),
@@ -779,7 +781,7 @@ def _reply_ready(record, obs) -> bool:
 
     A record without that exact targeted reply stays incomplete. Live orchestration; exercised
     through the Coordinator/Respond adapter seam in ``tests/test_respond_tracer.py``."""
-    from agentflow.gate import respond_reply_posted
+    from agentflow.gate import respond_reply_change, respond_reply_posted
     from agentflow.loop import _pr_comments, _run
     parsed = _source_facts(record)
     if parsed is None:
@@ -791,12 +793,19 @@ def _reply_ready(record, obs) -> bool:
     comments = _pr_comments(record.repo, pr.get("number"))
     if comments is None or not respond_reply_posted(comments, record.target or ""):
         return False   # no durable reply bound to this record's maintainer-comment target
+    change = respond_reply_change(comments, record.target or "")
+    baseline_match = re.search(r"agentflow-respond-baseline:([^\s>]+)", record.input_ptr or "")
+    baseline = baseline_match.group(1) if baseline_match is not None else ""
+    if not change or not baseline:
+        return False
     # A reply exists. The owned worktree is mandatory evidence: without it there is no way to
     # prove that a requested branch change was either pushed or never left locally. Fail closed and
     # let preparation recover the PR branch before another attempt.
     if not wt.exists():
         return False
     head = pr.get("headRefOid") or ""
+    if change != "none" and (change == baseline or change != head):
+        return False
     fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
     if fetched.returncode != 0:
         return False
