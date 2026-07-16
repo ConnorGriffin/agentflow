@@ -1,0 +1,603 @@
+<!DOCTYPE html>
+<!--
+  LOCKED visual spec — agentflow project workspace (Wayfinder #128).
+  Locked 2026-07-16. This is the binding proof-of-match target for the
+  implementation; build to this, don't re-derive it.
+
+  Direction: the workspace where the operator decides what gets built for one
+  repo. Chosen from a convergence of three round-2 variants —
+    · shelf topology: efforts as a single urgency-ordered column (queue instinct),
+      rendered in THREE visual weights by how much a decision needs you:
+      awaiting = elevated copper "document" card · mid-loop map = flat bordered
+      panel · background work (active milestone, not-started maps) = borderless
+      ledger sections.
+    · anchored Ask composer: the dock is only the Ask panel; prioritization lives
+      in the shelf ordering, not the dock.
+  Language: daylight-white / instrument-teal, COPPER reserved exclusively for
+  "awaiting your decision"; Newsreader (serif, the thinking voice) + Inter (sans,
+  chrome); light + dark; mono only for hashes. WCAG AA verified both themes.
+  Honesty (ADR 0034): a Conversation turn is a bounded background session — turn
+  states (running / queued / parked) are shown, never faked as live chat; approve
+  is a two-beat hash-bound publish → verified receipt.
+  Routing: every view has a URL (#/<project>/<map|approve|ask>/<id>) so Back and
+  direct links work.
+  Data contract: workspace.capture.json (ADR 0033 daemon projection; gitignored,
+  synthetic — regenerate to render).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentflow — workspace · combined (convergence)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400;1,6..72,500&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; }
+
+  :root {
+    color-scheme: light;
+    --bg: oklch(1 0 0);
+    --surface: oklch(0.97 0.004 210);
+    --border: oklch(0.90 0.006 210);
+    --ink: oklch(0.22 0.015 210);
+    --muted: oklch(0.48 0.02 210);
+    --primary: oklch(0.58 0.11 188);
+    --accent: oklch(0.62 0.13 55);
+    --success: oklch(0.58 0.12 150);
+    --danger: oklch(0.55 0.16 25);
+    /* darker fills for solid buttons so white text clears WCAG AA 4.5:1 in light */
+    --primary-strong: oklch(0.53 0.12 188);
+    --accent-strong: oklch(0.55 0.15 55);
+
+    /* derived (recompute per theme via the vars above) */
+    --on-primary: oklch(1 0 0);
+    --on-accent: oklch(1 0 0);
+    --card: oklch(1 0 0);
+    --recess: oklch(0.97 0.004 210);
+    --primary-ink: color-mix(in oklab, var(--primary) 66%, var(--ink));
+    --accent-ink: color-mix(in oklab, var(--accent) 60%, var(--ink));
+    --success-ink: color-mix(in oklab, var(--success) 60%, var(--ink));
+    --primary-wash: color-mix(in oklab, var(--primary) 8%, var(--bg));
+    --accent-wash: color-mix(in oklab, var(--accent) 9%, var(--bg));
+    --shadow: 0 1px 2px oklch(0.25 0.02 210 / 0.05), 0 14px 30px -22px oklch(0.25 0.02 210 / 0.28);
+    --dock-shadow: 0 -10px 28px -24px oklch(0.2 0.02 210 / 0.45);
+
+    /* semantic z scale: content 0 · header chrome 10 · docked composer 15 · transient notes 20 */
+    --z-header: 10;
+    --z-dock: 15;
+    --z-note: 20;
+
+    --serif: "Newsreader", Georgia, serif;
+    --sans: "Inter", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+    /* fixed rem scale, ratio ~1.2, body 15px */
+    --fs--1: 0.75rem;
+    --fs-0: 0.8125rem;
+    --fs-1: 0.9375rem;
+    --fs-2: 1.125rem;
+    --fs-3: 1.375rem;
+    --fs-4: 1.625rem;
+    --fs-5: 2rem;
+
+    --dock-h: 88px; /* just the Ask panel; kept true by a ResizeObserver */
+    --content-max: 1180px;
+    --gutter: 24px; /* shared by header, main, and the dock so their edges align */
+  }
+
+  [data-theme="dark"] {
+    color-scheme: dark;
+    --bg: oklch(0.14 0.008 210);
+    --surface: oklch(0.19 0.01 210);
+    --border: oklch(0.30 0.012 210);
+    --ink: oklch(0.93 0.005 210);
+    --muted: oklch(0.68 0.012 210);
+    --primary: oklch(0.72 0.09 188);
+    --accent: oklch(0.70 0.12 55);
+    --success: oklch(0.70 0.11 150);
+    --danger: oklch(0.68 0.14 25);
+    --on-primary: oklch(0.14 0.008 210);
+    --on-accent: oklch(0.14 0.008 210);
+    --primary-strong: var(--primary);
+    --accent-strong: var(--accent);
+    --card: oklch(0.19 0.01 210);
+    --recess: oklch(0.165 0.009 210);
+    --shadow: 0 1px 2px oklch(0 0 0 / 0.35), 0 14px 30px -22px oklch(0 0 0 / 0.55);
+    --dock-shadow: 0 -10px 28px -24px oklch(0 0 0 / 0.6);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --bg: oklch(0.14 0.008 210);
+      --surface: oklch(0.19 0.01 210);
+      --border: oklch(0.30 0.012 210);
+      --ink: oklch(0.93 0.005 210);
+      --muted: oklch(0.68 0.012 210);
+      --primary: oklch(0.72 0.09 188);
+      --accent: oklch(0.70 0.12 55);
+      --success: oklch(0.70 0.11 150);
+      --danger: oklch(0.68 0.14 25);
+      --on-primary: oklch(0.14 0.008 210);
+      --on-accent: oklch(0.14 0.008 210);
+      --primary-strong: var(--primary);
+      --accent-strong: var(--accent);
+      --card: oklch(0.19 0.01 210);
+      --recess: oklch(0.165 0.009 210);
+      --shadow: 0 1px 2px oklch(0 0 0 / 0.35), 0 14px 30px -22px oklch(0 0 0 / 0.55);
+      --dock-shadow: 0 -10px 28px -24px oklch(0 0 0 / 0.6);
+    }
+  }
+
+  html { font-size: 16px; }
+  body {
+    font: 400 var(--fs-1)/1.5 var(--sans);
+    background: var(--bg);
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; overflow: hidden;
+    clip: rect(0 0 0 0); white-space: nowrap;
+  }
+
+  .ref { font-family: var(--mono); font-size: 0.86em; }
+  .dim { color: var(--muted); font-weight: 400; }
+
+  /* ---------- mock chrome (variant bar) ---------- */
+  .mockbar {
+    display: flex; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px;
+    padding: 6px 24px;
+    font-size: var(--fs--1); color: var(--muted);
+    background: var(--recess);
+    border-bottom: 1px solid var(--border);
+  }
+  .mockbar a { color: inherit; text-underline-offset: 2px; }
+  .mockbar strong { color: var(--ink); font-weight: 600; }
+
+  /* ---------- header ---------- */
+  .top {
+    position: relative; z-index: var(--z-header);
+    width: 100%; max-width: var(--content-max); margin: 0 auto;
+    padding: 20px var(--gutter) 8px;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .brand { display: flex; align-items: baseline; gap: 9px; margin-right: 8px; }
+  .brand-name { font-family: var(--serif); font-weight: 600; font-size: var(--fs-2); letter-spacing: -0.01em; }
+  .brand-sub { font-size: var(--fs-0); color: var(--muted); }
+  select {
+    font: 500 var(--fs-0)/1.3 var(--sans);
+    color: var(--ink); background: var(--card);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 7px 10px; max-width: 100%;
+  }
+  .top-links { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .quiet-link { color: var(--muted); font-size: var(--fs-0); text-decoration: none; padding: 6px 8px; border-radius: 6px; }
+  .quiet-link:hover { color: var(--ink); text-decoration: underline; text-underline-offset: 3px; }
+
+  main {
+    width: 100%; max-width: var(--content-max); margin: 0 auto;
+    padding: 10px var(--gutter) calc(var(--dock-h) + 36px);
+    flex: 1;
+  }
+
+  /* Enhancement only — content is visible by default; the reveal never gates it
+     (throttled/headless renders may not run the animation). Transform, not opacity. */
+  .view { animation: rise 0.18s ease-out both; }
+  .view:focus { outline: none; } /* focus moved here for screen readers, not a visible ring */
+  @keyframes rise { from { transform: translateY(5px); } to { transform: none; } }
+
+  /* ---------- buttons ---------- */
+  .btn {
+    display: inline-flex; align-items: center; gap: 7px;
+    font: 600 var(--fs-0)/1.25 var(--sans);
+    border-radius: 8px; padding: 9px 15px;
+    border: 1px solid transparent;
+    background: transparent; color: var(--ink);
+    cursor: pointer;
+    transition: background-color 0.16s ease-out, border-color 0.16s ease-out, color 0.16s ease-out;
+  }
+  .btn--copper { background: var(--accent-strong); color: var(--on-accent); }
+  .btn--copper:hover { background: color-mix(in oklab, var(--accent-strong) 88%, var(--ink)); }
+  .btn--teal { background: var(--primary-strong); color: var(--on-primary); }
+  .btn--teal:hover { background: color-mix(in oklab, var(--primary-strong) 88%, var(--ink)); }
+  .btn--quiet { border-color: var(--border); }
+  .btn--quiet:hover { border-color: var(--muted); }
+  .btn--ghost { color: var(--muted); }
+  .btn--ghost:hover { color: var(--ink); }
+  .btn--danger-quiet { color: var(--danger); }
+  .btn--danger-quiet:hover { text-decoration: underline; text-underline-offset: 3px; }
+  .btn--sm { padding: 6px 11px; }
+  .linklike {
+    background: none; border: none; padding: 0; cursor: pointer;
+    font: inherit; color: var(--primary-ink);
+    text-decoration: underline; text-underline-offset: 3px;
+  }
+  :is(.btn, .linklike, a, select, textarea, .sug):focus-visible {
+    outline: 2px solid var(--primary); outline-offset: 2px;
+  }
+
+  /* ---------- pills, tags & icons ---------- */
+  .icon { display: inline-flex; width: 12px; height: 12px; flex: none; vertical-align: -1px; }
+  .icon svg { width: 100%; height: 100%; display: block; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    font: 600 var(--fs--1)/1.2 var(--sans);
+    padding: 4px 9px; border-radius: 99px;
+  }
+  .pill--copper { background: var(--accent-wash); color: var(--accent-ink); }
+  .pill--teal   { background: var(--primary-wash); color: var(--primary-ink); }
+  .pill--ok     { background: color-mix(in oklab, var(--success) 10%, var(--bg)); color: var(--success-ink); }
+  .pill--ghost  { border: 1px solid var(--border); color: var(--muted); }
+  .tag {
+    display: inline-flex; align-items: center; align-self: center;
+    font: 500 var(--fs--1)/1.2 var(--sans); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 99px;
+    padding: 2px 9px; white-space: nowrap;
+  }
+
+  /* ---------- home head + calm line ---------- */
+  .room-head { margin-top: 8px; }
+  .room-title { font-family: var(--serif); font-weight: 600; font-size: var(--fs-3); letter-spacing: -0.01em; }
+  .room-status { font-size: var(--fs-0); color: var(--muted); margin-top: 4px; }
+  .urgency--calm {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 2px; margin-top: 14px;
+    color: var(--muted); font-size: var(--fs-0);
+    border-top: 1px solid var(--border);
+  }
+  .urgency--calm .icon { color: var(--success-ink); }
+
+  /* ---------- the shelf: one column, sharpest decision first ---------- */
+  .shelf {
+    display: flex; flex-direction: column;
+    gap: 12px; margin-top: 18px;
+  }
+  .obj {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--card);
+    padding: 16px 20px;
+    box-shadow: var(--shadow);
+    min-width: 0;
+  }
+  /* Three weights, by how much a decision needs you:
+     awaiting = document (full card) · panel = mid-loop map (flat, bordered)
+     · ledger = background work (borderless, a typographic row). */
+  .obj--awaiting {
+    border-color: color-mix(in oklab, var(--accent) 42%, var(--border));
+    background: var(--accent-wash);
+  }
+  .obj--panel {
+    box-shadow: none;
+    background: var(--bg);
+  }
+  .obj--ledger {
+    min-width: 0;
+    border-top: 1px solid var(--border);
+    padding: 16px 2px 4px;
+  }
+  .obj--ledger .obj-title { font-size: var(--fs-1); }
+  .obj--ledger .obj-actions { margin-top: 12px; }
+
+  .obj-tags { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .obj-kind { font-size: var(--fs--1); color: var(--muted); }
+  .obj-title {
+    font-family: var(--serif); font-weight: 600;
+    font-size: var(--fs-2); line-height: 1.25; letter-spacing: -0.01em;
+    text-wrap: balance;
+    margin: 9px 0 2px;
+  }
+  .obj-title--sm { font-size: var(--fs-2); margin: 8px 0 2px; }
+  .obj-note { display: flex; align-items: center; gap: 8px; font-size: var(--fs-0); color: var(--muted); margin-top: 12px; }
+  .obj-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: var(--fs-0); color: var(--ink); margin-top: 8px; }
+  .obj-actions { margin-top: 18px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+
+  /* destination line: names the effort a decision advances (map → milestone → issue) */
+  .dest { display: flex; gap: 8px; align-items: baseline; font-size: var(--fs-0); color: var(--muted); margin-top: 8px; }
+  .dest > .icon { color: var(--primary); align-self: center; }
+  .dest strong { color: var(--ink); font-weight: 600; }
+  .dest--doc { font-size: var(--fs-1); margin: 12px 0 2px; }
+
+  /* published-just-now object: the verified change landed back on the shelf */
+  .obj--published {
+    border-color: color-mix(in oklab, var(--success) 40%, var(--border));
+    background: color-mix(in oklab, var(--success) 7%, var(--bg));
+  }
+
+  /* parked-draft resume affordance */
+  .resume-chip {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    text-align: left; margin: 14px 0 0; padding: 10px 14px; border-radius: 10px;
+    border: 1px dashed var(--border); background: var(--recess);
+    color: var(--ink); font: 400 var(--fs-0)/1.4 var(--sans); cursor: pointer;
+    transition: border-color 0.16s ease-out;
+  }
+  .resume-chip:hover { border-color: var(--muted); }
+  .resume-chip > .icon { color: var(--muted); align-self: center; }
+  .resume-chip > span:first-of-type { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .resume-go { flex: none; color: var(--primary-ink); font-weight: 600; }
+
+  .arc { flex: none; }
+  .arc-track { stroke: var(--border); fill: none; stroke-width: 1.5; }
+  .arc-prog { stroke: var(--primary); fill: none; stroke-width: 2.5; stroke-linecap: round; }
+  .obj-progress { display: flex; align-items: center; gap: 12px; margin: 12px 0 4px; }
+  .frac { font-size: var(--fs-0); color: var(--muted); }
+
+  .list-label { font: 600 var(--fs-0)/1.3 var(--sans); color: var(--ink); margin-top: 16px; }
+
+  .next { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 11px; }
+  .next-item { display: flex; gap: 10px; min-width: 0; }
+  .next-item > .icon { margin-top: 4px; color: var(--muted); }
+  .next-head { display: block; font-weight: 500; font-size: var(--fs-1); line-height: 1.35; }
+  .next-sub { display: block; font-size: var(--fs-0); color: var(--muted); margin-top: 1px; }
+  .next-item--copper > .icon { color: var(--accent); }
+  .next-item--copper .next-head { color: var(--accent-ink); font-weight: 600; }
+  .next-item--teal > .icon { color: var(--primary); }
+  .next-item--mute .next-head { color: var(--muted); font-weight: 400; }
+
+  /* background-turn line inside a shelf object / effort detail — honest, quiet */
+  .turnline {
+    display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap;
+    font-size: var(--fs-0); color: var(--muted);
+    margin-top: 12px; padding-top: 10px;
+    border-top: 1px dashed var(--border);
+  }
+  .turnline > .icon { margin-top: 3px; }
+  .turnline--run > .icon { color: var(--primary); }
+  .turnline-body { flex: 1 1 200px; min-width: 0; }
+  .turnline-head { color: var(--ink); font-weight: 500; }
+  .turnline .btn { align-self: center; }
+
+  /* pipeline row inside the active milestone */
+  .pipeline { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 12px; font-size: var(--fs-0); }
+  .pipe-item { display: inline-flex; align-items: baseline; gap: 7px; min-width: 0; }
+  .pipe-item > .icon { align-self: center; color: var(--muted); }
+  .pipe-item--teal > .icon { color: var(--primary); }
+  .pipe-item--ok > .icon { color: var(--success-ink); }
+  .ev {
+    font-family: var(--mono); font-size: var(--fs--1);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 2px 7px; color: var(--muted); white-space: nowrap;
+  }
+  .ev-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 12px; }
+
+  /* ---------- recently landed ---------- */
+  .landed { margin-top: 30px; }
+  .landed-row {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px;
+    padding: 10px 2px; border-top: 1px solid var(--border);
+  }
+  .landed-row:first-of-type { margin-top: 8px; }
+  .landed-title { font-weight: 500; }
+  .landed-meta { font-size: var(--fs-0); color: var(--muted); }
+  .landed-ev { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+
+  /* ---------- focused views (approval / dialogue / detail) ---------- */
+  .backrow { margin: 6px 0 18px; }
+  .doc-page, .convo { max-width: 68ch; margin: 0 auto; }
+  .page-head-meta { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; font-size: var(--fs-0); color: var(--muted); }
+  .doc-h1 {
+    font-family: var(--serif); font-weight: 600; font-size: var(--fs-4);
+    line-height: 1.2; letter-spacing: -0.01em; text-wrap: balance;
+    margin: 14px 0 6px;
+  }
+  .kind-line { font-size: var(--fs-0); color: var(--muted); margin-bottom: 18px; }
+  .prose { font-family: var(--serif); font-size: 1.0625rem; line-height: 1.65; max-width: 68ch; }
+  .sect { margin-top: 30px; }
+  .sect-h { font: 600 var(--fs-1)/1.3 var(--sans); margin-bottom: 8px; }
+  .accept { list-style: none; padding: 0; margin: 0; }
+  .accept li {
+    display: flex; gap: 10px; padding: 7px 0;
+    font-family: var(--serif); font-size: 1.0625rem; line-height: 1.5;
+  }
+  .accept .icon { margin-top: 6px; color: var(--primary); }
+  .vers { list-style: none; padding: 0; margin: 0; }
+  .vers li {
+    display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline;
+    padding: 7px 0; font-size: var(--fs-0); color: var(--muted);
+    border-top: 1px solid var(--border);
+  }
+  .vers li:first-child { border-top: none; }
+  .ver--current { color: var(--ink); }
+  .ver-note-current { color: var(--accent-ink); font-weight: 600; }
+
+  .decision { margin-top: 32px; border-top: 1px solid var(--border); padding-top: 22px; }
+  .decision-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .decision-sub { font-size: var(--fs-0); margin-top: 10px; }
+  .decision-q { font-family: var(--serif); font-size: var(--fs-2); line-height: 1.45; margin-bottom: 14px; }
+  .decision-note {
+    display: flex; gap: 10px; align-items: baseline;
+    font-size: var(--fs-0); color: var(--muted);
+    background: var(--recess); border-radius: 8px; padding: 12px 14px;
+  }
+  .decision-note .icon { color: var(--success-ink); align-self: center; }
+  .pubwait .icon { color: var(--primary); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .receipt {
+    display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline;
+    font-size: var(--fs-0); color: var(--muted); margin-top: 12px;
+  }
+
+  /* dialogue */
+  .convo-note { font-size: var(--fs-0); color: var(--muted); margin: 16px 0 4px; }
+  .turn { margin: 24px 0; }
+  .turn--operator { padding-left: 28px; }
+  .turn-meta { display: flex; gap: 10px; align-items: baseline; margin-bottom: 4px; flex-wrap: wrap; }
+  .turn-who { font: 600 var(--fs-0)/1.3 var(--sans); }
+  .turn--wayfinder .turn-who { color: var(--primary-ink); }
+  .turn-skill { font-size: var(--fs--1); color: var(--muted); }
+  .turn-text { font-family: var(--serif); font-size: 1.0625rem; line-height: 1.62; }
+
+  /* the current turn's state — a calm block, not a typing indicator (ADR 0034) */
+  .turnstate {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: var(--recess); border-radius: 10px;
+    padding: 14px 16px; margin: 26px 0;
+    font-size: var(--fs-0); color: var(--muted);
+  }
+  .turnstate > .icon { margin-top: 3px; }
+  .turnstate--parked { background: var(--accent-wash); }
+  .turnstate--parked > .icon { color: var(--accent-ink); }
+  .turnstate--parked .turnstate-head { color: var(--accent-ink); }
+  .turnstate--run > .icon { color: var(--primary); }
+  .turnstate-body { flex: 1; min-width: 0; }
+  .turnstate-head { display: block; font-weight: 600; color: var(--ink); }
+  .turnstate-sub { display: block; margin-top: 2px; line-height: 1.5; }
+  .turnstate .btn, .turnstate .tag { align-self: center; }
+
+  .attach {
+    border-top: 1px solid color-mix(in oklab, var(--accent) 35%, var(--border));
+    border-bottom: 1px solid color-mix(in oklab, var(--accent) 35%, var(--border));
+    padding: 16px 0; margin: 28px 0;
+  }
+  .attach-title { font-family: var(--serif); font-weight: 600; font-size: var(--fs-2); margin: 8px 0 4px; text-wrap: balance; }
+  .attach-meta { font-size: var(--fs-0); color: var(--muted); }
+  .attach-actions { margin-top: 12px; }
+  .context-note {
+    font-family: var(--serif); font-size: 1.0625rem; line-height: 1.6;
+    color: var(--muted); max-width: 68ch; margin-top: 18px;
+  }
+
+  /* effort detail */
+  .detail-head { max-width: 78ch; }
+  .detail-meta { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 10px; }
+  .settled-list { list-style: none; padding: 0; margin: 10px 0 0; display: grid; gap: 14px; }
+  .settled-item { display: flex; gap: 10px; min-width: 0; }
+  .settled-item > .icon { margin-top: 4px; color: var(--success-ink); }
+  .settled-head { display: block; font-weight: 500; font-size: var(--fs-1); }
+  .settled-ev { display: block; font-size: var(--fs-0); color: var(--muted); margin-top: 3px; }
+  .hist { list-style: none; padding: 0; margin: 10px 0 0; }
+  .hist li { padding: 12px 2px; border-top: 1px solid var(--border); }
+  .hist li:first-child { border-top: none; }
+  .hist-title { font-weight: 500; }
+  .hist-meta { font-size: var(--fs-0); color: var(--muted); margin-top: 2px; }
+  .hist-outcome {
+    font-family: var(--serif); font-style: italic; font-size: var(--fs-1);
+    color: color-mix(in oklab, var(--ink) 75%, var(--muted));
+    margin-top: 5px; max-width: 68ch;
+  }
+
+  /* ---------- empty state ---------- */
+  .empty2 { margin-top: 22px; max-width: 46rem; }
+  .empty2-lead { font-family: var(--serif); font-size: var(--fs-2); line-height: 1.4; margin-bottom: 16px; }
+
+  .load-error { margin-top: 40px; color: var(--muted); }
+
+  /* ---------- the anchored dock: the workspace's one constant ---------- */
+  #dock {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: var(--z-dock);
+    background: var(--bg);
+    border-top: 1px solid var(--border);
+    box-shadow: var(--dock-shadow);
+    padding: 10px 0 calc(12px + env(safe-area-inset-bottom));
+  }
+  .dock-inner { max-width: var(--content-max); margin: 0 auto; padding: 0 var(--gutter); }
+  .sugs { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+  .sug {
+    display: flex; align-items: baseline; gap: 10px;
+    width: 100%; text-align: left;
+    padding: 9px 14px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    cursor: pointer;
+    font: 400 var(--fs-0)/1.45 var(--sans); color: var(--ink);
+    transition: background-color 0.16s ease-out, border-color 0.16s ease-out;
+  }
+  .sug:hover { background: var(--surface); }
+  .sug > .icon { align-self: center; color: var(--muted); }
+  .sug-text { flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+  .sug-q { font-family: var(--serif); font-weight: 500; font-size: var(--fs-1); }
+  .dock-row { display: flex; gap: 8px; align-items: flex-end; }
+  #composer {
+    flex: 1; min-width: 0; resize: none;
+    font: 500 1.0625rem/1.5 var(--serif); color: var(--ink);
+    background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 14px;
+    min-height: 46px; max-height: 160px;
+  }
+  #composer::placeholder { color: var(--muted); font-style: italic; opacity: 1; }
+  #composer:focus {
+    outline: none; border-color: var(--primary);
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--primary) 22%, transparent);
+  }
+  .dock-send {
+    flex: none; display: inline-flex; align-items: center;
+    height: 46px; padding: 0 18px;
+    background: var(--primary-strong); color: var(--on-primary);
+    border: none; border-radius: 10px; cursor: pointer;
+    font: 600 var(--fs-0)/1 var(--sans);
+    transition: background-color 0.16s ease-out;
+  }
+  .dock-send:hover { background: color-mix(in oklab, var(--primary-strong) 88%, var(--ink)); }
+  .dock-hint { margin-top: 6px; font-size: var(--fs--1); color: var(--muted); }
+
+  /* ---------- responsive ---------- */
+  @media (max-width: 560px) {
+    :root { --gutter: 16px; }
+    .top { padding-top: 14px; }
+    .turn--operator { padding-left: 12px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .view { animation: none; }
+    .btn, .sug, .dock-send { transition: none; }
+    .pubwait .icon { animation: none; }
+    * { scroll-behavior: auto !important; }
+  }
+</style>
+</head>
+<body>
+
+<!-- MOCK-ONLY: not part of the real app -->
+<nav class="mockbar" aria-label="Mockup status">
+  <span><strong>LOCKED visual spec</strong> · agentflow project workspace (#128) · data from <span class="ref">workspace.capture.json</span></span>
+  <span>shelf topology + anchored Ask composer + queue prioritization</span>
+</nav>
+<!-- /MOCK-ONLY -->
+
+<header class="top">
+  <div class="brand">
+    <span class="brand-name">agentflow</span>
+    <span class="brand-sub">workspace</span>
+  </div>
+  <label class="switcher">
+    <span class="visually-hidden">Project</span>
+    <select id="project-select"></select>
+  </label>
+  <div class="top-links">
+    <a class="quiet-link" href="dashboard-v2-combined.html">Fleet console ↗</a>
+    <!-- MOCK-ONLY: theme toggle for reviewing both themes -->
+    <button id="theme-toggle" class="btn btn--ghost btn--sm" type="button">Theme</button>
+    <!-- /MOCK-ONLY -->
+  </div>
+</header>
+
+<p id="live-status" class="visually-hidden" aria-live="polite" role="status"></p>
+
+<main id="app">
+  <noscript><p class="load-error">This mockup renders from <span class="ref">workspace.capture.json</span> and needs JavaScript.</p></noscript>
+</main>
+
+<!-- The anchored composer: just the Ask panel. It never moves; the room transforms around it. -->
+<div id="dock" role="region" aria-label="Ask Wayfinder">
+  <div class="dock-inner">
+    <form id="dock-form" autocomplete="off">
+      <div class="dock-row">
+        <label class="visually-hidden" for="composer">Ask Wayfinder</label>
+        <textarea id="composer" rows="1" placeholder="What should we work on?"></textarea>
+        <button id="dock-send" class="dock-send" type="submit">Ask</button>
+      </div>
+      <p id="dock-hint" class="dock-hint"></p>
+    </form>
+  </div>
+</div>
+
+<script src="./workspace-combined.js"></script>
+</body>
+</html>
