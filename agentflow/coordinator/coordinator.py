@@ -42,7 +42,8 @@ SUPERVISOR_WINDOW = 2 * 3600              # observe-until horizon stamped at adm
 # The required-outcome noun each stage proves, for the completion log line (ADR 0028).
 _OUTCOME_LABEL = {
     "intake": "route parsed", "build": "pr opened", "review": "verdict recorded",
-    "revise": "revision pushed", "mockup": "mockup committed", "respond": "reply posted"}
+    "revise": "revision pushed", "mockup": "mockup committed", "respond": "reply posted",
+    "converse": "reply appended"}
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,8 @@ class Submission:
                                     # genuinely new stage with a fresh budget
     descendant_of: str | None = None  # a subagent shares this root stage's one reservation
     transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
+    interactive: bool = False         # operator-present (Ask) turn: admission priority over
+                                      # background pipeline work (ADR 0034)
 
 
 @dataclass(frozen=True)
@@ -147,7 +150,7 @@ class Coordinator:
             builder_complexity=submission.builder_complexity, round=submission.round,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
-            created_at=int(time.time()))
+            interactive=submission.interactive, created_at=int(time.time()))
         with self._lock:
             successor, prior, transferred, root = self._store.submit(
                 record, submission.transfer_from)
@@ -197,11 +200,15 @@ class Coordinator:
             waiting = [r for r in self._records.values()
                        if r.pool == pool and r.state == WAITING and not r.hold_pending
                        and r.root is None]  # descendants share the root's reservation, never admit
+            # An operator's interactive turn (an Ask) outranks background pipeline work at
+            # admission (ADR 0034): it sorts to the head of each queue. This only reorders
+            # admission — the permit/gate/pool checks below still gate every start unchanged, so
+            # priority never bypasses budgets, permits, or pool saturation.
             continuations = sorted(
                 (r for r in waiting if r.continuation and r.eligible_at <= now),
-                key=lambda r: (r.eligible_at, r.created_at, r.identity))
+                key=lambda r: (not r.interactive, r.eligible_at, r.created_at, r.identity))
             cold = sorted((r for r in waiting if not r.continuation),
-                          key=lambda r: r.identity)
+                          key=lambda r: (not r.interactive, r.identity))
             for record in continuations:
                 # An admission (permit/gate) refusal or a launch that never started blocks the
                 # pool head-of-line (ADR 0029); only a preparation miss is skipped, since it

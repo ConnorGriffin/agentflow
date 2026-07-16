@@ -1,11 +1,15 @@
 """Dashboard v2 web server (ADR 0023) — FastAPI console over the daemon's snapshot.
 
-Serves the built Svelte console and one read-only endpoint, `GET /api/snapshot`,
-whose body is the fleet snapshot the daemon last published (ADR 0026). This server
-**never queries GitHub**: the daemon produces the snapshot once per tick and writes
-it to a state file; any number of tabs and servers read that same file for free.
-With the daemon down the console serves the last snapshot, honestly aged by its
-`gh_fresh_at` stamp; before a daemon has ever run it serves an empty fleet.
+Serves the built Svelte console and read-only endpoints whose bodies are the projections the
+daemon last published (ADR 0026): `GET /api/snapshot` is the fleet snapshot and
+`GET /api/workspace` is the Project-workspace read model (ADR 0033). This server **never queries
+GitHub and never opens either SQLite store**: the daemon produces every projection once per tick
+and writes it to a state file; any number of tabs and servers read that same file for free.
+
+Writes are different (ADR 0033): `POST /api/command` is a thin transport to the daemon's local
+command channel. The web server validates transport concerns and enqueues the command with its
+idempotency key and expected aggregate revision — it never applies a domain transition itself. If
+the daemon is down the command fails *unavailable*; there is no direct-write fallback.
 
     uv run agentflow-web        # build the console first: see agentflow/webui/README.md
 """
@@ -16,8 +20,22 @@ from collections.abc import Callable
 from pathlib import Path
 
 from agentflow import live
+from agentflow.coordinated_converse import read_projection
+from agentflow.workspace import channel
 
 DIST = Path(__file__).parent / "webui" / "dist"
+
+# The command fields the transport requires per kind. The web layer validates only shape — the
+# daemon owns every domain rule (ADR 0033).
+_REQUIRED = {
+    "open_ask": ("key", "repo", "conversation_id", "prompt"),
+    "send_turn": ("key", "repo", "conversation_id", "prompt", "expected_revision"),
+}
+
+# What the console sees before any daemon has published a workspace projection: an empty
+# workspace with no projects — the same contract shape, never an error (ADR 0033).
+EMPTY_WORKSPACE = {"workspace": {"read_model_at": None, "revision": 0, "available": False},
+                   "projects": []}
 
 # What the console sees before any daemon has ever published: an empty fleet with no
 # freshness stamp — the same contract shape, never an error (ADR 0026).
@@ -35,10 +53,14 @@ def create_app(
     read: Callable[[], dict | None] = live.read_snapshot,
     *,
     dist: Path = DIST,
+    read_workspace: Callable[[], dict | None] = read_projection,
+    available: Callable[[], bool] = channel.daemon_available,
+    enqueue: Callable[[dict], None] = channel.enqueue,
 ):
-    """Build the FastAPI app: the daemon-published snapshot plus the built console."""
-    from fastapi import FastAPI
-    from fastapi.responses import PlainTextResponse
+    """Build the FastAPI app: the daemon-published projections, the command transport, and the
+    built console."""
+    from fastapi import Body, FastAPI
+    from fastapi.responses import JSONResponse, PlainTextResponse
     from fastapi.staticfiles import StaticFiles
 
     app = FastAPI(title="agentflow console", docs_url=None, redoc_url=None)
@@ -47,6 +69,36 @@ def create_app(
     def api_snapshot():
         snap = read()
         return NEVER_RAN if snap is None else snap
+
+    @app.get("/api/workspace")
+    def api_workspace():
+        """The daemon-published workspace read model, file-only (ADR 0033). Before any daemon has
+        published one, an empty workspace — the same contract shape, never an error."""
+        projection = read_workspace()
+        return EMPTY_WORKSPACE if projection is None else projection
+
+    @app.post("/api/command")
+    def api_command(command: dict = Body(...)):
+        """Transport one workspace command to the daemon's command channel (ADR 0033). Validates
+        only transport shape — the daemon applies every domain rule. Fails *unavailable* when the
+        daemon is down; there is no direct-write fallback."""
+        kind = command.get("kind") if isinstance(command, dict) else None
+        required = _REQUIRED.get(kind)
+        if required is None:
+            return JSONResponse({"status": "rejected", "error": "unknown command kind"},
+                                status_code=400)
+        missing = [f for f in required if command.get(f) in (None, "")]
+        if missing:
+            return JSONResponse(
+                {"status": "rejected", "error": f"missing fields: {', '.join(missing)}"},
+                status_code=400)
+        if not available():
+            return JSONResponse(
+                {"status": "unavailable",
+                 "error": "the daemon is not running; no command was applied"},
+                status_code=503)
+        enqueue(command)
+        return JSONResponse({"status": "queued", "key": command["key"]}, status_code=202)
 
     # The console SPA is a static build; mount it last so /api/* wins. Serving is a
     # no-op until `npm run build` has produced dist/ (see agentflow/webui/README.md).
