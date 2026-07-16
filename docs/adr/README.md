@@ -71,6 +71,8 @@ then Context / Decision / Alternatives / Consequences.
   ceiling: operator activity selects the daemon's ceiling (85% idle / 50% active,
   paced) instead of hard-stopping dispatch; gate reports facts, balancer owns
   policy (rides 0023's concurrency slice).
+- [0026](0026-daemon-owned-snapshot.md) — The daemon is the sole producer of the
+  snapshot; web reads local published state and never queries GitHub.
 - [0027](0027-wayfinder-planning-boundary.md) — Wayfinder planning artifacts stay
   upstream of intake; only the build tickets wayfinder files enter agentflow.
 - [0028](0028-stage-scoped-continuations.md) — Continuations are durable,
@@ -89,3 +91,6 @@ then Context / Decision / Alternatives / Consequences.
 - [0032](0032-shared-global-agent-instructions.md) — Claude and Codex share one
   machine-global instruction file; the engineering charter remains canonical and
   referenced by both.
+- [0033](0033-project-workspace-state-and-control-plane.md) — The daemon alone owns
+  local Project/Conversation/Proposal state and projections; GitHub and default-branch
+  git remain authoritative for published artifacts.
