@@ -9,10 +9,9 @@ the running-record ledger, the crash-safe provider start handshake, outcome-firs
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
 
-This slice is intentionally dormant: no production pipeline stage submits work here yet, so
-the current legacy pipeline behavior cannot change. It makes the later Build tracer small
-enough to review while proving the interface and the crash boundaries with an injected
-launcher, gate, and observer.
+Build is the first production stage behind this coordinator (issue #103); every other logical
+stage remains queued behind the admission gate until its own tracer lands. The interface and
+crash boundaries remain exercised with injected launcher, gate, and observer collaborators.
 """
 
 from __future__ import annotations
@@ -28,6 +27,17 @@ from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
 from agentflow.coordinator.store import Store, default_store_path
+
+# The observe-until window a recovered running attempt is logged against (ADR 0028's
+# supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
+# stable deadline after a restart.
+CONTINUATION_BUDGET = ATTEMPT_BUDGET - 1  # the two automatic continuations after the first try
+SUPERVISOR_WINDOW = 2 * 3600              # observe-until horizon stamped at admission, for the log
+
+# The required-outcome noun each stage proves, for the completion log line (ADR 0028).
+_OUTCOME_LABEL = {
+    "intake": "route parsed", "build": "pr opened", "review": "verdict recorded",
+    "revise": "revision pushed", "mockup": "mockup committed", "respond": "reply posted"}
 
 
 @dataclass(frozen=True)
@@ -77,18 +87,28 @@ class Coordinator:
     exercised with fakes: a **launcher** that starts a provider family and reports its
     liveness, an admission **gate** (the composed headroom/ceiling/cap/pacing check), and a
     stage **adapter** that observes an ended family and verifies its stage outcome. Production
-    uses the real spawning launcher with pid liveness; the gate and adapter default to
-    permissive/never-verified stubs until the live stages supply them. None of these is a
+    uses the real spawning launcher with pid liveness; a bare coordinator keeps permissive/
+    never-verified defaults, while the live Build tracer supplies its gate and adapter. None is a
     public operation — the only public surface is ``submit_stage`` and ``cycle``.
     """
 
-    def __init__(self, *, launcher=None, gate=None, adapter=None) -> None:
+    def __init__(self, *, launcher=None, gate=None, adapter=None, log=None) -> None:
         self._store = Store(default_store_path())
         self._launcher = launcher or LocalLauncher()
         self._gate = gate or _admit_everything
         self._adapter = adapter or _DefaultAdapter()
+        # A stage adapter that owns branch/worktree recovery may reject admission before it
+        # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
+        # An adapter with no prepare (the read-only default) is always ready.
+        self._prepare = getattr(self._adapter, "prepare", None) or (lambda _record: True)
+        self._log = log or (lambda _line: None)
         self._lock = threading.RLock()
         self._records: dict[str, Record] = self._store.load()
+        # In-memory bookkeeping (reset on restart, which is correct): identities this process
+        # started, so reconciliation only logs "recovered running" for a family it did not just
+        # launch — i.e. one found alive after a fresh coordinator reloaded the durable store.
+        self._started_here: set[str] = set()
+        self._recovered_logged: set[str] = set()
 
     # --- public interface ---------------------------------------------------------------
 
@@ -110,6 +130,7 @@ class Coordinator:
                           and submission.pool == submission.builder_lineage)
         record = Record(
             identity=identity, stage=stage, pool=submission.pool,
+            repo=submission.repo, subject=str(submission.subject), target=submission.target,
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
@@ -145,6 +166,9 @@ class Coordinator:
             prior.claim = False
             prior.retired = True
             self._persist(prior)
+            self._emit(prior, f"attempt {prior.attempts}/{ATTEMPT_BUDGET} completed — "
+                              f"{_OUTCOME_LABEL.get(prior.stage, prior.stage)}; "
+                              f"claim transferred to {record.stage}")
 
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
         """Reconcile, returning the stage outcomes and holds settled this cycle, then admit
@@ -162,10 +186,13 @@ class Coordinator:
             cold = sorted((r for r in waiting if not r.continuation),
                           key=lambda r: r.identity)
             for record in continuations:
-                if not self._admit(record):
-                    return outcomes  # first blocked continuation stops the pool this cycle
+                # An admission (permit/gate) refusal or a launch that never started blocks the
+                # pool head-of-line (ADR 0029); only a preparation miss is skipped, since it
+                # reserved nothing and can retry next cycle without holding capacity hostage.
+                if self._admit(record, now) not in ("started", "unprepared"):
+                    return outcomes
             for record in cold:
-                self._admit(record)
+                self._admit(record, now)
             return outcomes
 
     # --- reconciliation -----------------------------------------------------------------
@@ -181,6 +208,11 @@ class Coordinator:
         self._records = self._store.load()
         outcomes: list[StageOutcome] = []
         for record in list(self._records.values()):
+            if record.hold_pending:
+                outcome = self._finalize_hold(record)
+                if outcome is not None:
+                    outcomes.append(outcome)
+                continue
             if record.state != RUNNING:
                 continue
             if record.start_fact == NOT_STARTED:
@@ -206,20 +238,36 @@ class Coordinator:
                     outcome = self._finalize(record)
                     if outcome is not None:
                         outcomes.append(outcome)
-                elif not was_committed:
-                    self._persist(record)
+                else:
+                    # A family found alive that this process did not itself launch is a
+                    # recovered running attempt — observed, never re-launched, claim retained.
+                    if (record.identity not in self._started_here
+                            and record.identity not in self._recovered_logged):
+                        self._recovered_logged.add(record.identity)
+                        self._emit(record, f"recovered running attempt {record.attempts}/"
+                                          f"{ATTEMPT_BUDGET} pid {record.family} — observing "
+                                          f"until {record.deadline}; claim retained")
+                    if not was_committed:
+                        self._persist(record)
         return outcomes
 
     # --- admission ----------------------------------------------------------------------
 
-    def _admit(self, record: Record) -> bool:
-        if not self._begin_start(record):
-            return False
+    def _admit(self, record: Record, now: int) -> str:
+        """Try to start one attempt. Returns ``unprepared`` (the stage adapter refused before
+        admission — no permit, no attempt), ``blocked`` (admission/permits refused), ``started``
+        (a provider family exists and an attempt was consumed), or ``not_started`` (admitted but
+        no provider came into existence — no attempt consumed)."""
+        if not self._prepare(record):
+            return "unprepared"
+        if not self._begin_start(record, now):
+            return "blocked"
         result = self._launcher.start(record, self._store)
+        self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
-        return result.fact == STARTED
+        return STARTED if result.fact == STARTED else "not_started"
 
-    def _begin_start(self, record: Record) -> bool:
+    def _begin_start(self, record: Record, now: int) -> bool:
         if (record.state != WAITING or record.hold_pending
                 or record.attempts >= ATTEMPT_BUDGET):
             return False
@@ -241,6 +289,8 @@ class Coordinator:
         record.family = None
         record.process_alive = False
         record.attempt_committed = False  # a fresh attempt has not been consumed yet
+        record.started_at = now
+        record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
         if not self._store.reserve(record, PERMIT_BUDGET):
             record.state = WAITING  # the pool cannot fit this demand right now
             record.start_fact = None
@@ -257,8 +307,15 @@ class Coordinator:
             self._persist(record)
             return
         record.family = family or record.family
+        was_continuation = record.continuation
         self._consume_attempt(record)
         self._persist(record)
+        if was_continuation:
+            done = record.attempts - 1  # continuations completed before this one
+            self._emit(record, f"continuation {done}/{CONTINUATION_BUDGET} "
+                              f"(attempt {record.attempts}/{ATTEMPT_BUDGET}) → {record.pool}")
+        else:
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} → {record.pool}")
 
     def _consume_attempt(self, record: Record) -> None:
         """Consume exactly one attempt for a durable ``started``. Idempotent: a recovery that
@@ -281,29 +338,49 @@ class Coordinator:
             record.state = COMPLETED
             self._persist(record)
             self._retire_descendants(record)
+            # A completed stage keeps its claim until the next stage transfers it (ADR 0028);
+            # the transfer line is emitted when that next stage is submitted.
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed — "
+                              f"{_OUTCOME_LABEL.get(record.stage, record.stage)}; claim retained")
             return StageOutcome(record.identity, record.stage, "completed")
         label = obs.classification()
+        cause = obs.cause.value
         if label == "permanent":
             self._hold(record)
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
+                              f"permanent; held for human; claim released")
         elif record.attempts < ATTEMPT_BUDGET:
             record.state = WAITING
             record.continuation = True
             record.eligible_at = obs.reset_at or 0
             self._persist(record)
+            done = record.attempts  # continuations begun after this interruption
+            when = f"at {record.eligible_at}" if record.eligible_at else "next cycle"
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
+                              f"({cause}) — continuation {done}/{CONTINUATION_BUDGET} eligible "
+                              f"{when}; claim retained")
             return None
         else:
             self._hold(record)
-        # The dormant slice owns the human handoff itself; a real stage adapter proves it in
-        # the live pipeline. Finalizing it here is idempotent and crash-safe.
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
+                              f"({cause}) — continuation budget exhausted; held for human; "
+                              f"claim released")
+        # The stage adapter proves a live external handoff; the coordinator then finalizes it
+        # idempotently and crash-safely.
         return self._finalize_hold(record)
 
     def _finalize_hold(self, record: Record) -> StageOutcome | None:
         if not record.hold_pending:
             return None
         if record.handoff_proof is None:
+            finalize = getattr(self._adapter, "finalize_hold", None)
+            proof = finalize(record) if finalize is not None else (
+                f"proof:{record.identity}:{STAGE_NATIVE_HANDOFF[record.stage]}")
+            if proof is None:
+                return None  # the external handoff is not durable yet; retry next cycle
             record.handoffs = 1
             record.handoff_kind = STAGE_NATIVE_HANDOFF[record.stage]
-            record.handoff_proof = f"proof:{record.identity}:{record.handoff_kind}"
+            record.handoff_proof = proof
             record.notifications = 1
             self._persist(record)
         record.state = HELD
@@ -337,12 +414,18 @@ class Coordinator:
     def _persist(self, record: Record) -> None:
         self._store.upsert(record)
 
+    def _emit(self, record: Record, tail: str) -> None:
+        """One stable ADR 0028 operational line: ``{repo}: {subject}: {stage}: {tail}``. The
+        prefix identifies the logical stage; the tail carries the attempt, cause, and claim
+        disposition. Provider prose and secrets never reach here — only typed causes do."""
+        self._log(f"{record.repo}: {record.subject}: {record.stage}: {tail}")
+
 
 def _identity(repo: str, subject: str, stage: str, target: str | None) -> str:
     return "|".join((repo, str(subject), stage, target or "-"))
 
 
 def _admit_everything(record: Record) -> bool:
-    """The default admission gate for the dormant slice: the permit ledger is the only limit
-    until the live stages supply the composed headroom/ceiling/cap/pacing gate (ADR 0030)."""
+    """The bare coordinator's default gate. Live tracers supply their stage gate; tests and
+    direct construction use only the private permit ledger (ADR 0030)."""
     return True

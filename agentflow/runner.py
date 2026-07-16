@@ -621,12 +621,15 @@ def _completed_agentflow_session(repo: str, lane: str, name: str,
     return False
 
 
-def recover_stale_worktrees(repo: str, workdir: str) -> WorktreeRecovery:
+def recover_stale_worktrees(repo: str, workdir: str,
+                            protected: set[str] = frozenset()) -> WorktreeRecovery:
     """Prune stale registrations and remove completed agentflow-owned sessions.
 
     Git's registry establishes repository ownership; the path is used only after
     ownership is known to recognize agentflow's current and legacy session names.
-    Completion lookups and the final clean/pushed checks all fail closed.
+    Completion lookups and the final clean/pushed checks all fail closed. ``protected`` contains
+    durable coordinator-owned sources; recovery retains them even when they are clean and no
+    provider is currently alive, because a waiting continuation still owns that worktree.
     """
     _run(["git", "-C", workdir, "worktree", "prune"])
     registered = _registered_worktrees(workdir)
@@ -644,6 +647,9 @@ def recover_stale_worktrees(repo: str, workdir: str) -> WorktreeRecovery:
         if len(relative.parts) != 2:
             continue
         lane, name = relative.parts
+        if owned_path in protected:
+            retained.append(path)
+            continue
         if _worktree_is_active(Path(path)):
             retained.append(path)
             continue

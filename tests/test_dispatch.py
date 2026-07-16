@@ -4,6 +4,8 @@ import threading
 import time
 from collections import Counter
 
+import pytest
+
 from agentflow import dispatch, gate, loop
 from agentflow.dispatch import BUILD_CONCURRENCY, STAGE_CAPS, TRIAGE_CONCURRENCY, Governor
 from agentflow.loop import RepoConfig
@@ -235,6 +237,100 @@ def test_yield_decision_is_logged_before_the_dashboard_shows_it(monkeypatch):
     monkeypatch.setattr(loop, "run_once", lambda cfg, _log=None, slot=None: "no builds")
     dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), _log=logs.append)
     assert any("claude yielding to operator" in m and "ceiling 50%" in m for m in logs)
+
+
+def test_coordinated_phase_submits_to_the_coordinator_and_skips_the_legacy_build(monkeypatch):
+    """In coordinated phase Build goes to the session coordinator, never the legacy launcher —
+    so one cycle can never launch both legacy and coordinator-owned Build work (issue #103).
+    Afterward the live board is republished as a projection of the running records."""
+    from agentflow.coordinator import COORDINATED, Phase
+    _idle_pools(monkeypatch)
+    _no_triage_no_mockup_no_respond(monkeypatch)
+    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: pytest.fail(
+        "Intake must stay queued while Build is coordinated"))
+    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
+        "Mockup must stay queued while Build is coordinated"))
+    monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
+        "Respond must stay queued while Build is coordinated"))
+    monkeypatch.setattr(loop, "run_once", lambda *a, **k: pytest.fail(
+        "legacy build must not launch while Build is coordinated"))
+    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
+                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
+    issue = {"number": 7, "title": "add a thing",
+             "labels": [{"name": "agentflow:complexity:deep"}]}
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
+    builder = type("B", (), {"tool": "claude"})()
+    monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (builder, None, ""))
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    submitted, projected = [], []
+    coord = type("C", (), {"submit_stage": lambda self, sub: submitted.append(sub)})()
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project",
+                        lambda coordinator, phase, _log=None: projected.append(coordinator) or [])
+
+    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
+                       _log=lambda _m: None)
+
+    assert len(submitted) == 1
+    assert submitted[0].stage == "build" and submitted[0].subject == "7"
+    assert projected  # running records were projected back onto the live board
+
+
+def test_draining_phase_launches_no_new_provider_stage(monkeypatch):
+    """A drain stops every new legacy provider stage and makes no coordinated submission, while
+    the coordinator keeps reconciling whatever it already owns (issue #103)."""
+    from agentflow.coordinator import DRAINING, Phase
+    _idle_pools(monkeypatch)
+    _no_triage_no_mockup_no_respond(monkeypatch)
+    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: pytest.fail(
+        "no new Intake during a drain"))
+    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
+        "no new Mockup during a drain"))
+    monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
+        "no new Respond during a drain"))
+    monkeypatch.setattr(loop, "run_once", lambda *a, **k: pytest.fail(
+        "no new legacy build during a drain"))
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: pytest.fail(
+        "no new coordinated submission during a drain"))
+    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
+                        lambda rollout, repos, sessions, **k: Phase(DRAINING))
+    reconciled = []
+    coord = object()
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project",
+                        lambda coordinator, phase, _log=None: reconciled.append(coordinator) or [])
+
+    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
+                       _log=lambda _m: None)
+
+    assert reconciled == [coord]  # existing records still reconcile; nothing new launches
+
+
+def test_unreadable_rollout_evidence_fails_closed_into_a_named_drain(monkeypatch):
+    monkeypatch.setattr(dispatch.live, "running_strict",
+                        lambda: (_ for _ in ()).throw(ValueError("partial live board")))
+    logs = []
+
+    phase = dispatch._resolve_phase(None, [RepoConfig("o/r", "/tmp")], logs.append)
+
+    assert phase.name == "draining" and not phase.launch_legacy
+    assert "partial live board" in phase.blocked_by[0]
+    assert any("draining" in line for line in logs)
+
+
+def test_coordinated_submission_requires_the_visible_build_claim(monkeypatch):
+    issue = {"number": 7, "title": "add a thing",
+             "labels": [{"name": "agentflow:complexity:deep"}]}
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
+    monkeypatch.setattr(dispatch, "pick_pair",
+                        lambda *a, **k: (type("B", (), {"tool": "claude"})(), None, ""))
+    monkeypatch.setattr(dispatch.coordinated_build, "build_submission", lambda *a: object())
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: False)
+    submitted = []
+    coord = type("C", (), {"submit_stage": lambda self, value: submitted.append(value)})()
+
+    result = dispatch._submit_coordinated_build(RepoConfig("o/r", "/tmp"), coord, None)
+
+    assert "could not claim" in result
+    assert submitted == []
 
 
 def test_merges_never_overlap_under_concurrent_builds(monkeypatch):

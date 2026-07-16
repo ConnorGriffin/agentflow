@@ -455,18 +455,19 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
             assert marker is not None
             marker.write_text(str(child.pid))
             runner_mod._ACTIVE_WORKTREES.clear()  # simulate a freshly started recovery process
-            report = recover_stale_worktrees("owner/repo", str(repo))
+            report = recover_stale_worktrees(
+                "owner/repo", str(repo), protected={os.path.realpath(legacy_two)})
     finally:
         child.terminate()
         child.wait()
 
     assert set(report.removed) == {
-        str(completed), str(legacy), str(legacy_two), str(intake), str(intake_two),
+        str(completed), str(legacy), str(intake), str(intake_two),
         str(intake_three), str(review), str(review_two),
     }
-    assert len(report.removed) == 8
+    assert len(report.removed) == 7
     assert (dirty.exists() and unpushed.exists() and active.exists() and
-            active_open_pr.exists() and active_legacy.exists())
+            active_open_pr.exists() and active_legacy.exists() and legacy_two.exists())
     assert foreign_wt.exists()
     registered = _git(repo, "worktree", "list", "--porcelain")
     assert str(completed) not in registered and str(legacy) not in registered

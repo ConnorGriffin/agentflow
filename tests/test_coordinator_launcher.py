@@ -196,3 +196,20 @@ def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tm
 
     observation = ClaudeProviderAdapter().observe(record)
     assert observation.partial_output == str(source)
+
+
+def test_coordinator_supervisor_marks_its_worktree_active(tmp_path, monkeypatch):
+    """Startup recovery sees a coordinator provider through the same PID marker it already
+    trusts for legacy sessions, so it cannot remove a clean worktree before reconciliation."""
+    from agentflow import runner
+    from agentflow.coordinator._launch_child import _clear_active, _mark_active
+
+    marker = tmp_path / "agentflow-active"
+    monkeypatch.setattr(runner, "_active_marker", lambda path: marker)
+
+    written = _mark_active(str(tmp_path))
+    assert written == marker
+    assert marker.read_text().strip().isdigit()
+
+    _clear_active(marker)
+    assert not marker.exists()

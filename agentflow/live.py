@@ -90,6 +90,38 @@ def running() -> list[dict]:
     return _entries()
 
 
+def running_strict() -> list[dict]:
+    """Every recorded live session for a safety decision.
+
+    A missing file means no session has ever been recorded. A present file that cannot be
+    read as a list is ambiguous and raises instead of looking like an idle fleet; rollout
+    uses this stricter read so corrupt current-format state can never activate coordinated
+    Build by accident.
+    """
+    try:
+        data = json.loads(LIVE_FILE.read_text())
+    except FileNotFoundError:
+        return []
+    if not isinstance(data, list):
+        raise ValueError(f"live-session state is not a list: {LIVE_FILE}")
+    return data
+
+
+def replace_projection(entries: list[dict], *, owned_worktrees: set[str] | None = None) -> None:
+    """Replace the building-stage entries on the board with the coordinator's running-record
+    projection, leaving other live sessions (legacy triage / mockup / respond) untouched. During
+    a drain, ``owned_worktrees`` limits replacement to coordinator-owned Build entries so a
+    still-running legacy Build remains visible as drain evidence. Once coordinated, omitting it
+    replaces the whole building lane. (ADR 0030, issue #103)."""
+    kept = []
+    for entry in running_strict():
+        if entry.get("stage") != "building":
+            kept.append(entry)
+        elif owned_worktrees is not None and entry.get("worktree") not in owned_worktrees:
+            kept.append(entry)
+    _write_atomic(LIVE_FILE, kept + list(entries))
+
+
 def reap(is_alive: Callable[[str], bool]) -> list[dict]:
     """Drop entries whose owning worktree is no longer alive — the dead-session sweep the
     daemon runs at startup, so a crashed run never leaves a phantom session on the board.

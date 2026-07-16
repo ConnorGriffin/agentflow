@@ -11,6 +11,8 @@ import types
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from agentflow import daemon, live
 from agentflow.daemon import PollLoop, _acquire_lock, _release_lock, cycle, main
 from agentflow.loop import RepoConfig
@@ -136,6 +138,27 @@ def test_reclaim_cycle_strips_nothing_on_github_error(monkeypatch):
 
     assert released == []
     assert any("no stale claims" in m for m in logs)
+
+
+def test_forward_rollout_preserves_build_claims_for_drain_evidence(tmp_path, monkeypatch):
+    """A coordinated request inspects legacy Build claims; the old stale-claim pass must not
+    erase them first and turn an ambiguous forward drain into a false all-clear."""
+    from agentflow.coordinator import Rollout
+
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    Rollout().request_coordinated()
+    monkeypatch.setattr(daemon, "reclaim_claims", lambda *a, **k: pytest.fail(
+        "forward rollout must preserve Build claims"))
+    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda cfg: 0)
+    monkeypatch.setattr(daemon, "recheck_once", lambda cfg: "nothing")
+    seen = []
+    monkeypatch.setattr(daemon.dispatch, "run_cycle",
+                        lambda repos, rollout=None, rollout_mode=None, _log=None:
+                        seen.append((rollout.mode, rollout_mode)))
+
+    daemon.dispatch_cycle([A], _log=lambda _line: None)
+
+    assert seen == [("coordinated", "coordinated")]
 
 
 def test_main_once_runs_one_cycle_and_exits(tmp_path):
