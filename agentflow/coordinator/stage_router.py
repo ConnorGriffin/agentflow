@@ -1,9 +1,9 @@
 """Route each coordinator adapter call to the per-stage adapter for the record's stage.
 
-The coordinator owns one stage adapter, but a live coordinator now runs more than one logical
-stage (Build and Review, issues #103/#104). This thin router dispatches ``prepare``, ``observe``,
-``verify``, and ``finalize_hold`` on ``record.stage`` so each stage keeps its own preparation,
-outcome verification, and human handoff while the coordinator stays stage-agnostic (ADR 0030).
+The coordinator owns one stage adapter, but a live coordinator runs several logical stages.
+This thin router dispatches preparation, observation, outcome capture/verification, completed
+projection, and hold finalization on ``record.stage`` so stage policy stays local while the
+coordinator remains stage-agnostic (ADR 0030).
 
 A record whose stage has no registered adapter prepares trivially, verifies to False (no outcome
 can be proven for a stage with no verifier), and produces no handoff — the same conservative
@@ -38,6 +38,16 @@ class StageRouter:
     def verify(self, record, obs) -> bool:
         adapter = self._for(record)
         return bool(adapter.verify(record, obs)) if adapter is not None else False
+
+    def capture(self, record, obs) -> str | None:
+        adapter = self._for(record)
+        fn = getattr(adapter, "capture", None) if adapter is not None else None
+        return fn(record, obs) if fn is not None else None
+
+    def finalize_completed(self, record) -> str | None:
+        adapter = self._for(record)
+        fn = getattr(adapter, "finalize_completed", None) if adapter is not None else None
+        return fn(record) if fn is not None else None
 
     def finalize_hold(self, record) -> str | None:
         adapter = self._for(record)

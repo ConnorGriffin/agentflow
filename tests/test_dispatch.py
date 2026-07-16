@@ -246,8 +246,7 @@ def test_coordinated_phase_submits_to_the_coordinator_and_skips_the_legacy_build
     from agentflow.coordinator import COORDINATED, Phase
     _idle_pools(monkeypatch)
     _no_triage_no_mockup_no_respond(monkeypatch)
-    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: pytest.fail(
-        "Intake must stay queued while Build is coordinated"))
+    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
     monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
         "Mockup must stay queued while Build is coordinated"))
     monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
@@ -273,6 +272,31 @@ def test_coordinated_phase_submits_to_the_coordinator_and_skips_the_legacy_build
     assert len(submitted) == 1
     assert submitted[0].stage == "build" and submitted[0].subject == "7"
     assert projected  # running records were projected back onto the live board
+
+
+def test_coordinated_phase_claims_and_submits_intake_before_build(monkeypatch):
+    from agentflow.coordinator import COORDINATED, Phase
+    _idle_pools(monkeypatch)
+    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
+                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
+    intake = {"number": 3, "title": "vague", "body": "help", "labels": []}
+    monkeypatch.setattr(loop, "_next_intake_candidate",
+                        lambda cfg, reserved: None if reserved else (intake, ""))
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
+    builder = type("B", (), {"tool": "claude"})()
+    monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (builder, None, ""))
+    claims = []
+    monkeypatch.setattr(loop, "_claim_triage",
+                        lambda repo, number: claims.append((repo, number)) or True)
+    submitted = []
+    coord = type("C", (), {"submit_stage": lambda self, sub: submitted.append(sub)})()
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
+
+    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
+                       _log=lambda _m: None)
+
+    assert claims == [("o/r", 3)]
+    assert len(submitted) == 1 and submitted[0].stage == "intake"
 
 
 def test_draining_phase_launches_no_new_provider_stage(monkeypatch):

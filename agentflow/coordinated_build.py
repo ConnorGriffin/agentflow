@@ -1,5 +1,5 @@
-"""Build, Review, and Revise behind the session coordinator, wired into the daemon's dispatch
-(issues #103, #104, #105).
+"""Intake, Build, Review, and Revise behind the session coordinator, wired into dispatch
+(issues #103–#106).
 
 This is the seam that turns the rollout phase into action. In **legacy** phase the daemon's
 existing build path is untouched; in **draining** phase no new provider stage of any kind
@@ -29,7 +29,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from agentflow.coordinator import (BuildStageAdapter, Coordinator, MODE_COORDINATED, Phase,
+from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter, MODE_COORDINATED, Phase,
                                    ReviewStageAdapter, ReviseStageAdapter, Rollout, StageRouter,
                                    tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
@@ -300,21 +300,70 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's one coordinator for Build, Review, and Revise (issues #103, #104, #105). Its
+    """The daemon's coordinator for Intake, Build, Review, and Revise (issues #103–#106). Its
     Build adapter verifies the real PR outcome and reuses the retained worktree; its Review adapter
     verifies a durable verdict for the exact PR head SHA and recreates the read-only checkout; its
     Revise adapter verifies a pushed revision on the same branch and reuses that retained worktree;
-    and its admission gate enables Build, Review, and Revise alone, so every other logical stage
-    stays queued. One :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    and its admission gate keeps Mockup and Respond queued. One :class:`StageRouter` dispatches
+    each adapter call on the record's stage."""
+    from agentflow import coordinated_intake
+    intake = IntakeStageAdapter(
+        worktree_reset=coordinated_intake.reset_worktree,
+        apply_route=coordinated_intake.apply_route,
+        handoff=coordinated_intake.hold_intake)
     build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
     review = ReviewStageAdapter(
         verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr)
     revise = ReviseStageAdapter(
         revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
-    router = StageRouter({"build": build, "review": review, "revise": revise})
-    return Coordinator(adapter=router, gate=tracer.build_review_revise_gate,
+    router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise})
+    return Coordinator(adapter=router, gate=_production_gate(),
                        log=_log or (lambda _line: None))
+
+
+class _ProductionGate:
+    """One dispatch cycle's composed durable admission policy."""
+
+    def __init__(self) -> None:
+        from collections import Counter
+        self._paced = Counter()
+        self._active: dict[str, bool] = {}
+
+    def __call__(self, record) -> bool:
+        from agentflow import balancer, dispatch
+        from agentflow.coordinator.record import RUNNING
+        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build"}
+        if not tracer.build_review_revise_gate(record):
+            return False
+        running = [item for item in tracer.load_records() if item.state == RUNNING]
+        stage = lane.get(record.stage, record.stage)
+        if len(running) >= dispatch.MACHINE_CEILING:
+            return False
+        if sum(lane.get(item.stage, item.stage) == stage for item in running) >= dispatch.STAGE_CAPS.get(stage, 1):
+            return False
+        try:
+            status = balancer._query_pool(record.pool)
+        except Exception:
+            return False
+        if not status or not status.clear:
+            return False
+        self._active[record.pool] = status.active
+        return not (status.active and self._paced[record.pool] >= balancer.ACTIVE_PACE)
+
+    def started(self, record) -> None:
+        """Charge operator pacing only after the provider start is durable."""
+        if self._active.get(record.pool, False):
+            self._paced[record.pool] += 1
+
+
+def _production_gate():
+    """Compose stage enablement, headroom, machine/stage caps, and operator pacing.
+
+    Running durable records are the concurrency ledger. The closure lasts one daemon dispatch
+    cycle, so its active-pool counter is exactly the per-cycle pacing budget.
+    """
+    return _ProductionGate()
 
 
 def _pr_exists(record) -> bool:
@@ -762,6 +811,9 @@ def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> lis
         if (record.state == COMPLETED and not record.retired and record.claim
                 and not record.hold_pending):  # a pending park is already retried by reconcile
             opener = _OPENERS.get(record.stage)
+            if record.stage == "intake":
+                coord.settle_completed(record.identity)
+                continue
             if opener is not None:
                 try:
                     opener(coord, record.identity)

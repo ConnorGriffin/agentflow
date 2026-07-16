@@ -21,7 +21,8 @@ from agentflow.balancer import pick_pair
 from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
                             maintainer_comment, park, reply_pending, squash_merge,
                             ui_evidence_gap)
-from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _DISCLAIMER,
+from agentflow.intake import (INTAKE_MARK, Intake, IntakeResult, IntakeRoute, STATE_LABELS,
+                              _DISCLAIMER, _strip_quoted_lines,
                               apply_intake, awaiting_recheck, intake_result_is_durable,
                               replies_since_intake)
 from agentflow.notify import notify
@@ -338,7 +339,7 @@ TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns 
 _TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING}
 
 
-def reclaim_triage_claims(cfg: RepoConfig) -> int:
+def reclaim_triage_claims(cfg: RepoConfig, coordinator_owned: set[int] = frozenset()) -> int:
     """Drop `agentflow:triaging` claims stranded when a daemon is killed mid-grounding (issue
     #74). Intake opens no PR, so its only outcome signal is a state label — a claim is stale
     only when intake has stamped none of them AND no session is grounding it right now (the
@@ -352,6 +353,7 @@ def reclaim_triage_claims(cfg: RepoConfig) -> int:
     live_now = _issues_with_live_session(cfg.repo)
     stale = [i["number"] for i in json.loads(r.stdout or "[]")
              if i["number"] not in live_now
+             and i["number"] not in coordinator_owned
              and not ({lbl["name"] for lbl in i.get("labels", [])} & set(STATE_LABELS))]
     for n in stale:
         _release_triage(cfg.repo, n)
@@ -552,13 +554,14 @@ def _release(repo: str, n: int) -> None:
     _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", BUILDING])
 
 
-def _claim_triage(repo: str, n: int) -> None:
+def _claim_triage(repo: str, n: int) -> bool:
     """Claim issue n for intake *before* its grounding session, so a concurrent or next-cycle
     dispatch skips it — closing intake's no-label-yet window (the state label is only stamped
     once the session finishes). Symmetric to `_claim`; ensures the label first."""
-    _run(["gh", "label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
-          "--description", "A grounding session is triaging this issue", "--force"])
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", TRIAGING])
+    created = _run(["gh", "label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
+                    "--description", "A grounding session is triaging this issue", "--force"])
+    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", TRIAGING])
+    return created.returncode == 0 and claimed.returncode == 0
 
 
 def _release_triage(repo: str, n: int) -> None:
@@ -694,6 +697,12 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
         comments = json.loads(cr.stdout or "{}").get("comments", [])
         allowlist = intake_allowlist(cfg.repo, cfg.workdir)
         if awaiting_recheck(comments, allowlist):
+            qualifying = [c for c in comments
+                          if c.get("author", {}).get("login", "") in allowlist
+                          and INTAKE_MARK not in _strip_quoted_lines(c.get("body", ""))]
+            if qualifying:
+                latest = qualifying[-1]
+                issue["_intake_target"] = str(latest.get("id") or latest.get("createdAt") or "")
             return issue, replies_since_intake(comments, allowlist)
     return None
 

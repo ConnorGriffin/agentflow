@@ -22,6 +22,34 @@ from agentflow.coordinator.record import Record
 from agentflow.loop import RepoConfig
 
 
+def test_operator_pacing_is_charged_only_after_a_confirmed_start(make_coord, monkeypatch):
+    from agentflow.balancer import PoolStatus
+    from agentflow.coordinator.launcher import NOT_STARTED, StartResult
+    gate = coordinated_build._production_gate()
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool: PoolStatus(tool, True, 10.0, active=True))
+    fake = FakeSession()
+
+    class FirstLaunchMisses:
+        calls = 0
+        def start(self, record, store):
+            self.calls += 1
+            return StartResult(NOT_STARTED) if self.calls == 1 else fake.start(record, store)
+        def is_alive(self, family):
+            return fake.is_alive(family)
+
+    launcher = FirstLaunchMisses()
+    coord = make_coord(fake, launcher=launcher, gate=gate)
+    for subject in ("1", "2", "3"):
+        coord.submit_stage(Submission(repo="o/r", subject=subject, stage="intake",
+                                      pool="claude", source="/readonly"))
+
+    coord.cycle("claude")
+
+    assert launcher.calls == 2  # miss is free, one confirmed start spends active pacing
+
+
 def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
     return Submission(repo="o/r", subject=subject, stage="build", pool=pool,
                       complexity="deep", effort=effort, source=source)

@@ -342,6 +342,31 @@ every newline inside a string value as \\n and every quote as \\":
 For "grill"/"mockup", omit complexity and effort."""
 
 
+def intake_prompt(repo: str, issue: dict, extra: str = "") -> str:
+    """The durable provider input for one Intake stage."""
+    prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(issue["number"]), disclaimer=_DISCLAIMER,
+                   title=issue.get("title", ""), body=issue.get("body") or "(no description)")
+    if extra:
+        prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier hold — treat this as their "
+                   "answer or waiver: promote to ready if the issue is now settled (they answered "
+                   "your questions, waived the visual spec requirement, or pointed at a locked spec), "
+                   "else re-post ONLY what's still open. "
+                   "IF this issue was held for a MOCKUP and a variant round was already drawn (a "
+                   "comment on the issue naming variants A/B/C/D with screenshots), the reply may be "
+                   "a PICK — \"B\", \"the second one\", \"A but tighter\". In that case: read that "
+                   "mockup comment (it links the committed variant files on a mockup branch), map "
+                   "the pick to its variant, and route \"ready\" with a brief that references THAT "
+                   "chosen variant's committed file as the LOCKED visual spec the build must match "
+                   "(ADR 0018 — the build's screenshot is checked against the locked mockup, so name "
+                   "the exact file/branch). A request for a DIFFERENT or fresh set is NOT a pick — "
+                   "re-hold (route \"mockup\") as a follow-up; never auto-loop a new variant round. "
+                   'If nothing genuinely open changed — the reply was chit-chat, or it didn\'t move '
+                   'any open question — answer route "nothing-new" (no body) and I\'ll stay quiet '
+                   "rather than restate myself.\n"
+                   f"---\n{extra}\n---")
+    return prompt
+
+
 class Intake:
     """Runs a tool-agnostic grounding session and reads back its routing decision."""
 
@@ -360,26 +385,7 @@ class Intake:
         except subprocess.CalledProcessError as e:
             return _infra_failed(f"intake worktree/provision failed: {e}")
 
-        prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(n), disclaimer=_DISCLAIMER,
-                       title=issue.get("title", ""), body=issue.get("body") or "(no description)")
-        if extra:
-            prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier hold — treat this as their "
-                       "answer or waiver: promote to ready if the issue is now settled (they answered "
-                       "your questions, waived the visual spec requirement, or pointed at a locked spec), "
-                       "else re-post ONLY what's still open. "
-                       "IF this issue was held for a MOCKUP and a variant round was already drawn (a "
-                       "comment on the issue naming variants A/B/C/D with screenshots), the reply may be "
-                       "a PICK — \"B\", \"the second one\", \"A but tighter\". In that case: read that "
-                       "mockup comment (it links the committed variant files on a mockup branch), map "
-                       "the pick to its variant, and route \"ready\" with a brief that references THAT "
-                       "chosen variant's committed file as the LOCKED visual spec the build must match "
-                       "(ADR 0018 — the build's screenshot is checked against the locked mockup, so name "
-                       "the exact file/branch). A request for a DIFFERENT or fresh set is NOT a pick — "
-                       "re-hold (route \"mockup\") as a follow-up; never auto-loop a new variant round. "
-                       'If nothing genuinely open changed — the reply was chit-chat, or it didn\'t move '
-                       'any open question — answer route "nothing-new" (no body) and I\'ll stay quiet '
-                       "rather than restate myself.\n"
-                       f"---\n{extra}\n---")
+        prompt = intake_prompt(repo, issue, extra)
         # Ground at the capable tier — a cheap model that mis-scopes is the expensive miss.
         model = self.runner.model_for(Complexity.DEEP)
         session = live.Session(repo=repo, number=n, title=issue.get("title", ""),
@@ -447,7 +453,13 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
 
     # Idempotent: if our last word on this issue already says the same thing, changing
     # nothing (no comment, no label churn) is the whole point — don't re-post it.
-    if INTAKE_MARK in comment and comment.strip() == _latest_comment(repo, issue_number):
+    exact_labels = set(labels).issubset(current_labels)
+    stale_state = any(name in current_labels and name not in set(labels) for name in STATE_LABELS)
+    stale_dials = any(any(name.startswith(p) for p in _DIAL_PREFIXES)
+                      and name not in set(labels) for name in current_labels)
+    title_done = not retitled_from
+    if (INTAKE_MARK in comment and comment.strip() == _latest_comment(repo, issue_number)
+            and exact_labels and not stale_state and not stale_dials and title_done):
         return f"unchanged -> {result.route.value} (already posted)"
 
     if retitled_from is not None:

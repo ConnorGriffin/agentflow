@@ -11,9 +11,8 @@ the running-record ledger, the crash-safe provider start handshake, outcome-firs
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
 
-Build, Review, and Revise are the production stages behind this coordinator (issues #103,
-#104, #105); every
-other logical stage remains queued behind the admission gate until its own tracer lands. Review
+Intake, Build, Review, and Revise are the production stages behind this coordinator (issues
+#103–#106); Mockup and Respond remain queued behind the admission gate. Review
 is read-only, so an eligible continuation may move to the other pool when its home pool cannot
 fit it. The interface and crash boundaries remain exercised with injected launcher, gate, and
 observer collaborators.
@@ -182,6 +181,29 @@ class Coordinator:
                                   f"next stage remains — parking for human; claim released")
                 self._persist(record)
             return self._finalize_hold(record)
+
+    def settle_completed(self, identity: str) -> bool:
+        """Project a completed stage to its durable external boundary, then release its claim.
+
+        Stage-native outcome data is already persisted before this is callable. The adapter's
+        projection must be idempotent and return durable proof; a missing proof leaves ownership
+        intact so reconciliation can safely drive it again after a restart.
+        """
+        with self._lock:
+            record = self._records.get(identity)
+            if record is None or record.retired:
+                return bool(record and not record.claim)
+            if record.state != COMPLETED:
+                return False
+            finalize = getattr(self._adapter, "finalize_completed", None)
+            proof = finalize(record) if finalize is not None else None
+            if proof is None:
+                return False
+            record.handoff_proof = proof
+            record.claim = False
+            record.retired = True
+            self._persist(record)
+            return True
 
     def _register_descendant(self, record: Record) -> None:
         """A descendant/subagent shares its root's single reservation and is never admitted or
@@ -377,6 +399,9 @@ class Coordinator:
         was_continuation = record.continuation
         self._consume_attempt(record)
         self._persist(record)
+        started = getattr(self._gate, "started", None)
+        if started is not None:
+            started(record)
         if was_continuation:
             done = record.attempts - 1  # continuations completed before this one
             self._emit(record, f"continuation {done}/{CONTINUATION_BUDGET} "
@@ -401,7 +426,12 @@ class Coordinator:
         remains and holds when it is exhausted. Returns the terminal outcome, if any."""
         obs = self._adapter.observe(record)
         self._release(record)
-        if self._adapter.verify(record, obs):
+        capture = getattr(self._adapter, "capture", None)
+        outcome = capture(record, obs) if capture is not None else None
+        if outcome is not None:
+            record.outcome = outcome
+            self._persist(record)  # parsed outcome precedes any external projection
+        if outcome is not None or self._adapter.verify(record, obs):
             record.state = COMPLETED
             self._persist(record)
             self._retire_descendants(record)

@@ -1,11 +1,11 @@
-"""The tracer bridge (issues #103, #104, #105) — the small set of reads and gates that connect the
-session coordinator to the legacy dispatch surfaces while Build, Review, and Revise are the
+"""The tracer bridge (issues #103–#106) — the small set of reads and gates that connect the
+session coordinator to dispatch while Intake, Build, Review, and Revise are the
 coordinated stages.
 
 Three things the dispatch layer needs when Build, Review, and Revise run behind the coordinator,
 all derived from the durable continuation records so there is no second source of truth:
 
-- **Build, Review, and Revise are the only enabled logical stages.** :func:`build_review_revise_gate`
+- **Intake, Build, Review, and Revise are the enabled logical stages.** :func:`build_review_revise_gate`
   is the coordinator's admission gate in coordinated mode: every other logical stage may be
   submitted and sit visibly ``waiting``, but it never admits, so it consumes neither a permit nor an
   attempt. :func:`build_and_review_gate` and :func:`build_only_gate` are the retained gates for the
@@ -34,7 +34,7 @@ from agentflow.coordinator.store import Store, default_store_path
 # source :func:`build_review_revise_gate` consumes. Every other stage may be submitted and sit
 # visibly ``waiting``, but the gate never admits it, so it consumes neither a permit nor an
 # attempt.
-ENABLED_STAGES = ("build", "review", "revise")
+ENABLED_STAGES = ("intake", "build", "review", "revise")
 
 
 def build_only_gate(record: Record) -> bool:
@@ -52,7 +52,7 @@ def build_and_review_gate(record: Record) -> bool:
 def build_review_revise_gate(record: Record) -> bool:
     """The coordinated-mode admission gate: admit exactly :data:`ENABLED_STAGES`, refuse every
     other logical stage. A refused stage stays ``waiting`` and reserves nothing — no permit, no
-    attempt — so Intake, Respond, and Mockup remain visibly queued until their own slices land."""
+    attempt — so Respond and Mockup remain visibly queued until their own slices land."""
     return record.stage in ENABLED_STAGES
 
 
@@ -89,7 +89,7 @@ def coordinator_active(records) -> bool:
 
 # Revise shares Build's board lane: it works on the same PR branch/worktree, so it reads as a
 # builder session (exactly as the legacy revise pass does) and is replaced with the Build lane.
-_STAGE_LANE = {"build": "building", "review": "reviewing", "revise": "building"}
+_STAGE_LANE = {"intake": "triaging", "build": "building", "review": "reviewing", "revise": "building"}
 
 
 def live_projection(records) -> list[dict]:

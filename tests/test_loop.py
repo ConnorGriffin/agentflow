@@ -322,6 +322,17 @@ def test_reclaim_triage_frees_a_stranded_claim_for_the_intake_queue(monkeypatch)
     assert _untriaged({"number": 69, "labels": []})
 
 
+def test_reclaim_triage_keeps_a_coordinator_owned_continuation(monkeypatch):
+    owned = _triaging(69)
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([owned])))
+    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
+    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
+
+    assert reclaim_triage_claims(RepoConfig("o/r", "."), coordinator_owned={69}) == 0
+    assert released == []
+
+
 def test_reclaim_triage_keeps_a_claim_with_an_intake_outcome(monkeypatch):
     # A claim alongside a state label is a genuinely-triaged issue (or a rarer double failure,
     # out of scope) — the no-outcome reclaim must not touch it.

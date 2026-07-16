@@ -121,14 +121,14 @@ def test_stage_outcome_is_the_only_terminal_fact_that_crosses_the_seam():
     assert not hasattr(Coordinator, "reconcile")  # reconciliation is private to cycle
 
 
-def test_public_surface_is_exactly_submit_cycle_and_park_completed(make_coord):
-    """ADR 0030's deep seam: submit_stage, cycle, and park_completed (the ADR's issue #105
-    amendment — parking a completed stage the product policy leaves with no successor) are the
+def test_public_surface_includes_completed_boundary_settlement(make_coord):
+    """ADR 0030's deep seam includes completed boundary settlement (issue #106), alongside
+    parking a completed stage the product policy leaves with no successor. These are the
     only public operations. Permit accounting, the working-set map, and reconciliation are
     private — no mutable records map, and no lifecycle/policy control knob is exposed."""
     coord = make_coord(FakeSession())
     public = {name for name in dir(coord)
               if not name.startswith("_") and callable(getattr(coord, name))}
-    assert public == {"submit_stage", "cycle", "park_completed"}
+    assert public == {"submit_stage", "cycle", "park_completed", "settle_completed"}
     assert not hasattr(coord, "permits")      # permit accounting is an internal invariant
     assert not hasattr(coord, "records")      # the working set is private (_records)
