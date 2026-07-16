@@ -85,6 +85,19 @@ _CLAUDE_CAUSES = {
 _CLAUDE_KNOWN_TYPES = {"assistant", "result", "error"}
 
 
+def _claude_assistant_text(event: dict) -> str | None:
+    """Extract text from Claude CLI's ``assistant.message.content`` blocks."""
+    message = event.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+        return None
+    text = [
+        block["text"] for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+    return "\n".join(text) if text else None
+
+
 def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                     partial_output="", family=None, process_alive=False) -> ProviderObservation:
     """Extract facts from Claude's structured stream. A recognized ``error`` subtype gives a
@@ -99,9 +112,13 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
     for event in events:
         etype = event.get("type")
         if etype == "assistant":
-            final_message = event.get("text", final_message)
+            message = _claude_assistant_text(event)
+            if message is not None:
+                final_message = message
         elif etype == "result":
-            final_message = event.get("final_message", final_message)
+            result = event.get("result")
+            if isinstance(result, str):
+                final_message = result
         elif etype == "error":
             mapped = _CLAUDE_CAUSES.get(event.get("subtype"))
             if mapped is not None:

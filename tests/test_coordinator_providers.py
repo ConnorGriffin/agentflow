@@ -44,15 +44,22 @@ def test_claude_timeout_and_process_come_from_supervisor_and_exit():
 
 
 def test_claude_clean_run_leaves_cause_to_the_stage_outcome():
-    obs = classify_claude([{"type": "assistant", "text": "done"},
-                           {"type": "result", "final_message": "ok"}], exit_status=0)
+    obs = classify_claude([
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "hidden"},
+            {"type": "text", "text": "done"},
+        ]}},
+        {"type": "result", "result": "ok"},
+    ], exit_status=0)
     assert obs.cause is ProviderCause.NONE
     assert obs.final_message == "ok"
 
 
 def test_claude_preserves_unrecognized_events_and_reports_unknown():
     obs = classify_claude([
-        {"type": "assistant", "text": "hi"},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "hi"},
+        ]}},
         {"type": "telemetry", "weird": {"nested": 1}},
         {"type": "error", "subtype": "brand_new_thing"},
     ])
@@ -131,11 +138,13 @@ def test_provider_adapters_observe_from_durable_session_artifacts(tmp_path, monk
         ev.write_text(events_text)
         exit_path(default_store_path(), token).write_text(exit_text)
 
-    artifacts("tok-1", '{"type": "assistant", "text": "hi"}\n'
+    artifacts("tok-1", '{"type":"assistant","message":{"content":'
+                       '[{"type":"text","text":"hi"}]}}\n'
                        '{"type": "error", "subtype": "capacity", "reset_at": 42}\n', "0\n")
     claude_rec = Record("i", "review", "claude", 1, launch_token="tok-1", family="123")
     obs = ClaudeProviderAdapter().observe(claude_rec)
     assert obs.cause is ProviderCause.CAPACITY and obs.reset_at == 42 and obs.exit_status == 0
+    assert obs.final_message == "hi"
     assert any(e.get("type") == "assistant" for e in obs.events)  # events preserved
 
     artifacts("tok-2", "I am rate limited, sorry\n", "1\n")  # prose, not structured

@@ -286,19 +286,20 @@ def test_coordinated_phase_claims_and_submits_intake_before_build(monkeypatch):
     monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
     builder = type("B", (), {"tool": "claude"})()
     monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (builder, None, ""))
-    claims = []
+    events = []
     monkeypatch.setattr(loop, "_claim_triage",
-                        lambda repo, number: claims.append((repo, number)) or True)
+                        lambda repo, number: events.append(("claim", repo, number)) or True)
     monkeypatch.setattr(loop, "_run", lambda cmd: subprocess.CompletedProcess(
         cmd, 0, "source-sha\n", ""))
     submitted = []
-    coord = type("C", (), {"submit_stage": lambda self, sub: submitted.append(sub)})()
+    coord = type("C", (), {"submit_stage": lambda self, sub: (
+        submitted.append(sub), events.append(("submit", sub.subject)))})()
     monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
 
     dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
                        _log=lambda _m: None)
 
-    assert claims == [("o/r", 3)]
+    assert events == [("submit", "3"), ("claim", "o/r", 3)]
     assert len(submitted) == 1 and submitted[0].stage == "intake"
 
 

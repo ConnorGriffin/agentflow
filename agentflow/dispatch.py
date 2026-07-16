@@ -243,11 +243,12 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
         submission = coordinated_intake.intake_submission(cfg, issue, extra, builder.tool)
         if submission is None:
             return f"#{issue['number']}: Intake source unreadable — deferring"
-        # Claim first. If the store then fails, reconciliation fails closed and leaves this
-        # visible ownership in place for repair; no legacy path may start a duplicate.
-        if not loop._claim_triage(cfg.repo, issue["number"]):
-            return f"#{issue['number']}: could not claim Intake — refusing coordinator submission"
+        # Persist ownership first, then project its GitHub claim. A crash can therefore leave
+        # either no claim or an idempotently resubmittable record, never an unowned claim that
+        # looks like ambiguous legacy work and holds the rollout drain forever.
         coordinator.submit_stage(submission)
+        if not loop._claim_triage(cfg.repo, issue["number"]):
+            return f"#{issue['number']}: Intake record saved; claim pending — deferring admission"
         reserved.add(issue["number"])
         submitted.append(f"#{issue['number']} → {builder.tool}")
     return "; ".join(submitted) if submitted else "no un-triaged issues"
