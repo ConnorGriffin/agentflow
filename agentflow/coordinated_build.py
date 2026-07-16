@@ -585,11 +585,15 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
     review = records.get(review_identity)
     if review is None or review.stage != "review" or not review.target:
         return
-    if not revise_round_budget_remains(records.values(), review.repo, review.subject):
-        return  # the one auto-revise round is spent; the merge/park policy owns what happens next
     verdict = _review_verdict(review)
     if verdict.clean or not verdict.blocking:
-        return  # a clean (or non-blocking) verdict is not a revise trigger
+        return  # a clean (or non-blocking) verdict is the merge path, not a revise
+    if not revise_round_budget_remains(records.values(), review.repo, review.subject):
+        # The one auto-revise round is spent and the review still blocks: no revise, review, or
+        # merge stage will ever consume this outcome, so park the PR for a human exactly once and
+        # release the review's retained claim rather than leaving the PR owned forever (ADR 0028).
+        coord._park_completed(review_identity)
+        return
     facts = _revise_builder_source(review)
     if facts is None:
         return

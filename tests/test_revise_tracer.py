@@ -4,11 +4,20 @@ Revise adopts the builder's retained PR branch/worktree, stays pinned to the bui
 and complexity, keeps its local work across an interrupted continuation, completes only on a
 verified pushed revision (independent of provider exit), parks the PR on exhaustion without
 discarding that work, and a completed Revise opens one new Review bound to the changed head SHA with
-a fresh budget. The Build → Review → Revise → Review claim transfers and their crash boundaries are
-exercised here through a stage router that runs all three live stages behind one coordinator.
+a fresh budget.
+
+The Build → Review → Revise → Review path is exercised end to end through
+:func:`coordinated_build.reconcile_and_project` — the production interface that actually opens each
+transition — with only its external reads faked (the PR head a completed Build/Revise exposes, the
+issue complexity label a revise trigger reads, and the parsed review verdict). This proves the real
+transition wiring, not a hand-submitted stand-in for it. The crash boundaries are exercised through
+the coordinator's public seam behind the same stage router that runs all three live stages.
 """
 
 from __future__ import annotations
+
+import json
+from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
@@ -17,7 +26,9 @@ from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, Revise
                                     StageRouter, Submission, tracer)
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import Record
+from agentflow.coordinator.rollout import COORDINATED
 from agentflow.gate import MAX_REVISES
+from agentflow.reviewer import Finding, Verdict
 
 BUILD_WT = "/w/.agentflow/worktrees/claude/issue-7-x"
 REVIEW_WT = "/w/.agentflow/worktrees/codex-review/pr-42-x"
@@ -53,53 +64,156 @@ def _records(coord):
     return list(coord._store.load().values())
 
 
-# --- the full Build → Review → Revise → Review path, one claim at every hop ---------------
+def _ident(subject, stage, target="-"):
+    """The coordinator identity for one issue's stage (``repo|subject|stage|target``)."""
+    return f"o/r|{subject}|{stage}|{target}"
 
-def test_full_path_transfers_the_claim_at_each_hop_and_keeps_lineage(make_coord):
+
+_BLOCKING = Verdict(clean=False, findings=(Finding("blocking", "fix the thing"),))
+
+
+class _Live:
+    """Drives the real Build → Review → Revise → Review transitions through
+    :func:`coordinated_build.reconcile_and_project`, faking only its external reads. ``head`` is the
+    PR head SHA a completed Build/Revise exposes (mutable, so a pushed revision advances it),
+    ``verdict`` is the parsed review verdict a blocking Review acts on, and ``labels`` are the issue
+    complexity labels a revise trigger reads. Each :meth:`step` is one full reconcile of both build
+    pools plus the transition projection it settles."""
+
+    def __init__(self, coord, fake, monkeypatch, *, head, number=42,
+                 labels=("agentflow:complexity:deep",), verdict=_BLOCKING):
+        self.coord = coord
+        self.fake = fake
+        self.head = head
+        self.number = number
+        self.labels = list(labels)
+        self.verdict = verdict
+        self.projections = []
+        monkeypatch.setattr("agentflow.loop._run", self._gh)
+        monkeypatch.setattr(coordinated_build, "_review_verdict", lambda review: self.verdict)
+        monkeypatch.setattr("agentflow.live.replace_projection",
+                            lambda entries, **kw: self.projections.append(entries))
+
+    def _gh(self, cmd, *args, **kwargs):
+        if "list" in cmd:               # gh pr list --head ... --json number,headRefOid
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                [{"number": self.number, "headRefOid": self.head}]))
+        if "view" in cmd:               # gh issue view <n> --json labels
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                {"labels": [{"name": name} for name in self.labels]}))
+        return SimpleNamespace(returncode=0, stdout="")
+
+    def step(self):
+        return coordinated_build.reconcile_and_project(
+            self.coord, SimpleNamespace(name=COORDINATED))
+
+    def run_stage(self, identity, *, head=None):
+        """Admit and start the one waiting stage, then end its provider and reconcile so its
+        durable outcome settles and the next transition is projected. Returns the settled stages."""
+        self.step()
+        if head is not None:
+            self.head = head
+        self.fake.end(identity, cause=ProviderCause.PROCESS)
+        return [o.stage for o in self.step()]
+
+
+# --- the full Build → Review → Revise → Review path, opened by reconcile_and_project -------
+
+def test_reconcile_opens_each_transition_and_transfers_the_claim_at_every_hop(make_coord,
+                                                                              monkeypatch):
+    """The production interface — not a hand-submitted stand-in — opens Review from a completed
+    Build, Revise from a blocking Review, and the next Review from a completed Revise. Each hop
+    transfers the change claim before the prior stage retires, keeps the builder lineage/worktree,
+    and binds the review to the exact head SHA (ADR 0028/0030)."""
     fake = FakeSession()
     pr, verdict, revision = [True], [False], [False]
     coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
                        gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-a")
+
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
                                           complexity="deep", effort="high", source=BUILD_WT))
-    coord.cycle("claude")
+    live.step()                                          # Build admitted and started
     fake.end(build, cause=ProviderCause.PROCESS)
-    assert [o.stage for o in coord.cycle("claude")] == ["build"]
+    assert live.step()[0].stage == "build"               # Build completes → reconcile opens Review
 
-    # Build → Review, bound to the reviewed head SHA, claim transferred before Build retires.
-    review = coord.submit_stage(Submission(repo="o/r", subject="7", stage="review", pool="codex",
-                                           complexity="deep", target="sha-a", source=REVIEW_WT,
-                                           builder_lineage="claude", transfer_from=build))
+    # Build → Review: reconcile bound it to the reviewed head SHA and transferred the claim.
+    review = _ident("7", "review", "sha-a")
     assert record_of(coord, build).retired is True
+    r = record_of(coord, review)
+    assert r.claim is True and r.pool == "codex" and r.builder_lineage == "claude"
+    assert r.target == "sha-a"
     assert tracer.owned_issues(_records(coord), "o/r") == {7}
-    coord.cycle("codex")
-    verdict[0] = True                                   # a blocking verdict became durable
-    fake.end(review, cause=ProviderCause.PROCESS)
-    assert [o.stage for o in coord.cycle("codex")] == ["review"]
 
-    # Review → Revise, pinned to the builder's tool lineage and its retained PR branch/worktree.
-    revise = coord.submit_stage(Submission(repo="o/r", subject="7", stage="revise", pool="claude",
-                                           complexity="deep", target="sha-a", source=BUILD_WT,
-                                           builder_lineage="claude", transfer_from=review))
+    live.step()                                          # Review admitted and started (codex)
+    verdict[0] = True                                    # a blocking verdict became durable
+    fake.end(review, cause=ProviderCause.PROCESS)
+    assert live.step()[0].stage == "review"              # Review completes → reconcile opens Revise
+
+    # Review → Revise: pinned to the builder's tool lineage and its retained PR branch/worktree.
+    revise = _ident("7", "revise", "sha-a")
     assert record_of(coord, review).retired is True
     rev = record_of(coord, revise)
     assert rev.claim is True and rev.pool == "claude" and rev.lineage == "claude"
     assert rev.source == BUILD_WT                        # adopts the builder's retained worktree
     assert tracer.owned_issues(_records(coord), "o/r") == {7}
-    coord.cycle("claude")
-    revision[0] = True                                  # the revision was pushed to the same branch
+
+    live.step()                                          # Revise admitted and started (claude)
+    live.head = "sha-b"                                  # the revision was pushed to the same branch
+    revision[0] = True
     fake.end(revise, cause=ProviderCause.PROCESS)
-    assert [o.stage for o in coord.cycle("claude")] == ["revise"]
+    assert live.step()[0].stage == "revise"              # Revise completes → reconcile opens Review
 
     # Revise → a new Review for the changed head SHA, with a fresh budget; the prior review is gone.
-    review2 = coord.submit_stage(Submission(repo="o/r", subject="7", stage="review", pool="codex",
-                                            complexity="deep", target="sha-b", source=REVIEW_WT,
-                                            builder_lineage="claude", transfer_from=revise))
+    review2 = _ident("7", "review", "sha-b")
     assert review2 != review                             # a new head SHA is a genuinely new review
     assert record_of(coord, revise).retired is True
     r2 = record_of(coord, review2)
-    assert r2.attempts == 0 and r2.claim is True         # fresh budget; prior SHA's review not reused
+    assert r2.attempts == 0 and r2.claim is True and r2.target == "sha-b"
+    assert r2.pool == "codex" and r2.builder_lineage == "claude"
     assert tracer.owned_issues(_records(coord), "o/r") == {7}
+
+
+# --- a blocking review with the auto-revise round spent parks once and releases the claim --
+
+def test_reconcile_parks_a_blocking_review_once_the_revise_round_is_spent(make_coord, monkeypatch):
+    """Once the single auto-revise product round (ADR 0018) is used, a further blocking Review has
+    no revise, review, or merge stage to hand its claim to. Reconcile must park the PR for a human
+    exactly once and release the retained claim, not leave the PR owned forever."""
+    fake = FakeSession()
+    pr, verdict, revision = [True], [True], [True]
+    coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
+                       gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-a")
+
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
+                                          complexity="deep", effort="high", source=BUILD_WT))
+    assert live.run_stage(build) == ["build"]            # Build completes → Review(sha-a)
+
+    # MAX_REVISES logical revise rounds, each: blocking Review → Revise → pushed revision → Review.
+    heads = iter(["sha-b", "sha-c", "sha-d", "sha-e"])
+    for _ in range(MAX_REVISES):
+        review = _ident("7", "review", live.head)
+        assert live.run_stage(review) == ["review"]      # Review blocks → reconcile opens Revise
+        revise = _ident("7", "revise", live.head)
+        assert record_of(coord, revise).claim is True
+        assert live.run_stage(revise, head=next(heads)) == ["revise"]  # pushed → opens next Review
+    assert sum(1 for r in _records(coord) if r.stage == "revise") == MAX_REVISES
+
+    # The final blocking Review has no round left: reconcile parks it and releases the claim.
+    final_review = _ident("7", "review", live.head)
+    assert live.run_stage(final_review) == ["review"]
+    parked = record_of(coord, final_review)
+    assert parked.state == "held" and parked.claim is False
+    assert parked.handoffs == 1 and parked.notifications == 1
+    assert tracer.owned_issues(_records(coord), "o/r") == set()   # the PR is no longer owned
+    assert sum(1 for r in _records(coord) if r.stage == "revise") == MAX_REVISES  # no extra revise
+
+    # Idempotent: another reconcile neither re-parks nor re-notifies, and opens no new stage.
+    assert live.step() == []
+    still = record_of(coord, final_review)
+    assert still.handoffs == 1 and still.notifications == 1
+    assert tracer.owned_issues(_records(coord), "o/r") == set()
 
 
 # --- outcome-first: a pushed revision completes; local-only changes do not ----------------

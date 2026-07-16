@@ -146,6 +146,26 @@ class Coordinator:
                 self._persist(record)
         return identity
 
+    def _park_completed(self, identity: str) -> "StageOutcome | None":
+        """Terminally park a completed stage the product policy leaves with no next stage to take
+        over its claim (ADR 0028) — a driver-only continuation of the two-call seam, never a third
+        public operation. A blocking Review whose one auto-revise round is already spent has no
+        revise, review, or merge to transfer to, so without this its retained claim would keep the
+        PR owned forever. Release that claim through the very same idempotent, notify-once human
+        handoff a budget exhaustion uses. Returns the ``held`` outcome, or ``None`` when the record
+        is missing, already retired, or not a completed stage awaiting a transfer. Idempotent and
+        crash-safe: a repeat re-observes the durable handoff and neither re-notifies nor
+        double-releases the claim."""
+        with self._lock:
+            record = self._records.get(identity)
+            if record is None or record.retired or record.state != COMPLETED:
+                return None
+            record.hold_pending = True
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no next "
+                              f"stage remains — parking for human; claim released")
+            self._persist(record)
+            return self._finalize_hold(record)
+
     def _register_descendant(self, record: Record) -> None:
         """A descendant/subagent shares its root's single reservation and is never admitted or
         reserved independently (ADR 0030). Recording the lineage on the root lets the root's
