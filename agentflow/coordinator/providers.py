@@ -15,6 +15,7 @@ by a Codex-specific policy in the coordinator.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -175,12 +176,27 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
 # only: `verify` always returns False because provider success can never stand in for a stage
 # outcome — that check belongs to the stage adapter (ADR 0030 completion locality).
 
+PROVIDER_INPUT_V1 = "agentflow-provider-input-v1"
+
+
+def _durable_prompt(record) -> str:
+    """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt."""
+    raw = record.input_ptr or ""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
+            and isinstance(payload.get("prompt"), str)):
+        return payload["prompt"]
+    return raw
+
 
 class ClaudeProviderAdapter:
     """Launches a structured Claude session and observes its durable events + exit."""
 
     def __init__(self, prompt_of=None) -> None:
-        self._prompt_of = prompt_of or (lambda record: record.input_ptr or "")
+        self._prompt_of = prompt_of or _durable_prompt
 
     def command(self, record) -> list[str]:
         from agentflow.runner import ClaudeRunner
@@ -203,7 +219,7 @@ class CodexProviderAdapter:
     exit status — never the `codex exec --json` prose, which is preserved but never diagnoses."""
 
     def __init__(self, prompt_of=None, account_of=None) -> None:
-        self._prompt_of = prompt_of or (lambda record: record.input_ptr or "")
+        self._prompt_of = prompt_of or _durable_prompt
         self._account_of = account_of
 
     def command(self, record) -> list[str]:

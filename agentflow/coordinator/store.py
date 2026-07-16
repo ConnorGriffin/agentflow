@@ -20,8 +20,9 @@ import json
 import os
 import sqlite3
 import threading
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Mapping
 from uuid import uuid4
 
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, Record
@@ -50,6 +51,21 @@ def default_store_path() -> Path:
 class StoreUnavailable(RuntimeError):
     """The store could not be read or is a schema this build does not understand. The
     coordinator treats this as fail-closed: no starts, no claim changes."""
+
+
+@dataclass(frozen=True)
+class ReservationLimits:
+    """Global limits that must be decided with the permit reservation.
+
+    ``lane_by_stage`` preserves dispatch's deliberate grouping: Review and Revise consume
+    Build concurrency, while Intake consumes Triage concurrency. The production gate owns
+    those policy values; the store only enforces the supplied snapshot atomically.
+    """
+
+    machine_ceiling: int
+    stage_cap: int
+    stage_lane: str
+    lane_by_stage: Mapping[str, str]
 
 
 class Store:
@@ -216,16 +232,36 @@ class Store:
                 self._rollback_quietly()
                 raise
 
-    def reserve(self, record: Record, budget: int) -> bool:
+    def reserve(self, record: Record, budget: int,
+                limits: ReservationLimits | None = None) -> bool:
         """Atomically reserve ``record``'s demand on its pool, or refuse. Availability is read
         and the running row is written under one ``BEGIN IMMEDIATE``, so two coordinator
         instances racing on the same file serialize on the write lock and can never push a
-        pool's ledger past ``budget`` (ADR 0029/0030). Returns whether the reservation was
+        pool's ledger past ``budget`` (ADR 0029/0030). When supplied, machine and dispatch-lane
+        limits are checked from those same running rows in the same transaction, so racers on
+        different pools cannot exceed either global cap. Returns whether the reservation was
         taken; on refusal nothing is written."""
         payload = self._encode(record)
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                if limits is not None:
+                    rows = self._conn.execute(
+                        "SELECT data FROM records WHERE state = ? AND identity != ?",
+                        (RUNNING, record.identity),
+                    ).fetchall()
+                    running = [self._decode(row[0]) for row in rows]
+                    roots = [item for item in running if item.root is None]
+                    if len(roots) >= limits.machine_ceiling:
+                        self._conn.execute("ROLLBACK")
+                        return False
+                    lane_count = sum(
+                        limits.lane_by_stage.get(item.stage, item.stage) == limits.stage_lane
+                        for item in roots
+                    )
+                    if lane_count >= limits.stage_cap:
+                        self._conn.execute("ROLLBACK")
+                        return False
                 row = self._conn.execute(
                     "SELECT COALESCE(SUM(demand), 0) FROM records"
                     " WHERE pool = ? AND state = ? AND identity != ?",

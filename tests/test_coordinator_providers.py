@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 
 from agentflow.coordinator.providers import (
-    ProviderCause, classify_claude, classify_codex)
+    PROVIDER_INPUT_V1, ClaudeProviderAdapter, ProviderCause, classify_claude, classify_codex)
 
 
 @pytest.mark.parametrize(
@@ -96,6 +96,23 @@ def test_classification_labels_bridge_to_coordinator_vocabulary():
     assert classify_claude([{"type": "error", "subtype": "capacity"}]).classification() == "recoverable"
     assert classify_claude([{"type": "error", "subtype": "billing"}]).classification() == "permanent"
     assert classify_codex(exit_status=1).classification() == "unknown"
+
+
+def test_provider_command_unwraps_the_versioned_durable_prompt(monkeypatch):
+    import json
+    from agentflow.coordinator.record import Record
+    from agentflow.runner import ClaudeRunner
+
+    prompts = []
+    monkeypatch.setattr(ClaudeRunner, "structured_argv",
+                        lambda self, prompt, model, source: prompts.append(prompt) or ["claude"])
+    record = Record("i", "intake", "claude", 1, model="opus", source="/wt",
+                    input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,
+                                          "prompt": "ground the issue",
+                                          "snapshot": {"number": 7}}))
+
+    assert ClaudeProviderAdapter().command(record) == ["claude"]
+    assert prompts == ["ground the issue"]
 
 
 def test_provider_adapters_observe_from_durable_session_artifacts(tmp_path, monkeypatch):

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -564,12 +564,24 @@ def _claim_triage(repo: str, n: int) -> bool:
     return created.returncode == 0 and claimed.returncode == 0
 
 
-def _release_triage(repo: str, n: int) -> None:
+def _release_triage(repo: str, n: int) -> bool:
     """Drop the intake claim once routing is written (the state label dedups from here) or the
     session ended. A crash *before* this strands the claim: fail-safe (the issue is skipped,
     never double-triaged), auto-reclaimed next cycle by `reclaim_triage_claims` — the missing
-    state label is intake's stale signal, standing in for the open-PR check builds have."""
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", TRIAGING])
+    state label is intake's stale signal, standing in for the open-PR check builds have.
+    Returns durable proof that GitHub no longer carries the claim."""
+    removed = _run(["gh", "issue", "edit", str(n), "--repo", repo,
+                    "--remove-label", TRIAGING])
+    if removed.returncode != 0:
+        return False
+    viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
+    if viewed.returncode != 0:
+        return False
+    try:
+        labels = json.loads(viewed.stdout or "{}").get("labels", [])
+    except ValueError:
+        return False
+    return TRIAGING not in {label.get("name") for label in labels if isinstance(label, dict)}
 
 
 def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexity: Complexity,
@@ -707,28 +719,13 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
     return None
 
 
-# Consecutive intake infra failures per (repo, issue), in-memory in the daemon. Infra
-# failures leave no GitHub trace by design (no comment, no label), so the retry streak
-# lives here; a restart resets it — fine for a bounded safety backstop, not state of record.
-_intake_infra_failures: dict[tuple[str, int], int] = {}
-INTAKE_MAX_INFRA_FAILURES = 3   # after this many in a row on one issue, post one held comment
-
-
 def _handle_intake_infra_failure(cfg: RepoConfig, n: int, result: IntakeResult) -> str:
-    """An intake that fell over before the model weighed in (worktree/provision/launch).
-    Post nothing, change no labels, leave the issue for next cycle — until the streak hits
-    the backstop, when we post exactly one held comment so a truly broken issue isn't
-    retried forever in silence (ADR 0019)."""
-    key = (cfg.repo, n)
-    fails = _intake_infra_failures.get(key, 0) + 1
-    _intake_infra_failures[key] = fails
-    if fails < INTAKE_MAX_INFRA_FAILURES:
-        return f"#{n}: intake couldn't start ({result.detail}) — retrying silently ({fails}/{INTAKE_MAX_INFRA_FAILURES})"
-    del _intake_infra_failures[key]
-    apply_intake(cfg.repo, n, "", [], replace(result, infra_failed=False))  # a real, human-visible hold
-    notify("agentflow needs you", f"{cfg.repo} #{n}: intake keeps failing to start",
-           f"https://github.com/{cfg.repo}/issues/{n}")
-    return f"#{n}: intake couldn't start ({result.detail}) — held after {INTAKE_MAX_INFRA_FAILURES} tries"
+    """A legacy Intake setup failure stays quiet and free until coordinated mode owns it.
+
+    The durable coordinator is the sole retry/hold budget. The temporary rollback path must
+    not keep a second in-memory streak whose count resets on restart.
+    """
+    return f"#{n}: intake couldn't start ({result.detail}) — retrying silently"
 
 
 def _next_intake_candidate(cfg: RepoConfig,
@@ -778,7 +775,6 @@ def _run_intake_session(cfg: RepoConfig, issue: dict, extra: str, builder) -> st
         result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
         if result.infra_failed:
             return _handle_intake_infra_failure(cfg, n, result)
-        _intake_infra_failures.pop((cfg.repo, n), None)   # a clean run ends the streak
         current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
         summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
         tool = getattr(builder, "tool", None)

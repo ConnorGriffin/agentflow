@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from agentflow.coordinator import Submission
+from agentflow.coordinator.providers import PROVIDER_INPUT_V1
 from agentflow.intake import IntakeResult, apply_intake, intake_prompt, intake_result_is_durable
 
 
@@ -27,7 +28,8 @@ def intake_submission(cfg, issue: dict, extra: str, tool: str) -> Submission | N
         return None
     return Submission(repo=cfg.repo, subject=str(n), stage="intake", target=target,
                       pool=tool, complexity="deep", source=str(source_path), claim=True,
-                      input_ptr=json.dumps({"snapshot": snapshot, "source_ref": source_ref,
+                      input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,
+                                            "snapshot": snapshot, "source_ref": source_ref,
                                             "prompt": intake_prompt(cfg.repo, issue, extra)},
                                            sort_keys=True))
 
@@ -94,7 +96,8 @@ def apply_route(record, result: IntakeResult) -> str | None:
     apply_intake(record.repo, number, issue.get("title", snapshot.get("title", "")), labels, result)
     if not intake_result_is_durable(record.repo, number, result):
         return None
-    _release_triage(record.repo, number)
+    if not _release_triage(record.repo, number):
+        return None
     url = f"https://github.com/{record.repo}/issues/{number}"
     if not already and result.route.value in ("grill", "mockup"):
         from agentflow.notify import notify
@@ -119,9 +122,10 @@ def hold_intake(record) -> str | None:
                  [x.get("name", "") for x in issue.get("labels", [])], result)
     if not intake_result_is_durable(record.repo, number, result):
         return None
+    if not _release_triage(record.repo, number):
+        return None
     url = f"https://github.com/{record.repo}/issues/{number}"
     if record.notifications == 0:
         if not notify("agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}", url):
             return None
-    _release_triage(record.repo, number)
     return url

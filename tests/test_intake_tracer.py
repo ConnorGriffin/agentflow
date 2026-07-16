@@ -89,6 +89,25 @@ def test_parsed_route_is_durable_before_projection_even_after_bad_exit(make_coor
     assert len(applied) == 1
 
 
+def test_completed_projection_logs_durable_claim_release(make_coord):
+    fake = IntakeSession()
+    lines = []
+    adapter = IntakeStageAdapter(
+        worktree_reset=lambda record: True, observer=fake,
+        apply_route=lambda record, result: "issue-proof")
+    coord = make_coord(fake, adapter=adapter, log=lines.append)
+    identity = coord.submit_stage(_submission())
+    coord.cycle("claude")
+    fake.message = ('{"route":"ready","title":"Scoped","body":"brief",'
+                    '"complexity":"deep","effort":"medium"}')
+    fake.end(identity, cause=ProviderCause.PROCESS)
+
+    coord.cycle("claude")
+    coord.cycle("claude")
+
+    assert "o/r: 7: intake: attempt 1/3 settled — route parsed; claim released" in lines
+
+
 def test_unparsed_success_uses_three_started_attempts_then_one_hold(make_coord):
     fake = IntakeSession()
     holds = []
@@ -178,9 +197,12 @@ def test_production_projection_applies_once_then_releases_claim(make_coord, monk
     coord.cycle("claude")
     monkeypatch.setattr(loop, "_run", gh)
     monkeypatch.setattr(intake_mod, "_run", gh)
-    monkeypatch.setattr(loop, "_release_triage",
-                        lambda repo, number: (released.append(number),
-                                              issue["labels"].remove("agentflow:triaging")))
+    def release(repo, number):
+        released.append(number)
+        issue["labels"].remove("agentflow:triaging")
+        return True
+
+    monkeypatch.setattr(loop, "_release_triage", release)
     monkeypatch.setattr("agentflow.notify.notify",
                         lambda *args: notified.append(args) or True)
 
@@ -221,7 +243,7 @@ def test_production_exhaustion_notifies_once(make_coord, monkeypatch):
                         lambda *args: applied.append(args))
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
     monkeypatch.setattr(loop, "_release_triage",
-                        lambda repo, number: released.append(number))
+                        lambda repo, number: released.append(number) or True)
     monkeypatch.setattr("agentflow.notify.notify",
                         lambda *args: notified.append(args) or True)
     adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
@@ -244,7 +266,7 @@ def test_exhaustion_retries_a_failed_notification_before_holding(make_coord, mon
         returncode=0, stdout='{"title":"old","labels":[],"comments":[]}'))
     monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
-    monkeypatch.setattr(loop, "_release_triage", lambda *args: None)
+    monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
     monkeypatch.setattr("agentflow.notify.notify",
                         lambda *args: notified.append(args) or next(deliveries))
     adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,

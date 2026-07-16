@@ -322,6 +322,21 @@ def test_reclaim_triage_frees_a_stranded_claim_for_the_intake_queue(monkeypatch)
     assert _untriaged({"number": 69, "labels": []})
 
 
+def test_release_triage_proves_the_claim_is_absent(monkeypatch):
+    calls = iter((_FakeRun(), _FakeRun('{"labels":[]}')))
+    monkeypatch.setattr(loop, "_run", lambda cmd: next(calls))
+
+    assert loop._release_triage("o/r", 69) is True
+
+
+def test_release_triage_fails_closed_when_github_still_reports_the_claim(monkeypatch):
+    calls = iter((_FakeRun(), _FakeRun(
+        '{"labels":[{"name":"agentflow:triaging"}]}')))
+    monkeypatch.setattr(loop, "_run", lambda cmd: next(calls))
+
+    assert loop._release_triage("o/r", 69) is False
+
+
 def test_reclaim_triage_keeps_a_coordinator_owned_continuation(monkeypatch):
     owned = _triaging(69)
     released = []
@@ -1261,13 +1276,12 @@ def test_main_config_requires_repo():
         _main_config([])
 
 
-# --- intake no-spam: infra failures retry silently, backstop holds once (issue #23) ---
+# --- intake no-spam: legacy infra failures stay free of a second retry budget ---
 
 def _stub_intake_once(monkeypatch, result):
     """Drive intake_once with a canned intake result and record any apply_intake call."""
     issue = {"number": 5, "title": "t", "labels": []}
     applied = []
-    loop._intake_infra_failures.clear()
     monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
     monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg, reserved=frozenset(): issue)
     monkeypatch.setattr(loop, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
@@ -1292,31 +1306,15 @@ def test_intake_infra_failure_posts_nothing_and_leaves_it_untriaged(monkeypatch)
     assert "retrying silently" in out
 
 
-def test_intake_infra_backstop_posts_exactly_one_held_comment(monkeypatch):
+def test_repeated_legacy_intake_infra_failures_never_create_an_in_memory_hold(monkeypatch):
     from agentflow.intake import IntakeResult
 
     result = IntakeResult(IntakeRoute.GRILL, "", parsed=False, infra_failed=True, detail="launch non-zero")
     applied = _stub_intake_once(monkeypatch, result)
     cfg = RepoConfig("o/r", "/tmp")
-    for _ in range(loop.INTAKE_MAX_INFRA_FAILURES):
-        loop.intake_once(cfg)
-    # exactly one held comment, and only on the last try
-    assert len(applied) == 1
-    assert applied[0].route is IntakeRoute.GRILL and applied[0].infra_failed is False
-
-
-def test_intake_clean_run_ends_the_infra_streak(monkeypatch):
-    from agentflow.intake import IntakeResult
-
-    infra = IntakeResult(IntakeRoute.GRILL, "", parsed=False, infra_failed=True, detail="x")
-    applied = _stub_intake_once(monkeypatch, infra)
-    cfg = RepoConfig("o/r", "/tmp")
-    loop.intake_once(cfg)   # one infra failure banked
-    # now a clean routing lands; the streak must reset so a later blip doesn't hit the backstop early
-    ok = IntakeResult(IntakeRoute.READY, "brief", complexity=Complexity.DEEP, effort=Effort.MEDIUM)
-    monkeypatch.setattr(loop, "Intake", lambda builder: SimpleNamespace(intake=lambda *a, **k: ok))
-    loop.intake_once(cfg)
-    assert loop._intake_infra_failures.get((cfg.repo, 5)) is None
+    for _ in range(5):
+        assert "retrying silently" in loop.intake_once(cfg)
+    assert applied == []
 
 
 def test_intake_disposes_after_the_routing_is_applied(monkeypatch):

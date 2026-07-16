@@ -33,7 +33,7 @@ from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAd
                                    ReviewStageAdapter, ReviseStageAdapter, Rollout, StageRouter,
                                    tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
-from agentflow.coordinator.store import StoreUnavailable, default_store_path
+from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
 
 BUILD_POOLS = ("claude", "codex")
@@ -335,16 +335,8 @@ class _ProductionGate:
         self._active: dict[str, bool] = {}
 
     def __call__(self, record) -> bool:
-        from agentflow import balancer, dispatch
-        from agentflow.coordinator.record import RUNNING
-        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build"}
+        from agentflow import balancer
         if not tracer.build_review_revise_gate(record):
-            return False
-        running = [item for item in tracer.load_records() if item.state == RUNNING]
-        stage = lane.get(record.stage, record.stage)
-        if len(running) >= dispatch.MACHINE_CEILING:
-            return False
-        if sum(lane.get(item.stage, item.stage) == stage for item in running) >= dispatch.STAGE_CAPS.get(stage, 1):
             return False
         try:
             status = balancer._query_pool(record.pool)
@@ -354,6 +346,19 @@ class _ProductionGate:
             return False
         self._active[record.pool] = status.active
         return not (status.active and self._paced[record.pool] >= balancer.ACTIVE_PACE)
+
+    @staticmethod
+    def reservation_limits(record) -> ReservationLimits:
+        """The global limits the store enforces with the running-row reservation."""
+        from agentflow import dispatch
+        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build"}
+        stage_lane = lane.get(record.stage, record.stage)
+        return ReservationLimits(
+            machine_ceiling=dispatch.MACHINE_CEILING,
+            stage_cap=dispatch.STAGE_CAPS.get(stage_lane, 1),
+            stage_lane=stage_lane,
+            lane_by_stage=lane,
+        )
 
     def started(self, record) -> None:
         """Charge operator pacing only after the provider start is durable."""

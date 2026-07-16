@@ -7,10 +7,11 @@ nothing here is wired into the daemon yet.
 
 from __future__ import annotations
 
-from conftest import FakeSession, NeverStartsLauncher, permits
+from conftest import FakeSession, NeverStartsLauncher, permits, record_of
 
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.providers import ProviderCause
+from agentflow.coordinator.store import ReservationLimits
 
 
 def test_submit_stage_is_idempotent_on_the_logical_stage_identity(make_coord):
@@ -98,6 +99,36 @@ def test_permit_ledger_is_shared_across_coordinator_instances(make_coord):
     assert permits(a, "codex") == 4
     b.cycle("codex")                     # b sees the shared ledger is full and reserves none
     assert permits(b, "codex") == 4
+
+
+def test_global_stage_limit_is_enforced_through_the_coordinator_seam(make_coord):
+    """A Build already running on one pool keeps a Review waiting on the other because both
+    consume the shared Build lane and its limit is reserved in the durable ledger."""
+    fake = FakeSession()
+
+    class OneBuildLane:
+        def __call__(self, record):
+            return True
+
+        def reservation_limits(self, record):
+            return ReservationLimits(
+                machine_ceiling=4, stage_cap=1, stage_lane="build",
+                lane_by_stage={"build": "build", "review": "build", "revise": "build"},
+            )
+
+    gate = OneBuildLane()
+    first = make_coord(fake, gate=gate)
+    build = first.submit_stage(Submission(
+        repo="o/r", subject="1", stage="build", pool="claude", effort="low"))
+    first.cycle("claude")
+
+    second = make_coord(fake, gate=gate)
+    review = second.submit_stage(Submission(
+        repo="o/r", subject="2", stage="review", pool="codex"))
+    second.cycle("codex")
+
+    assert record_of(second, build).state == "running"
+    assert record_of(second, review).state == "waiting"
 
 
 def test_only_build_is_wired_behind_the_coordinator():

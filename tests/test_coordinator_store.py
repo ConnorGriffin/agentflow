@@ -18,7 +18,7 @@ import pytest
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.record import Record
 from agentflow.coordinator.store import (
-    SCHEMA_VERSION, Store, StoreUnavailable, default_store_path)
+    ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable, default_store_path)
 
 
 def test_default_store_lives_under_the_state_directory(coord_state):
@@ -74,6 +74,76 @@ def test_reserve_is_atomic_across_instances(tmp_path):
 
     assert len(reserved) == 2
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
+
+
+def test_global_stage_cap_is_atomic_across_pools(tmp_path):
+    """Review and Build share Build's lane. Distinct coordinators racing on distinct pools
+    still reserve at most the lane cap because the decision lives in the shared transaction."""
+    path = tmp_path / "coord.db"
+    Store(path).close()
+    records = [
+        Record(f"R{i}", "review" if i % 2 else "build",
+               "claude" if i % 2 else "codex", 1, state="running")
+        for i in range(8)
+    ]
+    limits = ReservationLimits(
+        machine_ceiling=8, stage_cap=2, stage_lane="build",
+        lane_by_stage={"build": "build", "review": "build", "revise": "build"},
+    )
+    barrier = threading.Barrier(len(records))
+    reserved = []
+    lock = threading.Lock()
+
+    def race(record):
+        store = Store(path)
+        barrier.wait()
+        if store.reserve(record, budget=5, limits=limits):
+            with lock:
+                reserved.append(record.identity)
+        store.close()
+
+    threads = [threading.Thread(target=race, args=(record,)) for record in records]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(reserved) == 2
+
+
+def test_machine_ceiling_is_atomic_across_stage_lanes_and_pools(tmp_path):
+    path = tmp_path / "coord.db"
+    Store(path).close()
+    stages = ("intake", "build", "mockup", "respond")
+    records = [
+        Record(f"R{i}", stages[i % len(stages)],
+               "claude" if i % 2 else "codex", 1, state="running")
+        for i in range(8)
+    ]
+    barrier = threading.Barrier(len(records))
+    reserved = []
+    lock = threading.Lock()
+
+    def race(record):
+        store = Store(path)
+        lane = {"intake": "triage"}.get(record.stage, record.stage)
+        limits = ReservationLimits(
+            machine_ceiling=3, stage_cap=8, stage_lane=lane,
+            lane_by_stage={"intake": "triage"},
+        )
+        barrier.wait()
+        if store.reserve(record, budget=5, limits=limits):
+            with lock:
+                reserved.append(record.identity)
+        store.close()
+
+    threads = [threading.Thread(target=race, args=(record,)) for record in records]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(reserved) == 3
 
 
 def test_existing_zero_byte_store_fails_closed(tmp_path):

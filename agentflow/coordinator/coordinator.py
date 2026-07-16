@@ -347,9 +347,9 @@ class Coordinator:
             return False  # a code-writing stage may not silently leave its pinned lineage
         if not self._gate(record):
             return False  # an independent admission gate (headroom, ceiling, cap, pacing)
-        # Flip to a reservation and atomically claim the demand on the ledger; the store
-        # reads availability and writes the running row under one lock, so concurrent
-        # instances cannot push a pool past its five-permit budget (ADR 0029/0030). The fresh
+        # Flip to a reservation and atomically claim demand plus any global admission limits
+        # on the ledger; concurrent instances cannot push a pool, machine, or stage lane past
+        # its reviewed budget (ADR 0029/0030). The fresh
         # launch token binds this reservation to exactly one bootstrap child: only a child
         # holding it may record `started`, so a timed-out launch disowned back to waiting can
         # never be adopted by an uncancelled child (ADR 0030 handshake boundary).
@@ -361,7 +361,9 @@ class Coordinator:
         record.attempt_committed = False  # a fresh attempt has not been consumed yet
         record.started_at = now
         record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
-        if not self._store.reserve(record, PERMIT_BUDGET):
+        reservation_limits = getattr(self._gate, "reservation_limits", None)
+        limits = reservation_limits(record) if reservation_limits is not None else None
+        if not self._store.reserve(record, PERMIT_BUDGET, limits):
             record.state = WAITING  # the pool cannot fit this demand right now
             record.start_fact = None
             return False
@@ -410,6 +412,8 @@ class Coordinator:
         record.claim = False
         record.retired = True
         self._persist(record)
+        self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} settled — "
+                          f"{_OUTCOME_LABEL.get(record.stage, record.stage)}; claim released")
         return True
 
     def _finalize(self, record: Record) -> StageOutcome | None:
