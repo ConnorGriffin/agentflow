@@ -64,5 +64,8 @@ class Record:
     builder_lineage: str | None = None   # who built the diff — a same-tool review cannot auto-merge
     builder_complexity: str | None = None  # the original builder complexity, carried so a later
                                            # Revise never re-reads a mutable issue label (ADR 0018)
+    round: int = 0                       # completed auto-revise rounds behind this stage; part of
+                                         # the identity so an evidence-only revision's re-review at
+                                         # the same head SHA is still a fresh stage
     auto_merge_allowed: bool = True
     root: str | None = None              # the root stage this descends from; it shares the root's reservation

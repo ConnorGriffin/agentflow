@@ -2,14 +2,17 @@
 
 Stage orchestration ``submit_stage``s the facts for one logical stage and later ``cycle``s a
 pool to collect the completed stage outcomes and human holds that reconciliation produced.
-Those two calls are the whole public surface. Everything hard lives behind them: the
+``park_completed`` is the one deliberate addition to that surface: it turns a completed stage
+the product policy leaves with no successor into the same idempotent human hold a budget
+exhaustion produces. Everything hard lives behind them: the
 continuation record and its four states, the waiting queue and ADR 0028 ordering, the
 attempt budget, the reviewed five-permit admission matrix, the atomic permit reservation on
 the running-record ledger, the crash-safe provider start handshake, outcome-first
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
 
-Build and Review are the production stages behind this coordinator (issues #103, #104); every
+Build, Review, and Revise are the production stages behind this coordinator (issues #103,
+#104, #105); every
 other logical stage remains queued behind the admission gate until its own tracer lands. Review
 is read-only, so an eligible continuation may move to the other pool when its home pool cannot
 fit it. The interface and crash boundaries remain exercised with injected launcher, gate, and
@@ -60,6 +63,9 @@ class Submission:
     input_ptr: str | None = None
     builder_lineage: str | None = None
     builder_complexity: str | None = None  # the original builder complexity, carried to a Revise
+    round: int = 0                  # completed auto-revise rounds behind this stage — part of the
+                                    # identity, so a re-review at an unchanged head SHA is still a
+                                    # genuinely new stage with a fresh budget
     descendant_of: str | None = None  # a subagent shares this root stage's one reservation
     transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
 
@@ -92,7 +98,7 @@ class Coordinator:
     stage **adapter** that observes an ended family and verifies its stage outcome. Production
     uses the real spawning launcher with pid liveness; a bare coordinator keeps permissive/
     never-verified defaults, while the live Build tracer supplies its gate and adapter. None is a
-    public operation — the only public surface is ``submit_stage`` and ``cycle``.
+    public operation — the public surface is ``submit_stage``, ``cycle``, and ``park_completed``.
     """
 
     def __init__(self, *, launcher=None, gate=None, adapter=None, log=None) -> None:
@@ -122,7 +128,8 @@ class Coordinator:
         model = MODEL_FOR.get((submission.pool, submission.complexity), "opus")
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
-        identity = _identity(submission.repo, submission.subject, stage, submission.target)
+        identity = _identity(submission.repo, submission.subject, stage, submission.target,
+                             submission.round)
         # A code-writing stage is pinned to the tool that built its diff (or, first time, its
         # own pool) and cannot silently cross pools; a read-only stage is unpinned and may run
         # on either pool. A review by the same tool that built the diff cannot auto-merge
@@ -137,35 +144,41 @@ class Coordinator:
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
-            builder_complexity=submission.builder_complexity,
+            builder_complexity=submission.builder_complexity, round=submission.round,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of)
         with self._lock:
             existing = self._records.setdefault(identity, record)
             if existing is record:
                 self._register_descendant(record)
-                self._transfer_claim(record, submission.transfer_from)
                 self._persist(record)
+            # The successor is durable before the prior stage retires, and the transfer re-runs
+            # on a repeated submission: a crash between the two writes leaves the prior completed
+            # and still claimed, which the next idempotent submission finishes (ADR 0028 — a
+            # restart repeats the transfer safely, never drops or duplicates the claim).
+            self._transfer_claim(existing, submission.transfer_from)
         return identity
 
-    def _park_completed(self, identity: str) -> "StageOutcome | None":
+    def park_completed(self, identity: str) -> "StageOutcome | None":
         """Terminally park a completed stage the product policy leaves with no next stage to take
-        over its claim (ADR 0028) — a driver-only continuation of the two-call seam, never a third
-        public operation. A blocking Review whose one auto-revise round is already spent has no
-        revise, review, or merge to transfer to, so without this its retained claim would keep the
-        PR owned forever. Release that claim through the very same idempotent, notify-once human
-        handoff a budget exhaustion uses. Returns the ``held`` outcome, or ``None`` when the record
-        is missing, already retired, or not a completed stage awaiting a transfer. Idempotent and
-        crash-safe: a repeat re-observes the durable handoff and neither re-notifies nor
-        double-releases the claim."""
+        over its claim (ADR 0028) — the third public operation beside ``submit_stage`` and
+        ``cycle``, added deliberately: the completed-outcome consumer sometimes learns there is no
+        successor (a blocking Review whose auto-revise rounds are spent, a record missing the
+        lineage facts a successor needs), and without this the retained claim would keep the PR
+        owned forever. It stays within ADR 0030's seam: the hold still flows through the stage
+        adapter's own ``finalize_hold`` handoff, exactly as a budget exhaustion does. Returns the
+        ``held`` outcome, or ``None`` when the record is missing, already retired, or not a
+        completed stage awaiting a transfer. Idempotent and crash-safe: a repeat re-observes the
+        durable handoff and neither re-notifies nor double-releases the claim."""
         with self._lock:
             record = self._records.get(identity)
             if record is None or record.retired or record.state != COMPLETED:
                 return None
-            record.hold_pending = True
-            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no next "
-                              f"stage remains — parking for human; claim released")
-            self._persist(record)
+            if not record.hold_pending:
+                record.hold_pending = True
+                self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no "
+                                  f"next stage remains — parking for human; claim released")
+                self._persist(record)
             return self._finalize_hold(record)
 
     def _register_descendant(self, record: Record) -> None:
@@ -186,7 +199,7 @@ class Coordinator:
         if prior_identity is None:
             return
         prior = self._records.get(prior_identity)
-        if prior is not None and prior.state == COMPLETED:
+        if prior is not None and prior.state == COMPLETED and not prior.retired:
             prior.claim = False
             prior.retired = True
             self._persist(prior)
@@ -488,8 +501,14 @@ class Coordinator:
         self._log(f"{record.repo}: {record.subject}: {record.stage}: {tail}")
 
 
-def _identity(repo: str, subject: str, stage: str, target: str | None) -> str:
-    return "|".join((repo, str(subject), stage, target or "-"))
+def _identity(repo: str, subject: str, stage: str, target: str | None, round: int = 0) -> str:
+    # The auto-revise round joins the identity once one exists, so an evidence-only revision —
+    # whose re-review binds to the *same* head SHA — still opens a genuinely new stage rather
+    # than colliding with the retired prior review's record.
+    parts = [repo, str(subject), stage, target or "-"]
+    if round:
+        parts.append(f"r{round}")
+    return "|".join(parts)
 
 
 def _admit_everything(record: Record) -> bool:

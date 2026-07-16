@@ -64,9 +64,11 @@ def _records(coord):
     return list(coord._store.load().values())
 
 
-def _ident(subject, stage, target="-"):
-    """The coordinator identity for one issue's stage (``repo|subject|stage|target``)."""
-    return f"o/r|{subject}|{stage}|{target}"
+def _ident(subject, stage, target="-", round=0):
+    """The coordinator identity for one issue's stage (``repo|subject|stage|target[|r<round>]``
+    — the auto-revise round joins the identity once one exists)."""
+    base = f"o/r|{subject}|{stage}|{target}"
+    return f"{base}|r{round}" if round else base
 
 
 _BLOCKING = Verdict(clean=False, findings=(Finding("blocking", "fix the thing"),))
@@ -88,6 +90,7 @@ class _Live:
         self.number = number
         self.labels = list(labels)
         self.verdict = verdict
+        self.fail_gh = False            # flip to make every gh read fail (a transient outage)
         self.projections = []
         monkeypatch.setattr("agentflow.loop._run", self._gh)
         monkeypatch.setattr(coordinated_build, "_review_verdict", lambda review: self.verdict)
@@ -95,6 +98,8 @@ class _Live:
                             lambda entries, **kw: self.projections.append(entries))
 
     def _gh(self, cmd, *args, **kwargs):
+        if self.fail_gh:
+            return SimpleNamespace(returncode=1, stdout="")
         if "list" in cmd:               # gh pr list --head ... --json number,headRefOid
             return SimpleNamespace(returncode=0, stdout=json.dumps(
                 [{"number": self.number, "headRefOid": self.head}]))
@@ -165,7 +170,7 @@ def test_reconcile_opens_each_transition_and_transfers_the_claim_at_every_hop(ma
     assert live.step()[0].stage == "revise"              # Revise completes → reconcile opens Review
 
     # Revise → a new Review for the changed head SHA, with a fresh budget; the prior review is gone.
-    review2 = _ident("7", "review", "sha-b")
+    review2 = _ident("7", "review", "sha-b", round=1)
     assert review2 != review                             # a new head SHA is a genuinely new review
     assert record_of(coord, revise).retired is True
     r2 = record_of(coord, review2)
@@ -177,9 +182,10 @@ def test_reconcile_opens_each_transition_and_transfers_the_claim_at_every_hop(ma
 # --- a blocking review with the auto-revise round spent parks once and releases the claim --
 
 def test_reconcile_parks_a_blocking_review_once_the_revise_round_is_spent(make_coord, monkeypatch):
-    """Once the single auto-revise product round (ADR 0018) is used, a further blocking Review has
-    no revise, review, or merge stage to hand its claim to. Reconcile must park the PR for a human
-    exactly once and release the retained claim, not leave the PR owned forever."""
+    """Once the auto-revise product cap (``MAX_REVISES`` rounds, ADR 0004) is spent, a further
+    blocking Review has no revise, review, or merge stage to hand its claim to. Reconcile must park
+    the PR for a human exactly once and release the retained claim, not leave the PR owned
+    forever."""
     fake = FakeSession()
     pr, verdict, revision = [True], [True], [True]
     coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
@@ -192,16 +198,16 @@ def test_reconcile_parks_a_blocking_review_once_the_revise_round_is_spent(make_c
 
     # MAX_REVISES logical revise rounds, each: blocking Review → Revise → pushed revision → Review.
     heads = iter(["sha-b", "sha-c", "sha-d", "sha-e"])
-    for _ in range(MAX_REVISES):
-        review = _ident("7", "review", live.head)
+    for used in range(MAX_REVISES):
+        review = _ident("7", "review", live.head, round=used)
         assert live.run_stage(review) == ["review"]      # Review blocks → reconcile opens Revise
-        revise = _ident("7", "revise", live.head)
+        revise = _ident("7", "revise", live.head, round=used)
         assert record_of(coord, revise).claim is True
         assert live.run_stage(revise, head=next(heads)) == ["revise"]  # pushed → opens next Review
     assert sum(1 for r in _records(coord) if r.stage == "revise") == MAX_REVISES
 
     # The final blocking Review has no round left: reconcile parks it and releases the claim.
-    final_review = _ident("7", "review", live.head)
+    final_review = _ident("7", "review", live.head, round=MAX_REVISES)
     assert live.run_stage(final_review) == ["review"]
     parked = record_of(coord, final_review)
     assert parked.state == "held" and parked.claim is False
@@ -242,6 +248,32 @@ def test_review_to_revise_keeps_the_builder_complexity_when_the_issue_label_chan
     revise = record_of(coord, _ident("7", "revise", "sha-a"))
     assert revise.claim is True and revise.complexity == "standard"   # the original builder value
     assert revise.builder_complexity == "standard"        # still durable for the next hop
+
+
+def test_review_without_durable_builder_complexity_parks_instead_of_stranding(make_coord,
+                                                                              monkeypatch):
+    """Issue #105 (spec): a blocking review carrying no durable builder complexity (a record from
+    before that lineage fact existed) can never open a revise — a permanent condition. It must
+    create exactly one parked-PR handoff and release the claim, not silently strand the PR."""
+    fake = FakeSession()
+    coord = make_coord(fake, adapter=_router(fake, pr=[True], verdict=[True], revision=[False]),
+                       gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-a")
+    review = coord.submit_stage(Submission(repo="o/r", subject="7", stage="review", pool="codex",
+                                           complexity="deep", target="sha-a", source=REVIEW_WT,
+                                           builder_lineage="claude"))   # no builder_complexity
+    live.step()                                           # Review admitted and started
+    fake.end(review, cause=ProviderCause.PROCESS)
+    assert [o.stage for o in live.step()] == ["review"]   # completes; the opener finds no lineage
+
+    parked = record_of(coord, review)
+    assert parked.state == "held" and parked.claim is False
+    assert parked.handoffs == 1 and parked.notifications == 1
+    assert not any(r.stage == "revise" for r in _records(coord))
+    assert tracer.owned_issues(_records(coord), "o/r") == set()
+    assert live.step() == []                              # idempotent: no re-park, no revise
+    still = record_of(coord, review)
+    assert still.handoffs == 1 and still.notifications == 1
 
 
 # --- outcome-first: a pushed revision completes; local-only changes do not ----------------
@@ -295,6 +327,66 @@ def test_revise_completes_on_durable_non_code_evidence_with_no_pushed_head(make_
                             "![before/after](https://user-images.githubusercontent.com/1/x.png)"}]
     fake.end(ident, cause=ProviderCause.PROCESS)          # a bad exit cannot undo a durable outcome
     assert [o.status for o in coord.cycle("claude")] == ["completed"]
+
+
+def test_evidence_only_completion_opens_a_fresh_review_at_the_unchanged_head(make_coord,
+                                                                             monkeypatch):
+    """Issue #105 (spec): an evidence-only revision completes with the head SHA unchanged, so the
+    next review binds to the *same* SHA as the retired prior review. The completed Revise must
+    still hand its claim to a genuinely NEW review record with a fresh budget — the revise round
+    joins the identity — never silently collide with the retired record and strand the chain."""
+    fake = FakeSession()
+    pr, verdict, revision = [True], [False], [False]
+    coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
+                       gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-a")
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
+                                          complexity="deep", effort="high", source=BUILD_WT))
+    assert live.run_stage(build) == ["build"]             # Build completes → Review(sha-a)
+    review = _ident("7", "review", "sha-a")
+    verdict[0] = True
+    assert live.run_stage(review) == ["review"]           # Review blocks → reconcile opens Revise
+    revise = _ident("7", "revise", "sha-a")
+
+    live.step()                                           # Revise admitted and started
+    revision[0] = True                                    # durable evidence; head UNCHANGED (sha-a)
+    fake.end(revise, cause=ProviderCause.PROCESS)
+    assert [o.stage for o in live.step()] == ["revise"]   # completes → must open a fresh review
+
+    review2 = _ident("7", "review", "sha-a", round=1)     # same SHA, next round → a new identity
+    r2 = record_of(coord, review2)
+    assert r2.claim is True and r2.attempts == 0 and r2.target == "sha-a"  # fresh review budget
+    assert record_of(coord, revise).retired is True       # the claim actually transferred
+    assert record_of(coord, review).retired is True       # the prior review stays retired
+    assert tracer.owned_issues(_records(coord), "o/r") == {7}
+    live.step()                                           # a repeat pass opens nothing new
+    assert sum(1 for r in _records(coord) if r.stage == "review") == 2
+
+
+def test_revision_ready_rejects_a_head_that_does_not_descend_from_the_reviewed_sha(tmp_path,
+                                                                                   monkeypatch):
+    """A head that merely *differs* from the reviewed SHA is not a pushed revision: only a head
+    descending from it counts, so a force-push back to an older commit keeps the revise incomplete
+    instead of completing on a rewind (issue #105). The retained builder worktree answers the
+    ancestry question."""
+    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-9-x"
+    wt.mkdir(parents=True)
+    record = Record(identity="o/r|9|revise|sha-a", stage="revise", pool="claude", lineage="claude",
+                    demand=3, repo="o/r", subject="9", target="sha-a", source=str(wt))
+    ancestor = [1]                                        # git merge-base --is-ancestor exit code
+    def _gh(cmd, *a, **k):
+        if "merge-base" in cmd:
+            return SimpleNamespace(returncode=ancestor[0], stdout="")
+        if "list" in cmd:                                 # gh pr list → a DIFFERENT head
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                [{"headRefOid": "sha-rewound", "number": 42}]))
+        return SimpleNamespace(returncode=0, stdout="")
+    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [])
+
+    assert coordinated_build._revision_ready(record, None) is False  # rewound head, no evidence
+    ancestor[0] = 0                                       # the head descends from the reviewed SHA
+    assert coordinated_build._revision_ready(record, None) is True
 
 
 # --- retained worktree reuse: a miss costs nothing; an interrupt keeps local work ---------
@@ -417,10 +509,12 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
 
 # --- crash boundaries at both transfer points ---------------------------------------------
 
-def test_restart_at_transfer_points_keeps_one_claim_and_never_duplicates(make_coord):
-    """Fault injection (ADR 0028): a daemon death at the Review→Revise and Revise→Review transfer
-    points must never drop a claim, double-claim, duplicate a revision or a review, or hand out a
-    free attempt."""
+def test_restart_at_transfer_points_redrives_the_next_stage_without_resubmission(make_coord,
+                                                                                 monkeypatch):
+    """Fault injection (ADR 0028): a daemon death between a stage persisting COMPLETED and its
+    opener running must not strand the chain. On restart, the reconcile pass itself re-drives each
+    transfer from the durable records — no hand-resubmitted successor — without dropping a claim,
+    double-claiming, duplicating a revision or a review, or handing out a free attempt."""
     fake = FakeSession()
     pr, verdict, revision = [True], [True], [False]
     adapter = _router(fake, pr=pr, verdict=verdict, revision=revision)
@@ -429,32 +523,77 @@ def test_restart_at_transfer_points_keeps_one_claim_and_never_duplicates(make_co
                                           complexity="deep", effort="high", source=BUILD_WT))
     coord.cycle("claude")
     fake.end(build, cause=ProviderCause.PROCESS)
-    coord.cycle("claude")
-    review = coord.submit_stage(Submission(repo="o/r", subject="7", stage="review", pool="codex",
-                                           complexity="deep", target="sha-a", source=REVIEW_WT,
-                                           builder_lineage="claude", transfer_from=build))
-    coord.cycle("codex")
-    fake.end(review, cause=ProviderCause.PROCESS)         # verdict[0] already durable → completes
-    coord.cycle("codex")
+    assert [o.stage for o in coord.cycle("claude")] == ["build"]  # completed; death before opener
 
-    # Death before the Review → Revise transfer: a fresh coordinator still sees Review owning it.
+    # Restart at Build → Review: reconcile re-drives the transfer from the completed record.
     restarted = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
-    assert record_of(restarted, review).claim is True and record_of(restarted, review).retired is False
-    revise = restarted.submit_stage(Submission(repo="o/r", subject="7", stage="revise", pool="claude",
-                                               complexity="deep", target="sha-a", source=BUILD_WT,
-                                               builder_lineage="claude", transfer_from=review))
-    assert record_of(restarted, review).retired is True
+    live = _Live(restarted, fake, monkeypatch, head="sha-a")
+    live.step()
+    review = _ident("7", "review", "sha-a")
+    assert record_of(restarted, build).retired is True
+    assert record_of(restarted, review).claim is True
     assert tracer.owned_issues(_records(restarted), "o/r") == {7}
 
-    # The revise runs and pushes; then the daemon dies before retirement.
-    restarted.cycle("claude")
+    # The review reaches its durable blocking verdict; the daemon dies again before its opener.
+    live.step()                                           # Review admitted and started (codex)
+    fake.end(review, cause=ProviderCause.PROCESS)         # verdict[0] already durable → completes
+    assert [o.stage for o in restarted.cycle("codex")] == ["review"]
+
+    # Restart at Review → Revise: re-driven with no hand-resubmitted successor.
+    again = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    live2 = _Live(again, fake, monkeypatch, head="sha-a")
+    live2.step()
+    revise = _ident("7", "revise", "sha-a")
+    assert record_of(again, review).retired is True
+    rev = record_of(again, revise)
+    assert rev.claim is True and rev.attempts == 0        # one claim owner, no free attempt
+    assert sum(1 for r in _records(again) if r.stage == "revise") == 1
+    assert tracer.owned_issues(_records(again), "o/r") == {7}
+
+    # The revise runs and pushes; the daemon dies after completion, before its opener.
+    live2.step()                                          # Revise admitted and started (claude)
+    live2.head = "sha-b"
     revision[0] = True
     fake.end(revise, cause=ProviderCause.PROCESS)
-    again = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
-    assert [o.status for o in again.cycle("claude")] == ["completed"]  # finalized exactly once
-    assert record_of(again, revise).claim is True                     # kept until the next stage
-    assert record_of(again, revise).attempts == 1                     # attempt not double-counted
-    assert again.cycle("claude") == []                                # no duplicate revision work
+    assert [o.stage for o in again.cycle("claude")] == ["revise"]  # finalized exactly once
+
+    # Restart at Revise → Review: re-driven, one new review, nothing duplicated.
+    final = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    live3 = _Live(final, fake, monkeypatch, head="sha-b")
+    live3.step()
+    review2 = _ident("7", "review", "sha-b", round=1)
+    assert record_of(final, revise).retired is True
+    assert record_of(final, revise).attempts == 1         # attempt not double-counted
+    r2 = record_of(final, review2)
+    assert r2.claim is True and r2.attempts == 0          # a fresh review budget
+    assert tracer.owned_issues(_records(final), "o/r") == {7}
+    live3.step()                                          # a repeat pass opens nothing new
+    assert sum(1 for r in _records(final) if r.stage == "review") == 2
+    assert sum(1 for r in _records(final) if r.stage == "revise") == 1
+
+
+def test_transient_opener_failure_is_redriven_on_the_next_pass(make_coord, monkeypatch):
+    """An opener that fails on a transient read (a gh non-zero exit) must not strand the chain:
+    the completed record still holds the change claim, so the next reconcile pass re-drives the
+    same transfer without any hand-resubmission."""
+    fake = FakeSession()
+    pr, verdict, revision = [True], [False], [False]
+    coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
+                       gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-a")
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
+                                          complexity="deep", effort="high", source=BUILD_WT))
+    live.step()                                           # Build admitted and started
+    fake.end(build, cause=ProviderCause.PROCESS)
+    live.fail_gh = True                                   # the PR lookup fails this pass
+    assert [o.stage for o in live.step()] == ["build"]    # completed, but no review opened
+    assert record_of(coord, build).claim is True and record_of(coord, build).retired is False
+    assert not any(r.stage == "review" for r in _records(coord))
+
+    live.fail_gh = False
+    live.step()                                           # the next pass re-drives the transfer
+    assert record_of(coord, _ident("7", "review", "sha-a")).claim is True
+    assert record_of(coord, build).retired is True
 
 
 # --- Build, Review, and Revise are the only enabled stages --------------------------------
@@ -486,6 +625,7 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
     assert sub.stage == "revise" and sub.target == "sha-a"            # revises away from reviewed SHA
     assert sub.pool == "claude" and sub.builder_lineage == "claude"   # the builder's tool lineage
     assert sub.complexity == "deep"                                   # the original builder complexity
+    assert sub.round == review.round                                  # stays in the review's round
     assert sub.transfer_from == "o/r|7|review|sha-a"                  # assumes the review's claim
     assert sub.source == "/home/w/.agentflow/worktrees/claude/issue-7-fix-thing"  # retained build wt
     # A review with no builder lineage, an unreadable source, or a missing SHA yields no submission.
@@ -506,13 +646,15 @@ def test_review_submission_from_a_completed_revise_binds_the_new_head_and_keeps_
     assert sub is not None
     assert sub.stage == "review" and sub.target == "sha-b-new"       # bound to the changed head SHA
     assert sub.pool == "codex" and sub.builder_lineage == "claude"   # original builder still recorded
+    assert sub.round == revise.round + 1                             # the revise round it follows
     assert sub.transfer_from == "o/r|7|revise|sha-a"                 # assumes the revise's claim
     assert "pr-42-fix-thing" in sub.source
 
 
 def test_continuation_attempts_do_not_expand_the_auto_revise_round_policy():
-    """The per-stage continuation budget is separate from the single auto-revise product round
-    (ADR 0018): a logical Revise counts once no matter how many of its attempts it burned."""
+    """The per-stage continuation budget is separate from the auto-revise product cap
+    (``MAX_REVISES`` rounds, ADR 0004): a logical Revise counts once no matter how many of its
+    attempts it burned."""
     revises = [Record(identity=f"o/r|7|revise|sha-{i}", stage="revise", pool="claude", demand=3,
                       repo="o/r", subject="7", attempts=3) for i in range(MAX_REVISES)]
     assert coordinated_build.revise_round_budget_remains([], "o/r", "7") is True
