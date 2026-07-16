@@ -24,7 +24,7 @@ from dataclasses import fields
 from pathlib import Path
 from uuid import uuid4
 
-from agentflow.coordinator.record import NOT_STARTED, RUNNING, STARTED, Record
+from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, Record
 
 SCHEMA_VERSION = 1
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
@@ -172,6 +172,30 @@ class Store:
                 )
             except sqlite3.DatabaseError as e:
                 raise StoreUnavailable(f"cannot write continuation store: {e}") from e
+
+    def upsert_with_claim_transfer(self, record: Record, prior_identity: str) -> Record | None:
+        """Persist a successor and retire its completed predecessor in one transaction.
+
+        The predecessor remains the owner unless the successor row can be written. Repeating
+        the transaction is safe after a restart: an already-retired predecessor and its stable
+        successor identity are simply written again without creating another record.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (prior_identity,)).fetchone()
+                prior = self._decode(row[0]) if row is not None else None
+                self._write(record)
+                if prior is not None and prior.state == COMPLETED:
+                    prior.claim = False
+                    prior.retired = True
+                    self._write(prior)
+                self._conn.execute("COMMIT")
+                return prior
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot transfer stage claim: {e}") from e
 
     def reserve(self, record: Record, budget: int) -> bool:
         """Atomically reserve ``record``'s demand on its pool, or refuse. Availability is read

@@ -464,8 +464,12 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
                    "--json", "number,headRefOid", "--limit", "1"])
     if listed.returncode != 0:
         return
-    prs = json.loads(listed.stdout or "[]")
-    if not prs:
+    try:
+        prs = json.loads(listed.stdout or "[]")
+    except json.JSONDecodeError:
+        return
+    if (not isinstance(prs, list) or not prs or not isinstance(prs[0], dict)
+            or not isinstance(prs[0].get("number"), int)):
         return
     reviewer_tool = "codex" if build.pool == "claude" else "claude"
     submission = review_submission(
@@ -483,9 +487,12 @@ def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> lis
     now = int(time.time())
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
-    for outcome in outcomes:
-        if outcome.stage == "build" and outcome.status == "completed":
-            _open_review_on_completed_build(coord, outcome.identity)
+    # Handoffs are driven from durable state, not only this process's outcomes. A daemon may
+    # die after Build completion is committed but before it consumes the returned outcome.
+    # Completed Builds keep their claim until the exact-head Review is atomically persisted.
+    for record in tracer.load_records():
+        if record.stage == "build" and record.state == "completed" and not record.retired:
+            _open_review_on_completed_build(coord, record.identity)
     records = tracer.load_records()
     owned = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     live.replace_projection(

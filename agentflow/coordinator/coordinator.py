@@ -142,7 +142,9 @@ class Coordinator:
             existing = self._records.setdefault(identity, record)
             if existing is record:
                 self._register_descendant(record)
-                self._transfer_claim(record, submission.transfer_from)
+            if submission.transfer_from is not None:
+                self._transfer_claim(existing, submission.transfer_from)
+            elif existing is record:
                 self._persist(record)
         return identity
 
@@ -163,11 +165,10 @@ class Coordinator:
         stages cannot drop ownership — then releases it and retires as the next stage takes over."""
         if prior_identity is None:
             return
-        prior = self._records.get(prior_identity)
-        if prior is not None and prior.state == COMPLETED:
-            prior.claim = False
-            prior.retired = True
-            self._persist(prior)
+        prior = self._store.upsert_with_claim_transfer(record, prior_identity)
+        if prior is not None:
+            self._records[prior.identity] = prior
+        if prior is not None and prior.state == COMPLETED and prior.retired:
             self._emit(prior, f"attempt {prior.attempts}/{ATTEMPT_BUDGET} completed — "
                               f"{_OUTCOME_LABEL.get(prior.stage, prior.stage)}; "
                               f"claim transferred to {record.stage}")

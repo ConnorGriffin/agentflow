@@ -9,6 +9,8 @@ coordinator.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from conftest import FakeSession, permits, record_of
 
 from agentflow import coordinated_build
@@ -249,6 +251,56 @@ def test_daemon_death_between_stages_keeps_ownership_and_transfers_once(make_coo
     assert again.cycle("codex") == []                                 # no duplicate review work
 
 
+def test_production_reconciliation_recovers_completed_build_handoff_after_restart(
+        make_coord, monkeypatch):
+    """Kill the daemon after Build completion, then recover only through the production pass."""
+    fake = FakeSession()
+    pr, verdict, prep = [True], [False], [True]
+    adapter = _router(fake, pr=pr, verdict=verdict, prep=prep)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    build = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="build", pool="claude", complexity="deep",
+        effort="high", source="/work/.agentflow/worktrees/claude/issue-7-recover-handoff"))
+    coord.cycle("claude")
+    fake.end(build, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+
+    # The process dies before production consumes that cycle's outcome. A fresh coordinator
+    # must rediscover the durable Build instead of relying on an in-memory outcome.
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    calls = []
+
+    def gh(cmd):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=1, stdout="")
+        return SimpleNamespace(returncode=0, stdout='[{"number":42,"headRefOid":"head-a"}]')
+
+    monkeypatch.setattr("agentflow.loop._run", gh)
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+    phase = SimpleNamespace(name="coordinated")
+
+    # An unreadable PR fails closed: Build still owns the change and a later pass retries.
+    coordinated_build.reconcile_and_project(restarted, phase)
+    assert record_of(restarted, build).claim is True
+    assert record_of(restarted, build).retired is False
+
+    coordinated_build.reconcile_and_project(restarted, phase)
+    review = "o/r|7|review|head-a"
+    assert record_of(restarted, build).retired is True
+    assert record_of(restarted, build).claim is False
+    assert record_of(restarted, review).state == "waiting"
+    assert record_of(restarted, review).claim is True
+
+    # Repeated reconciliation/restart neither creates another record nor another provider.
+    coordinated_build.reconcile_and_project(restarted, phase)
+    restarted_again = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coordinated_build.reconcile_and_project(restarted_again, phase)
+    assert list(fake.family_of).count(review) == 1
+    assert len([r for r in _records(restarted_again) if r.stage == "review"]) == 1
+    assert len(calls) == 2
+
+
 # --- build and review are the only enabled stages ----------------------------------------
 
 def test_only_build_and_review_admit_other_stages_stay_waiting(make_coord):
@@ -286,3 +338,12 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     assert coordinated_build.review_submission(
         Record(identity="x", stage="build", pool="claude", demand=5, repo="o/r", subject="7"),
         "sha", "codex", 42) is None
+
+
+def test_review_identity_is_idempotent_per_exact_head(make_coord):
+    coord = make_coord()
+    same = coord.submit_stage(_review(target="head-a"))
+    assert coord.submit_stage(_review(target="head-a")) == same
+    changed = coord.submit_stage(_review(target="head-b"))
+    assert changed != same
+    assert {r.target for r in _records(coord) if r.stage == "review"} == {"head-a", "head-b"}
