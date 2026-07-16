@@ -290,6 +290,15 @@ def test_child_start_and_disown_are_mutually_exclusive(tmp_path):
     assert store.child_start("R-lose", "T2", 5252) is False
     reread = store.record_of("R-lose")
     assert reread.start_fact != STARTED and reread.family is None
+
+    # A delayed timeout from an older launch cannot rotate or disown a newer generation.
+    newer = Record("R-stale", "review", "codex", 2, state="running", launch_token="T-new")
+    store.upsert(newer)
+    before = store.record_of("R-stale")
+    assert store.disown_launch("R-stale", "T-old") == (NOT_STARTED, None)
+    after = store.record_of("R-stale")
+    assert after.launch_token == before.launch_token == "T-new"
+    assert after.revision == before.revision and after.start_fact is None
     store.close()
 
 

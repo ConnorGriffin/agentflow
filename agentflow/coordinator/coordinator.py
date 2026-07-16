@@ -379,12 +379,21 @@ class Coordinator:
         # The bootstrap child may have advanced the durable row while the parent waited for its
         # handshake. Continue from that exact revision; never overwrite the child's start fact
         # with the older reservation snapshot.
+        attempted_token = record.launch_token
         durable = self._store.record_of(record.identity)
         if durable is None or durable.state != RUNNING:
             return
+        assert fact in {STARTED, NOT_STARTED}
+        if fact == STARTED:
+            if (durable.start_fact != STARTED
+                    or durable.launch_token != attempted_token):
+                return
+        elif not (durable.start_fact == NOT_STARTED
+                  or durable.launch_token == attempted_token):
+            # A delayed result from an older launch may not release a newer running attempt.
+            return
         record = durable
         self._records[record.identity] = record
-        assert fact in {STARTED, NOT_STARTED}
         record.start_fact = fact
         if fact == NOT_STARTED:
             self._release(record)

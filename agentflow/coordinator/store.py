@@ -411,6 +411,12 @@ class Store:
                 if record.start_fact == STARTED and record.launch_token == token:
                     self._conn.execute("ROLLBACK")
                     return (STARTED, record.family)
+                if record.state != RUNNING or record.launch_token != token:
+                    # A delayed timeout belongs to an older reservation generation. It has no
+                    # authority over the current attempt and must not rotate its token.
+                    self._conn.execute("ROLLBACK")
+                    return (NOT_STARTED, None)
+                record.start_fact = NOT_STARTED
                 record.launch_token = uuid4().hex  # any late child write can no longer match
                 record.revision += 1
                 self._write(record)

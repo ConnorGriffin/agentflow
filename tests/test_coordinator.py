@@ -7,6 +7,8 @@ nothing here is wired into the daemon yet.
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import threading
 
 from conftest import FakeSession, NeverStartsLauncher, permits, record_of
@@ -297,6 +299,66 @@ def test_hold_finalization_has_one_cross_coordinator_owner(make_coord):
     durable = record_of(first, identity)
     assert durable.state == "held" and durable.hold_pending is False
     assert durable.claim is False and durable.handoff_proof == "hold-proof"
+
+
+def test_delayed_launch_timeout_cannot_disown_a_newer_attempt(make_coord):
+    """A timeout callback retained by attempt T1 runs only after public ``cycle`` has admitted
+    T2. Its old token must not rotate T2 or release its live reservation."""
+    fake = FakeSession()
+    delayed = []
+
+    class FirstLauncher:
+        def start(self, record, store):
+            token = record.launch_token
+            delayed.append(lambda: store.disown_launch(record.identity, token))
+            from agentflow.coordinator.launcher import NOT_STARTED, StartResult
+            return StartResult(NOT_STARTED)
+
+        def is_alive(self, family):
+            return False
+
+    first = make_coord(fake, launcher=FirstLauncher())
+    identity = first.submit_stage(Submission(
+        repo="o/r", subject="launch-generation", stage="review", pool="claude"))
+    first.cycle("claude")
+    assert record_of(first, identity).state == "waiting"
+
+    current = make_coord(fake)
+    current.cycle("claude")
+    before = record_of(current, identity)
+    assert before.state == "running" and fake.is_alive(before.family)
+    assert delayed.pop()() == ("not_started", None)
+
+    after = record_of(current, identity)
+    assert after.state == "running" and after.launch_token == before.launch_token
+    assert after.family == before.family and fake.is_alive(after.family)
+    assert permits(current, "claude") == before.demand
+
+
+def test_schema_v1_record_without_revision_advances_through_public_cycle(make_coord):
+    """A pre-revision schema-v1 payload decodes at generation zero and can be admitted by the
+    public coordinator seam after an upgrade."""
+    fake = FakeSession()
+    seed = make_coord(fake)
+    identity = seed.submit_stage(Submission(
+        repo="o/r", subject="legacy-v1", stage="review", pool="claude"))
+    path = seed._store.path
+    seed._store.close()
+
+    conn = sqlite3.connect(path)
+    payload = json.loads(conn.execute(
+        "SELECT data FROM records WHERE identity = ?", (identity,)).fetchone()[0])
+    payload.pop("revision")
+    conn.execute("UPDATE records SET data = ? WHERE identity = ?",
+                 (json.dumps(payload), identity))
+    conn.commit()
+    conn.close()
+
+    upgraded = make_coord(fake)
+    upgraded.cycle("claude")
+    durable = record_of(upgraded, identity)
+    assert durable.state == "running" and durable.revision > 0
+    assert durable.attempts == 1 and fake.is_alive(durable.family)
 
 
 def test_only_build_is_wired_behind_the_coordinator():
