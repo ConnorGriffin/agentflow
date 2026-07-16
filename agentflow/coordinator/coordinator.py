@@ -453,9 +453,8 @@ class Coordinator:
                 return None
         if outcome is not None or self._adapter.verify(record, obs):
             record.state = COMPLETED
-            if not self._persist(record):
+            if not self._persist(record, retire_descendants=True):
                 return None
-            self._retire_descendants(record)
             # A completed stage keeps its claim until the next stage transfers it (ADR 0028);
             # the transfer line is emitted when that next stage is submitted.
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed — "
@@ -514,25 +513,13 @@ class Coordinator:
             current.claim = False
             return True
 
-        held = self._store.transition(record, hold)
+        held = self._store.transition(record, hold, retire_descendants=True)
         if held is None:
             return None
         self._records[held.identity] = held
-        self._retire_descendants(held)
         return StageOutcome(held.identity, held.stage, "held", held.handoff_kind)
 
     # --- internal helpers ---------------------------------------------------------------
-
-    def _retire_descendants(self, record: Record) -> None:
-        """A root's terminal outcome retires its subagents: they shared its one reservation, so
-        they are done when it is and never linger as waiting work or a second outcome."""
-        for identity in record.descendants:
-            child = self._records.get(identity)
-            if child is not None and not child.retired:
-                child.state = COMPLETED
-                child.retired = True
-                child.claim = False
-                self._persist(child)
 
     def _hold(self, record: Record) -> bool:
         record.state = WAITING
@@ -542,8 +529,8 @@ class Coordinator:
     def _release(self, record: Record) -> None:
         record.process_alive = False
 
-    def _persist(self, record: Record) -> bool:
-        if self._store.upsert(record):
+    def _persist(self, record: Record, *, retire_descendants: bool = False) -> bool:
+        if self._store.upsert(record, retire_descendants=retire_descendants):
             self._records[record.identity] = record
             return True
         # Another coordinator advanced this identity. Refresh the working set and let the

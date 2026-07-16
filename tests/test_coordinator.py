@@ -424,6 +424,41 @@ def test_descendant_racing_root_completion_never_survives_orphaned(make_coord):
     assert all(record.retired for record in children)
 
 
+def test_crash_after_root_completion_commit_cannot_orphan_descendant(make_coord):
+    """Root completion and descendant retirement commit together. A daemon crash in the first
+    instruction after that transaction leaves both terminal for a fresh coordinator."""
+    fake = FakeSession()
+    armed = [False]
+
+    def crash_after_commit(line):
+        if armed[0] and " completed — " in line:
+            raise RuntimeError("simulated daemon crash after terminal commit")
+
+    coord = make_coord(fake, log=crash_after_commit)
+    root = coord.submit_stage(Submission(
+        repo="o/r", subject="crash-root", stage="review", pool="claude"))
+    coord.cycle("claude")
+    child = coord.submit_stage(Submission(
+        repo="o/r", subject="crash-child", stage="respond", pool="claude",
+        descendant_of=root))
+    fake.end(root, success=True)
+    armed[0] = True
+
+    try:
+        coord.cycle("claude")
+    except RuntimeError as error:
+        assert str(error) == "simulated daemon crash after terminal commit"
+    else:
+        raise AssertionError("simulated crash did not fire")
+
+    restarted = make_coord(fake)
+    durable_root = record_of(restarted, root)
+    durable_child = record_of(restarted, child)
+    assert durable_root.state == "completed"
+    assert durable_child.state == "completed" and durable_child.retired is True
+    assert durable_child.claim is False
+
+
 def test_schema_v1_record_without_revision_advances_through_public_cycle(make_coord):
     """A pre-revision schema-v1 payload decodes at generation zero and can be admitted by the
     public coordinator seam after an upgrade."""

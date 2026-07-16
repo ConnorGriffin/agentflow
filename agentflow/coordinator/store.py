@@ -173,7 +173,7 @@ class Store:
                 raise StoreUnavailable(f"cannot read continuation store: {e}") from e
         return {r.identity: r for r in (self._decode(row[0]) for row in rows)}
 
-    def upsert(self, record: Record) -> bool:
+    def upsert(self, record: Record, *, retire_descendants: bool = False) -> bool:
         """Persist one record only if its durable revision is still current.
 
         The caller's object is advanced to the committed revision. A stale writer returns
@@ -193,6 +193,8 @@ class Store:
                     return False
                 record.revision += 1
                 self._write(record)
+                if retire_descendants:
+                    self._retire_descendants(record)
                 self._conn.execute("COMMIT")
                 return True
             except sqlite3.DatabaseError as e:
@@ -200,7 +202,8 @@ class Store:
                 raise StoreUnavailable(f"cannot write continuation store: {e}") from e
 
     def transition(self, expected: Record,
-                   operation: Callable[[Record], bool]) -> Record | None:
+                   operation: Callable[[Record], bool], *,
+                   retire_descendants: bool = False) -> Record | None:
         """Serialize one externally-backed terminal transition.
 
         The durable revision is claimed under ``BEGIN IMMEDIATE`` before ``operation`` runs.
@@ -225,6 +228,8 @@ class Store:
                     return None
                 current.revision += 1
                 self._write(current)
+                if retire_descendants:
+                    self._retire_descendants(current)
                 self._conn.execute("COMMIT")
                 return current
             except sqlite3.DatabaseError as e:
@@ -473,6 +478,22 @@ class Store:
             (record.identity, record.pool, record.state, record.demand,
              self._encode(record)),
         )
+
+    def _retire_descendants(self, root: Record) -> None:
+        """Retire a root's registered descendants inside the caller's transaction."""
+        for identity in root.descendants:
+            row = self._conn.execute(
+                "SELECT data FROM records WHERE identity = ?", (identity,)).fetchone()
+            if row is None:
+                continue
+            child = self._decode(row[0])
+            if child.retired:
+                continue
+            child.state = COMPLETED
+            child.retired = True
+            child.claim = False
+            child.revision += 1
+            self._write(child)
 
     def _rollback_quietly(self) -> None:
         try:
