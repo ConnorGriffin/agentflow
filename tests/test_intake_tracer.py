@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shutil
+from pathlib import Path
 from types import SimpleNamespace
 
 from conftest import FakeSession, record_of, starts_until_held
@@ -11,6 +13,9 @@ from agentflow import coordinated_intake, intake as intake_mod, loop
 from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
+
+_READY_MESSAGE = ('{"route":"ready","title":"Scoped","body":"brief",'
+                  '"complexity":"deep","effort":"medium"}')
 
 
 class IntakeSession(FakeSession):
@@ -164,6 +169,82 @@ def test_human_reply_targets_a_fresh_intake_stage(make_coord):
     initial = coord.submit_stage(_submission())
     replied = coord.submit_stage(_submission(target="comment-99"))
     assert initial != replied
+
+
+def test_completed_intake_disposes_its_worktree_before_retiring(make_coord, tmp_path):
+    """A completed Intake settlement removes its read-only checkout *before* the record retires,
+    so a leftover worktree can never later read as ambiguous legacy activation evidence
+    (issue #106). Exercised end to end through ``Coordinator.cycle``."""
+    fake = IntakeSession()
+    wt = tmp_path / "wd" / ".agentflow" / "worktrees" / "claude-intake" / "issue-7"
+    wt.mkdir(parents=True)
+    retired_at_dispose = []
+
+    def dispose(record):
+        retired_at_dispose.append(record.retired)  # must still be owned when we dispose
+        shutil.rmtree(record.source, ignore_errors=True)
+        return not Path(record.source).exists()
+
+    adapter = IntakeStageAdapter(
+        worktree_reset=lambda record: True, observer=fake,
+        apply_route=lambda record, result: "issue-proof", worktree_dispose=dispose)
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="intake", pool="claude",
+        source=str(wt), input_ptr="durable issue"))
+    coord.cycle("claude")
+    fake.message = _READY_MESSAGE
+    fake.end(identity, cause=ProviderCause.PROCESS)
+
+    coord.cycle("claude")   # classifies the ended attempt -> completed
+    coord.cycle("claude")   # settles the completed record -> disposes then retires
+
+    assert not wt.exists()                             # the read-only checkout is gone
+    assert record_of(coord, identity).retired is True  # the record settled
+    assert retired_at_dispose == [False]               # disposed BEFORE it retired
+
+
+def test_undisposable_intake_worktree_defers_retirement(make_coord):
+    """If the checkout cannot be disposed, settlement withholds the completion proof and the
+    record stays completed-and-owned so a later cycle retries, never retiring over evidence."""
+    fake = IntakeSession()
+    adapter = IntakeStageAdapter(
+        worktree_reset=lambda record: True, observer=fake,
+        apply_route=lambda record, result: "issue-proof",
+        worktree_dispose=lambda record: False)  # never manages to remove it
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission())
+    coord.cycle("claude")
+    fake.message = _READY_MESSAGE
+    fake.end(identity, cause=ProviderCause.PROCESS)
+
+    coord.cycle("claude")
+    coord.cycle("claude")
+
+    settled = record_of(coord, identity)
+    assert settled.state == "completed" and settled.retired is False
+
+
+def test_dispose_worktree_is_idempotent_and_marker_guarded(monkeypatch, tmp_path):
+    """The disposer removes only a real ``<pool>-intake/issue-<n>`` checkout, is a no-op success
+    on an already-absent one, and refuses a source outside the intake marker."""
+    calls = []
+    monkeypatch.setattr(loop, "_run",
+                        lambda cmd: calls.append(cmd) or SimpleNamespace(returncode=0, stdout=""))
+    wt = tmp_path / "wd" / ".agentflow" / "worktrees" / "claude-intake" / "issue-7"
+    absent = SimpleNamespace(source=str(wt), pool="claude", subject="7")
+    assert coordinated_intake.dispose_worktree(absent) is True   # already gone — no git call
+    assert calls == []
+
+    outside = SimpleNamespace(source="/tmp/not-an-intake-worktree", pool="claude", subject="7")
+    assert coordinated_intake.dispose_worktree(outside) is False
+
+    wt.mkdir(parents=True)
+    monkeypatch.setattr(loop, "_run", lambda cmd: (shutil.rmtree(wt, ignore_errors=True)
+                                                   or SimpleNamespace(returncode=0, stdout="")))
+    present = SimpleNamespace(source=str(wt), pool="claude", subject="7")
+    assert coordinated_intake.dispose_worktree(present) is True
+    assert not wt.exists()
 
 
 def test_production_projection_applies_once_then_releases_claim(make_coord, monkeypatch):

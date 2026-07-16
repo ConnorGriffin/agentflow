@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Mapping
 from uuid import uuid4
 
-from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, Record
+from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 
 SCHEMA_VERSION = 1
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
@@ -240,11 +240,28 @@ class Store:
         pool's ledger past ``budget`` (ADR 0029/0030). When supplied, machine and dispatch-lane
         limits are checked from those same running rows in the same transaction, so racers on
         different pools cannot exceed either global cap. Returns whether the reservation was
-        taken; on refusal nothing is written."""
+        taken; on refusal nothing is written.
+
+        The write is a same-identity compare-and-set: an existing row must still be ``waiting``.
+        Two coordinator instances that both loaded the
+        same ``waiting`` record and each flipped it to ``running`` with its own fresh launch token
+        serialize on the write lock — the first commits its reservation, and the second finds the
+        row already advanced and refuses instead of clobbering the winner's token or terminal
+        outcome. Exactly one running reservation and one launch token survive the race."""
         payload = self._encode(record)
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                existing_row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
+                if existing_row is not None:
+                    existing = self._decode(existing_row[0])
+                    if existing.state != WAITING:
+                        # Reservation is a WAITING -> RUNNING compare-and-set. Any other durable
+                        # state means another instance already advanced this identity; never
+                        # overwrite its token, completion, or hold with a stale waiting view.
+                        self._conn.execute("ROLLBACK")
+                        return False
                 if limits is not None:
                     rows = self._conn.execute(
                         "SELECT data FROM records WHERE state = ? AND identity != ?",

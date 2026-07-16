@@ -76,6 +76,75 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
 
 
+def test_reserve_refuses_a_foreign_running_reservation(tmp_path):
+    """The same-identity compare-and-set: once one instance holds a record's running
+    reservation under its launch token, a second instance still holding the stale waiting view
+    cannot reserve the same identity with its own token, and the winner's token is untouched."""
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    store.upsert(Record("R", "build", "claude", 1, state="waiting"))
+
+    assert store.reserve(
+        Record("R", "build", "claude", 1, state="running", launch_token="A"), budget=5)
+    # A racer that loaded the record while it was still waiting now tries its own reservation.
+    assert not store.reserve(
+        Record("R", "build", "claude", 1, state="running", launch_token="B"), budget=5)
+    assert store.record_of("R").launch_token == "A"   # loser did not overwrite the winner
+    assert store.permits_used("claude") == 1           # exactly one running reservation
+    store.close()
+
+
+def test_reserve_never_overwrites_a_terminal_same_identity(tmp_path):
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    store.upsert(Record("R", "intake", "claude", 1, state="completed",
+                        launch_token="winner", outcome="route"))
+
+    stale = Record("R", "intake", "claude", 1, state="running", launch_token="stale")
+    assert store.reserve(stale, budget=5) is False
+    durable = store.record_of("R")
+    assert durable.state == "completed" and durable.launch_token == "winner"
+    assert durable.outcome == "route"
+    store.close()
+
+
+def test_two_processes_racing_one_waiting_record_yield_one_reservation(tmp_path):
+    """Two coordinator instances that both loaded the same waiting record and each flipped it to
+    running with its own fresh launch token race to reserve. Exactly one wins; the surviving
+    running row carries the winner's token, and no second permit is charged (ADR 0030)."""
+    path = tmp_path / "coord.db"
+    seed = Store(path)
+    seed.upsert(Record("R", "build", "claude", 1, state="waiting"))
+    seed.close()
+
+    barrier = threading.Barrier(2)
+    results: dict[str, bool] = {}
+    lock = threading.Lock()
+
+    def race(token):
+        store = Store(path)  # a distinct instance/connection per process
+        record = Record("R", "build", "claude", 1, state="running", launch_token=token)
+        barrier.wait()
+        won = store.reserve(record, budget=5)
+        with lock:
+            results[token] = won
+        store.close()
+
+    threads = [threading.Thread(target=race, args=(t,)) for t in ("TA", "TB")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sum(results.values()) == 1               # exactly one reservation taken
+    winner = next(tok for tok, won in results.items() if won)
+    final = Store(path)
+    reread = final.record_of("R")
+    assert reread.state == "running" and reread.launch_token == winner
+    assert final.permits_used("claude") == 1        # one running reservation, one launch token
+    final.close()
+
+
 def test_global_stage_cap_is_atomic_across_pools(tmp_path):
     """Review and Build share Build's lane. Distinct coordinators racing on distinct pools
     still reserve at most the lane cap because the decision lives in the shared transaction."""

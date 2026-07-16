@@ -15,26 +15,70 @@ from agentflow.coordinator.providers import (
 
 
 @pytest.mark.parametrize(
-    ("subtype", "cause"),
+    ("error_type", "cause"),
     [
-        ("capacity", ProviderCause.CAPACITY),
-        ("rate_limit", ProviderCause.CAPACITY),
-        ("authentication", ProviderCause.PERMANENT),
-        ("billing", ProviderCause.PERMANENT),
-        ("permission", ProviderCause.PERMANENT),
-        ("configuration", ProviderCause.PERMANENT),
-        ("server", ProviderCause.SERVER),
-        ("transport", ProviderCause.SERVER),
+        ("rate_limit_error", ProviderCause.CAPACITY),
+        ("overloaded_error", ProviderCause.SERVER),
+        ("api_error", ProviderCause.SERVER),
+        ("authentication_error", ProviderCause.PERMANENT),
+        ("billing_error", ProviderCause.PERMANENT),
+        ("permission_error", ProviderCause.PERMANENT),
+        ("not_found_error", ProviderCause.PERMANENT),
+        ("invalid_request_error", ProviderCause.PERMANENT),
     ],
 )
-def test_claude_typed_error_subtypes_map_to_their_cause(subtype, cause):
-    obs = classify_claude([{"type": "error", "subtype": subtype}])
+def test_claude_assistant_error_values_map_to_their_cause(error_type, cause):
+    # The real Agent SDK surfaces provider errors as an `error` value on the assistant turn,
+    # not an invented `type:error` stream event.
+    obs = classify_claude([{"type": "assistant", "error": {"type": error_type}}])
     assert obs.cause is cause
+    nested = classify_claude([{"type": "assistant", "message": {"error": {"type": error_type}}}])
+    assert nested.cause is cause
 
 
-def test_claude_capacity_carries_the_reset_time():
-    obs = classify_claude([{"type": "error", "subtype": "capacity", "reset_at": 900}])
+@pytest.mark.parametrize(
+    ("error_value", "cause"),
+    [
+        ("rate_limit", ProviderCause.CAPACITY),
+        ("authentication_failed", ProviderCause.PERMANENT),
+        ("billing_error", ProviderCause.PERMANENT),
+        ("invalid_request", ProviderCause.PERMANENT),
+        ("server_error", ProviderCause.SERVER),
+        ("max_output_tokens", ProviderCause.PROCESS),
+    ],
+)
+def test_claude_sdk_assistant_error_strings_map_to_their_cause(error_value, cause):
+    assert classify_claude([{"type": "assistant", "error": error_value}]).cause is cause
+
+
+def test_claude_rejected_rate_limit_event_is_capacity_with_reset():
+    obs = classify_claude([
+        {"type": "rate_limit_event",
+         "rate_limit_info": {"status": "rejected", "resetsAt": 900}},
+    ])
     assert obs.cause is ProviderCause.CAPACITY and obs.reset_at == 900
+
+
+def test_claude_allowed_rate_limit_event_establishes_no_cause():
+    obs = classify_claude([
+        {"type": "rate_limit_event",
+         "rate_limit_info": {"status": "allowed", "resetsAt": 900}},
+        {"type": "result", "subtype": "success", "result": "done"},
+    ])
+    assert obs.cause is ProviderCause.NONE and obs.final_message == "done"
+
+
+def test_claude_terminal_result_subtype_failures_are_process_interruptions():
+    assert classify_claude(
+        [{"type": "result", "subtype": "error_max_turns"}]).cause is ProviderCause.PROCESS
+    assert classify_claude(
+        [{"type": "result", "subtype": "error_during_execution"}]).cause is ProviderCause.PROCESS
+    assert classify_claude(
+        [{"type": "result", "subtype": "error_max_budget_usd"}]
+    ).cause is ProviderCause.PERMANENT
+    assert classify_claude(
+        [{"type": "result", "subtype": "error_max_structured_output_retries"}]
+    ).cause is ProviderCause.PROCESS
 
 
 def test_claude_timeout_and_process_come_from_supervisor_and_exit():
@@ -61,11 +105,11 @@ def test_claude_preserves_unrecognized_events_and_reports_unknown():
             {"type": "text", "text": "hi"},
         ]}},
         {"type": "telemetry", "weird": {"nested": 1}},
-        {"type": "error", "subtype": "brand_new_thing"},
+        {"type": "assistant", "error": {"type": "brand_new_error"}},
     ])
     assert obs.cause is ProviderCause.UNKNOWN
     kinds = {e.get("type") for e in obs.unrecognized}
-    assert "telemetry" in kinds and "error" in kinds
+    assert "telemetry" in kinds and "assistant" in kinds
     assert len(obs.events) == 3  # nothing dropped
 
 
@@ -100,8 +144,12 @@ def test_codex_untyped_failure_stays_bounded_unknown_but_timeout_is_typed():
 
 
 def test_classification_labels_bridge_to_coordinator_vocabulary():
-    assert classify_claude([{"type": "error", "subtype": "capacity"}]).classification() == "recoverable"
-    assert classify_claude([{"type": "error", "subtype": "billing"}]).classification() == "permanent"
+    assert classify_claude(
+        [{"type": "assistant", "error": {"type": "rate_limit_error"}}]
+    ).classification() == "recoverable"
+    assert classify_claude(
+        [{"type": "assistant", "error": {"type": "billing_error"}}]
+    ).classification() == "permanent"
     assert classify_codex(exit_status=1).classification() == "unknown"
 
 
@@ -140,7 +188,8 @@ def test_provider_adapters_observe_from_durable_session_artifacts(tmp_path, monk
 
     artifacts("tok-1", '{"type":"assistant","message":{"content":'
                        '[{"type":"text","text":"hi"}]}}\n'
-                       '{"type": "error", "subtype": "capacity", "reset_at": 42}\n', "0\n")
+                       '{"type": "rate_limit_event", "rate_limit_info":'
+                       ' {"status": "rejected", "resetsAt": 42}}\n', "0\n")
     claude_rec = Record("i", "review", "claude", 1, launch_token="tok-1", family="123")
     obs = ClaudeProviderAdapter().observe(claude_rec)
     assert obs.cause is ProviderCause.CAPACITY and obs.reset_at == 42 and obs.exit_status == 0

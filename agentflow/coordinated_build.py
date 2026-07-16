@@ -200,7 +200,11 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
 
     sources = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     evidence = list(legacy_evidence(live_sessions, sources))
-    owned_by_repo = {cfg.repo: tracer.owned_issues(records, cfg.repo) for cfg in repos}
+    # Ownership is resolved per claim type: an Intake record owns only its issue's `triaging`
+    # claim, a Build/Review/Revise record only its issue's `building` claim. Keying the exclusion
+    # per lane stops one type's live record from hiding the other type's stale legacy claim.
+    owned_by_lane = {(cfg.repo, lane): tracer.owned_issues(records, cfg.repo, lane=lane)
+                     for cfg in repos for lane in ("building", "triaging")}
     for cfg in repos:
         for claim_label, lane in ((BUILDING, "building"), (TRIAGING, "triaging")):
             claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
@@ -219,7 +223,7 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
                 continue
             for issue in (item for page in pages for item in page):
                 number = issue.get("number")
-                if isinstance(number, int) and number not in owned_by_repo[cfg.repo]:
+                if isinstance(number, int) and number not in owned_by_lane[(cfg.repo, lane)]:
                     evidence.append(f"{cfg.repo}#{number} legacy {lane} claim")
 
         root = Path(cfg.workdir) / ".agentflow" / "worktrees"
@@ -279,13 +283,17 @@ def resolve_phase(rollout: Rollout, repos, live_sessions, *, store_path=None,
         coordinator_active=tracer.coordinator_active(records), requested_mode=mode)
 
 
-def owned_issues(cfg, *, store_path=None) -> set[int]:
+def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
     """The issues in ``cfg.repo`` a coordinator record still owns — the set legacy claim
-    reclamation must never strip (ADR 0028). Empty (and side-effect free) when no store exists."""
+    reclamation must never strip (ADR 0028). Empty (and side-effect free) when no store exists.
+
+    ``lane`` scopes ownership to one claim type: ``"building"`` (Build/Review/Revise) or
+    ``"triaging"`` (Intake). The build and triage reclamation passes each pass their own lane so
+    one claim type's live record never shields the other type's stale claim (issue #106)."""
     path = Path(store_path or default_store_path())
     if not path.exists():
         return set()
-    return tracer.owned_issues(tracer.load_records(path), cfg.repo)
+    return tracer.owned_issues(tracer.load_records(path), cfg.repo, lane=lane)
 
 
 def owned_worktrees(cfg, *, store_path=None) -> set[str]:
@@ -314,6 +322,7 @@ def build_coordinator(_log=None) -> Coordinator:
         worktree_reset=coordinated_intake.reset_worktree,
         apply_route=coordinated_intake.apply_route,
         claim_ready=coordinated_intake.intake_claim_ready,
+        worktree_dispose=coordinated_intake.dispose_worktree,
         handoff=coordinated_intake.hold_intake)
     build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)

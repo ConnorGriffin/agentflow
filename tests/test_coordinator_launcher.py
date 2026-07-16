@@ -114,7 +114,8 @@ def test_launched_session_is_observed_from_its_durable_artifacts(coord_state):
     from agentflow.coordinator.store import Store, default_store_path
 
     emitted = [{"type": "assistant", "text": "working"},
-               {"type": "error", "subtype": "capacity", "reset_at": 900}]
+               {"type": "rate_limit_event",
+                "rate_limit_info": {"status": "rejected", "resetsAt": 900}}]
     script = ("import json,sys\n"
               + "\n".join(f"print(json.dumps({e!r}))" for e in emitted) + "\nsys.exit(0)\n")
     provider = lambda record: [sys.executable, "-c", script]

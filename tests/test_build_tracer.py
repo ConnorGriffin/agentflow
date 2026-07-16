@@ -256,6 +256,32 @@ def test_owned_issues_and_active_track_coordinator_ownership(make_coord):
     assert tracer.owned_issues(_records(coord), "o/r") == {7}
 
 
+def _owner(stage, subject):
+    return Record(identity=f"{stage}-{subject}", stage=stage, pool="claude", demand=1,
+                  repo="o/r", subject=str(subject), claim=True)
+
+
+def test_owned_issues_is_claim_type_aware():
+    # Only Intake owns a triaging claim; only Build/Review/Revise own a building claim.
+    records = [_owner("build", 7), _owner("review", 9), _owner("revise", 11),
+               _owner("intake", 8)]
+    assert tracer.owned_issues(records, "o/r", lane="building") == {7, 9, 11}
+    assert tracer.owned_issues(records, "o/r", lane="triaging") == {8}
+    assert tracer.owned_issues(records, "o/r") == {7, 8, 9, 11}  # lane=None: every owner
+
+
+def test_one_claim_type_never_hides_the_others_stale_claim():
+    # An Intake record owns issue 7's *triaging* claim, not a *building* one — so a stale
+    # building claim on issue 7 is NOT shielded from reclamation by the intake record.
+    intake = _owner("intake", 7)
+    assert 7 not in tracer.owned_issues([intake], "o/r", lane="building")
+    assert tracer.owned_issues([intake], "o/r", lane="triaging") == {7}
+    # Symmetric: a Build record owns issue 7's building claim, never a triaging one.
+    build = _owner("build", 7)
+    assert 7 not in tracer.owned_issues([build], "o/r", lane="triaging")
+    assert tracer.owned_issues([build], "o/r", lane="building") == {7}
+
+
 # --- ADR 0028 log shapes -----------------------------------------------------------------
 
 def test_attempt_interrupt_continuation_and_completion_log_shapes(make_coord):
@@ -361,9 +387,13 @@ def test_forward_activation_excludes_coordinator_owned_claim_and_worktree(tmp_pa
                         lambda workdir: [(str(wt), "agentflow/claude/issue-7-owned")])
     monkeypatch.setattr(runner, "_active_marker", lambda path: None)
 
+    include_triaging = [False]
+
     def fake_run(cmd, cwd=None, timeout=None):
         if cmd[:3] == ["gh", "api", "--paginate"]:
-            return subprocess.CompletedProcess(cmd, 0, '[[{"number": 7}]]', "")
+            is_building = "labels=agentflow:building" in cmd
+            payload = '[[{"number": 7}]]' if is_building or include_triaging[0] else "[[]]"
+            return subprocess.CompletedProcess(cmd, 0, payload, "")
         raise AssertionError(cmd)
 
     monkeypatch.setattr(loop, "_run", fake_run)
@@ -372,6 +402,12 @@ def test_forward_activation_excludes_coordinator_owned_claim_and_worktree(tmp_pa
                  "worktree": str(wt)}], [record])
 
     assert evidence == ()
+
+    include_triaging[0] = True
+    evidence = coordinated_build.activation_evidence(
+        [cfg], [{"repo": "o/r", "number": 7, "stage": "building",
+                 "worktree": str(wt)}], [record])
+    assert "o/r#7 legacy triaging claim" in evidence
 
 
 def test_forward_activation_names_legacy_intake_claim_and_worktree(tmp_path, monkeypatch):

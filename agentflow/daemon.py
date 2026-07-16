@@ -115,9 +115,14 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
 def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False,
              preserve_triage: bool = False) -> str:
     from agentflow import coordinated_build
-    builds = 0 if preserve_builds else reclaim_claims(cfg, coordinated_build.owned_issues(cfg))
+    # Each reclamation pass is scoped to the claim type it reconciles: only Build/Review/Revise
+    # records own a `building` claim, only Intake records own a `triaging` one. Passing the
+    # matching lane stops one claim type's live record from shielding the other's stale claim.
+    builds = (0 if preserve_builds
+              else reclaim_claims(cfg, coordinated_build.owned_issues(cfg, lane="building")))
     triaging = (0 if preserve_triage
-                else reclaim_triage_claims(cfg, coordinated_build.owned_issues(cfg)))
+                else reclaim_triage_claims(
+                    cfg, coordinated_build.owned_issues(cfg, lane="triaging")))
     parts = []
     if builds:
         parts.append(f"reclaimed {builds} stale build claim(s)")

@@ -63,14 +63,31 @@ def _issue_number(record: Record) -> int | None:
         return None
 
 
-def owned_issues(records, repo: str) -> set[int]:
+# Which GitHub claim label each logical stage owns. Intake owns the ``triaging`` claim; Build,
+# Review, and Revise all work the same PR branch and own the ``building`` claim. The two are
+# distinct claim types on distinct issues, so ownership must be resolved per claim type — an
+# Intake record must never be read as owning a ``building`` claim, nor a Build record a
+# ``triaging`` one, or one type's live record would shield the other type's stale claim from
+# reclamation (and hide it from forward-activation evidence).
+CLAIM_LANE = {"intake": "triaging", "build": "building", "review": "building", "revise": "building"}
+
+
+def owned_issues(records, repo: str, lane: str | None = None) -> set[int]:
     """The issue numbers in ``repo`` that a coordinator record still owns — anything not retired
     that still holds its GitHub claim, whether it is running, waiting, or completed and awaiting
     the next stage's transfer. Legacy claim reclamation must skip these: an ``agentflow:building``
-    claim can legitimately outlive its provider process now (ADR 0028)."""
+    claim can legitimately outlive its provider process now (ADR 0028).
+
+    ``lane`` scopes ownership to one claim type (``"building"`` or ``"triaging"``): only Intake
+    records own a ``triaging`` claim, and only Build/Review/Revise records own a ``building`` one.
+    Reclamation and forward activation pass the lane they are reconciling so one claim type's live
+    record can never hide the other type's stale claim. ``lane=None`` returns every owned issue
+    (any claim type)."""
     owned: set[int] = set()
     for record in records:
         if record.repo != repo or record.retired or not record.claim:
+            continue
+        if lane is not None and CLAIM_LANE.get(record.stage) != lane:
             continue
         number = _issue_number(record)
         if number is not None:

@@ -152,6 +152,11 @@ def parse_intake(payload: str) -> IntakeResult:
                 return _held("intake decision carried no body")
             title = str(data.get("title", "")).strip()
             if route is IntakeRoute.READY:
+                if not title:
+                    # A ready build MUST carry a rewritten title (the prompt demands one); an
+                    # empty title is a malformed decision, not a valid ready. Hold rather than
+                    # promote a titleless build (a wrong build is the expensive miss).
+                    return _held("ready decision carried no title")
                 complexity = _enum_or_none(Complexity, data.get("complexity")) or Complexity.DEEP
                 effort = _enum_or_none(Effort, data.get("effort")) or Effort.MEDIUM
                 return IntakeResult(route, body, title, complexity, effort)
@@ -177,6 +182,23 @@ def compose_ready_body(brief: str, current_body: str) -> str:
     original = current_body.strip() or "_(no description as filed)_"
     return (f"{brief}\n\n{_ORIGINAL_MARK}\n<details>\n<summary>Original issue as filed</summary>"
             f"\n\n{original}\n\n</details>")
+
+
+def _ready_body_has_envelope(body: str) -> bool:
+    """Whether ``body`` has one complete generated original-text envelope."""
+    index = body.find(_ORIGINAL_MARK)
+    if index <= 0 or body.count(_ORIGINAL_MARK) != 1:
+        return False
+    tail = body[index:]
+    opening = (f"{_ORIGINAL_MARK}\n<details>\n"
+               "<summary>Original issue as filed</summary>\n\n")
+    return tail.startswith(opening) and tail.endswith("\n\n</details>")
+
+
+def _ready_body_is_canonical(body: str, brief: str) -> bool:
+    """Whether the exact requested brief precedes one complete original-text envelope."""
+    return (body.startswith(f"{brief.strip()}\n\n{_ORIGINAL_MARK}")
+            and _ready_body_has_envelope(body))
 
 
 def intake_labels(result: IntakeResult) -> list[str]:
@@ -403,15 +425,21 @@ def _ensure_label(repo: str, name: str) -> None:
     _run(["gh", "label", "create", name, "--repo", repo, "--color", color, "--force"])
 
 
-def _issue_body(repo: str, issue_number: int) -> str:
-    """The issue's current body text, or "" if it can't be read. Impure."""
+def _issue_body(repo: str, issue_number: int) -> str | None:
+    """The issue's current body text, or ``None`` when it can't be read. Impure.
+
+    Unreadable is deliberately distinct from an empty body: on a ready routing the current
+    body IS the original text we must preserve verbatim, so treating an unreadable read as ""
+    would silently replace the real original with the "no description as filed" placeholder.
+    A ready projection therefore fails closed on ``None`` (defer, retry next cycle) rather than
+    clobbering the original."""
     r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"])
     if r.returncode != 0:
-        return ""
+        return None
     try:
         return json.loads(r.stdout or "{}").get("body") or ""
     except ValueError:
-        return ""
+        return None
 
 
 def _result_comment(result: IntakeResult) -> str:
@@ -482,8 +510,21 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
     stale_dials = any(any(name.startswith(p) for p in _DIAL_PREFIXES)
                       and name not in set(labels) for name in current_labels)
     title_done = not retitled_from
-    current_body = _issue_body(repo, issue_number) if result.route is IntakeRoute.READY else ""
-    body_done = result.route is not IntakeRoute.READY or result.body in current_body
+    if result.route is IntakeRoute.READY:
+        current_body = _issue_body(repo, issue_number)
+        if current_body is None:
+            # Fail closed: we cannot compose the brief without the original to preserve.
+            return f"routed -> {result.route.value} deferred (body unreadable)"
+        if _ORIGINAL_MARK in current_body and not _ready_body_has_envelope(current_body):
+            return f"routed -> {result.route.value} deferred (body envelope malformed)"
+        # Body is done only when it is EXACTLY the canonical composed body — the brief over the
+        # preserved original — not merely when the brief appears somewhere in it. `compose` is
+        # idempotent, so re-composing the already-composed body reproduces it byte-for-byte.
+        body_done = (current_body == compose_ready_body(result.body, current_body)
+                     and _ready_body_is_canonical(current_body, result.body))
+    else:
+        current_body = ""
+        body_done = True
     if (comment_done and exact_labels and not stale_state and not stale_dials
             and title_done and body_done):
         return f"unchanged -> {result.route.value} (already posted)"
@@ -542,7 +583,13 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult)
     if not any(_comment_matches_result(comment, result) for comment in comments):
         return False
     if result.route is IntakeRoute.READY:
-        return result.body in (issue.get("body") or "")
+        # Prove the EXACT canonical composed body — the brief over the preserved original —
+        # not just that the brief appears somewhere. `compose_ready_body` is idempotent on an
+        # already-composed body, so the durable body must equal composing the brief over itself.
+        if not result.title:
+            return False
+        body = issue.get("body") or ""
+        return _ready_body_is_canonical(body, result.body)
     return True
 
 
