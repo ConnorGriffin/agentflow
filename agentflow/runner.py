@@ -35,6 +35,27 @@ MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
 _MARKER_RE = re.compile(rf"^({'|'.join(MARKERS)}):")
 _ACTIVE_WORKTREES: dict[str, int] = {}
 
+_CLAUDE_AUTONOMOUS_SETTINGS = json.dumps({
+    "sandbox": {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "allowUnsandboxedCommands": False,
+        "autoAllowBashIfSandboxed": True,
+        "enableWeakerNetworkIsolation": True,
+        "network": {
+            "allowedDomains": [
+                "github.com",
+                "api.github.com",
+                "ssh.github.com",
+                "*.githubusercontent.com",
+                "registry.npmjs.org",
+                "pypi.org",
+                "files.pythonhosted.org",
+            ],
+        },
+    },
+}, separators=(",", ":"))
+
 
 class Complexity(str, Enum):
     """The model-size dial intake stamps per issue (ADR 0018). Tool-agnostic; each
@@ -130,6 +151,21 @@ def _run_session(cmd: list[str], cwd: str, timeout: int) -> subprocess.Completed
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="",
                                            stderr=f"timed out after {timeout}s")
     return subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+
+
+def _bounded_prompt(prompt: str, cwd: str) -> str:
+    """Tell the provider which checkout it owns; the CLI sandbox enforces the same boundary."""
+    worktree = os.path.realpath(cwd)
+    current = _run(["git", "-C", worktree, "branch", "--show-current"])
+    branch = current.stdout.strip() if current.returncode == 0 else ""
+    branch = branch or "detached HEAD"
+    return f"""Session boundary (enforced by the launcher):
+- Your assigned worktree is `{worktree}`.
+- Your assigned branch is `{branch}`.
+- Work only in that worktree and do not switch or create branches.
+- Never use another checkout, even if an index, hook, or search result names one.
+
+{prompt}"""
 
 
 def _active_marker(wt: Path) -> Path | None:
@@ -341,12 +377,16 @@ class ClaudeRunner(_WorktreeRunner):
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
 
     def launch(self, prompt: str, cwd: str, model: str) -> tuple[bool, str]:
-        # Hazard-free autonomous build: skip permission prompts. A hazardous repo
-        # would pass a tight --allowedTools instead (profile-driven, later).
-        # `claude -p` prints the final assistant message to stdout — that's the message.
+        # Claude's sandbox confines Bash (and its children) to the assigned worktree;
+        # normal edit permissions enforce the same project boundary for file tools.
+        # Loading project settings but not user settings also keeps a machine-global
+        # hook from injecting paths to a different checkout into an autonomous session.
         session_timeout = int(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
-        r = _run_session(["claude", "-p", prompt, "--model", model,
-                          "--dangerously-skip-permissions"], cwd, session_timeout)
+        r = _run_session([
+            "claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
+            "--permission-mode", "acceptEdits", "--setting-sources", "project",
+            "--settings", _CLAUDE_AUTONOMOUS_SETTINGS,
+        ], cwd, session_timeout)
         return r.returncode == 0, r.stdout
 
 
@@ -365,9 +405,18 @@ class CodexRunner(_WorktreeRunner):
         fd, outfile = tempfile.mkstemp(prefix="agentflow-codex-")
         os.close(fd)
         try:
+            worktree = os.path.realpath(cwd)
+            common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
+                           "--git-common-dir"])
+            writable_roots = json.dumps([common.stdout.strip()]) if common.returncode == 0 else "[]"
             r = _run_session(
-                [codex_bin, "exec", "-m", model, "--dangerously-bypass-approvals-and-sandbox",
-                 "--skip-git-repo-check", "-o", outfile, prompt], cwd, session_timeout)
+                [codex_bin, "exec", "-m", model, "--sandbox", "workspace-write",
+                 "--cd", worktree, "--ignore-user-config", "--ephemeral",
+                 "-c", 'approval_policy="never"',
+                 "-c", "sandbox_workspace_write.network_access=true",
+                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
+                 "--skip-git-repo-check", "-o", outfile, _bounded_prompt(prompt, cwd)],
+                cwd, session_timeout)
             try:
                 msg = Path(outfile).read_text()
             except OSError:
@@ -389,8 +438,11 @@ class CodexRunner(_WorktreeRunner):
             cwd = Path(tmp) / ".agentflow" / "worktrees" / "codex-probe"
             cwd.mkdir(parents=True, exist_ok=True)
             r = _run([codex_bin, "exec", "-m", model,
-                      "--dangerously-bypass-approvals-and-sandbox",
-                      "--skip-git-repo-check", "reply with: ok"],
+                      "--sandbox", "workspace-write", "--cd", str(cwd.resolve()),
+                      "--ignore-user-config", "--ephemeral",
+                      "-c", 'approval_policy="never"',
+                      "-c", "sandbox_workspace_write.network_access=true",
+                      "--skip-git-repo-check", _bounded_prompt("reply with: ok", str(cwd))],
                      cwd=str(cwd), timeout=timeout)
             return r.returncode == 0
 
