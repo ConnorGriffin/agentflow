@@ -81,13 +81,15 @@ def _build_source_parts(record):
 
 def review_submission(build_record, head_sha, reviewer_tool, pr_number,
                       *, acceptance="", surfaces=""):
-    """Translate a completed Build and its PR head SHA into one Review stage submission — the
-    minimal facts the coordinator needs (ADR 0030). The review is bound to the *exact* head SHA
-    (its immutable target, so a new head SHA starts a fresh review stage), assumes the Build's
-    change claim, records the builder's lineage so a same-tool review can finish but never
-    auto-merges, and points at a fresh read-only review worktree the reviewer checks out at that
-    SHA. Cross-tool review is always the deep safety net. Pure: the mapping is the test surface
-    (ADR 0020). Returns ``None`` if the Build worktree or head SHA is unreadable."""
+    """Translate a completed Build (or completed Revise) and its PR head SHA into one Review stage
+    submission — the minimal facts the coordinator needs (ADR 0030). The review is bound to the
+    *exact* head SHA (its immutable target, so a new head SHA starts a fresh review stage), assumes
+    the prior stage's change claim, records the builder's lineage so a same-tool review can finish
+    but never auto-merges, and carries the *original builder complexity* forward so a later Revise
+    reads it from the durable record instead of a mutable issue label (ADR 0018). It points at a
+    fresh read-only review worktree the reviewer checks out at that SHA. Cross-tool review is always
+    the deep safety net. Pure: the mapping is the test surface (ADR 0020). Returns ``None`` if the
+    Build worktree or head SHA is unreadable."""
     from agentflow.coordinator import Submission
     from agentflow.reviewer import REVIEW_PROMPT, review_worktree
     parts = _build_source_parts(build_record)
@@ -102,7 +104,7 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         target=head_sha, pool=reviewer_tool, complexity="deep",
         source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=brief, builder_lineage=build_record.pool,
-        transfer_from=build_record.identity)
+        builder_complexity=build_record.complexity, transfer_from=build_record.identity)
 
 
 def _revise_builder_source(review_record):
@@ -147,7 +149,8 @@ def revise_submission(review_record, complexity, findings="", *, surfaces=""):
         repo=review_record.repo, subject=review_record.subject, stage="revise",
         target=review_record.target, pool=review_record.builder_lineage, complexity=complexity,
         source=build_worktree, claim=True, input_ptr=brief,
-        builder_lineage=review_record.builder_lineage, transfer_from=review_record.identity)
+        builder_lineage=review_record.builder_lineage, builder_complexity=complexity,
+        transfer_from=review_record.identity)
 
 
 def revise_round_budget_remains(records, repo, subject) -> bool:
@@ -480,18 +483,41 @@ def _review_source_facts(record):
     return workdir, int(match.group(1))
 
 
+def _park_pr_number(record) -> int | None:
+    """The PR number to park for a Review or a Revise record. A Review encodes it directly in its
+    read-only review worktree path (``.../<tool>-review/pr-<pr>-<slug>``); a Revise instead owns the
+    *builder's* branch/worktree (``.../<tool>/issue-<subject>-<slug>``, no PR number), so the open PR
+    for that branch is looked up from GitHub. Returns ``None`` when it cannot be resolved, so the
+    park handoff stays pending and retries rather than proving a park it never made."""
+    facts = _review_source_facts(record)
+    if facts is not None:
+        return facts[1]
+    from agentflow.loop import _run
+    parsed = _source_facts(record)
+    if parsed is None:
+        return None
+    _workdir, branch, _wt = parsed
+    r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch, "--state", "all",
+              "--json", "number", "--limit", "1"])
+    if r.returncode != 0:
+        return None
+    prs = json.loads(r.stdout or "[]")
+    return prs[0].get("number") if prs else None
+
+
 def _park_pr(record) -> str | None:
-    """Park the reviewed PR for a human and notify once (ADR 0028's exhaustion table). The park
-    comment is the durable proof; a repeat after a daemon crash observes the same comment and does
-    not notify again. Live orchestration, not unit-tested (ADR 0020)."""
+    """Park the reviewed PR for a human and notify once (ADR 0028's exhaustion table). Serves both
+    the Review-native park and the Revise-native park — Revise owns a builder worktree, so the PR is
+    resolved by branch (:func:`_park_pr_number`). The park comment is the durable proof; a repeat
+    after a daemon crash observes the same comment and does not notify again. Live orchestration, not
+    unit-tested (ADR 0020)."""
     from agentflow.gate import park
     from agentflow.loop import _pr_comments
     from agentflow.notify import notify
     from agentflow.reviewer import Verdict
-    facts = _review_source_facts(record)
-    if facts is None:
+    pr = _park_pr_number(record)
+    if pr is None:
         return None
-    _workdir, pr = facts
     marker = "agentflow: parked for human review"
     comments = _pr_comments(record.repo, pr)
     if comments is None:
@@ -512,25 +538,41 @@ def _park_pr(record) -> str | None:
 # --- Revise stage: pushed-revision outcome on the retained branch (live; ADR 0020) ------
 
 def _revision_ready(record, obs) -> bool:
-    """The Revise outcome is a verified pushed revision on the same PR branch: its head SHA has
-    moved past the reviewed SHA the revise was opened against (``record.target``), read from GitHub
-    independently of how the reviser exited (ADR 0028). A branch whose head still equals the
-    reviewed SHA pushed nothing and stays incomplete. Live orchestration, not unit-tested (ADR
+    """The Revise outcome is a verified pushed revision **or** the required durable non-code proof,
+    read from GitHub independently of how the reviser exited (ADR 0028, issue #105):
+
+    - a pushed revision: the PR branch head SHA has moved past the reviewed SHA the revise was
+      opened against (``record.target``); or
+    - the required non-code proof: a durable agentflow-marked PR comment carrying attached evidence
+      (e.g. a before/after screenshot), the way a finding that asks to *show* something is answered
+      without a code change.
+
+    A branch whose head still equals the reviewed SHA and carries no such evidence comment pushed and
+    proved nothing, so it stays incomplete and continues. Live orchestration, not unit-tested (ADR
     0020)."""
-    from agentflow.loop import _run
+    from agentflow.gate import PR_MARK, has_image_evidence
+    from agentflow.loop import _pr_comments, _run
     parsed = _source_facts(record)
     if parsed is None or not record.target:
         return False
     _workdir, branch, _wt = parsed
     r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch, "--state", "open",
-              "--json", "headRefOid", "--limit", "1"])
+              "--json", "headRefOid,number", "--limit", "1"])
     if r.returncode != 0:
         raise RuntimeError(f"cannot verify Revise outcome for {record.repo}:{branch}")
     prs = json.loads(r.stdout or "[]")
     if not prs:
         return False
     head = prs[0].get("headRefOid", "")
-    return bool(head) and head != record.target
+    if head and head != record.target:
+        return True  # a pushed revision advanced the branch past the reviewed SHA
+    # No new code, but an evidence-only revision still completes on its durable non-code proof: an
+    # agentflow-authored PR comment (our marker, never the maintainer's) that attaches evidence.
+    comments = _pr_comments(record.repo, prs[0].get("number"))
+    if comments is None:
+        return False
+    return any(PR_MARK in (c.get("body", "") or "") and has_image_evidence(c.get("body", "") or "")
+               for c in comments)
 
 
 def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> None:
@@ -580,7 +622,6 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
     parks on its own exhaustion rather than looping. Submission is idempotent on the revise identity
     (repo, subject, revise, reviewed SHA), so a repeat or restart never opens a second revise. Live,
     not unit-tested (ADR 0020) — its mapping is covered through :func:`revise_submission`."""
-    from agentflow.loop import _run, complexity_from_labels
     records = {record.identity: record for record in tracer.load_records()}
     review = records.get(review_identity)
     if review is None or review.stage != "review" or not review.target:
@@ -597,20 +638,14 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
     facts = _revise_builder_source(review)
     if facts is None:
         return
-    _build_worktree, _pr = facts
-    viewed = _run(["gh", "issue", "view", str(review.subject), "--repo", review.repo,
-                   "--json", "labels"])
-    if viewed.returncode != 0:
-        return
-    try:
-        labels = [lbl.get("name", "") for lbl in json.loads(viewed.stdout or "{}").get("labels", [])]
-    except json.JSONDecodeError:
-        return
-    complexity = complexity_from_labels(labels)
-    if complexity is None:
+    # The revise runs at the *original builder* complexity, carried durably on the review record
+    # since the build opened it (ADR 0018). Re-reading the issue's live label here would let a
+    # changed, removed, or unreadable label alter or block the revise; the stage chain owns it.
+    complexity = review.builder_complexity
+    if not complexity:
         return
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking)
-    submission = revise_submission(review, complexity.value, findings)
+    submission = revise_submission(review, complexity, findings)
     if submission is not None:
         coord.submit_stage(submission)
 

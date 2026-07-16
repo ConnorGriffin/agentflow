@@ -216,6 +216,34 @@ def test_reconcile_parks_a_blocking_review_once_the_revise_round_is_spent(make_c
     assert tracer.owned_issues(_records(coord), "o/r") == set()
 
 
+# --- Review → Revise carries the original builder complexity, never a mutable label reread --
+
+def test_review_to_revise_keeps_the_builder_complexity_when_the_issue_label_changes(make_coord,
+                                                                                    monkeypatch):
+    """Review→Revise must run at the *original builder* complexity, carried durably on the record
+    since the Build opened the Review — never re-read from the issue's live label. A label changed
+    (or removed) after the build cannot alter or block the Revise (ADR 0018)."""
+    fake = FakeSession()
+    pr, verdict, revision = [True], [True], [False]
+    coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
+                       gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-a")
+
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
+                                          complexity="standard", effort="high", source=BUILD_WT))
+    assert live.run_stage(build) == ["build"]             # Build(standard) completes → Review(sha-a)
+    review = _ident("7", "review", "sha-a")
+    assert record_of(coord, review).builder_complexity == "standard"  # carried onto the review
+
+    # The issue label is CHANGED before the blocking review opens the revise. The old behavior
+    # re-read it and would revise at "deep"; the durable builder complexity must win instead.
+    live.labels = ["agentflow:complexity:deep"]
+    assert live.run_stage(review) == ["review"]           # Review blocks → reconcile opens Revise
+    revise = record_of(coord, _ident("7", "revise", "sha-a"))
+    assert revise.claim is True and revise.complexity == "standard"   # the original builder value
+    assert revise.builder_complexity == "standard"        # still durable for the next hop
+
+
 # --- outcome-first: a pushed revision completes; local-only changes do not ----------------
 
 def test_revise_completes_only_on_a_pushed_revision_even_after_a_bad_exit(make_coord):
@@ -230,6 +258,42 @@ def test_revise_completes_only_on_a_pushed_revision_even_after_a_bad_exit(make_c
 
     revision[0] = True                                   # the branch now carries the pushed revision
     fake.end(ident, cause=ProviderCause.PROCESS)         # a bad exit cannot undo a durable outcome
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+
+
+# --- outcome-first: the required durable non-code proof completes a revision too -----------
+
+def test_revise_completes_on_durable_non_code_evidence_with_no_pushed_head(make_coord, monkeypatch):
+    """Issue #105: a revision completes on a pushed head SHA OR the required durable non-code proof
+    — an agentflow-marked PR comment that attaches evidence (e.g. a screenshot). The PRODUCTION
+    verifier (:func:`coordinated_build._revision_ready`) must accept an evidence-only revision whose
+    head never moved, not consume its continuations and park (the reported behavior)."""
+    comments = [[]]                                       # the PR carries no evidence yet
+    def _gh(cmd, *a, **k):                                # gh pr list → head is unchanged (== target)
+        if "list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                [{"headRefOid": "sha-a", "number": 42}]))
+        return SimpleNamespace(returncode=0, stdout="")
+    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+
+    fake = FakeSession()
+    revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
+                                worktree_ready=lambda r: True, observer=fake)
+    coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT, target="sha-a"))
+
+    coord.cycle("claude")
+    comments[0] = [{"body": "the maintainer drops a screenshot but with no agentflow marker "
+                            "![shot](https://user-images.githubusercontent.com/1/x.png)"}]
+    fake.end(ident, cause=ProviderCause.PROCESS)          # head unchanged, only an UNMARKED image
+    assert coord.cycle("claude") == []                    # not our proof → continues, does not park
+    assert record_of(coord, ident).continuation
+
+    # The reviser answers the finding with an attached screenshot on an agentflow-marked comment.
+    comments[0] = [{"body": "> *agentflow: reply from the build agent.*\n\n"
+                            "![before/after](https://user-images.githubusercontent.com/1/x.png)"}]
+    fake.end(ident, cause=ProviderCause.PROCESS)          # a bad exit cannot undo a durable outcome
     assert [o.status for o in coord.cycle("claude")] == ["completed"]
 
 
@@ -306,6 +370,49 @@ def test_exhaustion_parks_the_pr_once_and_does_not_discard_local_work(make_coord
     assert handoffs == [ident]
     assert make_coord(fake, adapter=adapter).cycle("claude") == []
     assert handoffs == [ident]                            # a restart never repeats the external park
+
+
+def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_coord, monkeypatch):
+    """A Revise owns the *builder* worktree (``.../<tool>/issue-<n>-<slug>``), not a review worktree,
+    so its exhaustion handoff must resolve the PR by branch. The PRODUCTION park
+    (:func:`coordinated_build._park_pr`) must post the durable park proof and release the claim —
+    not return no proof and leave the handoff pending with the claim retained (the reported
+    behavior)."""
+    parked, notified, pr_comments = [], [], []
+    def _gh(cmd, *a, **k):                                # gh pr list --head <branch> → PR number 42
+        if "list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps([{"number": 42}]))
+        return SimpleNamespace(returncode=0, stdout="")
+    def _park(repo, pr, verdict, *, reason):
+        parked.append((repo, pr))
+        pr_comments.append({"body": "> *agentflow: parked for human review.*"})
+    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.gate.park", _park)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(pr_comments))
+    monkeypatch.setattr("agentflow.notify.notify", lambda *a, **k: notified.append(a))
+
+    fake = FakeSession()
+    revise = ReviseStageAdapter(revision_ready=lambda r, o: False, worktree_ready=lambda r: True,
+                                observer=fake, handoff=coordinated_build._park_pr)
+    coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT))
+
+    outcome = None
+    for _ in range(8):
+        settled = coord.cycle("claude")
+        if settled:
+            outcome = settled[0]
+            break
+        fake.end(ident, cause=ProviderCause.PROCESS)
+    assert outcome is not None and outcome.status == "held" and outcome.handoff == "pr:parked"
+    assert parked == [("o/r", 42)] and len(notified) == 1  # parked and notified exactly once
+    rec = record_of(coord, ident)
+    assert rec.state == "held" and rec.claim is False and rec.handoffs == 1
+    assert rec.source == BUILD_WT                          # the builder worktree is left intact
+
+    # Idempotent across a restart: the same durable park proof, no second park or notification.
+    assert make_coord(fake, adapter=StageRouter({"revise": revise})).cycle("claude") == []
+    assert parked == [("o/r", 42)] and len(notified) == 1
 
 
 # --- crash boundaries at both transfer points ---------------------------------------------

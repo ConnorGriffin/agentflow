@@ -59,6 +59,7 @@ class Submission:
     pool: str = "claude"            # allowed pool or pinned lineage
     input_ptr: str | None = None
     builder_lineage: str | None = None
+    builder_complexity: str | None = None  # the original builder complexity, carried to a Revise
     descendant_of: str | None = None  # a subagent shares this root stage's one reservation
     transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
 
@@ -136,6 +137,7 @@ class Coordinator:
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
+            builder_complexity=submission.builder_complexity,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of)
         with self._lock:

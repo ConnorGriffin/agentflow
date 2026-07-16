@@ -62,5 +62,7 @@ class Record:
     hold_pending: bool = False           # classified as a hold, awaiting its durable handoff
     retired: bool = False
     builder_lineage: str | None = None   # who built the diff — a same-tool review cannot auto-merge
+    builder_complexity: str | None = None  # the original builder complexity, carried so a later
+                                           # Revise never re-reads a mutable issue label (ADR 0018)
     auto_merge_allowed: bool = True
     root: str | None = None              # the root stage this descends from; it shares the root's reservation
