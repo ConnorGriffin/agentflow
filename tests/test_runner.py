@@ -132,6 +132,12 @@ def test_claude_launch_confines_the_session_to_its_assigned_worktree(tmp_path, m
     prompt = cmd[cmd.index("-p") + 1]
     assert str(wt.resolve()) in prompt and branch in prompt
 
+    structured = ClaudeRunner().structured_argv("build it", "sonnet", str(wt))
+    assert "--dangerously-skip-permissions" not in structured
+    assert structured[structured.index("--permission-mode") + 1] == "acceptEdits"
+    assert "--output-format" in structured
+    assert str(wt.resolve()) in structured[structured.index("-p") + 1]
+
 
 def test_codex_launch_confines_the_session_to_its_assigned_worktree(tmp_path, monkeypatch):
     repo = _repo_with_origin(tmp_path)
@@ -158,6 +164,32 @@ def test_codex_launch_confines_the_session_to_its_assigned_worktree(tmp_path, mo
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
     prompt = cmd[-1]
     assert str(wt.resolve()) in prompt and branch in prompt
+
+    structured = CodexRunner().structured_argv(
+        "build it", "gpt-5.6-terra", str(wt))
+    assert "--dangerously-bypass-approvals-and-sandbox" not in structured
+    assert structured[structured.index("--sandbox") + 1] == "workspace-write"
+    assert structured[structured.index("--cd") + 1] == str(wt.resolve())
+    assert "--json" in structured
+    assert str(wt.resolve()) in structured[-1]
+
+
+def test_codex_account_fact_uses_typed_limit_windows(monkeypatch):
+    payload = json.dumps({
+        "windows": [
+            {"used_percent": 100, "window_minutes": 300, "resets_at": 1234},
+            {"used_percent": 60, "window_minutes": 10080, "resets_at": 9999},
+        ]
+    })
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[-1] == "limits"
+        assert kwargs["env"]["TRIAGE_AGENT"] == "codex"
+        return subprocess.CompletedProcess(cmd, 0, payload, "")
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+    assert CodexRunner().account_fact() == {
+        "kind": "rate_limited", "reset_at": 1234}
 
 
 def test_codex_probe_uses_the_same_workspace_sandbox(monkeypatch):

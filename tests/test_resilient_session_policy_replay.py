@@ -1,61 +1,32 @@
 """Executable historical replay for the resilient-session policy (Wayfinder #94).
 
-This is deliberately a verification model, not the ADR 0030 production coordinator.
-Synthetic root identifiers carry only the aggregate demand and duration reported in
-``docs/research/historical-session-demand.md``.  Explicit interruption cases then replay
-the state, admission, and crash rules accepted in ADRs 0028--0030.
+These cases drive the **production** session coordinator (ADR 0030) through its public
+``submit_stage`` / ``cycle`` seam — never its private transitions. The admission matrix,
+continuation ordering, attempt budget, permit ledger, capacity waits, and exhaustion holds
+are exercised against the same code the daemon will run, over an isolated store per case.
+Synthetic roots carry only the aggregate demand reported in
+``docs/research/historical-session-demand.md``; the scenarios then replay the state,
+admission, and outcome rules accepted in ADRs 0028--0030.
+
+The provider lifecycle is scripted through the injected :class:`FakeSession` (a started and
+alive family, then a specific ending); ``cycle`` returns only the terminal outcomes stage
+orchestration consumes. The suite exercises continuation priority, gate composition, permit
+conservation, tool-lineage rules (cross-pool review and the code-writing pin), descendant
+reservation sharing, next-stage claim transfer, and fail-closed recovery. Only true cross-pool
+*re-routing* of a read-only continuation onto the other pool mid-life remains a later slice.
 """
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pytest
+from conftest import FakeSession, permits, record_of, starts_until_held
 
-
-PERMIT_BUDGET = 5
-ATTEMPT_BUDGET = 3
-CODE_WRITING = {"build", "revise", "mockup", "respond"}
-STAGE_NATIVE_HANDOFF = {
-    "intake": "issue:needs-grilling",
-    "build": "issue:needs-grilling",
-    "mockup": "issue:needs-mockup",
-    "review": "pr:parked",
-    "revise": "pr:parked",
-    "respond": "pr:parked",
-}
-
-# Exact reviewed rows from ADR 0029. Unknown rows on a known pool fall back to five;
-# an unknown pool is inadmissible because there is no permit ledger to charge.
-ADMISSION_MATRIX = {
-    ("intake", "claude", "opus", "deep", None): 1,
-    ("intake", "codex", "sol", "deep", None): 1,
-    ("review", "claude", "opus", "deep", None): 1,
-    ("review", "codex", "sol", "deep", None): 2,
-    ("revise", "claude", "sonnet", "standard", None): 3,
-    ("revise", "claude", "opus", "deep", None): 3,
-    ("revise", "codex", "terra", "standard", None): 4,
-    ("revise", "codex", "sol", "deep", None): 4,
-    ("respond", "claude", "opus", "deep", None): 3,
-    ("respond", "codex", "sol", "deep", None): 5,
-    ("mockup", "claude", "opus", "deep", None): 5,
-    ("mockup", "codex", "sol", "deep", None): 5,
-}
-for pool, model, complexity, demands in (
-    ("claude", "sonnet", "standard", (3, 4, 5, 5)),
-    ("claude", "opus", "deep", (4, 4, 5, 5)),
-    ("codex", "terra", "standard", (4, 5, 5, 5)),
-    ("codex", "sol", "deep", (5, 5, 5, 5)),
-):
-    for effort, demand in zip(("low", "medium", "high", "extra"), demands, strict=True):
-        ADMISSION_MATRIX[("build", pool, model, complexity, effort)] = demand
-
-
-def admission_demand(stage, pool, model, complexity, effort=None):
-    if pool not in {"claude", "codex"}:
-        return None
-    return ADMISSION_MATRIX.get((stage, pool, model, complexity, effort), PERMIT_BUDGET)
+from agentflow.coordinator import Submission
+from agentflow.coordinator.admission import (
+    ADMISSION_MATRIX, CODE_WRITING, STAGE_NATIVE_HANDOFF, admission_demand)
+from agentflow.coordinator.providers import ProviderCause
 
 
 @dataclass(frozen=True)
@@ -89,222 +60,14 @@ HISTORICAL_ROOTS = {
 }
 
 
-@dataclass
-class Record:
-    identity: str
-    stage: str
-    pool: str
-    demand: int
-    continuation: bool = False
-    eligible_at: int = 0
-    created_at: int = 0
-    model: str = "opus"
-    complexity: str = "deep"
-    effort: str | None = None
-    attempts: int = 0
-    state: str = "waiting"
-    claim: bool = True
-    lineage: str | None = None
-    start_fact: str | None = None
-    process_alive: bool = False
-    descendants: set[str] = field(default_factory=set)
-    handoffs: int = 0
-    handoff_kind: str | None = None
-    notifications: int = 0
-    handoff_proof: str | None = None
-    hold_pending: bool = False
-    retired: bool = False
-    builder_lineage: str | None = None
-    auto_merge_allowed: bool = True
-
-
-@dataclass(frozen=True)
-class Gates:
-    """The independent preconditions that must all pass for one provider start."""
-
-    headroom: bool = True
-    machine: bool = True
-    stage: bool = True
-    pace: bool = True
-
-
-class ReplayCoordinator:
-    """Policy oracle with explicit controls at crash and durable-boundary transitions."""
-
-    def __init__(self) -> None:
-        self.records: dict[str, Record] = {}
-        self.running: dict[str, Record] = {}
-
-    def submit(self, record: Record) -> Record:
-        existing = self.records.setdefault(record.identity, record)
-        if existing.state == "running":
-            self.running[existing.identity] = existing
-        return existing
-
-    def permits_used(self, pool: str) -> int:
-        return sum(record.demand for record in self.running.values() if record.pool == pool)
-
-    def begin_start(self, record: Record, gates: Gates = Gates()) -> bool:
-        if (record.state != "waiting" or record.hold_pending
-                or record.attempts >= ATTEMPT_BUDGET):
-            return False
-        if record.stage in CODE_WRITING and record.pool != record.lineage:
-            return False
-        if not all((gates.headroom, gates.machine, gates.stage, gates.pace)):
-            return False
-        if self.permits_used(record.pool) + record.demand > PERMIT_BUDGET:
-            return False
-        record.state = "running"
-        record.start_fact = None
-        self.running[record.identity] = record
-        return True
-
-    def commit_start(self, record: Record, fact: str) -> None:
-        assert record.state == "running"
-        assert fact in {"started", "not_started"}
-        record.start_fact = fact
-        if fact == "not_started":
-            self._release(record)
-            record.state = "waiting"
-            return
-        record.attempts += 1
-        record.process_alive = True
-
-    def recover_start(self, record: Record, fact: str, *, process_alive: bool) -> None:
-        """Replay the crash-recoverable provider start handshake from ADR 0030."""
-
-        if record.start_fact is None:
-            self.commit_start(record, fact)
-        if fact == "not_started":
-            return
-        record.process_alive = process_alive
-        if not process_alive:
-            self.finish(record, provider="incomplete", outcome=False)
-
-    def add_descendant(self, record: Record, synthetic_id: str) -> None:
-        record.descendants.add(synthetic_id)
-
-    def finish(self, record: Record, *, provider: str, outcome: bool,
-               eligible_at: int | None = None) -> None:
-        """Apply outcome-first classification, then release the provider family."""
-
-        assert record.state == "running"
-        self._release(record)
-        if outcome:
-            record.state = "completed"
-            return
-        if provider in {"bail", "permanent"}:
-            self._hold(record)
-            return
-        if record.attempts < ATTEMPT_BUDGET:
-            record.state = "waiting"
-            record.continuation = True
-            record.eligible_at = eligible_at or 0
-            return
-        self._hold(record)
-
-    def route(self, record: Record, available: dict[str, bool], safe: set[str]) -> str | None:
-        """Choose an allowed pool and recalculate demand at the destination row."""
-
-        if record.stage in CODE_WRITING:
-            candidates = [record.lineage] if record.lineage else []
-        else:
-            candidates = [record.pool, *sorted(set(available) - {record.pool})]
-        for pool in candidates:
-            if pool not in safe or not available.get(pool, False):
-                continue
-            model = {("claude", "deep"): "opus", ("codex", "deep"): "sol",
-                     ("claude", "standard"): "sonnet",
-                     ("codex", "standard"): "terra"}[(pool, record.complexity)]
-            demand = admission_demand(
-                record.stage, pool, model, record.complexity, record.effort)
-            if demand is None:
-                continue
-            record.pool = pool
-            record.model = model
-            record.demand = demand
-            if record.stage == "review":
-                record.auto_merge_allowed = record.builder_lineage != pool
-            return pool
-        return None
-
-    def cycle(self, pool: str, *, now: int,
-              gates_by_id: dict[str, Gates] | None = None) -> list[str]:
-        """Admit eligible continuations first, with strict head-of-line blocking."""
-
-        gates_by_id = gates_by_id or {}
-        waiting = [r for r in self.records.values()
-                   if r.pool == pool and r.state == "waiting" and not r.hold_pending]
-        continuations = sorted(
-            (r for r in waiting if r.continuation and r.eligible_at <= now),
-            key=lambda r: (r.eligible_at, r.created_at, r.identity),
-        )
-        cold = sorted((r for r in waiting if not r.continuation), key=lambda r: r.identity)
-        admitted: list[str] = []
-        for record in continuations:
-            if not self.begin_start(record, gates_by_id.get(record.identity, Gates())):
-                return admitted
-            self.commit_start(record, "started")
-            admitted.append(record.identity)
-        for record in cold:
-            if self.begin_start(record, gates_by_id.get(record.identity, Gates())):
-                self.commit_start(record, "started")
-                admitted.append(record.identity)
-        return admitted
-
-    def finalize_hold(self, record: Record, *, crash_after_proof: bool = False) -> None:
-        """Persist one external handoff proof before entering ``held``."""
-
-        if not record.hold_pending:
-            return
-        if record.handoff_proof is None:
-            record.handoffs = 1
-            record.handoff_kind = STAGE_NATIVE_HANDOFF[record.stage]
-            record.handoff_proof = f"proof:{record.identity}:{record.handoff_kind}"
-            record.notifications = 1
-        if crash_after_proof:
-            return
-        record.state = "held"
-        record.hold_pending = False
-        record.claim = False
-
-    def finalize_completion(self, record: Record, *, next_record: Record | None = None,
-                            external_boundary_proven: bool = False) -> None:
-        """Transfer ownership or release it only after a durable boundary exists."""
-
-        if record.state != "completed" or record.retired:
-            return
-        if next_record is not None:
-            next_record.claim = True
-            self.submit(next_record)
-        elif not external_boundary_proven:
-            return
-        record.claim = False
-        record.retired = True
-
-    def _hold(self, record: Record) -> None:
-        record.state = "waiting"
-        record.hold_pending = True
-
-    def _release(self, record: Record) -> None:
-        self.running.pop(record.identity, None)
-        record.process_alive = False
-
-
-def record_from(root: HistoricalRoot, *, suffix: str = "") -> Record:
-    expected = admission_demand(
-        root.stage, root.pool, root.model, root.complexity, root.effort)
-    assert expected == root.demand
-    return Record(
-        root.synthetic_id + suffix,
-        root.stage,
-        root.pool,
-        root.demand,
-        model=root.model,
-        complexity=root.complexity,
-        effort=root.effort,
-        lineage=root.pool if root.stage in CODE_WRITING else None,
-    )
+def submit_root(coord, key: str, *, suffix: str = "") -> str:
+    """Submit one historical root through the public seam, asserting its reviewed demand."""
+    root = HISTORICAL_ROOTS[key]
+    assert admission_demand(
+        root.stage, root.pool, root.model, root.complexity, root.effort) == root.demand
+    return coord.submit_stage(Submission(
+        repo="o/r", subject=root.synthetic_id + suffix, stage=root.stage, pool=root.pool,
+        complexity=root.complexity, effort=root.effort))
 
 
 def test_reviewed_matrix_is_monotone_conservative_and_pool_scoped():
@@ -325,292 +88,265 @@ def test_reviewed_matrix_is_monotone_conservative_and_pool_scoped():
     assert admission_demand("review", "unknown", "sol", "deep") is None
 
 
-def test_same_snapshot_historical_stampede_is_bounded_atomically():
+def test_same_snapshot_historical_stampede_is_bounded_atomically(make_coord):
     """The observed 4+1+5 launch burst becomes 4+1 admitted and 5 deferred."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    medium = submit_root(coord, "claude-medium-build")   # demand 4
+    intake = submit_root(coord, "claude-intake")         # demand 1
+    deep = submit_root(coord, "claude-deep-build")       # demand 5
 
-    replay = ReplayCoordinator()
-    roots = [
-        record_from(HISTORICAL_ROOTS["claude-medium-build"]),
-        record_from(HISTORICAL_ROOTS["claude-intake"]),
-        record_from(HISTORICAL_ROOTS["claude-deep-build"]),
-    ]
-    for root in roots:
-        replay.submit(root)
+    assert coord.cycle("claude") == []
+    assert permits(coord, "claude") == 5                  # 4 + 1 admitted; the 5 is deferred
 
-    admitted = replay.cycle("claude", now=0)
-
-    assert admitted == ["H-BUILD-1", "H-INTAKE-1"]
-    assert replay.permits_used("claude") == 5
-    assert roots[2].state == "waiting" and roots[2].attempts == 0
-
-
-def test_two_writers_cannot_share_one_five_permit_pool():
-    replay = ReplayCoordinator()
-    first = replay.submit(record_from(HISTORICAL_ROOTS["claude-revise"]))
-    second = replay.submit(record_from(HISTORICAL_ROOTS["claude-revise"], suffix="-2"))
-
-    assert replay.begin_start(first)
-    replay.commit_start(first, "started")
-    assert not replay.begin_start(second)
-    assert replay.permits_used("claude") == 3
-    assert second.attempts == 0
+    fake.end(medium, success=True)
+    fake.end(intake, success=True)
+    completed = {o.identity for o in coord.cycle("claude")}
+    assert completed == {medium, intake}                 # exactly the two that were admitted
+    assert permits(coord, "claude") == 5                  # now the deferred build (5) runs
+    assert coord.cycle("claude") == []                   # deep is running, nothing terminal
+    fake.kill(deep)                                       # (leave the store clean)
 
 
-def test_near_exclusive_writer_keeps_useful_short_stage_concurrency():
-    replay = ReplayCoordinator()
-    writer = replay.submit(record_from(HISTORICAL_ROOTS["claude-medium-build"]))
-    short = replay.submit(record_from(HISTORICAL_ROOTS["claude-review"]))
-    other_writer = replay.submit(record_from(HISTORICAL_ROOTS["claude-revise"]))
+def test_two_writers_cannot_share_one_five_permit_pool(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    first = submit_root(coord, "claude-revise")               # demand 3
+    second = submit_root(coord, "claude-revise", suffix="-2")  # demand 3
 
-    for record in (writer, short):
-        assert replay.begin_start(record)
-        replay.commit_start(record, "started")
+    coord.cycle("claude")
+    assert permits(coord, "claude") == 3                       # only one writer fits (3 + 3 > 5)
 
-    assert replay.permits_used("claude") == 5
-    assert not replay.begin_start(other_writer)
-
-
-def test_continuation_head_of_line_blocks_bypass_without_preempting_live_work():
-    replay = ReplayCoordinator()
-    live_short = replay.submit(record_from(HISTORICAL_ROOTS["claude-intake"], suffix="-live"))
-    assert replay.begin_start(live_short)
-    replay.commit_start(live_short, "started")
-
-    oldest = replay.submit(Record("C-OLD", "build", "claude", 5, True, 1, 1, lineage="claude"))
-    later = replay.submit(Record("C-LATER", "review", "claude", 1, True, 2, 2))
-    cold = replay.submit(Record("COLD", "intake", "claude", 1))
-
-    assert replay.cycle("claude", now=10) == []
-    assert live_short.state == "running"
-    assert later.state == cold.state == "waiting"
-
-    replay.finish(live_short, provider="success", outcome=True)
-    assert replay.cycle("claude", now=10) == [oldest.identity]
-    assert later.state == cold.state == "waiting"
+    done: set[str] = set()
+    for _ in range(4):
+        fake.end(first, success=True)   # completes whichever writer is currently running
+        fake.end(second, success=True)
+        done.update(o.identity for o in coord.cycle("claude"))
+        assert permits(coord, "claude") <= 3                   # never both writers at once
+    assert done == {first, second}                            # each ran, one after the other
 
 
-def test_code_lineage_is_pinned_while_read_only_continuation_can_move():
-    replay = ReplayCoordinator()
-    pinned = replay.submit(Record(
-        "PINNED", "build", "codex", 5, True,
-        model="sol", complexity="deep", effort="medium", lineage="codex"))
-    available = {"claude": True, "codex": False}
+def test_near_exclusive_writer_keeps_useful_short_stage_concurrency(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    submit_root(coord, "claude-medium-build")                # demand 4
+    submit_root(coord, "claude-review")                      # demand 1
+    submit_root(coord, "claude-revise")                      # demand 3, cannot fit
 
-    assert replay.route(pinned, available, safe={"claude", "codex"}) is None
-    assert (pinned.pool, pinned.demand, pinned.lineage) == ("codex", 5, "codex")
-    pinned.pool = "claude"  # even a malformed caller cannot bypass the lineage gate
-    assert not replay.begin_start(pinned)
-    pinned.pool = "codex"
-
-    movable = replay.submit(Record(
-        "MOVABLE", "review", "codex", 2, True, model="sol", complexity="deep",
-        builder_lineage="codex"))
-    assert replay.route(movable, available, safe={"claude"}) == "claude"
-    assert (movable.pool, movable.model, movable.demand, movable.lineage,
-            movable.auto_merge_allowed) == ("claude", "opus", 1, None, True)
-
-    same_tool = replay.submit(Record(
-        "SAME-TOOL", "review", "claude", 1, True, model="opus", complexity="deep",
-        builder_lineage="claude"))
-    assert replay.route(same_tool, {"claude": True}, safe={"claude"}) == "claude"
-    assert same_tool.auto_merge_allowed is False
-    assert replay.begin_start(same_tool)
-    replay.commit_start(same_tool, "started")
-    replay.finish(same_tool, provider="success", outcome=True)
-    assert (same_tool.state, same_tool.auto_merge_allowed) == ("completed", False)
+    coord.cycle("claude")
+    assert permits(coord, "claude") == 5   # a 4-permit writer still leaves room for a 1 review
 
 
-def test_future_capacity_reset_controls_eligibility_without_hot_looping():
-    replay = ReplayCoordinator()
-    paused = replay.submit(record_from(HISTORICAL_ROOTS["claude-review"]))
-    assert replay.begin_start(paused)
-    replay.commit_start(paused, "started")
-    replay.finish(paused, provider="recoverable", outcome=False, eligible_at=50)
-    cold = replay.submit(record_from(HISTORICAL_ROOTS["claude-intake"]))
+def test_continuation_head_of_line_blocks_bypass_without_preempting_live_work(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    big = submit_root(coord, "claude-deep-build")            # demand 5
+    coord.cycle("claude")                                    # big runs, pool full
+    fake.end(big, cause=ProviderCause.CAPACITY, reset_at=100)  # deferred continuation @100
 
-    assert replay.cycle("claude", now=49) == [cold.identity]
-    replay.finish(cold, provider="success", outcome=True)
-    assert (paused.state, paused.attempts, paused.claim) == ("waiting", 1, True)
-    assert replay.cycle("claude", now=50) == [paused.identity]
+    live = submit_root(coord, "claude-intake")               # demand 1
+    assert coord.cycle("claude", now=0) == []                # big not eligible yet; live runs
+    assert permits(coord, "claude") == 1
 
+    cold = submit_root(coord, "claude-review")               # demand 1, could fit beside live
+    assert coord.cycle("claude", now=100) == []              # big is eligible but cannot fit
+    assert permits(coord, "claude") == 1                      # cold did NOT bypass the blocked big
 
-@pytest.mark.parametrize("failed_gate", ["headroom", "machine", "stage", "pace"])
-def test_every_independent_gate_defers_without_permits_or_attempts(failed_gate):
-    replay = ReplayCoordinator()
-    record = replay.submit(record_from(HISTORICAL_ROOTS["claude-intake"]))
-    gates = Gates(**{failed_gate: False})
-
-    assert not replay.begin_start(record, gates)
-    assert record.state == "waiting"
-    assert record.attempts == replay.permits_used("claude") == 0
+    fake.end(live, success=True)
+    assert {o.identity for o in coord.cycle("claude", now=100)} == {live}
+    assert permits(coord, "claude") == 5                      # big (continuation) admitted first
+    assert coord.cycle("claude", now=100) == []              # cold still waits behind big
+    fake.kill(big)
 
 
-def test_permit_deferral_also_consumes_neither_permit_nor_attempt():
-    replay = ReplayCoordinator()
-    live = replay.submit(record_from(HISTORICAL_ROOTS["claude-medium-build"]))
-    deferred = replay.submit(record_from(HISTORICAL_ROOTS["claude-review"], suffix="-2"))
-    assert replay.begin_start(live)
-    replay.commit_start(live, "started")
-    full = replay.submit(record_from(HISTORICAL_ROOTS["claude-intake"], suffix="-full"))
-    assert replay.begin_start(full)
-    replay.commit_start(full, "started")
-    used_before = replay.permits_used("claude")
+def test_future_capacity_reset_controls_eligibility_without_hot_looping(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    paused = submit_root(coord, "claude-review")
+    coord.cycle("claude", now=0)
+    fake.end(paused, cause=ProviderCause.CAPACITY, reset_at=50)
 
-    assert not replay.begin_start(deferred)
-    assert deferred.attempts == 0
-    assert replay.permits_used("claude") == used_before == 5
-
-
-def test_crash_recovery_distinguishes_not_started_from_started_atomically():
-    before_crash = ReplayCoordinator()
-    reserved = before_crash.submit(record_from(HISTORICAL_ROOTS["codex-review"]))
-    assert before_crash.begin_start(reserved)
-
-    after_crash = ReplayCoordinator()
-    not_started = after_crash.submit(deepcopy(reserved))
-    assert after_crash.permits_used("codex") == 2  # ambiguous running state fails closed
-    after_crash.recover_start(not_started, "not_started", process_alive=False)
-    assert (not_started.state, not_started.attempts, after_crash.permits_used("codex")) == (
-        "waiting", 0, 0)
-
-    before_crash = ReplayCoordinator()
-    started = before_crash.submit(record_from(HISTORICAL_ROOTS["codex-review"], suffix="-2"))
-    assert before_crash.begin_start(started)
-    before_crash.commit_start(started, "started")
-
-    after_crash = ReplayCoordinator()
-    recovered = after_crash.submit(deepcopy(started))
-    after_crash.recover_start(recovered, "started", process_alive=True)
-    after_crash.recover_start(recovered, "started", process_alive=True)
-    assert (recovered.state, recovered.attempts, after_crash.permits_used("codex")) == (
-        "running", 1, 2)
+    cold = submit_root(coord, "claude-intake")
+    assert coord.cycle("claude", now=49) == []               # paused deferred; cold admitted
+    assert permits(coord, "claude") == 1                      # only the cold intake is running
+    fake.end(cold, success=True)
+    assert {o.identity for o in coord.cycle("claude", now=49)} == {cold}
+    assert coord.cycle("claude", now=49) == []               # paused still not eligible
+    assert permits(coord, "claude") == 0
+    assert coord.cycle("claude", now=50) == []               # reset reached — paused restarts
+    assert permits(coord, "claude") == 1
 
 
-def test_live_recovered_family_keeps_one_root_reservation_and_dead_family_releases_it():
-    before_crash = ReplayCoordinator()
-    root = before_crash.submit(record_from(HISTORICAL_ROOTS["codex-review"]))
-    assert before_crash.begin_start(root)
-    before_crash.commit_start(root, "started")
-    for descendant in ("D-1", "D-2", "D-3", "D-4"):
-        before_crash.add_descendant(root, descendant)
+def test_a_closed_gate_defers_without_permits_or_attempts(make_coord):
+    fake = FakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    identity = submit_root(coord, "claude-intake")
 
-    after_crash = ReplayCoordinator()
-    recovered = after_crash.submit(deepcopy(root))
-    after_crash.recover_start(recovered, "started", process_alive=True)
-    assert after_crash.permits_used("codex") == 2
-    assert len(recovered.descendants) == 4
+    assert coord.cycle("claude") == []
+    assert permits(coord, "claude") == 0                      # a failed gate reserves nothing
 
-    after_crash.recover_start(recovered, "started", process_alive=False)
-    assert after_crash.permits_used("codex") == 0
-    assert (recovered.state, recovered.attempts, recovered.claim) == ("waiting", 1, True)
+    fake.gate_open = True
+    # No permit and no attempt were spent, so the full three-attempt budget remains.
+    assert starts_until_held(coord, fake, identity, "claude") == 3
 
 
-@pytest.mark.parametrize("provider", ["recoverable", "incomplete", "unknown", "success"])
-def test_non_terminal_endings_wait_when_the_outcome_is_missing(provider):
-    replay = ReplayCoordinator()
-    record = replay.submit(Record(f"END-{provider}", "review", "claude", 1))
-    assert replay.begin_start(record)
-    replay.commit_start(record, "started")
-    replay.finish(record, provider=provider, outcome=False)
-    assert (record.state, record.attempts, record.claim) == ("waiting", 1, True)
+def test_permit_deferral_consumes_neither_permit_nor_attempt(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    live = submit_root(coord, "claude-medium-build")         # demand 4
+    deferred = submit_root(coord, "claude-revise")           # demand 3, cannot fit beside live
+    coord.cycle("claude")
+    assert permits(coord, "claude") == 4                      # only the writer started
+
+    fake.end(live, success=True)                             # free the pool
+    # The deferred writer never spent an attempt while blocked, so it keeps its full budget.
+    assert starts_until_held(coord, fake, deferred, "claude") == 3
 
 
-def test_outcome_precedence_permanent_hold_and_exhaustion_all_terminate_safely():
-    replay = ReplayCoordinator()
+@pytest.mark.parametrize("cause", [
+    ProviderCause.CAPACITY, ProviderCause.SERVER, ProviderCause.TIMEOUT,
+    ProviderCause.PROCESS, ProviderCause.UNKNOWN, ProviderCause.NONE])
+def test_non_terminal_endings_wait_when_the_outcome_is_missing(make_coord, cause):
+    fake = FakeSession()
+    fake.gate_open = True
+    coord = make_coord(fake)
+    identity = submit_root(coord, "claude-review")
+    coord.cycle("claude")
+    fake.gate_open = False  # observe the wait itself, without an immediate re-admit
+    fake.end(identity, cause=cause)
 
-    success = replay.submit(Record("OUTCOME", "review", "claude", 1))
-    assert replay.begin_start(success)
-    replay.commit_start(success, "started")
-    replay.finish(success, provider="permanent", outcome=True)
-    assert success.state == "completed"
-
-    permanent = replay.submit(Record("PERMANENT", "review", "claude", 1))
-    assert replay.begin_start(permanent)
-    replay.commit_start(permanent, "started")
-    replay.finish(permanent, provider="permanent", outcome=False)
-    assert (permanent.state, permanent.hold_pending, permanent.claim) == (
-        "waiting", True, True)
-    replay.finalize_hold(permanent)
-    assert (permanent.state, permanent.handoffs, permanent.claim) == ("held", 1, False)
-
-    exhausted = replay.submit(Record("EXHAUSTED", "build", "claude", 3, lineage="claude"))
-    for expected_attempt in range(1, ATTEMPT_BUDGET + 1):
-        assert replay.begin_start(exhausted)
-        replay.commit_start(exhausted, "started")
-        replay.finish(exhausted, provider="unknown", outcome=False)
-        assert exhausted.attempts == expected_attempt
-    assert (exhausted.state, exhausted.hold_pending, exhausted.claim) == (
-        "waiting", True, True)
-    replay.finalize_hold(exhausted)
-    assert (exhausted.state, exhausted.handoffs, exhausted.claim) == ("held", 1, False)
-    assert not replay.begin_start(exhausted)
-    replay.finalize_hold(exhausted)
-    assert exhausted.handoffs == 1
+    assert coord.cycle("claude") == []                       # no terminal outcome
+    assert permits(coord, "claude") == 0                      # reservation released, waiting
 
 
-@pytest.mark.parametrize(
-    ("stage", "expected"),
-    STAGE_NATIVE_HANDOFF.items(),
-)
-def test_exhaustion_creates_exactly_one_stage_native_handoff(stage, expected):
-    replay = ReplayCoordinator()
-    record = replay.submit(Record(f"HOLD-{stage}", stage, "claude", 1,
-                                  attempts=ATTEMPT_BUDGET - 1,
-                                  lineage="claude" if stage in CODE_WRITING else None))
-    assert replay.begin_start(record)
-    replay.commit_start(record, "started")
-    replay.finish(record, provider="unknown", outcome=False)
-    replay.finalize_hold(record)
-
-    assert (record.state, record.handoffs, record.handoff_kind, record.claim) == (
-        "held", 1, expected, False)
+def test_a_verified_outcome_completes_the_stage(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = submit_root(coord, "claude-review")
+    coord.cycle("claude")
+    fake.end(identity, success=True)
+    assert [(o.identity, o.status) for o in coord.cycle("claude")] == [(identity, "completed")]
 
 
-def test_handoff_proof_survives_crash_without_duplicate_handoff_or_notification():
-    before_crash = ReplayCoordinator()
-    record = before_crash.submit(Record(
-        "CRASH-HOLD", "review", "claude", 1, attempts=ATTEMPT_BUDGET - 1))
-    assert before_crash.begin_start(record)
-    before_crash.commit_start(record, "started")
-    before_crash.finish(record, provider="unknown", outcome=False)
-    before_crash.finalize_hold(record, crash_after_proof=True)
-    assert (record.state, record.hold_pending, record.claim, record.handoffs,
-            record.notifications, record.handoff_proof is not None) == (
-        "waiting", True, True, 1, 1, True)
-
-    after_crash = ReplayCoordinator()
-    recovered = after_crash.submit(deepcopy(record))
-    after_crash.finalize_hold(recovered)
-    assert (recovered.state, recovered.claim, recovered.handoffs,
-            recovered.notifications, recovered.handoff_proof) == (
-        "held", False, 1, 1, record.handoff_proof)
+def test_permanent_condition_holds_immediately_regardless_of_budget(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = submit_root(coord, "claude-review")
+    coord.cycle("claude")
+    fake.end(identity, cause=ProviderCause.PERMANENT)
+    outcomes = coord.cycle("claude")
+    assert [(o.identity, o.status) for o in outcomes] == [(identity, "held")]
+    assert coord.cycle("claude") == []                       # a hold is not re-emitted
 
 
-def test_completed_stage_transfers_claim_before_retirement_or_releases_at_boundary():
-    replay = ReplayCoordinator()
-    build = replay.submit(Record(
-        "BUILD-STAGE", "build", "claude", 4, lineage="claude"))
-    assert replay.begin_start(build)
-    replay.commit_start(build, "started")
-    replay.finish(build, provider="success", outcome=True)
-    assert (build.state, build.claim, build.retired) == ("completed", True, False)
-
-    review = Record("REVIEW-STAGE", "review", "codex", 2, model="sol")
-    replay.finalize_completion(build, next_record=review)
-    assert (review.state, review.claim) == ("waiting", True)
-    assert (build.claim, build.retired) == (False, True)
-
-    assert replay.begin_start(review)
-    replay.commit_start(review, "started")
-    replay.finish(review, provider="success", outcome=True)
-    replay.finalize_completion(review, external_boundary_proven=True)
-    assert (review.state, review.claim, review.retired) == ("completed", False, True)
+def test_exhausting_the_attempt_budget_holds_the_stage(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = submit_root(coord, "claude-review")
+    # Three unknown interruptions exhaust the budget and hold the stage.
+    assert starts_until_held(coord, fake, identity, "claude") == 3
 
 
-def test_submission_is_idempotent_so_one_logical_stage_cannot_duplicate_work():
-    replay = ReplayCoordinator()
-    first = replay.submit(Record("SAME-STAGE", "build", "claude", 4, lineage="claude"))
-    duplicate = replay.submit(Record("SAME-STAGE", "build", "claude", 4, lineage="claude"))
+@pytest.mark.parametrize(("stage", "expected"), STAGE_NATIVE_HANDOFF.items())
+def test_exhaustion_creates_exactly_one_stage_native_handoff(make_coord, stage, expected):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    pool = "claude"
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject=f"HOLD-{stage}", stage=stage, pool=pool, complexity="deep"))
+    starts = 0
+    held = None
+    for _ in range(12):
+        for outcome in coord.cycle(pool):
+            if outcome.identity == identity and outcome.status == "held":
+                held = outcome
+        if held is not None:
+            break
+        if permits(coord, pool) > 0:
+            starts += 1
+            fake.end(identity, cause=ProviderCause.UNKNOWN)
+    assert held is not None and held.handoff == expected
+    assert coord.cycle(pool) == []                            # exactly one handoff, not repeated
 
-    assert duplicate is first
-    assert len(replay.records) == 1
+
+def test_submission_is_idempotent_so_one_logical_stage_cannot_duplicate_work(make_coord):
+    fake = FakeSession()
+    coord = make_coord(fake)
+    first = submit_root(coord, "claude-medium-build")
+    duplicate = submit_root(coord, "claude-medium-build")
+    assert duplicate == first
+    coord.cycle("claude")
+    assert permits(coord, "claude") == 4                      # one reservation, not two
+
+
+def test_descendants_share_the_root_reservation_without_new_permits(make_coord):
+    """A running root reserves once; its subagents inherit that reservation and never reserve
+    independently, so nested work cannot push the pool past budget (ADR 0030). When the root
+    completes, its descendants retire with it rather than lingering as waiting work."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    root = submit_root(coord, "claude-medium-build")             # demand 4
+    coord.cycle("claude")
+    assert permits(coord, "claude") == 4
+
+    for i in range(2):  # two subagents of the running root, each nominally demand 4
+        coord.submit_stage(Submission(
+            repo="o/r", subject=HISTORICAL_ROOTS["claude-medium-build"].synthetic_id,
+            stage="build", pool="claude", complexity="standard", effort="medium",
+            target=f"sub-{i}", descendant_of=root))
+    assert coord.cycle("claude") == []
+    assert permits(coord, "claude") == 4                        # descendants reserved nothing
+
+    fake.end(root, success=True)
+    assert {o.identity for o in coord.cycle("claude")} == {root}  # only the root is terminal
+    assert permits(coord, "claude") == 0                        # released; descendants retired
+
+
+def test_a_completed_stage_transfers_its_claim_to_the_next_stage(make_coord):
+    """A completed stage keeps its GitHub claim until the next stage assumes it, then releases
+    it — so a crash between stages can never drop ownership or double-claim (ADR 0030)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    review = coord.submit_stage(Submission(repo="o/r", subject="T", stage="review", pool="claude"))
+    coord.cycle("claude")
+    fake.end(review, success=True)
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+    assert record_of(coord, review).claim is True               # kept until the transfer lands
+
+    revise = coord.submit_stage(Submission(
+        repo="o/r", subject="T", stage="revise", pool="claude", transfer_from=review))
+    assert record_of(coord, review).claim is False              # released to the next stage
+    assert record_of(coord, revise).claim is True               # revise now owns the claim
+
+
+def test_a_read_only_review_routes_cross_pool_and_lineage_governs_auto_merge(make_coord):
+    """A read-only review is unpinned: it runs on either pool. Whether it may auto-merge turns
+    on lineage — a review by the same tool that built the diff cannot, a cross-tool one can
+    (ADR 0028)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    cross = coord.submit_stage(Submission(repo="o/r", subject="X", stage="review",
+                                          pool="codex", builder_lineage="claude"))
+    same = coord.submit_stage(Submission(repo="o/r", subject="Y", stage="review",
+                                         pool="claude", builder_lineage="claude"))
+    assert record_of(coord, cross).auto_merge_allowed is True    # a different tool reviewed it
+    assert record_of(coord, same).auto_merge_allowed is False    # a same-tool review cannot merge
+
+    # Both admit on their own pool — the read-only review was free to route cross-pool.
+    assert coord.cycle("codex") == [] and permits(coord, "codex") == 2
+    assert coord.cycle("claude") == [] and permits(coord, "claude") == 1
+    fake.kill(cross)
+    fake.kill(same)
+
+
+def test_a_code_writing_stage_cannot_leave_its_builder_lineage(make_coord):
+    """A code-writing stage is pinned to the tool that built its diff. A revise of a
+    claude-built diff submitted onto codex is an illegal cross-pool move: it never admits and
+    reserves nothing, failing closed rather than silently switching tools (ADR 0028)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    coord.submit_stage(Submission(repo="o/r", subject="Z", stage="revise", pool="codex",
+                                  builder_lineage="claude", complexity="deep"))
+    assert coord.cycle("codex") == []
+    assert permits(coord, "codex") == 0
