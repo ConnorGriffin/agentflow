@@ -114,7 +114,7 @@ def replace_projection(entries: list[dict], *, owned_worktrees: set[str] | None 
     still-running legacy Build remains visible as drain evidence. Once coordinated, omitting it
     replaces the whole building lane. (ADR 0030, issue #103)."""
     kept = []
-    for entry in _entries():
+    for entry in running_strict():
         if entry.get("stage") != "building":
             kept.append(entry)
         elif owned_worktrees is not None and entry.get("worktree") not in owned_worktrees:

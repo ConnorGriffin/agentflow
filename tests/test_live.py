@@ -107,6 +107,16 @@ def test_drain_projection_preserves_legacy_build_entries(state):
     assert entries["/tmp/coordinator-build"]["pid"] == 222
 
 
+def test_projection_never_clears_ambiguous_live_state(state):
+    raw = "{ partial live state"
+    live.LIVE_FILE.write_text(raw)
+
+    with pytest.raises(ValueError):
+        live.replace_projection([])
+
+    assert live.LIVE_FILE.read_text() == raw
+
+
 def test_reap_drops_dead_session_and_keeps_the_live_one(state):
     live.record(_session(number=1), "/tmp/alive")
     live.record(_session(number=2), "/tmp/dead")

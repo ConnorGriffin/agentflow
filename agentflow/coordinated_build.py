@@ -196,7 +196,7 @@ def _pr_exists(record) -> bool:
     r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch,
               "--state", "all", "--json", "headRefName,url", "--limit", "1"])
     if r.returncode != 0:
-        return False
+        raise RuntimeError(f"cannot verify Build PR outcome for {record.repo}:{branch}")
     return any(pr.get("headRefName") == branch
                for pr in json.loads(r.stdout or "[]"))
 

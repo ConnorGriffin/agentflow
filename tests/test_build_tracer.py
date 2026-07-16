@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
 from conftest import FakeSession, permits, record_of
 
 from agentflow import coordinated_build
@@ -370,6 +372,21 @@ def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, "wrong", ""),
     )
     assert coordinated_build._worktree_ready(record) is False
+
+
+def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monkeypatch):
+    from agentflow import loop
+
+    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-7-owned"
+    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                    repo="o/r", subject="7", source=str(wt), claim=True, lineage="claude")
+    monkeypatch.setattr(
+        loop, "_run",
+        lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 1, "", "offline"),
+    )
+
+    with pytest.raises(RuntimeError, match="cannot verify Build PR outcome"):
+        coordinated_build._pr_exists(record)
 
 
 def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(monkeypatch):
