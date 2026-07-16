@@ -21,9 +21,36 @@ import os
 import signal
 import subprocess
 import sys
+from pathlib import Path
 
 from agentflow.coordinator.session import events_path, write_result
 from agentflow.coordinator.store import Store
+
+
+def _mark_active(working_dir: str) -> Path | None:
+    """Mirror the detached supervisor pid into the legacy worktree-liveness marker.
+
+    Startup recovery still consults this current-format marker before coordinator
+    reconciliation. Keeping it for the supervisor's lifetime prevents that recovery pass from
+    removing a clean coordinator-owned worktree while its provider is alive.
+    """
+    if not working_dir:
+        return None
+    from agentflow.runner import _active_marker
+    marker = _active_marker(Path(working_dir))
+    if marker is not None:
+        marker.write_text(str(os.getpid()))
+    return marker
+
+
+def _clear_active(marker: Path | None) -> None:
+    if marker is None:
+        return
+    try:
+        if marker.read_text().strip() == str(os.getpid()):
+            marker.unlink()
+    except OSError:
+        pass
 
 
 def main(args: list[str]) -> None:
@@ -38,7 +65,9 @@ def main(args: list[str]) -> None:
     store.close()
     if not won:
         os._exit(0)  # our reservation is gone; starting a provider now would be unreserved
+    marker = _mark_active(working_dir)
     if not provider:
+        _clear_active(marker)
         os._exit(0)  # dormant: no provider to become; a started-then-ended attempt
     # Remain as the recorded family supervisor while the provider runs in its own process
     # group. Output streams directly to its durable artifact, so partial output survives a
@@ -54,6 +83,7 @@ def main(args: list[str]) -> None:
                 stderr=subprocess.STDOUT, start_new_session=True)
         except OSError:
             write_result(store_path, token, exit_status=None, signal=None, timed_out=False)
+            _clear_active(marker)
             os._exit(0)
         try:
             returncode = process.wait(timeout=float(timeout))
@@ -77,6 +107,7 @@ def main(args: list[str]) -> None:
     exit_status = returncode if returncode >= 0 else None
     write_result(store_path, token, exit_status=exit_status,
                  signal=ended_by_signal, timed_out=timed_out)
+    _clear_active(marker)
     os._exit(0)
 
 

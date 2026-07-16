@@ -21,6 +21,8 @@ daemon, GitHub, or a live store; :func:`load_records` is the thin production rea
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import Store, default_store_path
 
@@ -72,6 +74,11 @@ def live_projection(records) -> list[dict]:
         if record.state != RUNNING or record.stage != "build":
             continue
         number = _issue_number(record)
+        branch = None
+        if record.source and "/.agentflow/worktrees/" in record.source:
+            branch = "agentflow/" + record.source.split("/.agentflow/worktrees/", 1)[1]
+        started_at = (datetime.fromtimestamp(record.started_at, timezone.utc).isoformat()
+                      if record.started_at else "")
         entries.append({
             "repo": record.repo,
             "number": number if number is not None else record.subject,
@@ -79,9 +86,10 @@ def live_projection(records) -> list[dict]:
             "stage": "building",
             "tool": record.pool,
             "model": record.model,
-            "branch": None,
+            "branch": branch,
             "worktree": record.source or "",
             "pid": int(record.family) if record.family and record.family.isdigit() else None,
+            "started_at": started_at,
         })
     return entries
 

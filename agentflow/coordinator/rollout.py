@@ -74,15 +74,20 @@ class Rollout:
 
     @property
     def mode(self) -> str:
-        """The operator's durable desired mode. A missing, partial, or corrupt file reads as
-        legacy — the original behavior — and the phase derivation still refuses to resume
-        legacy launching while coordinator records own work, so this default is fail-closed."""
+        """The operator's durable desired mode.
+
+        A missing file means rollout has never been requested and starts in legacy. A present
+        file that is partial, corrupt, unreadable, or carries an unknown value is ambiguous and
+        raises: callers must drain rather than guess which side the operator requested.
+        """
         try:
             data = json.loads(self.path.read_text())
-        except (OSError, json.JSONDecodeError):
+        except FileNotFoundError:
             return MODE_LEGACY
         mode = data.get("mode") if isinstance(data, dict) else None
-        return mode if mode in _MODES else MODE_LEGACY
+        if mode not in _MODES:
+            raise ValueError(f"invalid rollout state: {self.path}")
+        return mode
 
     def request_coordinated(self) -> None:
         """Ask to roll Build forward onto the coordinator. Durably records the intent; the

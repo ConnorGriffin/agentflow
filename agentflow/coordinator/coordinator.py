@@ -285,6 +285,7 @@ class Coordinator:
         record.family = None
         record.process_alive = False
         record.attempt_committed = False  # a fresh attempt has not been consumed yet
+        record.started_at = now
         record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
         if not self._store.reserve(record, PERMIT_BUDGET):
             record.state = WAITING  # the pool cannot fit this demand right now
@@ -368,9 +369,14 @@ class Coordinator:
         if not record.hold_pending:
             return None
         if record.handoff_proof is None:
+            finalize = getattr(self._adapter, "finalize_hold", None)
+            proof = finalize(record) if finalize is not None else (
+                f"proof:{record.identity}:{STAGE_NATIVE_HANDOFF[record.stage]}")
+            if proof is None:
+                return None  # the external handoff is not durable yet; retry next cycle
             record.handoffs = 1
             record.handoff_kind = STAGE_NATIVE_HANDOFF[record.stage]
-            record.handoff_proof = f"proof:{record.identity}:{record.handoff_kind}"
+            record.handoff_proof = proof
             record.notifications = 1
             self._persist(record)
         record.state = HELD

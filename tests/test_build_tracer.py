@@ -7,11 +7,17 @@ the coordinator interface — never by poking private transitions.
 
 from __future__ import annotations
 
+import json
+import subprocess
+
 from conftest import FakeSession, permits, record_of
 
+from agentflow import coordinated_build
 from agentflow.coordinator import BuildStageAdapter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause
+from agentflow.coordinator.record import Record
+from agentflow.loop import RepoConfig
 
 
 def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
@@ -19,11 +25,12 @@ def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
                       complexity="deep", effort=effort, source=source)
 
 
-def _adapter(fake, *, pr, prep):
+def _adapter(fake, *, pr, prep, handoff=None):
     """A Build adapter wired to test flags: ``pr``/``prep`` are single-element lists so a test
     flips PR existence and worktree readiness mid-flight; the fake plays observer + launcher."""
     return BuildStageAdapter(pr_exists=lambda r: pr[0],
-                             worktree_ready=lambda r: prep[0], observer=fake)
+                             worktree_ready=lambda r: prep[0], observer=fake,
+                             handoff=handoff)
 
 
 def _records(coord):
@@ -100,7 +107,12 @@ def test_preparation_failure_consumes_no_permit_or_attempt(make_coord):
 def test_exhaustion_holds_once_with_one_handoff_and_notification(make_coord):
     fake = FakeSession()
     pr, prep = [False], [True]
-    coord = make_coord(fake, adapter=_adapter(fake, pr=pr, prep=prep))
+    handoffs = []
+    adapter = _adapter(
+        fake, pr=pr, prep=prep,
+        handoff=lambda record: handoffs.append(record.identity) or "issue-proof",
+    )
+    coord = make_coord(fake, adapter=adapter)
     ident = coord.submit_stage(_build())
     outcome = None
     for _ in range(6):
@@ -115,6 +127,9 @@ def test_exhaustion_holds_once_with_one_handoff_and_notification(make_coord):
     assert rec.attempts == 3                        # initial + two continuations, no more
     assert rec.handoffs == 1 and rec.notifications == 1
     assert rec.source == "/wt/issue-7"              # worktree left untouched for human re-entry
+    assert handoffs == [ident]
+    assert make_coord(fake, adapter=adapter).cycle("claude") == []
+    assert handoffs == [ident]                       # restart cannot repeat the external handoff
 
 
 # --- idempotent submission ---------------------------------------------------------------
@@ -155,10 +170,13 @@ def test_running_build_projects_to_live_board_waiting_does_not(make_coord):
                        gate=tracer.build_only_gate)
     coord.submit_stage(_build("7"))
     coord.submit_stage(Submission(repo="o/r", subject="8", stage="review", pool="claude"))
-    coord.cycle("claude")
+    coord.cycle("claude", now=123)
     projection = tracer.live_projection(_records(coord))
     assert [e["number"] for e in projection] == [7]     # only the running build
     assert projection[0]["stage"] == "building" and projection[0]["tool"] == "claude"
+    assert set(projection[0]) == {"repo", "number", "title", "stage", "tool", "model",
+                                  "branch", "worktree", "pid", "started_at"}
+    assert projection[0]["started_at"].startswith("1970-01-01T00:02:03")
 
 
 def test_owned_issues_and_active_track_coordinator_ownership(make_coord):
@@ -241,3 +259,126 @@ def test_claim_transfer_log_shape(make_coord):
     coord.submit_stage(Submission(repo="o/r", subject="7", stage="review", pool="claude",
                                   transfer_from=build))
     assert "o/r: 7: build: attempt 1/3 completed — pr opened; claim transferred to review" in lines
+
+
+def test_forward_activation_names_live_claim_pid_and_dirty_worktree(tmp_path, monkeypatch):
+    from agentflow import loop, runner
+
+    cfg = RepoConfig("o/r", str(tmp_path))
+    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-7-legacy"
+    wt.mkdir(parents=True)
+    marker = tmp_path / "active-pid"
+    marker.write_text("123")
+    monkeypatch.setattr(runner, "_registered_worktrees",
+                        lambda workdir: [(str(wt), "agentflow/claude/issue-7-legacy")])
+    monkeypatch.setattr(runner, "_active_marker", lambda path: marker)
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return subprocess.CompletedProcess(cmd, 0, '[{"number": 7}]', "")
+        if cmd[:3] == ["git", "-C", str(wt)]:
+            return subprocess.CompletedProcess(cmd, 0, " M progress.py\n", "")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    evidence = coordinated_build.activation_evidence(
+        [cfg], [{"repo": "o/r", "number": 7, "stage": "building",
+                 "worktree": str(wt)}], [])
+
+    assert any("legacy session live" in item for item in evidence)
+    assert any("legacy building claim" in item for item in evidence)
+    assert any("PID marker" in item for item in evidence)
+    assert any("is dirty" in item for item in evidence)
+
+
+def test_forward_activation_excludes_coordinator_owned_claim_and_worktree(tmp_path, monkeypatch):
+    from agentflow import loop, runner
+
+    cfg = RepoConfig("o/r", str(tmp_path))
+    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-7-owned"
+    wt.mkdir(parents=True)
+    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                    repo="o/r", subject="7", source=str(wt), claim=True)
+    monkeypatch.setattr(runner, "_registered_worktrees",
+                        lambda workdir: [(str(wt), "agentflow/claude/issue-7-owned")])
+    monkeypatch.setattr(runner, "_active_marker", lambda path: None)
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        if cmd[:3] == ["gh", "issue", "list"]:
+            return subprocess.CompletedProcess(cmd, 0, '[{"number": 7}]', "")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    evidence = coordinated_build.activation_evidence(
+        [cfg], [{"repo": "o/r", "number": 7, "stage": "building",
+                 "worktree": str(wt)}], [record])
+
+    assert evidence == ()
+
+
+def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
+        tmp_path, monkeypatch):
+    from agentflow import loop, runner
+
+    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-7-owned"
+    wt.mkdir(parents=True)
+    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                    repo="o/r", subject="7", source=str(wt), claim=True, lineage="claude")
+    monkeypatch.setattr(runner, "_worktree_is_registered", lambda workdir, path: True)
+    provisioned = []
+    monkeypatch.setattr(runner.ClaudeRunner, "provision",
+                        lambda self, path: provisioned.append(path))
+    expected = "agentflow/claude/issue-7-owned"
+    monkeypatch.setattr(
+        loop, "_run",
+        lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, expected, ""),
+    )
+
+    assert coordinated_build._worktree_ready(record) is True
+    assert provisioned == [wt]
+
+    monkeypatch.setattr(
+        loop, "_run",
+        lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, "wrong", ""),
+    )
+    assert coordinated_build._worktree_ready(record) is False
+
+
+def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(monkeypatch):
+    from agentflow import intake, loop, notify as notify_module
+
+    state = {
+        "title": "Build it",
+        "url": "https://github.com/o/r/issues/7",
+        "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
+        "comments": [],
+    }
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        if cmd[:3] == ["gh", "issue", "view"]:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(state), "")
+        if cmd[:3] == ["gh", "issue", "edit"] and "--remove-label" in cmd:
+            state["labels"] = [label for label in state["labels"]
+                               if label["name"] != "agentflow:building"]
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(cmd)
+
+    def fake_apply(repo, number, title, labels, result):
+        state["labels"] = [{"name": "agentflow:needs-grilling"},
+                           {"name": "agentflow:building"}]
+        if not any(comment["body"] == result.body for comment in state["comments"]):
+            state["comments"].append({"body": result.body})
+        return "applied"
+
+    notifications = []
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(intake, "apply_intake", fake_apply)
+    monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
+    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                    repo="o/r", subject="7", source="/retained/wt", claim=True)
+
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
+    assert len(state["comments"]) == 1
+    assert len(notifications) == 1

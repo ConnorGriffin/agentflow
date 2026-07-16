@@ -153,9 +153,11 @@ def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _l
     """Run the fail-closed worktree recovery pass once at daemon startup, then sweep the live
     board of any session whose worktree is no longer alive — a crashed run's phantom sessions,
     dropped with the same liveness signal the worktree recovery just used."""
+    from agentflow import coordinated_build
     for cfg in repos:
         try:
-            report = sweep(cfg.repo, cfg.workdir)
+            protected = coordinated_build.owned_worktrees(cfg)
+            report = sweep(cfg.repo, cfg.workdir, protected)
             if report.removed or report.retained:
                 _log(f"{cfg.repo}: startup worktree recovery removed {len(report.removed)}, "
                      f"retained {len(report.retained)} for recovery")

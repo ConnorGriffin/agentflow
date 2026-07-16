@@ -28,7 +28,7 @@ from collections import Counter
 
 from agentflow import balancer, coordinated_build, live, loop
 from agentflow.balancer import pick_pair
-from agentflow.coordinator import LEGACY, Phase, Rollout
+from agentflow.coordinator import DRAINING, Phase, Rollout
 
 # Named config (env-overridable). The machine ceiling caps total live sessions; the
 # per-stage caps cap each kind. Triage > build on purpose (see the module docstring).
@@ -216,18 +216,23 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
     submission = coordinated_build.build_submission(cfg, issue, builder.tool)
     if submission is None:
         return f"#{issue['number']}: skipped — no agentflow:complexity:* label (ADR 0018 gate)"
+    if not loop._claim(cfg.repo, issue["number"]):
+        return f"#{issue['number']}: could not claim Build — refusing coordinator submission"
     coordinator.submit_stage(submission)
     return f"#{issue['number']}: submitted to coordinator → {builder.tool} (build)"
 
 
-def _resolve_phase(rollout, _log) -> Phase:
-    """This cycle's Build rollout phase, failing toward legacy so a read hiccup never suspends
-    the pipeline. Cheap in the steady legacy state — it never creates a coordinator store."""
+def _resolve_phase(rollout, repos, _log) -> Phase:
+    """This cycle's Build rollout phase. Any ambiguous rollout, live-session, coordinator,
+    claim, or worktree read fails closed into a named drain; it can never re-enable legacy
+    launching or activate coordinated Build by guessing."""
     try:
-        return coordinated_build.resolve_phase(rollout or Rollout(log=_log), live.running())
-    except Exception as e:  # noqa: BLE001 — a rollout read must never sink the dispatch cycle
-        _log(f"rollout: phase read error, staying legacy: {type(e).__name__}: {e}")
-        return Phase(LEGACY)
+        sessions = live.running_strict()
+        return coordinated_build.resolve_phase(rollout or Rollout(log=_log), repos, sessions)
+    except Exception as e:  # noqa: BLE001 — ambiguity drains Build, not the whole cycle
+        reason = f"rollout state unreadable ({type(e).__name__}: {e})"
+        _log(f"rollout: {reason} — draining")
+        return Phase(DRAINING, (reason,))
 
 
 def run_cycle(repos, governor: Governor | None = None, *, rollout=None,
@@ -242,7 +247,7 @@ def run_cycle(repos, governor: Governor | None = None, *, rollout=None,
     gov = governor if governor is not None else Governor()
     gov.begin_cycle()
     slot = _Slot(gov, _pool_activity(_log))
-    phase = _resolve_phase(rollout, _log)
+    phase = _resolve_phase(rollout, repos, _log)
     coord = None
     if not phase.launch_legacy:  # coordinated or draining — the coordinator owns Build now
         coord = coordinator if coordinator is not None else coordinated_build.build_coordinator(_log)
@@ -251,4 +256,4 @@ def run_cycle(repos, governor: Governor | None = None, *, rollout=None,
     for thread in repo_threads:
         thread.join()
     if coord is not None:
-        coordinated_build.reconcile_and_project(coord, _log=_log)
+        coordinated_build.reconcile_and_project(coord, phase, _log=_log)

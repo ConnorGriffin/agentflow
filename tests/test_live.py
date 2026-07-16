@@ -87,6 +87,26 @@ def test_missing_or_corrupt_file_reads_as_fleet_idle(state):
     assert live.running() == []                              # corrupt → idle, never a crash
 
 
+def test_rollout_read_refuses_corrupt_live_state(state):
+    assert live.running_strict() == []                       # a missing board is clean
+    live.LIVE_FILE.write_text("{ this is not json")
+    with pytest.raises(ValueError):
+        live.running_strict()                                # a present corrupt board is ambiguous
+
+
+def test_drain_projection_preserves_legacy_build_entries(state):
+    live.record(_session(number=1), "/tmp/legacy-build")
+    live.record(_session(number=2), "/tmp/coordinator-build")
+    replacement = {**live.running()[1], "pid": 222}
+
+    live.replace_projection([replacement], owned_worktrees={"/tmp/coordinator-build"})
+
+    entries = {entry["worktree"]: entry for entry in live.running()}
+    assert set(entries) == {"/tmp/legacy-build", "/tmp/coordinator-build"}
+    assert entries["/tmp/legacy-build"]["number"] == 1
+    assert entries["/tmp/coordinator-build"]["pid"] == 222
+
+
 def test_reap_drops_dead_session_and_keeps_the_live_one(state):
     live.record(_session(number=1), "/tmp/alive")
     live.record(_session(number=2), "/tmp/dead")

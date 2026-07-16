@@ -532,12 +532,18 @@ def _dispatch_build(cfg: RepoConfig, issue: dict, operator: bool = False,
             slot.release("build")
 
 
-def _claim(repo: str, n: int) -> None:
+def _claim(repo: str, n: int) -> bool:
     """Mark issue n as owned by an agent *before* its build runs, so a concurrent or
-    next-cycle dispatch skips it (closes the no-PR-yet window). Ensures the label first."""
-    _run(["gh", "label", "create", BUILDING, "--repo", repo, "--color", "fbca04",
-          "--description", "An agent is building this issue", "--force"])
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", BUILDING])
+    next-cycle dispatch skips it (closes the no-PR-yet window). Ensures the label first and
+    reports whether ownership was actually made visible; coordinated Build refuses submission
+    when it cannot establish this guard."""
+    created = _run(["gh", "label", "create", BUILDING, "--repo", repo, "--color", "fbca04",
+                    "--description", "An agent is building this issue", "--force"])
+    if created.returncode != 0:
+        return False
+    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo,
+                    "--add-label", BUILDING])
+    return claimed.returncode == 0
 
 
 def _release(repo: str, n: int) -> None:

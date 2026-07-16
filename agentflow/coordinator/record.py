@@ -48,6 +48,7 @@ class Record:
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move
     source: str | None = None    # durable working-directory/worktree pointer for provider launch
     input_ptr: str | None = None # durable pointer the provider adapter rebuilds the prompt from
+    started_at: int = 0                  # epoch when the current attempt was admitted
     deadline: int = 0                    # supervisor observe-until deadline, for the recovered-running log
     start_fact: str | None = None        # durable launcher handshake result: started | not_started
     launch_token: str | None = None      # nonce a reservation stamps; only the child holding it may record `started`

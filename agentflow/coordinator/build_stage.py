@@ -30,10 +30,11 @@ class BuildStageAdapter:
     unprepared.
     """
 
-    def __init__(self, *, pr_exists, worktree_ready=None, observer=None) -> None:
+    def __init__(self, *, pr_exists, worktree_ready=None, observer=None, handoff=None) -> None:
         self._pr_exists = pr_exists
         self._worktree_ready = worktree_ready or (lambda record: bool(record.source))
         self._observer = observer or ProviderObserver()
+        self._handoff = handoff
 
     def prepare(self, record) -> bool:
         """Reuse the retained branch and worktree before admission (ADR 0030). Returns whether
@@ -52,3 +53,11 @@ class BuildStageAdapter:
         provider exited: a bad exit with the PR present completes; a clean exit without it does
         not (ADR 0028)."""
         return bool(self._pr_exists(record))
+
+    def finalize_hold(self, record) -> str | None:
+        """Create the Build-native human handoff and return its durable proof. Production moves
+        the issue to ``needs-grilling`` and notifies once; tests may omit the collaborator and
+        use the coordinator's local proof for the dormant seam."""
+        if self._handoff is not None:
+            return self._handoff(record)
+        return f"proof:{record.identity}:issue:needs-grilling"

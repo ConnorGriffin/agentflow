@@ -73,10 +73,12 @@ def test_no_phase_ever_launches_both_sides(tmp_path):
                 assert not (phase.launch_legacy and phase.submit_coordinated)
 
 
-def test_corrupt_durable_file_reads_as_legacy_but_stays_fail_closed(tmp_path):
+def test_corrupt_durable_file_refuses_to_guess_a_mode(tmp_path):
     path = tmp_path / "rollout.json"
     path.write_text("{not json")
     roll = Rollout(path)
-    assert roll.mode == MODE_LEGACY
-    # Even defaulted-to-legacy, it will not resume legacy launching while a record owns work.
-    assert roll.phase(coordinator_active=True).name == DRAINING
+    # The dispatch seam catches this ambiguity and derives a named drain. The state object must
+    # not silently reinterpret a partially-written coordinated request as legacy launching.
+    import pytest
+    with pytest.raises(ValueError):
+        _ = roll.mode
