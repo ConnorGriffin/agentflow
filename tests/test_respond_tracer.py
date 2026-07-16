@@ -443,7 +443,7 @@ def test_reply_ready_rejects_a_generic_reply_that_is_not_bound_to_its_target(
 
 
 def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
-                change="none", head="h", baseline="h"):
+                change="none", head="h", baseline="h", ancestry_rc=0):
     """Wire ``_reply_ready`` against a real retained worktree that exists on disk (so the pushed-
     change reads run) with our marked reply already the last word. ``ahead``/``status`` fake the
     ``git rev-list`` and ``git status --porcelain`` reads, and the record is returned so the caller
@@ -463,6 +463,8 @@ def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
             return SimpleNamespace(returncode=0, stdout=ahead)
         if "status" in cmd:
             return SimpleNamespace(returncode=status_rc, stdout=status)
+        if "merge-base" in cmd:
+            return SimpleNamespace(returncode=ancestry_rc, stdout="")
         return SimpleNamespace(returncode=0, stdout="")               # fetch and anything else
 
     monkeypatch.setattr("agentflow.loop._run", _run)
@@ -520,6 +522,26 @@ def test_reply_ready_rejects_a_pushed_head_proof_that_did_not_advance_or_match(
     mismatch = _reply_read(monkeypatch, tmp_path / "mismatch", change="claimed-head",
                            head="different-head", baseline="old-head")
     assert coordinated_build._reply_ready(mismatch, None) is False
+
+
+def test_reply_ready_rejects_a_force_pushed_unrelated_revision(monkeypatch, tmp_path):
+    rec = _reply_read(monkeypatch, tmp_path, change="new-head", head="new-head",
+                      baseline="old-head", ancestry_rc=1)
+    assert coordinated_build._reply_ready(rec, None) is False
+
+
+def test_reply_ready_rejects_multiple_ambiguous_outcome_markers(monkeypatch, tmp_path):
+    from agentflow.gate import respond_change_marker, respond_reply_disclaimer
+
+    rec = _reply_read(monkeypatch, tmp_path, change="none", head="new-head",
+                      baseline="old-head")
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+        {"body": "please change it", "id": "cid"},
+        {"body": (respond_reply_disclaimer("cid") + "\n" +
+                  respond_change_marker("none") + "\n" +
+                  respond_change_marker("new-head"))},
+    ])
+    assert coordinated_build._reply_ready(rec, None) is False
 
 
 def test_settle_respond_releases_the_building_claim_and_proves_it(monkeypatch):

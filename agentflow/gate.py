@@ -86,8 +86,8 @@ def respond_reply_change(comments: list[dict], target: str) -> str:
                if _respond_reply_target(comment.get("body", "")) == str(target)]
     if len(matches) != 1:
         return ""
-    change = _RESPOND_CHANGE_RE.search(matches[0])
-    return change.group(1).strip() if change is not None else ""
+    changes = _RESPOND_CHANGE_RE.findall(matches[0])
+    return changes[0].strip() if len(changes) == 1 else ""
 
 
 def _unanswered_maintainer_comments(comments: list[dict]) -> list[tuple[str, str]]:

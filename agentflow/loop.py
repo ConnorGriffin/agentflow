@@ -208,10 +208,6 @@ Do not degrade the two charter gates while revising (ADR 0018):
 Blocking findings:
 {findings}"""
 
-# The responder's reply disclaimer — carries the PR marker (`agentflow:`) so the next
-# cycle can tell it apart from the maintainer's comment (see gate.reply_pending).
-_RESPOND_DISCLAIMER = "> *agentflow: reply from the build agent.*"
-
 RESPOND_PROMPT = """A maintainer left a comment on PR #{n} in this worktree and it is
 still unanswered. Read the full conversation first (`gh pr view {n} --json comments`),
 then answer the maintainer comment named below. This is a REPLY, not a fresh review —

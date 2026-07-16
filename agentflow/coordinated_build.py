@@ -809,6 +809,11 @@ def _reply_ready(record, obs) -> bool:
     fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
     if fetched.returncode != 0:
         return False
+    if change != "none":
+        ancestry = _run(["git", "-C", str(wt), "merge-base", "--is-ancestor",
+                         baseline, head])
+        if ancestry.returncode != 0:
+            return False
     ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
     if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
         return False
