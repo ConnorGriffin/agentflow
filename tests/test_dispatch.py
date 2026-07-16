@@ -1,477 +1,222 @@
-"""The dispatch governor and cycle — the concurrency/pacing decision surface (ADR 0023 / 0025)."""
+"""Coordinator-only dispatch: submission, pause/drain, and deletion guards (issue #109)."""
 
-import json
-import subprocess
-import threading
-import time
-from collections import Counter
+from __future__ import annotations
+
+import ast
+import inspect
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
-from agentflow import dispatch, gate, loop
-from agentflow.dispatch import BUILD_CONCURRENCY, STAGE_CAPS, TRIAGE_CONCURRENCY, Governor
+from agentflow import dispatch, loop
 from agentflow.loop import RepoConfig
 
 
-class _Tracker:
-    """Records how many sessions of each kind are in flight at once, across threads."""
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.current = Counter()
-        self.peak = Counter()
-        self.total_current = 0
-        self.total_peak = 0
-
-    def enter(self, stage):
-        with self.lock:
-            self.current[stage] += 1
-            self.total_current += 1
-            self.peak[stage] = max(self.peak[stage], self.current[stage])
-            self.total_peak = max(self.total_peak, self.total_current)
-
-    def leave(self, stage):
-        with self.lock:
-            self.current[stage] -= 1
-            self.total_current -= 1
+def test_stage_caps_remain_named_inputs_to_the_coordinator_gate():
+    assert dispatch.STAGE_CAPS == {"triage": 3, "build": 2, "mockup": 1, "respond": 1}
+    assert dispatch.MACHINE_CEILING > 0
 
 
-def test_named_config_lets_triage_outrun_builds():
-    """Grounding sessions are cheap and the intake queue should drain fast, so triage is
-    allowed more parallelism than builds — the load-bearing asymmetry in the ADR."""
-    assert TRIAGE_CONCURRENCY > BUILD_CONCURRENCY
-    assert STAGE_CAPS["triage"] == TRIAGE_CONCURRENCY
-    assert STAGE_CAPS["build"] == BUILD_CONCURRENCY
-
-
-def test_machine_ceiling_bounds_total_sessions_across_kinds():
-    """No more than the machine ceiling run at once, counting every kind together."""
-    gov = Governor(machine_ceiling=3, stage_caps={"triage": 5, "build": 5})
-    assert gov.admit("triage", "claude") is True
-    assert gov.admit("build", "codex") is True
-    assert gov.admit("triage", "claude") is True
-    assert gov.admit("build", "codex") is False   # 4th session over the ceiling of 3
-    gov.release("triage")
-    assert gov.admit("build", "codex") is True     # a freed slot reopens capacity
-
-
-def test_per_stage_cap_limits_builds_while_triage_still_flows():
-    """With both pools clear, builds are capped lower than triage: several triages run
-    concurrently while builds stay capacity-bound (the ADR's deep-queue scenario)."""
-    gov = Governor(machine_ceiling=10, stage_caps={"triage": 3, "build": 2})
-    assert [gov.admit("build", "claude") for _ in range(3)] == [True, True, False]
-    assert [gov.admit("triage", "codex") for _ in range(4)] == [True, True, True, False]
-
-
-def test_active_pool_paces_to_one_new_session_per_cycle():
-    """When the operator is active on a pool, only ACTIVE_PACE new sessions start on it per
-    cycle — while the other, idle pool keeps dispatching at full concurrency."""
-    gov = Governor(machine_ceiling=10, stage_caps={"build": 5}, pace=1)
-    assert gov.admit("build", "claude", active=True) is True
-    assert gov.admit("build", "claude", active=True) is False   # paced: one per cycle
-    assert gov.admit("build", "codex", active=False) is True    # idle pool unaffected
-    assert gov.admit("build", "codex", active=False) is True
-
-
-def test_pace_budget_refreshes_each_cycle_but_slots_do_not():
-    """A new cycle refreshes the pace budget for an active pool; live slots persist until
-    their sessions actually release (they are not per-cycle)."""
-    gov = Governor(machine_ceiling=10, stage_caps={"build": 5}, pace=1)
-    assert gov.admit("build", "claude", active=True) is True
-    assert gov.admit("build", "claude", active=True) is False
-    gov.begin_cycle()
-    assert gov.admit("build", "claude", active=True) is True    # pace budget back
-    assert gov.live == 2                                        # both prior slots still held
-
-
-def test_admission_is_thread_safe_under_a_race():
-    """Concurrent chains racing the last slot: exactly the ceiling get in, never more."""
-    gov = Governor(machine_ceiling=5, stage_caps={"build": 100})
-    admitted = []
-    barrier = threading.Barrier(20)
-
-    def race():
-        barrier.wait()
-        if gov.admit("build", "claude"):
-            admitted.append(1)
-
-    threads = [threading.Thread(target=race) for _ in range(20)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert sum(admitted) == 5
-
-
-# --- the concurrent dispatch cycle, through the public `run_cycle` interface -----------
-# These drive `run_cycle` with instrumented session bodies so the concurrency, ceiling,
-# and pacing DECISIONS are exercised end to end — not just the governor's counters.
-
-def _idle_pools(monkeypatch, active=None):
-    """Make every pool read idle (or active per `active`) without touching the gate."""
-    active = active or {}
-    monkeypatch.setattr(dispatch, "_pool_activity",
-                        lambda _log: {"claude": active.get("claude", False),
-                                      "codex": active.get("codex", False)})
-
-
-def _no_triage_no_mockup_no_respond(monkeypatch, tracker=None, build_tool=None):
-    """Stub the non-build stages to no-ops so a test can isolate build concurrency."""
-    monkeypatch.setattr(loop, "_next_intake_candidate", lambda cfg, reserved=frozenset(): None)
-    monkeypatch.setattr(loop, "produce_once", lambda cfg, _log=None, slot=None: "no mockups")
-    monkeypatch.setattr(loop, "respond_once", lambda cfg, _log=None, slot=None: "no replies")
-
-
-def _build_body(tracker, tool_for):
-    def fake_run_once(cfg, _log=None, slot=None):
-        tool = tool_for(cfg.repo)
-        if slot is not None and not slot.admit("build", tool):
-            return f"{cfg.repo}: build deferred"
-        try:
-            tracker.enter("build")
-            time.sleep(0.05)
-            return f"{cfg.repo}: built"
-        finally:
-            tracker.leave("build")
-            if slot is not None:
-                slot.release("build")
-    return fake_run_once
-
-
-def test_multiple_builds_run_concurrently_across_repos_up_to_the_build_cap(monkeypatch):
-    """With ready issues across repos and both pools clear, more than one build runs at once —
-    up to the per-stage build cap, never beyond the machine ceiling."""
-    tracker = _Tracker()
-    _idle_pools(monkeypatch)
-    _no_triage_no_mockup_no_respond(monkeypatch)
-    monkeypatch.setattr(loop, "run_once", _build_body(tracker, lambda repo: "claude"))
-
-    repos = [RepoConfig(f"o/r{i}", f"/tmp/{i}") for i in range(5)]
-    gov = Governor(machine_ceiling=4, stage_caps={"build": 2, "triage": 3,
-                                                  "mockup": 1, "respond": 1})
-    dispatch.run_cycle(repos, gov, _log=lambda _m: None)
-
-    assert tracker.peak["build"] == 2        # more than one build concurrent, capped at 2
-    assert tracker.total_peak <= 4           # never over the machine ceiling
-
-
-def test_several_triages_run_concurrently_when_the_queue_is_deep(monkeypatch):
-    """A deep intake queue on one repo drains fast: several grounding sessions run at once,
-    up to the triage cap (higher than builds), and the fan-out never re-picks a claimed issue."""
-    tracker = _Tracker()
-    _idle_pools(monkeypatch)
-    monkeypatch.setattr(loop, "produce_once", lambda cfg, _log=None, slot=None: "no mockups")
-    monkeypatch.setattr(loop, "respond_once", lambda cfg, _log=None, slot=None: "no replies")
-    monkeypatch.setattr(loop, "run_once", lambda cfg, _log=None, slot=None: "no builds")
-
-    queue = list(range(1, 8))   # 7 issues waiting
-    reserved_seen = []
-
-    def next_candidate(cfg, reserved=frozenset()):
-        reserved_seen.append(set(reserved))
-        remaining = [n for n in queue if n not in reserved]
-        return ({"number": remaining[0], "labels": [], "title": "t"}, "") if remaining else None
-
-    monkeypatch.setattr(loop, "_next_intake_candidate", next_candidate)
-    monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
-
-    class _Builder:
-        tool = "claude"
-    monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (_Builder(), None, ""))
-
-    def fake_session(cfg, issue, extra, builder):
-        tracker.enter("triage")
-        time.sleep(0.05)
-        tracker.leave("triage")
-        return f"#{issue['number']}: triaged"
-    monkeypatch.setattr(loop, "_run_intake_session", fake_session)
-
-    gov = Governor(machine_ceiling=10, stage_caps={"triage": 3, "build": 2,
-                                                   "mockup": 1, "respond": 1})
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], gov, _log=lambda _m: None)
-
-    assert tracker.peak["triage"] == 3            # several triages concurrent, capped at 3
-    assert tracker.current["triage"] == 0         # all released
-    # The fan-out selected exactly the cap-many distinct issues, reserving as it went.
-    assert any(len(r) == 3 for r in reserved_seen)
-
-
-def test_active_pool_paces_while_the_idle_pool_runs_free(monkeypatch):
-    """Operator active on claude: at most one new claude session starts this cycle, while the
-    idle codex pool keeps dispatching. The active pool yields — it does not hard-stop."""
-    tracker = _Tracker()
-    _idle_pools(monkeypatch, active={"claude": True})
-    _no_triage_no_mockup_no_respond(monkeypatch)
-    # Even repos build on claude (active/paced), odd on codex (idle/free).
-    tool_for = lambda repo: "claude" if int(repo[-1]) % 2 == 0 else "codex"
-    started = Counter()
-
-    def fake_run_once(cfg, _log=None, slot=None):
-        tool = tool_for(cfg.repo)
-        if slot is not None and not slot.admit("build", tool):
-            return "deferred"
-        try:
-            started[tool] += 1
-            time.sleep(0.02)
-            return "built"
-        finally:
-            slot.release("build")
-    monkeypatch.setattr(loop, "run_once", fake_run_once)
-
-    repos = [RepoConfig(f"o/r{i}", f"/tmp/{i}") for i in range(6)]
-    gov = Governor(machine_ceiling=10, stage_caps={"build": 5, "triage": 3,
-                                                   "mockup": 1, "respond": 1}, pace=1)
-    dispatch.run_cycle(repos, gov, _log=lambda _m: None)
-
-    assert started["claude"] == 1     # active pool paced to one new session per cycle
-    assert started["codex"] >= 2      # idle pool unaffected
-
-
-def test_yield_decision_is_logged_before_the_dashboard_shows_it(monkeypatch):
-    """The operator-yield is observable in the daemon log (ADR 0025) — driven off the real
-    activity read, not a stubbed one, so the log line reflects the actual pool fact."""
-    from agentflow.balancer import PoolStatus
-    logs = []
-    monkeypatch.setattr(dispatch.balancer, "_query_pool",
-                        lambda tool: PoolStatus(tool, True, 20.0, active=(tool == "claude"),
-                                                ceiling=50.0 if tool == "claude" else 85.0))
-    _no_triage_no_mockup_no_respond(monkeypatch)
-    monkeypatch.setattr(loop, "run_once", lambda cfg, _log=None, slot=None: "no builds")
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), _log=logs.append)
-    assert any("claude yielding to operator" in m and "ceiling 50%" in m for m in logs)
-
-
-def test_coordinated_phase_submits_to_the_coordinator_and_skips_the_legacy_build(monkeypatch):
-    """In coordinated phase Build goes to the session coordinator, never the legacy launcher —
-    so one cycle can never launch both legacy and coordinator-owned Build work (issue #103).
-    Afterward the live board is republished as a projection of the running records."""
-    from agentflow.coordinator import COORDINATED, Phase
-    _idle_pools(monkeypatch)
-    _no_triage_no_mockup_no_respond(monkeypatch)
-    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
-        "legacy Mockup orchestration must not run in coordinated mode"))
-    monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
-        "Respond must stay queued while Build is coordinated"))
-    monkeypatch.setattr(loop, "run_once", lambda *a, **k: pytest.fail(
-        "legacy build must not launch while Build is coordinated"))
-    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
-                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
-    issue = {"number": 7, "title": "add a thing",
-             "labels": [{"name": "agentflow:complexity:deep"}]}
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
-    builder = type("B", (), {"tool": "claude"})()
-    monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (builder, None, ""))
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
-    submitted, projected = [], []
-    coord = type("C", (), {"submit_stage": lambda self, sub: submitted.append(sub)})()
+def test_paused_cycle_submits_nothing_but_still_reconciles(monkeypatch):
+    monkeypatch.setattr(dispatch, "_submit_repo", lambda *a: pytest.fail(
+        "pause may not submit cold work"))
+    reconciled = []
     monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project",
-                        lambda coordinator, phase, _log=None: projected.append(coordinator) or [])
+                        lambda coord, _log=None: reconciled.append(coord))
+    claims = []
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_orphaned_claims",
+                        lambda cfg, _log=None: claims.append(cfg.repo))
+    coord = object()
 
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
-                       _log=lambda _m: None)
+    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], submit_new=False,
+                       coordinator=coord, _log=lambda _line: None)
 
-    assert len(submitted) == 1
-    assert submitted[0].stage == "build" and submitted[0].subject == "7"
-    assert projected  # running records were projected back onto the live board
+    assert reconciled == [coord]
+    assert claims == ["o/r"]
 
 
-def test_coordinated_phase_claims_and_submits_intake_before_build(monkeypatch):
-    from agentflow.coordinator import COORDINATED, Phase
-    _idle_pools(monkeypatch)
-    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
-                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
-    intake = {"number": 3, "title": "vague", "body": "help", "labels": []}
-    monkeypatch.setattr(loop, "_next_intake_candidate",
-                        lambda cfg, reserved: None if reserved else (intake, ""))
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
-    builder = type("B", (), {"tool": "claude"})()
-    monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (builder, None, ""))
-    events = []
-    monkeypatch.setattr(loop, "_claim_triage",
-                        lambda repo, number: events.append(("claim", repo, number)) or True)
-    monkeypatch.setattr(loop, "_run", lambda cmd: subprocess.CompletedProcess(
-        cmd, 0, "source-sha\n", ""))
+def test_active_cycle_submits_each_repo_then_reconciles_once(monkeypatch):
     submitted = []
-    coord = type("C", (), {"submit_stage": lambda self, sub: (
-        submitted.append(sub), events.append(("submit", sub.subject)))})()
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
+    monkeypatch.setattr(dispatch, "_submit_repo",
+                        lambda cfg, coord, log: submitted.append((cfg.repo, coord)))
+    reconciled = []
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project",
+                        lambda coord, _log=None: reconciled.append(coord))
+    claims = []
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_orphaned_claims",
+                        lambda cfg, _log=None: claims.append(cfg.repo))
+    coord = object()
 
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
-                       _log=lambda _m: None)
+    dispatch.run_cycle([RepoConfig("o/a", "/a"), RepoConfig("o/b", "/b")],
+                       coordinator=coord, _log=lambda _line: None)
 
-    assert events == [("submit", "3"), ("claim", "o/r", 3)]
-    assert len(submitted) == 1 and submitted[0].stage == "intake"
+    assert sorted(submitted) == [("o/a", coord), ("o/b", coord)]
+    assert reconciled == [coord]
+    assert sorted(claims) == ["o/a", "o/b"]
 
 
-def test_coordinated_run_cycle_discovers_claims_and_submits_one_respond(monkeypatch):
-    """The public dispatch interface turns one pending comment into its durable Respond."""
-    from agentflow.coordinator import COORDINATED, Phase
-    _idle_pools(monkeypatch)
-    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
-                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
-    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
-    monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
-        "legacy Respond must not launch in coordinated mode"))
+def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch):
+    from agentflow import coordinated_build
 
-    def github(argv):
-        if argv[:3] == ["gh", "pr", "list"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps([
-                {"number": 42,
-                 "headRefName": "agentflow/claude/issue-7-fix-thing",
-                 "headRefOid": "head-42"}]), "")
-        if argv[:3] == ["gh", "pr", "view"]:
-            return subprocess.CompletedProcess(argv, 0, json.dumps({"comments": [
-                {"body": "> *agentflow: parked for human review.*"},
-                {"body": "please tweak it", "id": "IC_42"},
-            ]}), "")
-        return subprocess.CompletedProcess(argv, 1, "", "unexpected")
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    calls = []
 
-    monkeypatch.setattr(loop, "_run", github)
+    def run(argv):
+        calls.append(argv)
+        if argv[1:3] == ["issue", "list"]:
+            label = argv[argv.index("--label") + 1]
+            payload = ('[{"number":7,"updatedAt":"2020-01-01T00:00:00Z"}]'
+                       if label == "agentflow:building" else "[]")
+            return SimpleNamespace(returncode=0, stdout=payload)
+        if argv[1:3] == ["issue", "view"]:
+            return SimpleNamespace(returncode=0, stdout='{"labels":[]}')
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(loop, "_run", run)
+
+    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
+    assert any(argv[1:3] == ["issue", "edit"] for argv in calls)
+
+
+def test_unreadable_coordinator_state_clears_no_claim(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.store import StoreUnavailable
+
+    monkeypatch.setattr(coordinated_build.tracer, "load_records",
+                        lambda: (_ for _ in ()).throw(StoreUnavailable("locked")))
+    monkeypatch.setattr(loop, "_run", lambda argv: pytest.fail("must not inspect or clear claims"))
+
+    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
+
+
+def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import HELD, WAITING, Record
+
+    waiting = Record(identity="wait", stage="build", pool="claude", demand=5,
+                     repo="o/r", subject="7", state=WAITING, claim=True)
+    held = Record(identity="held", stage="review", pool="codex", demand=2,
+                  repo="o/r", subject="8", state=HELD, claim=False)
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [waiting, held])
+    edited = []
+
+    def run(argv):
+        if argv[1:3] == ["issue", "list"]:
+            label = argv[argv.index("--label") + 1]
+            payload = ('[{"number":7,"updatedAt":"2020-01-01T00:00:00Z"},'
+                       '{"number":8,"updatedAt":"2020-01-01T00:00:00Z"}]'
+                       if label == "agentflow:building" else "[]")
+            return SimpleNamespace(returncode=0, stdout=payload)
+        if argv[1:3] == ["issue", "edit"]:
+            edited.append(int(argv[3]))
+            return SimpleNamespace(returncode=0, stdout="")
+        if argv[1:3] == ["issue", "view"]:
+            return SimpleNamespace(returncode=0, stdout='{"labels":[]}')
+        raise AssertionError(argv)
+
+    monkeypatch.setattr(loop, "_run", run)
+
+    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
+    assert edited == [8]
+
+
+def test_build_submission_claims_then_enters_the_coordinator(monkeypatch):
+    issue = {"number": 7, "title": "Do it", "body": "brief",
+             "labels": [{"name": "ready-for-agent"},
+                        {"name": "agentflow:complexity:deep"},
+                        {"name": "agentflow:effort:high"}]}
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
+    builder = SimpleNamespace(tool="claude")
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (builder, None, ""))
     events = []
-    monkeypatch.setattr(loop, "_claim",
-                        lambda repo, number: events.append(("claim", number)) or True)
-    coord = type("C", (), {"submit_stage": lambda self, sub: events.append(("submit", sub))})()
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: events.append("claim") or True)
+    coord = SimpleNamespace(submit_stage=lambda submission: events.append(submission.stage))
 
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
-                       _log=lambda _m: None)
-
-    assert events[0] == ("claim", 7)
-    submitted = events[1][1]
-    assert submitted.stage == "respond" and submitted.target == "IC_42"
-    assert submitted.pool == "claude" and "please tweak it" in submitted.input_ptr
-    assert "agentflow-respond-baseline:head-42" in submitted.input_ptr
+    assert "submitted" in dispatch._submit_coordinated_build(
+        RepoConfig("o/r", "/tmp"), coord, None)
+    assert events == ["claim", "build"]
 
 
-def test_coordinated_run_cycle_defers_next_comment_until_prior_respond_settles(monkeypatch):
-    """One issue-level building claim cannot be released underneath a later Respond."""
-    from agentflow.coordinator import COORDINATED, Phase
-    _idle_pools(monkeypatch)
-    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
-                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
-    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
+def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
-        42, "agentflow/claude/issue-7-fix-thing", "second question", "IC_2", "head-42"))
+        42, "agentflow/claude/issue-7-fix", "please adjust", "cid-1", "base"))
     monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
                         lambda cfg, lane=None: {7})
-    claims, submitted = [], []
-    monkeypatch.setattr(loop, "_claim", lambda *a: claims.append(a) or True)
-    coord = type("C", (), {"submit_stage": lambda self, sub: submitted.append(sub)})()
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
+    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("must not double-claim"))
 
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
-                       _log=lambda _m: None)
-    assert claims == [] and submitted == []
+    result = dispatch._submit_coordinated_respond(
+        RepoConfig("o/r", "/tmp"), SimpleNamespace(), None)
+    assert "prior change stage" in result
 
 
-def test_coordinated_run_cycle_submits_and_claims_one_mockup_round(monkeypatch):
-    from agentflow.coordinator import COORDINATED, Phase
-    _idle_pools(monkeypatch)
-    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
-                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
-    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
-    monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: None)
-    issue = {"number": 11, "title": "A screen", "body": "Draw variants",
-             "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
-    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
-        "legacy Mockup must not launch in coordinated mode"))
-    builder = type("B", (), {"tool": "claude"})()
-    monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (builder, None, ""))
-    events = []
-    monkeypatch.setattr(loop, "_claim_mockup",
-                        lambda repo, number: events.append(("claim", number)) or True)
-    coord = type("C", (), {"submit_stage": lambda self, sub: events.append(("submit", sub))})()
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
+def test_live_board_is_overwritten_from_the_durable_projection(tmp_path, monkeypatch):
+    from agentflow import live
 
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
-                       _log=lambda _m: None)
-
-    assert events[0][0] == "submit" and events[0][1].stage == "mockup"
-    assert events[0][1].pool == "claude" and events[0][1].subject == "11"
-    assert events[1] == ("claim", 11)
+    monkeypatch.setattr(live, "LIVE_FILE", tmp_path / "live.json")
+    live.replace_projection([{"number": 9, "stage": "building"}])
+    live.replace_projection([{"number": 10, "stage": "reviewing"}])
+    assert live.running() == [{"number": 10, "stage": "reviewing"}]
 
 
-def test_draining_phase_launches_no_new_provider_stage(monkeypatch):
-    """A drain stops every new legacy provider stage and makes no coordinated submission, while
-    the coordinator keeps reconciling whatever it already owns (issue #103)."""
-    from agentflow.coordinator import DRAINING, Phase
-    _idle_pools(monkeypatch)
-    _no_triage_no_mockup_no_respond(monkeypatch)
-    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: pytest.fail(
-        "no new Intake during a drain"))
-    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
-        "no new Mockup during a drain"))
-    monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
-        "no new Respond during a drain"))
-    monkeypatch.setattr(loop, "run_once", lambda *a, **k: pytest.fail(
-        "no new legacy build during a drain"))
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: pytest.fail(
-        "no new coordinated submission during a drain"))
-    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
-                        lambda rollout, repos, sessions, **k: Phase(DRAINING))
-    reconciled = []
-    coord = object()
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project",
-                        lambda coordinator, phase, _log=None: reconciled.append(coordinator) or [])
-
-    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
-                       _log=lambda _m: None)
-
-    assert reconciled == [coord]  # existing records still reconcile; nothing new launches
+def test_production_dispatch_has_no_legacy_bypass_or_second_counter():
+    source = inspect.getsource(dispatch)
+    assert "class Governor" not in source
+    assert "launch_legacy" not in source
+    assert "produce_once" not in source
+    assert "respond_once" not in source
+    assert "run_once" not in source
+    assert "_live =" not in source and "_per_stage" not in source
 
 
-def test_unreadable_rollout_evidence_fails_closed_into_a_named_drain(monkeypatch):
-    monkeypatch.setattr(dispatch.live, "running_strict",
-                        lambda: (_ for _ in ()).throw(ValueError("partial live board")))
-    logs = []
+def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orchestration():
+    root = Path(__file__).parents[1] / "agentflow"
+    assert not (root / "coordinator" / "rollout.py").exists()
+    production = "\n".join(path.read_text() for path in root.rglob("*.py"))
+    assert ".launch(" not in production
+    assert ".build(" not in production
+    assert "MODE_LEGACY" not in production
+    assert "class Governor" not in production
+    assert "running_strict" not in production
 
-    phase = dispatch._resolve_phase(None, [RepoConfig("o/r", "/tmp")], logs.append)
-
-    assert phase.name == "draining" and not phase.launch_legacy
-    assert "partial live board" in phase.blocked_by[0]
-    assert any("draining" in line for line in logs)
-
-
-def test_coordinated_submission_requires_the_visible_build_claim(monkeypatch):
-    issue = {"number": 7, "title": "add a thing",
-             "labels": [{"name": "agentflow:complexity:deep"}]}
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
-    monkeypatch.setattr(dispatch, "pick_pair",
-                        lambda *a, **k: (type("B", (), {"tool": "claude"})(), None, ""))
-    monkeypatch.setattr(dispatch.coordinated_build, "build_submission", lambda *a: object())
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: False)
-    submitted = []
-    coord = type("C", (), {"submit_stage": lambda self, value: submitted.append(value)})()
-
-    result = dispatch._submit_coordinated_build(RepoConfig("o/r", "/tmp"), coord, None)
-
-    assert "could not claim" in result
-    assert submitted == []
-
-
-def test_merges_never_overlap_under_concurrent_builds(monkeypatch):
-    """Concurrent build chains landing at once must not overlap: the merge lock serializes the
-    squash-merge across all of them (ADR 0009 collision floor)."""
-    overlap = _Tracker()
-
-    def fake_run(cmd, cwd=None, timeout=None):
-        import subprocess
-        if cmd[:3] == ["gh", "pr", "view"]:
-            overlap.enter("merge")
-            time.sleep(0.03)
-            overlap.leave("merge")
-            return subprocess.CompletedProcess(cmd, 0, '{"isDraft": false}', "")
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(gate, "_run", fake_run)
-
-    threads = [threading.Thread(target=gate.squash_merge, args=("o/r", pr)) for pr in range(6)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    assert overlap.total_peak == 1   # exactly one merge in flight at any instant
+    allowed_spawners = {root / "coordinator" / "launcher.py",
+                        root / "coordinator" / "_launch_child.py"}
+    allowed_subprocess_run = {root / "balancer.py", root / "notify.py", root / "runner.py"}
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                if (isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                        and node.func.attr == "Popen"):
+                    assert path in allowed_spawners, f"provider-capable spawn outside launcher: {path}"
+                if (isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                        and node.func.attr == "run"):
+                    assert path in allowed_subprocess_run, f"subprocess.run outside adapters: {path}"
+                if (isinstance(node.func.value, ast.Name) and node.func.value.id == "os"
+                        and (node.func.attr.startswith("exec") or node.func.attr.startswith("spawn")
+                             or node.func.attr == "fork")):
+                    assert path in allowed_spawners, f"process start outside launcher: {path}"
+            if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.List):
+                first = node.args[0].elts[0] if node.args[0].elts else None
+                if isinstance(first, ast.Constant) and first.value in {"claude", "codex"}:
+                    assert path == root / "runner.py", f"direct provider command execution: {path}"
+            if isinstance(node, ast.Call):
+                counter_name = None
+                if isinstance(node.func, ast.Name):
+                    counter_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    counter_name = node.func.attr
+                if counter_name in {"Semaphore", "BoundedSemaphore"}:
+                    raise AssertionError(f"second capacity ledger primitive: {path}:{node.lineno}")
+                if counter_name == "Counter":
+                    assert path in {root / "coordinated_build.py", root / "dashboard_data.py"}, (
+                        f"counter outside pacing/projection owners: {path}:{node.lineno}")
+            if "coordinator" not in path.parts and isinstance(
+                    node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = [item.id for target in targets for item in ast.walk(target)
+                         if isinstance(item, ast.Name)]
+                assert not any("permit" in name.lower() for name in names), (
+                    f"second permit ledger outside coordinator: {path}:{node.lineno}")

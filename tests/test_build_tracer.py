@@ -208,7 +208,7 @@ def test_repeated_submission_and_restart_make_one_record(make_coord):
 def test_only_build_admits_other_stages_stay_waiting(make_coord):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_adapter(fake, pr=[False], prep=[True]),
-                       gate=tracer.build_only_gate)
+                       gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(_build())
     review = coord.submit_stage(Submission(repo="o/r", subject="7", stage="review",
                                            pool="claude"))
@@ -225,7 +225,7 @@ def test_only_build_admits_other_stages_stay_waiting(make_coord):
 def test_running_build_projects_to_live_board_waiting_does_not(make_coord):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_adapter(fake, pr=[False], prep=[True]),
-                       gate=tracer.build_only_gate)
+                       gate=tracer.build_review_revise_gate)
     coord.submit_stage(_build("7"))
     coord.submit_stage(Submission(repo="o/r", subject="8", stage="review", pool="claude"))
     coord.cycle("claude", now=123)
@@ -237,22 +237,19 @@ def test_running_build_projects_to_live_board_waiting_does_not(make_coord):
     assert projection[0]["started_at"].startswith("1970-01-01T00:02:03")
 
 
-def test_owned_issues_and_active_track_coordinator_ownership(make_coord):
+def test_owned_issues_track_coordinator_ownership(make_coord):
     fake = FakeSession()
     pr, prep = [False], [True]
     coord = make_coord(fake, adapter=_adapter(fake, pr=pr, prep=prep))
     ident = coord.submit_stage(_build("7"))
     coord.cycle("claude")
-    # A running build owns its claim and is in flight.
+    # A running build owns its claim.
     assert tracer.owned_issues(_records(coord), "o/r") == {7}
-    assert tracer.coordinator_active(_records(coord)) is True
     assert tracer.owned_issues(_records(coord), "other/repo") == set()
-    # Complete it: the PR is a durable boundary, so it no longer holds a rollback drain open,
-    # but it still owns its claim until a next stage transfers it.
+    # A completed Build still owns its claim until Review atomically assumes it.
     pr[0] = True
     fake.end(ident, cause=ProviderCause.PROCESS)
     coord.cycle("claude")
-    assert tracer.coordinator_active(_records(coord)) is False
     assert tracer.owned_issues(_records(coord), "o/r") == {7}
 
 
@@ -312,8 +309,8 @@ def test_exhaustion_log_shape(make_coord):
         if coord.cycle("claude"):
             break
         fake.end(ident, cause=ProviderCause.PROCESS)
-    assert ("o/r: 7: build: attempt 3/3 interrupted (process) — continuation budget "
-            "exhausted; held for human; claim released") in lines
+    assert ("o/r: 7: build: attempt 3/3 held for human — durable handoff proved; "
+            "claim released") in lines
 
 
 def test_recovered_running_log_shape_after_restart(make_coord):
@@ -343,96 +340,6 @@ def test_claim_transfer_log_shape(make_coord):
     coord.submit_stage(Submission(repo="o/r", subject="7", stage="review", pool="claude",
                                   transfer_from=build))
     assert "o/r: 7: build: attempt 1/3 completed — pr opened; claim transferred to review" in lines
-
-
-def test_forward_activation_names_live_claim_pid_and_dirty_worktree(tmp_path, monkeypatch):
-    from agentflow import loop, runner
-
-    cfg = RepoConfig("o/r", str(tmp_path))
-    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-7-legacy"
-    wt.mkdir(parents=True)
-    marker = tmp_path / "active-pid"
-    marker.write_text("123")
-    monkeypatch.setattr(runner, "_registered_worktrees",
-                        lambda workdir: [(str(wt), "agentflow/claude/issue-7-legacy")])
-    monkeypatch.setattr(runner, "_active_marker", lambda path: marker)
-
-    def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "api", "--paginate"]:
-            return subprocess.CompletedProcess(cmd, 0, '[[], [{"number": 7}]]', "")
-        if cmd[:3] == ["git", "-C", str(wt)]:
-            return subprocess.CompletedProcess(cmd, 0, " M progress.py\n", "")
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(loop, "_run", fake_run)
-    evidence = coordinated_build.activation_evidence(
-        [cfg], [{"repo": "o/r", "number": 7, "stage": "building",
-                 "worktree": str(wt)}], [])
-
-    assert any("legacy session live" in item for item in evidence)
-    assert any("legacy building claim" in item for item in evidence)
-    assert any("PID marker" in item for item in evidence)
-    assert any("is dirty" in item for item in evidence)
-
-
-def test_forward_activation_excludes_coordinator_owned_claim_and_worktree(tmp_path, monkeypatch):
-    from agentflow import loop, runner
-
-    cfg = RepoConfig("o/r", str(tmp_path))
-    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-7-owned"
-    wt.mkdir(parents=True)
-    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-                    repo="o/r", subject="7", source=str(wt), claim=True)
-    monkeypatch.setattr(runner, "_registered_worktrees",
-                        lambda workdir: [(str(wt), "agentflow/claude/issue-7-owned")])
-    monkeypatch.setattr(runner, "_active_marker", lambda path: None)
-
-    include_triaging = [False]
-
-    def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "api", "--paginate"]:
-            is_building = "labels=agentflow:building" in cmd
-            payload = '[[{"number": 7}]]' if is_building or include_triaging[0] else "[[]]"
-            return subprocess.CompletedProcess(cmd, 0, payload, "")
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(loop, "_run", fake_run)
-    evidence = coordinated_build.activation_evidence(
-        [cfg], [{"repo": "o/r", "number": 7, "stage": "building",
-                 "worktree": str(wt)}], [record])
-
-    assert evidence == ()
-
-    include_triaging[0] = True
-    evidence = coordinated_build.activation_evidence(
-        [cfg], [{"repo": "o/r", "number": 7, "stage": "building",
-                 "worktree": str(wt)}], [record])
-    assert "o/r#7 legacy triaging claim" in evidence
-
-
-def test_forward_activation_names_legacy_intake_claim_and_worktree(tmp_path, monkeypatch):
-    from agentflow import loop, runner
-
-    cfg = RepoConfig("o/r", str(tmp_path))
-    wt = tmp_path / ".agentflow" / "worktrees" / "codex-intake" / "issue-8"
-    wt.mkdir(parents=True)
-    monkeypatch.setattr(runner, "_registered_worktrees",
-                        lambda workdir: [(str(wt), None)])
-    monkeypatch.setattr(runner, "_active_marker", lambda path: None)
-
-    def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "api", "--paginate"]:
-            body = '[[{"number": 8}]]' if "labels=agentflow:triaging" in cmd else "[[]]"
-            return subprocess.CompletedProcess(cmd, 0, body, "")
-        if cmd[:3] == ["git", "-C", str(wt)]:
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(loop, "_run", fake_run)
-    evidence = coordinated_build.activation_evidence([cfg], [], [])
-
-    assert "o/r#8 legacy triaging claim" in evidence
-    assert any(str(wt) in item and "ambiguous" in item for item in evidence)
 
 
 def test_live_build_preparation_verifies_branch_and_provisions_before_admission(

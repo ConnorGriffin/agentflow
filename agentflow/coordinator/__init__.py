@@ -9,8 +9,7 @@ admission matrix and its gates, attempt numbers, the launcher handshake, the con
 record, and provider observations — is a private implementation detail.
 
 All six logical stages are live behind this seam (issues #103–#108): the durable
-:class:`Rollout` switch and the :mod:`~agentflow.coordinator.tracer` bridge move them there after
-a legacy drain, while unknown future stages stay queued and dormant.
+Unknown future stages stay queued and dormant.
 """
 
 from agentflow.coordinator.build_stage import BuildStageAdapter
@@ -20,13 +19,10 @@ from agentflow.coordinator.coordinator import Coordinator, StageOutcome, Submiss
 from agentflow.coordinator.respond_stage import RespondStageAdapter
 from agentflow.coordinator.review_stage import ReviewStageAdapter
 from agentflow.coordinator.revise_stage import ReviseStageAdapter
-from agentflow.coordinator.rollout import (COORDINATED, DRAINING, LEGACY,
-                                           MODE_COORDINATED, MODE_LEGACY, Phase, Rollout)
 from agentflow.coordinator.stage_router import StageRouter
 
 __all__ = [
     "Coordinator", "StageOutcome", "Submission", "BuildStageAdapter", "IntakeStageAdapter",
     "MockupStageAdapter", "ReviewStageAdapter",
-    "ReviseStageAdapter", "RespondStageAdapter", "StageRouter", "Rollout", "Phase",
-    "LEGACY", "DRAINING", "COORDINATED", "MODE_LEGACY", "MODE_COORDINATED",
+    "ReviseStageAdapter", "RespondStageAdapter", "StageRouter",
 ]

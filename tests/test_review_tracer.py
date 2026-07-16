@@ -226,7 +226,7 @@ def test_completed_build_opens_review_and_transfers_the_claim_before_retiring(ma
     fake = FakeSession()
     pr, verdict, prep = [True], [False], [True]
     coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, prep=prep),
-                       gate=tracer.build_and_review_gate)
+                       gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
                                           complexity="deep", effort="high", source="/wt/issue-7"))
     coord.cycle("claude")
@@ -250,7 +250,7 @@ def test_daemon_death_between_stages_keeps_ownership_and_transfers_once(make_coo
     fake = FakeSession()
     pr, verdict, prep = [True], [False], [True]
     adapter = _router(fake, pr=pr, verdict=verdict, prep=prep)
-    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
                                           complexity="deep", effort="high", source="/wt/issue-7"))
     coord.cycle("claude")
@@ -258,7 +258,7 @@ def test_daemon_death_between_stages_keeps_ownership_and_transfers_once(make_coo
     coord.cycle("claude")                              # build completes, claim retained
 
     # Death before the transfer: a fresh coordinator still sees the Build owning its claim.
-    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     assert record_of(restarted, build).claim is True and record_of(restarted, build).retired is False
     review = restarted.submit_stage(_review("7", pool="codex", builder_lineage="claude",
                                             target="head-sha", transfer_from=build))
@@ -268,7 +268,7 @@ def test_daemon_death_between_stages_keeps_ownership_and_transfers_once(make_coo
     restarted.cycle("codex")
     verdict[0] = True
     fake.end(review, cause=ProviderCause.PROCESS)
-    again = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    again = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     assert [o.status for o in again.cycle("codex")] == ["completed"]   # finalized exactly once
     assert record_of(again, review).claim is True                     # kept until the next stage
     assert record_of(again, review).attempts == 1                     # attempt not double-counted
@@ -278,7 +278,7 @@ def test_daemon_death_between_stages_keeps_ownership_and_transfers_once(make_coo
 def test_death_before_successor_commit_keeps_completed_predecessor_ownership(make_coord):
     fake = FakeSession()
     adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
-    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
                                           pool="claude", complexity="deep", effort="high",
                                           source="/wt/issue-7"))
@@ -286,14 +286,14 @@ def test_death_before_successor_commit_keeps_completed_predecessor_ownership(mak
     fake.end(build, cause=ProviderCause.PROCESS)
     coord.cycle("claude")
 
-    crashed = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    crashed = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     crashed._store._conn = _CommitFault(crashed._store._conn, "before")
     with pytest.raises(RuntimeError, match="before successor commit"):
         crashed.submit_stage(_review("7", pool="codex", builder_lineage="claude",
                                      target="head-sha", transfer_from=build))
     crashed._store.close()
 
-    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     records = {r.identity: r for r in _records(restarted)}
     assert set(records) == {build}
     assert records[build].state == "completed"
@@ -303,7 +303,7 @@ def test_death_before_successor_commit_keeps_completed_predecessor_ownership(mak
 def test_death_after_successor_commit_leaves_one_owner_and_retry_is_idempotent(make_coord):
     fake = FakeSession()
     adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
-    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
                                           pool="claude", complexity="deep", effort="high",
                                           source="/wt/issue-7"))
@@ -313,13 +313,13 @@ def test_death_after_successor_commit_leaves_one_owner_and_retry_is_idempotent(m
     review_submission = _review("7", pool="codex", builder_lineage="claude",
                                 target="head-sha", transfer_from=build)
 
-    crashed = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    crashed = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     crashed._store._conn = _CommitFault(crashed._store._conn, "after")
     with pytest.raises(RuntimeError, match="after successor commit"):
         crashed.submit_stage(review_submission)
     crashed._store.close()
 
-    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     records = {r.identity: r for r in _records(restarted)}
     review = "o/r|7|review|head-sha"
     assert set(records) == {build, review}
@@ -333,7 +333,7 @@ def test_death_after_successor_commit_leaves_one_owner_and_retry_is_idempotent(m
 def test_successor_transfer_is_the_same_transition_for_review_to_revise(make_coord):
     fake = FakeSession()
     adapter = _router(fake, pr=[False], verdict=[True], prep=[True])
-    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     review = coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
                                         target="head-sha"))
     coord.cycle("codex")
@@ -351,7 +351,7 @@ def test_successor_transfer_is_the_same_transition_for_review_to_revise(make_coo
 def test_existing_successor_assumes_claim_durably_without_duplication(make_coord):
     fake = FakeSession()
     adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
-    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
                                           pool="claude", complexity="deep", effort="high",
                                           source="/wt/issue-7"))
@@ -365,7 +365,7 @@ def test_existing_successor_assumes_claim_durably_without_duplication(make_coord
 
     coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
                                target="head-sha", transfer_from=build))
-    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     records = {r.identity: r for r in _records(restarted)}
     assert set(records) == {build, review}
     assert records[build].retired is True and records[build].claim is False
@@ -375,7 +375,7 @@ def test_existing_successor_assumes_claim_durably_without_duplication(make_coord
 def test_store_failure_during_submission_preserves_predecessor_ownership(make_coord):
     fake = FakeSession()
     adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
-    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
                                           pool="claude", complexity="deep", effort="high",
                                           source="/wt/issue-7"))
@@ -388,7 +388,7 @@ def test_store_failure_during_submission_preserves_predecessor_ownership(make_co
         coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
                                    target="head-sha", transfer_from=build))
 
-    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     records = {r.identity: r for r in _records(restarted)}
     assert set(records) == {build}
     assert records[build].claim is True and records[build].retired is False
@@ -400,17 +400,18 @@ def test_production_reconciliation_recovers_completed_build_handoff_after_restar
     fake = FakeSession()
     pr, verdict, prep = [True], [False], [True]
     adapter = _router(fake, pr=pr, verdict=verdict, prep=prep)
-    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     build = coord.submit_stage(Submission(
         repo="o/r", subject="7", stage="build", pool="claude", complexity="deep",
-        effort="high", source="/work/.agentflow/worktrees/claude/issue-7-recover-handoff"))
+        effort="high", source="/work/.agentflow/worktrees/claude/issue-7-recover-handoff",
+        input_ptr="Issue acceptance"))
     coord.cycle("claude")
     fake.end(build, cause=ProviderCause.PROCESS)
     coord.cycle("claude")
 
     # The process dies before production consumes that cycle's outcome. A fresh coordinator
     # must rediscover the durable Build instead of relying on an in-memory outcome.
-    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
     calls = []
 
     def gh(cmd):
@@ -421,14 +422,12 @@ def test_production_reconciliation_recovers_completed_build_handoff_after_restar
 
     monkeypatch.setattr("agentflow.loop._run", gh)
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
-    phase = SimpleNamespace(name="coordinated")
-
     # An unreadable PR fails closed: Build still owns the change and a later pass retries.
-    coordinated_build.reconcile_and_project(restarted, phase)
+    coordinated_build.reconcile_and_project(restarted)
     assert record_of(restarted, build).claim is True
     assert record_of(restarted, build).retired is False
 
-    coordinated_build.reconcile_and_project(restarted, phase)
+    coordinated_build.reconcile_and_project(restarted)
     review = "o/r|7|review|head-a"
     assert record_of(restarted, build).retired is True
     assert record_of(restarted, build).claim is False
@@ -436,9 +435,9 @@ def test_production_reconciliation_recovers_completed_build_handoff_after_restar
     assert record_of(restarted, review).claim is True
 
     # Repeated reconciliation/restart neither creates another record nor another provider.
-    coordinated_build.reconcile_and_project(restarted, phase)
-    restarted_again = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
-    coordinated_build.reconcile_and_project(restarted_again, phase)
+    coordinated_build.reconcile_and_project(restarted)
+    restarted_again = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    coordinated_build.reconcile_and_project(restarted_again)
     assert list(fake.family_of).count(review) == 1
     assert len([r for r in _records(restarted_again) if r.stage == "review"]) == 1
     assert len(calls) == 2
@@ -570,14 +569,14 @@ def test_production_park_resolves_the_pr_from_the_review_worktree_and_parks_once
     assert parked == [("o/r", 42)] and len(notified) == 1
 
 
-# --- build and review are the only enabled stages ----------------------------------------
+# --- all production stages share the one gate --------------------------------------------
 
-def test_only_build_and_review_admit_other_stages_stay_waiting(make_coord):
+def test_all_stages_use_the_same_gate_and_pool_budget(make_coord):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_router(fake, pr=[False], verdict=[False], prep=[True]),
-                       gate=tracer.build_and_review_gate)
-    # A low-effort build (4 permits) leaves room for the review (1) — both admit; revise is
-    # gate-refused and never reserves, so it sits visibly waiting.
+                       gate=tracer.build_review_revise_gate)
+    # A low-effort build (4 permits) leaves room for the review (1). Revise is enabled by the
+    # same gate, but waits because the immutable five-permit pool budget is full.
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
                                           complexity="deep", effort="low", source="/wt/issue-7"))
     review = coord.submit_stage(_review("8", pool="claude", builder_lineage="codex"))
@@ -587,7 +586,153 @@ def test_only_build_and_review_admit_other_stages_stay_waiting(make_coord):
     assert record_of(coord, build).state == "running"
     assert record_of(coord, review).state == "running"
     revise_rec = record_of(coord, revise)
-    assert revise_rec.state == "waiting" and revise_rec.attempts == 0   # visibly queued, dormant
+    assert revise_rec.state == "waiting" and revise_rec.attempts == 0
+
+
+def _completed_review_record(*, profile="reviewed"):
+    return Record(
+        identity=f"o/r|7|review|sha-a|{profile}", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix", state="completed",
+        auto_merge_allowed=True)
+
+
+def test_clean_reviewed_settlement_parks_once_and_returns_durable_proof(monkeypatch):
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record()
+    comments = []
+    parked, notified = [], []
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_build, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+
+    def park(_repo, pr, _verdict, *, reason):
+        parked.append((pr, reason))
+        comments.append({"body": "> *agentflow: parked for human review.*"})
+
+    monkeypatch.setattr("agentflow.gate.park", park)
+    monkeypatch.setattr("agentflow.notify.notify",
+                        lambda *args, **kwargs: notified.append((args, kwargs)) or True)
+
+    proof = coordinated_build._settle_review(record)
+    assert proof == "https://github.com/o/r/pull/42"
+    assert len(parked) == 1 and len(notified) == 1
+    assert coordinated_build._settle_review(record) == proof
+    assert len(parked) == 1 and len(notified) == 1
+
+
+def test_clean_autonomous_settlement_uses_full_merge_gate(monkeypatch):
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record(profile="autonomous")
+    merged, finished, issue_edits = [], [], []
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_build, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.gate.ci_is_green", lambda _repo, _pr, **_kwargs: True)
+    monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
+    monkeypatch.setattr("agentflow.gate.reply_pending", lambda _comments: False)
+    monkeypatch.setattr("agentflow.gate.squash_merge",
+                        lambda _repo, pr: merged.append(pr) or True)
+    monkeypatch.setattr("agentflow.loop._finish_review",
+                        lambda *args, **kwargs: finished.append((args, kwargs)))
+    monkeypatch.setattr("agentflow.loop._run",
+                        lambda argv: issue_edits.append(argv) or SimpleNamespace(returncode=0))
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    coordinated_build._REVIEW_CI_OBSERVED[record.identity] = True
+
+    assert coordinated_build._settle_review(record) == "https://github.com/o/r/pull/42"
+    assert merged == [42] and len(finished) == 1
+    assert any(argv[1:3] == ["issue", "edit"] for argv in issue_edits)
+
+
+def test_review_settlement_releases_claim_through_public_coordinator_seam(make_coord, monkeypatch):
+    from agentflow.reviewer import Verdict
+
+    fake = FakeSession()
+    comments = []
+    parked = []
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_build, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+
+    def park(_repo, pr, _verdict, *, reason):
+        parked.append((pr, reason))
+        comments.append({"body": "> *agentflow: parked for human review.*"})
+
+    monkeypatch.setattr("agentflow.gate.park", park)
+    adapter = ReviewStageAdapter(
+        verdict_ready=lambda _record, _obs: True, worktree_reset=lambda _record: True,
+        observer=fake, settle=coordinated_build._settle_review,
+        prepare_settle=coordinated_build._prepare_review_settlement)
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_review(
+        target="sha-a", source="/work/.agentflow/worktrees/codex-review/pr-42-fix"))
+    coord.cycle("claude")
+    fake.end(ident, success=True, cause=ProviderCause.PROCESS)
+    assert [outcome.status for outcome in coord.cycle("claude")] == ["completed"]
+    assert record_of(coord, ident).claim is True
+
+    coord.cycle("claude")
+    settled = record_of(coord, ident)
+    assert settled.retired is True and settled.claim is False
+    assert len(parked) == 1
+    make_coord(fake, adapter=adapter).cycle("claude")
+    assert len(parked) == 1
+
+
+def test_same_tool_autonomous_review_settles_to_park_without_waiting_for_ci(
+        make_coord, monkeypatch):
+    from agentflow.reviewer import Verdict
+
+    fake = FakeSession()
+    comments, parked = [], []
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_build, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.gate.ci_is_green",
+                        lambda *args, **kwargs: pytest.fail("same-tool review must park before CI"))
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+
+    def park(_repo, pr, _verdict, *, reason):
+        parked.append((pr, reason))
+        comments.append({"body": "> *agentflow: parked for human review.*"})
+
+    monkeypatch.setattr("agentflow.gate.park", park)
+    adapter = ReviewStageAdapter(
+        verdict_ready=lambda _record, _obs: True, worktree_reset=lambda _record: True,
+        observer=fake, settle=coordinated_build._settle_review,
+        prepare_settle=coordinated_build._prepare_review_settlement)
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_review(
+        pool="claude", builder_lineage="claude", target="sha-a",
+        source="/work/.agentflow/worktrees/claude-review/pr-42-fix"))
+    coord.cycle("claude")
+    fake.end(ident, success=True, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+    coord.cycle("claude")
+
+    settled = record_of(coord, ident)
+    assert settled.auto_merge_allowed is False
+    assert settled.retired is True and settled.claim is False
+    assert len(parked) == 1
 
 
 # --- pure Build → Review submission mapping ----------------------------------------------
@@ -607,6 +752,21 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     assert coordinated_build.review_submission(
         Record(identity="x", stage="build", pool="claude", demand=5, repo="o/r", subject="7"),
         "sha", "codex", 42) is None
+
+
+def test_survivor_review_has_no_synthetic_predecessor(monkeypatch):
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    cfg = SimpleNamespace(repo="o/r", workdir="/work")
+
+    sub = coordinated_build.survivor_review_submission(
+        cfg, issue=7, slug="fix", builder_tool="claude", head_sha="head-a",
+        reviewer_tool="codex", pr_number=42, acceptance="Issue acceptance")
+
+    assert sub is not None and sub.stage == "review"
+    assert sub.transfer_from is None
+    assert sub.builder_lineage == "claude" and sub.target == "head-a"
+    assert "Issue acceptance" in sub.input_ptr
+    assert sub.builder_complexity is None  # a blocking survivor review parks; it never revises
 
 
 def test_review_identity_is_idempotent_per_exact_head(make_coord):

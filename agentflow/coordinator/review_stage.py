@@ -32,12 +32,15 @@ class ReviewStageAdapter:
     artifacts. Production wires the real verdict parse and a fresh detached checkout.
     """
 
-    def __init__(self, *, verdict_ready, worktree_reset=None, observer=None, handoff=None) -> None:
+    def __init__(self, *, verdict_ready, worktree_reset=None, observer=None, handoff=None,
+                 settle=None, prepare_settle=None) -> None:
         self._verdict_ready = verdict_ready
         self._worktree_reset = worktree_reset or (
             lambda record: bool(record.source and record.target))
         self._observer = observer or ProviderObserver()
         self._handoff = handoff
+        self._settle = settle
+        self._prepare_settle = prepare_settle
 
     def prepare(self, record) -> bool:
         """Recreate the read-only checkout at the reviewed head SHA before admission (ADR 0030).
@@ -64,3 +67,13 @@ class ReviewStageAdapter:
         if self._handoff is not None:
             return self._handoff(record)
         return f"proof:{record.identity}:pr:parked"
+
+    def finalize_completed(self, record) -> str | None:
+        """Project a clean verdict through the repo merge policy; blocking verdicts wait for Revise."""
+        if self._settle is not None:
+            return self._settle(record)
+        return None
+
+    def prepare_completed(self, record) -> bool:
+        """Run potentially slow merge-policy observation outside the store transaction."""
+        return bool(self._prepare_settle(record)) if self._prepare_settle is not None else True

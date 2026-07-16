@@ -1,6 +1,5 @@
 """The daemon's public lifecycle: two-clock polling, snapshot publishing, and cycle isolation."""
 
-import json
 import os
 import signal
 import subprocess
@@ -8,7 +7,6 @@ import sys
 import threading
 import time
 import types
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -24,7 +22,7 @@ B = RepoConfig("owner/b", "/tmp/b")
 def _loop(**kw):
     """A PollLoop wired for deterministic tests: a synchronous 'spawn' so a full pass runs
     inline, a stub clock, and recording sinks. Callers override what they're asserting on."""
-    kw.setdefault("dispatch_pass", lambda repos: None)
+    kw.setdefault("dispatch_pass", lambda repos, **kwargs: None)
     kw.setdefault("publish", lambda repos: None)
     kw.setdefault("enabled", lambda: True)
     kw.setdefault("spawn", lambda fn: fn())
@@ -98,105 +96,17 @@ def test_cycle_passes_log_into_run():
     assert any("build: ok" in m for m in emitted)          # result line also appeared
 
 
-def test_reclaim_cycle_clears_a_stranded_triaging_claim(monkeypatch):
-    # The daemon's reclaim pass runs at the top of every cycle. A claim left by a daemon killed
-    # mid-grounding — carrying no intake state label — must be cleared here and logged distinctly
-    # from a build reclaim, so the stalled issue re-enters the intake queue (issue #74).
-    from agentflow import loop
-
-    stranded = {"number": 69, "labels": [{"name": "agentflow:triaging"}]}
-
-    def fake_run(cmd):
-        if "--label" in cmd and "agentflow:triaging" in cmd:
-            return SimpleNamespace(stdout=json.dumps([stranded]), returncode=0)
-        return SimpleNamespace(stdout="[]", returncode=0)   # no build claims
-
-    released = []
-    monkeypatch.setattr(loop, "_run", fake_run)
-    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
-
-    logs = []
-    cycle([A], run=daemon._reclaim, _log=logs.append)
-
-    assert released == [69]
-    assert any("reclaimed 1 stale triaging claim(s)" in m for m in logs)
-
-
-def test_reclaim_cycle_strips_nothing_on_github_error(monkeypatch):
-    # Fail closed: a `gh` blip must reclaim no build, triaging, or drawing claim.
-    from agentflow import loop
-
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(stdout="", returncode=1))
-    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(("build", n)))
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(("triage", n)))
-    monkeypatch.setattr(loop, "_release_mockup", lambda repo, n: released.append(("drawing", n)))
-
-    logs = []
-    cycle([A], run=daemon._reclaim, _log=logs.append)
-
-    assert released == []
-    assert any("no stale claims" in m for m in logs)
-
-
-def test_reclaim_pass_preserves_coordinator_owned_drawing_claim(monkeypatch):
-    from agentflow import coordinated_build
-
-    lanes = []
-    monkeypatch.setattr(
-        coordinated_build, "owned_issues",
-        lambda cfg, lane=None: lanes.append(lane) or ({108} if lane == "drawing" else set()))
-    monkeypatch.setattr(daemon, "reclaim_claims", lambda cfg, owned: 0)
-    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda cfg, owned: 0)
-    seen = []
-    monkeypatch.setattr(daemon, "reclaim_mockup_claims",
-                        lambda cfg, owned: seen.append(owned) or 0)
-
-    assert daemon._reclaim(A) == "no stale claims"
-    assert lanes == ["building", "triaging", "drawing"]
-    assert seen == [{108}]
-
-
-def test_unreadable_coordinator_store_fails_closed_before_drawing_reclaim(monkeypatch):
-    from agentflow import coordinated_build
-
-    monkeypatch.setattr(daemon, "reclaim_claims", lambda cfg, owned: 0)
-    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda cfg, owned: 0)
-    monkeypatch.setattr(coordinated_build, "owned_issues",
-                        lambda cfg, lane=None: (_ for _ in ()).throw(RuntimeError("store unreadable"))
-                        if lane == "drawing" else set())
-    monkeypatch.setattr(daemon, "reclaim_mockup_claims", lambda *a: pytest.fail(
-        "an unreadable continuation store must preserve drawing claims"))
-
-    logs = []
-    cycle([A], run=daemon._reclaim, _log=logs.append)
-    assert any("store unreadable" in line for line in logs)
-
-
-def test_forward_rollout_preserves_build_claims_for_drain_evidence(tmp_path, monkeypatch):
-    """A coordinated request inspects legacy Build claims; the old stale-claim pass must not
-    erase them first and turn an ambiguous forward drain into a false all-clear."""
-    from agentflow.coordinator import Rollout
-
-    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
-    Rollout().request_coordinated()
-    monkeypatch.setattr(daemon, "reclaim_claims", lambda *a, **k: pytest.fail(
-        "forward rollout must preserve Build claims"))
-    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda *a, **k: pytest.fail(
-        "forward rollout must preserve Intake claims"))
-    monkeypatch.setattr(daemon, "reclaim_mockup_claims", lambda *a, **k: pytest.fail(
-        "forward rollout must preserve Mockup claims"))
-    monkeypatch.setattr(daemon, "recheck_once", lambda cfg: "nothing")
+def test_dispatch_cycle_has_no_claim_reclaimer_and_forwards_pause(monkeypatch):
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",
-                        lambda repos, rollout=None, rollout_mode=None, _log=None:
-                        seen.append((rollout.mode, rollout_mode)))
+                        lambda repos, submit_new=True, _log=None:
+                        seen.append((list(repos), submit_new)))
+    monkeypatch.setattr(daemon, "recheck_once",
+                        lambda cfg: pytest.fail("pause must not submit survivor reviews"))
 
-    daemon.dispatch_cycle([A], _log=lambda _line: None)
+    daemon.dispatch_cycle([A], _log=lambda _line: None, submit_new=False)
 
-    assert seen == [("coordinated", "coordinated")]
+    assert seen == [([A], False)]
 
 
 def test_main_once_runs_one_cycle_and_exits(tmp_path):
@@ -273,7 +183,7 @@ def test_probe_no_change_runs_no_full_pass_but_change_does(monkeypatch):
     answers = iter([True, False, False, True])   # startup heartbeat, then probe verdicts
     probe = types.SimpleNamespace(changed=lambda: next(answers))
     clock = iter([0, 1, 2, 3, 4])
-    loop = _loop(probe=probe, dispatch_pass=lambda repos: passes.append(repos),
+    loop = _loop(probe=probe, dispatch_pass=lambda repos, **kw: passes.append((repos, kw)),
                  publish=lambda repos: publishes.append("snap"), clock=lambda: next(clock))
 
     loop.tick()                       # t=0: startup heartbeat → one pass (probe not consulted)
@@ -302,7 +212,7 @@ def test_newly_ready_issue_dispatches_within_a_fast_tick(monkeypatch):
                         now=lambda: "2026-07-14T09:59:00Z")
     passes = []
     clock = iter([0, 1, 16])   # startup pass, then two fast ticks well inside the heartbeat
-    loop = _loop(probe=probe, dispatch_pass=lambda repos: passes.append("pass"),
+    loop = _loop(probe=probe, dispatch_pass=lambda repos, **kw: passes.append("pass"),
                  clock=lambda: next(clock))
 
     loop.tick()               # startup heartbeat consumes its slot; probe not consulted
@@ -320,7 +230,7 @@ def test_heartbeat_runs_a_full_pass_even_when_the_probe_sees_no_change(monkeypat
     passes = []
     probe = types.SimpleNamespace(changed=lambda: False)   # probe never reports change
     clock = iter([0, 15, 30, 105, 120])
-    loop = _loop(probe=probe, dispatch_pass=lambda repos: passes.append("pass"),
+    loop = _loop(probe=probe, dispatch_pass=lambda repos, **kw: passes.append("pass"),
                  clock=lambda: next(clock))
 
     loop.tick()   # t=0   heartbeat (startup)
@@ -331,24 +241,23 @@ def test_heartbeat_runs_a_full_pass_even_when_the_probe_sees_no_change(monkeypat
     assert len(passes) == 2   # the two heartbeats, nothing from the (never-changing) probe
 
 
-def test_dormant_fast_tick_makes_zero_calls_and_never_dispatches(monkeypatch):
-    """Dormant (no enable flag): the probe is never even asked and no dispatch runs, so a paused
-    fast tick costs zero network calls. Only the slow heartbeat republishes the console snapshot."""
+def test_dormant_fast_tick_only_reconciles_on_the_heartbeat(monkeypatch):
+    """Paused: no probe or cold submissions; heartbeat still reconciles owned records."""
     monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 100)
     monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
     probe_calls, passes, publishes = [], [], []
     probe = types.SimpleNamespace(changed=lambda: probe_calls.append(1) or True)
     clock = iter([0, 15, 30])
     loop = _loop(probe=probe, enabled=lambda: False,
-                 dispatch_pass=lambda repos: passes.append("pass"),
+                 dispatch_pass=lambda repos, **kw: passes.append(kw),
                  publish=lambda repos: publishes.append("snap"),
                  clock=lambda: next(clock))
 
-    loop.tick()   # t=0   heartbeat due, dormant → publish only, no probe, no dispatch
+    loop.tick()   # t=0   heartbeat due, paused → reconcile without cold submissions
     loop.tick()   # t=15  dormant fast tick → nothing at all
     loop.tick()   # t=30  dormant fast tick → nothing at all
     assert probe_calls == []      # the probe (its one API call) is never made while dormant
-    assert passes == []           # no dispatch pass while dormant
+    assert passes == [{"submit_new": False}]
     assert publishes == ["snap"]  # one republish on the heartbeat, so the paused board stays fresh
 
 
@@ -406,7 +315,7 @@ def test_fast_tick_returns_without_blocking_on_an_in_flight_pass():
         release = threading.Event()
         passes = []
 
-        def slow_pass(_repos):
+        def slow_pass(_repos, **kwargs):
             passes.append("start")
             started.set()
             release.wait(2)

@@ -3,6 +3,20 @@
 - Status: Accepted
 - Date: 2026-07-15
 
+## Final amendment — rollout removed after all six stages (2026-07-16)
+
+Issues #106–#108 completed Intake, Respond, and Mockup after Build/Review/Revise. Issue #109 then
+removed the `legacy → draining → coordinated` intent and phase machinery described below. It is
+retained here as deployment history, not as current operating behavior.
+
+Production now has one path: every stage submission and provider start goes through the session
+coordinator. `agentflow pause` stops cold submissions but continues reconciliation until active
+records complete or reach durable holds. `agentflow resume` admits from those durable records and
+then accepts cold submissions. There is no command or environment switch that can resume the old
+pipeline. Rollback means pause, drain, and deploy a coordinator-aware revision; an older binary
+must never run against active coordinator records. See
+[Coordinator operations](../coordinator-operations.md).
+
 ## Amendment — Intake activation (2026-07-16)
 
 Issue #106 extends the same drain-safe rollout to Intake. Forward activation now also waits

@@ -49,6 +49,11 @@ class StageRouter:
         fn = getattr(adapter, "finalize_completed", None) if adapter is not None else None
         return fn(record) if fn is not None else None
 
+    def prepare_completed(self, record) -> bool:
+        adapter = self._for(record)
+        fn = getattr(adapter, "prepare_completed", None) if adapter is not None else None
+        return bool(fn(record)) if fn is not None else True
+
     def finalize_hold(self, record) -> str | None:
         adapter = self._for(record)
         fn = getattr(adapter, "finalize_hold", None) if adapter is not None else None

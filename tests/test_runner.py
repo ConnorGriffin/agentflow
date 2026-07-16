@@ -1,9 +1,4 @@
-"""Test the Runner through its interface — the pure outcome classifier.
-
-Per the charter: the interface is the test surface. Worktree/CLI spawning lives
-behind adapters; the *decision* of what a session outcome means is `classify_build`,
-and that is what actually needs to be right.
-"""
+"""Provider command construction and fail-closed worktree plumbing."""
 
 import json
 import os
@@ -14,8 +9,8 @@ from unittest.mock import patch
 import pytest
 
 from agentflow import runner as runner_mod
-from agentflow.runner import (BuildStatus, BuildTask, ClaudeRunner, CodexRunner, Complexity,
-                              Effort, _run, classify_build, recover_stale_worktrees,
+from agentflow.runner import (ClaudeRunner, CodexRunner, Complexity,
+                              Effort, _run, recover_stale_worktrees,
                               remove_worktree_if_safe,
                               worktree_session)
 
@@ -39,36 +34,6 @@ def _repo_with_origin(tmp_path: Path) -> Path:
     _git(repo, "push", "-u", "origin", "main")
     _git(origin, "symbolic-ref", "HEAD", "refs/heads/main")
     return repo
-
-
-class _LifecycleRunner(ClaudeRunner):
-    def __init__(self, *, push: bool = True):
-        self.push = push
-
-    def provision(self, wt):
-        pass
-
-    def launch(self, prompt, cwd, model):
-        wt = Path(cwd)
-        _git(wt, "config", "user.email", "agentflow@example.com")
-        _git(wt, "config", "user.name", "agentflow test")
-        (wt / "result.txt").write_text(prompt)
-        _git(wt, "add", "result.txt")
-        _git(wt, "commit", "-m", prompt)
-        if self.push:
-            _git(wt, "push", "-u", "origin", "HEAD")
-        return True, "done"
-
-    def _pr_for_branch(self, repo, branch):
-        return f"https://github.com/{repo}/pull/1"
-
-    def _new_marker_comments(self, repo, issue, since):
-        return []
-
-
-def _task(repo: Path, issue: int) -> BuildTask:
-    return BuildTask("owner/repo", str(repo), issue, f"session-{issue}", Complexity.STANDARD,
-                     Effort.MEDIUM, f"session {issue}")
 
 
 def _branch_worktree(repo: Path, path: Path, branch: str, *, push: bool = True,
@@ -105,23 +70,13 @@ def test_every_complexity_maps_for_every_tool():
             assert runner.model_for(complexity)  # no complexity left unmapped
 
 
-def test_claude_launch_confines_the_session_to_its_assigned_worktree(tmp_path, monkeypatch):
+def test_claude_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     repo = _repo_with_origin(tmp_path)
     branch = "agentflow/claude/issue-7-owned"
     wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-7-owned"
     _branch_worktree(repo, wt, branch)
-    launched = {}
-
-    def fake_session(cmd, cwd, timeout):
-        launched.update(cmd=cmd, cwd=cwd, timeout=timeout)
-        return subprocess.CompletedProcess(cmd, 0, "done", "")
-
-    monkeypatch.setattr(runner_mod, "_run_session", fake_session)
-    assert ClaudeRunner().launch("build it", str(wt), "sonnet") == (True, "done")
-
-    cmd = launched["cmd"]
+    cmd = ClaudeRunner().structured_argv("build it", "sonnet", str(wt))
     settings = json.loads(cmd[cmd.index("--settings") + 1])
-    assert launched["cwd"] == str(wt)
     assert cmd[cmd.index("--setting-sources") + 1] == "project"
     assert cmd[cmd.index("--permission-mode") + 1] == "acceptEdits"
     assert "--dangerously-skip-permissions" not in cmd
@@ -132,30 +87,15 @@ def test_claude_launch_confines_the_session_to_its_assigned_worktree(tmp_path, m
     prompt = cmd[cmd.index("-p") + 1]
     assert str(wt.resolve()) in prompt and branch in prompt
 
-    structured = ClaudeRunner().structured_argv("build it", "sonnet", str(wt))
-    assert "--dangerously-skip-permissions" not in structured
-    assert structured[structured.index("--permission-mode") + 1] == "acceptEdits"
-    assert "--output-format" in structured
-    assert str(wt.resolve()) in structured[structured.index("-p") + 1]
+    assert "--output-format" in cmd
 
 
-def test_codex_launch_confines_the_session_to_its_assigned_worktree(tmp_path, monkeypatch):
+def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     repo = _repo_with_origin(tmp_path)
     branch = "agentflow/codex/issue-8-owned"
     wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-8-owned"
     _branch_worktree(repo, wt, branch)
-    launched = {}
-
-    def fake_session(cmd, cwd, timeout):
-        Path(cmd[cmd.index("-o") + 1]).write_text("done")
-        launched.update(cmd=cmd, cwd=cwd, timeout=timeout)
-        return subprocess.CompletedProcess(cmd, 0, "", "")
-
-    monkeypatch.setattr(runner_mod, "_run_session", fake_session)
-    assert CodexRunner().launch("build it", str(wt), "gpt-5.6-terra") == (True, "done")
-
-    cmd = launched["cmd"]
-    assert launched["cwd"] == str(wt)
+    cmd = CodexRunner().structured_argv("build it", "terra", str(wt))
     assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
     assert cmd[cmd.index("--cd") + 1] == str(wt.resolve())
     assert "--ignore-user-config" in cmd and "--ephemeral" in cmd
@@ -192,66 +132,8 @@ def test_codex_account_fact_uses_typed_limit_windows(monkeypatch):
         "kind": "rate_limited", "reset_at": 1234}
 
 
-def test_codex_probe_uses_the_same_workspace_sandbox(monkeypatch):
-    launched = {}
-    original_run = runner_mod._run
-
-    def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[0] == "codex":
-            launched.update(cmd=cmd, cwd=cwd, timeout=timeout)
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        return original_run(cmd, cwd=cwd, timeout=timeout)
-
-    monkeypatch.setattr(runner_mod, "_run", fake_run)
-    assert CodexRunner().probe() is True
-
-    cmd = launched["cmd"]
-    assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
-    assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
-    assert cmd[cmd.index("--cd") + 1] == str(Path(launched["cwd"]).resolve())
-    assert "--ignore-user-config" in cmd and "--ephemeral" in cmd
-    assert 'approval_policy="never"' in cmd
-    assert "sandbox_workspace_write.network_access=true" in cmd
-    assert str(Path(launched["cwd"]).resolve()) in cmd[-1]
-
-
 def test_effort_has_four_levels():
     assert [e.value for e in Effort] == ["low", "medium", "high", "extra"]
-
-
-def test_pr_opened_is_success():
-    out = classify_build("https://github.com/o/r/pull/7", [])
-    assert out.status is BuildStatus.PR_OPENED
-    assert out.pr_url.endswith("/pull/7")
-
-
-def test_pr_wins_even_if_a_marker_was_also_posted():
-    out = classify_build("https://github.com/o/r/pull/7", ["MISSING-CONTEXT: need a value"])
-    assert out.status is BuildStatus.PR_OPENED
-
-
-def test_marker_comment_is_a_bail():
-    out = classify_build(None, ["MISSING-CONTEXT: need the ISF threshold\nmore detail"])
-    assert out.status is BuildStatus.BAIL
-    assert out.marker == "MISSING-CONTEXT"
-    assert out.detail == "MISSING-CONTEXT: need the ISF threshold"
-
-
-def test_each_marker_recognized():
-    for marker in ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION"):
-        out = classify_build(None, [f"{marker}: blocked"])
-        assert out.status is BuildStatus.BAIL
-        assert out.marker == marker
-
-
-def test_non_marker_comment_is_not_a_bail():
-    out = classify_build(None, ["just a normal comment", "LGTM"])
-    assert out.status is BuildStatus.INCOMPLETE
-
-
-def test_nothing_left_behind_is_incomplete():
-    out = classify_build(None, [])
-    assert out.status is BuildStatus.INCOMPLETE
 
 
 def test_run_timeout_returns_nonzero_and_does_not_propagate():
@@ -264,26 +146,9 @@ def test_run_timeout_returns_nonzero_and_does_not_propagate():
     assert "timed out" in r.stderr
 
 
-def test_dead_pr_on_branch_classifies_as_no_pr():
-    # _pr_for_branch now filters to open PRs only, so a merged/closed PR returns
-    # None — the build classifies as INCOMPLETE (stuck handback), not PR_OPENED.
-    out = classify_build(None, [])
-    assert out.status is BuildStatus.INCOMPLETE
-    assert out.pr_url is None
-
-
-def test_completed_build_sessions_are_removed_but_unpushed_progress_is_retained(tmp_path):
-    repo = _repo_with_origin(tmp_path)
-
-    for issue in (1, 2):
-        assert _LifecycleRunner().build(_task(repo, issue)).status is BuildStatus.PR_OPENED
-
-    registered = _git(repo, "worktree", "list", "--porcelain")
-    assert registered.count("worktree ") == 1
-
-    assert _LifecycleRunner(push=False).build(_task(repo, 3)).status is BuildStatus.PR_OPENED
-    registered = _git(repo, "worktree", "list", "--porcelain")
-    assert "issue-3-session-3" in registered
+def test_generic_runner_refuses_provider_commands():
+    with pytest.raises(RuntimeError, match="coordinator launcher"):
+        _run(["codex", "exec", "do work"])
 
 
 def test_public_session_lifecycle_bounds_registrations_across_every_lane(tmp_path):
@@ -331,20 +196,6 @@ def test_public_session_lifecycle_bounds_registrations_across_every_lane(tmp_pat
     registered = _git(repo, "worktree", "list", "--porcelain")
     assert registered.count("worktree ") == 4  # main + dirty + unpushed + active
     assert foreign_wt.exists()
-
-
-def test_agent_launch_persists_the_child_pid_until_the_session_finishes(tmp_path):
-    repo = _repo_with_origin(tmp_path)
-    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-10-live"
-    _branch_worktree(repo, wt, "agentflow/codex/issue-10-live")
-
-    with worktree_session(wt):
-        result = runner_mod._run_session(["sh", "-c", "exit 0"], str(wt), 5)
-        marker = runner_mod._active_marker(wt)
-        assert marker is not None
-        child_pid = int(marker.read_text())
-        assert result.returncode == 0 and child_pid != os.getpid()
-    assert not marker.exists()
 
 
 def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):

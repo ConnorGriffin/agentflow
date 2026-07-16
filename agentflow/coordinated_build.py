@@ -1,21 +1,17 @@
 """All six logical stages behind the session coordinator, wired into dispatch
 (issues #103–#108).
 
-This is the seam that turns the rollout phase into action. In **legacy** phase the daemon's
-existing build path is untouched; in **draining** phase no new provider stage of any kind
-launches, but the coordinator keeps reconciling the records that still own work; in
-**coordinated** phase every provider stage enters one durable submission. Build, Review, and Revise
-transfer one change claim through their convergence loop; Intake, Mockup, and Respond each own
-their stage-native boundary and claim. The coordinator owns their continuation, admission, and
-completion, and the live board becomes a projection of its running records.
+Every provider stage enters one durable submission. Build, Review, and Revise transfer one change
+claim through their convergence loop; Intake, Mockup, and Respond each own their stage-native
+boundary and claim. The coordinator owns continuation, admission, and completion, and the live
+board is generated from its running records. There is no legacy provider path or bypass mode.
 
 The pure parts — mapping stage inputs to submissions, the Build/Review/Revise transfers, the
 ``MAX_REVISES``-capped
 auto-revise product policy (ADR 0004) that continuation attempts never expand; deriving the phase
-without disturbing a never-created store; spotting the current-format sessions a drain must wait
-on; and projecting running records — are exercised directly. The production factory wires the
+and projecting running records — are exercised directly. The production factory wires the
 coordinator's stage adapters to the real GitHub PR check, verdict parse, branch head, and
-worktrees, following the same live-orchestration path the legacy builder and reviewer use.
+worktrees, following the same stage-native completion contracts the earlier pipeline established.
 """
 
 from __future__ import annotations
@@ -26,18 +22,20 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter,
-                                   MockupStageAdapter, MODE_COORDINATED, Phase,
-                                   RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter, Rollout,
+                                   MockupStageAdapter,
+                                   RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
                                    StageRouter, tracer)
-from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
 
 BUILD_POOLS = ("claude", "codex")
-LEGACY_SESSION_POOLS = BUILD_POOLS + tuple(f"{tool}-intake" for tool in BUILD_POOLS)
+_ORPHAN_CLAIM_GRACE_SECONDS = 60 * 60
+_REVIEW_CI_OBSERVED: dict[str, bool] = {}
 
 
 def build_submission(cfg, issue: dict, tool: str):
@@ -138,6 +136,32 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         transfer_from=build_record.identity)
 
 
+def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
+                               head_sha: str, reviewer_tool: str, pr_number: int,
+                               acceptance: str):
+    """Submit a fresh exact-head Review for an already-open autonomous survivor.
+
+    A survivor has no completed coordinator predecessor to transfer from: its earlier chain has
+    already reached an external PR boundary. This mapping therefore creates a cold Review that
+    owns the newly-established visible claim directly, while preserving builder lineage and the
+    retained branch/worktree naming needed by any later Revise.
+    """
+    from agentflow.coordinator import Submission
+    from agentflow.loop import _surfaces_phrase, ui_surfaces
+    from agentflow.reviewer import REVIEW_PROMPT, review_worktree
+
+    if not head_sha or builder_tool not in BUILD_POOLS or reviewer_tool not in BUILD_POOLS:
+        return None
+    prompt = REVIEW_PROMPT.format(
+        pr=pr_number, acceptance=acceptance or "(none provided)",
+        surfaces=_surfaces_phrase(ui_surfaces(cfg.workdir)))
+    return Submission(
+        repo=cfg.repo, subject=str(issue), stage="review", target=head_sha,
+        pool=reviewer_tool, complexity="deep",
+        source=str(review_worktree(cfg.workdir, reviewer_tool, pr_number, slug)),
+        claim=True, input_ptr=prompt, builder_lineage=builder_tool)
+
+
 def _revise_builder_source(review_record):
     """The ``(build_worktree, pr_number)`` a Revise adopts from a blocking Review record. The
     revise reuses the *builder's* retained branch/worktree — ``.../<builder_lineage>/issue-<subject>
@@ -224,122 +248,8 @@ def revise_round_budget_remains(records, repo, subject) -> bool:
     return rounds < MAX_REVISES
 
 
-def legacy_evidence(live_sessions, coordinator_sources) -> tuple[str, ...]:
-    """The current-format sessions a forward drain must wait on: live-board entries not backed by
-    a coordinator running record. These are legacy provider sessions still finishing (or stale
-    entries) that could be mistaken for coordinator-owned work, so activation waits for them and
-    names them rather than clearing them (issue #103). Pure — the test surface."""
-    evidence: list[str] = []
-    for session in live_sessions:
-        if os.path.realpath(session.get("worktree", "")) in coordinator_sources:
-            continue  # this board entry is the coordinator's own projection
-        repo = session.get("repo", "?")
-        number = session.get("number", "?")
-        evidence.append(f"{repo}#{number} legacy session live ({session.get('stage', '?')})")
-    return tuple(evidence)
-
-
-def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
-    """Name every current-format fact that prevents a safe forward activation.
-
-    The live board is only one fact. A legacy Build or Intake may also have left its GitHub
-    claim, active PID marker, or registered/unregistered worktree. Coordinator-owned sources
-    and claims are excluded; everything else is named rather than cleared or guessed at.
-    """
-    from agentflow.loop import BUILDING, DRAWING, TRIAGING, _run
-    from agentflow.runner import _active_marker, _registered_worktrees
-
-    sources = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
-    evidence = list(legacy_evidence(live_sessions, sources))
-    # Ownership is resolved per claim type: an Intake record owns only its issue's `triaging`
-    # claim, code-change records only their issue's `building` claim, and Mockup only its drawing
-    # claim. Keying the exclusion per lane stops one live record from hiding another stale claim.
-    owned_by_lane = {(cfg.repo, lane): tracer.owned_issues(records, cfg.repo, lane=lane)
-                     for cfg in repos for lane in ("building", "triaging", "drawing")}
-    for cfg in repos:
-        for claim_label, lane in ((BUILDING, "building"), (TRIAGING, "triaging"),
-                                  (DRAWING, "drawing")):
-            claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
-                           f"repos/{cfg.repo}/issues", "-f", "state=open",
-                           "-f", f"labels={claim_label}", "-f", "per_page=100"])
-            if claims.returncode != 0:
-                evidence.append(f"{cfg.repo} {lane} claims unreadable")
-                continue
-            try:
-                pages = json.loads(claims.stdout or "[]")
-            except json.JSONDecodeError:
-                evidence.append(f"{cfg.repo} {lane} claims unreadable")
-                continue
-            if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-                evidence.append(f"{cfg.repo} {lane} claims unreadable")
-                continue
-            for issue in (item for page in pages for item in page):
-                number = issue.get("number")
-                if isinstance(number, int) and number not in owned_by_lane[(cfg.repo, lane)]:
-                    evidence.append(f"{cfg.repo}#{number} legacy {lane} claim")
-
-        root = Path(cfg.workdir) / ".agentflow" / "worktrees"
-        registered = _registered_worktrees(cfg.workdir)
-        if registered is None:
-            evidence.append(f"{cfg.repo} worktree registry unreadable")
-            continue
-        registered_paths = {os.path.realpath(path): Path(path) for path, _branch in registered}
-        candidates: dict[str, Path] = {}
-        for path in registered_paths.values():
-            try:
-                rel = path.resolve().relative_to(root.resolve())
-            except (OSError, ValueError):
-                continue
-            if (len(rel.parts) >= 2 and rel.parts[0] in LEGACY_SESSION_POOLS
-                    and rel.parts[1].startswith(("issue-", "mockup-"))):
-                candidates[os.path.realpath(path)] = path
-        for tool in LEGACY_SESSION_POOLS:
-            if (root / tool).exists():
-                for pattern in ("issue-*", "mockup-*"):
-                    for path in (root / tool).glob(pattern):
-                        candidates.setdefault(os.path.realpath(path), path)
-
-        for real, path in sorted(candidates.items()):
-            if real in sources:
-                continue
-            label = f"{cfg.repo} legacy worktree {path}"
-            if real not in registered_paths:
-                evidence.append(f"{label} is unregistered")
-                continue
-            marker = _active_marker(path)
-            if marker is not None and marker.exists():
-                evidence.append(f"{label} has PID marker")
-            status = _run(["git", "-C", str(path), "status", "--porcelain",
-                           "--untracked-files=all"])
-            if status.returncode != 0:
-                evidence.append(f"{label} state unreadable")
-            elif status.stdout.strip():
-                evidence.append(f"{label} is dirty")
-            else:
-                evidence.append(f"{label} is ambiguous")
-    return tuple(dict.fromkeys(evidence))
-
-
-def resolve_phase(rollout: Rollout, repos, live_sessions, *, store_path=None,
-                  requested_mode: str | None = None) -> Phase:
-    """Derive this cycle's phase from the durable rollout mode and the observed world, without
-    ever creating a store that never existed. In the steady legacy state (no coordinator has run)
-    this is a cheap ``legacy`` with no filesystem or GitHub reads."""
-    path = Path(store_path or default_store_path())
-    records = tracer.load_records(path) if path.exists() else []
-    mode = rollout.mode if requested_mode is None else requested_mode
-    if mode == MODE_COORDINATED:
-        return rollout.phase(
-            legacy_evidence=activation_evidence(repos, live_sessions, records),
-            requested_mode=mode,
-        )
-    return rollout.phase(
-        coordinator_active=tracer.coordinator_active(records), requested_mode=mode)
-
-
 def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
-    """The issues in ``cfg.repo`` a coordinator record still owns — the set legacy claim
-    reclamation must never strip (ADR 0028). Empty (and side-effect free) when no store exists.
+    """The issues in ``cfg.repo`` a coordinator record still owns. Empty when no store exists.
 
     ``lane`` scopes ownership to one claim type: ``"building"`` (Build/Review/Revise/Respond),
     ``"triaging"`` (Intake), or ``"drawing"`` (Mockup). Each reclamation pass supplies its lane
@@ -360,6 +270,78 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
         for record in tracer.load_records(path)
         if record.repo == cfg.repo and record.source and not record.retired
     }
+
+
+def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
+    """Clear visible claims only after coordinator reconciliation proves them orphaned.
+
+    The durable store is read first and is authoritative. An unreadable store clears nothing.
+    For each claim lane, any claim-owning continuation record for the issue keeps the label,
+    including a waiting/completed record with no live process. Because every provider family is
+    born from a running record, absence of such a record after ``Coordinator.cycle`` also proves
+    there is no live family. A one-hour grace protects short deterministic interactive claim
+    operations. GitHub listing or verification failures likewise clear nothing.
+    """
+    from agentflow.coordinator.record import RUNNING
+    from agentflow.loop import BUILDING, DRAWING, TRIAGING, _run
+
+    _log = _log or (lambda _line: None)
+    try:
+        records = tracer.load_records()
+    except StoreUnavailable as exc:
+        _log(f"{cfg.repo}: claim reconciliation deferred — coordinator state unreadable: {exc}")
+        return 0
+
+    lane_labels = (("building", BUILDING), ("triaging", TRIAGING), ("drawing", DRAWING))
+    cleared = 0
+    for lane, label in lane_labels:
+        listed = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+                       "--label", label, "--json", "number,updatedAt", "--limit", "100"])
+        if listed.returncode != 0:
+            _log(f"{cfg.repo}: {lane} claim reconciliation deferred — GitHub unreadable")
+            continue
+        try:
+            claimed = json.loads(listed.stdout or "[]")
+        except json.JSONDecodeError:
+            _log(f"{cfg.repo}: {lane} claim reconciliation deferred — GitHub response unreadable")
+            continue
+        for issue in claimed:
+            number = issue.get("number")
+            if not isinstance(number, int):
+                continue
+            try:
+                updated = datetime.fromisoformat(
+                    str(issue.get("updatedAt", "")).replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if time.time() - updated < _ORPHAN_CLAIM_GRACE_SECONDS:
+                continue  # protect short deterministic by-hand claim operations
+            related = [
+                record for record in records
+                if record.repo == cfg.repo and str(record.subject) == str(number)
+                and tracer.CLAIM_LANE.get(record.stage) == lane
+            ]
+            if any((not record.retired and record.claim) or record.state == RUNNING
+                   for record in related):
+                continue
+            removed = _run(["gh", "issue", "edit", str(number), "--repo", cfg.repo,
+                            "--remove-label", label])
+            if removed.returncode != 0:
+                continue
+            proved = _run(["gh", "issue", "view", str(number), "--repo", cfg.repo,
+                           "--json", "labels"])
+            if proved.returncode != 0:
+                continue
+            try:
+                labels = {item.get("name")
+                          for item in json.loads(proved.stdout or "{}").get("labels", [])}
+            except json.JSONDecodeError:
+                continue
+            if label not in labels:
+                cleared += 1
+                _log(f"{cfg.repo}: #{number}: reclaimed orphaned {lane} claim — "
+                     "no live family or continuation record")
+    return cleared
 
 
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
@@ -383,7 +365,8 @@ def build_coordinator(_log=None) -> Coordinator:
     build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
     review = ReviewStageAdapter(
-        verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr)
+        verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr,
+        settle=_settle_review, prepare_settle=_prepare_review_settlement)
     revise = ReviseStageAdapter(
         revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
     respond = RespondStageAdapter(
@@ -891,6 +874,178 @@ def _park_pr(record) -> str | None:
     return url
 
 
+def _review_pr_facts(record) -> dict | None:
+    """The PR's current head and state, or ``None`` when GitHub is unreadable."""
+    from agentflow.loop import _run
+
+    facts = _review_source_facts(record)
+    if facts is None:
+        return None
+    _workdir, pr = facts
+    viewed = _run(["gh", "pr", "view", str(pr), "--repo", record.repo,
+                   "--json", "headRefOid,state"])
+    if viewed.returncode != 0:
+        return None
+    try:
+        data = json.loads(viewed.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    head, state = data.get("headRefOid"), data.get("state")
+    if not isinstance(head, str) or not head or state not in {"OPEN", "CLOSED", "MERGED"}:
+        return None
+    return {"head": head, "state": state}
+
+
+def _review_pr_head(record) -> str | None:
+    facts = _review_pr_facts(record)
+    return facts["head"] if facts is not None else None
+
+
+def _prepare_review_settlement(record) -> bool:
+    """Perform slow CI observation outside the coordinator store transaction.
+
+    Only an exact-head, independent, clean autonomous review can merge and therefore needs the
+    bounded CI wait. Every park/revise path is immediately ready for its short transactional
+    finalization. Settlement rechecks both head and CI immediately before the merge.
+    """
+    from agentflow.gate import ci_is_green
+    from agentflow.loop import repo_profile
+
+    facts = _review_source_facts(record)
+    if facts is None:
+        return False
+    workdir, _pr = facts
+    verdict = _review_verdict(record)
+    if (not verdict.clean or repo_profile(workdir) != "autonomous"
+            or not record.auto_merge_allowed):
+        return True
+    if _review_pr_head(record) != record.target:
+        return True  # short settlement parks the stale exact-head verdict
+    _REVIEW_CI_OBSERVED[record.identity] = ci_is_green(record.repo, facts[1])
+    return True
+
+
+def _park_review_settlement(record, verdict, workdir: str, pr: int, comments: list[dict],
+                            *, reason: str, autonomous: bool) -> str | None:
+    """Idempotently park, prove, clean up, and notify one completed Review."""
+    from agentflow.gate import park
+    from agentflow.loop import _finish_review, _pr_comments
+    from agentflow.notify import notify
+    from agentflow import ratchet
+
+    marker = "agentflow: parked for human review"
+    already = any(marker in comment.get("body", "") for comment in comments)
+    if not already:
+        park(record.repo, pr, verdict, reason=reason)
+    proved = _pr_comments(record.repo, pr)
+    if proved is None or not any(marker in comment.get("body", "") for comment in proved):
+        return None
+    slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+    _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir), record.pool, pr, slug)
+    if autonomous:
+        ratchet.record_once(record.repo, "parked", record.identity)
+    url = f"https://github.com/{record.repo}/pull/{pr}"
+    if not already:
+        sequence = "review-" + hashlib.sha256(record.identity.encode()).hexdigest()[:24]
+        notify("agentflow needs you", f"{record.repo} PR #{pr}: reviewed — your action", url,
+               sequence_id=sequence)
+    return url
+
+
+def _settle_review(record) -> str | None:
+    """Consume a parsed exact-head verdict through the established repository merge policy."""
+    from agentflow import ratchet
+    from agentflow.gate import (MergeDecision, ci_is_green, decide_merge, reply_pending,
+                                squash_merge, ui_evidence_gap)
+    from agentflow.loop import (_UI_GAP_REASON, _finish_review, _pr_comments, _run,
+                                repo_profile, ui_surfaces)
+
+    facts = _review_source_facts(record)
+    if facts is None:
+        return None
+    workdir, pr = facts
+    verdict = _review_verdict(record)
+    if verdict.blocking:
+        return None  # durable opener transfers this claim to Revise
+    comments = _pr_comments(record.repo, pr)
+    if comments is None:
+        return None
+    profile = repo_profile(workdir)
+    autonomous = profile == "autonomous"
+    pr_facts = _review_pr_facts(record)
+    if pr_facts is None:
+        return None
+    head = pr_facts["head"]
+    if pr_facts["state"] == "MERGED":
+        slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+        _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
+                       record.pool, pr, slug, merged=True)
+        ratchet.record_once(
+            record.repo, ratchet.CLEAN_MERGE if record.round == 0 else "merge_after_revise",
+            record.identity)
+        _run(["gh", "issue", "edit", str(record.subject), "--repo", record.repo,
+              "--remove-label", "ready-for-agent"])
+        return f"https://github.com/{record.repo}/pull/{pr}"
+    if head != record.target:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments,
+            reason="PR head changed after the recorded review; a human must re-review",
+            autonomous=autonomous)
+
+    surfaces = ui_surfaces(workdir)
+    ui_gap = ui_evidence_gap(record.repo, pr, surfaces)
+    if not autonomous:
+        reason = _UI_GAP_REASON if ui_gap else f"is a `{profile}` repo — a human merges"
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments, reason=reason, autonomous=False)
+    if not verdict.clean:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments,
+            reason="review did not produce an actionable clean verdict", autonomous=True)
+    pending_reply = reply_pending(comments)
+    if not record.auto_merge_allowed or ui_gap or pending_reply:
+        reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments, reason=reason, autonomous=True)
+
+    # CI already completed in prepare_completed, outside SQLite's write transaction. Recheck it
+    # once without polling, together with the exact head, immediately before merge.
+    ci_green = _REVIEW_CI_OBSERVED.pop(record.identity, None)
+    if ci_green is None:
+        return None
+    if not ci_green:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments,
+            reason="CI did not complete successfully within the review settlement window",
+            autonomous=True)
+    decision = decide_merge(
+        verdict=verdict, ci_green=True, reviewer_tool=record.pool,
+        builder_tool=record.builder_lineage or "", revises_used=record.round,
+        ui_evidence_missing=False, reply_pending=False)
+    if decision is not MergeDecision.MERGE:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments,
+            reason="could not be auto-merged after review", autonomous=True)
+    if _review_pr_head(record) != record.target:
+        return None
+    if not ci_is_green(record.repo, pr, timeout=0, interval=0):
+        return None
+    if not squash_merge(record.repo, pr):
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments,
+            reason="could not be squash-merged (branch protection, conflict, or transient error)",
+            autonomous=True)
+    slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+    _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
+                   record.pool, pr, slug, merged=True)
+    ratchet.record_once(
+        record.repo, ratchet.CLEAN_MERGE if record.round == 0 else "merge_after_revise",
+        record.identity)
+    _run(["gh", "issue", "edit", str(record.subject), "--repo", record.repo,
+          "--remove-label", "ready-for-agent"])
+    return f"https://github.com/{record.repo}/pull/{pr}"
+
+
 def _park_respond(record) -> str | None:
     """Create Respond's record-specific park proof and idempotent phone notification.
 
@@ -990,13 +1145,16 @@ def _round_evidence(comment: dict, opened_at: int) -> bool:
     ``createdAt`` is missing or unparseable cannot be proven to postdate the round, so it fails
     closed."""
     from agentflow.gate import PR_MARK, has_image_evidence
-    from agentflow.runner import _iso_to_epoch
     body = comment.get("body", "") or ""
     if PR_MARK not in body or not has_image_evidence(body):
         return False
     if not opened_at:
         return True
-    created = _iso_to_epoch(comment.get("createdAt", "") or "")
+    try:
+        created = datetime.fromisoformat(
+            str(comment.get("createdAt", "") or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        created = None
     return created is not None and created > opened_at
 
 
@@ -1113,6 +1271,32 @@ def _open_pr_for_branch(repo: str, branch: str) -> dict | None:
     return prs[0]
 
 
+def _review_context(record) -> tuple[str, str] | None:
+    """The issue-anchored acceptance brief and declared UI surfaces for a Review."""
+    from agentflow.loop import _run, _surfaces_phrase, ui_surfaces
+
+    parts = _build_source_parts(record)
+    if parts is None:
+        return None
+    workdir, _slug = parts
+    acceptance = record.input_ptr if record.stage == "build" and record.input_ptr else None
+    if acceptance is None:
+        viewed = _run(["gh", "issue", "view", str(record.subject), "--repo", record.repo,
+                       "--json", "body"])
+        if viewed.returncode != 0:
+            return None
+        try:
+            payload = json.loads(viewed.stdout or "{}")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        acceptance = payload.get("body")
+        if not isinstance(acceptance, str):
+            return None
+    return acceptance, _surfaces_phrase(ui_surfaces(workdir))
+
+
 def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> None:
     """A completed Build opens exactly one waiting Review for the exact PR head SHA and transfers
     the change claim before the Build record retires — no ownership gap (ADR 0028). Submission is
@@ -1131,9 +1315,14 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
     pr = _open_pr_for_branch(build.repo, branch)
     if pr is None:
         return
+    context = _review_context(build)
+    if context is None:
+        return
+    acceptance, surfaces = context
     reviewer_tool = "codex" if build.pool == "claude" else "claude"
     submission = review_submission(
-        build, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"))
+        build, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"),
+        acceptance=acceptance, surfaces=surfaces)
     if submission is not None:
         coord.submit_stage(submission)
 
@@ -1164,7 +1353,8 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
     verdict = _review_verdict(review)
     if verdict.clean or not verdict.blocking:
         return  # a clean (or non-blocking) verdict is the merge path, not a revise
-    if not revise_round_budget_remains(records.values(), review.repo, review.subject):
+    if (review.round >= MAX_REVISES
+            or not revise_round_budget_remains(records.values(), review.repo, review.subject)):
         # The auto-revise rounds are spent and the review still blocks: no revise, review, or
         # merge stage will ever consume this outcome, so park the PR for a human exactly once and
         # release the review's retained claim rather than leaving the PR owned forever (ADR 0028).
@@ -1207,9 +1397,14 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
     pr = _open_pr_for_branch(revise.repo, branch)
     if pr is None:
         return
+    context = _review_context(revise)
+    if context is None:
+        return
+    acceptance, surfaces = context
     reviewer_tool = "codex" if revise.builder_lineage == "claude" else "claude"
     submission = review_submission(
-        revise, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"))
+        revise, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"),
+        acceptance=acceptance, surfaces=surfaces)
     if submission is not None:
         coord.submit_stage(submission)
 
@@ -1220,7 +1415,7 @@ _OPENERS = {"build": _open_review_on_completed_build,
             "revise": _open_review_on_completed_revise}
 
 
-def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> list:
+def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     """Reconcile every Build/Review/Revise pool and republish the live board as a projection of the
     running records (ADR 0030). A completed Build opens its Review, a blocking Review opens its
     Revise, and a completed Revise opens its next Review — each before the projection, so the claim
@@ -1251,9 +1446,5 @@ def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> lis
                     # store is the truth; skip and let the next pass re-read it.
                     continue
     records = tracer.load_records()
-    owned = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
-    live.replace_projection(
-        tracer.live_projection(records),
-        owned_worktrees=None if phase.name == COORDINATED else owned,
-    )
+    live.replace_projection(tracer.live_projection(records))
     return outcomes

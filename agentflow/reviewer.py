@@ -19,20 +19,17 @@ false `clean=True`. The invariants now enforced:
   as blocking (so "critical"/"BLOCKER"/"" don't leak through as nits).
 - Malformed containers, duplicate keys, and any parse exception → not-clean.
 
-Deep module: `Reviewer(other_tool).review(...) -> Verdict`. `parse_verdict` is pure
-— the test surface — and every adversarial case above is a regression test.
+Review launch is owned by the session coordinator. This module keeps the durable prompt,
+worktree naming, and pure verdict parser used by that adapter.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentflow import live
-from agentflow.runner import Complexity, _WorktreeRunner, _run, worktree_session
 
 # Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
 # "blocker", "high", unknown) is treated as blocking — fail safe.
@@ -182,49 +179,6 @@ the JSON must be the LAST thing in your message and must parse:
   "reviewed_sha": "<the headRefOid you fetched above>",
   "findings": [{{"severity": "blocking" | "nit", "file": "path", "line": 0, "summary": "..."}}]}}
 "verdict" is PASS only if there are zero blocking findings."""
-
-
-class Reviewer:
-    """Runs the OTHER tool as an independent reviewer and returns its verdict."""
-
-    def __init__(self, runner: _WorktreeRunner):
-        self.runner = runner  # the tool that did NOT build this PR
-
-    def review(self, repo: str, workdir: str, pr_number: int, pr_head_branch: str,
-               slug: str, acceptance: str = "",
-               surfaces: str = "any user-facing surface",
-               issue_number: int | None = None, title: str = "") -> Verdict:
-        head_sha = self._head_sha(repo, pr_number)
-        if not head_sha:
-            return _unparseable("could not read PR head SHA")
-
-        wt = review_worktree(workdir, self.runner.tool, pr_number, slug)
-        try:
-            self.runner.prepare_worktree_detached(workdir, f"origin/{pr_head_branch}", wt)
-            self.runner.provision(wt)
-        except subprocess.CalledProcessError as e:
-            return _unparseable(f"review worktree/provision failed: {e}")
-
-        # The verdict is the reviewer's captured final message — read by US, not a
-        # model-written file in the (untrusted) PR tree, so a builder cannot forge it.
-        prompt = REVIEW_PROMPT.format(pr=pr_number, acceptance=acceptance or "(none provided)",
-                                      surfaces=surfaces)
-        # Cross-review is always the deep safety net, independent of builder sizing.
-        model = self.runner.model_for(Complexity.DEEP)
-        session = live.Session(repo=repo, number=issue_number if issue_number is not None else pr_number,
-                               title=title, stage="reviewing", tool=self.runner.tool,
-                               model=model, branch=pr_head_branch)
-        with worktree_session(wt, session):
-            ok, message = self.runner.launch(prompt, cwd=str(wt), model=model)
-        if not ok:
-            return _unparseable("reviewer session errored (launch non-zero)")
-        v = parse_verdict(message, expected_sha=head_sha)
-        return Verdict(v.clean, v.findings, v.parsed, v.detail, reviewer_tool=self.runner.tool)
-
-    def _head_sha(self, repo: str, pr_number: int) -> str:
-        r = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
-                  "--json", "headRefOid", "-q", ".headRefOid"])
-        return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def review_worktree(workdir: str, tool: str, pr_number: int, slug: str) -> Path:

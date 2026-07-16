@@ -11,17 +11,15 @@ from agentflow.gate import respond_reply_disclaimer
 from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body
 from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
                             REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
-                            _build_review_merge, _free_to_dispatch, _issues_in_flight,
-                            _main_config, _mockup_eligible, _next_mockup_issue,
+                            _free_to_dispatch, _issues_in_flight,
+                            _mockup_eligible, _next_mockup_issue,
                             _next_pr_awaiting_reply, _next_ready_issue, _next_resumable_issue,
                             _rebase_survivor, _untriaged, base_advanced, build_issue,
                             complexity_from_labels, conflict_already_flagged, effort_from_labels,
                             held_build_result, intake_allowlist, issue_of_branch, pr_number,
-                            produce_once, reclaim_claims, reclaim_triage_claims,
                             recheck_once, repo_profile,
-                            respond_once, slug, ui_surfaces)
-from agentflow.reviewer import Verdict
-from agentflow.runner import BuildOutcome, BuildStatus, Complexity, Effort
+                            slug, ui_surfaces)
+from agentflow.runner import Complexity, Effort
 
 
 class _FakeRun:
@@ -260,69 +258,6 @@ def test_next_ready_issue_sees_blocker_preserved_by_intake(monkeypatch):
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
 
 
-def test_reclaim_claims_strips_nothing_when_in_flight_unknown(monkeypatch):
-    # The reclaim exists to prevent duplicates; failing open here would *create* one by
-    # clearing a live build's claim on a transient `gh` error.
-    claimed = [{"number": 7}]
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(claimed)))
-    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
-    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(n))
-    assert reclaim_claims(RepoConfig("o/r", ".")) == 0
-    assert released == []
-
-
-def test_reclaim_keeps_a_claim_a_live_session_still_holds(monkeypatch):
-    # Concurrent dispatch means a build is live at the top of a cycle before its PR exists —
-    # so reclaim must key on real session evidence (the live board), not just the open-PR
-    # check, or it would strip a running build's claim and let a duplicate start (issue #74).
-    claimed = [{"number": 7}, {"number": 8}]
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(claimed)))
-    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())   # neither has a PR yet
-    monkeypatch.setattr(loop.live, "running",
-                        lambda: [{"repo": "o/r", "number": 7, "stage": "building"}])
-    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(n))
-    # #7 has a live session → kept; #8 has neither PR nor session → genuinely stale.
-    assert reclaim_claims(RepoConfig("o/r", ".")) == 1
-    assert released == [8]
-
-
-def test_reclaim_never_strips_a_claim_a_coordinator_record_owns(monkeypatch):
-    # A coordinator record can hold `agentflow:building` while it waits between provider
-    # sessions — the claim legitimately outlives the process now (ADR 0028). Reclaim must skip
-    # it, or it would clear coordinator ownership and let a duplicate build in (issue #103).
-    claimed = [{"number": 7}, {"number": 8}]
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(claimed)))
-    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())   # neither has a PR yet
-    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())  # nor a session
-    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(n))
-    # #7 is owned by a coordinator record → kept; #8 is owned by nothing → genuinely stale.
-    assert reclaim_claims(RepoConfig("o/r", "."), coordinator_owned={7}) == 1
-    assert released == [8]
-
-
-def _triaging(number: int, *state_labels: str) -> dict:
-    return {"number": number,
-            "labels": [{"name": "agentflow:triaging"}] + [{"name": s} for s in state_labels]}
-
-
-def test_reclaim_triage_frees_a_stranded_claim_for_the_intake_queue(monkeypatch):
-    # A daemon killed mid-grounding leaves the triaging claim on the issue with no state label
-    # stamped yet — the queue then skips it forever. The cycle must clear it so it re-enters.
-    stranded = _triaging(69)
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([stranded])))
-    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
-
-    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 1
-    assert released == [69]
-    # Dropping the claim (its only queue-excluding label) makes the issue selectable again.
-    assert _untriaged({"number": 69, "labels": []})
-
-
 def test_release_triage_proves_the_claim_is_absent(monkeypatch):
     calls = iter((
         _FakeRun('{"labels":[{"name":"agentflow:triaging"}]}'),
@@ -354,53 +289,6 @@ def test_release_triage_accepts_an_already_absent_claim(monkeypatch):
 
     assert loop._release_triage("o/r", 69) is True
     assert len(calls) == 1
-
-
-def test_reclaim_triage_keeps_a_coordinator_owned_continuation(monkeypatch):
-    owned = _triaging(69)
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([owned])))
-    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
-
-    assert reclaim_triage_claims(RepoConfig("o/r", "."), coordinator_owned={69}) == 0
-    assert released == []
-
-
-def test_reclaim_triage_keeps_a_claim_with_an_intake_outcome(monkeypatch):
-    # A claim alongside a state label is a genuinely-triaged issue (or a rarer double failure,
-    # out of scope) — the no-outcome reclaim must not touch it.
-    resolved = _triaging(70, "ready-for-agent")
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([resolved])))
-    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
-
-    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 0
-    assert released == []
-
-
-def test_reclaim_triage_keeps_a_claim_a_live_session_still_holds(monkeypatch):
-    # An intake genuinely in flight this cycle has no state label yet — the live board, not
-    # cycle position, is what keeps its claim (the seam for concurrent dispatch, issue #74).
-    stranded, live_now = _triaging(69), _triaging(70)
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps([stranded, live_now])))
-    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: {70})
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
-
-    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 1
-    assert released == [69]
-
-
-def test_reclaim_triage_strips_nothing_when_listing_errors(monkeypatch):
-    # Fail closed, exactly as the build path does: a `gh` blip must never strip a live claim.
-    released = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(returncode=1))
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(n))
-
-    assert reclaim_triage_claims(RepoConfig("o/r", ".")) == 0
-    assert released == []
 
 
 def test_held_build_result_holds_instead_of_requeueing():
@@ -459,118 +347,34 @@ def test_work_order_helper_is_gone():
     assert not hasattr(loop, "_work_order")
 
 
-def test_dispatch_build_builds_guarded_from_the_brief(monkeypatch):
-    # ADR 0022: a guarded repo no longer needs a frozen work-order comment — it builds from
-    # the Agent Brief in the issue body like every profile. Fails first if the guarded branch
-    # still bails with "needs a frozen work order".
-    monkeypatch.setattr(loop, "repo_profile", lambda wd: "guarded")
-    monkeypatch.setattr(loop, "pick_pair", lambda operator=False: (object(), object(), ""))
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: None)
-    monkeypatch.setattr(loop, "_release", lambda repo, n: None)
-    seen = {}
-
-    def fake_brm(cfg, issue, n, sl, complexity, effort, builder, reviewer_runner, profile, build_prompt):
-        seen["profile"], seen["prompt"] = profile, build_prompt
-        return f"#{n}: built"
-
-    monkeypatch.setattr(loop, "_build_review_merge", fake_brm)
-    issue = {"number": 3, "title": "Insulin math", "body": "THE AGENT BRIEF BODY",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:deep"}]}
-    assert loop._dispatch_build(RepoConfig("o/r", "/tmp/x"), issue) == "#3: built"
-    assert seen["profile"] == "guarded"
-    assert "THE AGENT BRIEF BODY" in seen["prompt"]   # built from the Brief, not a work order
-
-
-def test_dispatch_build_emits_routing_log_before_session(monkeypatch):
-    """_log is called with 'routing → <tool> (build)' the instant a builder is chosen,
-    before the long session starts. Fails first if the log call is missing or comes after."""
-    class _FakeBuilder:
-        tool = "codex"
-
-    log_calls = []
-    brm_calls = []
-
-    def fake_brm(*a, **k):
-        brm_calls.append(list(log_calls))   # snapshot log state at session start
-        return "#7: built"
-
-    monkeypatch.setattr(loop, "repo_profile", lambda wd: "autonomous")
-    monkeypatch.setattr(loop, "pick_pair", lambda operator=False: (_FakeBuilder(), None, ""))
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: None)
-    monkeypatch.setattr(loop, "_release", lambda repo, n: None)
-    monkeypatch.setattr(loop, "_build_review_merge", fake_brm)
-    issue = {"number": 7, "title": "t", "body": "b",
-             "labels": [{"name": "agentflow:complexity:standard"}]}
-    loop._dispatch_build(RepoConfig("o/r", "/tmp"), issue, _log=log_calls.append)
-    assert any("routing → codex (build)" in m for m in log_calls)
-    assert brm_calls and any("routing" in m for m in brm_calls[0])   # logged before session
-
-
-def test_dispatch_build_deferral_includes_block_reason(monkeypatch):
-    """When no pool has headroom the deferral message names the per-pool block reason."""
-    monkeypatch.setattr(loop, "pick_pair",
-                        lambda operator=False: (None, None, "codex: rate limited, claude: active session"))
-    issue = {"number": 9, "title": "t", "body": "b",
-             "labels": [{"name": "agentflow:complexity:standard"}]}
-    out = loop._dispatch_build(RepoConfig("o/r", "/tmp"), issue)
-    assert "codex: rate limited" in out
-    assert "claude: active session" in out
-    assert "deferring" in out
-
-
-def test_intake_once_emits_routing_log_before_session(monkeypatch):
-    """_log is called with 'routing → <tool> (intake)' before the intake session starts."""
-    class _FakeBuilder:
-        tool = "claude"
-        def __init__(self): pass
-
-    log_calls = []
-    intake_calls = []
-
-    class _FakeIntake:
-        def __init__(self, runner): pass
-        def intake(self, *a, **k):
-            intake_calls.append(list(log_calls))   # snapshot log state at session start
-            from agentflow.intake import IntakeResult, IntakeRoute
-            return IntakeResult(route=IntakeRoute.READY, body="scoped to ready")
-
-    issue = {"number": 5, "title": "t", "labels": [], "state": "OPEN"}
-    monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
-    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg, reserved=frozenset(): issue)
-    monkeypatch.setattr(loop, "pick_pair", lambda: (_FakeBuilder(), None, ""))
-    monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: None)
-    monkeypatch.setattr(loop, "Intake", _FakeIntake)
-    monkeypatch.setattr(loop, "apply_intake", lambda *a, **k: "scoped to ready")
-    loop.intake_once(RepoConfig("o/r", "/tmp"), _log=log_calls.append)
-    assert any("routing → claude (intake)" in m for m in log_calls)
-    assert intake_calls and any("routing" in m for m in intake_calls[0])   # logged before session
-
-
-def test_intake_once_deferral_includes_block_reason(monkeypatch):
-    """When no pool has headroom the intake deferral names the per-pool block reason."""
-    issue = {"number": 3, "title": "t", "labels": []}
-    monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
-    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg, reserved=frozenset(): issue)
-    monkeypatch.setattr(loop, "pick_pair", lambda: (None, None, "codex: busy, claude: you"))
-    out = loop.intake_once(RepoConfig("o/r", "/tmp"))
-    assert "codex: busy" in out and "claude: you" in out
-    assert "deferring" in out
-
-
 def _issue_view(monkeypatch, issue):
     """Point loop._run at a canned `gh issue view` payload for build_issue's fetch."""
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun(json.dumps(issue)))
 
 
-def test_build_issue_dispatches_a_ready_free_issue(monkeypatch):
+def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
+    from agentflow import coordinated_build
+
     issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
              "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "_dispatch_build",
-                        lambda cfg, iss, operator=False: f"#{iss['number']}: dispatched op={operator}")
-    assert build_issue(RepoConfig("o/r", "/tmp"), 5) == "#5: dispatched op=True"
+    monkeypatch.setattr(loop, "pick_pair",
+                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(loop, "_claim", lambda repo, n: True)
+    submission = object()
+    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
+    submitted = []
+    coordinator = SimpleNamespace(submit_stage=submitted.append)
+    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coordinator)
+    reconciled = []
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project", reconciled.append)
+
+    out = build_issue(RepoConfig("o/r", "/tmp"), 5)
+
+    assert out == "#5: submitted to coordinator → claude (build)"
+    assert submitted == [submission]
+    assert reconciled == [coordinator]
 
 
 def test_build_issue_refuses_an_open_blocker(monkeypatch):
@@ -586,9 +390,6 @@ def test_build_issue_refuses_an_open_blocker(monkeypatch):
 
     monkeypatch.setattr(loop, "_run", fake_run)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "_dispatch_build",
-                        lambda *a, **k: pytest.fail("must not bypass the blocker"))
-
     out = build_issue(RepoConfig("o/r", "/tmp"), 42)
 
     assert "blocker" in out.lower()
@@ -598,7 +399,6 @@ def test_build_issue_refuses_a_held_issue_and_points_at_pickup(monkeypatch):
     issue = {"number": 7, "state": "OPEN", "title": "t", "body": "b",
              "labels": [{"name": "agentflow:needs-grilling"}]}
     _issue_view(monkeypatch, issue)
-    monkeypatch.setattr(loop, "_dispatch_build", lambda *a: pytest.fail("must not build a held issue"))
     out = build_issue(RepoConfig("o/r", "/tmp"), 7)
     assert "pickup" in out and "7" in out
 
@@ -606,7 +406,6 @@ def test_build_issue_refuses_a_held_issue_and_points_at_pickup(monkeypatch):
 def test_build_issue_refuses_an_untriaged_issue_and_points_at_triage(monkeypatch):
     issue = {"number": 8, "state": "OPEN", "title": "t", "body": "b", "labels": [{"name": "bug"}]}
     _issue_view(monkeypatch, issue)
-    monkeypatch.setattr(loop, "_dispatch_build", lambda *a: pytest.fail("must not build an un-triaged issue"))
     out = build_issue(RepoConfig("o/r", "/tmp"), 8)
     assert "triage" in out or "scope" in out
 
@@ -697,91 +496,8 @@ def test_build_issue_refuses_an_in_flight_issue(monkeypatch):
              "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:deep"}]}
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: {9})   # an open agentflow PR owns it
-    monkeypatch.setattr(loop, "_dispatch_build", lambda *a: pytest.fail("must not double-dispatch"))
     out = build_issue(RepoConfig("o/r", "/tmp"), 9)
     assert "flight" in out.lower() or "claim" in out.lower()
-
-
-def test_failed_merge_parks_and_pings(monkeypatch):
-    # A squash-merge failure (branch protection, conflict, transient error) must not
-    # silently idle — it must park the PR, ping, and record a ratchet event.
-    CLEAN_VERDICT = Verdict(clean=True)
-
-    class _FakeBuilder:
-        tool = "claude"
-        def build(self, task):
-            return BuildOutcome(BuildStatus.PR_OPENED, pr_url="https://github.com/o/r/pull/42")
-
-    class _FakeReviewer:
-        tool = "codex"
-
-    parked, notified, recorded = [], [], []
-
-    monkeypatch.setattr(loop, "ci_is_green", lambda repo, pr: True)
-    monkeypatch.setattr(loop, "squash_merge", lambda repo, pr: False)
-    monkeypatch.setattr(loop, "park",
-                        lambda repo, pr, verdict, reason="": parked.append((repo, pr, reason)))
-    monkeypatch.setattr(loop, "notify",
-                        lambda title, msg, url="": notified.append((title, msg)))
-    monkeypatch.setattr(loop.ratchet, "record",
-                        lambda repo, outcome: recorded.append(outcome))
-
-    class _PatchedReviewer:
-        def __init__(self, runner): pass
-        def review(self, *args, **kwargs): return CLEAN_VERDICT
-
-    monkeypatch.setattr(loop, "Reviewer", _PatchedReviewer)
-
-    cfg = RepoConfig("o/r", "/tmp")
-    issue = {"number": 42, "title": "t", "body": ""}
-    out = _build_review_merge(cfg, issue, 42, "t", Complexity.STANDARD, Effort.MEDIUM,
-                              _FakeBuilder(), _FakeReviewer(), "autonomous", "build")
-
-    assert "merge failed" in out
-    assert parked, "park must be called on merge failure"
-    assert parked[0][1] == 42
-    assert "branch protection" in parked[0][2] or "squash" in parked[0][2]
-    assert notified, "notify must be called on merge failure"
-    assert "needs you" in notified[0][0]
-    assert "parked" in recorded
-
-
-def test_reviewed_path_parks_a_screenshotless_ui_change_on_the_gate(monkeypatch):
-    # ADR 0018: a reviewed/guarded repo hands the PR to a human either way, but the
-    # mechanical UI-evidence gate still runs — a UI change with no screenshot must park
-    # with the missing-screenshot reason, not the generic "a human merges". Fails first
-    # if the reviewed branch skips ui_evidence_gap and parks with the profile reason.
-    from agentflow.reviewer import Verdict
-    from agentflow.runner import BuildOutcome, BuildStatus
-
-    class _Builder:
-        tool = "claude"
-        def build(self, task):
-            return BuildOutcome(BuildStatus.PR_OPENED, pr_url="https://github.com/o/r/pull/7")
-
-    class _FakeReviewer:
-        def __init__(self, runner): pass
-        def review(self, *a, **k):
-            return Verdict(clean=True)   # review says clean; the gate must still bite
-
-    reviewer_runner = type("R", (), {"tool": "codex"})()
-    monkeypatch.setattr(loop, "Reviewer", _FakeReviewer)
-    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
-    monkeypatch.setattr(loop, "ui_evidence_gap", lambda repo, pr, surfaces: True)
-    monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "_pr_comments",
-                        lambda repo, pr: [{"body": "> *agentflow: parked for human review.*"}])
-    removed = []
-    monkeypatch.setattr(loop, "remove_worktree_if_safe",
-                        lambda workdir, wt: removed.append(str(wt)) or True)
-    parked = {}
-    monkeypatch.setattr(loop, "park", lambda repo, pr, verdict, reason: parked.update(reason=reason))
-
-    loop._build_review_merge(RepoConfig("o/r", "/tmp"), {"body": ""}, 5, "x",
-                             Complexity.STANDARD, Effort.MEDIUM, _Builder(),
-                             reviewer_runner, "reviewed", "prompt")
-    assert "screenshot" in parked["reason"].lower()
-    assert removed == ["/tmp/.agentflow/worktrees/codex-review/pr-7-x"]
 
 
 # --- issue #18: answering maintainer comments on parked PRs ---------------------
@@ -836,66 +552,6 @@ def test_next_pr_awaiting_reply_ignores_human_branches(monkeypatch):
     prs = [{"number": 9, "headRefName": "my-hotfix"}]
     _pr_gh(monkeypatch, prs, {9: [{"body": _MAINT}]})
     assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) is None
-
-
-def test_respond_once_replies_without_merging_or_new_pr(monkeypatch):
-    # The responder's contract: a marker-prefixed reply, same branch, never a merge and
-    # never a new PR. Fails first if respond_once touches squash_merge or opens a PR.
-    prs = [{"number": 8, "headRefName": "agentflow/claude/issue-4-other",
-            "headRefOid": "head-8"}]
-    _pr_gh(monkeypatch, prs, {8: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"}]})
-    monkeypatch.setattr(loop, "_checkout_pr_branch", lambda cfg, branch, wt: True)
-    monkeypatch.setattr(loop, "_pr_comments",
-                        lambda repo, pr: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"},
-                                          {"body": respond_reply_disclaimer("IC_8")}])
-    removed = []
-    monkeypatch.setattr(loop, "remove_worktree_if_safe",
-                        lambda workdir, wt: removed.append(str(wt)) or True)
-
-    launched = {}
-
-    class _FakeRunner:
-        tool = "claude"
-        def provision(self, wt): pass
-        def model_for(self, c): return "opus"
-        def launch(self, prompt, cwd, model):
-            launched["prompt"] = prompt
-            return True, "replied"
-        def build(self, task): pytest.fail("responder must never build/open a PR")
-
-    monkeypatch.setattr(loop, "pick_pair", lambda: (_FakeRunner(), None, ""))
-    monkeypatch.setattr(loop, "squash_merge", lambda *a: pytest.fail("responder must never merge"))
-
-    out = respond_once(RepoConfig("o/r", "/tmp"))
-    assert "8" in out and "maintainer" in out.lower()
-    assert _MAINT in launched["prompt"]              # answers what was asked
-    assert "same branch" in launched["prompt"].lower()   # pushes fixes to the PR branch
-    assert removed == ["/tmp/.agentflow/worktrees/claude/issue-4-other"]
-
-
-def test_respond_once_noop_when_nothing_pending(monkeypatch):
-    _pr_gh(monkeypatch, [{"number": 7, "headRefName": "agentflow/claude/issue-3-x",
-                          "headRefOid": "head-7"}],
-           {7: [{"body": _PARK}]})   # our marker had the last word
-    monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("no PR pending — don't spawn"))  # never returns
-    assert respond_once(RepoConfig("o/r", ".")) == "no parked PRs awaiting reply"
-
-
-def test_responder_retains_worktree_when_reply_cannot_be_verified(monkeypatch):
-    monkeypatch.setattr(loop, "_next_pr_awaiting_reply",
-                        lambda cfg: (8, "agentflow/claude/issue-4-other", _MAINT,
-                                     "IC_8", "head-8"))
-    monkeypatch.setattr(loop, "_checkout_pr_branch", lambda *a: True)
-    monkeypatch.setattr(loop, "_pr_comments", lambda *a: None)
-    monkeypatch.setattr(loop, "remove_worktree_if_safe",
-                        lambda *a: pytest.fail("unknown state must retain the worktree"))
-
-    runner = SimpleNamespace(tool="claude", provision=lambda wt: None,
-                             model_for=lambda c: "opus",
-                             launch=lambda *a, **k: (True, "done"))
-    monkeypatch.setattr(loop, "pick_pair", lambda: (runner, None, ""))
-
-    assert "retaining" in respond_once(RepoConfig("o/r", "/tmp"))
 
 
 def test_pr_branch_checkout_refuses_to_reset_recoverable_work(monkeypatch, tmp_path):
@@ -999,123 +655,6 @@ def test_produce_prompt_drives_ui_mockups_headless_and_one_marked_comment():
     assert "push" in body.lower()               # variant HTML preserved on a branch, not lost
 
 
-def test_produce_once_selects_claims_and_spawns(monkeypatch):
-    # The phase draws the selected issue: claims it, spawns a session with the produce prompt in a
-    # mockup worktree, and releases the claim afterward. Never opens a PR.
-    issue = {"number": 11, "title": "New panel", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg, reserved=frozenset(): issue)
-
-    class _Builder:
-        tool = "claude"
-        def prepare_worktree(self, workdir, branch, wt, repo=None): pass
-        def provision(self, wt): pass
-        def model_for(self, c): return "opus"
-        def launch(self, prompt, cwd, model):
-            launched["prompt"] = prompt
-            return True, "drew"
-        def build(self, task): pytest.fail("produce must never build/open a PR")
-
-    launched, claimed, released = {}, [], []
-    monkeypatch.setattr(loop, "pick_pair", lambda: (_Builder(), None, ""))
-    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
-    monkeypatch.setattr(loop, "_claim_mockup", lambda repo, n: claimed.append(n))
-    monkeypatch.setattr(loop, "_release_mockup", lambda repo, n: released.append(n))
-    monkeypatch.setattr(loop, "_issue_comments", lambda repo, n: [])
-    monkeypatch.setattr(loop, "notify", lambda title, msg, url="": None)
-    out = produce_once(RepoConfig("o/r", "/tmp"))
-    assert "11" in out and "drew mockup variants" in out
-    assert claimed == [11] and released == [11]
-    assert "/ui-mockups" in launched["prompt"]
-    assert _MOCKUP_DISCLAIMER in launched["prompt"]
-
-
-def test_produce_once_noop_when_nothing_parked(monkeypatch):
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: None)
-    monkeypatch.setattr(loop, "pick_pair", lambda: pytest.fail("nothing to draw — don't spawn"))
-    assert produce_once(RepoConfig("o/r", ".")) == "no needs-mockup issues to draw"
-
-
-def test_produce_once_deferral_names_the_block_reason(monkeypatch):
-    issue = {"number": 3, "title": "t", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg, reserved=frozenset(): issue)
-    monkeypatch.setattr(loop, "pick_pair", lambda: (None, None, "codex: busy, claude: you"))
-    out = produce_once(RepoConfig("o/r", "/tmp"))
-    assert "codex: busy" in out and "deferring" in out
-
-
-# --- issue #55: notify maintainer when produce_once posts a result ----------------------
-
-def _stub_produce(monkeypatch, *, launch_ok, comments):
-    """Drive produce_once with a canned launch result and issue comments; return recorded pings."""
-    issue = {"number": 11, "title": "A screen", "body": "b",
-             "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg, reserved=frozenset(): issue)
-
-    class _Builder:
-        tool = "claude"
-        def prepare_worktree(self, workdir, branch, wt, repo=None): pass
-        def provision(self, wt): pass
-        def model_for(self, c): return "opus"
-        def launch(self, prompt, cwd, model): return launch_ok, ""
-
-    monkeypatch.setattr(loop, "pick_pair", lambda: (_Builder(), None, ""))
-    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: ["agentflow/static/"])
-    monkeypatch.setattr(loop, "_claim_mockup", lambda repo, n: None)
-    monkeypatch.setattr(loop, "_release_mockup", lambda repo, n: None)
-    monkeypatch.setattr(loop, "_issue_comments", lambda repo, n: comments)
-    pings = []
-    monkeypatch.setattr(loop, "notify", lambda title, msg, url="": pings.append((title, msg, url)))
-    return pings
-
-
-def test_produce_once_notifies_when_variants_posted(monkeypatch):
-    # A confirmed variant-round comment triggers exactly 1 notification pointing at the issue.
-    # Fails first if produce_once is silent after a real variant comment lands.
-    pings = _stub_produce(monkeypatch, launch_ok=True,
-                          comments=[{"body": f"{_MOCKUP_DISCLAIMER}\n\n## Variant A\n..."}])
-    removed = []
-    monkeypatch.setattr(loop, "remove_worktree_if_safe",
-                        lambda workdir, wt: removed.append(str(wt)) or True)
-    out = produce_once(RepoConfig("o/r", "/tmp"))
-    assert "drew mockup variants" in out
-    assert len(pings) == 1
-    title, msg, url = pings[0]
-    assert title == "agentflow needs you"
-    assert "o/r" in msg and "11" in msg
-    assert url == "https://github.com/o/r/issues/11"
-    assert "MISSING-CONTEXT" not in msg
-    assert removed == ["/tmp/.agentflow/worktrees/claude/mockup-11-a-screen"]
-
-
-def test_produce_once_notifies_missing_context(monkeypatch):
-    # A MISSING-CONTEXT comment triggers a distinct notification, never the variants-ready one.
-    pings = _stub_produce(monkeypatch, launch_ok=True,
-                          comments=[{"body": f"{_MOCKUP_DISCLAIMER}\nMISSING-CONTEXT: no surface found"}])
-    out = produce_once(RepoConfig("o/r", "/tmp"))
-    assert "MISSING-CONTEXT" in out
-    assert len(pings) == 1
-    title, msg, url = pings[0]
-    assert title == "agentflow needs you"
-    assert "MISSING-CONTEXT" in msg or "stuck" in msg.lower()
-    assert url == "https://github.com/o/r/issues/11"
-
-
-def test_produce_once_no_notify_on_session_error(monkeypatch):
-    # A failed session (ok=False) causes 0 notifications — the issue stays eligible for retry.
-    pings = _stub_produce(monkeypatch, launch_ok=False, comments=[])
-    out = produce_once(RepoConfig("o/r", "/tmp"))
-    assert "errored" in out
-    assert pings == []
-
-
-def test_produce_once_no_notify_without_confirmed_post(monkeypatch):
-    # ok=True but no MOCKUP_MARK comment found — session exited without posting, no notification.
-    pings = _stub_produce(monkeypatch, launch_ok=True, comments=[])
-    out = produce_once(RepoConfig("o/r", "/tmp"))
-    assert "drew mockup variants" in out
-    assert pings == []
-
-
 # --- issue #45: re-rebase survivors after main advances (ADR 0009 merge-time floor) -----
 
 def test_base_advanced_only_when_main_moved_past_the_last_rebase():
@@ -1190,6 +729,30 @@ def test_rebase_survivor_autonomous_clean_reruns_the_merge_gate(monkeypatch):
     assert out.endswith(": merged")
 
 
+def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch):
+    from agentflow import coordinated_build
+
+    monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    submission = SimpleNamespace(stage="review", transfer_from=None)
+    monkeypatch.setattr(coordinated_build, "survivor_review_submission",
+                        lambda *args, **kwargs: submission)
+    submitted = []
+    coord = SimpleNamespace(submit_stage=submitted.append)
+    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coord)
+    reconciled = []
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project",
+                        lambda current: reconciled.append(current))
+
+    result = loop._merge_autonomous_survivor(
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude",
+        "agentflow/claude/issue-7-fix")
+
+    assert result == "review submitted"
+    assert submitted == [submission] and reconciled == [coord]
+
+
 def _stub_recheck(monkeypatch, prs, *, advanced, profile, comments=None):
     """Drive recheck_once: canned open-PR list, base-advanced verdicts, and per-PR routing."""
     routed = []
@@ -1243,141 +806,7 @@ def test_recheck_skips_an_already_flagged_or_answered_survivor(monkeypatch):
     assert routed == [], "a flagged or maintainer-answered survivor must not be re-handled"
 
 
-def _wire_survivor_merge(monkeypatch, *, reviewer_tool, ci_green, verdict):
-    """Wire _merge_autonomous_survivor's real gate: a fresh review + CI + decide_merge."""
-    from agentflow.loop import _merge_autonomous_survivor
-
-    class _Reviewer:
-        def __init__(self, runner): pass
-        def review(self, *a, **k): return verdict
-
-    monkeypatch.setattr(loop, "Reviewer", _Reviewer)
-    monkeypatch.setattr(loop, "pick_pair",
-                        lambda: (SimpleNamespace(tool="x"), SimpleNamespace(tool=reviewer_tool), ""))
-    monkeypatch.setattr(loop, "_issue_meta", lambda cfg, n: {"body": "", "labels": []})
-    monkeypatch.setattr(loop, "ui_surfaces", lambda wd: [])
-    monkeypatch.setattr(loop, "ui_evidence_gap", lambda repo, pr, s: False)
-    monkeypatch.setattr(loop, "ci_is_green", lambda repo, pr: ci_green)
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [])
-    monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
-    monkeypatch.setattr(loop.ratchet, "record", lambda *a, **k: None)
-    merged, parked = [], []
-    monkeypatch.setattr(loop, "squash_merge", lambda repo, pr: merged.append(pr) or True)
-    monkeypatch.setattr(loop, "park", lambda repo, pr, v, reason: parked.append(pr))
-    return _merge_autonomous_survivor, merged, parked
-
-
-def test_autonomous_survivor_merges_only_through_the_full_gate(monkeypatch):
-    # Never less safe than reviewed: a survivor lands only on independent review + green CI +
-    # a clean verdict; a same-tool review (no independence) parks even when CI is green.
-    fn, merged, parked = _wire_survivor_merge(monkeypatch, reviewer_tool="codex",
-                                              ci_green=True, verdict=Verdict(clean=True))
-    assert fn(RepoConfig("o/r", "/tmp"), 8, 8, "sl", "claude", "agentflow/claude/issue-8-sl") == "merged"
-    assert merged == [8] and parked == []
-
-    fn, merged, parked = _wire_survivor_merge(monkeypatch, reviewer_tool="claude",
-                                              ci_green=True, verdict=Verdict(clean=True))
-    assert fn(RepoConfig("o/r", "/tmp"), 8, 8, "sl", "claude", "agentflow/claude/issue-8-sl") == "parked"
-    assert merged == [] and parked == [8]   # same-tool review can't auto-merge (ADR 0003)
-
-
-def test_autonomous_survivor_parks_when_ci_is_red(monkeypatch):
-    fn, merged, parked = _wire_survivor_merge(monkeypatch, reviewer_tool="codex",
-                                              ci_green=False, verdict=Verdict(clean=True))
-    assert fn(RepoConfig("o/r", "/tmp"), 8, 8, "sl", "claude", "agentflow/claude/issue-8-sl") == "parked"
-    assert merged == [] and parked == [8]
-
-
 def test_recheck_defers_when_pr_listing_fails(monkeypatch):
     # Unknown is not empty: a gh blip must defer, not read as 'no survivors'.
     monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: None)
     assert "deferring" in recheck_once(RepoConfig("o/r", "/tmp"))
-
-
-def test_pipeline_once_reports_the_mockup_phase(monkeypatch):
-    # AC: the produce phase's one-line result appears in the per-cycle log next to the others.
-    monkeypatch.setattr(loop, "recover_stale_worktrees",
-                        lambda *a: SimpleNamespace(removed=(), retained=()))
-    monkeypatch.setattr(loop, "intake_once", lambda cfg, _log=None: "nothing")
-    monkeypatch.setattr(loop, "run_once", lambda cfg, _log=None: "nothing")
-    monkeypatch.setattr(loop, "produce_once", lambda cfg, _log=None: "#9: drew mockup variants")
-    monkeypatch.setattr(loop, "respond_once", lambda cfg, _log=None: "nothing")
-    monkeypatch.setattr(loop, "recheck_once", lambda cfg: "nothing")
-    out = loop.pipeline_once(RepoConfig("o/r", "/tmp"))
-    assert "mockup: #9: drew mockup variants" in out
-
-
-def test_main_config_parses_repo_and_workdir():
-    # Entrypoint takes repo and optional workdir from argv — no hardcoded sandbox default.
-    cfg = _main_config(["owner/repo", "/some/path"])
-    assert cfg.repo == "owner/repo"
-    assert cfg.workdir == "/some/path"
-
-
-def test_main_config_derives_workdir_from_repo():
-    from pathlib import Path
-    cfg = _main_config(["owner/myrepo"])
-    assert cfg.repo == "owner/myrepo"
-    assert cfg.workdir == str(Path.home() / "Code" / "owner" / "myrepo")
-
-
-def test_main_config_requires_repo():
-    # Passing no args must exit with a usage message, not proceed with the old sandbox default.
-    with pytest.raises(SystemExit):
-        _main_config([])
-
-
-# --- intake no-spam: legacy infra failures stay free of a second retry budget ---
-
-def _stub_intake_once(monkeypatch, result):
-    """Drive intake_once with a canned intake result and record any apply_intake call."""
-    issue = {"number": 5, "title": "t", "labels": []}
-    applied = []
-    monkeypatch.setattr(loop, "_next_resumable_issue", lambda cfg: None)
-    monkeypatch.setattr(loop, "_next_untriaged_issue", lambda cfg, reserved=frozenset(): issue)
-    monkeypatch.setattr(loop, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
-    monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: None)
-    monkeypatch.setattr(loop, "_release_triage", lambda repo, n: None)
-    monkeypatch.setattr(loop, "notify", lambda *a, **k: None)
-    monkeypatch.setattr(loop, "Intake",
-                        lambda builder: SimpleNamespace(intake=lambda *a, **k: result))
-    monkeypatch.setattr(loop, "apply_intake",
-                        lambda repo, n, title, labels, r: applied.append(r) or "applied")
-    monkeypatch.setattr(loop, "intake_result_is_durable", lambda repo, n, result: True)
-    return applied
-
-
-def test_intake_infra_failure_posts_nothing_and_leaves_it_untriaged(monkeypatch):
-    from agentflow.intake import IntakeResult
-
-    result = IntakeResult(IntakeRoute.GRILL, "", parsed=False, infra_failed=True, detail="launch non-zero")
-    applied = _stub_intake_once(monkeypatch, result)
-    out = loop.intake_once(RepoConfig("o/r", "/tmp"))
-    assert applied == [], "an infra failure must post nothing (no apply)"
-    assert "retrying silently" in out
-
-
-def test_repeated_legacy_intake_infra_failures_never_create_an_in_memory_hold(monkeypatch):
-    from agentflow.intake import IntakeResult
-
-    result = IntakeResult(IntakeRoute.GRILL, "", parsed=False, infra_failed=True, detail="launch non-zero")
-    applied = _stub_intake_once(monkeypatch, result)
-    cfg = RepoConfig("o/r", "/tmp")
-    for _ in range(5):
-        assert "retrying silently" in loop.intake_once(cfg)
-    assert applied == []
-
-
-def test_intake_disposes_after_the_routing_is_applied(monkeypatch):
-    from agentflow.intake import IntakeResult
-
-    result = IntakeResult(IntakeRoute.READY, "brief", complexity=Complexity.DEEP,
-                          effort=Effort.MEDIUM)
-    applied = _stub_intake_once(monkeypatch, result)
-    removed = []
-    monkeypatch.setattr(loop, "remove_worktree_if_safe",
-                        lambda workdir, wt: removed.append((len(applied), str(wt))) or True)
-
-    loop.intake_once(RepoConfig("o/r", "/tmp"))
-
-    assert removed == [(1, "/tmp/.agentflow/worktrees/claude-intake/issue-5")]

@@ -1,4 +1,4 @@
-"""The persistent orchestrator daemon (ADR 0011) — brain persistent, hands ephemeral.
+"""The persistent orchestrator daemon — durable coordinator, ephemeral provider hands.
 
 Two clocks (issue #80). A **fast tick** (~15s) asks a cheap cross-fleet change-probe one
 question — a single API call for the whole fleet — and pays for a full dispatch pass only when
@@ -15,7 +15,8 @@ Properties:
   free on the fast clock: the probe isn't even asked, so a paused daemon makes zero network calls
   between heartbeats.
 - **Crash-tolerant** — each cycle is independent; an exception is logged and the loop
-  continues. State of record is GitHub, so a restart loses nothing.
+  continues. The coordinator store owns attempts, continuations, claims, and permits; GitHub owns
+  issue/PR outcomes. A restart reconciles both before starting more work.
 - **Sole snapshot producer** — it publishes the GitHub-backed fleet snapshot the console serves
   on the slow heartbeat clock (dormant included, so a paused board still refreshes) and after any
   full pass — never on the cheap fast tick, which must stay within its call budget. So watching
@@ -23,18 +24,14 @@ Properties:
   (ADR 0026). The web server (`agentflow-web`) only ever reads the published file.
 - **Single instance** — a lock dir (stamped with the owner's pid) prevents overlapping
   runs; a background thread heartbeats the lock every ~60s so even a cycle longer than
-  the stale threshold is never seen as stale, and only a genuinely stale lock (from a
-  crashed run) is reclaimed — atomically, taking real ownership. Shutdown removes the
-  lock only if this process still owns it. Single-instance is load-bearing:
-  dispatch dedup (the `agentflow:building`, `agentflow:triaging`, and drawing claims) assumes one
-  daemon — each is check-then-claim, not atomic. Concurrent dispatch keeps that safe by
-  selecting-and-claiming serially (builds are one-per-repo; the triage fan-out reserves each
-  issue in memory before choosing the next), so two sessions never grab the same issue.
+  the stale threshold is never seen as stale, and only a genuinely stale lock is reclaimed.
+  Shutdown removes the lock only if this process still owns it. The coordinator's SQLite
+  transactions remain the cross-process authority for submissions and reservations.
 
-Dispatch is now concurrent (ADR 0023 M6 slice 5): each cycle reclaims stale claims, then
-dispatches every repo's ready work at once — multiple builds across repos, several triages
-within a deep queue — bounded by the machine ceiling, per-stage caps, and the activity-
-adaptive ceiling/pacing (ADR 0025). Merges stay serialized (ADR 0009). See `agentflow.dispatch`.
+Dispatch discovers repos concurrently, then the coordinator reconciles and admits every attempt
+under the machine ceiling, stage caps, activity pacing, provider headroom, and immutable pool
+permits. Outcome-first claim reconciliation runs only after that durable pass. Merges stay
+serialized (ADR 0009). See `agentflow.dispatch`.
 
 Requires a working `codex` (see AGENTFLOW_CODEX_BIN) and `claude`, `gh`, `git`, `uv`
 on PATH, and — since it spawns tool sessions — an unsandboxed environment.
@@ -54,10 +51,9 @@ from pathlib import Path
 
 from agentflow import dispatch, live
 from agentflow.dashboard_data import snapshot
-from agentflow.loop import (RepoConfig, pipeline_once, reclaim_claims,
-                            reclaim_mockup_claims, reclaim_triage_claims, recheck_once)
+from agentflow.loop import RepoConfig, recheck_once
 from agentflow.probe import ChangeProbe
-from agentflow.runner import _worktree_is_active, recover_stale_worktrees
+from agentflow.runner import recover_stale_worktrees
 
 STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
 ENABLE_FLAG = STATE_DIR / "enabled"
@@ -101,10 +97,10 @@ def log(msg: str) -> None:
     print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} agentflow: {msg}", flush=True)
 
 
-def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
+def cycle(repos: list[RepoConfig], run, _log=log) -> None:
     """One serial pass over the repos, running `run` per repo. Each is isolated: an error in
-    one never stops the rest. Used for the passes that MUST stay serial — reclaim and the
-    merge-time re-rebase (ADR 0009) — while concurrent build/triage dispatch runs in between."""
+    one never stops the rest. Used for the merge-time re-rebase pass that must remain serial
+    (ADR 0009)."""
     for cfg in repos:
         try:
             _log(f"{cfg.repo}: {run(cfg, _log=_log)}")
@@ -112,62 +108,15 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
             _log(f"{cfg.repo}: cycle error: {type(e).__name__}: {e}")
 
 
-def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False,
-             preserve_triage: bool = False, preserve_mockups: bool = False) -> str:
-    from agentflow import coordinated_build
-    # Each reclamation pass is scoped to the claim type it reconciles: code-change stages own
-    # `building`, Intake owns `triaging`, and Mockup owns `drawing`. Passing the matching lane
-    # stops one claim type's live record from shielding another stale claim.
-    builds = (0 if preserve_builds
-              else reclaim_claims(cfg, coordinated_build.owned_issues(cfg, lane="building")))
-    triaging = (0 if preserve_triage
-                else reclaim_triage_claims(
-                    cfg, coordinated_build.owned_issues(cfg, lane="triaging")))
-    drawings = (0 if preserve_mockups else reclaim_mockup_claims(
-        cfg, coordinated_build.owned_issues(cfg, lane="drawing")))
-    parts = []
-    if builds:
-        parts.append(f"reclaimed {builds} stale build claim(s)")
-    if triaging:
-        parts.append(f"reclaimed {triaging} stale triaging claim(s)")
-    if drawings:
-        parts.append(f"reclaimed {drawings} stale drawing claim(s)")
-    return ", ".join(parts) if parts else "no stale claims"
-
-
 def _recheck(cfg: RepoConfig, _log=None) -> str:
     return f"recheck: {recheck_once(cfg)}"
 
 
-def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
-    """One full dispatch cycle: reclaim stale claims (serial, keyed on live sessions), then
-    dispatch every repo's ready work CONCURRENTLY (bounded by the governor + activity ceiling),
-    then re-rebase merge survivors SERIALLY — merges never overlap (ADR 0009). The two serial
-    passes bookend the concurrent one; each isolates per-repo errors via `cycle`."""
-    from agentflow.coordinator import MODE_COORDINATED, Rollout
-
-    rollout = Rollout(log=_log)
-    try:
-        rollout_mode = rollout.mode
-        preserve_builds = rollout_mode == MODE_COORDINATED
-        preserve_triage = rollout_mode == MODE_COORDINATED
-        preserve_mockups = rollout_mode == MODE_COORDINATED
-    except Exception as e:  # noqa: BLE001 — ambiguous intent must preserve possible ownership
-        rollout_mode = None
-        preserve_builds = True
-        preserve_triage = True
-        preserve_mockups = True
-        _log(f"rollout: state unreadable before reclaim ({type(e).__name__}: {e}) — "
-             "preserving Build, Intake, and Mockup claims")
-    cycle(
-        repos,
-        run=lambda cfg, _log=None: _reclaim(
-            cfg, _log=_log, preserve_builds=preserve_builds,
-            preserve_triage=preserve_triage, preserve_mockups=preserve_mockups),
-        _log=_log,
-    )
-    dispatch.run_cycle(repos, rollout=rollout, rollout_mode=rollout_mode, _log=_log)
-    cycle(repos, run=_recheck, _log=_log)
+def dispatch_cycle(repos: list[RepoConfig], _log=log, *, submit_new: bool = True) -> None:
+    """Reconcile coordinator records, optionally submit cold work, then serialize merge rechecks."""
+    dispatch.run_cycle(repos, submit_new=submit_new, _log=_log)
+    if submit_new:
+        cycle(repos, run=_recheck, _log=_log)
 
 
 def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> None:
@@ -182,9 +131,11 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
 
 
 def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _log=log) -> None:
-    """Run the fail-closed worktree recovery pass once at daemon startup, then sweep the live
-    board of any session whose worktree is no longer alive — a crashed run's phantom sessions,
-    dropped with the same liveness signal the worktree recovery just used."""
+    """Run fail-closed worktree recovery once at startup.
+
+    Durable coordinator records protect every owned source. The live board is not consulted; it
+    is regenerated from running records on the next reconciliation pass.
+    """
     from agentflow import coordinated_build
     for cfg in repos:
         try:
@@ -195,9 +146,6 @@ def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _l
                      f"retained {len(report.retained)} for recovery")
         except Exception as e:  # noqa: BLE001 — one repo cannot block daemon startup
             _log(f"{cfg.repo}: startup worktree recovery error: {type(e).__name__}: {e}")
-    dropped = live.reap(lambda wt: _worktree_is_active(Path(wt)))
-    if dropped:
-        _log(f"startup: dropped {len(dropped)} dead session(s) from the live board")
 
 
 class PollLoop:
@@ -207,9 +155,9 @@ class PollLoop:
     (dispatch-and-return) — and a single-flight guard means an in-flight pass is never doubled by
     a later tick, so the serial reclaim/recheck bookends and per-issue claim dedup still hold.
 
-    Dormant (no enable flag) is genuinely free: the probe is not even asked, so a paused daemon
-    makes zero network calls on the fast clock — it only republishes the console snapshot on the
-    slow heartbeat, so the operator watching a paused fleet still sees a freshly-aged board."""
+    Dormant (no enable flag) is free on the fast clock: the probe is not asked. On the slow
+    heartbeat it runs a drain pass with cold submission disabled, so active durable records keep
+    reconciling and the operator sees a fresh snapshot."""
 
     def __init__(self, repos, *, probe=None, dispatch_pass=None, publish=None,
                  enabled=None, clock=time.monotonic, spawn=None, _log=log) -> None:
@@ -227,7 +175,7 @@ class PollLoop:
     def _heartbeat_due(self, now: float) -> bool:
         return self._last_full is None or (now - self._last_full) >= FULL_PASS_SECONDS
 
-    def _start_full_pass(self) -> None:
+    def _start_full_pass(self, *, submit_new: bool) -> None:
         """Dispatch-and-return: run one full pass in a worker so the fast clock keeps ticking.
         If a pass from an earlier tick is still running, skip — it already covers this tick, and
         overlapping passes would race the serial bookends and the single-daemon claim dedup."""
@@ -237,7 +185,7 @@ class PollLoop:
 
         def work():
             try:
-                self._dispatch(self._repos)
+                self._dispatch(self._repos, submit_new=submit_new)
                 self._publish(self._repos)
             finally:
                 self._running.release()
@@ -246,7 +194,7 @@ class PollLoop:
 
     def tick(self) -> None:
         """One fast tick. Enabled: probe (one call) and run a full pass on change or heartbeat.
-        Dormant: never probe; only republish on the heartbeat so a paused board stays fresh."""
+        Dormant: never probe; reconcile owned records on the heartbeat without cold submission."""
         now = self._clock()
         heartbeat_due = self._heartbeat_due(now)
         if self._enabled():
@@ -254,10 +202,10 @@ class PollLoop:
             # heartbeat tick we skip the probe call entirely (it would run a full pass anyway).
             if heartbeat_due or self._probe.changed():
                 self._last_full = now
-                self._start_full_pass()
+                self._start_full_pass(submit_new=True)
         elif heartbeat_due:
             self._last_full = now
-            self._publish(self._repos)
+            self._start_full_pass(submit_new=False)
         # Stamp liveness every tick (local, no network) so the console sees a live, fast-polling
         # daemon even while it's dormant or between full passes.
         live.mark_cycle(FAST_TICK_SECONDS)

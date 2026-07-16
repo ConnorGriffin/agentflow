@@ -305,18 +305,7 @@ def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktr
     assert "origin/main" in added
 
 
-def test_drawing_claim_reconciliation_preserves_live_and_coordinator_owned_mockups(monkeypatch):
-    claimed = [{"number": 1}, {"number": 2}, {"number": 3}]
-    monkeypatch.setattr(loop, "_run", lambda argv: SimpleNamespace(
-        returncode=0, stdout=json.dumps(claimed)))
-    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: {1})
-    released = []
-    monkeypatch.setattr(loop, "_release_mockup", lambda repo, number: released.append(number))
-
-    assert loop.reclaim_mockup_claims(
-        SimpleNamespace(repo="o/r"), coordinator_owned={2}) == 1
-    assert released == [3]
-
+def test_drawing_ownership_comes_only_from_durable_mockup_records():
     records = [Record(identity="m", stage="mockup", pool="claude", demand=5,
                       repo="o/r", subject="2", claim=True)]
     assert tracer.owned_issues(records, "o/r", lane="drawing") == {2}
