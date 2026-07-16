@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-16
+- Amended: 2026-07-16 — the operator's conversation outranks background work at admission
 
 ## Context
 
@@ -50,6 +51,18 @@ captured artifact. Interactive method steps (grilling, ui-mockups rounds, domain
 *sequence of turns* — interactivity lives at the Conversation level, one coordinated session per
 operator turn, never one always-live process. A Chart that fans out into parallel AFK research
 tickets maps onto separate submitted stages, each with its own admission and budget.
+
+### The operator's conversation outranks background work
+
+When Conversation turns and pipeline stages contend for the same pool headroom, admission
+favors the operator's interactivity. Ask and Chart turns — and any actively conversational
+method step, a grilling exchange above all — are **interactive**: the operator is present and
+waiting, so these turns take admission priority over background build, review, and every other
+pipeline stage. Truly-AFK method steps (research fan-outs, codebase-design analysis) and
+answer-and-walk-away turns are **background**: they queue at ordinary pipeline priority.
+Mockup rounds default to background, but the operator may explicitly prioritize a round while
+actively iterating on it. Priority reorders admission; it never bypasses it — attempt budgets,
+permits, and pool saturation still gate every start.
 
 ### Two retention layers, cleanly split
 
@@ -115,7 +128,8 @@ label, so intake grounds it and no conversation silently enters the pipeline
 - A completed turn has no automated successor stage — the operator's next message submits the
   next turn — so a completed turn is adopted and retired, and `park_completed` handles a turn
   that needs the operator.
-- Admission-matrix calibration for `converse` turns, the turn-prompt/context-rebuild format, and
+- Admission-matrix calibration for `converse` turns — within the settled ordering that
+  interactive turns outrank background work — the turn-prompt/context-rebuild format, and
   the workspace Conversation/Proposal schema remain implementation choices for the prototype.
 - [#128](https://github.com/ConnorGriffin/agentflow/issues/128) (workspace prototype) may assume
   the coordinated-turn model, workspace-owned candidate artifacts and their staged/approved/
