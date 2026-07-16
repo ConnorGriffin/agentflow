@@ -232,16 +232,15 @@ _ADAPTERS = {"claude": ClaudeProviderAdapter, "codex": CodexProviderAdapter}
 
 
 def _dormant_provider_command(record) -> list[str]:
-    """A no-op provider that starts and exits, for a record that carries no prompt to run —
-    the dormant slice, where no live stage has submitted work yet (ADR 0030)."""
+    """A no-op provider that starts and exits for a bare record with no prompt (ADR 0030)."""
     return [sys.executable, "-c", ""]
 
 
 def provider_command(record) -> list[str]:
     """The real provider argv for a launched attempt, dispatched on its pool. A record with no
     durable input pointer has no prompt to run, so it falls back to the no-op provider: the
-    path is fully wired for real Claude/Codex sessions yet stays dormant until a stage submits
-    one. An unknown pool never reaches a launch (it has no permit ledger)."""
+    path is fully wired for real Claude/Codex sessions. An unknown pool never reaches a launch
+    (it has no permit ledger)."""
     adapter = _ADAPTERS.get(record.pool)
     if adapter is None or not record.input_ptr or not record.source:
         return _dormant_provider_command(record)

@@ -57,7 +57,7 @@ class BuildStageAdapter:
     def finalize_hold(self, record) -> str | None:
         """Create the Build-native human handoff and return its durable proof. Production moves
         the issue to ``needs-grilling`` and notifies once; tests may omit the collaborator and
-        use the coordinator's local proof for the dormant seam."""
+        use the coordinator's local proof."""
         if self._handoff is not None:
             return self._handoff(record)
         return f"proof:{record.identity}:issue:needs-grilling"

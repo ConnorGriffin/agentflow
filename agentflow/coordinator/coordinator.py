@@ -9,10 +9,9 @@ the running-record ledger, the crash-safe provider start handshake, outcome-firs
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
 
-This slice is intentionally dormant: no production pipeline stage submits work here yet, so
-the current legacy pipeline behavior cannot change. It makes the later Build tracer small
-enough to review while proving the interface and the crash boundaries with an injected
-launcher, gate, and observer.
+Build is the first production stage behind this coordinator (issue #103); every other logical
+stage remains queued behind the admission gate until its own tracer lands. The interface and
+crash boundaries remain exercised with injected launcher, gate, and observer collaborators.
 """
 
 from __future__ import annotations
@@ -88,8 +87,8 @@ class Coordinator:
     exercised with fakes: a **launcher** that starts a provider family and reports its
     liveness, an admission **gate** (the composed headroom/ceiling/cap/pacing check), and a
     stage **adapter** that observes an ended family and verifies its stage outcome. Production
-    uses the real spawning launcher with pid liveness; the gate and adapter default to
-    permissive/never-verified stubs until the live stages supply them. None of these is a
+    uses the real spawning launcher with pid liveness; a bare coordinator keeps permissive/
+    never-verified defaults, while the live Build tracer supplies its gate and adapter. None is a
     public operation — the only public surface is ``submit_stage`` and ``cycle``.
     """
 
@@ -361,8 +360,8 @@ class Coordinator:
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
                               f"({cause}) — continuation budget exhausted; held for human; "
                               f"claim released")
-        # The dormant slice owns the human handoff itself; a real stage adapter proves it in
-        # the live pipeline. Finalizing it here is idempotent and crash-safe.
+        # The stage adapter proves a live external handoff; the coordinator then finalizes it
+        # idempotently and crash-safely.
         return self._finalize_hold(record)
 
     def _finalize_hold(self, record: Record) -> StageOutcome | None:
@@ -422,6 +421,6 @@ def _identity(repo: str, subject: str, stage: str, target: str | None) -> str:
 
 
 def _admit_everything(record: Record) -> bool:
-    """The default admission gate for the dormant slice: the permit ledger is the only limit
-    until the live stages supply the composed headroom/ceiling/cap/pacing gate (ADR 0030)."""
+    """The bare coordinator's default gate. Live tracers supply their stage gate; tests and
+    direct construction use only the private permit ledger (ADR 0030)."""
     return True

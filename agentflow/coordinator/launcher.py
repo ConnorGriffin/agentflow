@@ -59,8 +59,7 @@ class LocalLauncher:
     per-attempt artifacts), then waits (bounded) for that durable fact to
     appear or for the child to die without it. ``provider_command`` maps a record to the argv
     the child runs; the default builds the real Claude/Codex session command for a record that
-    carries a prompt and a no-op for one that does not — the dormant slice, where no live stage
-    has submitted work yet.
+    carries a prompt and a no-op for a bare record that does not.
     """
 
     def __init__(self, provider_command=None, *, timeout: float = _HANDSHAKE_TIMEOUT_S,
