@@ -84,17 +84,21 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
     evidence = list(legacy_evidence(live_sessions, sources))
     owned_by_repo = {cfg.repo: tracer.owned_issues(records, cfg.repo) for cfg in repos}
     for cfg in repos:
-        claims = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-                       "--label", BUILDING, "--json", "number", "--limit", "100"])
+        claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
+                       f"repos/{cfg.repo}/issues", "-f", "state=open",
+                       "-f", f"labels={BUILDING}", "-f", "per_page=100"])
         if claims.returncode != 0:
             evidence.append(f"{cfg.repo} building claims unreadable")
         else:
             try:
-                claimed = json.loads(claims.stdout or "[]")
+                pages = json.loads(claims.stdout or "[]")
             except json.JSONDecodeError:
                 evidence.append(f"{cfg.repo} building claims unreadable")
             else:
-                for issue in claimed:
+                if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+                    evidence.append(f"{cfg.repo} building claims unreadable")
+                    pages = []
+                for issue in (item for page in pages for item in page):
                     number = issue.get("number")
                     if isinstance(number, int) and number not in owned_by_repo[cfg.repo]:
                         evidence.append(f"{cfg.repo}#{number} legacy building claim")
@@ -189,8 +193,8 @@ def _pr_exists(record) -> bool:
     if parsed is None:
         return False
     _workdir, branch, _wt = parsed
-    r = _run(["gh", "pr", "list", "--repo", record.repo, "--state", "all",
-              "--json", "headRefName,url", "--limit", "50"])
+    r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch,
+              "--state", "all", "--json", "headRefName,url", "--limit", "1"])
     if r.returncode != 0:
         return False
     return any(pr.get("headRefName") == branch

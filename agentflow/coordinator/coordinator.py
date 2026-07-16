@@ -208,6 +208,11 @@ class Coordinator:
         self._records = self._store.load()
         outcomes: list[StageOutcome] = []
         for record in list(self._records.values()):
+            if record.hold_pending:
+                outcome = self._finalize_hold(record)
+                if outcome is not None:
+                    outcomes.append(outcome)
+                continue
             if record.state != RUNNING:
                 continue
             if record.start_fact == NOT_STARTED:

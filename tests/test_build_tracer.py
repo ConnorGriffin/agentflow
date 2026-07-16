@@ -132,6 +132,34 @@ def test_exhaustion_holds_once_with_one_handoff_and_notification(make_coord):
     assert handoffs == [ident]                       # restart cannot repeat the external handoff
 
 
+def test_failed_exhaustion_handoff_retries_on_a_later_cycle(make_coord):
+    fake = FakeSession()
+    proofs = iter((None, "issue-proof"))
+    calls = []
+
+    def handoff(record):
+        calls.append(record.identity)
+        return next(proofs)
+
+    coord = make_coord(
+        fake,
+        adapter=_adapter(fake, pr=[False], prep=[True], handoff=handoff),
+    )
+    ident = coord.submit_stage(_build())
+    coord.cycle("claude")
+    for _ in range(2):
+        fake.end(ident, cause=ProviderCause.PROCESS)
+        assert coord.cycle("claude") == []           # reconcile, then start continuation
+    fake.end(ident, cause=ProviderCause.PROCESS)
+
+    assert coord.cycle("claude") == []               # GitHub handoff failed; keep pending
+    assert record_of(coord, ident).hold_pending is True
+    settled = coord.cycle("claude")                   # next daemon cycle retries finalization
+
+    assert [outcome.status for outcome in settled] == ["held"]
+    assert calls == [ident, ident]
+
+
 # --- idempotent submission ---------------------------------------------------------------
 
 def test_repeated_submission_and_restart_make_one_record(make_coord):
@@ -274,8 +302,8 @@ def test_forward_activation_names_live_claim_pid_and_dirty_worktree(tmp_path, mo
     monkeypatch.setattr(runner, "_active_marker", lambda path: marker)
 
     def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "issue", "list"]:
-            return subprocess.CompletedProcess(cmd, 0, '[{"number": 7}]', "")
+        if cmd[:3] == ["gh", "api", "--paginate"]:
+            return subprocess.CompletedProcess(cmd, 0, '[[], [{"number": 7}]]', "")
         if cmd[:3] == ["git", "-C", str(wt)]:
             return subprocess.CompletedProcess(cmd, 0, " M progress.py\n", "")
         raise AssertionError(cmd)
@@ -304,8 +332,8 @@ def test_forward_activation_excludes_coordinator_owned_claim_and_worktree(tmp_pa
     monkeypatch.setattr(runner, "_active_marker", lambda path: None)
 
     def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "issue", "list"]:
-            return subprocess.CompletedProcess(cmd, 0, '[{"number": 7}]', "")
+        if cmd[:3] == ["gh", "api", "--paginate"]:
+            return subprocess.CompletedProcess(cmd, 0, '[[{"number": 7}]]', "")
         raise AssertionError(cmd)
 
     monkeypatch.setattr(loop, "_run", fake_run)
