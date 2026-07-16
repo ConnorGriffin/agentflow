@@ -250,7 +250,7 @@ def test_coordinated_phase_submits_to_the_coordinator_and_skips_the_legacy_build
     _no_triage_no_mockup_no_respond(monkeypatch)
     monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
     monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
-        "Mockup must stay queued while Build is coordinated"))
+        "legacy Mockup orchestration must not run in coordinated mode"))
     monkeypatch.setattr(loop, "respond_once", lambda *a, **k: pytest.fail(
         "Respond must stay queued while Build is coordinated"))
     monkeypatch.setattr(loop, "run_once", lambda *a, **k: pytest.fail(
@@ -365,6 +365,35 @@ def test_coordinated_run_cycle_defers_next_comment_until_prior_respond_settles(m
     dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
                        _log=lambda _m: None)
     assert claims == [] and submitted == []
+
+
+def test_coordinated_run_cycle_submits_and_claims_one_mockup_round(monkeypatch):
+    from agentflow.coordinator import COORDINATED, Phase
+    _idle_pools(monkeypatch)
+    monkeypatch.setattr(dispatch.coordinated_build, "resolve_phase",
+                        lambda rollout, repos, sessions, **k: Phase(COORDINATED))
+    monkeypatch.setattr(loop, "_next_intake_candidate", lambda *a, **k: None)
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: None)
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: None)
+    issue = {"number": 11, "title": "A screen", "body": "Draw variants",
+             "labels": [{"name": "agentflow:needs-mockup"}]}
+    monkeypatch.setattr(loop, "_next_mockup_issue", lambda cfg: issue)
+    monkeypatch.setattr(loop, "produce_once", lambda *a, **k: pytest.fail(
+        "legacy Mockup must not launch in coordinated mode"))
+    builder = type("B", (), {"tool": "claude"})()
+    monkeypatch.setattr(dispatch, "pick_pair", lambda *a, **k: (builder, None, ""))
+    events = []
+    monkeypatch.setattr(loop, "_claim_mockup",
+                        lambda repo, number: events.append(("claim", number)) or True)
+    coord = type("C", (), {"submit_stage": lambda self, sub: events.append(("submit", sub))})()
+    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project", lambda *a, **k: [])
+
+    dispatch.run_cycle([RepoConfig("o/r", "/tmp")], Governor(), coordinator=coord,
+                       _log=lambda _m: None)
+
+    assert events[0][0] == "submit" and events[0][1].stage == "mockup"
+    assert events[0][1].pool == "claude" and events[0][1].subject == "11"
+    assert events[1] == ("claim", 11)
 
 
 def test_draining_phase_launches_no_new_provider_stage(monkeypatch):

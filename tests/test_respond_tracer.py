@@ -378,20 +378,20 @@ def test_public_respond_exhaustion_has_its_own_durable_park_and_notification(
     assert len(respond_parks) == 1 and len(notifications) == 1
 
 
-# --- admission: Respond is enabled, Mockup stays queued ------------------------------------
+# --- admission: Respond is enabled; unknown future stages stay queued ----------------------
 
-def test_gate_admits_respond_and_keeps_mockup_waiting(make_coord):
+def test_gate_admits_respond_and_keeps_unknown_stage_waiting(make_coord):
     fake = FakeSession()
     router = StageRouter({"respond": _respond_adapter(fake, reply=[False])})
     coord = make_coord(fake, adapter=router, gate=tracer.build_review_revise_gate)
     respond = coord.submit_stage(_respond_sub())
-    mockup = coord.submit_stage(Submission(repo="o/r", subject="11", stage="mockup",
+    future = coord.submit_stage(Submission(repo="o/r", subject="11", stage="future",
                                            pool="claude", complexity="deep"))
     coord.cycle("claude")
     assert record_of(coord, respond).state == "running"       # Respond now admits
     assert permits(coord, "claude") == 3                       # against its reviewed three-permit demand
-    m = record_of(coord, mockup)
-    assert m.state == "waiting" and m.attempts == 0           # Mockup stays visibly queued, dormant
+    pending = record_of(coord, future)
+    assert pending.state == "waiting" and pending.attempts == 0
 
 
 # --- pure mapping -------------------------------------------------------------------------

@@ -510,7 +510,7 @@ def test_schema_v1_record_without_revision_advances_through_public_cycle(make_co
 def test_only_build_is_wired_behind_the_coordinator():
     """Guardrail for issue #103: Build — and only Build — has moved behind the coordinator.
     Dispatch routes it through the rollout; the legacy provider surface (`runner`) and the other
-    five logical stages' orchestration (`loop`) still never import the coordinator, so nothing
+    six logical stages' orchestration (`loop`) still never import the coordinator, so nothing
     else submits work there."""
     import agentflow.dispatch
     import agentflow.loop

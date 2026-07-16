@@ -125,19 +125,54 @@ def test_reclaim_cycle_clears_a_stranded_triaging_claim(monkeypatch):
 
 
 def test_reclaim_cycle_strips_nothing_on_github_error(monkeypatch):
-    # Fail closed: a `gh` blip during the cycle must reclaim neither build nor triaging claims.
+    # Fail closed: a `gh` blip must reclaim no build, triaging, or drawing claim.
     from agentflow import loop
 
     released = []
     monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(stdout="", returncode=1))
     monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(("build", n)))
     monkeypatch.setattr(loop, "_release_triage", lambda repo, n: released.append(("triage", n)))
+    monkeypatch.setattr(loop, "_release_mockup", lambda repo, n: released.append(("drawing", n)))
 
     logs = []
     cycle([A], run=daemon._reclaim, _log=logs.append)
 
     assert released == []
     assert any("no stale claims" in m for m in logs)
+
+
+def test_reclaim_pass_preserves_coordinator_owned_drawing_claim(monkeypatch):
+    from agentflow import coordinated_build
+
+    lanes = []
+    monkeypatch.setattr(
+        coordinated_build, "owned_issues",
+        lambda cfg, lane=None: lanes.append(lane) or ({108} if lane == "drawing" else set()))
+    monkeypatch.setattr(daemon, "reclaim_claims", lambda cfg, owned: 0)
+    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda cfg, owned: 0)
+    seen = []
+    monkeypatch.setattr(daemon, "reclaim_mockup_claims",
+                        lambda cfg, owned: seen.append(owned) or 0)
+
+    assert daemon._reclaim(A) == "no stale claims"
+    assert lanes == ["building", "triaging", "drawing"]
+    assert seen == [{108}]
+
+
+def test_unreadable_coordinator_store_fails_closed_before_drawing_reclaim(monkeypatch):
+    from agentflow import coordinated_build
+
+    monkeypatch.setattr(daemon, "reclaim_claims", lambda cfg, owned: 0)
+    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda cfg, owned: 0)
+    monkeypatch.setattr(coordinated_build, "owned_issues",
+                        lambda cfg, lane=None: (_ for _ in ()).throw(RuntimeError("store unreadable"))
+                        if lane == "drawing" else set())
+    monkeypatch.setattr(daemon, "reclaim_mockup_claims", lambda *a: pytest.fail(
+        "an unreadable continuation store must preserve drawing claims"))
+
+    logs = []
+    cycle([A], run=daemon._reclaim, _log=logs.append)
+    assert any("store unreadable" in line for line in logs)
 
 
 def test_forward_rollout_preserves_build_claims_for_drain_evidence(tmp_path, monkeypatch):
@@ -151,6 +186,7 @@ def test_forward_rollout_preserves_build_claims_for_drain_evidence(tmp_path, mon
         "forward rollout must preserve Build claims"))
     monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda *a, **k: pytest.fail(
         "forward rollout must preserve Intake claims"))
+    monkeypatch.setattr(daemon, "reclaim_mockup_claims", lambda cfg, owned: 0)
     monkeypatch.setattr(daemon, "recheck_once", lambda cfg: "nothing")
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",

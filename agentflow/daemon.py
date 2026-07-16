@@ -26,7 +26,7 @@ Properties:
   the stale threshold is never seen as stale, and only a genuinely stale lock (from a
   crashed run) is reclaimed — atomically, taking real ownership. Shutdown removes the
   lock only if this process still owns it. Single-instance is load-bearing:
-  dispatch dedup (the `agentflow:building` and `agentflow:triaging` claims) assumes one
+  dispatch dedup (the `agentflow:building`, `agentflow:triaging`, and drawing claims) assumes one
   daemon — each is check-then-claim, not atomic. Concurrent dispatch keeps that safe by
   selecting-and-claiming serially (builds are one-per-repo; the triage fan-out reserves each
   issue in memory before choosing the next), so two sessions never grab the same issue.
@@ -55,7 +55,7 @@ from pathlib import Path
 from agentflow import dispatch, live
 from agentflow.dashboard_data import snapshot
 from agentflow.loop import (RepoConfig, pipeline_once, reclaim_claims,
-                            reclaim_triage_claims, recheck_once)
+                            reclaim_mockup_claims, reclaim_triage_claims, recheck_once)
 from agentflow.probe import ChangeProbe
 from agentflow.runner import _worktree_is_active, recover_stale_worktrees
 
@@ -115,19 +115,23 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
 def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False,
              preserve_triage: bool = False) -> str:
     from agentflow import coordinated_build
-    # Each reclamation pass is scoped to the claim type it reconciles: only Build/Review/Revise
-    # records own a `building` claim, only Intake records own a `triaging` one. Passing the
-    # matching lane stops one claim type's live record from shielding the other's stale claim.
+    # Each reclamation pass is scoped to the claim type it reconciles: code-change stages own
+    # `building`, Intake owns `triaging`, and Mockup owns `drawing`. Passing the matching lane
+    # stops one claim type's live record from shielding another stale claim.
     builds = (0 if preserve_builds
               else reclaim_claims(cfg, coordinated_build.owned_issues(cfg, lane="building")))
     triaging = (0 if preserve_triage
                 else reclaim_triage_claims(
                     cfg, coordinated_build.owned_issues(cfg, lane="triaging")))
+    drawings = reclaim_mockup_claims(
+        cfg, coordinated_build.owned_issues(cfg, lane="drawing"))
     parts = []
     if builds:
         parts.append(f"reclaimed {builds} stale build claim(s)")
     if triaging:
         parts.append(f"reclaimed {triaging} stale triaging claim(s)")
+    if drawings:
+        parts.append(f"reclaimed {drawings} stale drawing claim(s)")
     return ", ".join(parts) if parts else "no stale claims"
 
 
