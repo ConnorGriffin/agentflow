@@ -175,9 +175,11 @@ def _epoch(value):
     if isinstance(value, (int, float)):
         return int(value)
     if isinstance(value, str) and value:
-        from agentflow.runner import _iso_to_epoch
-        epoch = _iso_to_epoch(value)
-        return int(epoch) if epoch is not None else None
+        from datetime import datetime
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
     return None
 
 

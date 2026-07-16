@@ -6,8 +6,8 @@ construction, provisioning, and git plumbing; they do not orchestrate a Build li
 Ported and generalized from the dotfiles `codex-go` wrapper (Codex-only) into a
 two-tool abstraction — the "unified runner" the reuse map flagged as net-new.
 
-The interface is the test surface: `classify_build` and each adapter's tier→model
-resolution are pure, tested without spawning anything (see tests/test_runner.py).
+The interface is command construction, model resolution, and fail-closed worktree plumbing,
+tested without spawning a provider (see tests/test_runner.py).
 """
 
 from __future__ import annotations
@@ -21,9 +21,6 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-# Stable bail markers a session posts as a comment when it hits a gap (ADR 0005).
-MARKERS = ("MISSING-CONTEXT", "SCOPE-EXPANSION", "INTEGRATION-COLLISION")
-_MARKER_RE = re.compile(rf"^({'|'.join(MARKERS)}):")
 _ACTIVE_WORKTREES: dict[str, int] = {}
 
 _CLAUDE_AUTONOMOUS_SETTINGS = json.dumps({
@@ -68,55 +65,12 @@ class Effort(str, Enum):
     EXTRA = "extra"
 
 
-class BuildStatus(str, Enum):
-    PR_OPENED = "pr_opened"      # a PR exists for the branch — success
-    BAIL = "bail"               # session posted a marker comment and stopped
-    INCOMPLETE = "incomplete"   # ran, but neither a PR nor a bail — needs a look
-    ERROR = "error"             # the launch itself failed
-
-
-@dataclass(frozen=True, slots=True)
-class BuildTask:
-    repo: str        # "owner/name" on GitHub
-    workdir: str     # local main checkout (worktrees are cut from here)
-    issue: int
-    slug: str        # short kebab title, for branch/worktree naming
-    complexity: Complexity  # model-size dial from intake — no build without one
-    effort: Effort   # effort dial from intake — how much work the issue warrants
-    prompt: str      # the work order / self-scoped brief handed to the agent
-    title: str = ""  # the issue's human title, for the live board's session row
-
-
-@dataclass(frozen=True, slots=True)
-class BuildOutcome:
-    status: BuildStatus
-    pr_url: str | None = None
-    marker: str | None = None
-    detail: str = ""
-
-
 @dataclass(frozen=True, slots=True)
 class WorktreeRecovery:
     """What a recovery pass changed and which owned sessions it left for recovery."""
 
     removed: tuple[str, ...]
     retained: tuple[str, ...]
-
-
-def classify_build(pr_url: str | None, new_marker_comments: list[str]) -> BuildOutcome:
-    """Classify a finished build session from what it left behind. Pure.
-
-    Precedence mirrors `codex-go`: a PR is success even if a marker was also
-    posted; otherwise the first marker comment is a bail; otherwise incomplete.
-    """
-    if pr_url:
-        return BuildOutcome(BuildStatus.PR_OPENED, pr_url=pr_url)
-    for body in new_marker_comments:
-        m = _MARKER_RE.match(body.strip())
-        if m:
-            first_line = body.strip().splitlines()[0]
-            return BuildOutcome(BuildStatus.BAIL, marker=m.group(1), detail=first_line)
-    return BuildOutcome(BuildStatus.INCOMPLETE, detail="no PR and no bail marker")
 
 
 def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
@@ -295,24 +249,6 @@ class _WorktreeRunner:
                   "--state", "open", "--json", "url", "-q", ".[0].url // \"\""])
         return r.returncode == 0, r.stdout.strip() or None
 
-    def _pr_for_branch(self, repo: str, branch: str) -> str | None:
-        return self._open_pr_for_branch(repo, branch)[1]
-
-    def _new_marker_comments(self, repo: str, issue: int, since: float) -> list[str]:
-        r = _run(["gh", "issue", "view", str(issue), "--repo", repo, "--json", "comments"])
-        if r.returncode != 0:
-            return []
-        try:
-            comments = json.loads(r.stdout).get("comments", [])
-        except json.JSONDecodeError:
-            return []
-        out = []
-        for c in comments:
-            ts = _iso_to_epoch(c.get("createdAt", ""))
-            if ts is not None and ts >= since:
-                out.append(c.get("body", ""))
-        return out
-
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
@@ -376,14 +312,6 @@ class CodexRunner(_WorktreeRunner):
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, ValueError):
             return None
         return None
-
-def _iso_to_epoch(s: str) -> float | None:
-    from datetime import datetime
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return None
-
 
 def _pr_state_for_branch(repo: str, branch: str) -> str | None:
     """The current state of the most recent PR for this branch across all states

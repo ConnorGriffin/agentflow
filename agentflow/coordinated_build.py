@@ -1002,6 +1002,11 @@ def _settle_review(record) -> str | None:
         return _park_review_settlement(
             record, verdict, workdir, pr, comments,
             reason="review did not produce an actionable clean verdict", autonomous=True)
+    pending_reply = reply_pending(comments)
+    if not record.auto_merge_allowed or ui_gap or pending_reply:
+        reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
+        return _park_review_settlement(
+            record, verdict, workdir, pr, comments, reason=reason, autonomous=True)
 
     # CI already completed in prepare_completed, outside SQLite's write transaction. Recheck it
     # once without polling, together with the exact head, immediately before merge.
@@ -1016,11 +1021,11 @@ def _settle_review(record) -> str | None:
     decision = decide_merge(
         verdict=verdict, ci_green=True, reviewer_tool=record.pool,
         builder_tool=record.builder_lineage or "", revises_used=record.round,
-        ui_evidence_missing=ui_gap, reply_pending=reply_pending(comments))
-    if decision is not MergeDecision.MERGE or not record.auto_merge_allowed:
-        reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
+        ui_evidence_missing=False, reply_pending=False)
+    if decision is not MergeDecision.MERGE:
         return _park_review_settlement(
-            record, verdict, workdir, pr, comments, reason=reason, autonomous=True)
+            record, verdict, workdir, pr, comments,
+            reason="could not be auto-merged after review", autonomous=True)
     if _review_pr_head(record) != record.target:
         return None
     if not ci_is_green(record.repo, pr, timeout=0, interval=0):
@@ -1140,13 +1145,16 @@ def _round_evidence(comment: dict, opened_at: int) -> bool:
     ``createdAt`` is missing or unparseable cannot be proven to postdate the round, so it fails
     closed."""
     from agentflow.gate import PR_MARK, has_image_evidence
-    from agentflow.runner import _iso_to_epoch
     body = comment.get("body", "") or ""
     if PR_MARK not in body or not has_image_evidence(body):
         return False
     if not opened_at:
         return True
-    created = _iso_to_epoch(comment.get("createdAt", "") or "")
+    try:
+        created = datetime.fromisoformat(
+            str(comment.get("createdAt", "") or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        created = None
     return created is not None and created > opened_at
 
 

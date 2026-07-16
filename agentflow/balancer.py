@@ -78,7 +78,6 @@ class PoolStatus:
     active: bool = False           # operator working interactively on this pool (ADR 0025)
     ceiling: float = IDLE_CEILING_PCT   # the spend ceiling this pool dispatched under
     observed_at: float | None = None    # when the latest limit fact was seen (Codex)
-    refreshable: bool = False      # blocked purely by pacing/staleness — worth a probe
 
 
 def _parse_codex_facts(
@@ -150,9 +149,6 @@ def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
     if status.windows is None:
         return PoolStatus(status.tool, False, 100.0, "limit facts unavailable", None)
     paced, pace_reason = _codex_pacing(status.windows, now)
-    # A block is *refreshable* only when the pool was otherwise clear (no operator
-    # activity, no short-window capacity block, valid facts) and pacing/staleness is the
-    # sole reason it can't dispatch — the one case an active fact refresh can unstick.
     return PoolStatus(
         status.tool,
         status.clear and paced,
@@ -162,7 +158,6 @@ def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
         status.active,
         status.ceiling,
         status.observed_at,
-        refreshable=status.clear and not paced,
     )
 
 
