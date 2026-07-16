@@ -339,6 +339,8 @@ def test_concurrent_descendant_submissions_are_atomically_registered(make_coord)
     seed = make_coord(fake)
     root = seed.submit_stage(Submission(
         repo="o/r", subject="root", stage="review", pool="claude"))
+    seed.cycle("claude")
+    assert record_of(seed, root).state == "running"
     barrier = threading.Barrier(2)
     children = []
     errors = []
@@ -365,10 +367,61 @@ def test_concurrent_descendant_submissions_are_atomically_registered(make_coord)
 
     assert errors == [] and len(children) == 2
     assert record_of(seed, root).descendants == set(children)
-    seed.cycle("claude")
     fake.end(root, success=True)
     assert [outcome.identity for outcome in seed.cycle("claude")] == [root]
     assert all(record_of(seed, child).retired for child in children)
+
+
+def test_descendant_racing_root_completion_never_survives_orphaned(make_coord):
+    """Atomic root-state validation means the child either registers before completion and is
+    retired with the root, or its submission rolls back after completion. No active orphan can
+    survive either transaction order."""
+    from agentflow.coordinator.store import StoreUnavailable
+
+    fake = FakeSession()
+    seed = make_coord(fake)
+    root = seed.submit_stage(Submission(
+        repo="o/r", subject="terminal-root", stage="review", pool="claude"))
+    seed.cycle("claude")
+    fake.end(root, success=True)
+    barrier = threading.Barrier(2)
+    submitted = []
+    rejected = []
+    errors = []
+
+    def complete():
+        try:
+            coord = make_coord(fake)
+            barrier.wait()
+            coord.cycle("claude")
+        except BaseException as error:
+            errors.append(error)
+
+    def submit_child():
+        try:
+            coord = make_coord(fake)
+            barrier.wait()
+            submitted.append(coord.submit_stage(Submission(
+                repo="o/r", subject="late-child", stage="respond", pool="claude",
+                descendant_of=root)))
+        except StoreUnavailable:
+            rejected.append(True)
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=complete), threading.Thread(target=submit_child)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == [] and len(submitted) + len(rejected) == 1
+    # If the child transaction won first, the completion cycle intentionally lost its root
+    # revision CAS. The next normal pass reloads that registration and retires both together.
+    make_coord(fake).cycle("claude")
+    durable = seed._store.load()
+    children = [record for record in durable.values() if record.root == root]
+    assert all(record.retired for record in children)
 
 
 def test_schema_v1_record_without_revision_advances_through_public_cycle(make_coord):

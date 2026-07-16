@@ -281,6 +281,9 @@ class Store:
                     if root_row is None:
                         raise StoreUnavailable("cannot register descendant: root is missing")
                     root = self._decode(root_row[0])
+                    if root.state != RUNNING or root.retired or root.hold_pending:
+                        raise StoreUnavailable(
+                            "cannot register descendant: root is not actively running")
                     if successor.identity not in root.descendants:
                         root.descendants.add(successor.identity)
                         root.revision += 1
