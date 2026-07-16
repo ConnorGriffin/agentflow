@@ -113,7 +113,8 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
 
 
 def _reclaim(cfg: RepoConfig, _log=None) -> str:
-    builds = reclaim_claims(cfg)
+    from agentflow import coordinated_build
+    builds = reclaim_claims(cfg, coordinated_build.owned_issues(cfg))
     triaging = reclaim_triage_claims(cfg)
     parts = []
     if builds:

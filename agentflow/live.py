@@ -90,6 +90,15 @@ def running() -> list[dict]:
     return _entries()
 
 
+def replace_projection(entries: list[dict]) -> None:
+    """Replace the building-stage entries on the board with the coordinator's running-record
+    projection, leaving other live sessions (legacy triage / mockup / respond) untouched. In
+    coordinated mode the live board's building lane *is* a projection of running records rather
+    than a per-session write seam (ADR 0030, issue #103)."""
+    kept = [e for e in _entries() if e.get("stage") != "building"]
+    _write_atomic(LIVE_FILE, kept + list(entries))
+
+
 def reap(is_alive: Callable[[str], bool]) -> list[dict]:
     """Drop entries whose owning worktree is no longer alive — the dead-session sweep the
     daemon runs at startup, so a crashed run never leaves a phantom session on the board.

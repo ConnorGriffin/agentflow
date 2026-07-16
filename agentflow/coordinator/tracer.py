@@ -1,0 +1,97 @@
+"""The Build tracer bridge (issue #103) — the small set of reads and gates that connect the
+session coordinator to the legacy dispatch surfaces while Build is the only coordinated stage.
+
+Three things the dispatch layer needs when Build runs behind the coordinator, all derived from
+the durable continuation records so there is no second source of truth:
+
+- **Build is the only enabled logical stage.** :func:`build_only_gate` is the coordinator's
+  admission gate in coordinated mode: every other logical stage may be submitted and sit
+  visibly ``waiting``, but it never admits, so it consumes neither a permit nor an attempt.
+- **The live board becomes a projection of running records.** :func:`live_projection` renders
+  the running Build records as live-session entries; waiting records reserve nothing and do not
+  appear, exactly matching the reviewed admission demand they hold.
+- **Coordinator ownership is authoritative for claims.** :func:`owned_issues` names the issues a
+  coordinator record still owns, so legacy claim reclamation can never strip one; and
+  :func:`coordinator_active` reports whether any record still owns in-flight work, which gates a
+  rollback drain from resuming legacy launching.
+
+Every function is pure over an iterable of records, so the behaviors are exercised without a
+daemon, GitHub, or a live store; :func:`load_records` is the thin production reader.
+"""
+
+from __future__ import annotations
+
+from agentflow.coordinator.record import RUNNING, WAITING, Record
+from agentflow.coordinator.store import Store, default_store_path
+
+
+def build_only_gate(record: Record) -> bool:
+    """The coordinated-mode admission gate: admit Build, refuse every other logical stage.
+    A refused stage stays ``waiting`` and reserves nothing — no permit, no attempt — so Review,
+    Revise, Intake, Respond, and Mockup remain visibly queued until their own slices land."""
+    return record.stage == "build"
+
+
+def _issue_number(record: Record) -> int | None:
+    try:
+        return int(record.subject)
+    except (TypeError, ValueError):
+        return None
+
+
+def owned_issues(records, repo: str) -> set[int]:
+    """The issue numbers in ``repo`` that a coordinator record still owns — anything not retired
+    that still holds its GitHub claim, whether it is running, waiting, or completed and awaiting
+    the next stage's transfer. Legacy claim reclamation must skip these: an ``agentflow:building``
+    claim can legitimately outlive its provider process now (ADR 0028)."""
+    owned: set[int] = set()
+    for record in records:
+        if record.repo != repo or record.retired or not record.claim:
+            continue
+        number = _issue_number(record)
+        if number is not None:
+            owned.add(number)
+    return owned
+
+
+def coordinator_active(records) -> bool:
+    """Whether any coordinator record still owns in-flight work — a waiting continuation/queued
+    stage or a running provider. A completed record at its durable PR boundary and a held record
+    at its human handoff are not in-flight, so they do not hold a rollback drain open (issue
+    #103): rollback keeps reconciling until every record reaches such a boundary, then legacy
+    launching may resume."""
+    return any(not r.retired and r.state in (WAITING, RUNNING) for r in records)
+
+
+def live_projection(records) -> list[dict]:
+    """Render the running Build records as live-session board entries (ADR 0030: the live board
+    is a projection of running records, not an ownership source). One entry per running Build
+    record, keyed by its worktree; waiting records reserve nothing and are omitted."""
+    entries: list[dict] = []
+    for record in records:
+        if record.state != RUNNING or record.stage != "build":
+            continue
+        number = _issue_number(record)
+        entries.append({
+            "repo": record.repo,
+            "number": number if number is not None else record.subject,
+            "title": "",
+            "stage": "building",
+            "tool": record.pool,
+            "model": record.model,
+            "branch": None,
+            "worktree": record.source or "",
+            "pid": int(record.family) if record.family and record.family.isdigit() else None,
+        })
+    return entries
+
+
+def load_records(store_path=None) -> list[Record]:
+    """The durable continuation records — the production reader behind the pure functions
+    above. Reads the coordinator's private store directly; a fail-closed store surfaces its
+    :class:`StoreUnavailable` rather than reporting a falsely empty, all-clear world."""
+    store = Store(store_path or default_store_path())
+    try:
+        return list(store.load().values())
+    finally:
+        store.close()

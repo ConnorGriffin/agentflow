@@ -100,15 +100,17 @@ def test_permit_ledger_is_shared_across_coordinator_instances(make_coord):
     assert permits(b, "codex") == 4
 
 
-def test_coordinator_module_is_dormant_no_daemon_wiring():
-    """Guardrail for ADR 0030's dormant slice: no pipeline module imports the coordinator,
-    so the current legacy pipeline behavior cannot change."""
-    import agentflow.daemon
+def test_only_build_is_wired_behind_the_coordinator():
+    """Guardrail for issue #103: Build — and only Build — has moved behind the coordinator.
+    Dispatch routes it through the rollout; the legacy provider surface (`runner`) and the other
+    five logical stages' orchestration (`loop`) still never import the coordinator, so nothing
+    else submits work there."""
     import agentflow.dispatch
     import agentflow.loop
     import agentflow.runner
-    for module in (agentflow.daemon, agentflow.dispatch, agentflow.loop, agentflow.runner):
-        assert "coordinator" not in getattr(module, "__dict__", {})
+    dispatch_source = agentflow.dispatch.__loader__.get_source("agentflow.dispatch") or ""
+    assert "coordinated_build" in dispatch_source  # Build is wired
+    for module in (agentflow.loop, agentflow.runner):
         source = module.__loader__.get_source(module.__name__) or ""
         assert "agentflow.coordinator" not in source
 

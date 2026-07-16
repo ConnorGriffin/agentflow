@@ -287,6 +287,21 @@ def test_reclaim_keeps_a_claim_a_live_session_still_holds(monkeypatch):
     assert released == [8]
 
 
+def test_reclaim_never_strips_a_claim_a_coordinator_record_owns(monkeypatch):
+    # A coordinator record can hold `agentflow:building` while it waits between provider
+    # sessions — the claim legitimately outlives the process now (ADR 0028). Reclaim must skip
+    # it, or it would clear coordinator ownership and let a duplicate build in (issue #103).
+    claimed = [{"number": 7}, {"number": 8}]
+    released = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(claimed)))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())   # neither has a PR yet
+    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: set())  # nor a session
+    monkeypatch.setattr(loop, "_release", lambda repo, n: released.append(n))
+    # #7 is owned by a coordinator record → kept; #8 is owned by nothing → genuinely stale.
+    assert reclaim_claims(RepoConfig("o/r", "."), coordinator_owned={7}) == 1
+    assert released == [8]
+
+
 def _triaging(number: int, *state_labels: str) -> dict:
     return {"number": number,
             "labels": [{"name": "agentflow:triaging"}] + [{"name": s} for s in state_labels]}

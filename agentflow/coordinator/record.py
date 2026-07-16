@@ -32,6 +32,9 @@ class Record:
     stage: str             # logical stage: intake | build | review | revise | mockup | respond
     pool: str              # claude | codex — the pool this record is charged against
     demand: int            # permits this attempt reserves on `pool` (from the admission matrix)
+    repo: str = ""         # the originating repo — kept for the ADR 0028 logs and claim ownership
+    subject: str = ""      # the issue/PR subject — kept for the ADR 0028 logs and claim ownership
+    target: str | None = None  # immutable target (head SHA / comment id), part of the identity
     continuation: bool = False   # eligible ahead of cold work on its pool (ADR 0028 order)
     eligible_at: int = 0         # when a paused continuation may be admitted again
     created_at: int = 0          # tie-breaker after eligible_at in the continuation queue
@@ -45,6 +48,7 @@ class Record:
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move
     source: str | None = None    # durable working-directory/worktree pointer for provider launch
     input_ptr: str | None = None # durable pointer the provider adapter rebuilds the prompt from
+    deadline: int = 0                    # supervisor observe-until deadline, for the recovered-running log
     start_fact: str | None = None        # durable launcher handshake result: started | not_started
     launch_token: str | None = None      # nonce a reservation stamps; only the child holding it may record `started`
     family: str | None = None            # the provider process-family identity a `started` carries

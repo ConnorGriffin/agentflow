@@ -26,8 +26,9 @@ import os
 import threading
 from collections import Counter
 
-from agentflow import balancer, loop
+from agentflow import balancer, coordinated_build, live, loop
 from agentflow.balancer import pick_pair
+from agentflow.coordinator import LEGACY, Phase, Rollout
 
 # Named config (env-overridable). The machine ceiling caps total live sessions; the
 # per-stage caps cap each kind. Triage > build on purpose (see the module docstring).
@@ -177,14 +178,23 @@ def _triage_fanout(cfg, slot: _Slot, _log) -> list[threading.Thread]:
     return threads
 
 
-def _dispatch_repo(cfg, slot: _Slot, _log) -> None:
+def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> None:
     """Dispatch one repo's ready work concurrently: fan out triage across its intake queue,
     and start at most one build, one mockup draw, and one PR reply. Build concurrency across
     the fleet comes from running every repo's `_dispatch_repo` at once. Merges are handled
-    serially by the caller after these settle (ADR 0009)."""
+    serially by the caller after these settle (ADR 0009).
+
+    Build alone is gated by the rollout phase (issue #103): `legacy` keeps the existing build
+    path; `coordinated` submits one durable Build stage to the coordinator instead of launching;
+    `draining` launches no new build of either kind while existing records finish. Mockup,
+    respond, and triage stay on the legacy path — only Build has moved behind the coordinator."""
     threads = _triage_fanout(cfg, slot, _log)
-    threads.append(_spawn(lambda: _run_and_log(
-        cfg, "build", lambda: loop.run_once(cfg, _log=_log, slot=slot), _log)))
+    if phase.launch_legacy:
+        threads.append(_spawn(lambda: _run_and_log(
+            cfg, "build", lambda: loop.run_once(cfg, _log=_log, slot=slot), _log)))
+    elif phase.submit_coordinated and coordinator is not None:
+        _run_and_log(cfg, "build",
+                     lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
     threads.append(_spawn(lambda: _run_and_log(
         cfg, "mockup", lambda: loop.produce_once(cfg, _log=_log, slot=slot), _log)))
     threads.append(_spawn(lambda: _run_and_log(
@@ -193,15 +203,52 @@ def _dispatch_repo(cfg, slot: _Slot, _log) -> None:
         thread.join()
 
 
-def run_cycle(repos, governor: Governor | None = None, *, _log=None) -> None:
+def _submit_coordinated_build(cfg, coordinator, _log) -> str:
+    """Submit this repo's next ready issue as one durable Build stage. Submission is idempotent
+    on the stage identity, so a repeat or restart never opens a second Build — the coordinator
+    owns admission, continuation, and completion from here (issue #103)."""
+    issue = loop._next_ready_issue(cfg, _log=_log)
+    if not issue:
+        return "no ready-for-agent issues"
+    builder, _reviewer, block_msg = pick_pair()
+    if builder is None:
+        return f"#{issue['number']}: no pool has headroom ({block_msg}) — deferring"
+    submission = coordinated_build.build_submission(cfg, issue, builder.tool)
+    if submission is None:
+        return f"#{issue['number']}: skipped — no agentflow:complexity:* label (ADR 0018 gate)"
+    coordinator.submit_stage(submission)
+    return f"#{issue['number']}: submitted to coordinator → {builder.tool} (build)"
+
+
+def _resolve_phase(rollout, _log) -> Phase:
+    """This cycle's Build rollout phase, failing toward legacy so a read hiccup never suspends
+    the pipeline. Cheap in the steady legacy state — it never creates a coordinator store."""
+    try:
+        return coordinated_build.resolve_phase(rollout or Rollout(log=_log), live.running())
+    except Exception as e:  # noqa: BLE001 — a rollout read must never sink the dispatch cycle
+        _log(f"rollout: phase read error, staying legacy: {type(e).__name__}: {e}")
+        return Phase(LEGACY)
+
+
+def run_cycle(repos, governor: Governor | None = None, *, rollout=None,
+              coordinator=None, _log=None) -> None:
     """One concurrent dispatch pass over the fleet (ADR 0023 M6 slice 5). Reads each pool's
-    activity, then dispatches every repo's ready work at once — governed by the machine
-    ceiling, per-stage caps, and per-pool pacing. Merges are NOT here: they stay serialized
-    in the caller's re-rebase pass and behind the merge lock (ADR 0009)."""
+    activity and the Build rollout phase, then dispatches every repo's ready work at once —
+    governed by the machine ceiling, per-stage caps, and per-pool pacing. When Build is behind
+    the coordinator (coordinated or draining), one shared coordinator reconciles the Build pools
+    and republishes the live board as a projection of its running records after the repos
+    settle. Merges are NOT here: they stay serialized in the caller's re-rebase pass (ADR 0009)."""
     _log = _log or (lambda _m: None)
     gov = governor if governor is not None else Governor()
     gov.begin_cycle()
     slot = _Slot(gov, _pool_activity(_log))
-    repo_threads = [_spawn(lambda cfg=cfg: _dispatch_repo(cfg, slot, _log)) for cfg in repos]
+    phase = _resolve_phase(rollout, _log)
+    coord = None
+    if not phase.launch_legacy:  # coordinated or draining — the coordinator owns Build now
+        coord = coordinator if coordinator is not None else coordinated_build.build_coordinator(_log)
+    repo_threads = [_spawn(lambda cfg=cfg: _dispatch_repo(cfg, slot, _log, phase, coord))
+                    for cfg in repos]
     for thread in repo_threads:
         thread.join()
+    if coord is not None:
+        coordinated_build.reconcile_and_project(coord, _log=_log)

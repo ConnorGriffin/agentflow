@@ -82,3 +82,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0030](0030-session-coordinator-seam.md) — One session coordinator owns durable
   continuation, classification, and atomic admission; provider adapters extract facts
   while stage adapters retain completion and recovery locality.
+- [0031](0031-build-tracer-rollout.md) — Build moves behind the coordinator through a
+  durable legacy→draining→coordinated rollout: activation waits for a fleet-wide legacy
+  drain and refuses ambiguous state, Build is the only enabled stage, and rollback is a
+  drain that never converts a coordinator record back into a legacy retry.

@@ -306,12 +306,16 @@ def _issues_with_live_session(repo: str) -> set[int]:
             if s.get("repo") == repo and isinstance(s.get("number"), int)}
 
 
-def reclaim_claims(cfg: RepoConfig) -> int:
+def reclaim_claims(cfg: RepoConfig, coordinator_owned: set[int] = frozenset()) -> int:
     """Drop `agentflow:building` claims orphaned by a crash. A claim is stale only if no
     session is building it right now (the live board) AND it has no open agentflow PR — under
     concurrent dispatch a live build holds its claim before its PR exists, so we must not strip
     it. A stale claim is fail-safe (the issue is skipped, never duplicated) but blocks that
-    issue until cleared. Returns how many it cleared."""
+    issue until cleared. Returns how many it cleared.
+
+    `coordinator_owned` are the issues a session-coordinator record still owns (ADR 0028): a
+    claim can legitimately outlive its provider process now, so reclamation must never strip one
+    — that would clear coordinator ownership and let a duplicate build in (issue #103)."""
     r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
               "--label", BUILDING, "--json", "number", "--limit", "100"])
     if r.returncode != 0:
@@ -321,7 +325,8 @@ def reclaim_claims(cfg: RepoConfig) -> int:
         return 0   # can't see what's in flight — a live claim must never be stripped
     live_now = _issues_with_live_session(cfg.repo)
     stale = [i["number"] for i in json.loads(r.stdout or "[]")
-             if i["number"] not in in_flight and i["number"] not in live_now]
+             if i["number"] not in in_flight and i["number"] not in live_now
+             and i["number"] not in coordinator_owned]
     for n in stale:
         _release(cfg.repo, n)
     return len(stale)
