@@ -9,6 +9,11 @@ coordinator.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
 from conftest import FakeSession, permits, record_of
 
 from agentflow import coordinated_build
@@ -43,6 +48,25 @@ def _router(fake, *, pr, verdict, prep):
 
 def _records(coord):
     return list(coord._store.load().values())
+
+
+class _CommitFault:
+    """A connection proxy that kills submission immediately before or after SQLite COMMIT."""
+
+    def __init__(self, connection, point):
+        self._connection = connection
+        self._point = point
+
+    def execute(self, sql, parameters=()):
+        if sql == "COMMIT" and self._point == "before":
+            raise RuntimeError("daemon died immediately before successor commit")
+        result = self._connection.execute(sql, parameters)
+        if sql == "COMMIT" and self._point == "after":
+            raise RuntimeError("daemon died immediately after successor commit")
+        return result
+
+    def close(self):
+        self._connection.close()
 
 
 # --- outcome-first verdict verification --------------------------------------------------
@@ -249,6 +273,175 @@ def test_daemon_death_between_stages_keeps_ownership_and_transfers_once(make_coo
     assert again.cycle("codex") == []                                 # no duplicate review work
 
 
+def test_death_before_successor_commit_keeps_completed_predecessor_ownership(make_coord):
+    fake = FakeSession()
+    adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
+                                          pool="claude", complexity="deep", effort="high",
+                                          source="/wt/issue-7"))
+    coord.cycle("claude")
+    fake.end(build, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+
+    crashed = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    crashed._store._conn = _CommitFault(crashed._store._conn, "before")
+    with pytest.raises(RuntimeError, match="before successor commit"):
+        crashed.submit_stage(_review("7", pool="codex", builder_lineage="claude",
+                                     target="head-sha", transfer_from=build))
+    crashed._store.close()
+
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    records = {r.identity: r for r in _records(restarted)}
+    assert set(records) == {build}
+    assert records[build].state == "completed"
+    assert records[build].claim is True and records[build].retired is False
+
+
+def test_death_after_successor_commit_leaves_one_owner_and_retry_is_idempotent(make_coord):
+    fake = FakeSession()
+    adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
+                                          pool="claude", complexity="deep", effort="high",
+                                          source="/wt/issue-7"))
+    coord.cycle("claude")
+    fake.end(build, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+    review_submission = _review("7", pool="codex", builder_lineage="claude",
+                                target="head-sha", transfer_from=build)
+
+    crashed = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    crashed._store._conn = _CommitFault(crashed._store._conn, "after")
+    with pytest.raises(RuntimeError, match="after successor commit"):
+        crashed.submit_stage(review_submission)
+    crashed._store.close()
+
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    records = {r.identity: r for r in _records(restarted)}
+    review = "o/r|7|review|head-sha"
+    assert set(records) == {build, review}
+    assert records[build].retired is True and records[build].claim is False
+    assert records[review].retired is False and records[review].claim is True
+    assert tracer.owned_issues(list(records.values()), "o/r") == {7}
+    assert restarted.submit_stage(review_submission) == review
+    assert len(_records(restarted)) == 2
+
+
+def test_successor_transfer_is_the_same_transition_for_review_to_revise(make_coord):
+    fake = FakeSession()
+    adapter = _router(fake, pr=[False], verdict=[True], prep=[True])
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    review = coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
+                                        target="head-sha"))
+    coord.cycle("codex")
+    fake.end(review, cause=ProviderCause.PROCESS)
+    coord.cycle("codex")
+
+    revise = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="revise", pool="claude", target="head-sha",
+        builder_lineage="claude", source="/wt/issue-7", transfer_from=review))
+    records = {r.identity: r for r in _records(coord)}
+    assert records[review].retired is True and records[review].claim is False
+    assert records[revise].retired is False and records[revise].claim is True
+
+
+def test_existing_successor_assumes_claim_durably_without_duplication(make_coord):
+    fake = FakeSession()
+    adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
+                                          pool="claude", complexity="deep", effort="high",
+                                          source="/wt/issue-7"))
+    coord.cycle("claude")
+    fake.end(build, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+    review_without_claim = _review("7", pool="codex", builder_lineage="claude",
+                                   target="head-sha")
+    review_without_claim = replace(review_without_claim, claim=False)
+    review = coord.submit_stage(review_without_claim)
+
+    coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
+                               target="head-sha", transfer_from=build))
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    records = {r.identity: r for r in _records(restarted)}
+    assert set(records) == {build, review}
+    assert records[build].retired is True and records[build].claim is False
+    assert records[review].claim is True
+
+
+def test_store_failure_during_submission_preserves_predecessor_ownership(make_coord):
+    fake = FakeSession()
+    adapter = _router(fake, pr=[True], verdict=[False], prep=[True])
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
+                                          pool="claude", complexity="deep", effort="high",
+                                          source="/wt/issue-7"))
+    coord.cycle("claude")
+    fake.end(build, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+    coord._store.close()
+
+    with pytest.raises(RuntimeError):
+        coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
+                                   target="head-sha", transfer_from=build))
+
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    records = {r.identity: r for r in _records(restarted)}
+    assert set(records) == {build}
+    assert records[build].claim is True and records[build].retired is False
+
+
+def test_production_reconciliation_recovers_completed_build_handoff_after_restart(
+        make_coord, monkeypatch):
+    """Kill the daemon after Build completion, then recover only through the production pass."""
+    fake = FakeSession()
+    pr, verdict, prep = [True], [False], [True]
+    adapter = _router(fake, pr=pr, verdict=verdict, prep=prep)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    build = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="build", pool="claude", complexity="deep",
+        effort="high", source="/work/.agentflow/worktrees/claude/issue-7-recover-handoff"))
+    coord.cycle("claude")
+    fake.end(build, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+
+    # The process dies before production consumes that cycle's outcome. A fresh coordinator
+    # must rediscover the durable Build instead of relying on an in-memory outcome.
+    restarted = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    calls = []
+
+    def gh(cmd):
+        calls.append(cmd)
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=1, stdout="")
+        return SimpleNamespace(returncode=0, stdout='[{"number":42,"headRefOid":"head-a"}]')
+
+    monkeypatch.setattr("agentflow.loop._run", gh)
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+    phase = SimpleNamespace(name="coordinated")
+
+    # An unreadable PR fails closed: Build still owns the change and a later pass retries.
+    coordinated_build.reconcile_and_project(restarted, phase)
+    assert record_of(restarted, build).claim is True
+    assert record_of(restarted, build).retired is False
+
+    coordinated_build.reconcile_and_project(restarted, phase)
+    review = "o/r|7|review|head-a"
+    assert record_of(restarted, build).retired is True
+    assert record_of(restarted, build).claim is False
+    assert record_of(restarted, review).state == "waiting"
+    assert record_of(restarted, review).claim is True
+
+    # Repeated reconciliation/restart neither creates another record nor another provider.
+    coordinated_build.reconcile_and_project(restarted, phase)
+    restarted_again = make_coord(fake, adapter=adapter, gate=tracer.build_and_review_gate)
+    coordinated_build.reconcile_and_project(restarted_again, phase)
+    assert list(fake.family_of).count(review) == 1
+    assert len([r for r in _records(restarted_again) if r.stage == "review"]) == 1
+    assert len(calls) == 2
+
+
 # --- build and review are the only enabled stages ----------------------------------------
 
 def test_only_build_and_review_admit_other_stages_stay_waiting(make_coord):
@@ -286,3 +479,12 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     assert coordinated_build.review_submission(
         Record(identity="x", stage="build", pool="claude", demand=5, repo="o/r", subject="7"),
         "sha", "codex", 42) is None
+
+
+def test_review_identity_is_idempotent_per_exact_head(make_coord):
+    coord = make_coord()
+    same = coord.submit_stage(_review(target="head-a"))
+    assert coord.submit_stage(_review(target="head-a")) == same
+    changed = coord.submit_stage(_review(target="head-b"))
+    assert changed != same
+    assert {r.target for r in _records(coord) if r.stage == "review"} == {"head-a", "head-b"}

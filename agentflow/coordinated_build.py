@@ -33,7 +33,7 @@ from agentflow.coordinator import (BuildStageAdapter, Coordinator, MODE_COORDINA
                                    ReviewStageAdapter, ReviseStageAdapter, Rollout, StageRouter,
                                    tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
-from agentflow.coordinator.store import default_store_path
+from agentflow.coordinator.store import StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
 
 BUILD_POOLS = ("claude", "codex")
@@ -623,8 +623,14 @@ def _open_pr_for_branch(repo: str, branch: str) -> dict | None:
                    "--json", "number,headRefOid", "--limit", "1"])
     if listed.returncode != 0:
         return None
-    prs = json.loads(listed.stdout or "[]")
-    return prs[0] if prs else None
+    try:
+        prs = json.loads(listed.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if (not isinstance(prs, list) or not prs or not isinstance(prs[0], dict)
+            or not isinstance(prs[0].get("number"), int)):
+        return None
+    return prs[0]
 
 
 def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> None:
@@ -749,12 +755,21 @@ def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> lis
     now = int(time.time())
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
+    # Handoffs are driven from durable state, not only this process's outcomes. A daemon may
+    # die after a stage completion is committed but before it consumes the returned outcome.
+    # A completed stage keeps its claim until its successor is atomically persisted.
     for record in tracer.load_records():
         if (record.state == COMPLETED and not record.retired and record.claim
                 and not record.hold_pending):  # a pending park is already retried by reconcile
             opener = _OPENERS.get(record.stage)
             if opener is not None:
-                opener(coord, record.identity)
+                try:
+                    opener(coord, record.identity)
+                except StoreUnavailable:
+                    # The fail-closed transactional submit refused the transfer — e.g. another
+                    # process moved the claim between our durable snapshot and this submit. The
+                    # store is the truth; skip and let the next pass re-read it.
+                    continue
     records = tracer.load_records()
     owned = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     live.replace_projection(

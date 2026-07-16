@@ -150,15 +150,15 @@ class Coordinator:
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             created_at=int(time.time()))
         with self._lock:
-            existing = self._records.setdefault(identity, record)
-            if existing is record:
-                self._register_descendant(record)
-                self._persist(record)
-            # The successor is durable before the prior stage retires, and the transfer re-runs
-            # on a repeated submission: a crash between the two writes leaves the prior completed
-            # and still claimed, which the next idempotent submission finishes (ADR 0028 — a
-            # restart repeats the transfer safely, never drops or duplicates the claim).
-            self._transfer_claim(existing, submission.transfer_from)
+            successor, prior, transferred = self._store.submit(record, submission.transfer_from)
+            self._records[identity] = successor
+            if prior is not None:
+                self._records[prior.identity] = prior
+            self._register_descendant(successor)
+            if transferred and prior is not None:
+                self._emit(prior, f"attempt {prior.attempts}/{ATTEMPT_BUDGET} completed — "
+                           f"{_OUTCOME_LABEL.get(prior.stage, prior.stage)}; "
+                           f"claim transferred to {successor.stage}")
         return identity
 
     def park_completed(self, identity: str) -> "StageOutcome | None":
@@ -193,21 +193,6 @@ class Coordinator:
         if root is not None:
             root.descendants.add(record.identity)
             self._persist(root)
-
-    def _transfer_claim(self, record: Record, prior_identity: str | None) -> None:
-        """Assume the GitHub claim from a completed prior stage (ADR 0030 claim transfer). A
-        completed record keeps its claim until this transfer is durable — so a crash between
-        stages cannot drop ownership — then releases it and retires as the next stage takes over."""
-        if prior_identity is None:
-            return
-        prior = self._records.get(prior_identity)
-        if prior is not None and prior.state == COMPLETED and not prior.retired:
-            prior.claim = False
-            prior.retired = True
-            self._persist(prior)
-            self._emit(prior, f"attempt {prior.attempts}/{ATTEMPT_BUDGET} completed — "
-                              f"{_OUTCOME_LABEL.get(prior.stage, prior.stage)}; "
-                              f"claim transferred to {record.stage}")
 
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
         """Reconcile, returning the stage outcomes and holds settled this cycle, then admit
