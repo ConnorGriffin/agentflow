@@ -1,28 +1,33 @@
-"""Build behind the session coordinator, wired into the daemon's dispatch (issue #103).
+"""Build and Review behind the session coordinator, wired into the daemon's dispatch (issues
+#103, #104).
 
 This is the seam that turns the rollout phase into action. In **legacy** phase the daemon's
-existing build path is untouched; in **draining** phase no new Build of either kind launches,
-but the coordinator keeps reconciling the records that still own work; in **coordinated** phase
-a ready issue becomes exactly one Build submission, the coordinator owns its continuation,
-admission, and completion, and the live board becomes a projection of its running records.
+existing build path is untouched; in **draining** phase no new provider stage of either kind
+launches, but the coordinator keeps reconciling the records that still own work; in
+**coordinated** phase a ready issue becomes exactly one Build submission, a completed Build opens
+exactly one Review bound to the PR head SHA (transferring the claim before Build retires), the
+coordinator owns their continuation, admission, and completion, and the live board becomes a
+projection of its running records.
 
-The pure parts — mapping a ready issue to a submission, deriving the phase without disturbing a
-never-created store, spotting the current-format sessions a drain must wait on, and projecting
-running records — are exercised directly. The production factory wires the coordinator's Build
-adapter to the real GitHub PR check and worktree, following the same live-orchestration path the
-legacy builder uses (not unit-tested, ADR 0020).
+The pure parts — mapping a ready issue to a Build submission and a completed Build to a Review
+submission, deriving the phase without disturbing a never-created store, spotting the
+current-format sessions a drain must wait on, and projecting running records — are exercised
+directly. The production factory wires the coordinator's stage adapters to the real GitHub PR
+check, verdict parse, and worktrees, following the same live-orchestration path the legacy
+builder and reviewer use (not unit-tested, ADR 0020).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
 
 from agentflow.coordinator import (BuildStageAdapter, Coordinator, MODE_COORDINATED, Phase,
-                                   Rollout, tracer)
+                                   ReviewStageAdapter, Rollout, StageRouter, tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
 from agentflow.coordinator.store import default_store_path
 
@@ -53,6 +58,46 @@ def build_submission(cfg, issue: dict, tool: str):
         repo=cfg.repo, subject=str(n), stage="build", pool=tool,
         complexity=complexity.value, effort=effort_from_labels(labels).value,
         source=_builder_worktree(cfg, tool, n, sl), claim=True, input_ptr=brief)
+
+
+def _build_source_parts(record):
+    """The ``(workdir, slug)`` behind a Build record's owned worktree, or ``None``. The slug is
+    reused to name the review worktree so both stages of one issue read as a pair on disk."""
+    if not record.source or "/.agentflow/worktrees/" not in record.source:
+        return None
+    workdir, tail = record.source.split("/.agentflow/worktrees/", 1)
+    parts = tail.split("/", 1)
+    if len(parts) != 2:
+        return None
+    name = parts[1]
+    prefix = f"issue-{record.subject}-"
+    return workdir, (name[len(prefix):] if name.startswith(prefix) else name)
+
+
+def review_submission(build_record, head_sha, reviewer_tool, pr_number,
+                      *, acceptance="", surfaces=""):
+    """Translate a completed Build and its PR head SHA into one Review stage submission — the
+    minimal facts the coordinator needs (ADR 0030). The review is bound to the *exact* head SHA
+    (its immutable target, so a new head SHA starts a fresh review stage), assumes the Build's
+    change claim, records the builder's lineage so a same-tool review can finish but never
+    auto-merges, and points at a fresh read-only review worktree the reviewer checks out at that
+    SHA. Cross-tool review is always the deep safety net. Pure: the mapping is the test surface
+    (ADR 0020). Returns ``None`` if the Build worktree or head SHA is unreadable."""
+    from agentflow.coordinator import Submission
+    from agentflow.reviewer import REVIEW_PROMPT, review_worktree
+    parts = _build_source_parts(build_record)
+    if parts is None or not head_sha:
+        return None
+    workdir, slug = parts
+    brief = REVIEW_PROMPT.format(
+        pr=pr_number, acceptance=acceptance or "(none provided)",
+        surfaces=surfaces or "any user-facing surface")
+    return Submission(
+        repo=build_record.repo, subject=build_record.subject, stage="review",
+        target=head_sha, pool=reviewer_tool, complexity="deep",
+        source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
+        claim=True, input_ptr=brief, builder_lineage=build_record.pool,
+        transfer_from=build_record.identity)
 
 
 def legacy_evidence(live_sessions, coordinator_sources) -> tuple[str, ...]:
@@ -183,12 +228,17 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's one Build coordinator: its Build adapter verifies the real PR outcome and
-    reuses the retained worktree, and its admission gate enables Build alone so every other
-    logical stage stays queued (issue #103)."""
-    adapter = BuildStageAdapter(
+    """The daemon's one coordinator for Build and Review (issues #103, #104). Its Build adapter
+    verifies the real PR outcome and reuses the retained worktree; its Review adapter verifies a
+    durable verdict for the exact PR head SHA and recreates the read-only checkout; and its
+    admission gate enables Build and Review alone, so every other logical stage stays queued. One
+    :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
-    return Coordinator(adapter=adapter, gate=tracer.build_only_gate,
+    review = ReviewStageAdapter(
+        verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr)
+    router = StageRouter({"build": build, "review": review})
+    return Coordinator(adapter=router, gate=tracer.build_and_review_gate,
                        log=_log or (lambda _line: None))
 
 
@@ -312,14 +362,130 @@ def _hold_build(record) -> str | None:
     return str(url)
 
 
+# --- Review stage: verdict outcome, read-only checkout, PR park (live; ADR 0020) --------
+
+def _verdict_ready(record, obs) -> bool:
+    """The Review outcome is a parsed verdict for the exact reviewed head SHA (``record.target``).
+    The reviewer's captured final message is the durable verdict — read by us, never a file in the
+    untrusted PR tree — so a parsed verdict naming the target SHA completes review regardless of
+    how the reviewer exited; a missing verdict or one for another SHA stays incomplete (ADR 0028)."""
+    from agentflow.reviewer import parse_verdict
+    if not record.target:
+        return False
+    return parse_verdict(obs.final_message or "", expected_sha=record.target).parsed
+
+
+def _review_worktree_reset(record) -> bool:
+    """Recreate the read-only review checkout at the exact PR head SHA before admission (ADR 0030).
+    Review holds no local edits, so any stale checkout is discarded and rebuilt detached at the
+    record's immutable target SHA — the target is never touched. Any git failure returns False, so
+    admission is skipped with no permit and no attempt. Live orchestration, not unit-tested (ADR
+    0020)."""
+    from agentflow.loop import _run
+    from agentflow.runner import ClaudeRunner, CodexRunner
+    facts = _review_source_facts(record)
+    if facts is None or not record.target:
+        return False
+    workdir, _pr = facts
+    wt = Path(record.source)
+    if wt.exists():
+        _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt)])
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    runner = ClaudeRunner() if record.pool == "claude" else CodexRunner()
+    try:
+        runner.prepare_worktree_detached(workdir, record.target, wt)
+        runner.provision(wt)
+    except subprocess.CalledProcessError:
+        return False
+    return True
+
+
+def _review_source_facts(record):
+    """The ``(workdir, pr_number)`` a review worktree encodes, or ``None``. The review source is
+    ``.../<tool>-review/pr-<pr>-<slug>``, so the PR number is recoverable for the park handoff
+    without a second durable field."""
+    if not record.source or "/.agentflow/worktrees/" not in record.source:
+        return None
+    workdir, tail = record.source.split("/.agentflow/worktrees/", 1)
+    parts = tail.split("/")
+    if len(parts) != 2 or not parts[0].endswith("-review"):
+        return None
+    match = re.match(r"pr-(\d+)-", parts[1])
+    if match is None:
+        return None
+    return workdir, int(match.group(1))
+
+
+def _park_pr(record) -> str | None:
+    """Park the reviewed PR for a human and notify once (ADR 0028's exhaustion table). The park
+    comment is the durable proof; a repeat after a daemon crash observes the same comment and does
+    not notify again. Live orchestration, not unit-tested (ADR 0020)."""
+    from agentflow.gate import park
+    from agentflow.loop import _pr_comments
+    from agentflow.notify import notify
+    from agentflow.reviewer import Verdict
+    facts = _review_source_facts(record)
+    if facts is None:
+        return None
+    _workdir, pr = facts
+    marker = "agentflow: parked for human review"
+    comments = _pr_comments(record.repo, pr)
+    if comments is None:
+        return None
+    already = any(marker in comment.get("body", "") for comment in comments)
+    if not already:
+        park(record.repo, pr, Verdict(clean=False),
+             reason="exhausted its review budget without a durable verdict")
+    proved = _pr_comments(record.repo, pr)
+    if proved is None or not any(marker in comment.get("body", "") for comment in proved):
+        return None
+    url = f"https://github.com/{record.repo}/pull/{pr}"
+    if not already:
+        notify("agentflow needs you", f"{record.repo} PR #{pr}: review parked for your action", url)
+    return url
+
+
+def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> None:
+    """A completed Build opens exactly one waiting Review for the exact PR head SHA and transfers
+    the change claim before the Build record retires — no ownership gap (ADR 0028). Submission is
+    idempotent on the review identity (repo, subject, review, head SHA), so a repeat or restart
+    never opens a second review; a new head SHA is a genuinely new stage. Live, not unit-tested
+    (ADR 0020) — its mapping is covered through :func:`review_submission`."""
+    from agentflow.loop import _run
+    records = {record.identity: record for record in tracer.load_records()}
+    build = records.get(build_identity)
+    if build is None or build.stage != "build":
+        return
+    facts = _source_facts(build)
+    if facts is None:
+        return
+    _workdir, branch, _wt = facts
+    listed = _run(["gh", "pr", "list", "--repo", build.repo, "--head", branch, "--state", "open",
+                   "--json", "number,headRefOid", "--limit", "1"])
+    if listed.returncode != 0:
+        return
+    prs = json.loads(listed.stdout or "[]")
+    if not prs:
+        return
+    reviewer_tool = "codex" if build.pool == "claude" else "claude"
+    submission = review_submission(
+        build, prs[0].get("headRefOid", ""), reviewer_tool, prs[0].get("number"))
+    if submission is not None:
+        coord.submit_stage(submission)
+
+
 def reconcile_and_project(coord: Coordinator, phase: Phase, *, _log=None) -> list:
-    """Reconcile every Build pool and republish the live board as a projection of the running
-    records (ADR 0030). Returns the terminal outcomes settled this cycle."""
+    """Reconcile every Build/Review pool and republish the live board as a projection of the
+    running records (ADR 0030). A completed Build opens its Review before the projection, so the
+    claim transfers with no ownership gap. Returns the terminal outcomes settled this cycle."""
     from agentflow import live
     outcomes = []
     now = int(time.time())
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
+    for outcome in outcomes:
+        if outcome.stage == "build" and outcome.status == "completed":
+            _open_review_on_completed_build(coord, outcome.identity)
     records = tracer.load_records()
     owned = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     live.replace_projection(

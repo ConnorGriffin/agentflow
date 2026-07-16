@@ -1,15 +1,17 @@
-"""The Build tracer bridge (issue #103) — the small set of reads and gates that connect the
-session coordinator to the legacy dispatch surfaces while Build is the only coordinated stage.
+"""The tracer bridge (issues #103, #104) — the small set of reads and gates that connect the
+session coordinator to the legacy dispatch surfaces while Build and Review are the coordinated
+stages.
 
-Three things the dispatch layer needs when Build runs behind the coordinator, all derived from
-the durable continuation records so there is no second source of truth:
+Three things the dispatch layer needs when Build and Review run behind the coordinator, all
+derived from the durable continuation records so there is no second source of truth:
 
-- **Build is the only enabled logical stage.** :func:`build_only_gate` is the coordinator's
-  admission gate in coordinated mode: every other logical stage may be submitted and sit
-  visibly ``waiting``, but it never admits, so it consumes neither a permit nor an attempt.
+- **Build and Review are the only enabled logical stages.** :func:`build_and_review_gate` is the
+  coordinator's admission gate in coordinated mode: every other logical stage may be submitted
+  and sit visibly ``waiting``, but it never admits, so it consumes neither a permit nor an
+  attempt. :func:`build_only_gate` is the retained issue #103 gate for the Build-only slice.
 - **The live board becomes a projection of running records.** :func:`live_projection` renders
-  the running Build records as live-session entries; waiting records reserve nothing and do not
-  appear, exactly matching the reviewed admission demand they hold.
+  the running Build and Review records as live-session entries; waiting records reserve nothing
+  and do not appear, exactly matching the reviewed admission demand they hold.
 - **Coordinator ownership is authoritative for claims.** :func:`owned_issues` names the issues a
   coordinator record still owns, so legacy claim reclamation can never strip one; and
   :func:`coordinator_active` reports whether any record still owns in-flight work, which gates a
@@ -27,11 +29,23 @@ from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import Store, default_store_path
 
 
+# The logical stages enabled behind the coordinator today (issues #103, #104). Every other
+# stage may be submitted and sit visibly ``waiting``, but the gate never admits it, so it
+# consumes neither a permit nor an attempt.
+ENABLED_STAGES = ("building", "reviewing")
+
+
 def build_only_gate(record: Record) -> bool:
-    """The coordinated-mode admission gate: admit Build, refuse every other logical stage.
-    A refused stage stays ``waiting`` and reserves nothing — no permit, no attempt — so Review,
-    Revise, Intake, Respond, and Mockup remain visibly queued until their own slices land."""
+    """Legacy gate kept for the issue #103 slice: admit Build alone. Retained so the Build-only
+    behaviour stays exercised; the live coordinator uses :func:`build_and_review_gate`."""
     return record.stage == "build"
+
+
+def build_and_review_gate(record: Record) -> bool:
+    """The coordinated-mode admission gate: admit Build and Review, refuse every other logical
+    stage. A refused stage stays ``waiting`` and reserves nothing — no permit, no attempt — so
+    Revise, Intake, Respond, and Mockup remain visibly queued until their own slices land."""
+    return record.stage in ("build", "review")
 
 
 def _issue_number(record: Record) -> int | None:
@@ -65,13 +79,17 @@ def coordinator_active(records) -> bool:
     return any(not r.retired and r.state in (WAITING, RUNNING) for r in records)
 
 
+_STAGE_LANE = {"build": "building", "review": "reviewing"}
+
+
 def live_projection(records) -> list[dict]:
-    """Render the running Build records as live-session board entries (ADR 0030: the live board
-    is a projection of running records, not an ownership source). One entry per running Build
-    record, keyed by its worktree; waiting records reserve nothing and are omitted."""
+    """Render the running coordinated records as live-session board entries (ADR 0030: the live
+    board is a projection of running records, not an ownership source). One entry per running
+    Build or Review record, keyed by its worktree; waiting records reserve nothing and are
+    omitted."""
     entries: list[dict] = []
     for record in records:
-        if record.state != RUNNING or record.stage != "build":
+        if record.state != RUNNING or record.stage not in _STAGE_LANE:
             continue
         number = _issue_number(record)
         branch = None
@@ -83,7 +101,7 @@ def live_projection(records) -> list[dict]:
             "repo": record.repo,
             "number": number if number is not None else record.subject,
             "title": "",
-            "stage": "building",
+            "stage": _STAGE_LANE[record.stage],
             "tool": record.pool,
             "model": record.model,
             "branch": branch,
