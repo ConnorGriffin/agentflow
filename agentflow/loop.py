@@ -570,18 +570,28 @@ def _release_triage(repo: str, n: int) -> bool:
     never double-triaged), auto-reclaimed next cycle by `reclaim_triage_claims` — the missing
     state label is intake's stale signal, standing in for the open-PR check builds have.
     Returns durable proof that GitHub no longer carries the claim."""
+    def claim_present() -> bool | None:
+        viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
+        if viewed.returncode != 0:
+            return None
+        try:
+            labels = json.loads(viewed.stdout or "{}").get("labels", [])
+        except ValueError:
+            return None
+        return TRIAGING in {
+            label.get("name") for label in labels if isinstance(label, dict)
+        }
+
+    before = claim_present()
+    if before is None:
+        return False
+    if not before:
+        return True  # an earlier settlement released it before interruption
     removed = _run(["gh", "issue", "edit", str(n), "--repo", repo,
                     "--remove-label", TRIAGING])
     if removed.returncode != 0:
         return False
-    viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
-    if viewed.returncode != 0:
-        return False
-    try:
-        labels = json.loads(viewed.stdout or "{}").get("labels", [])
-    except ValueError:
-        return False
-    return TRIAGING not in {label.get("name") for label in labels if isinstance(label, dict)}
+    return claim_present() is False
 
 
 def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexity: Complexity,

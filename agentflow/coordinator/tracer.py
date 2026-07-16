@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agentflow.coordinator.record import RUNNING, WAITING, Record
+from agentflow.coordinator.record import COMPLETED, RUNNING, WAITING, Record
 from agentflow.coordinator.store import Store, default_store_path
 
 
@@ -84,7 +84,13 @@ def coordinator_active(records) -> bool:
     at its human handoff are not in-flight, so they do not hold a rollback drain open (issue
     #103): rollback keeps reconciling until every record reaches such a boundary, then legacy
     launching may resume."""
-    return any(not r.retired and r.state in (WAITING, RUNNING) for r in records)
+    return any(
+        not r.retired and (
+            r.state in (WAITING, RUNNING)
+            or (r.stage == "intake" and r.state == COMPLETED)
+        )
+        for r in records
+    )
 
 
 # Revise shares Build's board lane: it works on the same PR branch/worktree, so it reads as a

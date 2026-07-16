@@ -323,18 +323,36 @@ def test_reclaim_triage_frees_a_stranded_claim_for_the_intake_queue(monkeypatch)
 
 
 def test_release_triage_proves_the_claim_is_absent(monkeypatch):
-    calls = iter((_FakeRun(), _FakeRun('{"labels":[]}')))
+    calls = iter((
+        _FakeRun('{"labels":[{"name":"agentflow:triaging"}]}'),
+        _FakeRun(),
+        _FakeRun('{"labels":[]}'),
+    ))
     monkeypatch.setattr(loop, "_run", lambda cmd: next(calls))
 
     assert loop._release_triage("o/r", 69) is True
 
 
 def test_release_triage_fails_closed_when_github_still_reports_the_claim(monkeypatch):
-    calls = iter((_FakeRun(), _FakeRun(
-        '{"labels":[{"name":"agentflow:triaging"}]}')))
+    calls = iter((
+        _FakeRun('{"labels":[{"name":"agentflow:triaging"}]}'),
+        _FakeRun(),
+        _FakeRun('{"labels":[{"name":"agentflow:triaging"}]}'),
+    ))
     monkeypatch.setattr(loop, "_run", lambda cmd: next(calls))
 
     assert loop._release_triage("o/r", 69) is False
+
+
+def test_release_triage_accepts_an_already_absent_claim(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        loop, "_run",
+        lambda cmd: calls.append(cmd) or _FakeRun('{"labels":[]}'),
+    )
+
+    assert loop._release_triage("o/r", 69) is True
+    assert len(calls) == 1
 
 
 def test_reclaim_triage_keeps_a_coordinator_owned_continuation(monkeypatch):

@@ -16,6 +16,11 @@ def test_click_header_added_only_with_url():
     assert "Click: https://gh/pr/2" in a
 
 
+def test_sequence_id_makes_retries_update_one_notification():
+    a = _build_args("t", "m", "", "https://ntfy/x", "abc123")
+    assert "X-Sequence-ID: abc123" in a
+
+
 def test_empty_message_becomes_space():
     a = _build_args("t", "", "", "https://ntfy/x")
     assert a[-2] == " "  # ntfy rejects an empty body

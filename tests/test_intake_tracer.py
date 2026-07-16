@@ -9,6 +9,7 @@ from conftest import FakeSession, record_of, starts_until_held
 
 from agentflow import coordinated_intake, intake as intake_mod, loop
 from agentflow.coordinator import IntakeStageAdapter, Submission
+from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
 
 
@@ -106,6 +107,24 @@ def test_completed_projection_logs_durable_claim_release(make_coord):
     coord.cycle("claude")
 
     assert "o/r: 7: intake: attempt 1/3 settled — route parsed; claim released" in lines
+
+
+def test_unprojected_completed_intake_keeps_rollback_draining(make_coord):
+    fake = IntakeSession()
+    adapter = IntakeStageAdapter(
+        worktree_reset=lambda record: True, observer=fake,
+        apply_route=lambda record, result: None)
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission())
+    coord.cycle("claude")
+    fake.message = ('{"route":"ready","title":"Scoped","body":"brief",'
+                    '"complexity":"deep","effort":"medium"}')
+    fake.end(identity, cause=ProviderCause.PROCESS)
+
+    coord.cycle("claude")
+
+    assert record_of(coord, identity).state == "completed"
+    assert tracer.coordinator_active(coord._store.load().values()) is True
 
 
 def test_unparsed_success_uses_three_started_attempts_then_one_hold(make_coord):
@@ -212,6 +231,37 @@ def test_production_projection_applies_once_then_releases_claim(make_coord, monk
     assert released == [7] and len(notified) == 1
 
 
+def test_route_notification_retries_with_one_stable_delivery_identity(make_coord, monkeypatch):
+    fake = IntakeSession()
+    deliveries = iter((False, True))
+    notified = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(
+        returncode=0, stdout='{"title":"old","labels":[],"comments":[]}'))
+    monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
+    monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
+    monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
+    monkeypatch.setattr("agentflow.notify.notify",
+                        lambda *args: notified.append(args) or next(deliveries))
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=coordinated_intake.apply_route)
+    coord = make_coord(fake, adapter=adapter)
+    submission = _submission()
+    submission = Submission(**{**submission.__dict__, "input_ptr":
+                            '{"snapshot":{"title":"old"},"prompt":"p"}'})
+    identity = coord.submit_stage(submission)
+    coord.cycle("claude")
+    fake.message = '{"route":"grill","body":"question"}'
+    fake.end(identity, cause=ProviderCause.PROCESS)
+
+    coord.cycle("claude")  # captures the route; projection starts next cycle
+    coord.cycle("claude")  # first ntfy delivery reports failure
+    assert record_of(coord, identity).retired is False
+    coord.cycle("claude")  # stable-sequence retry succeeds
+
+    assert notified[0][3] == notified[1][3]
+    assert record_of(coord, identity).retired is True
+
+
 def test_production_preparation_recreates_read_only_worktree(make_coord, monkeypatch, tmp_path):
     fake = IntakeSession()
     prepared = []
@@ -277,4 +327,37 @@ def test_exhaustion_retries_a_failed_notification_before_holding(make_coord, mon
 
     assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 3
     assert len(notified) == 2
+    assert notified[0][3] == notified[1][3]  # ntfy replaces one stable client notification
+    assert record_of(coord, identity).notifications == 1
+
+
+def test_exhaustion_replay_after_accepted_delivery_updates_one_notification(make_coord,
+                                                                            monkeypatch):
+    fake = IntakeSession()
+    notified = []
+    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(
+        returncode=0, stdout='{"title":"old","labels":[],"comments":[]}'))
+    monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
+    monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
+    monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
+    monkeypatch.setattr("agentflow.notify.notify",
+                        lambda *args: notified.append(args) or True)
+    delivered = [False]
+
+    def crash_after_first_delivery(record):
+        proof = coordinated_intake.hold_intake(record)
+        if proof is not None and not delivered[0]:
+            delivered[0] = True
+            return None  # daemon died before the coordinator persisted notification state
+        return proof
+
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=lambda *args: "proof",
+                                 handoff=crash_after_first_delivery)
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission())
+
+    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 3
+    assert len(notified) == 2
+    assert notified[0][3] == notified[1][3]
     assert record_of(coord, identity).notifications == 1

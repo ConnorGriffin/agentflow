@@ -112,10 +112,12 @@ def cycle(repos: list[RepoConfig], run=pipeline_once, _log=log) -> None:
             _log(f"{cfg.repo}: cycle error: {type(e).__name__}: {e}")
 
 
-def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False) -> str:
+def _reclaim(cfg: RepoConfig, _log=None, *, preserve_builds: bool = False,
+             preserve_triage: bool = False) -> str:
     from agentflow import coordinated_build
     builds = 0 if preserve_builds else reclaim_claims(cfg, coordinated_build.owned_issues(cfg))
-    triaging = reclaim_triage_claims(cfg, coordinated_build.owned_issues(cfg))
+    triaging = (0 if preserve_triage
+                else reclaim_triage_claims(cfg, coordinated_build.owned_issues(cfg)))
     parts = []
     if builds:
         parts.append(f"reclaimed {builds} stale build claim(s)")
@@ -139,15 +141,18 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log) -> None:
     try:
         rollout_mode = rollout.mode
         preserve_builds = rollout_mode == MODE_COORDINATED
+        preserve_triage = rollout_mode == MODE_COORDINATED
     except Exception as e:  # noqa: BLE001 — ambiguous intent must preserve possible ownership
         rollout_mode = None
         preserve_builds = True
+        preserve_triage = True
         _log(f"rollout: state unreadable before reclaim ({type(e).__name__}: {e}) — "
-             "preserving Build claims")
+             "preserving Build and Intake claims")
     cycle(
         repos,
         run=lambda cfg, _log=None: _reclaim(
-            cfg, _log=_log, preserve_builds=preserve_builds),
+            cfg, _log=_log, preserve_builds=preserve_builds,
+            preserve_triage=preserve_triage),
         _log=_log,
     )
     dispatch.run_cycle(repos, rollout=rollout, rollout_mode=rollout_mode, _log=_log)

@@ -432,14 +432,20 @@ def _comment_matches_result(body: str, result: IntakeResult) -> bool:
         actual.startswith('> Retitled from: "') and actual.endswith(f"\n\n{expected}"))
 
 
-def _result_comment_exists(repo: str, issue_number: int, result: IntakeResult) -> bool:
+def _result_comment_exists(repo: str, issue_number: int,
+                           result: IntakeResult) -> bool | None:
+    """Whether this route's comment exists, or ``None`` when GitHub is unreadable.
+
+    Unreadable is deliberately distinct from absent: treating uncertainty as absence could
+    post a duplicate while replaying a partially projected route.
+    """
     r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"])
     if r.returncode != 0:
-        return False
+        return None
     try:
         comments = json.loads(r.stdout or "{}").get("comments", [])
     except ValueError:
-        return False
+        return None
     return any(_comment_matches_result(c.get("body", ""), result)
                for c in comments if isinstance(c, dict))
 
@@ -469,6 +475,8 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
     # Idempotent across partial writes: once this route's comment exists, retries finish any
     # remaining title/body/label mutations without posting it again.
     comment_done = _result_comment_exists(repo, issue_number, result)
+    if comment_done is None:
+        return f"routed -> {result.route.value} deferred (comments unreadable)"
     exact_labels = set(labels).issubset(current_labels)
     stale_state = any(name in current_labels and name not in set(labels) for name in STATE_LABELS)
     stale_dials = any(any(name.startswith(p) for p in _DIAL_PREFIXES)

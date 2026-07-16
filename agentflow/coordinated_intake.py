@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from hashlib import sha256
 from pathlib import Path
 
 from agentflow.coordinator import Submission
@@ -92,16 +93,20 @@ def apply_route(record, result: IntakeResult) -> str | None:
         return None
     issue = json.loads(viewed.stdout or "{}")
     labels = [label.get("name", "") for label in issue.get("labels", [])]
-    already = intake_result_is_durable(record.repo, number, result)
     apply_intake(record.repo, number, issue.get("title", snapshot.get("title", "")), labels, result)
     if not intake_result_is_durable(record.repo, number, result):
         return None
     if not _release_triage(record.repo, number):
         return None
     url = f"https://github.com/{record.repo}/issues/{number}"
-    if not already and result.route.value in ("grill", "mockup"):
+    if result.route.value in ("grill", "mockup"):
         from agentflow.notify import notify
-        notify("agentflow needs you", f"{record.repo} #{number}: {result.route.value}", url)
+        sequence_id = sha256(
+            f"{record.identity}:intake-route:{result.route.value}".encode()
+        ).hexdigest()[:12]
+        if not notify("agentflow needs you", f"{record.repo} #{number}: {result.route.value}",
+                      url, sequence_id):
+            return None
     return url
 
 
@@ -126,6 +131,8 @@ def hold_intake(record) -> str | None:
         return None
     url = f"https://github.com/{record.repo}/issues/{number}"
     if record.notifications == 0:
-        if not notify("agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}", url):
+        sequence_id = sha256(f"{record.identity}:intake-hold".encode()).hexdigest()[:12]
+        if not notify("agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}",
+                      url, sequence_id):
             return None
     return url
