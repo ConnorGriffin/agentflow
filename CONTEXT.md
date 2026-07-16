@@ -182,10 +182,8 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 
 - **Charter** — the canonical engineering-standards file (`standards/CHARTER.md`)
   every app in the flow must meet: deep-module architecture, UI→`/ui-mockups`,
-  test-through-the-interface, maintainability. Both tools read the *same bytes*
-  (Claude `@import`s it; Codex's global `AGENTS.md` symlinks to it), and it's
-  enforced at cross-review as blocking findings. Machine-global scope; per-repo files
-  carry facts + `profile`, not the charter.
+  test-through-the-interface, maintainability. It applies machine-wide and is
+  enforced at cross-review through blocking findings.
 
 - **Hazard** — an *environmental* obstacle to autonomous work: PHI/real data,
   live credentials, a demo that needs a running app. Historically fenced work off
