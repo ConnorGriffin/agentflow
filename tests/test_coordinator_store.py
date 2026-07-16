@@ -18,7 +18,7 @@ import pytest
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.record import Record
 from agentflow.coordinator.store import (
-    SCHEMA_VERSION, Store, StoreUnavailable, default_store_path)
+    ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable, default_store_path)
 
 
 def test_default_store_lives_under_the_state_directory(coord_state):
@@ -74,6 +74,160 @@ def test_reserve_is_atomic_across_instances(tmp_path):
 
     assert len(reserved) == 2
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
+
+
+def test_reserve_refuses_a_foreign_running_reservation(tmp_path):
+    """The same-identity compare-and-set: once one instance holds a record's running
+    reservation under its launch token, a second instance still holding the stale waiting view
+    cannot reserve the same identity with its own token, and the winner's token is untouched."""
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    store.upsert(Record("R", "build", "claude", 1, state="waiting"))
+
+    assert store.reserve(
+        Record("R", "build", "claude", 1, state="running", launch_token="A"), budget=5)
+    # A racer that loaded the record while it was still waiting now tries its own reservation.
+    assert not store.reserve(
+        Record("R", "build", "claude", 1, state="running", launch_token="B"), budget=5)
+    assert store.record_of("R").launch_token == "A"   # loser did not overwrite the winner
+    assert store.permits_used("claude") == 1           # exactly one running reservation
+    store.close()
+
+
+def test_reserve_never_overwrites_a_terminal_same_identity(tmp_path):
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    store.upsert(Record("R", "intake", "claude", 1, state="completed",
+                        launch_token="winner", outcome="route"))
+
+    stale = Record("R", "intake", "claude", 1, state="running", launch_token="stale")
+    assert store.reserve(stale, budget=5) is False
+    durable = store.record_of("R")
+    assert durable.state == "completed" and durable.launch_token == "winner"
+    assert durable.outcome == "route"
+    store.close()
+
+
+def test_reserve_requires_the_loaded_waiting_token_generation(tmp_path):
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    store.upsert(Record("R", "review", "claude", 1, state="waiting",
+                        launch_token="newer", attempts=1, eligible_at=100))
+
+    stale = Record("R", "review", "claude", 1, state="running",
+                   launch_token="stale", attempts=0)
+    assert store.reserve(stale, budget=5, expected_launch_token=None) is False
+    durable = store.record_of("R")
+    assert durable.attempts == 1 and durable.launch_token == "newer"
+    assert durable.eligible_at == 100
+    store.close()
+
+
+def test_two_processes_racing_one_waiting_record_yield_one_reservation(tmp_path):
+    """Two coordinator instances that both loaded the same waiting record and each flipped it to
+    running with its own fresh launch token race to reserve. Exactly one wins; the surviving
+    running row carries the winner's token, and no second permit is charged (ADR 0030)."""
+    path = tmp_path / "coord.db"
+    seed = Store(path)
+    seed.upsert(Record("R", "build", "claude", 1, state="waiting"))
+    seed.close()
+
+    barrier = threading.Barrier(2)
+    results: dict[str, bool] = {}
+    lock = threading.Lock()
+
+    def race(token):
+        store = Store(path)  # a distinct instance/connection per process
+        record = Record("R", "build", "claude", 1, state="running", launch_token=token)
+        barrier.wait()
+        won = store.reserve(record, budget=5)
+        with lock:
+            results[token] = won
+        store.close()
+
+    threads = [threading.Thread(target=race, args=(t,)) for t in ("TA", "TB")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert sum(results.values()) == 1               # exactly one reservation taken
+    winner = next(tok for tok, won in results.items() if won)
+    final = Store(path)
+    reread = final.record_of("R")
+    assert reread.state == "running" and reread.launch_token == winner
+    assert final.permits_used("claude") == 1        # one running reservation, one launch token
+    final.close()
+
+
+def test_global_stage_cap_is_atomic_across_pools(tmp_path):
+    """Review and Build share Build's lane. Distinct coordinators racing on distinct pools
+    still reserve at most the lane cap because the decision lives in the shared transaction."""
+    path = tmp_path / "coord.db"
+    Store(path).close()
+    records = [
+        Record(f"R{i}", "review" if i % 2 else "build",
+               "claude" if i % 2 else "codex", 1, state="running")
+        for i in range(8)
+    ]
+    limits = ReservationLimits(
+        machine_ceiling=8, stage_cap=2, stage_lane="build",
+        lane_by_stage={"build": "build", "review": "build", "revise": "build"},
+    )
+    barrier = threading.Barrier(len(records))
+    reserved = []
+    lock = threading.Lock()
+
+    def race(record):
+        store = Store(path)
+        barrier.wait()
+        if store.reserve(record, budget=5, limits=limits):
+            with lock:
+                reserved.append(record.identity)
+        store.close()
+
+    threads = [threading.Thread(target=race, args=(record,)) for record in records]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(reserved) == 2
+
+
+def test_machine_ceiling_is_atomic_across_stage_lanes_and_pools(tmp_path):
+    path = tmp_path / "coord.db"
+    Store(path).close()
+    stages = ("intake", "build", "mockup", "respond")
+    records = [
+        Record(f"R{i}", stages[i % len(stages)],
+               "claude" if i % 2 else "codex", 1, state="running")
+        for i in range(8)
+    ]
+    barrier = threading.Barrier(len(records))
+    reserved = []
+    lock = threading.Lock()
+
+    def race(record):
+        store = Store(path)
+        lane = {"intake": "triage"}.get(record.stage, record.stage)
+        limits = ReservationLimits(
+            machine_ceiling=3, stage_cap=8, stage_lane=lane,
+            lane_by_stage={"intake": "triage"},
+        )
+        barrier.wait()
+        if store.reserve(record, budget=5, limits=limits):
+            with lock:
+                reserved.append(record.identity)
+        store.close()
+
+    threads = [threading.Thread(target=race, args=(record,)) for record in records]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(reserved) == 3
 
 
 def test_existing_zero_byte_store_fails_closed(tmp_path):
@@ -136,6 +290,15 @@ def test_child_start_and_disown_are_mutually_exclusive(tmp_path):
     assert store.child_start("R-lose", "T2", 5252) is False
     reread = store.record_of("R-lose")
     assert reread.start_fact != STARTED and reread.family is None
+
+    # A delayed timeout from an older launch cannot rotate or disown a newer generation.
+    newer = Record("R-stale", "review", "codex", 2, state="running", launch_token="T-new")
+    store.upsert(newer)
+    before = store.record_of("R-stale")
+    assert store.disown_launch("R-stale", "T-old") == (NOT_STARTED, None)
+    after = store.record_of("R-stale")
+    assert after.launch_token == before.launch_token == "T-new"
+    assert after.revision == before.revision and after.start_fact is None
     store.close()
 
 

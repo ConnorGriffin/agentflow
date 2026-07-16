@@ -15,6 +15,7 @@ by a Codex-specific policy in the coordinator.
 
 from __future__ import annotations
 
+import json
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -69,27 +70,127 @@ class ProviderObservation:
         return _CLASSIFICATION[self.cause]
 
 
-# The Claude event subtypes we understand. Anything else is preserved as unrecognized and
-# leaves the cause unknown rather than being guessed at.
-_CLAUDE_CAUSES = {
-    "capacity": ProviderCause.CAPACITY,
+# The Anthropic API error `type` values an `assistant` message may carry (assistant.error),
+# mapped to our typed causes. These are the real SDK/API error types — not invented `type:error`
+# stream events. A capacity (rate limit) is recoverable; overloaded/api are transient server
+# conditions; auth/permission/billing/not-found/invalid-request are permanent human holds.
+_CLAUDE_ERROR_CAUSES = {
+    # Agent SDK's SDKAssistantMessageError string union.
     "rate_limit": ProviderCause.CAPACITY,
-    "authentication": ProviderCause.PERMANENT,
-    "billing": ProviderCause.PERMANENT,
-    "permission": ProviderCause.PERMANENT,
-    "configuration": ProviderCause.PERMANENT,
-    "server": ProviderCause.SERVER,
-    "transport": ProviderCause.SERVER,
+    "authentication_failed": ProviderCause.PERMANENT,
+    "invalid_request": ProviderCause.PERMANENT,
+    "server_error": ProviderCause.SERVER,
+    "max_output_tokens": ProviderCause.PROCESS,
+    # API error objects retained for forward-compatible structured observations.
+    "rate_limit_error": ProviderCause.CAPACITY,
+    "overloaded_error": ProviderCause.SERVER,
+    "api_error": ProviderCause.SERVER,
+    "timeout_error": ProviderCause.SERVER,
+    "authentication_error": ProviderCause.PERMANENT,
+    "permission_error": ProviderCause.PERMANENT,
+    "billing_error": ProviderCause.PERMANENT,
+    "not_found_error": ProviderCause.PERMANENT,
+    "invalid_request_error": ProviderCause.PERMANENT,
+    "request_too_large": ProviderCause.PERMANENT,
 }
-_CLAUDE_KNOWN_TYPES = {"assistant", "result", "error"}
+
+# Terminal `result.subtype` failures (SDKResultMessage). `success` is a clean end; the error
+# subtypes are a process-level interruption that no typed provider cause explains, so they map to
+# the recoverable/incomplete PROCESS cause rather than being guessed at as capacity or permanent.
+_CLAUDE_RESULT_CAUSES = {
+    "error_max_turns": ProviderCause.PROCESS,
+    "error_during_execution": ProviderCause.PROCESS,
+    "error_max_budget_usd": ProviderCause.PERMANENT,
+    "error_max_structured_output_retries": ProviderCause.PROCESS,
+}
+
+# The stream message types this classifier actively models. Every other type (system init, user
+# tool results, partial stream_event, telemetry, …) is preserved verbatim as unrecognized so
+# nothing is silently dropped and an unknown shape stays fail-safe.
+_CLAUDE_KNOWN_TYPES = {"assistant", "result", "rate_limit_event"}
+
+
+def _claude_result_error(event: dict):
+    """Classify the Agent SDK ``ResultMessage`` error surface.
+
+    A result may retain ``subtype=success`` while reporting an API failure through
+    ``is_error``/``api_error_status``/``errors``. Status is the only typed fact used here:
+    429 is capacity, authentication/payment/permission statuses are permanent, and 5xx
+    (including Anthropic's 529 overload) are server interruptions. Other shaped failures stay
+    unknown and are preserved by the caller rather than guessed from prose.
+    """
+    status = event.get("api_error_status")
+    try:
+        status = int(status) if not isinstance(status, bool) else None
+    except (TypeError, ValueError):
+        status = None
+    errors = event.get("errors")
+    has_errors = isinstance(errors, (list, tuple)) and bool(errors)
+    has_error = event.get("is_error") is True or status is not None or has_errors
+    if not has_error:
+        return None, False
+    if status == 429:
+        return ProviderCause.CAPACITY, True
+    if status in {401, 402, 403}:
+        return ProviderCause.PERMANENT, True
+    if status is not None and 500 <= status <= 599:
+        return ProviderCause.SERVER, True
+    return ProviderCause.UNKNOWN, True
+
+
+def _claude_assistant_text(event: dict) -> str | None:
+    """Extract text from Claude's ``assistant.message.content`` blocks (SDKAssistantMessage)."""
+    message = event.get("message")
+    if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+        return None
+    text = [
+        block["text"] for block in message["content"]
+        if isinstance(block, dict) and block.get("type") == "text"
+        and isinstance(block.get("text"), str)
+    ]
+    return "\n".join(text) if text else None
+
+
+def _claude_error_type(event: dict):
+    """The Anthropic error ``type`` carried on an ``assistant`` message's error value, if any.
+    The error may sit directly on the event (``assistant.error``) or inside its API message
+    (``assistant.message.error``); both are the SDK's assistant-turn error surface."""
+    error = event.get("error")
+    if error is None:
+        message = event.get("message")
+        error = message.get("error") if isinstance(message, dict) else None
+    if error is None:
+        return None, False
+    if isinstance(error, str):
+        return error, True
+    if isinstance(error, dict):
+        return error.get("type"), True
+    return None, True  # a truthy but unshaped error — present, but no typed cause
+
+
+def _epoch(value):
+    """Coerce a ``resetsAt`` (Unix seconds or ISO-8601) into epoch seconds, or ``None``."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value:
+        from agentflow.runner import _iso_to_epoch
+        epoch = _iso_to_epoch(value)
+        return int(epoch) if epoch is not None else None
+    return None
 
 
 def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                     partial_output="", family=None, process_alive=False) -> ProviderObservation:
-    """Extract facts from Claude's structured stream. A recognized ``error`` subtype gives a
-    typed cause; a supervisor timeout or a non-zero exit without one is a recoverable process
-    interruption; a clean exit leaves the cause to the stage outcome. Unrecognized event
-    fields are preserved verbatim so nothing is silently dropped."""
+    """Extract facts from Claude's structured Agent SDK stream. A typed cause comes from the real
+    stream shapes — an ``assistant`` message's error value, a rejected ``rate_limit_event``
+    (with its ``resetsAt``), or a terminal ``result.subtype`` failure — never an invented
+    ``type:error`` event. A supervisor timeout or a non-zero exit without any of those is a
+    recoverable process interruption; a clean exit leaves the cause to the stage outcome. The
+    real ``assistant.message.content`` text and ``result.result`` output are still parsed, and
+    every unrecognized event or unshaped error is preserved verbatim so nothing is silently
+    dropped (fail-safe)."""
     events = tuple(events)
     cause = ProviderCause.NONE
     reset_at = None
@@ -98,18 +199,51 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
     for event in events:
         etype = event.get("type")
         if etype == "assistant":
-            final_message = event.get("text", final_message)
+            text = _claude_assistant_text(event)
+            if text is not None:
+                final_message = text
+            error_type, has_error = _claude_error_type(event)
+            if has_error:
+                mapped = _CLAUDE_ERROR_CAUSES.get(error_type)
+                if mapped is not None:
+                    if cause is ProviderCause.NONE:
+                        cause = mapped
+                else:
+                    if cause is ProviderCause.NONE:
+                        cause = ProviderCause.UNKNOWN
+                    unrecognized.append(dict(event))  # an error we could not type — preserve it
+        elif etype == "rate_limit_event":
+            info = event.get("rate_limit_info")
+            rejected = (isinstance(info, dict)
+                        and (info.get("status") == "rejected" or info.get("rejected") is True))
+            if rejected:
+                # A rejected rate limit is a real capacity interruption; an allowed one is
+                # informational and establishes no cause.
+                if cause is ProviderCause.NONE:
+                    cause = ProviderCause.CAPACITY
+                reset_at = _epoch(info.get("resetsAt")) or reset_at
         elif etype == "result":
-            final_message = event.get("final_message", final_message)
-        elif etype == "error":
-            mapped = _CLAUDE_CAUSES.get(event.get("subtype"))
-            if mapped is not None:
-                cause = mapped
-                if mapped is ProviderCause.CAPACITY:
-                    reset_at = event.get("reset_at", reset_at)
-            else:
-                cause = ProviderCause.UNKNOWN
-                unrecognized.append(dict(event))
+            result = event.get("result")
+            if isinstance(result, str):
+                final_message = result
+            subtype = event.get("subtype")
+            result_cause, has_result_error = _claude_result_error(event)
+            if has_result_error:
+                if (cause is ProviderCause.NONE
+                        or (cause is ProviderCause.UNKNOWN
+                            and result_cause is not ProviderCause.UNKNOWN)):
+                    cause = result_cause
+                if result_cause is ProviderCause.UNKNOWN:
+                    unrecognized.append(dict(event))
+            elif subtype and subtype != "success":
+                mapped = _CLAUDE_RESULT_CAUSES.get(subtype)
+                if mapped is not None:
+                    if cause is ProviderCause.NONE:
+                        cause = mapped
+                else:
+                    if cause is ProviderCause.NONE:
+                        cause = ProviderCause.UNKNOWN
+                    unrecognized.append(dict(event))  # an unmodeled terminal failure — preserve
         if etype not in _CLAUDE_KNOWN_TYPES:
             unrecognized.append(dict(event))
     if cause is ProviderCause.NONE:
@@ -175,12 +309,27 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
 # only: `verify` always returns False because provider success can never stand in for a stage
 # outcome — that check belongs to the stage adapter (ADR 0030 completion locality).
 
+PROVIDER_INPUT_V1 = "agentflow-provider-input-v1"
+
+
+def _durable_prompt(record) -> str:
+    """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt."""
+    raw = record.input_ptr or ""
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return raw
+    if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
+            and isinstance(payload.get("prompt"), str)):
+        return payload["prompt"]
+    return raw
+
 
 class ClaudeProviderAdapter:
     """Launches a structured Claude session and observes its durable events + exit."""
 
     def __init__(self, prompt_of=None) -> None:
-        self._prompt_of = prompt_of or (lambda record: record.input_ptr or "")
+        self._prompt_of = prompt_of or _durable_prompt
 
     def command(self, record) -> list[str]:
         from agentflow.runner import ClaudeRunner
@@ -203,7 +352,7 @@ class CodexProviderAdapter:
     exit status — never the `codex exec --json` prose, which is preserved but never diagnoses."""
 
     def __init__(self, prompt_of=None, account_of=None) -> None:
-        self._prompt_of = prompt_of or (lambda record: record.input_ptr or "")
+        self._prompt_of = prompt_of or _durable_prompt
         self._account_of = account_of
 
     def command(self, record) -> list[str]:

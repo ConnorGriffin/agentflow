@@ -11,9 +11,8 @@ the running-record ledger, the crash-safe provider start handshake, outcome-firs
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
 
-Build, Review, and Revise are the production stages behind this coordinator (issues #103,
-#104, #105); every
-other logical stage remains queued behind the admission gate until its own tracer lands. Review
+Intake, Build, Review, and Revise are the production stages behind this coordinator (issues
+#103–#106); Mockup and Respond remain queued behind the admission gate. Review
 is read-only, so an eligible continuation may move to the other pool when its home pool cannot
 fit it. The interface and crash boundaries remain exercised with injected launcher, gate, and
 observer collaborators.
@@ -150,11 +149,13 @@ class Coordinator:
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             created_at=int(time.time()))
         with self._lock:
-            successor, prior, transferred = self._store.submit(record, submission.transfer_from)
+            successor, prior, transferred, root = self._store.submit(
+                record, submission.transfer_from)
             self._records[identity] = successor
             if prior is not None:
                 self._records[prior.identity] = prior
-            self._register_descendant(successor)
+            if root is not None:
+                self._records[root.identity] = root
             if transferred and prior is not None:
                 self._emit(prior, f"attempt {prior.attempts}/{ATTEMPT_BUDGET} completed — "
                            f"{_OUTCOME_LABEL.get(prior.stage, prior.stage)}; "
@@ -178,21 +179,12 @@ class Coordinator:
                 return None
             if not record.hold_pending:
                 record.hold_pending = True
+                record.hold_reason = "completed stage has no successor"
+                if not self._persist(record):
+                    return None
                 self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no "
                                   f"next stage remains — parking for human; claim released")
-                self._persist(record)
             return self._finalize_hold(record)
-
-    def _register_descendant(self, record: Record) -> None:
-        """A descendant/subagent shares its root's single reservation and is never admitted or
-        reserved independently (ADR 0030). Recording the lineage on the root lets the root's
-        terminal outcome retire it, so nested work can never push a pool past its budget."""
-        if record.root is None:
-            return
-        root = self._records.get(record.root)
-        if root is not None:
-            root.descendants.add(record.identity)
-            self._persist(root)
 
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:
         """Reconcile, returning the stage outcomes and holds settled this cycle, then admit
@@ -241,6 +233,9 @@ class Coordinator:
                 outcome = self._finalize_hold(record)
                 if outcome is not None:
                     outcomes.append(outcome)
+                continue
+            if record.state == COMPLETED and not record.retired:
+                self._settle_completed(record)
                 continue
             if record.state != RUNNING:
                 continue
@@ -344,12 +339,14 @@ class Coordinator:
             return False  # a code-writing stage may not silently leave its pinned lineage
         if not self._gate(record):
             return False  # an independent admission gate (headroom, ceiling, cap, pacing)
-        # Flip to a reservation and atomically claim the demand on the ledger; the store
-        # reads availability and writes the running row under one lock, so concurrent
-        # instances cannot push a pool past its five-permit budget (ADR 0029/0030). The fresh
+        # Flip to a reservation and atomically claim demand plus any global admission limits
+        # on the ledger; concurrent instances cannot push a pool, machine, or stage lane past
+        # its reviewed budget (ADR 0029/0030). The fresh
         # launch token binds this reservation to exactly one bootstrap child: only a child
         # holding it may record `started`, so a timed-out launch disowned back to waiting can
         # never be adopted by an uncancelled child (ADR 0030 handshake boundary).
+        expected_launch_token = record.launch_token
+        expected_revision = record.revision
         record.state = RUNNING
         record.start_fact = None
         record.launch_token = uuid4().hex
@@ -358,15 +355,36 @@ class Coordinator:
         record.attempt_committed = False  # a fresh attempt has not been consumed yet
         record.started_at = now
         record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
-        if not self._store.reserve(record, PERMIT_BUDGET):
+        reservation_limits = getattr(self._gate, "reservation_limits", None)
+        limits = reservation_limits(record) if reservation_limits is not None else None
+        if not self._store.reserve(
+                record, PERMIT_BUDGET, limits,
+                expected_launch_token=expected_launch_token,
+                expected_revision=expected_revision):
             record.state = WAITING  # the pool cannot fit this demand right now
             record.start_fact = None
             return False
         return True
 
     def _commit_start(self, record: Record, fact: str, family: str | None = None) -> None:
-        assert record.state == RUNNING
+        # The bootstrap child may have advanced the durable row while the parent waited for its
+        # handshake. Continue from that exact revision; never overwrite the child's start fact
+        # with the older reservation snapshot.
+        attempted_token = record.launch_token
+        durable = self._store.record_of(record.identity)
+        if durable is None or durable.state != RUNNING:
+            return
         assert fact in {STARTED, NOT_STARTED}
+        if fact == STARTED:
+            if (durable.start_fact != STARTED
+                    or durable.launch_token != attempted_token):
+                return
+        elif not (durable.start_fact == NOT_STARTED
+                  or durable.launch_token == attempted_token):
+            # A delayed result from an older launch may not release a newer running attempt.
+            return
+        record = durable
+        self._records[record.identity] = record
         record.start_fact = fact
         if fact == NOT_STARTED:
             self._release(record)
@@ -376,7 +394,11 @@ class Coordinator:
         record.family = family or record.family
         was_continuation = record.continuation
         self._consume_attempt(record)
-        self._persist(record)
+        if not self._persist(record):
+            return
+        started = getattr(self._gate, "started", None)
+        if started is not None:
+            started(record)
         if was_continuation:
             done = record.attempts - 1  # continuations completed before this one
             self._emit(record, f"continuation {done}/{CONTINUATION_BUDGET} "
@@ -394,6 +416,28 @@ class Coordinator:
 
     # --- outcome-first classification ---------------------------------------------------
 
+    def _settle_completed(self, record: Record) -> bool:
+        """Project a completed stage at its durable boundary behind the ``cycle`` seam."""
+        def settle(current: Record) -> bool:
+            if current.state != COMPLETED or current.retired:
+                return False
+            finalize = getattr(self._adapter, "finalize_completed", None)
+            proof = finalize(current) if finalize is not None else None
+            if proof is None:
+                return False
+            current.handoff_proof = proof
+            current.claim = False
+            current.retired = True
+            return True
+
+        settled = self._store.transition(record, settle)
+        if settled is None:
+            return False
+        self._records[settled.identity] = settled
+        self._emit(settled, f"attempt {settled.attempts}/{ATTEMPT_BUDGET} settled — "
+                          f"{_OUTCOME_LABEL.get(settled.stage, settled.stage)}; claim released")
+        return True
+
     def _finalize(self, record: Record) -> StageOutcome | None:
         """Classify an ended provider family and release its reservation atomically (ADR
         0028 precedence): a verified stage outcome completes it; a permanent provider
@@ -401,10 +445,16 @@ class Coordinator:
         remains and holds when it is exhausted. Returns the terminal outcome, if any."""
         obs = self._adapter.observe(record)
         self._release(record)
-        if self._adapter.verify(record, obs):
+        capture = getattr(self._adapter, "capture", None)
+        outcome = capture(record, obs) if capture is not None else None
+        if outcome is not None:
+            record.outcome = outcome
+            if not self._persist(record):  # parsed outcome precedes any external projection
+                return None
+        if outcome is not None or self._adapter.verify(record, obs):
             record.state = COMPLETED
-            self._persist(record)
-            self._retire_descendants(record)
+            if not self._persist(record, retire_descendants=True):
+                return None
             # A completed stage keeps its claim until the next stage transfers it (ADR 0028);
             # the transfer line is emitted when that next stage is submitted.
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed — "
@@ -413,14 +463,17 @@ class Coordinator:
         label = obs.classification()
         cause = obs.cause.value
         if label == "permanent":
-            self._hold(record)
+            record.hold_reason = f"permanent provider condition ({cause})"
+            if not self._hold(record):
+                return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
                               f"permanent; held for human; claim released")
         elif record.attempts < ATTEMPT_BUDGET:
             record.state = WAITING
             record.continuation = True
             record.eligible_at = obs.reset_at or 0
-            self._persist(record)
+            if not self._persist(record):
+                return None
             done = record.attempts  # continuations begun after this interruption
             when = f"at {record.eligible_at}" if record.eligible_at else "next cycle"
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
@@ -428,7 +481,9 @@ class Coordinator:
                               f"{when}; claim retained")
             return None
         else:
-            self._hold(record)
+            record.hold_reason = "continuation budget exhausted"
+            if not self._hold(record):
+                return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
                               f"({cause}) — continuation budget exhausted; held for human; "
                               f"claim released")
@@ -439,47 +494,51 @@ class Coordinator:
     def _finalize_hold(self, record: Record) -> StageOutcome | None:
         if not record.hold_pending:
             return None
-        if record.handoff_proof is None:
-            finalize = getattr(self._adapter, "finalize_hold", None)
-            proof = finalize(record) if finalize is not None else (
-                f"proof:{record.identity}:{STAGE_NATIVE_HANDOFF[record.stage]}")
-            if proof is None:
-                return None  # the external handoff is not durable yet; retry next cycle
-            record.handoffs = 1
-            record.handoff_kind = STAGE_NATIVE_HANDOFF[record.stage]
-            record.handoff_proof = proof
-            record.notifications = 1
-            self._persist(record)
-        record.state = HELD
-        record.hold_pending = False
-        record.claim = False
-        self._persist(record)
-        self._retire_descendants(record)
-        return StageOutcome(record.identity, record.stage, "held", record.handoff_kind)
+
+        def hold(current: Record) -> bool:
+            if not current.hold_pending or current.state not in {WAITING, COMPLETED}:
+                return False
+            if current.handoff_proof is None:
+                finalize = getattr(self._adapter, "finalize_hold", None)
+                proof = finalize(current) if finalize is not None else (
+                    f"proof:{current.identity}:{STAGE_NATIVE_HANDOFF[current.stage]}")
+                if proof is None:
+                    return False
+                current.handoffs = 1
+                current.handoff_kind = STAGE_NATIVE_HANDOFF[current.stage]
+                current.handoff_proof = proof
+                current.notifications = 1
+            current.state = HELD
+            current.hold_pending = False
+            current.claim = False
+            return True
+
+        held = self._store.transition(record, hold, retire_descendants=True)
+        if held is None:
+            return None
+        self._records[held.identity] = held
+        return StageOutcome(held.identity, held.stage, "held", held.handoff_kind)
 
     # --- internal helpers ---------------------------------------------------------------
 
-    def _retire_descendants(self, record: Record) -> None:
-        """A root's terminal outcome retires its subagents: they shared its one reservation, so
-        they are done when it is and never linger as waiting work or a second outcome."""
-        for identity in record.descendants:
-            child = self._records.get(identity)
-            if child is not None and not child.retired:
-                child.state = COMPLETED
-                child.retired = True
-                child.claim = False
-                self._persist(child)
-
-    def _hold(self, record: Record) -> None:
+    def _hold(self, record: Record) -> bool:
         record.state = WAITING
         record.hold_pending = True
-        self._persist(record)
+        return self._persist(record)
 
     def _release(self, record: Record) -> None:
         record.process_alive = False
 
-    def _persist(self, record: Record) -> None:
-        self._store.upsert(record)
+    def _persist(self, record: Record, *, retire_descendants: bool = False) -> bool:
+        if self._store.upsert(record, retire_descendants=retire_descendants):
+            self._records[record.identity] = record
+            return True
+        # Another coordinator advanced this identity. Refresh the working set and let the
+        # current pass stop at the lost compare-and-set instead of overwriting the winner.
+        durable = self._store.record_of(record.identity)
+        if durable is not None:
+            self._records[record.identity] = durable
+        return False
 
     def _emit(self, record: Record, tail: str) -> None:
         """One stable ADR 0028 operational line: ``{repo}: {subject}: {stage}: {tail}``. The

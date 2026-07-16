@@ -26,12 +26,22 @@ def test_ready_with_all_fields_is_build_ready():
 
 def test_ready_missing_complexity_defaults_deep():
     # A bigger model is the safe sizing miss — never a wrong build.
-    v = parse_intake('{"route": "ready", "body": "brief", "effort": "low"}')
+    v = parse_intake('{"route": "ready", "title": "t", "body": "brief", "effort": "low"}')
     assert v.route is IntakeRoute.READY and v.complexity is Complexity.DEEP
 
 
 def test_ready_missing_effort_defaults_medium():
-    assert parse_intake('{"route": "ready", "body": "b", "complexity": "deep"}').effort is Effort.MEDIUM
+    assert parse_intake(
+        '{"route": "ready", "title": "t", "body": "b", "complexity": "deep"}').effort is Effort.MEDIUM
+
+
+def test_ready_without_a_title_preserves_the_ready_route():
+    # Title rewriting is optional routing output; coordinated projection preserves the durable
+    # filed title when it is omitted.
+    titleless = parse_intake('{"route": "ready", "body": "brief", "complexity": "deep"}')
+    assert titleless.parsed is True and titleless.route is IntakeRoute.READY
+    assert parse_intake(
+        '{"route": "ready", "title": "   ", "body": "brief"}').route is IntakeRoute.READY
 
 
 def test_grill_and_mockup_routes():
@@ -72,7 +82,7 @@ def test_prose_then_bare_json_object_is_recovered():
 
 def test_prose_then_json_ready_recovers_dials():
     payload = ('Grounded against the code; a clean add.\n'
-               '{"route":"ready","body":"## Brief","complexity":"deep","effort":"high"}')
+               '{"route":"ready","title":"t","body":"## Brief","complexity":"deep","effort":"high"}')
     v = parse_intake(payload)
     assert v.route is IntakeRoute.READY and v.complexity is Complexity.DEEP and v.effort is Effort.HIGH
 
@@ -92,7 +102,7 @@ def test_parse_never_raises_and_holds(payload):
 
 
 def test_labels_for_ready_carry_both_dials():
-    r = parse_intake('{"route": "ready", "body": "b", "complexity": "deep", "effort": "extra"}')
+    r = parse_intake('{"route": "ready", "title": "t", "body": "b", "complexity": "deep", "effort": "extra"}')
     assert intake_labels(r) == ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:extra"]
 
 
@@ -231,6 +241,12 @@ class _GhRecorder:
                 return c[c.index("--body") + 1]
         return None
 
+    def _edit_title(self):
+        for c in self.calls:
+            if "edit" in c and "--title" in c:
+                return c[c.index("--title") + 1]
+        return None
+
     def _comment(self):
         for c in self.calls:
             if "comment" in c and "--body" in c:
@@ -256,12 +272,27 @@ def test_apply_intake_ready_writes_brief_to_body_and_a_short_comment(monkeypatch
     assert comment.count("\n") <= 8                            # short
 
 
+def test_coordinated_ready_projects_title_and_original_from_durable_source(monkeypatch):
+    rec = _GhRecorder(current_body="later mutable body")
+    monkeypatch.setattr(intake_mod, "_run", rec)
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "",
+                          Complexity.DEEP, Effort.MEDIUM)
+
+    apply_intake("owner/repo", 16, "later mutable title", [], result,
+                 "Filed title", "original as filed")
+
+    assert rec._edit_title() == "Filed title"
+    assert rec._edit_body() == compose_ready_body(result.body, "original as filed")
+
+
 def test_intake_result_must_be_visible_before_its_worktree_is_disposable(monkeypatch):
-    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", complexity=Complexity.DEEP,
-                          effort=Effort.MEDIUM)
-    issue = {"body": result.body,
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
+                          Complexity.DEEP, Effort.MEDIUM)
+    # The durable body is the canonical composition — the brief over the preserved original.
+    issue = {"title": "Scoped",
+             "body": compose_ready_body(result.body, "the original as filed"),
              "labels": [{"name": name} for name in intake_labels(result)],
-             "comments": [{"body": f"{INTAKE_MARK}\n\nReady."}]}
+             "comments": [{"body": intake_mod._READY_COMMENT}]}
     monkeypatch.setattr(intake_mod, "_run",
                         lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(issue)))
     assert intake_result_is_durable("owner/repo", 5, result) is True
@@ -269,6 +300,115 @@ def test_intake_result_must_be_visible_before_its_worktree_is_disposable(monkeyp
     monkeypatch.setattr(intake_mod, "_run",
                         lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
     assert intake_result_is_durable("owner/repo", 5, result) is False
+
+
+def test_intake_durability_requires_exact_title_and_routing_labels(monkeypatch):
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped title",
+                          Complexity.DEEP, Effort.MEDIUM)
+    issue = {
+        "title": "Wrong title",
+        "body": result.body,
+        "labels": ([{"name": name} for name in intake_labels(result)]
+                   + [{"name": "agentflow:needs-grilling"},
+                      {"name": "agentflow:effort:high"}]),
+        "comments": [{"body": intake_mod._READY_COMMENT}],
+    }
+    monkeypatch.setattr(intake_mod, "_run",
+                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(issue)))
+
+    assert intake_result_is_durable("owner/repo", 5, result) is False
+
+
+def test_intake_durability_requires_this_routes_exact_comment(monkeypatch):
+    result = IntakeResult(IntakeRoute.GRILL,
+                          "> *agentflow intake — generated by AI.*\n\nnew question")
+    issue = {"title": "t", "body": "", "labels": [{"name": "agentflow:needs-grilling"}],
+             "comments": [{"body": f"{INTAKE_MARK}\n\nold question"}]}
+    monkeypatch.setattr(intake_mod, "_run",
+                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(issue)))
+
+    assert intake_result_is_durable("owner/repo", 5, result) is False
+
+
+def test_ready_durability_requires_the_exact_composed_body_not_a_substring(monkeypatch):
+    # A body that merely CONTAINS the brief (but is not the canonical composition preserving
+    # the original) must not read as durable — only the exact composed body does.
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
+                          Complexity.DEEP, Effort.MEDIUM)
+    base = {"title": "Scoped",
+            "labels": [{"name": name} for name in intake_labels(result)],
+            "comments": [{"body": intake_mod._READY_COMMENT}]}
+
+    substring_only = dict(base, body=f"noise\n{result.body}\nmore noise")  # brief present, not canonical
+    monkeypatch.setattr(intake_mod, "_run",
+                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(substring_only)))
+    assert intake_result_is_durable("owner/repo", 5, result) is False
+
+    canonical = dict(base, body=compose_ready_body(result.body, "original as filed"))
+    monkeypatch.setattr(intake_mod, "_run",
+                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(canonical)))
+    assert intake_result_is_durable("owner/repo", 5, result) is True
+
+
+def test_ready_durability_binds_original_body_and_title_to_the_submission(monkeypatch):
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "",
+                          Complexity.DEEP, Effort.MEDIUM)
+    base = {"title": "Filed title",
+            "labels": [{"name": name} for name in intake_labels(result)],
+            "comments": [{"body": intake_mod._READY_COMMENT}]}
+    wrong_original = dict(base, body=compose_ready_body(result.body, "different text"))
+    monkeypatch.setattr(intake_mod, "_run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=json.dumps(wrong_original)))
+    assert intake_result_is_durable(
+        "owner/repo", 5, result, source_title="Filed title", source_body="as filed") is False
+
+    exact = dict(base, body=compose_ready_body(result.body, "as filed"))
+    monkeypatch.setattr(intake_mod, "_run", lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=json.dumps(exact)))
+    assert intake_result_is_durable(
+        "owner/repo", 5, result, source_title="Filed title", source_body="as filed") is True
+
+
+def test_apply_intake_ready_defers_and_preserves_original_when_body_unreadable(monkeypatch):
+    # An unreadable body must fail closed — we cannot compose the brief without the original to
+    # preserve, and treating unreadable as "" would clobber the real original text.
+    calls = []
+
+    def gh(cmd, cwd=None):
+        calls.append(cmd)
+        if "view" in cmd and "comments" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"comments": []}))
+        if "view" in cmd and "body" in cmd:
+            return SimpleNamespace(returncode=1, stdout="")  # body read fails
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(intake_mod, "_run", gh)
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
+                          Complexity.DEEP, Effort.MEDIUM)
+    summary = apply_intake("owner/repo", 5, "old", [], result)
+
+    assert "deferred" in summary
+    # Nothing was written: no body edit (which would clobber the original), no labels, no comment.
+    assert not any("edit" in c or "comment" in c and "view" not in c for c in calls)
+
+
+def test_ready_projection_rejects_a_malformed_original_envelope(monkeypatch):
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
+                          Complexity.DEEP, Effort.MEDIUM)
+    malformed = f"old brief\n\n{intake_mod._ORIGINAL_MARK}\noriginal without details"
+    calls = []
+
+    def gh(cmd, cwd=None):
+        calls.append(cmd)
+        if "view" in cmd and "comments" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"comments": []}))
+        if "view" in cmd and "body" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"body": malformed}))
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(intake_mod, "_run", gh)
+    assert "deferred" in apply_intake("owner/repo", 5, "old", [], result)
+    assert not any("edit" in cmd or "comment" in cmd and "view" not in cmd for cmd in calls)
 
 
 def test_apply_intake_grill_keeps_the_full_comment_and_never_touches_the_body(monkeypatch):
@@ -329,6 +469,48 @@ def test_apply_intake_skips_a_re_post_of_the_same_hold(monkeypatch):
     apply_intake("owner/repo", 5, "t", ["agentflow:needs-grilling"],
                  IntakeResult(IntakeRoute.GRILL, question))
     assert not spy.wrote_anything(), "an identical re-apply must be a no-op"
+
+
+def test_apply_intake_finishes_partial_labels_without_duplicate_comment(monkeypatch):
+    question = "> *agentflow intake — generated by AI.*\n\nwhich window did you mean?"
+    spy = _GhSpy(latest_comment=question)
+    monkeypatch.setattr(intake_mod, "_run", spy)
+
+    apply_intake("owner/repo", 5, "t", [], IntakeResult(IntakeRoute.GRILL, question))
+
+    assert not any("comment" in c and "view" not in c for c in spy.calls)
+    assert any("--add-label" in c for c in spy.calls)
+
+
+def test_apply_intake_writes_nothing_when_comment_history_is_unreadable(monkeypatch):
+    calls = []
+
+    def gh(cmd, cwd=None):
+        calls.append(cmd)
+        if "view" in cmd and "comments" in cmd:
+            return SimpleNamespace(returncode=1, stdout="")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(intake_mod, "_run", gh)
+    result = IntakeResult(
+        IntakeRoute.GRILL,
+        "> *agentflow intake — generated by AI.*\n\nwhich window did you mean?",
+    )
+
+    assert "deferred" in apply_intake("owner/repo", 5, "t", [], result)
+    assert not any(("comment" in cmd and "view" not in cmd) or "edit" in cmd for cmd in calls)
+
+
+def test_apply_intake_finishes_partial_ready_body_without_duplicate_comment(monkeypatch):
+    result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "t",
+                          Complexity.DEEP, Effort.MEDIUM)
+    spy = _GhSpy(latest_comment=intake_mod._READY_COMMENT, current_body="original")
+    monkeypatch.setattr(intake_mod, "_run", spy)
+
+    apply_intake("owner/repo", 5, "t", intake_labels(result), result)
+
+    assert not any("comment" in c and "view" not in c for c in spy.calls)
+    assert any("--body" in c for c in spy.calls)
 
 
 def test_apply_intake_still_posts_a_genuinely_new_question(monkeypatch):

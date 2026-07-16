@@ -187,9 +187,8 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
     The rollout gates every provider launch (issues #103, #104, #105): `legacy` keeps today's
     paths; `coordinated` submits one durable Build stage (a completed Build opens its Review, a
     blocking Review opens its Revise, and a completed Revise opens its next Review, all behind the
-    coordinator) and leaves Intake, Mockup, and Respond queued; `draining` launches nothing new
-    while existing work finishes. Only Build, Review, and Revise have moved behind the coordinator,
-    so no other legacy stage may bypass that dormant gate."""
+    coordinator), while Mockup and Respond remain queued; `draining` launches nothing new while
+    existing work finishes. No legacy stage may bypass that dormant gate."""
     threads: list[threading.Thread] = []
     if phase.launch_legacy:
         threads = _triage_fanout(cfg, slot, _log)
@@ -200,6 +199,8 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
         threads.append(_spawn(lambda: _run_and_log(
             cfg, "respond", lambda: loop.respond_once(cfg, _log=_log, slot=slot), _log)))
     elif phase.submit_coordinated and coordinator is not None:
+        _run_and_log(cfg, "intake",
+                     lambda: _submit_coordinated_intake(cfg, coordinator, _log), _log)
         _run_and_log(cfg, "build",
                      lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
     for thread in threads:
@@ -223,6 +224,34 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
         return f"#{issue['number']}: could not claim Build — refusing coordinator submission"
     coordinator.submit_stage(submission)
     return f"#{issue['number']}: submitted to coordinator → {builder.tool} (build)"
+
+
+def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
+    """Submit all currently admissible Intake candidates as durable read-only stages."""
+    from agentflow import coordinated_intake
+    reserved: set[int] = set()
+    submitted = []
+    while True:
+        picked = loop._next_intake_candidate(cfg, reserved)
+        if picked is None:
+            break
+        issue, extra = picked
+        builder, _reviewer, block_msg = pick_pair()
+        if builder is None:
+            return ("; ".join(submitted) if submitted else
+                    f"#{issue['number']}: no pool has headroom ({block_msg}) — deferring")
+        submission = coordinated_intake.intake_submission(cfg, issue, extra, builder.tool)
+        if submission is None:
+            return f"#{issue['number']}: Intake source unreadable — deferring"
+        # Persist ownership first, then project its GitHub claim. A crash can therefore leave
+        # either no claim or an idempotently resubmittable record, never an unowned claim that
+        # looks like ambiguous legacy work and holds the rollout drain forever.
+        coordinator.submit_stage(submission)
+        if not loop._claim_triage(cfg.repo, issue["number"]):
+            return f"#{issue['number']}: Intake record saved; claim pending — deferring admission"
+        reserved.add(issue["number"])
+        submitted.append(f"#{issue['number']} → {builder.tool}")
+    return "; ".join(submitted) if submitted else "no un-triaged issues"
 
 
 def _resolve_phase(rollout, repos, _log, requested_mode=None) -> Phase:

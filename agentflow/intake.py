@@ -179,6 +179,23 @@ def compose_ready_body(brief: str, current_body: str) -> str:
             f"\n\n{original}\n\n</details>")
 
 
+def _ready_body_has_envelope(body: str) -> bool:
+    """Whether ``body`` has one complete generated original-text envelope."""
+    index = body.find(_ORIGINAL_MARK)
+    if index <= 0 or body.count(_ORIGINAL_MARK) != 1:
+        return False
+    tail = body[index:]
+    opening = (f"{_ORIGINAL_MARK}\n<details>\n"
+               "<summary>Original issue as filed</summary>\n\n")
+    return tail.startswith(opening) and tail.endswith("\n\n</details>")
+
+
+def _ready_body_is_canonical(body: str, brief: str) -> bool:
+    """Whether the exact requested brief precedes one complete original-text envelope."""
+    return (body.startswith(f"{brief.strip()}\n\n{_ORIGINAL_MARK}")
+            and _ready_body_has_envelope(body))
+
+
 def intake_labels(result: IntakeResult) -> list[str]:
     """The labels to stamp for a routed issue — exactly one state, plus dials when
     ready. Pure (test surface)."""
@@ -342,6 +359,31 @@ every newline inside a string value as \\n and every quote as \\":
 For "grill"/"mockup", omit complexity and effort."""
 
 
+def intake_prompt(repo: str, issue: dict, extra: str = "") -> str:
+    """The durable provider input for one Intake stage."""
+    prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(issue["number"]), disclaimer=_DISCLAIMER,
+                   title=issue.get("title", ""), body=issue.get("body") or "(no description)")
+    if extra:
+        prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier hold — treat this as their "
+                   "answer or waiver: promote to ready if the issue is now settled (they answered "
+                   "your questions, waived the visual spec requirement, or pointed at a locked spec), "
+                   "else re-post ONLY what's still open. "
+                   "IF this issue was held for a MOCKUP and a variant round was already drawn (a "
+                   "comment on the issue naming variants A/B/C/D with screenshots), the reply may be "
+                   "a PICK — \"B\", \"the second one\", \"A but tighter\". In that case: read that "
+                   "mockup comment (it links the committed variant files on a mockup branch), map "
+                   "the pick to its variant, and route \"ready\" with a brief that references THAT "
+                   "chosen variant's committed file as the LOCKED visual spec the build must match "
+                   "(ADR 0018 — the build's screenshot is checked against the locked mockup, so name "
+                   "the exact file/branch). A request for a DIFFERENT or fresh set is NOT a pick — "
+                   "re-hold (route \"mockup\") as a follow-up; never auto-loop a new variant round. "
+                   'If nothing genuinely open changed — the reply was chit-chat, or it didn\'t move '
+                   'any open question — answer route "nothing-new" (no body) and I\'ll stay quiet '
+                   "rather than restate myself.\n"
+                   f"---\n{extra}\n---")
+    return prompt
+
+
 class Intake:
     """Runs a tool-agnostic grounding session and reads back its routing decision."""
 
@@ -360,26 +402,7 @@ class Intake:
         except subprocess.CalledProcessError as e:
             return _infra_failed(f"intake worktree/provision failed: {e}")
 
-        prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(n), disclaimer=_DISCLAIMER,
-                       title=issue.get("title", ""), body=issue.get("body") or "(no description)")
-        if extra:
-            prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier hold — treat this as their "
-                       "answer or waiver: promote to ready if the issue is now settled (they answered "
-                       "your questions, waived the visual spec requirement, or pointed at a locked spec), "
-                       "else re-post ONLY what's still open. "
-                       "IF this issue was held for a MOCKUP and a variant round was already drawn (a "
-                       "comment on the issue naming variants A/B/C/D with screenshots), the reply may be "
-                       "a PICK — \"B\", \"the second one\", \"A but tighter\". In that case: read that "
-                       "mockup comment (it links the committed variant files on a mockup branch), map "
-                       "the pick to its variant, and route \"ready\" with a brief that references THAT "
-                       "chosen variant's committed file as the LOCKED visual spec the build must match "
-                       "(ADR 0018 — the build's screenshot is checked against the locked mockup, so name "
-                       "the exact file/branch). A request for a DIFFERENT or fresh set is NOT a pick — "
-                       "re-hold (route \"mockup\") as a follow-up; never auto-loop a new variant round. "
-                       'If nothing genuinely open changed — the reply was chit-chat, or it didn\'t move '
-                       'any open question — answer route "nothing-new" (no body) and I\'ll stay quiet '
-                       "rather than restate myself.\n"
-                       f"---\n{extra}\n---")
+        prompt = intake_prompt(repo, issue, extra)
         # Ground at the capable tier — a cheap model that mis-scopes is the expensive miss.
         model = self.runner.model_for(Complexity.DEEP)
         session = live.Session(repo=repo, number=n, title=issue.get("title", ""),
@@ -397,34 +420,63 @@ def _ensure_label(repo: str, name: str) -> None:
     _run(["gh", "label", "create", name, "--repo", repo, "--color", color, "--force"])
 
 
-def _issue_body(repo: str, issue_number: int) -> str:
-    """The issue's current body text, or "" if it can't be read. Impure."""
+def _issue_body(repo: str, issue_number: int) -> str | None:
+    """The issue's current body text, or ``None`` when it can't be read. Impure.
+
+    Unreadable is deliberately distinct from an empty body: on a ready routing the current
+    body IS the original text we must preserve verbatim, so treating an unreadable read as ""
+    would silently replace the real original with the "no description as filed" placeholder.
+    A ready projection therefore fails closed on ``None`` (defer, retry next cycle) rather than
+    clobbering the original."""
     r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"])
     if r.returncode != 0:
-        return ""
+        return None
     try:
         return json.loads(r.stdout or "{}").get("body") or ""
     except ValueError:
-        return ""
+        return None
 
 
-def _latest_comment(repo: str, issue_number: int) -> str:
-    """The issue's most recent non-empty comment body, or "" if none / unreadable. Impure."""
+def _result_comment(result: IntakeResult) -> str:
+    """The stable comment payload for one route, excluding an optional retitle preface."""
+    return _READY_COMMENT if result.route is IntakeRoute.READY else result.body
+
+
+def _comment_matches_result(body: str, result: IntakeResult) -> bool:
+    """Whether a durable issue comment is this route's output.
+
+    The first projection may include the old title as a conversational preface. A retry after
+    the title mutation can no longer reconstruct that old title, so match the stable payload at
+    the end while still requiring the generated retitle preface shape.
+    """
+    actual = body.strip()
+    expected = _result_comment(result).strip()
+    return actual == expected or (
+        actual.startswith('> Retitled from: "') and actual.endswith(f"\n\n{expected}"))
+
+
+def _result_comment_exists(repo: str, issue_number: int,
+                           result: IntakeResult) -> bool | None:
+    """Whether this route's comment exists, or ``None`` when GitHub is unreadable.
+
+    Unreadable is deliberately distinct from absent: treating uncertainty as absence could
+    post a duplicate while replaying a partially projected route.
+    """
     r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"])
     if r.returncode != 0:
-        return ""
+        return None
     try:
         comments = json.loads(r.stdout or "{}").get("comments", [])
     except ValueError:
-        return ""
-    for c in reversed(comments):
-        if c.get("body", "").strip():
-            return c["body"].strip()
-    return ""
+        return None
+    return any(_comment_matches_result(c.get("body", ""), result)
+               for c in comments if isinstance(c, dict))
 
 
 def apply_intake(repo: str, issue_number: int, current_title: str,
-                 current_labels: list[str], result: IntakeResult) -> str:
+                 current_labels: list[str], result: IntakeResult,
+                 source_title: str | None = None,
+                 source_body: str | None = None) -> str:
     """Write the decision to GitHub, then set the one state label + dials (clearing any
     other state label). Impure; returns a one-line summary.
 
@@ -440,22 +492,50 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
         return "nothing new — nothing to post"
 
     labels = intake_labels(result)
-    retitled_from = current_title if (result.title and result.title != current_title) else None
-    comment = _READY_COMMENT if result.route is IntakeRoute.READY else result.body
+    target_title = result.title or source_title or ""
+    retitled_from = current_title if (target_title and target_title != current_title) else None
+    comment = _result_comment(result)
     if retitled_from is not None:
         comment = f'> Retitled from: "{retitled_from}"\n\n{comment}'
 
-    # Idempotent: if our last word on this issue already says the same thing, changing
-    # nothing (no comment, no label churn) is the whole point — don't re-post it.
-    if INTAKE_MARK in comment and comment.strip() == _latest_comment(repo, issue_number):
+    # Idempotent across partial writes: once this route's comment exists, retries finish any
+    # remaining title/body/label mutations without posting it again.
+    comment_done = _result_comment_exists(repo, issue_number, result)
+    if comment_done is None:
+        return f"routed -> {result.route.value} deferred (comments unreadable)"
+    exact_labels = set(labels).issubset(current_labels)
+    stale_state = any(name in current_labels and name not in set(labels) for name in STATE_LABELS)
+    stale_dials = any(any(name.startswith(p) for p in _DIAL_PREFIXES)
+                      and name not in set(labels) for name in current_labels)
+    title_done = not retitled_from
+    if result.route is IntakeRoute.READY:
+        current_body = _issue_body(repo, issue_number)
+        if current_body is None:
+            # Fail closed: we cannot compose the brief without the original to preserve.
+            return f"routed -> {result.route.value} deferred (body unreadable)"
+        if (source_body is None and _ORIGINAL_MARK in current_body
+                and not _ready_body_has_envelope(current_body)):
+            return f"routed -> {result.route.value} deferred (body envelope malformed)"
+        # Coordinated Intake projects from its immutable submission snapshot. Legacy callers
+        # without that source retain the old idempotent behavior over the live body.
+        body_source = source_body if source_body is not None else current_body
+        expected_body = compose_ready_body(result.body, body_source)
+        body_done = (current_body == expected_body
+                     and _ready_body_is_canonical(current_body, result.body))
+    else:
+        current_body = ""
+        body_done = True
+    if (comment_done and exact_labels and not stale_state and not stale_dials
+            and title_done and body_done):
         return f"unchanged -> {result.route.value} (already posted)"
 
     if retitled_from is not None:
-        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", result.title])
+        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", target_title])
     if result.route is IntakeRoute.READY:
-        body = compose_ready_body(result.body, _issue_body(repo, issue_number))
-        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--body", body])
-    _run(["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", comment])
+        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo,
+              "--body", expected_body])
+    if not comment_done:
+        _run(["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", comment])
 
     for name in labels:
         _ensure_label(repo, name)
@@ -474,12 +554,14 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
     return f"routed -> {result.route.value}{tail}"
 
 
-def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult) -> bool:
+def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult,
+                             source_title: str | None = None,
+                             source_body: str | None = None) -> bool:
     """Verify that the routing decision is visible on GitHub before disposal."""
     if result.route is IntakeRoute.NOTHING_NEW:
         return True
     r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo,
-              "--json", "body,labels,comments"])
+              "--json", "title,body,labels,comments"])
     if r.returncode != 0:
         return False
     try:
@@ -488,13 +570,32 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult)
         return False
     labels = {label.get("name") for label in issue.get("labels", [])
               if isinstance(label, dict)}
-    if not set(intake_labels(result)).issubset(labels):
+    required = set(intake_labels(result))
+    if not required.issubset(labels):
+        return False
+    if any(name in labels and name not in required for name in STATE_LABELS):
+        return False
+    if any(any(name.startswith(prefix) for prefix in _DIAL_PREFIXES)
+           and name not in required for name in labels):
+        return False
+    expected_title = result.title or source_title
+    if expected_title is not None and issue.get("title") != expected_title:
         return False
     comments = [comment.get("body", "") for comment in issue.get("comments", [])
                 if isinstance(comment, dict)]
+    if not any(_comment_matches_result(comment, result) for comment in comments):
+        return False
     if result.route is IntakeRoute.READY:
-        return result.body in (issue.get("body") or "") and any(INTAKE_MARK in c for c in comments)
-    return any(result.body in comment for comment in comments)
+        # Prove the EXACT canonical composed body — the brief over the preserved original —
+        # not just that the brief appears somewhere. `compose_ready_body` is idempotent on an
+        # already-composed body, so the durable body must equal composing the brief over itself.
+        body = issue.get("body") or ""
+        if not _ready_body_is_canonical(body, result.body):
+            return False
+        if source_body is not None:
+            return body == compose_ready_body(result.body, source_body)
+        return True
+    return True
 
 
 def sweep_legacy_labels(repo: str) -> list[str]:

@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -21,7 +21,8 @@ from agentflow.balancer import pick_pair
 from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
                             maintainer_comment, park, reply_pending, squash_merge,
                             ui_evidence_gap)
-from agentflow.intake import (Intake, IntakeResult, IntakeRoute, STATE_LABELS, _DISCLAIMER,
+from agentflow.intake import (INTAKE_MARK, Intake, IntakeResult, IntakeRoute, STATE_LABELS,
+                              _DISCLAIMER, _strip_quoted_lines,
                               apply_intake, awaiting_recheck, intake_result_is_durable,
                               replies_since_intake)
 from agentflow.notify import notify
@@ -338,7 +339,7 @@ TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns 
 _TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING}
 
 
-def reclaim_triage_claims(cfg: RepoConfig) -> int:
+def reclaim_triage_claims(cfg: RepoConfig, coordinator_owned: set[int] = frozenset()) -> int:
     """Drop `agentflow:triaging` claims stranded when a daemon is killed mid-grounding (issue
     #74). Intake opens no PR, so its only outcome signal is a state label — a claim is stale
     only when intake has stamped none of them AND no session is grounding it right now (the
@@ -352,6 +353,7 @@ def reclaim_triage_claims(cfg: RepoConfig) -> int:
     live_now = _issues_with_live_session(cfg.repo)
     stale = [i["number"] for i in json.loads(r.stdout or "[]")
              if i["number"] not in live_now
+             and i["number"] not in coordinator_owned
              and not ({lbl["name"] for lbl in i.get("labels", [])} & set(STATE_LABELS))]
     for n in stale:
         _release_triage(cfg.repo, n)
@@ -552,21 +554,44 @@ def _release(repo: str, n: int) -> None:
     _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", BUILDING])
 
 
-def _claim_triage(repo: str, n: int) -> None:
+def _claim_triage(repo: str, n: int) -> bool:
     """Claim issue n for intake *before* its grounding session, so a concurrent or next-cycle
     dispatch skips it — closing intake's no-label-yet window (the state label is only stamped
     once the session finishes). Symmetric to `_claim`; ensures the label first."""
-    _run(["gh", "label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
-          "--description", "A grounding session is triaging this issue", "--force"])
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", TRIAGING])
+    created = _run(["gh", "label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
+                    "--description", "A grounding session is triaging this issue", "--force"])
+    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", TRIAGING])
+    return created.returncode == 0 and claimed.returncode == 0
 
 
-def _release_triage(repo: str, n: int) -> None:
+def _release_triage(repo: str, n: int) -> bool:
     """Drop the intake claim once routing is written (the state label dedups from here) or the
     session ended. A crash *before* this strands the claim: fail-safe (the issue is skipped,
     never double-triaged), auto-reclaimed next cycle by `reclaim_triage_claims` — the missing
-    state label is intake's stale signal, standing in for the open-PR check builds have."""
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", TRIAGING])
+    state label is intake's stale signal, standing in for the open-PR check builds have.
+    Returns durable proof that GitHub no longer carries the claim."""
+    def claim_present() -> bool | None:
+        viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
+        if viewed.returncode != 0:
+            return None
+        try:
+            labels = json.loads(viewed.stdout or "{}").get("labels", [])
+        except ValueError:
+            return None
+        return TRIAGING in {
+            label.get("name") for label in labels if isinstance(label, dict)
+        }
+
+    before = claim_present()
+    if before is None:
+        return False
+    if not before:
+        return True  # an earlier settlement released it before interruption
+    removed = _run(["gh", "issue", "edit", str(n), "--repo", repo,
+                    "--remove-label", TRIAGING])
+    if removed.returncode != 0:
+        return False
+    return claim_present() is False
 
 
 def _build_review_merge(cfg: RepoConfig, issue: dict, n: int, sl: str, complexity: Complexity,
@@ -694,32 +719,23 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
         comments = json.loads(cr.stdout or "{}").get("comments", [])
         allowlist = intake_allowlist(cfg.repo, cfg.workdir)
         if awaiting_recheck(comments, allowlist):
+            qualifying = [c for c in comments
+                          if c.get("author", {}).get("login", "") in allowlist
+                          and INTAKE_MARK not in _strip_quoted_lines(c.get("body", ""))]
+            if qualifying:
+                latest = qualifying[-1]
+                issue["_intake_target"] = str(latest.get("id") or latest.get("createdAt") or "")
             return issue, replies_since_intake(comments, allowlist)
     return None
 
 
-# Consecutive intake infra failures per (repo, issue), in-memory in the daemon. Infra
-# failures leave no GitHub trace by design (no comment, no label), so the retry streak
-# lives here; a restart resets it — fine for a bounded safety backstop, not state of record.
-_intake_infra_failures: dict[tuple[str, int], int] = {}
-INTAKE_MAX_INFRA_FAILURES = 3   # after this many in a row on one issue, post one held comment
-
-
 def _handle_intake_infra_failure(cfg: RepoConfig, n: int, result: IntakeResult) -> str:
-    """An intake that fell over before the model weighed in (worktree/provision/launch).
-    Post nothing, change no labels, leave the issue for next cycle — until the streak hits
-    the backstop, when we post exactly one held comment so a truly broken issue isn't
-    retried forever in silence (ADR 0019)."""
-    key = (cfg.repo, n)
-    fails = _intake_infra_failures.get(key, 0) + 1
-    _intake_infra_failures[key] = fails
-    if fails < INTAKE_MAX_INFRA_FAILURES:
-        return f"#{n}: intake couldn't start ({result.detail}) — retrying silently ({fails}/{INTAKE_MAX_INFRA_FAILURES})"
-    del _intake_infra_failures[key]
-    apply_intake(cfg.repo, n, "", [], replace(result, infra_failed=False))  # a real, human-visible hold
-    notify("agentflow needs you", f"{cfg.repo} #{n}: intake keeps failing to start",
-           f"https://github.com/{cfg.repo}/issues/{n}")
-    return f"#{n}: intake couldn't start ({result.detail}) — held after {INTAKE_MAX_INFRA_FAILURES} tries"
+    """A legacy Intake setup failure stays quiet and free until coordinated mode owns it.
+
+    The durable coordinator is the sole retry/hold budget. The temporary rollback path must
+    not keep a second in-memory streak whose count resets on restart.
+    """
+    return f"#{n}: intake couldn't start ({result.detail}) — retrying silently"
 
 
 def _next_intake_candidate(cfg: RepoConfig,
@@ -769,7 +785,6 @@ def _run_intake_session(cfg: RepoConfig, issue: dict, extra: str, builder) -> st
         result = Intake(builder).intake(cfg.repo, cfg.workdir, issue, extra=extra)
         if result.infra_failed:
             return _handle_intake_infra_failure(cfg, n, result)
-        _intake_infra_failures.pop((cfg.repo, n), None)   # a clean run ends the streak
         current_labels = [lbl["name"] for lbl in issue.get("labels", [])]
         summary = apply_intake(cfg.repo, n, issue.get("title", ""), current_labels, result)
         tool = getattr(builder, "tool", None)

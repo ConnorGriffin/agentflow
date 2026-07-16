@@ -20,11 +20,12 @@ import json
 import os
 import sqlite3
 import threading
-from dataclasses import fields
+from dataclasses import dataclass, fields
 from pathlib import Path
+from typing import Callable, Mapping
 from uuid import uuid4
 
-from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, Record
+from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 
 SCHEMA_VERSION = 1
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
@@ -50,6 +51,21 @@ def default_store_path() -> Path:
 class StoreUnavailable(RuntimeError):
     """The store could not be read or is a schema this build does not understand. The
     coordinator treats this as fail-closed: no starts, no claim changes."""
+
+
+@dataclass(frozen=True)
+class ReservationLimits:
+    """Global limits that must be decided with the permit reservation.
+
+    ``lane_by_stage`` preserves dispatch's deliberate grouping: Review and Revise consume
+    Build concurrency, while Intake consumes Triage concurrency. The production gate owns
+    those policy values; the store only enforces the supplied snapshot atomically.
+    """
+
+    machine_ceiling: int
+    stage_cap: int
+    stage_lane: str
+    lane_by_stage: Mapping[str, str]
 
 
 class Store:
@@ -157,28 +173,82 @@ class Store:
                 raise StoreUnavailable(f"cannot read continuation store: {e}") from e
         return {r.identity: r for r in (self._decode(row[0]) for row in rows)}
 
-    def upsert(self, record: Record) -> None:
-        """Persist one record's current state. Called after every coordinator transition."""
-        payload = self._encode(record)
+    def upsert(self, record: Record, *, retire_descendants: bool = False) -> bool:
+        """Persist one record only if its durable revision is still current.
+
+        The caller's object is advanced to the committed revision. A stale writer returns
+        ``False`` without changing durable state, so an old cycle can never replace a newer
+        continuation or terminal transition.
+        """
         with self._lock:
             try:
-                self._conn.execute(
-                    "INSERT INTO records (identity, pool, state, demand, data)"
-                    " VALUES (?, ?, ?, ?, ?)"
-                    " ON CONFLICT(identity) DO UPDATE SET"
-                    " pool=excluded.pool, state=excluded.state,"
-                    " demand=excluded.demand, data=excluded.data",
-                    (record.identity, record.pool, record.state, record.demand, payload),
-                )
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
+                if row is not None and self._decode(row[0]).revision != record.revision:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                if row is None and record.revision != 0:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record.revision += 1
+                self._write(record)
+                if retire_descendants:
+                    self._retire_descendants(record)
+                self._conn.execute("COMMIT")
+                return True
             except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
                 raise StoreUnavailable(f"cannot write continuation store: {e}") from e
 
+    def transition(self, expected: Record,
+                   operation: Callable[[Record], bool], *,
+                   retire_descendants: bool = False) -> Record | None:
+        """Serialize one externally-backed terminal transition.
+
+        The durable revision is claimed under ``BEGIN IMMEDIATE`` before ``operation`` runs.
+        Therefore only one coordinator may perform the external finalization for a generation.
+        A process crash releases SQLite's transaction; the stage adapter's idempotent durable
+        proof can then be retried by a fresh coordinator. Returning false rolls back cleanly.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (expected.identity,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                current = self._decode(row[0])
+                if current.revision != expected.revision:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                if not operation(current):
+                    self._conn.execute("ROLLBACK")
+                    return None
+                current.revision += 1
+                self._write(current)
+                if retire_descendants:
+                    self._retire_descendants(current)
+                self._conn.execute("COMMIT")
+                return current
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot transition continuation store: {e}") from e
+            except BaseException:
+                self._rollback_quietly()
+                raise
+
     def submit(self, record: Record,
-               prior_identity: str | None = None) -> tuple[Record, Record | None, bool]:
+               prior_identity: str | None = None
+               ) -> tuple[Record, Record | None, bool, Record | None]:
         """Persist an idempotent stage submission. When ``prior_identity`` is supplied, the
         successor insert and completed predecessor's claim transfer are one transaction.
-        Returns the durable successor, predecessor (if any), and whether this call transferred
-        ownership. Any missing or ineligible predecessor aborts without exposing a successor."""
+        Returns the durable successor, predecessor (if any), whether this call transferred
+        ownership, and the updated root (for a descendant). Successor creation, claim transfer,
+        and descendant registration share one transaction; no crash or concurrent root write can
+        expose an orphaned descendant. Any missing or ineligible predecessor/root aborts without
+        exposing a successor."""
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -186,6 +256,7 @@ class Store:
                     "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
                 successor = self._decode(successor_row[0]) if successor_row is not None else record
                 prior = None
+                root = None
                 transferred = False
                 if prior_identity is not None:
                     prior_row = self._conn.execute(
@@ -203,12 +274,31 @@ class Store:
                         successor.claim = True
                         prior.claim = False
                         prior.retired = True
+                        prior.revision += 1
                         self._write(prior)
                         transferred = True
                 if successor_row is None or transferred:
+                    successor.revision += 1
                     self._write(successor)
+                if successor.root is not None:
+                    root_row = self._conn.execute(
+                        "SELECT data FROM records WHERE identity = ?", (successor.root,)).fetchone()
+                    if root_row is None:
+                        raise StoreUnavailable("cannot register descendant: root is missing")
+                    root = self._decode(root_row[0])
+                    already_registered = (
+                        successor_row is not None
+                        and successor.identity in root.descendants)
+                    if (not already_registered
+                            and (root.state != RUNNING or root.retired or root.hold_pending)):
+                        raise StoreUnavailable(
+                            "cannot register descendant: root is not actively running")
+                    if not already_registered:
+                        root.descendants.add(successor.identity)
+                        root.revision += 1
+                        self._write(root)
                 self._conn.execute("COMMIT")
-                return successor, prior, transferred
+                return successor, prior, transferred, root
             except sqlite3.DatabaseError as e:
                 self._rollback_quietly()
                 raise StoreUnavailable(f"cannot submit continuation: {e}") from e
@@ -216,16 +306,59 @@ class Store:
                 self._rollback_quietly()
                 raise
 
-    def reserve(self, record: Record, budget: int) -> bool:
+    def reserve(self, record: Record, budget: int,
+                limits: ReservationLimits | None = None,
+                expected_launch_token: str | None = None,
+                expected_revision: int | None = None) -> bool:
         """Atomically reserve ``record``'s demand on its pool, or refuse. Availability is read
         and the running row is written under one ``BEGIN IMMEDIATE``, so two coordinator
         instances racing on the same file serialize on the write lock and can never push a
-        pool's ledger past ``budget`` (ADR 0029/0030). Returns whether the reservation was
-        taken; on refusal nothing is written."""
-        payload = self._encode(record)
+        pool's ledger past ``budget`` (ADR 0029/0030). When supplied, machine and dispatch-lane
+        limits are checked from those same running rows in the same transaction, so racers on
+        different pools cannot exceed either global cap. Returns whether the reservation was
+        taken; on refusal nothing is written.
+
+        The write is a same-identity compare-and-set: an existing row must still be ``waiting``
+        at the launch-token generation the caller loaded.
+        Two coordinator instances that both loaded the
+        same ``waiting`` record and each flipped it to ``running`` with its own fresh launch token
+        serialize on the write lock — the first commits its reservation, and the second finds the
+        row already advanced and refuses instead of clobbering the winner's token or terminal
+        outcome. Exactly one running reservation and one launch token survive the race."""
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                existing_row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
+                if existing_row is not None:
+                    existing = self._decode(existing_row[0])
+                    if (existing.state != WAITING
+                            or existing.launch_token != expected_launch_token
+                            or (expected_revision is not None
+                                and existing.revision != expected_revision)):
+                        # Reservation is a WAITING -> RUNNING compare-and-set. Any other durable
+                        # state or token means another instance already advanced this identity;
+                        # never overwrite newer attempts, completion, or hold state with a stale
+                        # waiting generation.
+                        self._conn.execute("ROLLBACK")
+                        return False
+                if limits is not None:
+                    rows = self._conn.execute(
+                        "SELECT data FROM records WHERE state = ? AND identity != ?",
+                        (RUNNING, record.identity),
+                    ).fetchall()
+                    running = [self._decode(row[0]) for row in rows]
+                    roots = [item for item in running if item.root is None]
+                    if len(roots) >= limits.machine_ceiling:
+                        self._conn.execute("ROLLBACK")
+                        return False
+                    lane_count = sum(
+                        limits.lane_by_stage.get(item.stage, item.stage) == limits.stage_lane
+                        for item in roots
+                    )
+                    if lane_count >= limits.stage_cap:
+                        self._conn.execute("ROLLBACK")
+                        return False
                 row = self._conn.execute(
                     "SELECT COALESCE(SUM(demand), 0) FROM records"
                     " WHERE pool = ? AND state = ? AND identity != ?",
@@ -234,14 +367,8 @@ class Store:
                 if int(row[0]) + record.demand > budget:
                     self._conn.execute("ROLLBACK")
                     return False
-                self._conn.execute(
-                    "INSERT INTO records (identity, pool, state, demand, data)"
-                    " VALUES (?, ?, ?, ?, ?)"
-                    " ON CONFLICT(identity) DO UPDATE SET"
-                    " pool=excluded.pool, state=excluded.state,"
-                    " demand=excluded.demand, data=excluded.data",
-                    (record.identity, record.pool, record.state, record.demand, payload),
-                )
+                record.revision = (existing.revision + 1 if existing_row is not None else 1)
+                self._write(record)
                 self._conn.execute("COMMIT")
                 return True
             except sqlite3.DatabaseError as e:
@@ -285,6 +412,7 @@ class Store:
                 record.start_fact = STARTED
                 record.family = str(pid)
                 record.process_alive = True
+                record.revision += 1
                 self._write(record)
                 self._conn.execute("COMMIT")
                 return True
@@ -310,7 +438,14 @@ class Store:
                 if record.start_fact == STARTED and record.launch_token == token:
                     self._conn.execute("ROLLBACK")
                     return (STARTED, record.family)
+                if record.state != RUNNING or record.launch_token != token:
+                    # A delayed timeout belongs to an older reservation generation. It has no
+                    # authority over the current attempt and must not rotate its token.
+                    self._conn.execute("ROLLBACK")
+                    return (NOT_STARTED, None)
+                record.start_fact = NOT_STARTED
                 record.launch_token = uuid4().hex  # any late child write can no longer match
+                record.revision += 1
                 self._write(record)
                 self._conn.execute("COMMIT")
                 return (NOT_STARTED, None)
@@ -347,6 +482,22 @@ class Store:
             (record.identity, record.pool, record.state, record.demand,
              self._encode(record)),
         )
+
+    def _retire_descendants(self, root: Record) -> None:
+        """Retire a root's registered descendants inside the caller's transaction."""
+        for identity in root.descendants:
+            row = self._conn.execute(
+                "SELECT data FROM records WHERE identity = ?", (identity,)).fetchone()
+            if row is None:
+                continue
+            child = self._decode(row[0])
+            if child.retired:
+                continue
+            child.state = COMPLETED
+            child.retired = True
+            child.claim = False
+            child.revision += 1
+            self._write(child)
 
     def _rollback_quietly(self) -> None:
         try:

@@ -149,7 +149,8 @@ def test_forward_rollout_preserves_build_claims_for_drain_evidence(tmp_path, mon
     Rollout().request_coordinated()
     monkeypatch.setattr(daemon, "reclaim_claims", lambda *a, **k: pytest.fail(
         "forward rollout must preserve Build claims"))
-    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda cfg: 0)
+    monkeypatch.setattr(daemon, "reclaim_triage_claims", lambda *a, **k: pytest.fail(
+        "forward rollout must preserve Intake claims"))
     monkeypatch.setattr(daemon, "recheck_once", lambda cfg: "nothing")
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",

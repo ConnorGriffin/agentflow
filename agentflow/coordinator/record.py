@@ -49,10 +49,12 @@ class Record:
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move
     source: str | None = None    # durable working-directory/worktree pointer for provider launch
     input_ptr: str | None = None # durable pointer the provider adapter rebuilds the prompt from
+    outcome: str | None = None   # stage-native durable outcome, captured before external projection
     started_at: int = 0                  # epoch when the current attempt was admitted
     deadline: int = 0                    # supervisor observe-until deadline, for the recovered-running log
     start_fact: str | None = None        # durable launcher handshake result: started | not_started
     launch_token: str | None = None      # nonce a reservation stamps; only the child holding it may record `started`
+    revision: int = 0                    # optimistic concurrency generation; every durable write advances it
     family: str | None = None            # the provider process-family identity a `started` carries
     process_alive: bool = False          # whether that family is still executing
     descendants: set[str] = field(default_factory=set)  # subagents charged to the root reservation
@@ -61,6 +63,7 @@ class Record:
     notifications: int = 0
     handoff_proof: str | None = None     # proof the stage-native human handoff exists (crash-safe)
     hold_pending: bool = False           # classified as a hold, awaiting its durable handoff
+    hold_reason: str | None = None       # exhaustion, permanent cause, or no-successor boundary
     retired: bool = False
     builder_lineage: str | None = None   # who built the diff — a same-tool review cannot auto-merge
     builder_complexity: str | None = None  # the original builder complexity, carried so a later

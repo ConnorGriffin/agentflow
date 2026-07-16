@@ -1,5 +1,5 @@
-"""Build, Review, and Revise behind the session coordinator, wired into the daemon's dispatch
-(issues #103, #104, #105).
+"""Intake, Build, Review, and Revise behind the session coordinator, wired into dispatch
+(issues #103–#106).
 
 This is the seam that turns the rollout phase into action. In **legacy** phase the daemon's
 existing build path is untouched; in **draining** phase no new provider stage of any kind
@@ -29,14 +29,15 @@ import subprocess
 import time
 from pathlib import Path
 
-from agentflow.coordinator import (BuildStageAdapter, Coordinator, MODE_COORDINATED, Phase,
+from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter, MODE_COORDINATED, Phase,
                                    ReviewStageAdapter, ReviseStageAdapter, Rollout, StageRouter,
                                    tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
-from agentflow.coordinator.store import StoreUnavailable, default_store_path
+from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
 
 BUILD_POOLS = ("claude", "codex")
+LEGACY_SESSION_POOLS = BUILD_POOLS + tuple(f"{tool}-intake" for tool in BUILD_POOLS)
 
 
 def build_submission(cfg, issue: dict, tool: str):
@@ -190,35 +191,40 @@ def legacy_evidence(live_sessions, coordinator_sources) -> tuple[str, ...]:
 def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
     """Name every current-format fact that prevents a safe forward activation.
 
-    The live board is only one fact. A legacy Build may also have left its GitHub claim, an
-    active PID marker, or a registered/unregistered Build worktree. Coordinator-owned sources
+    The live board is only one fact. A legacy Build or Intake may also have left its GitHub
+    claim, active PID marker, or registered/unregistered worktree. Coordinator-owned sources
     and claims are excluded; everything else is named rather than cleared or guessed at.
     """
-    from agentflow.loop import BUILDING, _run
+    from agentflow.loop import BUILDING, TRIAGING, _run
     from agentflow.runner import _active_marker, _registered_worktrees
 
     sources = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     evidence = list(legacy_evidence(live_sessions, sources))
-    owned_by_repo = {cfg.repo: tracer.owned_issues(records, cfg.repo) for cfg in repos}
+    # Ownership is resolved per claim type: an Intake record owns only its issue's `triaging`
+    # claim, a Build/Review/Revise record only its issue's `building` claim. Keying the exclusion
+    # per lane stops one type's live record from hiding the other type's stale legacy claim.
+    owned_by_lane = {(cfg.repo, lane): tracer.owned_issues(records, cfg.repo, lane=lane)
+                     for cfg in repos for lane in ("building", "triaging")}
     for cfg in repos:
-        claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
-                       f"repos/{cfg.repo}/issues", "-f", "state=open",
-                       "-f", f"labels={BUILDING}", "-f", "per_page=100"])
-        if claims.returncode != 0:
-            evidence.append(f"{cfg.repo} building claims unreadable")
-        else:
+        for claim_label, lane in ((BUILDING, "building"), (TRIAGING, "triaging")):
+            claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
+                           f"repos/{cfg.repo}/issues", "-f", "state=open",
+                           "-f", f"labels={claim_label}", "-f", "per_page=100"])
+            if claims.returncode != 0:
+                evidence.append(f"{cfg.repo} {lane} claims unreadable")
+                continue
             try:
                 pages = json.loads(claims.stdout or "[]")
             except json.JSONDecodeError:
-                evidence.append(f"{cfg.repo} building claims unreadable")
-            else:
-                if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
-                    evidence.append(f"{cfg.repo} building claims unreadable")
-                    pages = []
-                for issue in (item for page in pages for item in page):
-                    number = issue.get("number")
-                    if isinstance(number, int) and number not in owned_by_repo[cfg.repo]:
-                        evidence.append(f"{cfg.repo}#{number} legacy building claim")
+                evidence.append(f"{cfg.repo} {lane} claims unreadable")
+                continue
+            if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+                evidence.append(f"{cfg.repo} {lane} claims unreadable")
+                continue
+            for issue in (item for page in pages for item in page):
+                number = issue.get("number")
+                if isinstance(number, int) and number not in owned_by_lane[(cfg.repo, lane)]:
+                    evidence.append(f"{cfg.repo}#{number} legacy {lane} claim")
 
         root = Path(cfg.workdir) / ".agentflow" / "worktrees"
         registered = _registered_worktrees(cfg.workdir)
@@ -232,9 +238,10 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
                 rel = path.resolve().relative_to(root.resolve())
             except (OSError, ValueError):
                 continue
-            if len(rel.parts) >= 2 and rel.parts[0] in BUILD_POOLS and rel.parts[1].startswith("issue-"):
+            if (len(rel.parts) >= 2 and rel.parts[0] in LEGACY_SESSION_POOLS
+                    and rel.parts[1].startswith("issue-")):
                 candidates[os.path.realpath(path)] = path
-        for tool in BUILD_POOLS:
+        for tool in LEGACY_SESSION_POOLS:
             for path in (root / tool).glob("issue-*") if (root / tool).exists() else ():
                 candidates.setdefault(os.path.realpath(path), path)
 
@@ -276,13 +283,17 @@ def resolve_phase(rollout: Rollout, repos, live_sessions, *, store_path=None,
         coordinator_active=tracer.coordinator_active(records), requested_mode=mode)
 
 
-def owned_issues(cfg, *, store_path=None) -> set[int]:
+def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
     """The issues in ``cfg.repo`` a coordinator record still owns — the set legacy claim
-    reclamation must never strip (ADR 0028). Empty (and side-effect free) when no store exists."""
+    reclamation must never strip (ADR 0028). Empty (and side-effect free) when no store exists.
+
+    ``lane`` scopes ownership to one claim type: ``"building"`` (Build/Review/Revise) or
+    ``"triaging"`` (Intake). The build and triage reclamation passes each pass their own lane so
+    one claim type's live record never shields the other type's stale claim (issue #106)."""
     path = Path(store_path or default_store_path())
     if not path.exists():
         return set()
-    return tracer.owned_issues(tracer.load_records(path), cfg.repo)
+    return tracer.owned_issues(tracer.load_records(path), cfg.repo, lane=lane)
 
 
 def owned_worktrees(cfg, *, store_path=None) -> set[str]:
@@ -300,21 +311,77 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's one coordinator for Build, Review, and Revise (issues #103, #104, #105). Its
+    """The daemon's coordinator for Intake, Build, Review, and Revise (issues #103–#106). Its
     Build adapter verifies the real PR outcome and reuses the retained worktree; its Review adapter
     verifies a durable verdict for the exact PR head SHA and recreates the read-only checkout; its
     Revise adapter verifies a pushed revision on the same branch and reuses that retained worktree;
-    and its admission gate enables Build, Review, and Revise alone, so every other logical stage
-    stays queued. One :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    and its admission gate keeps Mockup and Respond queued. One :class:`StageRouter` dispatches
+    each adapter call on the record's stage."""
+    from agentflow import coordinated_intake
+    intake = IntakeStageAdapter(
+        worktree_reset=coordinated_intake.reset_worktree,
+        apply_route=coordinated_intake.apply_route,
+        claim_ready=coordinated_intake.intake_claim_ready,
+        worktree_dispose=coordinated_intake.dispose_worktree,
+        handoff=coordinated_intake.hold_intake)
     build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
     review = ReviewStageAdapter(
         verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr)
     revise = ReviseStageAdapter(
         revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
-    router = StageRouter({"build": build, "review": review, "revise": revise})
-    return Coordinator(adapter=router, gate=tracer.build_review_revise_gate,
+    router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise})
+    return Coordinator(adapter=router, gate=_production_gate(),
                        log=_log or (lambda _line: None))
+
+
+class _ProductionGate:
+    """One dispatch cycle's composed durable admission policy."""
+
+    def __init__(self) -> None:
+        from collections import Counter
+        self._paced = Counter()
+        self._active: dict[str, bool] = {}
+
+    def __call__(self, record) -> bool:
+        from agentflow import balancer
+        if not tracer.build_review_revise_gate(record):
+            return False
+        try:
+            status = balancer._query_pool(record.pool)
+        except Exception:
+            return False
+        if not status or not status.clear:
+            return False
+        self._active[record.pool] = status.active
+        return not (status.active and self._paced[record.pool] >= balancer.ACTIVE_PACE)
+
+    @staticmethod
+    def reservation_limits(record) -> ReservationLimits:
+        """The global limits the store enforces with the running-row reservation."""
+        from agentflow import dispatch
+        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build"}
+        stage_lane = lane.get(record.stage, record.stage)
+        return ReservationLimits(
+            machine_ceiling=dispatch.MACHINE_CEILING,
+            stage_cap=dispatch.STAGE_CAPS.get(stage_lane, 1),
+            stage_lane=stage_lane,
+            lane_by_stage=lane,
+        )
+
+    def started(self, record) -> None:
+        """Charge operator pacing only after the provider start is durable."""
+        if self._active.get(record.pool, False):
+            self._paced[record.pool] += 1
+
+
+def _production_gate():
+    """Compose stage enablement, headroom, machine/stage caps, and operator pacing.
+
+    Running durable records are the concurrency ledger. The closure lasts one daemon dispatch
+    cycle, so its active-pool counter is exactly the per-cycle pacing budget.
+    """
+    return _ProductionGate()
 
 
 def _pr_exists(record) -> bool:

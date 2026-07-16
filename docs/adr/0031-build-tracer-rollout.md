@@ -3,6 +3,15 @@
 - Status: Accepted
 - Date: 2026-07-15
 
+## Amendment — Intake activation (2026-07-16)
+
+Issue #106 extends the same drain-safe rollout to Intake. Forward activation now also waits
+for every current-format `agentflow:triaging` claim and Intake worktree to be absent or proved
+coordinator-owned before coordinated Intake may launch. Intake then shares the coordinator's
+durable continuation, admission, and claim-settlement rules; its route is captured before the
+GitHub projection, and the triaging claim is released only after the projected issue state and
+claim absence are both proved durable. Respond and Mockup remain waiting and disabled.
+
 ## Context
 
 [ADR 0028](0028-stage-scoped-continuations.md), [0029](0029-static-per-pool-admission.md),
