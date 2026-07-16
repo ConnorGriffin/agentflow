@@ -58,6 +58,22 @@ def reply_pending(comments: list[dict]) -> bool:
     return False
 
 
+def maintainer_comment_id(comments: list[dict]) -> str:
+    """The stable id of the maintainer's latest unanswered comment — the head of the run
+    `maintainer_comment` returns, and the immutable target that gives one coordinated Respond
+    stage its identity (issue #107). A later maintainer comment has a new id, so it becomes a
+    genuinely new Respond target with its own budget. Empty when our own marker had the last
+    word (nothing to answer) or there are no comments. Pure (test surface)."""
+    for c in reversed(comments):
+        body = c.get("body", "").strip()
+        if not body:
+            continue
+        if PR_MARK in body:
+            return ""
+        return str(c.get("id") or c.get("url") or "")
+    return ""
+
+
 def maintainer_comment(comments: list[dict]) -> str:
     """The maintainer's comment text since our last PR marker — what the responder must
     answer. Pure (test surface)."""

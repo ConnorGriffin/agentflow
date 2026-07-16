@@ -674,22 +674,19 @@ def test_transient_opener_failure_is_redriven_on_the_next_pass(make_coord, monke
     assert record_of(coord, build).retired is True
 
 
-# --- Build, Review, and Revise are the only enabled stages --------------------------------
+# --- an enabled code-writing stage admits; the still-disabled Mockup stays waiting ---------
 
 def test_build_review_revise_admit_other_stages_stay_waiting(make_coord):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_router(fake, pr=[False], verdict=[False], revision=[False]),
                        gate=tracer.build_review_revise_gate)
     revise = coord.submit_stage(_revise_sub("9", pool="claude"))
-    respond = coord.submit_stage(Submission(repo="o/r", subject="10", stage="respond", pool="claude",
-                                            builder_lineage="claude", complexity="deep"))
     mockup = coord.submit_stage(Submission(repo="o/r", subject="11", stage="mockup", pool="claude",
                                            complexity="deep"))
     coord.cycle("claude")
-    assert record_of(coord, revise).state == "running"                # Revise now admits
-    for later in (respond, mockup):
-        rec = record_of(coord, later)
-        assert rec.state == "waiting" and rec.attempts == 0           # still visibly queued, dormant
+    assert record_of(coord, revise).state == "running"                # Revise admits
+    rec = record_of(coord, mockup)
+    assert rec.state == "waiting" and rec.attempts == 0               # Mockup stays visibly queued, dormant
 
 
 # --- pure mappings ------------------------------------------------------------------------

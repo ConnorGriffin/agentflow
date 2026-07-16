@@ -19,7 +19,7 @@ from pathlib import Path
 from agentflow import live, ratchet
 from agentflow.balancer import pick_pair
 from agentflow.gate import (MAX_REVISES, MergeDecision, ci_is_green, decide_merge,
-                            maintainer_comment, park, reply_pending, squash_merge,
+                            maintainer_comment, maintainer_comment_id, park, reply_pending, squash_merge,
                             ui_evidence_gap)
 from agentflow.intake import (INTAKE_MARK, Intake, IntakeResult, IntakeRoute, STATE_LABELS,
                               _DISCLAIMER, _strip_quoted_lines,
@@ -799,11 +799,13 @@ def _run_intake_session(cfg: RepoConfig, issue: dict, extra: str, builder) -> st
     return f"#{n}: {summary}{' (resumed)' if extra else ''}"
 
 
-def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str] | None:
+def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str, str] | None:
     """The next open agentflow PR whose latest comment is the maintainer's unanswered
-    question — returns (pr_number, head_branch, their_comment). Skips a PR where our own
-    marker had the last word (a park notice, or a reply we already posted) so the responder
-    never wakes on its own comments (issue #18)."""
+    question — returns (pr_number, head_branch, their_comment, comment_target). The target is
+    the stable id of that unanswered comment (`maintainer_comment_id`), so one maintainer
+    comment maps to one Respond identity and a later comment becomes a new target. Skips a PR
+    where our own marker had the last word (a park notice, or a reply we already posted) so the
+    responder never wakes on its own comments (issue #18)."""
     r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
               "--json", "number,headRefName", "--limit", "100"])
     if r.returncode != 0:
@@ -817,7 +819,8 @@ def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str] | None:
             continue
         comments = json.loads(cr.stdout or "{}").get("comments", [])
         if reply_pending(comments):
-            return pr["number"], branch, maintainer_comment(comments)
+            return (pr["number"], branch, maintainer_comment(comments),
+                    maintainer_comment_id(comments))
     return None
 
 
@@ -846,7 +849,7 @@ def respond_once(cfg: RepoConfig, _log=None, slot=None) -> str:
     pending = _next_pr_awaiting_reply(cfg)
     if not pending:
         return "no parked PRs awaiting reply"
-    pr, branch, comment = pending
+    pr, branch, comment, _target = pending
     m = _BRANCH_RE.match(branch)
     if not m:
         return f"PR #{pr}: unrecognized branch {branch}"

@@ -184,11 +184,12 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
     the fleet comes from running every repo's `_dispatch_repo` at once. Merges are handled
     serially by the caller after these settle (ADR 0009).
 
-    The rollout gates every provider launch (issues #103, #104, #105): `legacy` keeps today's
-    paths; `coordinated` submits one durable Build stage (a completed Build opens its Review, a
-    blocking Review opens its Revise, and a completed Revise opens its next Review, all behind the
-    coordinator), while Mockup and Respond remain queued; `draining` launches nothing new while
-    existing work finishes. No legacy stage may bypass that dormant gate."""
+    The rollout gates every provider launch (issues #103–#107): `legacy` keeps today's paths;
+    `coordinated` submits one durable Build stage (a completed Build opens its Review, a blocking
+    Review opens its Revise, and a completed Revise opens its next Review) and one durable Respond
+    stage per PR awaiting a maintainer reply, all behind the coordinator, while Mockup remains
+    queued; `draining` launches nothing new while existing work finishes. No legacy stage may
+    bypass that dormant gate."""
     threads: list[threading.Thread] = []
     if phase.launch_legacy:
         threads = _triage_fanout(cfg, slot, _log)
@@ -203,6 +204,8 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
                      lambda: _submit_coordinated_intake(cfg, coordinator, _log), _log)
         _run_and_log(cfg, "build",
                      lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
+        _run_and_log(cfg, "respond",
+                     lambda: _submit_coordinated_respond(cfg, coordinator, _log), _log)
     for thread in threads:
         thread.join()
 
@@ -224,6 +227,27 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
         return f"#{issue['number']}: could not claim Build — refusing coordinator submission"
     coordinator.submit_stage(submission)
     return f"#{issue['number']}: submitted to coordinator → {builder.tool} (build)"
+
+
+def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
+    """Submit this repo's next PR awaiting a maintainer reply as one durable Respond stage. Respond
+    adopts the change's original tool lineage and its retained PR branch/worktree, so there is no
+    tool to pick — the coordinator owns admission, continuation, and completion from here. It holds
+    the `building` change claim while it waits. Submission is idempotent on the stage identity (repo,
+    subject, respond, comment target), so a repeat or restart never opens a second Respond, and a
+    later maintainer comment opens a genuinely new one with a fresh budget (issue #107)."""
+    pending = loop._next_pr_awaiting_reply(cfg)
+    if not pending:
+        return "no PRs awaiting reply"
+    pr, branch, comment, target = pending
+    submission = coordinated_build.respond_submission(cfg, pr, branch, comment, target)
+    if submission is None:
+        return f"PR #{pr}: not a resolvable agentflow respond target — skipping"
+    number = int(submission.subject)
+    if not loop._claim(cfg.repo, number):
+        return f"#{number}: could not claim Respond — refusing coordinator submission"
+    coordinator.submit_stage(submission)
+    return f"#{number}: submitted PR #{pr} to coordinator → {submission.pool} (respond)"
 
 
 def _submit_coordinated_intake(cfg, coordinator, _log) -> str:

@@ -30,8 +30,8 @@ import time
 from pathlib import Path
 
 from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter, MODE_COORDINATED, Phase,
-                                   ReviewStageAdapter, ReviseStageAdapter, Rollout, StageRouter,
-                                   tracer)
+                                   RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter, Rollout,
+                                   StageRouter, tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
@@ -159,6 +159,29 @@ def revise_submission(review_record, complexity, findings="", *, surfaces=""):
         source=build_worktree, claim=True, input_ptr=brief,
         builder_lineage=review_record.builder_lineage, builder_complexity=complexity,
         round=review_record.round, transfer_from=review_record.identity)
+
+
+def respond_submission(cfg, pr_number, branch, comment, target):
+    """Translate one unanswered maintainer comment on an existing agentflow PR into a single
+    Respond stage submission — the minimal facts the coordinator needs (ADR 0030). Respond adopts
+    the change's *original tool lineage* and its retained PR branch/worktree — both recovered from
+    the branch name (``agentflow/<tool>/issue-<n>-<slug>``), so capacity on the other pool can never
+    silently switch this code-writing continuation — is bound to the maintainer comment it answers
+    (its immutable ``target``, so a later comment opens a genuinely new Respond with a fresh budget),
+    and holds the ``building`` change claim while it waits. Pure: the mapping is the test surface
+    (ADR 0020). Returns ``None`` when the branch is not an agentflow PR branch or the comment target
+    is missing."""
+    from agentflow.coordinator import Submission
+    from agentflow.loop import _BRANCH_RE, _RESPOND_DISCLAIMER, RESPOND_PROMPT, _builder_worktree
+    m = _BRANCH_RE.match(branch or "")
+    if m is None or not target:
+        return None
+    tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
+    brief = RESPOND_PROMPT.format(n=pr_number, comment=comment, disclaimer=_RESPOND_DISCLAIMER)
+    return Submission(
+        repo=cfg.repo, subject=str(n), stage="respond", target=str(target),
+        pool=tool, complexity="deep", source=_builder_worktree(cfg, tool, n, sl),
+        claim=True, input_ptr=brief, builder_lineage=tool)
 
 
 def revise_round_budget_remains(records, repo, subject) -> bool:
@@ -311,12 +334,13 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's coordinator for Intake, Build, Review, and Revise (issues #103–#106). Its
-    Build adapter verifies the real PR outcome and reuses the retained worktree; its Review adapter
-    verifies a durable verdict for the exact PR head SHA and recreates the read-only checkout; its
-    Revise adapter verifies a pushed revision on the same branch and reuses that retained worktree;
-    and its admission gate keeps Mockup and Respond queued. One :class:`StageRouter` dispatches
-    each adapter call on the record's stage."""
+    """The daemon's coordinator for Intake, Build, Review, Revise, and Respond (issues #103–#107).
+    Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
+    adapter verifies a durable verdict for the exact PR head SHA and recreates the read-only
+    checkout; its Revise adapter verifies a pushed revision on the same branch and reuses that
+    retained worktree; its Respond adapter verifies the marked reply plus any pushed change on that
+    same branch and releases the change claim on completion; and its admission gate keeps Mockup
+    queued. One :class:`StageRouter` dispatches each adapter call on the record's stage."""
     from agentflow import coordinated_intake
     intake = IntakeStageAdapter(
         worktree_reset=coordinated_intake.reset_worktree,
@@ -330,7 +354,11 @@ def build_coordinator(_log=None) -> Coordinator:
         verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr)
     revise = ReviseStageAdapter(
         revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
-    router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise})
+    respond = RespondStageAdapter(
+        reply_ready=_reply_ready, worktree_ready=_worktree_ready, handoff=_park_pr,
+        settle=_settle_respond)
+    router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
+                          "respond": respond})
     return Coordinator(adapter=router, gate=_production_gate(),
                        log=_log or (lambda _line: None))
 
@@ -360,7 +388,8 @@ class _ProductionGate:
     def reservation_limits(record) -> ReservationLimits:
         """The global limits the store enforces with the running-row reservation."""
         from agentflow import dispatch
-        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build"}
+        lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build",
+                "respond": "respond"}
         stage_lane = lane.get(record.stage, record.stage)
         return ReservationLimits(
             machine_ceiling=dispatch.MACHINE_CEILING,
@@ -678,6 +707,75 @@ def _round_evidence(comment: dict, opened_at: int) -> bool:
         return True
     created = _iso_to_epoch(comment.get("createdAt", "") or "")
     return created is not None and created > opened_at
+
+
+# --- Respond stage: posted-reply outcome on the retained PR branch (live; ADR 0020) ------
+
+def _reply_ready(record, obs) -> bool:
+    """The Respond outcome is the marked agentflow reply to the maintainer comment this record
+    answers, plus any branch change verified pushed (ADR 0028, issue #107) — read from GitHub
+    independently of how the responder exited:
+
+    - the reply: the PR's latest comment now carries our marker, so the maintainer's question is no
+      longer the last word — a reply we posted (told apart by the marker, never the maintainer's); and
+    - verified pushed: the retained PR-branch worktree holds no commit absent from the pushed remote
+      branch head. A responder that committed a small fix but never pushed it left the remote branch
+      unchanged, so the stage stays incomplete and continues on that same retained worktree.
+
+    A PR whose latest comment is still the maintainer's posted no reply and stays incomplete. Live
+    orchestration; exercised with faked GitHub/worktree reads in ``tests/test_respond_tracer.py``."""
+    from agentflow.gate import reply_pending
+    from agentflow.loop import _pr_comments, _run
+    parsed = _source_facts(record)
+    if parsed is None:
+        return False
+    _workdir, branch, wt = parsed
+    pr = _open_pr_for_branch(record.repo, branch)
+    if pr is None:
+        return False
+    comments = _pr_comments(record.repo, pr.get("number"))
+    if comments is None or reply_pending(comments):
+        return False   # the maintainer still has the last word — no reply posted yet
+    # A reply exists. Any branch change the responder made must be verified pushed: the retained
+    # worktree must hold no local commit that is absent from the PR's remote branch head. A
+    # responder that committed a small fix but never pushed it leaves a commit here that the fetched
+    # remote head does not contain, so the stage stays incomplete and continues.
+    if wt.exists():
+        head = pr.get("headRefOid") or ""
+        _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
+        ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
+        if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
+            return False
+    return True
+
+
+def _settle_respond(record) -> str | None:
+    """Release Respond's change claim once the reply is durable, retiring the record with no
+    successor and no human handoff (issue #107). Drops the ``building`` claim label so the answered
+    PR returns to the normal merge pipeline, proves the label is gone, then returns the PR (or issue)
+    URL as the durable proof. Idempotent and crash-safe: removing an already-removed label is a
+    no-op, so a repeat re-proves the same release. Returns ``None`` when the issue is unreadable or
+    the label is still present, so settlement retries next cycle rather than retiring over a claim it
+    never released. Live orchestration, not unit-tested (ADR 0020)."""
+    from agentflow.loop import BUILDING, _run
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return None
+    _run(["gh", "issue", "edit", str(number), "--repo", record.repo, "--remove-label", BUILDING])
+    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo, "--json", "labels,url"])
+    if proved.returncode != 0:
+        return None
+    try:
+        state = json.loads(proved.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    if BUILDING in {label.get("name") for label in state.get("labels", [])}:
+        return None   # the claim label is still present — retry rather than retire over it
+    pr = _park_pr_number(record)
+    if pr is not None:
+        return f"https://github.com/{record.repo}/pull/{pr}"
+    return state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
 
 
 def _open_pr_for_branch(repo: str, branch: str) -> dict | None:

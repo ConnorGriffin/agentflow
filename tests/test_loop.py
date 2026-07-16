@@ -795,10 +795,12 @@ def _pr_gh(monkeypatch, prs, comments_by_pr):
 def test_next_pr_awaiting_reply_picks_the_unanswered_one(monkeypatch):
     prs = [{"number": 7, "headRefName": "agentflow/claude/issue-3-do-thing"},
            {"number": 8, "headRefName": "agentflow/codex/issue-4-other"}]
-    comments = {7: [{"body": _PARK}],                     # our marker last — answered
-                8: [{"body": _PARK}, {"body": _MAINT}]}   # maintainer last — pending
+    comments = {7: [{"body": _PARK}],                                    # our marker last — answered
+                8: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"}]}    # maintainer last — pending
     _pr_gh(monkeypatch, prs, comments)
-    assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (8, "agentflow/codex/issue-4-other", _MAINT)
+    # The fourth element is the stable id of the unanswered comment — the Respond target (issue #107).
+    assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (
+        8, "agentflow/codex/issue-4-other", _MAINT, "IC_8")
 
 
 def test_next_pr_awaiting_reply_ignores_human_branches(monkeypatch):
@@ -851,7 +853,7 @@ def test_respond_once_noop_when_nothing_pending(monkeypatch):
 
 def test_responder_retains_worktree_when_reply_cannot_be_verified(monkeypatch):
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply",
-                        lambda cfg: (8, "agentflow/claude/issue-4-other", _MAINT))
+                        lambda cfg: (8, "agentflow/claude/issue-4-other", _MAINT, "IC_8"))
     monkeypatch.setattr(loop, "_checkout_pr_branch", lambda *a: True)
     monkeypatch.setattr(loop, "_pr_comments", lambda *a: None)
     monkeypatch.setattr(loop, "remove_worktree_if_safe",

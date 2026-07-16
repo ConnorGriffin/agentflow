@@ -1,15 +1,15 @@
-"""The tracer bridge (issues #103–#106) — the small set of reads and gates that connect the
-session coordinator to dispatch while Intake, Build, Review, and Revise are the
+"""The tracer bridge (issues #103–#107) — the small set of reads and gates that connect the
+session coordinator to dispatch while Intake, Build, Review, Revise, and Respond are the
 coordinated stages.
 
-Three things the dispatch layer needs when Build, Review, and Revise run behind the coordinator,
-all derived from the durable continuation records so there is no second source of truth:
+Three things the dispatch layer needs when these stages run behind the coordinator, all derived
+from the durable continuation records so there is no second source of truth:
 
-- **Intake, Build, Review, and Revise are the enabled logical stages.** :func:`build_review_revise_gate`
-  is the coordinator's admission gate in coordinated mode: every other logical stage may be
-  submitted and sit visibly ``waiting``, but it never admits, so it consumes neither a permit nor an
-  attempt. :func:`build_and_review_gate` and :func:`build_only_gate` are the retained gates for the
-  earlier issue #104 and #103 slices.
+- **Intake, Build, Review, Revise, and Respond are the enabled logical stages.**
+  :func:`build_review_revise_gate` is the coordinator's admission gate in coordinated mode: every
+  other logical stage may be submitted and sit visibly ``waiting``, but it never admits, so it
+  consumes neither a permit nor an attempt. :func:`build_and_review_gate` and :func:`build_only_gate`
+  are the retained gates for the earlier issue #104 and #103 slices.
 - **The live board becomes a projection of running records.** :func:`live_projection` renders
   the running Build and Review records as live-session entries; waiting records reserve nothing
   and do not appear, exactly matching the reviewed admission demand they hold.
@@ -30,11 +30,11 @@ from agentflow.coordinator.record import COMPLETED, RUNNING, WAITING, Record
 from agentflow.coordinator.store import Store, default_store_path
 
 
-# The logical stages enabled behind the coordinator today (issues #103, #104, #105) — the one
-# source :func:`build_review_revise_gate` consumes. Every other stage may be submitted and sit
+# The logical stages enabled behind the coordinator today (issues #103–#107) — the one source
+# :func:`build_review_revise_gate` consumes. Every other stage (Mockup) may be submitted and sit
 # visibly ``waiting``, but the gate never admits it, so it consumes neither a permit nor an
 # attempt.
-ENABLED_STAGES = ("intake", "build", "review", "revise")
+ENABLED_STAGES = ("intake", "build", "review", "revise", "respond")
 
 
 def build_only_gate(record: Record) -> bool:
@@ -52,7 +52,7 @@ def build_and_review_gate(record: Record) -> bool:
 def build_review_revise_gate(record: Record) -> bool:
     """The coordinated-mode admission gate: admit exactly :data:`ENABLED_STAGES`, refuse every
     other logical stage. A refused stage stays ``waiting`` and reserves nothing — no permit, no
-    attempt — so Respond and Mockup remain visibly queued until their own slices land."""
+    attempt — so Mockup remains visibly queued until its own slice lands."""
     return record.stage in ENABLED_STAGES
 
 
@@ -64,12 +64,13 @@ def _issue_number(record: Record) -> int | None:
 
 
 # Which GitHub claim label each logical stage owns. Intake owns the ``triaging`` claim; Build,
-# Review, and Revise all work the same PR branch and own the ``building`` claim. The two are
-# distinct claim types on distinct issues, so ownership must be resolved per claim type — an
+# Review, Revise, and Respond all work the same PR branch and own the ``building`` claim. The two
+# are distinct claim types on distinct issues, so ownership must be resolved per claim type — an
 # Intake record must never be read as owning a ``building`` claim, nor a Build record a
 # ``triaging`` one, or one type's live record would shield the other type's stale claim from
 # reclamation (and hide it from forward-activation evidence).
-CLAIM_LANE = {"intake": "triaging", "build": "building", "review": "building", "revise": "building"}
+CLAIM_LANE = {"intake": "triaging", "build": "building", "review": "building",
+              "revise": "building", "respond": "building"}
 
 
 def owned_issues(records, repo: str, lane: str | None = None) -> set[int]:
@@ -110,16 +111,17 @@ def coordinator_active(records) -> bool:
     )
 
 
-# Revise shares Build's board lane: it works on the same PR branch/worktree, so it reads as a
-# builder session (exactly as the legacy revise pass does) and is replaced with the Build lane.
-_STAGE_LANE = {"intake": "triaging", "build": "building", "review": "reviewing", "revise": "building"}
+# Revise and Respond share Build's board lane: both work the same PR branch/worktree, so they read
+# as a builder session (exactly as the legacy revise/respond passes do) under the Build lane.
+_STAGE_LANE = {"intake": "triaging", "build": "building", "review": "reviewing",
+               "revise": "building", "respond": "building"}
 
 
 def live_projection(records) -> list[dict]:
     """Render the running coordinated records as live-session board entries (ADR 0030: the live
     board is a projection of running records, not an ownership source). One entry per running
-    Build, Review, or Revise record, keyed by its worktree; waiting records reserve nothing and are
-    omitted."""
+    Build, Review, Revise, or Respond record, keyed by its worktree; waiting records reserve nothing
+    and are omitted."""
     entries: list[dict] = []
     for record in records:
         if record.state != RUNNING or record.stage not in _STAGE_LANE:
