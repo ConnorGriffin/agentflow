@@ -693,6 +693,48 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
     assert len(parked) == 1
 
 
+def test_same_tool_autonomous_review_settles_to_park_without_waiting_for_ci(
+        make_coord, monkeypatch):
+    from agentflow.reviewer import Verdict
+
+    fake = FakeSession()
+    comments, parked = [], []
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_build, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.gate.ci_is_green",
+                        lambda *args, **kwargs: pytest.fail("same-tool review must park before CI"))
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+
+    def park(_repo, pr, _verdict, *, reason):
+        parked.append((pr, reason))
+        comments.append({"body": "> *agentflow: parked for human review.*"})
+
+    monkeypatch.setattr("agentflow.gate.park", park)
+    adapter = ReviewStageAdapter(
+        verdict_ready=lambda _record, _obs: True, worktree_reset=lambda _record: True,
+        observer=fake, settle=coordinated_build._settle_review,
+        prepare_settle=coordinated_build._prepare_review_settlement)
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_review(
+        pool="claude", builder_lineage="claude", target="sha-a",
+        source="/work/.agentflow/worktrees/claude-review/pr-42-fix"))
+    coord.cycle("claude")
+    fake.end(ident, success=True, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+    coord.cycle("claude")
+
+    settled = record_of(coord, ident)
+    assert settled.auto_merge_allowed is False
+    assert settled.retired is True and settled.claim is False
+    assert len(parked) == 1
+
+
 # --- pure Build → Review submission mapping ----------------------------------------------
 
 def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():

@@ -202,6 +202,17 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
                 first = node.args[0].elts[0] if node.args[0].elts else None
                 if isinstance(first, ast.Constant) and first.value in {"claude", "codex"}:
                     assert path == root / "runner.py", f"direct provider command execution: {path}"
+            if isinstance(node, ast.Call):
+                counter_name = None
+                if isinstance(node.func, ast.Name):
+                    counter_name = node.func.id
+                elif isinstance(node.func, ast.Attribute):
+                    counter_name = node.func.attr
+                if counter_name in {"Semaphore", "BoundedSemaphore"}:
+                    raise AssertionError(f"second capacity ledger primitive: {path}:{node.lineno}")
+                if counter_name == "Counter":
+                    assert path in {root / "coordinated_build.py", root / "dashboard_data.py"}, (
+                        f"counter outside pacing/projection owners: {path}:{node.lineno}")
             if "coordinator" not in path.parts and isinstance(
                     node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
