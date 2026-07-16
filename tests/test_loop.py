@@ -660,6 +660,14 @@ def test_next_resumable_issue_picks_up_needs_mockup_reply(monkeypatch):
     assert _MAINTAINER_REPLY in reply
 
 
+def test_next_resumable_issue_waits_while_mockup_owns_the_drawing_claim(monkeypatch):
+    issue = {"number": 11, "title": "t", "body": "b",
+             "labels": [{"name": "agentflow:needs-mockup"}, {"name": DRAWING}]}
+    monkeypatch.setattr(loop, "_run", _make_resumable_run([], [issue]))
+
+    assert _next_resumable_issue(RepoConfig("o/r", ".")) is None
+
+
 def test_next_resumable_issue_returns_none_when_last_comment_is_ours(monkeypatch):
     issue = {"number": 12, "title": "t", "body": "b",
              "labels": [{"name": "agentflow:needs-mockup"}]}

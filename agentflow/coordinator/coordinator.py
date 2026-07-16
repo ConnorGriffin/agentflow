@@ -11,8 +11,8 @@ the running-record ledger, the crash-safe provider start handshake, outcome-firs
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
 
-Intake, Build, Review, Revise, and Respond are the production stages behind this coordinator
-(issues #103–#107); Mockup remains queued behind the admission gate. Review
+All six logical stages are production stages behind this coordinator (issues #103–#108),
+including Mockup's durable visual round. Review
 is read-only, so an eligible continuation may move to the other pool when its home pool cannot
 fit it. The interface and crash boundaries remain exercised with injected launcher, gate, and
 observer collaborators.

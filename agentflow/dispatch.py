@@ -184,11 +184,11 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
     the fleet comes from running every repo's `_dispatch_repo` at once. Merges are handled
     serially by the caller after these settle (ADR 0009).
 
-    The rollout gates every provider launch (issues #103–#107): `legacy` keeps today's paths;
+    The rollout gates every provider launch (issues #103–#108): `legacy` keeps today's paths;
     `coordinated` submits one durable Build stage (a completed Build opens its Review, a blocking
     Review opens its Revise, and a completed Revise opens its next Review) and one durable Respond
-    stage per PR awaiting a maintainer reply, all behind the coordinator, while Mockup remains
-    queued; `draining` launches nothing new while existing work finishes. No legacy stage may
+    stage per PR awaiting a maintainer reply and one durable Mockup round, all behind the
+    coordinator; `draining` launches nothing new while existing work finishes. No legacy stage may
     bypass that dormant gate."""
     threads: list[threading.Thread] = []
     if phase.launch_legacy:
@@ -204,6 +204,8 @@ def _dispatch_repo(cfg, slot: _Slot, _log, phase: Phase, coordinator=None) -> No
                      lambda: _submit_coordinated_intake(cfg, coordinator, _log), _log)
         _run_and_log(cfg, "build",
                      lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
+        _run_and_log(cfg, "mockup",
+                     lambda: _submit_coordinated_mockup(cfg, coordinator, _log), _log)
         _run_and_log(cfg, "respond",
                      lambda: _submit_coordinated_respond(cfg, coordinator, _log), _log)
     for thread in threads:
@@ -252,6 +254,22 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
         return f"#{number}: could not claim Respond — refusing coordinator submission"
     coordinator.submit_stage(submission)
     return f"#{number}: submitted PR #{pr} to coordinator → {submission.pool} (respond)"
+
+
+def _submit_coordinated_mockup(cfg, coordinator, _log) -> str:
+    """Submit and visibly claim one eligible held issue's stable Mockup variant round."""
+    issue = loop._next_mockup_issue(cfg)
+    if not issue:
+        return "no needs-mockup issues to draw"
+    builder, _reviewer, block_msg = pick_pair()
+    if builder is None:
+        return f"#{issue['number']}: no pool has headroom to draw mockups ({block_msg}) — deferring"
+    submission = coordinated_build.mockup_submission(cfg, issue, builder.tool)
+    coordinator.submit_stage(submission)  # durable ownership before the visible claim
+    if not loop._claim_mockup(cfg.repo, issue["number"]):
+        return f"#{issue['number']}: Mockup record saved; drawing claim pending"
+    return (f"#{issue['number']}: submitted to coordinator → "
+            f"{builder.tool} (mockup)")
 
 
 def _submit_coordinated_intake(cfg, coordinator, _log) -> str:

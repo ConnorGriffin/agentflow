@@ -1,0 +1,455 @@
+"""Mockup as the sixth coordinated stage, exercised through the public coordinator seam."""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+from conftest import FakeSession, permits, record_of
+
+from agentflow import coordinated_build, loop
+from agentflow.coordinator import MockupStageAdapter, StageRouter
+from agentflow.coordinator.providers import ProviderCause
+from agentflow.coordinator import tracer
+from agentflow.coordinator.record import Record
+
+
+def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage():
+    cfg = SimpleNamespace(repo="o/r", workdir="/home/w")
+    issue = {"number": 11, "title": "Compare navigation concepts", "body": "Draw variants"}
+
+    first = coordinated_build.mockup_submission(cfg, issue, "claude")
+    again = coordinated_build.mockup_submission(cfg, issue, "claude")
+
+    assert first == again
+    assert first.stage == "mockup" and first.subject == "11" and first.target is None
+    assert first.pool == first.builder_lineage == "claude"
+    assert first.complexity == "deep" and first.claim is True
+    assert first.source == "/home/w/.agentflow/worktrees/claude/mockup-11-compare-navigation-concepts"
+    assert "/ui-mockups" in first.input_ptr and "EXACTLY ONE comment" in first.input_ptr
+    assert "continuation" in first.input_ptr and "NEVER post another" in first.input_ptr
+
+
+def test_resubmission_cannot_switch_the_original_mockup_lineage(make_coord):
+    fake = FakeSession()
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: False,
+        observer=fake,
+    )
+    coord = make_coord(fake, adapter=adapter)
+    cfg = SimpleNamespace(repo="o/r", workdir="/w")
+    issue = {"number": 11, "title": "A screen", "body": "Draw it"}
+    ident = coord.submit_stage(coordinated_build.mockup_submission(cfg, issue, "claude"))
+    assert coord.submit_stage(coordinated_build.mockup_submission(cfg, issue, "codex")) == ident
+
+    rec = record_of(coord, ident)
+    assert rec.pool == rec.lineage == "claude"
+    assert "/claude/mockup-11-a-screen" in rec.source
+
+
+def test_mockup_waiting_and_preparation_miss_retain_claim_lineage_and_local_work(make_coord):
+    fake = FakeSession()
+    ready = [False]
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: ready[0],
+        observer=fake,
+    )
+    coord = make_coord(fake, adapter=adapter)
+    sub = coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
+    ident = coord.submit_stage(sub)
+
+    assert coord.cycle("claude") == []
+    rec = record_of(coord, ident)
+    assert rec.state == "waiting" and rec.attempts == 0 and permits(coord, "claude") == 0
+    assert rec.claim is True and rec.lineage == "claude" and rec.source == sub.source
+
+    ready[0] = True
+    coord.cycle("claude")
+    assert record_of(coord, ident).attempts == 1
+    assert permits(coord, "claude") == 5
+
+
+def test_interrupted_mockup_continues_on_the_same_branch_and_pinned_pool(make_coord):
+    fake = FakeSession()
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: True,
+        observer=fake,
+    )
+    coord = make_coord(fake, adapter=adapter)
+    sub = coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
+    ident = coord.submit_stage(sub)
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.PROCESS)
+
+    coord.cycle("claude")
+    rec = record_of(coord, ident)
+    assert rec.state == "running" and rec.continuation is True and rec.attempts == 2
+    assert rec.pool == rec.lineage == "claude" and rec.source == sub.source and rec.claim is True
+    assert coord.cycle("codex") == []
+
+
+def test_live_admission_gate_enables_mockup_at_its_reviewed_five_permit_demand(make_coord):
+    fake = FakeSession()
+    adapter = StageRouter({"mockup": MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: True,
+        observer=fake,
+    )})
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    sub = coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
+    ident = coord.submit_stage(sub)
+
+    coord.cycle("claude")
+    assert record_of(coord, ident).state == "running"
+    assert permits(coord, "claude") == 5
+
+
+def test_public_mockup_seam_completes_only_on_pushed_variants_screenshots_and_one_comment(
+        make_coord, monkeypatch, tmp_path):
+    fake = FakeSession()
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    comment = (
+        "> *agentflow intake: mockup variants — generated by AI.*\n\n"
+        "![A](https://github.com/o/r/raw/refs/heads/agentflow/claude/mockup-11-a-screen/"
+        "mockups/a.png)\n![B](https://github.com/o/r/raw/refs/heads/agentflow/claude/"
+        "mockup-11-a-screen/mockups/b.png)\n![C](https://github.com/o/r/raw/refs/heads/"
+        "agentflow/claude/mockup-11-a-screen/mockups/c.png)")
+    monkeypatch.setattr("agentflow.loop._issue_comments",
+                        lambda repo, number: [{"body": comment}])
+
+    def external_read(argv):
+        if "rev-parse" in argv and "HEAD" in argv:
+            return SimpleNamespace(returncode=0, stdout="pushed-head\n")
+        if "rev-parse" in argv and any(str(arg).startswith("origin/") for arg in argv):
+            return SimpleNamespace(returncode=0, stdout="pushed-head\n")
+        if "diff" in argv and "--name-only" in argv:
+            files = [f"mockups/{name}.{ext}" for name in "abc" for ext in ("html", "png")]
+            return SimpleNamespace(returncode=0, stdout="\n".join(files) + "\n")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("agentflow.loop._run", external_read)
+    settled = []
+    adapter = MockupStageAdapter(
+        outcome_ready=coordinated_build._mockup_outcome_ready,
+        worktree_ready=lambda record: True,
+        observer=fake,
+        settle=lambda record: settled.append(record.identity) or "issue-url",
+    )
+    coord = make_coord(fake, adapter=adapter)
+    sub = coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir=str(tmp_path)),
+        {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
+    ident = coord.submit_stage(sub)
+    coord.cycle("claude")
+    fake.end(ident, success=False, cause=ProviderCause.PROCESS)
+
+    restarted = make_coord(fake, adapter=adapter)
+    assert [out.status for out in restarted.cycle("claude")] == ["completed"]
+    assert record_of(restarted, ident).claim is True
+    restarted.cycle("claude")
+    rec = record_of(restarted, ident)
+    assert rec.retired is True and rec.claim is False and settled == [ident]
+
+
+def test_duplicate_marked_comments_cannot_complete_mockup(monkeypatch, tmp_path):
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    comment = {"body": "> *agentflow intake: mockup variants — generated by AI.*"}
+    monkeypatch.setattr("agentflow.loop._issue_comments",
+                        lambda repo, number: [comment, comment])
+    monkeypatch.setattr("agentflow.loop._run",
+                        lambda argv: (_ for _ in ()).throw(AssertionError(
+                            "duplicate comments must fail before git verification")))
+    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
+                 repo="o/r", subject="11", lineage="claude", source=str(wt))
+
+    assert coordinated_build._mockup_outcome_ready(rec, SimpleNamespace()) is False
+
+
+def test_deleted_mockup_artifacts_do_not_count_as_committed_outcome(monkeypatch, tmp_path):
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    comment = {"body": (
+        "> *agentflow intake: mockup variants — generated by AI.*\n"
+        "mockups/a.png mockups/b.png mockups/c.png")}
+    monkeypatch.setattr("agentflow.loop._issue_comments", lambda repo, number: [comment])
+
+    def git(argv):
+        if "rev-parse" in argv:
+            return SimpleNamespace(returncode=0, stdout="head\n")
+        if "diff" in argv:
+            assert "--diff-filter=ACMRT" in argv
+            return SimpleNamespace(returncode=0, stdout="")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("agentflow.loop._run", git)
+    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
+                 repo="o/r", subject="11", lineage="claude", source=str(wt))
+
+    assert coordinated_build._mockup_outcome_ready(rec, SimpleNamespace()) is False
+
+
+def test_missing_context_is_an_immediate_single_human_boundary_that_preserves_work(
+        make_coord, monkeypatch):
+    fake = FakeSession()
+    monkeypatch.setattr("agentflow.loop._issue_comments", lambda repo, number: [{
+        "body": ("> *agentflow intake: mockup variants — generated by AI.*\n\n"
+                 "MISSING-CONTEXT: no runnable surface")
+    }])
+    handoffs = []
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: True,
+        missing_context=coordinated_build._mockup_missing_context,
+        observer=fake,
+        handoff=lambda record: handoffs.append(record.identity) or "issue-proof",
+    )
+    coord = make_coord(fake, adapter=adapter)
+    sub = coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
+    ident = coord.submit_stage(sub)
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.NONE)
+
+    outcomes = coord.cycle("claude")
+    assert [out.status for out in outcomes] == ["held"]
+    rec = record_of(coord, ident)
+    assert rec.attempts == 1 and rec.claim is False and rec.source == sub.source
+    assert rec.handoffs == rec.notifications == 1 and handoffs == [ident]
+    assert make_coord(fake, adapter=adapter).cycle("claude") == []
+    assert handoffs == [ident]
+
+
+def test_exhaustion_creates_one_mockup_handoff_and_preserves_unfinished_work(make_coord):
+    fake = FakeSession()
+    handoffs = []
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: True,
+        observer=fake,
+        handoff=lambda record: handoffs.append(record.identity) or "issue-proof",
+    )
+    coord = make_coord(fake, adapter=adapter)
+    sub = coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
+    ident = coord.submit_stage(sub)
+    outcome = None
+    for _ in range(8):
+        settled = coord.cycle("claude")
+        if settled:
+            outcome = settled[0]
+            break
+        fake.end(ident, cause=ProviderCause.PROCESS)
+
+    assert outcome is not None and outcome.status == "held"
+    rec = record_of(coord, ident)
+    assert rec.attempts == 3 and rec.handoffs == rec.notifications == 1
+    assert rec.claim is False and rec.source == sub.source
+    assert handoffs == [ident]
+    assert make_coord(fake, adapter=adapter).cycle("claude") == []
+    assert handoffs == [ident]
+
+
+def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktree(
+        make_coord, monkeypatch, tmp_path):
+    fake = FakeSession()
+    claimed = [False]
+    calls = []
+
+    def external_read(argv):
+        calls.append(argv)
+        if argv[:3] == ["gh", "issue", "view"]:
+            labels = ([{"name": "agentflow:needs-mockup"},
+                       {"name": "agentflow:drawing-mockup"}] if claimed[0]
+                      else [{"name": "agentflow:needs-mockup"}])
+            return SimpleNamespace(returncode=0, stdout=json.dumps({"labels": labels}))
+        if "show-ref" in argv:
+            return SimpleNamespace(returncode=1, stdout="")
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("agentflow.loop._run", external_read)
+    monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: (
+            coordinated_build._mockup_claim_ready(record)
+            and coordinated_build._worktree_ready(record)),
+        observer=fake,
+    )
+    coord = make_coord(fake, adapter=adapter)
+    sub = coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir=str(tmp_path)),
+        {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
+    ident = coord.submit_stage(sub)
+
+    coord.cycle("claude")
+    assert record_of(coord, ident).attempts == 0 and permits(coord, "claude") == 0
+    assert not any("worktree" in call and "add" in call for call in calls)
+
+    claimed[0] = True
+    coord.cycle("claude")
+    assert record_of(coord, ident).attempts == 1 and permits(coord, "claude") == 5
+    added = next(call for call in calls if "worktree" in call and "add" in call)
+    assert "origin/main" in added
+
+
+def test_drawing_claim_reconciliation_preserves_live_and_coordinator_owned_mockups(monkeypatch):
+    claimed = [{"number": 1}, {"number": 2}, {"number": 3}]
+    monkeypatch.setattr(loop, "_run", lambda argv: SimpleNamespace(
+        returncode=0, stdout=json.dumps(claimed)))
+    monkeypatch.setattr(loop, "_issues_with_live_session", lambda repo: {1})
+    released = []
+    monkeypatch.setattr(loop, "_release_mockup", lambda repo, number: released.append(number))
+
+    assert loop.reclaim_mockup_claims(
+        SimpleNamespace(repo="o/r"), coordinator_owned={2}) == 1
+    assert released == [3]
+
+    records = [Record(identity="m", stage="mockup", pool="claude", demand=5,
+                      repo="o/r", subject="2", claim=True)]
+    assert tracer.owned_issues(records, "o/r", lane="drawing") == {2}
+
+
+def test_completed_mockup_releases_claim_keeps_human_boundary_and_disposes_worktree(
+        monkeypatch, tmp_path):
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+
+    def github(argv):
+        if argv[:3] == ["gh", "issue", "edit"]:
+            labels.discard("agentflow:drawing-mockup")
+            return SimpleNamespace(returncode=0, stdout="")
+        if argv[:3] == ["gh", "issue", "view"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "labels": [{"name": label} for label in labels],
+                "url": "https://github.com/o/r/issues/11",
+            }))
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("agentflow.loop._run", github)
+    monkeypatch.setattr("agentflow.runner.remove_worktree_if_safe",
+                        lambda workdir, path: (path.rmdir() is None))
+    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
+                 repo="o/r", subject="11", lineage="claude", source=str(wt))
+
+    assert coordinated_build._settle_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert not wt.exists() and labels == {"agentflow:needs-mockup"}
+    assert coordinated_build._settle_mockup(rec) == "https://github.com/o/r/issues/11"
+
+
+def test_exhausted_mockup_posts_one_stable_handoff_and_retains_worktree(monkeypatch, tmp_path):
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+    comments = []
+
+    def github(argv):
+        if argv[:3] == ["gh", "issue", "comment"]:
+            comments.append({"body": argv[argv.index("--body") + 1]})
+            return SimpleNamespace(returncode=0, stdout="")
+        if argv[:3] == ["gh", "issue", "edit"]:
+            labels.add("agentflow:needs-mockup")
+            labels.discard("agentflow:drawing-mockup")
+            return SimpleNamespace(returncode=0, stdout="")
+        if argv[:3] == ["gh", "issue", "view"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "labels": [{"name": label} for label in labels], "comments": comments,
+                "url": "https://github.com/o/r/issues/11",
+            }))
+        raise AssertionError(argv)
+
+    notifications = []
+    monkeypatch.setattr("agentflow.loop._run", github)
+    monkeypatch.setattr("agentflow.notify.notify",
+                        lambda *args, **kwargs: notifications.append((args, kwargs)) or True)
+    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
+                 repo="o/r", subject="11", lineage="claude", source=str(wt),
+                 hold_reason="continuation budget exhausted")
+
+    first = coordinated_build._hold_mockup(rec)
+    second = coordinated_build._hold_mockup(rec)
+    assert first == second == "https://github.com/o/r/issues/11"
+    assert len(comments) == 1 and "agentflow-mockup-hold" in comments[0]["body"]
+    assert labels == {"agentflow:needs-mockup"} and wt.exists()
+    assert len(notifications) == 2
+    assert notifications[0][1]["sequence_id"] == notifications[1][1]["sequence_id"]
+
+
+def test_missing_context_comment_is_the_handoff_and_never_gets_a_second_comment(
+        monkeypatch, tmp_path):
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+    comments = [{"body": (
+        "> *agentflow intake: mockup variants — generated by AI.*\n\n"
+        "MISSING-CONTEXT: no runnable surface") }]
+
+    def github(argv):
+        if argv[:3] == ["gh", "issue", "comment"]:
+            raise AssertionError("MISSING-CONTEXT already is the durable handoff")
+        if argv[:3] == ["gh", "issue", "edit"]:
+            labels.discard("agentflow:drawing-mockup")
+            return SimpleNamespace(returncode=0, stdout="")
+        if argv[:3] == ["gh", "issue", "view"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "labels": [{"name": label} for label in labels], "comments": comments,
+                "url": "https://github.com/o/r/issues/11",
+            }))
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("agentflow.loop._run", github)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
+                 repo="o/r", subject="11", lineage="claude", source=str(wt))
+
+    assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert len(comments) == 1 and wt.exists()
+
+
+def test_partial_marked_comment_is_edited_into_the_exhaustion_handoff(monkeypatch, tmp_path):
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+    comments = [{"id": "IC_partial", "body": (
+        "> *agentflow intake: mockup variants — generated by AI.*\n\n"
+        "Only variant A was finished.")}]
+
+    def github(argv):
+        if argv[:3] == ["gh", "issue", "comment"]:
+            raise AssertionError("the one existing variant-round comment must be edited")
+        if argv[:3] == ["gh", "api", "graphql"]:
+            body_arg = next(arg for arg in argv if arg.startswith("body="))
+            comments[0]["body"] = body_arg.removeprefix("body=")
+            return SimpleNamespace(returncode=0, stdout="{}")
+        if argv[:3] == ["gh", "issue", "edit"]:
+            labels.discard("agentflow:drawing-mockup")
+            return SimpleNamespace(returncode=0, stdout="")
+        if argv[:3] == ["gh", "issue", "view"]:
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                "labels": [{"name": label} for label in labels], "comments": comments,
+                "url": "https://github.com/o/r/issues/11",
+            }))
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("agentflow.loop._run", github)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
+                 repo="o/r", subject="11", lineage="claude", source=str(wt))
+
+    assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert len(comments) == 1
+    assert "agentflow-mockup-hold" in comments[0]["body"]
+    assert "continuation budget" in comments[0]["body"] and wt.exists()

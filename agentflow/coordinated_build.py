@@ -1,18 +1,16 @@
-"""Intake, Build, Review, and Revise behind the session coordinator, wired into dispatch
-(issues #103–#106).
+"""All six logical stages behind the session coordinator, wired into dispatch
+(issues #103–#108).
 
 This is the seam that turns the rollout phase into action. In **legacy** phase the daemon's
 existing build path is untouched; in **draining** phase no new provider stage of any kind
 launches, but the coordinator keeps reconciling the records that still own work; in
-**coordinated** phase a ready issue becomes exactly one Build submission, a completed Build opens
-exactly one Review bound to the PR head SHA, a blocking Review opens exactly one Revise on the
-builder's retained branch, and a completed Revise opens exactly one new Review bound to the new
-head SHA — each transferring the change claim before the prior record retires, so there is no
-ownership gap. The coordinator owns their continuation, admission, and completion, and the live
-board becomes a projection of its running records.
+**coordinated** phase every provider stage enters one durable submission. Build, Review, and Revise
+transfer one change claim through their convergence loop; Intake, Mockup, and Respond each own
+their stage-native boundary and claim. The coordinator owns their continuation, admission, and
+completion, and the live board becomes a projection of its running records.
 
-The pure parts — mapping a ready issue to a Build submission, a completed Build to a Review, a
-blocking Review to a Revise, and a completed Revise back to a Review; the ``MAX_REVISES``-capped
+The pure parts — mapping stage inputs to submissions, the Build/Review/Revise transfers, the
+``MAX_REVISES``-capped
 auto-revise product policy (ADR 0004) that continuation attempts never expand; deriving the phase
 without disturbing a never-created store; spotting the current-format sessions a drain must wait
 on; and projecting running records — are exercised directly. The production factory wires the
@@ -30,7 +28,8 @@ import subprocess
 import time
 from pathlib import Path
 
-from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter, MODE_COORDINATED, Phase,
+from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter,
+                                   MockupStageAdapter, MODE_COORDINATED, Phase,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter, Rollout,
                                    StageRouter, tracer)
 from agentflow.coordinator.rollout import COORDINATED, DRAINING, LEGACY
@@ -65,6 +64,30 @@ def build_submission(cfg, issue: dict, tool: str):
         repo=cfg.repo, subject=str(n), stage="build", pool=tool,
         complexity=complexity.value, effort=effort_from_labels(labels).value,
         source=_builder_worktree(cfg, tool, n, sl), claim=True, input_ptr=brief)
+
+
+def mockup_submission(cfg, issue: dict, tool: str):
+    """Translate one eligible held issue into its single durable Mockup variant round.
+
+    The stable identity is ``(repo, issue, mockup)``: repeated discovery returns the same record,
+    while the pinned pool and owned branch/worktree preserve tool lineage and local progress across
+    fresh-session continuations. The durable prompt reconstructs the exact same visual-design job.
+    """
+    from agentflow.coordinator import Submission
+    from agentflow.loop import (PRODUCE_PROMPT, _MOCKUP_DISCLAIMER, _surfaces_phrase,
+                                slug, ui_surfaces)
+
+    n = int(issue["number"])
+    sl = slug(issue.get("title", ""))
+    branch = f"agentflow/{tool}/mockup-{n}-{sl}"
+    source = f"{cfg.workdir}/.agentflow/worktrees/{tool}/mockup-{n}-{sl}"
+    prompt = PRODUCE_PROMPT.format(
+        repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
+        branch=branch, surfaces=_surfaces_phrase(ui_surfaces(cfg.workdir)),
+        disclaimer=_MOCKUP_DISCLAIMER)
+    return Submission(
+        repo=cfg.repo, subject=str(n), stage="mockup", pool=tool, complexity="deep",
+        source=source, claim=True, input_ptr=prompt, builder_lineage=tool)
 
 
 def _build_source_parts(record):
@@ -223,18 +246,19 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
     claim, active PID marker, or registered/unregistered worktree. Coordinator-owned sources
     and claims are excluded; everything else is named rather than cleared or guessed at.
     """
-    from agentflow.loop import BUILDING, TRIAGING, _run
+    from agentflow.loop import BUILDING, DRAWING, TRIAGING, _run
     from agentflow.runner import _active_marker, _registered_worktrees
 
     sources = {os.path.realpath(r.source) for r in records if r.source and not r.retired}
     evidence = list(legacy_evidence(live_sessions, sources))
     # Ownership is resolved per claim type: an Intake record owns only its issue's `triaging`
-    # claim, a Build/Review/Revise record only its issue's `building` claim. Keying the exclusion
-    # per lane stops one type's live record from hiding the other type's stale legacy claim.
+    # claim, code-change records only their issue's `building` claim, and Mockup only its drawing
+    # claim. Keying the exclusion per lane stops one live record from hiding another stale claim.
     owned_by_lane = {(cfg.repo, lane): tracer.owned_issues(records, cfg.repo, lane=lane)
-                     for cfg in repos for lane in ("building", "triaging")}
+                     for cfg in repos for lane in ("building", "triaging", "drawing")}
     for cfg in repos:
-        for claim_label, lane in ((BUILDING, "building"), (TRIAGING, "triaging")):
+        for claim_label, lane in ((BUILDING, "building"), (TRIAGING, "triaging"),
+                                  (DRAWING, "drawing")):
             claims = _run(["gh", "api", "--paginate", "--slurp", "-X", "GET",
                            f"repos/{cfg.repo}/issues", "-f", "state=open",
                            "-f", f"labels={claim_label}", "-f", "per_page=100"])
@@ -267,11 +291,13 @@ def activation_evidence(repos, live_sessions, records) -> tuple[str, ...]:
             except (OSError, ValueError):
                 continue
             if (len(rel.parts) >= 2 and rel.parts[0] in LEGACY_SESSION_POOLS
-                    and rel.parts[1].startswith("issue-")):
+                    and rel.parts[1].startswith(("issue-", "mockup-"))):
                 candidates[os.path.realpath(path)] = path
         for tool in LEGACY_SESSION_POOLS:
-            for path in (root / tool).glob("issue-*") if (root / tool).exists() else ():
-                candidates.setdefault(os.path.realpath(path), path)
+            if (root / tool).exists():
+                for pattern in ("issue-*", "mockup-*"):
+                    for path in (root / tool).glob(pattern):
+                        candidates.setdefault(os.path.realpath(path), path)
 
         for real, path in sorted(candidates.items()):
             if real in sources:
@@ -315,9 +341,9 @@ def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
     """The issues in ``cfg.repo`` a coordinator record still owns — the set legacy claim
     reclamation must never strip (ADR 0028). Empty (and side-effect free) when no store exists.
 
-    ``lane`` scopes ownership to one claim type: ``"building"`` (Build/Review/Revise) or
-    ``"triaging"`` (Intake). The build and triage reclamation passes each pass their own lane so
-    one claim type's live record never shields the other type's stale claim (issue #106)."""
+    ``lane`` scopes ownership to one claim type: ``"building"`` (Build/Review/Revise/Respond),
+    ``"triaging"`` (Intake), or ``"drawing"`` (Mockup). Each reclamation pass supplies its lane
+    so one claim type's live record never shields another type's stale claim."""
     path = Path(store_path or default_store_path())
     if not path.exists():
         return set()
@@ -339,13 +365,14 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's coordinator for Intake, Build, Review, Revise, and Respond (issues #103–#107).
+    """The daemon's coordinator for all six logical stages (issues #103–#108).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
     adapter verifies a durable verdict for the exact PR head SHA and recreates the read-only
     checkout; its Revise adapter verifies a pushed revision on the same branch and reuses that
     retained worktree; its Respond adapter verifies the marked reply plus any pushed change on that
-    same branch and releases the change claim on completion; and its admission gate keeps Mockup
-    queued. One :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    same branch and releases the change claim on completion; its Mockup adapter verifies one
+    pushed visual round and releases its drawing claim at the human-pick boundary. One
+    :class:`StageRouter` dispatches each adapter call on the record's stage."""
     from agentflow import coordinated_intake
     intake = IntakeStageAdapter(
         worktree_reset=coordinated_intake.reset_worktree,
@@ -362,8 +389,15 @@ def build_coordinator(_log=None) -> Coordinator:
     respond = RespondStageAdapter(
         reply_ready=_reply_ready, worktree_ready=_worktree_ready, handoff=_park_respond,
         settle=_settle_respond)
+    mockup = MockupStageAdapter(
+        outcome_ready=_mockup_outcome_ready,
+        worktree_ready=lambda record: (_mockup_claim_ready(record)
+                                       and _worktree_ready(record)),
+        missing_context=_mockup_missing_context,
+        handoff=_hold_mockup,
+        settle=_settle_mockup)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
-                          "respond": respond})
+                          "respond": respond, "mockup": mockup})
     return Coordinator(adapter=router, gate=_production_gate(),
                        log=_log or (lambda _line: None))
 
@@ -394,7 +428,7 @@ class _ProductionGate:
         """The global limits the store enforces with the running-row reservation."""
         from agentflow import dispatch
         lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build",
-                "respond": "respond"}
+                "respond": "respond", "mockup": "mockup"}
         stage_lane = lane.get(record.stage, record.stage)
         return ReservationLimits(
             machine_ceiling=dispatch.MACHINE_CEILING,
@@ -437,7 +471,12 @@ def _source_facts(record):
     if not record.source or "/.agentflow/worktrees/" not in record.source:
         return None
     workdir, tail = record.source.split("/.agentflow/worktrees/", 1)
-    if not tail.startswith(f"{record.pool}/issue-") or record.lineage != record.pool:
+    if not tail.startswith(f"{record.pool}/") or record.lineage != record.pool:
+        return None
+    name = tail.split("/", 1)[1] if "/" in tail else ""
+    valid_name = (name.startswith(f"mockup-{record.subject}-")
+                  if record.stage == "mockup" else name.startswith("issue-"))
+    if not valid_name:
         return None
     return workdir, f"agentflow/{tail}", Path(record.source)
 
@@ -479,7 +518,7 @@ def _worktree_ready(record) -> bool:
                        f"refs/remotes/origin/{branch}"]).returncode == 0
         if remote:
             add += ["-b", branch, str(wt), f"origin/{branch}"]
-        elif record.stage == "build":
+        elif record.stage in {"build", "mockup"}:
             add += ["-b", branch, str(wt), "origin/main"]
         else:
             return False
@@ -490,6 +529,204 @@ def _worktree_ready(record) -> bool:
     except subprocess.CalledProcessError:
         return False
     return True
+
+
+def _mockup_outcome_ready(record, obs) -> bool:
+    """Prove one pushed variant round: committed artifacts/screenshots and one marked comment.
+
+    The worktree is continuation state, never outcome authority. Completion requires its clean
+    head to equal the remote branch, at least three branch-only HTML variants and screenshots,
+    and exactly one durable issue comment that embeds every committed screenshot. A
+    MISSING-CONTEXT comment is a human hold, not a completed visual round.
+    """
+    from agentflow.loop import MOCKUP_MARK, _issue_comments, _run
+
+    parsed = _source_facts(record)
+    if parsed is None:
+        return False
+    _workdir, branch, wt = parsed
+    if not wt.exists():
+        return False
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return False
+    marked = [comment for comment in _issue_comments(record.repo, number)
+              if MOCKUP_MARK in comment.get("body", "")]
+    if len(marked) != 1 or "MISSING-CONTEXT:" in marked[0].get("body", ""):
+        return False
+    fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", "main", branch])
+    if fetched.returncode != 0:
+        return False
+    local = _run(["git", "-C", str(wt), "rev-parse", "HEAD"])
+    remote = _run(["git", "-C", str(wt), "rev-parse", f"origin/{branch}"])
+    status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
+    if (local.returncode != 0 or remote.returncode != 0 or status.returncode != 0
+            or not local.stdout.strip() or local.stdout.strip() != remote.stdout.strip()
+            or status.stdout.strip()):
+        return False
+    changed = _run(["git", "-C", str(wt), "diff", "--name-only", "--diff-filter=ACMRT",
+                    "origin/main...HEAD"])
+    if changed.returncode != 0:
+        return False
+    paths = [path for path in changed.stdout.splitlines() if path.startswith("mockups/")]
+    variants = [path for path in paths if path.lower().endswith((".html", ".htm"))]
+    screenshots = [path for path in paths
+                   if path.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))]
+    body = marked[0].get("body", "")
+    return (len(variants) >= 3 and len(screenshots) >= 3
+            and all(path in body for path in screenshots))
+
+
+def _mockup_missing_context(record) -> bool:
+    """Whether this issue carries Mockup's deliberate durable MISSING-CONTEXT boundary."""
+    from agentflow.loop import MOCKUP_MARK, _issue_comments
+
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return False
+    return any(MOCKUP_MARK in comment.get("body", "")
+               and "MISSING-CONTEXT:" in comment.get("body", "")
+               for comment in _issue_comments(record.repo, number))
+
+
+def _mockup_claim_ready(record) -> bool:
+    """Prove Mockup's visible drawing claim immediately before admission."""
+    from agentflow.loop import DRAWING, _run
+
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return False
+    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
+                   "--json", "labels"])
+    if viewed.returncode != 0:
+        return False
+    try:
+        labels = {label.get("name") for label in json.loads(viewed.stdout or "{}").get("labels", [])}
+    except json.JSONDecodeError:
+        return False
+    return DRAWING in labels and "agentflow:needs-mockup" in labels
+
+
+def _settle_mockup(record) -> str | None:
+    """Retire one completed visual round at the human-pick boundary.
+
+    The durable comment and pushed artifacts were already verified by the adapter. Settlement
+    removes and proves the drawing claim, keeps ``needs-mockup`` in place for the maintainer's
+    choice, and disposes the clean pushed worktree before coordinator ownership disappears.
+    Every step is idempotent; an unreadable label or stubborn worktree retries next cycle.
+    """
+    from agentflow.loop import DRAWING, _run
+    from agentflow.runner import remove_worktree_if_safe
+
+    parsed = _source_facts(record)
+    if parsed is None:
+        return None
+    workdir, _branch, wt = parsed
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return None
+    _run(["gh", "issue", "edit", str(number), "--repo", record.repo,
+          "--remove-label", DRAWING])
+    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
+                   "--json", "labels,url"])
+    if proved.returncode != 0:
+        return None
+    try:
+        state = json.loads(proved.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    labels = {label.get("name") for label in state.get("labels", [])}
+    if DRAWING in labels or "agentflow:needs-mockup" not in labels:
+        return None
+    if wt.exists() and not remove_worktree_if_safe(workdir, wt):
+        return None
+    if wt.exists():
+        return None
+    return state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
+
+
+def _hold_mockup(record) -> str | None:
+    """Create Mockup's one issue-native handoff while preserving unfinished local work.
+
+    MISSING-CONTEXT already is the durable stage-native handoff; exhaustion posts one stable
+    marked comment. Both leave ``needs-mockup`` in place, release and prove the drawing claim,
+    retain the worktree, and use a stable notification sequence across crash retries.
+    """
+    from agentflow.loop import DRAWING, MOCKUP_MARK, _MOCKUP_DISCLAIMER, _run
+    from agentflow.notify import notify
+
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return None
+    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
+                   "--json", "labels,comments,url"])
+    if viewed.returncode != 0:
+        return None
+    try:
+        issue = json.loads(viewed.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    comments = issue.get("comments", [])
+    marked = next((comment for comment in comments
+                   if MOCKUP_MARK in comment.get("body", "")), None)
+    missing = next((comment for comment in comments
+                    if MOCKUP_MARK in comment.get("body", "")
+                    and "MISSING-CONTEXT:" in comment.get("body", "")), None)
+    proof = "<!-- agentflow-mockup-hold:" + hashlib.sha256(
+        record.identity.encode()).hexdigest()[:24] + " -->"
+    explanation = ("Mockup exhausted its continuation budget before completing the visual round. "
+                   "The branch and local worktree are retained for a human to continue.")
+    existing = marked or next((comment for comment in comments
+                               if proof in comment.get("body", "")), None)
+    if existing is None:
+        body = f"{_MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}"
+        posted = _run(["gh", "issue", "comment", str(number), "--repo", record.repo,
+                       "--body", body])
+        if posted.returncode != 0:
+            return None
+    elif missing is None and proof not in existing.get("body", ""):
+        comment_id = existing.get("id")
+        if not comment_id:
+            return None
+        body = f"{existing.get('body', '').rstrip()}\n\n{proof}\n\n{explanation}"
+        mutation = ("mutation($id:ID!,$body:String!){updateIssueComment("
+                    "input:{id:$id,body:$body}){issueComment{id}}}")
+        edited = _run(["gh", "api", "graphql", "-f", f"query={mutation}",
+                       "-f", f"id={comment_id}", "-f", f"body={body}"])
+        if edited.returncode != 0:
+            return None
+    _run(["gh", "issue", "edit", str(number), "--repo", record.repo,
+          "--add-label", "agentflow:needs-mockup", "--remove-label", DRAWING])
+    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
+                   "--json", "labels,comments,url"])
+    if proved.returncode != 0:
+        return None
+    try:
+        state = json.loads(proved.stdout or "{}")
+    except json.JSONDecodeError:
+        return None
+    labels = {label.get("name") for label in state.get("labels", [])}
+    final_comments = state.get("comments", [])
+    has_proof = any(
+        proof in comment.get("body", "")
+        or (MOCKUP_MARK in comment.get("body", "")
+            and "MISSING-CONTEXT:" in comment.get("body", ""))
+        for comment in final_comments)
+    if DRAWING in labels or "agentflow:needs-mockup" not in labels or not has_proof:
+        return None
+    url = state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
+    sequence = "mockup-" + hashlib.sha256(record.identity.encode()).hexdigest()[:24]
+    reason = ("missing context" if missing is not None
+              else "continuation budget exhausted")
+    if not notify("agentflow needs you", f"{record.repo} #{number}: Mockup held — {reason}",
+                  url, sequence_id=sequence):
+        return None
+    return str(url)
 
 
 def _hold_build(record) -> str | None:

@@ -724,8 +724,9 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
             seen.add(issue["number"])
             deduped.append(issue)
     for issue in deduped:
-        if TRIAGING in {lbl["name"] for lbl in issue["labels"]}:
-            continue   # a re-intake already owns this held issue
+        claims = {lbl["name"] for lbl in issue["labels"]}
+        if TRIAGING in claims or DRAWING in claims:
+            continue   # Intake or the current Mockup round already owns this held issue
         cr = _run(["gh", "issue", "view", str(issue["number"]), "--repo", cfg.repo, "--json", "comments"])
         if cr.returncode != 0:
             continue
@@ -936,6 +937,12 @@ You are on branch `{branch}` in this worktree. PRESERVE the work so it is not lo
 worktree: commit every variant's HTML (and any forked render/screenshot files) AND the
 screenshots to this branch, then `git push -u origin {branch}`.
 
+This may be a continuation after an interrupted session. Before changing anything, inspect the
+branch, worktree, and issue comments. Reuse committed or local variants and finish only missing
+artifacts; never create a second variant round or duplicate already-pushed work. If the marked
+issue comment already exists, NEVER post another: finish and push any missing work, then edit that
+existing comment in place if its links or descriptions need correction.
+
 Then post EXACTLY ONE comment on the ISSUE (`gh issue comment {n}`), and nothing else — do not
 edit the issue title, body, or labels; do not open a PR. The comment MUST:
 - START with this exact line, verbatim (it marks the comment as ours so the daemon never mistakes
@@ -954,20 +961,41 @@ variants (no runnable surface, missing grounding), post one comment starting wit
 and prefixed `MISSING-CONTEXT:`, then stop."""
 
 
-def _claim_mockup(repo: str, n: int) -> None:
+def _claim_mockup(repo: str, n: int) -> bool:
     """Claim issue n for the produce phase *before* its long drawing session, so a concurrent or
     next-cycle pass skips it (no double-draw). Symmetric to `_claim_triage`; ensures the label
     first. A crash before release strands the claim — fail-safe (skipped, never double-drawn),
     cleared by hand, since the session opens no PR to check liveness against."""
-    _run(["gh", "label", "create", DRAWING, "--repo", repo, "--color", "fef2c0",
-          "--description", "A session is drawing mockup variants for this issue", "--force"])
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", DRAWING])
+    created = _run(["gh", "label", "create", DRAWING, "--repo", repo, "--color", "fef2c0",
+                    "--description", "A session is drawing mockup variants for this issue",
+                    "--force"])
+    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", DRAWING])
+    return created.returncode == 0 and claimed.returncode == 0
 
 
 def _release_mockup(repo: str, n: int) -> None:
     """Drop the drawing claim once the variant round is posted (the mockup comment dedups from
     here via MOCKUP_MARK) or the session ended."""
     _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", DRAWING])
+
+
+def reclaim_mockup_claims(cfg: RepoConfig, coordinator_owned: set[int] = frozenset()) -> int:
+    """Drop orphaned drawing claims without stealing a live or coordinated Mockup.
+
+    Mockup opens no PR, so the only safe liveness facts are the live-session board and the
+    durable continuation store supplied by the daemon. An unreadable GitHub listing clears
+    nothing; an unreadable continuation store prevents the daemon from calling this function.
+    """
+    listed = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+                   "--label", DRAWING, "--json", "number", "--limit", "100"])
+    if listed.returncode != 0:
+        return 0
+    live_now = _issues_with_live_session(cfg.repo)
+    stale = [issue["number"] for issue in json.loads(listed.stdout or "[]")
+             if issue["number"] not in live_now and issue["number"] not in coordinator_owned]
+    for number in stale:
+        _release_mockup(cfg.repo, number)
+    return len(stale)
 
 
 def _has_mockup_variants(comments: list[dict]) -> bool:

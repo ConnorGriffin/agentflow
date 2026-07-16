@@ -8,13 +8,14 @@ directory, the
 admission matrix and its gates, attempt numbers, the launcher handshake, the continuation
 record, and provider observations — is a private implementation detail.
 
-Intake, Build, Review, Revise, and Respond are the live stages behind this seam (issues
-#103–#107): the durable :class:`Rollout` switch and the :mod:`~agentflow.coordinator.tracer` bridge
-move them there after a legacy drain, while every other logical stage stays queued and dormant.
+All six logical stages are live behind this seam (issues #103–#108): the durable
+:class:`Rollout` switch and the :mod:`~agentflow.coordinator.tracer` bridge move them there after
+a legacy drain, while unknown future stages stay queued and dormant.
 """
 
 from agentflow.coordinator.build_stage import BuildStageAdapter
 from agentflow.coordinator.intake_stage import IntakeStageAdapter
+from agentflow.coordinator.mockup_stage import MockupStageAdapter
 from agentflow.coordinator.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.respond_stage import RespondStageAdapter
 from agentflow.coordinator.review_stage import ReviewStageAdapter
@@ -24,7 +25,8 @@ from agentflow.coordinator.rollout import (COORDINATED, DRAINING, LEGACY,
 from agentflow.coordinator.stage_router import StageRouter
 
 __all__ = [
-    "Coordinator", "StageOutcome", "Submission", "BuildStageAdapter", "IntakeStageAdapter", "ReviewStageAdapter",
+    "Coordinator", "StageOutcome", "Submission", "BuildStageAdapter", "IntakeStageAdapter",
+    "MockupStageAdapter", "ReviewStageAdapter",
     "ReviseStageAdapter", "RespondStageAdapter", "StageRouter", "Rollout", "Phase",
     "LEGACY", "DRAINING", "COORDINATED", "MODE_LEGACY", "MODE_COORDINATED",
 ]
