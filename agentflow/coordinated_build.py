@@ -404,6 +404,12 @@ class _ProductionGate:
         from agentflow import balancer
         if not tracer.build_review_revise_gate(record):
             return False
+        # An interactive turn (an operator-present Ask) is a real-time conversation: it is exempt
+        # from the recent-session cooldown, the spend ceiling, and the active-pacing budget (ADR
+        # 0034/0025 as amended by #162). Only the reservation ledger in `_begin_start` — true zero
+        # capacity — may still defer it. Background stages keep the full clear + pacing gate.
+        if record.interactive:
+            return True
         try:
             status = balancer._query_pool(record.pool)
         except Exception:
@@ -428,7 +434,11 @@ class _ProductionGate:
         )
 
     def started(self, record) -> None:
-        """Charge operator pacing only after the provider start is durable."""
+        """Charge operator pacing only after the provider start is durable. An interactive turn
+        never consumes the background pace budget — even when a background record already marked
+        the pool active this cycle, its start is exempt from pacing (ADR 0034/0025 as amended)."""
+        if record.interactive:
+            return
         if self._active.get(record.pool, False):
             self._paced[record.pool] += 1
 

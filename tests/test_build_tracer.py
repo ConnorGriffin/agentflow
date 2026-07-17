@@ -50,6 +50,95 @@ def test_operator_pacing_is_charged_only_after_a_confirmed_start(make_coord, mon
     assert launcher.calls == 2  # miss is free, one confirmed start spends active pacing
 
 
+def _converse(subject="c1", *, pool="claude", source="/wt/ask"):
+    """An operator-present Ask turn — interactive, so admission is real-time (issue #161)."""
+    return Submission(repo="o/r", subject=subject, stage="converse", target="1", pool=pool,
+                      complexity="deep", source=source, interactive=True)
+
+
+def test_interactive_turn_admits_under_a_not_clear_pool(make_coord, monkeypatch):
+    # An operator-present Ask turn is a real-time conversation: it launches on the next cycle even
+    # when the pool is not clear (here the recent-session cooldown at 47% of an 85% ceiling —
+    # nowhere near a real limit), because a permit is freely available (issue #161). Background
+    # work on the same pool stays deferred by the not-clear pool. Fails against pre-#161 code,
+    # where the interactive turn was gated exactly like background and sat waiting.
+    from agentflow.balancer import PoolStatus
+    gate = coordinated_build._production_gate()
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(
+        "agentflow.balancer._query_pool",
+        lambda tool: PoolStatus(tool, False, 47.0, reason="a session was active in the last 10m"))
+    fake = FakeSession()
+    coord = make_coord(fake, gate=gate)
+    ask = coord.submit_stage(_converse())
+    background = coord.submit_stage(_build())
+
+    coord.cycle("claude")
+
+    assert record_of(coord, ask).state == "running"        # launched despite the not-clear pool
+    assert record_of(coord, background).state == "waiting"  # background still deferred
+
+
+def test_interactive_turn_defers_only_when_no_permit_fits(make_coord, monkeypatch):
+    # True zero capacity — no permit obtainable on the reservation ledger — is the ONLY thing that
+    # may still defer an interactive turn (issue #161). A background build claims all five of the
+    # pool's permits; the Ask turn then cannot reserve its demand and stays waiting.
+    from agentflow.balancer import PoolStatus
+    gate = coordinated_build._production_gate()
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool: PoolStatus(tool, True, 10.0))
+    fake = FakeSession()
+    coord = make_coord(fake, gate=gate)
+    background = coord.submit_stage(_build())  # demand 5 — the whole pool
+    coord.cycle("claude")
+    assert record_of(coord, background).state == "running" and permits(coord, "claude") == 5
+
+    ask = coord.submit_stage(_converse())
+    coord.cycle("claude")
+    assert record_of(coord, ask).state == "waiting"  # no permit fits — the sole admissible block
+
+
+def test_interactive_start_leaves_the_background_pace_slot_intact(monkeypatch):
+    # An interactive start must not consume the background active-pacing budget, even on a pool a
+    # background record already marked active this cycle (issue #161). With ACTIVE_PACE == 1, an
+    # Ask turn admits and charges nothing, so the pool's single background pace slot survives for a
+    # background start — which then spends it, deferring the next background record.
+    from agentflow.balancer import PoolStatus
+    from agentflow.coordinator.record import Record
+    gate = coordinated_build._production_gate()
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool: PoolStatus(tool, True, 10.0, active=True))
+    ask = Record(identity="ask", stage="converse", pool="claude", demand=2, repo="o/r",
+                 subject="c1", interactive=True)
+    background_a = Record(identity="a", stage="build", pool="claude", demand=5, repo="o/r",
+                          subject="7")
+    background_b = Record(identity="b", stage="build", pool="claude", demand=5, repo="o/r",
+                          subject="8")
+
+    assert gate(ask) is True
+    gate.started(ask)                       # interactive — charges no pace budget
+    assert gate(background_a) is True       # the one background pace slot is still open
+    gate.started(background_a)              # background start spends it
+    assert gate(background_b) is False      # now paced out for the cycle
+
+
+def test_interactive_flag_never_admits_a_disabled_stage(monkeypatch):
+    # Stage enablement still holds: an unknown stage marked interactive is refused by the stage
+    # gate, before the interactive carve-out is ever consulted (issue #161). _query_pool would
+    # raise if reached, proving the refusal short-circuits on stage enablement.
+    from agentflow.coordinator.record import Record
+    gate = coordinated_build._production_gate()
+
+    def _boom(tool):
+        raise AssertionError("stage gate must refuse before the pool is queried")
+
+    monkeypatch.setattr("agentflow.balancer._query_pool", _boom)
+    unknown = Record(identity="x", stage="frobnicate", pool="claude", demand=1, repo="o/r",
+                     subject="9", interactive=True)
+    assert gate(unknown) is False
+
+
 def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
     return Submission(repo="o/r", subject=subject, stage="build", pool=pool,
                       complexity="deep", effort=effort, source=source)
