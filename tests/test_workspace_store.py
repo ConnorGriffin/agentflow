@@ -130,7 +130,11 @@ def test_completing_a_parked_turn_lets_the_conversation_resume(store):
     # A continuation that finally produces the reply completes the same turn (a park is not final).
     out = store.complete_turn(cid, 0, "resolved reply", now=3)
     assert out.accepted
-    turn = store.conversation(cid).turns[0]
+    convo = store.conversation(cid)
+    # The aggregate resumes too: adopting the reply clears the park, so the projection no longer
+    # reports the conversation as parked (not just the turn).
+    assert convo.state == "active"
+    turn = convo.turns[0]
     assert turn.state == REPLIED and turn.reply == "resolved reply"
 
 

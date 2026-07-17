@@ -130,7 +130,7 @@ def _park_ask(record) -> str | None:
 # --- submission mapping (pure) ----------------------------------------------------------
 
 def converse_submission(repo: str, workdir: str, conversation_id: str, ordinal: int,
-                        prompt: str, *, pool: str = "claude", skill: str = "grilling"):
+                        prompt: str, *, pool: str = "claude"):
     """One operator message → one ``converse`` stage submission. The stable identity is
     ``(repo, conversation_id, converse, ordinal)`` so re-submitting the same turn is idempotent.
     Marked interactive: an operator is present and waiting, so this turn outranks background

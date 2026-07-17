@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agentflow.workspace.store import PAUSED, REPLIED, WORKING
+from agentflow.workspace.store import PAUSED, WORKING
 
 
 def _iso(epoch: int) -> str | None:
@@ -100,8 +100,3 @@ def workspace_projection(projects: list[dict], *, read_model_at: int, revision: 
             for p in projects
         ],
     }
-
-
-# Re-exported for callers that only classify turn liveness.
-IN_CONVERSATION = (WORKING,)
-REPLIED_STATE = REPLIED

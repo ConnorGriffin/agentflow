@@ -224,14 +224,14 @@ class WorkspaceStore:
                 conversation_id, prompt, expected_revision, skill, priority, now), idempotency_key)
 
     def complete_turn(self, conversation_id: str, ordinal: int, reply: str, *,
-                      skill: str | None = None, now: int = 0) -> CommandOutcome:
+                      now: int = 0) -> CommandOutcome:
         """Append the session's reply to a working turn — the single place the workspace adopts an
         accepted turn (ADR 0034). Idempotent per ``(conversation_id, ordinal)``: once a turn is
         replied, a second completion is a no-op that returns the existing reply, so one
         ``(repository, Conversation ID, turn ordinal)`` can never carry two replies."""
         with self._lock:
             return self._commit(lambda: self._complete_turn(
-                conversation_id, ordinal, reply, skill, now), None)
+                conversation_id, ordinal, reply, now), None)
 
     def park_turn(self, conversation_id: str, ordinal: int, *, reason: str,
                   now: int = 0) -> CommandOutcome:
@@ -334,7 +334,7 @@ class WorkspaceStore:
             (new_revision, now, conversation_id))
         return CommandOutcome(ACCEPTED, conversation_id, ordinal, new_revision)
 
-    def _complete_turn(self, conversation_id, ordinal, reply, skill, now) -> CommandOutcome:
+    def _complete_turn(self, conversation_id, ordinal, reply, now) -> CommandOutcome:
         row = self._conn.execute(
             "SELECT t.state FROM turns t WHERE t.conversation_id = ? AND t.ordinal = ?",
             (conversation_id, ordinal)).fetchone()
@@ -346,14 +346,13 @@ class WorkspaceStore:
             rev = self._conn.execute(
                 "SELECT revision FROM conversations WHERE id = ?", (conversation_id,)).fetchone()[0]
             return CommandOutcome(ACCEPTED, conversation_id, ordinal, rev)
-        sets = "state = 'replied', reply = ?, replied_at = ?, park_reason = NULL"
-        params: list = [reply, now]
-        if skill is not None:
-            sets += ", skill = ?"
-            params.append(skill)
-        params.extend([conversation_id, ordinal])
         self._conn.execute(
-            f"UPDATE turns SET {sets} WHERE conversation_id = ? AND ordinal = ?", params)
+            "UPDATE turns SET state = 'replied', reply = ?, replied_at = ?, park_reason = NULL"
+            " WHERE conversation_id = ? AND ordinal = ?", (reply, now, conversation_id, ordinal))
+        # Restore the aggregate: adopting the reply ends any park, so a resumed conversation is no
+        # longer reported as parked (the projection reads conversations.state). No-op if active.
+        self._conn.execute(
+            "UPDATE conversations SET state = 'active' WHERE id = ?", (conversation_id,))
         new_revision = self._bump(conversation_id, now)
         return CommandOutcome(ACCEPTED, conversation_id, ordinal, new_revision)
 
