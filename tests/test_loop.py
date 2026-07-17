@@ -11,7 +11,7 @@ from agentflow.gate import respond_reply_disclaimer
 from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body
 from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
                             REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
-                            _free_to_dispatch, _issues_in_flight,
+                            _free_to_dispatch, _issues_in_flight, _native_blockers,
                             _mockup_eligible, _next_mockup_issue,
                             _next_pr_awaiting_reply, _next_ready_issue, _next_resumable_issue,
                             _rebase_survivor, _untriaged, base_advanced, build_issue,
@@ -80,7 +80,8 @@ def test_issue_of_branch_is_none_for_non_agentflow_branches():
     assert issue_of_branch("") is None
 
 
-def test_free_to_dispatch_skips_claimed_or_in_flight():
+def test_free_to_dispatch_skips_claimed_or_in_flight(monkeypatch):
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun("[]"))   # no native edges
     cfg = RepoConfig("o/r", ".")
     ready = {"number": 5, "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
     assert _free_to_dispatch(cfg, ready, set()) is True
@@ -92,7 +93,13 @@ def test_free_to_dispatch_skips_claimed_or_in_flight():
 def test_free_to_dispatch_ignores_blocked_by_in_incidental_prose(monkeypatch):
     issue = {"number": 5, "body": "This may be Blocked by #41 after the next review.",
              "labels": [{"name": "ready-for-agent"}]}
-    monkeypatch.setattr(loop, "_run", lambda cmd: pytest.fail("prose is not a declaration"))
+
+    def fake_run(cmd):
+        if cmd[1] == "api":
+            return _FakeRun("[]")   # no native edges
+        pytest.fail("prose is not a declaration")
+
+    monkeypatch.setattr(loop, "_run", fake_run)
 
     assert _free_to_dispatch(RepoConfig("o/r", "."), issue, set()) is True
 
@@ -160,10 +167,18 @@ def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
     assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 5
 
 
-def _ready_dispatch_run(ready, blocker_states):
+def _ready_dispatch_run(ready, blocker_states, native=None):
+    """Fake `_run` for the dispatch gate. `blocker_states` maps blocker number → state
+    (None ⇒ `gh` failure). `native` maps issue number → the raw `blocked_by` edge array the
+    native endpoint returns (default: an empty array, i.e. no native edges)."""
+    native = native or {}
+
     def fake_run(cmd):
         if cmd[1:3] == ["issue", "list"]:
             return _FakeRun(json.dumps(ready))
+        if cmd[1] == "api" and cmd[2].endswith("/dependencies/blocked_by"):
+            number = int(cmd[2].split("/issues/")[1].split("/")[0])
+            return _FakeRun(json.dumps(native.get(number, [])))
         if cmd[1:3] == ["issue", "view"]:
             state = blocker_states.get(int(cmd[3]))
             if state is None:
@@ -172,6 +187,10 @@ def _ready_dispatch_run(ready, blocker_states):
         raise AssertionError(cmd)
 
     return fake_run
+
+
+def _native_edge(number, state, repo="o/r"):
+    return {"number": number, "state": state, "repository": {"full_name": repo}}
 
 
 def test_next_ready_issue_skips_an_issue_blocked_by_an_open_issue(monkeypatch):
@@ -234,6 +253,8 @@ def test_next_ready_issue_fails_closed_on_malformed_blocker_state(monkeypatch):
     def fake_run(cmd):
         if cmd[1:3] == ["issue", "list"]:
             return _FakeRun(json.dumps(ready))
+        if cmd[1] == "api":
+            return _FakeRun("[]")
         if cmd[1:4] == ["issue", "view", "41"]:
             return _FakeRun("[]")
         raise AssertionError(cmd)
@@ -256,6 +277,113 @@ def test_next_ready_issue_sees_blocker_preserved_by_intake(monkeypatch):
 
     assert "Blocked by #41" in body
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
+
+
+def test_native_blockers_reads_over_the_daemons_real_gh_path(monkeypatch):
+    # Headless-read evidence: drive `_native_blockers` through the daemon's *actual* `_run`
+    # (agentflow.runner._run), not a fake, capturing the argv it hands to gh. Proves the
+    # unattended run context reads native blocked-by via `gh api .../dependencies/blocked_by`.
+    import subprocess as real_subprocess
+
+    from agentflow import runner
+
+    seen = {}
+
+    def fake_subprocess_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        payload = json.dumps([_native_edge(41, "OPEN"), _native_edge(7, "CLOSED", "other/repo")])
+        return real_subprocess.CompletedProcess(cmd, returncode=0, stdout=payload, stderr="")
+
+    monkeypatch.setattr(runner.subprocess, "run", fake_subprocess_run)
+
+    blockers = _native_blockers(RepoConfig("o/r", "."), 42)
+
+    assert seen["cmd"] == ["gh", "api", "repos/o/r/issues/42/dependencies/blocked_by"]
+    assert blockers == {41}   # same-repo edge unioned; cross-repo edge ignored
+
+
+def test_next_ready_issue_holds_on_open_native_blocker(monkeypatch):
+    # A native blocked-by edge with no prose line at all must still hold the issue —
+    # the regression this ticket exists to fix (native edges were invisible before).
+    ready = [{"number": 42, "title": "dependent", "body": "",
+              "labels": [{"name": "ready-for-agent"}]}]
+    native = {42: [_native_edge(41, "OPEN")]}
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}, native))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", ".")) is None
+
+
+def test_next_ready_issue_frees_on_closed_native_blocker(monkeypatch):
+    ready = [{"number": 42, "title": "dependent", "body": "",
+              "labels": [{"name": "ready-for-agent"}]}]
+    native = {42: [_native_edge(41, "CLOSED")]}
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "CLOSED"}, native))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 42
+
+
+def test_next_ready_issue_unions_prose_and_native_blockers(monkeypatch):
+    # Prose blocker #40 is closed; a native blocker #41 is open. Either open source holds.
+    ready = [{"number": 42, "title": "dependent", "body": "Blocked by #40",
+              "labels": [{"name": "ready-for-agent"}]}]
+    native = {42: [_native_edge(41, "OPEN")]}
+    blocker_states = {40: "CLOSED", 41: "OPEN"}
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, blocker_states, native))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    cfg = RepoConfig("o/r", ".")
+
+    assert _next_ready_issue(cfg) is None
+    blocker_states[41] = "CLOSED"
+    assert _next_ready_issue(cfg)["number"] == 42
+
+
+def test_next_ready_issue_fails_closed_when_native_read_fails(monkeypatch):
+    ready = [{"number": 42, "title": "dependent", "body": "",
+              "labels": [{"name": "ready-for-agent"}]}]
+    logs = []
+
+    def fake_run(cmd):
+        if cmd[1:3] == ["issue", "list"]:
+            return _FakeRun(json.dumps(ready))
+        if cmd[1] == "api":
+            return _FakeRun(returncode=1)   # native fetch failed — unknown, not "no blockers"
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append) is None
+    assert any("#42" in message and "could not be determined" in message for message in logs)
+
+
+def test_next_ready_issue_fails_closed_on_malformed_native_response(monkeypatch):
+    ready = [{"number": 42, "title": "dependent", "body": "",
+              "labels": [{"name": "ready-for-agent"}]}]
+
+    def fake_run(cmd):
+        if cmd[1:3] == ["issue", "list"]:
+            return _FakeRun(json.dumps(ready))
+        if cmd[1] == "api":
+            return _FakeRun("not json")
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", ".")) is None
+
+
+def test_next_ready_issue_ignores_cross_repo_native_blocker(monkeypatch):
+    # A native edge pointing at another repo does not by itself hold the issue.
+    ready = [{"number": 42, "title": "dependent", "body": "",
+              "labels": [{"name": "ready-for-agent"}]}]
+    native = {42: [_native_edge(41, "OPEN", repo="other/repo")]}
+    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {}, native))
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+
+    assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 42
 
 
 def test_release_triage_proves_the_claim_is_absent(monkeypatch):
@@ -348,8 +476,13 @@ def test_work_order_helper_is_gone():
 
 
 def _issue_view(monkeypatch, issue):
-    """Point loop._run at a canned `gh issue view` payload for build_issue's fetch."""
-    monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun(json.dumps(issue)))
+    """Point loop._run at a canned `gh issue view` payload for build_issue's fetch, with no
+    native blocked-by edges (the dispatch gate reads those too)."""
+    def fake_run(argv):
+        if argv[1] == "api":
+            return _FakeRun("[]")
+        return _FakeRun(json.dumps(issue))
+    monkeypatch.setattr(loop, "_run", fake_run)
 
 
 def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
@@ -382,6 +515,8 @@ def test_build_issue_refuses_an_open_blocker(monkeypatch):
              "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
 
     def fake_run(cmd):
+        if cmd[1] == "api":
+            return _FakeRun("[]")
         if cmd[1:4] == ["issue", "view", "42"]:
             return _FakeRun(json.dumps(issue))
         if cmd[1:4] == ["issue", "view", "41"]:
