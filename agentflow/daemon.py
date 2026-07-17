@@ -173,6 +173,31 @@ def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _l
             _log(f"{cfg.repo}: startup worktree recovery error: {type(e).__name__}: {e}")
 
 
+def _dead_family_running(_log=log) -> bool:
+    """The fast tick's local-completion wake (issue #158): True when a ``running`` record's
+    provider family is *proven* dead — its pid no longer exists — so its permits are stranded
+    until reconciliation flips it off ``running``. Network-free: it is a local ``os.kill`` sweep
+    of the durable ledger, so it keeps the fast tick's zero-network character (no `gh` call).
+
+    Fail closed on uncertainty. Only a family that ``pid_family_alive`` proves gone counts; an
+    unknown/permission-denied liveness (``pid_family_alive`` returns True) and a record that never
+    recorded a family do not, so we never thrash on a family we cannot prove ended. A store-read
+    error is swallowed like the other daemon cycle guards and reported as 'nothing to wake', never
+    crashing the loop. Reuses the very liveness reconcile and worktree recovery already trust — not
+    a second notion of completion. The wake converges: the full pass it triggers reconciles the
+    dead family off ``running``, so the next tick finds nothing to wake."""
+    from agentflow.coordinator import tracer
+    from agentflow.coordinator.launcher import pid_family_alive
+    from agentflow.coordinator.record import RUNNING
+    try:
+        records = tracer.load_records()
+    except Exception as e:  # noqa: BLE001 — an unreadable ledger must not kill the fast tick
+        _log(f"local-completion check skipped: {type(e).__name__}: {e}")
+        return False
+    return any(r.state == RUNNING and r.family and not pid_family_alive(r.family)
+               for r in records)
+
+
 class PollLoop:
     """The two-clock poll loop (issue #80). Each fast tick asks the change-probe one cheap
     question; a full dispatch pass runs only on change, or when the slow heartbeat clock is due.
@@ -185,12 +210,14 @@ class PollLoop:
     reconciling and the operator sees a fresh snapshot."""
 
     def __init__(self, repos, *, probe=None, dispatch_pass=None, publish=None,
-                 enabled=None, clock=time.monotonic, spawn=None, _log=log) -> None:
+                 enabled=None, local_complete=None, clock=time.monotonic, spawn=None,
+                 _log=log) -> None:
         self._repos = repos
         self._probe = probe if probe is not None else ChangeProbe(repos)
         self._dispatch = dispatch_pass or dispatch_cycle
         self._publish = publish or publish_snapshot
         self._enabled = enabled or ENABLE_FLAG.exists
+        self._local_complete = local_complete or _dead_family_running
         self._clock = clock
         self._spawn = spawn or (lambda fn: threading.Thread(target=fn, daemon=True).start())
         self._log = _log
@@ -219,14 +246,20 @@ class PollLoop:
         self._spawn(work)
 
     def tick(self) -> None:
-        """One fast tick. Enabled: probe (one call) and run a full pass on change or heartbeat.
-        Dormant: never probe; reconcile owned records on the heartbeat without cold submission."""
+        """One fast tick. Enabled: probe (one call) and run a full pass on change, on a locally
+        proven provider completion, or on the heartbeat. Dormant: never probe or sweep for local
+        completion; reconcile owned records on the heartbeat without cold submission."""
         now = self._clock()
         heartbeat_due = self._heartbeat_due(now)
         if self._enabled():
-            # Heartbeat is the unconditional clock; the probe is the opportunistic one — so on a
-            # heartbeat tick we skip the probe call entirely (it would run a full pass anyway).
-            if heartbeat_due or self._probe.changed():
+            # Heartbeat is the unconditional clock; the GitHub probe and the local-completion sweep
+            # are the opportunistic ones — so on a heartbeat tick we skip both (a full pass runs
+            # anyway). The local sweep (issue #158) wakes a full pass when a provider family died
+            # after its last GitHub bump, so stranded permits release within one fast tick instead
+            # of waiting out the heartbeat; it is network-free, mirroring the probe's enabled-only
+            # gating, and the pass it triggers reconciles the dead family off `running` so the next
+            # tick converges back to quiet.
+            if heartbeat_due or self._probe.changed() or self._local_complete():
                 self._last_full = now
                 self._start_full_pass(submit_new=True)
         elif heartbeat_due:
