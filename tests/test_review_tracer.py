@@ -571,7 +571,8 @@ def test_production_reset_ignores_a_leftover_other_tool_checkout_of_the_same_pr(
 def test_a_review_checkout_that_keeps_failing_surfaces_in_the_log(tmp_path):
     """Issue #171: a genuinely stuck review (one whose checkout never succeeds) must become
     visible rather than no-op'ing admission silently every cycle. The first miss can be transient
-    and stays quiet; a repeat logs once."""
+    and stays quiet; a repeat surfaces once, then re-reminds periodically so a long-stuck review
+    keeps a breadcrumb instead of a single line lost to scrollback."""
     repo = _repo_with_origin(tmp_path)
     wt = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-99-x"
     record = SimpleNamespace(repo="o/r", source=str(wt), target="0" * 40, pool="claude")
@@ -582,6 +583,11 @@ def test_a_review_checkout_that_keeps_failing_surfaces_in_the_log(tmp_path):
     assert logs == []  # a single miss can be transient
     assert coordinated_build._review_worktree_reset(record, _log=logs.append) is False
     assert len(logs) == 1 and "o/r" in logs[0]  # the repeat is surfaced
+    for _ in range(9):  # failures 3..11 stay quiet — one breadcrumb, not one per cycle
+        coordinated_build._review_worktree_reset(record, _log=logs.append)
+    assert len(logs) == 1
+    coordinated_build._review_worktree_reset(record, _log=logs.append)  # the 12th re-reminds
+    assert len(logs) == 2
     coordinated_build._REVIEW_PREPARE_FAILURES.pop(record.source, None)
 
 

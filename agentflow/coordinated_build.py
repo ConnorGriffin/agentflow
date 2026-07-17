@@ -801,8 +801,8 @@ def _verdict_ready(record, obs) -> bool:
 
 
 # Consecutive review-prepare failures per source path, so a genuinely stuck
-# review (one that never checks out) surfaces once instead of silently no-op'ing
-# admission every cycle. Process-local — a daemon restart re-arms it.
+# review (one that never checks out) is surfaced periodically instead of silently
+# no-op'ing admission every cycle. Process-local — a daemon restart re-arms it.
 _REVIEW_PREPARE_FAILURES: dict[str, int] = {}
 
 
@@ -831,7 +831,9 @@ def _review_worktree_reset(record, _log=None) -> bool:
     except subprocess.CalledProcessError:
         fails = _REVIEW_PREPARE_FAILURES[record.source] = \
             _REVIEW_PREPARE_FAILURES.get(record.source, 0) + 1
-        if fails == 2 and _log is not None:
+        # Surface on the 2nd consecutive failure, then re-remind every 10th, so a
+        # long-stuck review keeps a periodic breadcrumb instead of a single line.
+        if _log is not None and fails >= 2 and (fails - 2) % 10 == 0:
             _log(f"{record.repo}: review checkout keeps failing at {record.source} — "
                  "admission is stuck; the PR will not be reviewed until it is cleared")
         return False
