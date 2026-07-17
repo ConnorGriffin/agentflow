@@ -758,16 +758,22 @@ def _rebase_branch(cfg: RepoConfig, branch: str, wt: Path) -> RebaseResult:
     Live orchestration, not unit-tested (mirrors `_checkout_pr_branch`)."""
     if not _checkout_pr_branch(cfg, branch, wt):
         return RebaseResult.ERROR
-    before = _run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
-    if _run(["git", "-C", str(wt), "rebase", "origin/main"]).returncode != 0:
-        _run(["git", "-C", str(wt), "rebase", "--abort"])
-        return RebaseResult.CONFLICT
-    after = _run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
-    if after and after == before:
-        return RebaseResult.NOOP
-    if _run(["git", "-C", str(wt), "push", "--force-with-lease", "origin", branch]).returncode != 0:
-        return RebaseResult.ERROR
-    return RebaseResult.CLEAN
+    # Claim the worktree session only AFTER the checkout has run: `_checkout_pr_branch` reuses an
+    # existing worktree only when its own idle/disposability guard passes, and that guard rejects
+    # an *active* worktree. Marking the session before the checkout makes the guard see our own
+    # mark and refuse — every survivor with a live builder worktree then fails plumbing forever.
+    # Held across rebase+push so a concurrent cleanup can't remove the worktree mid-rebase.
+    with worktree_session(wt):
+        before = _run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
+        if _run(["git", "-C", str(wt), "rebase", "origin/main"]).returncode != 0:
+            _run(["git", "-C", str(wt), "rebase", "--abort"])
+            return RebaseResult.CONFLICT
+        after = _run(["git", "-C", str(wt), "rev-parse", "HEAD"]).stdout.strip()
+        if after and after == before:
+            return RebaseResult.NOOP
+        if _run(["git", "-C", str(wt), "push", "--force-with-lease", "origin", branch]).returncode != 0:
+            return RebaseResult.ERROR
+        return RebaseResult.CLEAN
 
 
 def _park_conflicted_survivor(cfg: RepoConfig, pr: int, n: int) -> None:
@@ -828,8 +834,7 @@ def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str
         return f"#{pr}: unrecognized branch {branch}"
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
     wt = Path(_builder_worktree(cfg, tool, n, sl))
-    with worktree_session(wt):
-        result = _rebase_branch(cfg, branch, wt)
+    result = _rebase_branch(cfg, branch, wt)
     if result is RebaseResult.CONFLICT:
         _park_conflicted_survivor(cfg, pr, n)
         comments = _pr_comments(cfg.repo, pr)
