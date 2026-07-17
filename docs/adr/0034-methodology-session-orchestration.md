@@ -4,6 +4,7 @@
 - Date: 2026-07-16
 - Amended: 2026-07-16 — the operator's conversation outranks background work at admission
 - Amended: 2026-07-16 — an interactive conversation turn is real-time: it is exempt from headroom pacing, and only true-zero capacity may defer it ([#161](https://github.com/ConnorGriffin/agentflow/issues/161))
+- Amended: 2026-07-17 — shelf-first: both interactive carve-outs above are retracted; interactive methodology work lives in the operator's chat tool and enters the workspace only as staged Proposals; the workspace is the artifact surface, not a chat client
 
 ## Context
 
@@ -52,29 +53,48 @@ captured artifact. Interactive method steps (grilling, ui-mockups rounds, domain
 *sequence of turns* — interactivity lives at the Conversation level, one coordinated session per
 operator turn, never one always-live process. A Chart that fans out into parallel AFK research
 tickets maps onto separate submitted stages, each with its own admission and budget.
+*(Amended 2026-07-17: interactive method steps no longer run as workspace turns at all — they run
+in the operator's chat tool; only bounded, answer-and-walk-away turns and AFK steps run through
+the coordinator. See the shelf-first amendment below.)*
 
-### The operator's conversation outranks background work
+### Shelf-first: interactive methodology work lives in the operator's chat tool
 
-When Conversation turns and pipeline stages contend for the same pool headroom, admission
-favors the operator's interactivity. Ask and Chart turns — and any actively conversational
-method step, a grilling exchange above all — are **interactive**: the operator is present and
-waiting, so these turns take admission priority over background build, review, and every other
-pipeline stage. Truly-AFK method steps (research fan-outs, codebase-design analysis) and
-answer-and-walk-away turns are **background**: they queue at ordinary pipeline priority.
-Mockup rounds default to background, but the operator may explicitly prioritize a round while
-actively iterating on it. For **background** turns, priority only reorders admission; it never
-bypasses attempt budgets, permits, or pool saturation.
+*(This section replaces, and retracts, the two 2026-07-16 amendments: "the operator's
+conversation outranks background work" and "an interactive turn is real-time".)*
 
-An **interactive** conversation turn is different in kind, and this amendment supersedes that
-limit for it. A grilling or Ask turn is hard-earned, deliberate, steerable human-and-AI work —
-the opposite of a fire-and-forget mockup round — and its entire value is real-time
-responsiveness; latency destroys it. So an interactive turn is **exempt** from the recent-session
-cooldown, the activity/headroom pacing, and the spend-ceiling deferral of
-[ADR 0025](0025-activity-adaptive-spend-ceiling.md): it is admitted **immediately**, and
-background work yields its headroom rather than making a present operator wait. The *only* thing
-that may defer an interactive turn is **true zero capacity** — no permit obtainable at all, the
-hard machine ceiling — the one limit that is physically unavoidable. Headroom exists to pace
-autonomous background work; it must never pace a human who is sitting there conversing.
+Those amendments were right that a grilling exchange is hard-earned, deliberate, steerable
+human-and-AI work whose value latency destroys. They were wrong about where that work should
+run. One day of dogfooding the real-time posture produced its refutation: an admission
+carve-out so interactive turns bypass headroom pacing
+([#161](https://github.com/ConnorGriffin/agentflow/issues/161)), permit-release latency a
+waiting human immediately notices
+([#158](https://github.com/ConnorGriffin/agentflow/issues/158),
+[#164](https://github.com/ConnorGriffin/agentflow/pull/164)), and a workspace transcript that
+needed its own rendering repairs — the leading edge of rebuilding an interactive chat client
+feature-by-feature inside the workspace, while the operator's chat tool (Claude Code, Codex)
+already *is* that client, polished. The deletion test applies: a workspace chat that must be
+made as responsive as Claude Code merely relocates Claude Code.
+
+So the interactive tier moves out of the workspace:
+
+- **Interactive method steps — grilling above all, and any actively steered exchange — run in
+  the operator's own chat tool** as ordinary skill sessions. They are the operator's sessions,
+  outside coordinator admission; agentflow neither schedules, paces, nor renders them.
+- **The workspace Conversation surface is bounded, not real-time.** Answer-and-walk-away Ask
+  turns and AFK method steps (research fan-outs, codebase-design analysis, mockup rounds)
+  remain coordinated **background** turns at ordinary pipeline priority — the recent-session
+  cooldown, activity pacing, and the [ADR 0025](0025-activity-adaptive-spend-ceiling.md)
+  ceiling all apply; no converse turn is exempt. The workspace makes no further chat-client
+  investment: no streaming, no real-time admission, no rendering parity.
+- **A chat-tool session reaches the workspace through the same one-way door.** An interactive
+  session's resolved output enters as a **staged Proposal** — skills stage, the daemon adopts,
+  the operator promotes — so the promotion boundary below is unchanged. The chat tool never
+  writes durable truth directly; approval and Publication stay hash-bound, operator-only
+  workspace acts.
+
+Under this posture the workspace's identity is the **artifact surface**: staged Proposals
+awaiting decision, hash-bound approval, provenanced Publication and build handoff, the pipeline
+mirror, and landed Acceptance Evidence — the things a chat tool cannot durably be.
 
 ### Two retention layers, cleanly split
 
@@ -140,11 +160,14 @@ label, so intake grounds it and no conversation silently enters the pipeline
 - A completed turn has no automated successor stage — the operator's next message submits the
   next turn — so a completed turn is adopted and retired, and `park_completed` handles a turn
   that needs the operator.
-- Admission-matrix calibration for `converse` turns — within the settled ordering that
-  interactive turns outrank background work — the turn-prompt/context-rebuild format, and
-  the workspace Conversation/Proposal schema remain implementation choices for the prototype.
+- Admission-matrix calibration for `converse` turns — all background, per the shelf-first
+  amendment — the turn-prompt/context-rebuild format, and the workspace Conversation/Proposal
+  schema remain implementation choices for the prototype.
 - [#128](https://github.com/ConnorGriffin/agentflow/issues/128) (workspace prototype) may assume
   the coordinated-turn model, workspace-owned candidate artifacts and their staged/approved/
   published state, and UI-drives-only-via-commands. [#129](https://github.com/ConnorGriffin/agentflow/issues/129)
   (first validation slice) may assume grilling as a sequence of coordinated turns to a staged
-  Proposal without Publication.
+  Proposal without Publication. *(Amended 2026-07-17: grilling runs in the operator's chat
+  tool; its output enters the workspace as a staged Proposal. The slice-1 tracers are otherwise
+  unaffected — staging, approval, Publication, and evidence are exactly the artifact surface
+  this amendment keeps.)*
