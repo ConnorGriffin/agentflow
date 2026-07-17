@@ -25,12 +25,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 from agentflow import live
 from agentflow.coordinator import Submission
-from agentflow.workspace import channel
+from agentflow.workspace import channel, publish
 from agentflow.workspace.projection import workspace_projection
 from agentflow.workspace.store import ACCEPTED, WorkspaceStore, project_slug
 
@@ -54,6 +55,49 @@ as needed:
 Writing that file is the sole durable outcome of this turn. If you exit without writing it, the
 turn is incomplete and will run again — never write it twice.
 """
+
+# When the operator asks for a build-issue write-up, the turn produces a *complete* draft itself
+# (decide-then-review, ADR 0034) — no interrogation, one input surface. The session writes the
+# structured proposal draft alongside its human reply; the daemon-side finalizer adopts that draft
+# into an immutable Proposal version. The session has no durable write path beyond its worktree, so
+# staging is daemon-only.
+BUILD_ISSUE_PROMPT = """\
+You are answering one turn of an Ask conversation about the repository {repo}.
+
+This is turn {ordinal} of conversation {conversation_id}. The operator asked:
+
+{prompt}
+
+They want you to write this up as a *complete* build issue for {repo}. Produce the whole draft
+yourself from the repository and the conversation — do not ask the operator questions. Write TWO
+files in your worktree, creating parent directories as needed:
+
+1. Your human-readable reply (a short note that you drafted the build issue and what it covers):
+
+    {reply_path}
+
+2. The structured proposal draft as JSON with exactly these keys — "title" (string), "summary"
+   (string, the problem/outcome in prose), "acceptance" (array of strings, each a checkable
+   criterion), and "body" (string, any extra detail or empty):
+
+    {proposal_path}
+
+Do not open a pull request, push a branch, edit GitHub, apply any label, or change any durable
+project state — this is a conversation, not a build. Writing those two files is the sole durable
+outcome of this turn; the daemon adopts the draft into an immutable, content-hashed proposal you
+can then review and approve. If you exit without writing them, the turn is incomplete and will run
+again — never write them twice.
+"""
+
+# Build-issue intent is detected from the operator's own words (one input surface, no draft
+# button). "write this up as a build issue", "draft a build-issue", etc. all trip it.
+_BUILD_ISSUE_INTENT = re.compile(r"build[\s-]?issue", re.IGNORECASE)
+
+
+def wants_build_issue(prompt: str) -> bool:
+    """Whether an operator message asks to stage a Build-Issue Proposal from the conversation."""
+    return bool(_BUILD_ISSUE_INTENT.search(prompt or ""))
+
 
 WORKSPACE_PROJECTION_FILE = "workspace.json"
 
@@ -83,6 +127,40 @@ def read_reply(record) -> str | None:
     except OSError:
         return None
     return text or None
+
+
+def proposal_path(record) -> str:
+    """The per-turn structured proposal-draft artifact inside the turn's worktree. Present only for
+    a build-issue turn; per-*ordinal* so an earlier draft cannot be adopted for a later turn."""
+    return os.path.join(record.source or "", ".agentflow", f"ask-proposal-{record.target}.json")
+
+
+def read_proposal_draft(record) -> dict | None:
+    """The structured build-issue draft the session wrote for this turn, normalized, or ``None`` if
+    absent/invalid. The daemon — not the session — computes the content hash from this, so the
+    provenance key is trustworthy (ADR 0034)."""
+    try:
+        raw = Path(proposal_path(record)).read_text()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    title = str(data.get("title") or "").strip()
+    if not title:
+        return None
+    acceptance = data.get("acceptance") or []
+    if not isinstance(acceptance, list):
+        acceptance = [str(acceptance)]
+    return {
+        "title": title,
+        "summary": str(data.get("summary") or "").strip(),
+        "acceptance": [str(a).strip() for a in acceptance if str(a).strip()],
+        "body": str(data.get("body") or "").strip(),
+    }
 
 
 # --- stage collaborators (injected into ConverseStageAdapter) ---------------------------
@@ -123,19 +201,33 @@ def _ask_worktree_ready(record) -> bool:
 
 def _adopt_turn(record) -> str | None:
     """Adopt the accepted turn: append its immutable reply to the daemon-owned workspace — the
-    single writer of the reply turn (ADR 0034). Returns a durable proof, or ``None`` to retry next
-    cycle if the reply cannot be read (never retire over a turn that was not durably appended)."""
+    single writer of the reply turn (ADR 0034). When the turn produced a structured build-issue
+    draft, also adopt it as a **new immutable, content-hashed Proposal version** in the same
+    finalize; this is the sole promotion of a session draft into staged truth (ADR 0034). Returns a
+    durable proof, or ``None`` to retry next cycle if the reply or a present draft could not be
+    durably appended (never retire over a turn that was not adopted)."""
     reply = read_reply(record)
     if reply is None:
         return None
+    now = int(time.time())
     store = WorkspaceStore(record.repo)
     try:
-        outcome = store.complete_turn(record.subject, int(record.target), reply,
-                                      now=int(time.time()))
+        outcome = store.complete_turn(record.subject, int(record.target), reply, now=now)
+        if not outcome.accepted:
+            return None
+        draft = read_proposal_draft(record)
+        if draft is not None:
+            digest = publish.content_hash(draft["title"], draft["summary"],
+                                          draft["acceptance"], draft["body"])
+            staged = store.stage_proposal(
+                record.subject, title=draft["title"], summary=draft["summary"],
+                acceptance=draft["acceptance"], body=draft["body"], content_hash=digest,
+                idempotency_key=f"stage:{record.subject}:{record.target}", now=now)
+            if not staged.accepted:
+                return None
+            return f"workspace:{record.subject}#{record.target}:staged:{digest[:15]}"
     finally:
         store.close()
-    if not outcome.accepted:
-        return None
     return f"workspace:{record.subject}#{record.target}:adopted"
 
 
@@ -163,9 +255,16 @@ def converse_submission(repo: str, workdir: str, conversation_id: str, ordinal: 
     Marked interactive: an operator is present and waiting, so this turn outranks background
     pipeline work at admission (ADR 0034)."""
     worktree = ask_worktree(workdir, pool, conversation_id)
-    input_ptr = ASK_PROMPT.format(
-        repo=repo, ordinal=ordinal, conversation_id=conversation_id, prompt=prompt,
-        reply_path=os.path.join(worktree, ".agentflow", f"ask-reply-{ordinal}.md"))
+    reply_at = os.path.join(worktree, ".agentflow", f"ask-reply-{ordinal}.md")
+    if wants_build_issue(prompt):
+        input_ptr = BUILD_ISSUE_PROMPT.format(
+            repo=repo, ordinal=ordinal, conversation_id=conversation_id, prompt=prompt,
+            reply_path=reply_at,
+            proposal_path=os.path.join(worktree, ".agentflow", f"ask-proposal-{ordinal}.json"))
+    else:
+        input_ptr = ASK_PROMPT.format(
+            repo=repo, ordinal=ordinal, conversation_id=conversation_id, prompt=prompt,
+            reply_path=reply_at)
     return Submission(
         repo=repo, subject=conversation_id, stage="converse", pool=pool, complexity="deep",
         target=str(ordinal), source=worktree, input_ptr=input_ptr, claim=True, interactive=True)
@@ -200,6 +299,19 @@ def apply_command(command: dict, coordinator, *, workdir: str,
             outcome = store.start_turn(cid, command["prompt"],
                                        expected_revision=command["expected_revision"],
                                        idempotency_key=key, now=now)
+        elif kind == "approve_proposal":
+            # Hash-bound approval: the operator approves the exact version they saw, not "latest"
+            # (ADR 0034). No coordinated turn — publication reconciles separately (ADR 0033).
+            outcome = store.approve_proposal(command["conversation_id"], command["content_hash"],
+                                             idempotency_key=key, now=now)
+            return {"status": outcome.status, "conversation_id": outcome.conversation_id,
+                    "content_hash": outcome.content_hash, "version": outcome.version,
+                    "error": outcome.error}
+        elif kind == "discard_proposal":
+            outcome = store.discard_proposal(command["conversation_id"], idempotency_key=key,
+                                             now=now)
+            return {"status": outcome.status, "conversation_id": outcome.conversation_id,
+                    "error": outcome.error}
         else:
             return {"status": "rejected", "error": f"unknown command kind {kind!r}"}
     finally:
@@ -248,11 +360,13 @@ def build_projection(repos: list, *, store_factory=WorkspaceStore, now=None,
         store = store_factory(cfg.repo)
         try:
             convos = store.conversations()
+            proposals = store.proposals()
         finally:
             store.close()
         projects.append({
             "id": project_slug(cfg.repo), "repo": cfg.repo,
-            "profile": getattr(cfg, "profile", ""), "conversations": convos})
+            "profile": getattr(cfg, "profile", ""), "conversations": convos,
+            "proposals": proposals})
     return workspace_projection(projects, read_model_at=now, revision=now,
                                 daemon_available=daemon_available)
 

@@ -10,9 +10,12 @@
 
   let data = $state(null);
   let projectId = $state(null);
-  let view = $state({ name: 'home', param: null }); // home | dialogue
+  let view = $state({ name: 'home', param: null }); // home | dialogue | approval
   let pending = $state({}); // convId -> [operator prompts sent this session, awaiting the projection]
   let notice = $state('');
+  // The second beat of a hash-bound approval is UI-local: arming reveals the confirm, which sends
+  // the approve command bound to the EXACT version hash on screen (never "latest").
+  let armed = $state(false);
 
   const uuid = () =>
     (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
@@ -33,6 +36,9 @@
   }
   const elapsedMin = (iso) => Math.max(0, Math.floor((now - Date.parse(iso)) / 60000));
   const convById = (p, id) => p.conversations.find((c) => c.id === id);
+  const proposalById = (p, id) =>
+    (p.proposals || []).find((x) => x.conversation_id === id);
+  const shortHash = (h) => (h || '').replace(/^sha256:/, '').slice(0, 8);
 
   // ---------- routing: every view has a URL (#/<project>/ask/<id>) ----------
   function parseHash() {
@@ -41,13 +47,16 @@
     if (data && !data.projects.some((p) => p.id === pid)) pid = data.projects[0]?.id;
     projectId = pid;
     if (parts[1] === 'ask' && parts[2]) view = { name: 'dialogue', param: parts[2] };
+    else if (parts[1] === 'approve' && parts[2]) view = { name: 'approval', param: parts[2] };
     else view = { name: 'home', param: null };
+    armed = false; // each view entry starts disarmed — approval is a deliberate two-beat
   }
   function go(hash) {
     if (location.hash !== hash) location.hash = hash;
     else parseHash();
   }
   const openConv = (id) => go('#/' + projectId + '/ask/' + id);
+  const openApproval = (cid) => go('#/' + projectId + '/approve/' + cid);
   const toHome = () => go('#/' + projectId);
 
   // ---------- polling ----------
@@ -138,8 +147,30 @@
     sendTurn();
   }
 
+  // ---------- Build-Issue Proposal decisions (approve is hash-bound; the daemon publishes) ------
+  function approveProposal(prop) {
+    if (!project || !prop || !prop.content_hash) return;
+    // Bind to the EXACT version hash the operator is looking at (ADR 0034), not "latest".
+    send({
+      key: uuid(), kind: 'approve_proposal', repo: project.repo,
+      conversation_id: prop.conversation_id, content_hash: prop.content_hash,
+    });
+    armed = false;
+  }
+  function discardProposal(prop) {
+    if (!project || !prop) return;
+    send({
+      key: uuid(), kind: 'discard_proposal', repo: project.repo,
+      conversation_id: prop.conversation_id,
+    });
+    toHome();
+  }
+
   // ---------- derived view data ----------
   let conversations = $derived(project ? project.conversations : []);
+  let proposals = $derived(project && project.proposals ? project.proposals : []);
+  let stagedProposals = $derived(proposals.filter((x) => x.state === 'staged'));
+  let publishedProposals = $derived(proposals.filter((x) => x.state === 'published'));
   let dockPlaceholder = $derived(
     view.name === 'dialogue' ? 'Reply to Wayfinder…' : 'What should we work on?',
   );
@@ -253,6 +284,118 @@
         {/if}
       </div>
     </div>
+  {:else if view.name === 'approval'}
+    {@const prop = proposalById(project, view.param)}
+    <div class="view" tabindex="-1">
+      <div class="backrow">
+        <button class="btn btn--ghost btn--sm" onclick={toHome}>← Back to the shelf</button>
+      </div>
+      {#if !prop}
+        <p class="load-error">This proposal is no longer staged — it was published or discarded.</p>
+      {:else}
+        <div class="doc-page">
+          <div class="page-head-meta">
+            {#if prop.state === 'published'}
+              <span class="pill pill--ok">Published — verified</span>
+            {:else if prop.state === 'approved'}
+              <span class="pill pill--teal">Publishing…</span>
+            {:else}
+              <span class="pill pill--copper">Waiting on you</span>
+            {/if}
+            <span
+              >staged {ago(prop.staged_at)} · v{prop.version} ·
+              <span class="ref">{shortHash(prop.content_hash)}</span></span>
+          </div>
+          <h1 class="doc-h1">{prop.title || 'Build issue'}</h1>
+          <p class="kind-line">Build-issue proposal for <span class="ref">{project.repo}</span></p>
+          <p class="prose">{prop.summary}</p>
+
+          {#if prop.acceptance && prop.acceptance.length}
+            <div class="sect">
+              <h2 class="sect-h">Acceptance criteria</h2>
+              <ul class="accept">
+                {#each prop.acceptance as a}
+                  <li><span>{a}</span></li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+
+          <div class="sect">
+            <h2 class="sect-h">Versions</h2>
+            <ul class="vers">
+              {#each prop.versions as v}
+                <li class={v.current ? 'ver--current' : ''}>
+                  <span class="ref">v{v.version} · {shortHash(v.content_hash)}</span>
+                  <span>staged {ago(v.staged_at)}</span>
+                  <span class={v.current ? 'ver-note-current' : 'dim'}
+                    >{v.current ? 'current — awaiting decision' : 'superseded'}</span>
+                </li>
+              {/each}
+            </ul>
+          </div>
+
+          <div class="decision">
+            {#if prop.state === 'published'}
+              <div class="decision-note">
+                <span
+                  ><strong>Publication verified.</strong> v{prop.version} is now published truth for
+                  <span class="ref">{project.repo}</span> — the build issue is created and handed to
+                  the pipeline.</span>
+              </div>
+              {#if prop.publication}
+                <div class="receipt">
+                  {#if prop.publication.issue_number}
+                    <span class="ev">issue #{prop.publication.issue_number}</span>
+                  {/if}
+                  <span>provenance <span class="ref">{shortHash(prop.content_hash)}</span></span>
+                </div>
+              {/if}
+              <div class="decision-row">
+                {#if prop.publication && prop.publication.issue_url}
+                  <a class="btn btn--teal" href={prop.publication.issue_url}>See the build issue ↗</a>
+                {/if}
+                <button class="linklike" onclick={toHome}>Back to the shelf →</button>
+              </div>
+            {:else if prop.state === 'approved'}
+              <div class="decision-note pubwait">
+                <span
+                  >Publishing v{prop.version} ·
+                  <span class="ref">{shortHash(prop.approved_hash)}</span> to
+                  <span class="ref">{project.repo}</span>… waiting for the publication receipt to
+                  verify. The daemon creates the issue idempotently — a replay never files a
+                  duplicate.</span>
+              </div>
+            {:else if armed}
+              <p class="decision-q">
+                Publish version {prop.version} (<span class="ref"
+                  >{shortHash(prop.content_hash)}</span>) to
+                <span class="ref">{project.repo}</span>? This creates a real GitHub build issue and
+                hands it to the pipeline.
+              </p>
+              <div class="decision-row">
+                <button class="btn btn--copper" onclick={() => approveProposal(prop)}
+                  >Confirm — approve &amp; publish</button>
+                <button class="linklike" onclick={() => (armed = false)}>Cancel</button>
+              </div>
+            {:else}
+              <div class="decision-row">
+                <button class="btn btn--copper" onclick={() => (armed = true)}
+                  >Approve &amp; publish…</button>
+                <button class="btn btn--danger-quiet" onclick={() => discardProposal(prop)}
+                  >Discard proposal</button>
+              </div>
+              <p class="dim decision-sub">
+                Approving creates the GitHub issue and hands it to the pipeline. It binds to version
+                {prop.version} (<span class="ref">{shortHash(prop.content_hash)}</span>) and counts
+                only once the publication is verified. Discarding drops the draft; the conversation
+                keeps its history.
+              </p>
+            {/if}
+          </div>
+        </div>
+      {/if}
+    </div>
   {:else}
     <div class="view" tabindex="-1">
       <div class="room-head">
@@ -264,7 +407,7 @@
         </p>
       </div>
 
-      {#if !conversations.length}
+      {#if !conversations.length && !proposals.length}
         <div class="empty2">
           <p class="empty2-lead">
             Start with an Ask. Nothing reaches GitHub until you approve it.
@@ -278,7 +421,50 @@
           </div>
         </div>
       {:else}
-        <section class="shelf" aria-label="Conversations">
+        <section class="shelf" aria-label="Efforts, sharpest decision first">
+          <!-- Copper = "awaiting your decision" only: a staged build-issue proposal awaiting you. -->
+          {#each stagedProposals as prop}
+            <article class="obj obj--awaiting">
+              <div class="obj-tags">
+                <span class="pill pill--copper">Waiting on you</span>
+                <span class="obj-kind">Staged build issue · from your Ask</span>
+              </div>
+              <h2 class="obj-title obj-title--sm">{prop.title || 'Build issue'}</h2>
+              <p class="obj-meta">
+                <span class="dim"
+                  >v{prop.version} · <span class="ref">{shortHash(prop.content_hash)}</span> ·
+                  staged {ago(prop.staged_at)}</span>
+              </p>
+              <div class="obj-actions">
+                <button class="btn btn--copper" onclick={() => openApproval(prop.conversation_id)}
+                  >Review &amp; approve</button>
+                <button class="linklike" onclick={() => openConv(prop.conversation_id)}
+                  >read the Ask</button>
+              </div>
+            </article>
+          {/each}
+          <!-- The verified change lands back on the shelf in a non-copper "published" weight. -->
+          {#each publishedProposals as prop}
+            <article class="obj obj--published">
+              <div class="obj-tags">
+                <span class="pill pill--ok">Published ✓</span>
+                <span class="obj-kind">Build issue · handed to the pipeline</span>
+              </div>
+              <h2 class="obj-title obj-title--sm">{prop.title || 'Build issue'}</h2>
+              <p class="obj-meta">
+                <span class="dim"
+                  >{#if prop.publication && prop.publication.issue_number}issue #{prop.publication
+                      .issue_number} · {/if}provenance <span class="ref"
+                    >{shortHash(prop.content_hash)}</span></span>
+              </p>
+              <div class="obj-actions">
+                {#if prop.publication && prop.publication.issue_url}
+                  <a class="quiet-link" href={prop.publication.issue_url}
+                    >Watch it build in the fleet console ↗</a>
+                {/if}
+              </div>
+            </article>
+          {/each}
           {#each conversations as c}
             <article class="obj--ledger">
               <div class="obj-tags">

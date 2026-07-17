@@ -30,6 +30,8 @@ DIST = Path(__file__).parent / "webui" / "dist"
 _REQUIRED = {
     "open_ask": ("key", "repo", "conversation_id", "prompt"),
     "send_turn": ("key", "repo", "conversation_id", "prompt", "expected_revision"),
+    "approve_proposal": ("key", "repo", "conversation_id", "content_hash"),
+    "discard_proposal": ("key", "repo", "conversation_id"),
 }
 
 # What the console sees before any daemon has published a workspace projection: an empty

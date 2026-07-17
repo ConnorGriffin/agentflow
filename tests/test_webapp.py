@@ -97,3 +97,23 @@ def test_command_with_a_missing_field_is_rejected_as_a_transport_error():
 def test_unknown_command_kind_is_rejected():
     client = _workspace_client(available=True)
     assert client.post("/api/command", json={"key": "k", "kind": "delete_everything"}).status_code == 400
+
+
+def test_approve_and_discard_commands_are_transported_verbatim():
+    sent = []
+    client = _workspace_client(available=True, enqueue=sent.append)
+    approve = {"key": "a1", "kind": "approve_proposal", "repo": "o/r", "conversation_id": "c1",
+               "content_hash": "sha256:v1"}
+    discard = {"key": "d1", "kind": "discard_proposal", "repo": "o/r", "conversation_id": "c1"}
+    assert client.post("/api/command", json=approve).status_code == 202
+    assert client.post("/api/command", json=discard).status_code == 202
+    assert sent == [approve, discard]
+
+
+def test_approve_without_the_content_hash_is_a_transport_error():
+    """Approval is hash-bound: the transport requires the exact version hash the operator saw."""
+    sent = []
+    client = _workspace_client(available=True, enqueue=sent.append)
+    res = client.post("/api/command", json={
+        "key": "a1", "kind": "approve_proposal", "repo": "o/r", "conversation_id": "c1"})
+    assert res.status_code == 400 and sent == []

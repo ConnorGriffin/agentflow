@@ -15,6 +15,7 @@ a real workspace store, with only the launcher/liveness/provider faked (ADR 0020
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from conftest import FakeSession, permits, record_of
@@ -22,7 +23,7 @@ from conftest import FakeSession, permits, record_of
 from agentflow import coordinated_converse
 from agentflow.coordinator import ConverseStageAdapter, StageRouter, Submission, tracer
 from agentflow.coordinator.providers import ProviderCause
-from agentflow.workspace.store import PAUSED, REPLIED, WorkspaceStore
+from agentflow.workspace.store import PAUSED, REPLIED, STAGED, WorkspaceStore
 
 REPO = "ConnorGriffin/agentflow"
 
@@ -62,6 +63,63 @@ def _write_reply(record, text):
     path = Path(coordinated_converse.reply_path(record))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
+
+
+def _write_proposal(record, draft):
+    path = Path(coordinated_converse.proposal_path(record))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(draft))
+
+
+# --- build-issue staging: the finalizer adopts a session draft as an immutable Proposal --
+
+def test_a_build_issue_turn_picks_the_drafting_prompt(coord_state):
+    """Operator intent alone routes the turn (one input surface, no draft button): a "write this up
+    as a build issue" message runs the drafting prompt and asks the session for the structured
+    proposal artifact; an ordinary question does not."""
+    build = coordinated_converse.converse_submission(
+        REPO, str(coord_state), "conv-1", 0, "write this up as a build issue")
+    assert "ask-proposal-0.json" in build.input_ptr
+    plain = coordinated_converse.converse_submission(
+        REPO, str(coord_state), "conv-1", 0, "what does the repo do?")
+    assert "ask-proposal-0.json" not in plain.input_ptr
+
+
+def test_the_finalizer_stages_a_content_hashed_proposal_from_a_build_issue_turn(
+        make_coord, coord_state):
+    """Through the public coordinate seam: a build-issue turn whose session wrote the reply AND a
+    structured draft is adopted by the daemon-side finalizer into a staged, content-hashed Proposal
+    version — the single promotion of a session draft into staged truth (ADR 0034)."""
+    fake = FakeSession()
+    coord = _coord(make_coord, fake)
+    _seed_conversation(prompt="write this up as a build issue")
+    ident = coord.submit_stage(_submission(coord_state, ordinal=0,
+                                           prompt="write this up as a build issue"))
+    coord.cycle("claude")
+    record = record_of(coord, ident)
+    _write_reply(record, "I drafted a build issue for the publish button.")
+    _write_proposal(record, {"title": "Add a Publish button", "summary": "operator wants publish",
+                             "acceptance": ["clicking publishes", "idempotent"], "body": ""})
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+    coord.cycle("claude")                                    # settle → finalize_completed adopts
+    assert record_of(coord, ident).retired is True
+
+    store = WorkspaceStore(REPO)
+    try:
+        prop = store.proposal("conv-1")
+        assert prop is not None and prop.state == STAGED and prop.title == "Add a Publish button"
+        assert len(prop.versions) == 1
+        v = prop.versions[0]
+        # The daemon computes the hash from the draft — the provenance key is not provider-supplied.
+        from agentflow.workspace import publish
+        assert v.content_hash == publish.content_hash(
+            "Add a Publish button", "operator wants publish",
+            ["clicking publishes", "idempotent"], "")
+        # The reply turn is adopted too — the conversation carries both.
+        assert store.conversation("conv-1").turns[0].reply is not None
+    finally:
+        store.close()
 
 
 # --- identity: one message is one turn; re-submission never duplicates ------------------

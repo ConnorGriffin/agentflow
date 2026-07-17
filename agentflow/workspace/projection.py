@@ -5,17 +5,19 @@ bounded JSON projection the web layer serves; the projection is disposable and n
 source or policy input. A generation carries its own read-model time and workspace revision so
 the console can age it honestly, exactly like the fleet snapshot (ADR 0026/0033).
 
-This tracer's projection needs only the "in a conversation" background weight for the shelf and
-the turn transcript for the dialogue view — no Proposals, maps, or milestones (those are later
-tracers). Turn states are surfaced honestly (working / replied / paused), never faked as live
-chat (ADR 0034).
+This projection surfaces the "in a conversation" background weight and the turn transcript, and —
+for the build-issue tracer — the staged Build-Issue Proposals: each carries its immutable versions
+and their content hashes, the exact hash awaiting decision, and, once published, its verified issue
+receipt so the console can render the copper "awaiting your decision" weight and the non-copper
+"published ✓" weight (ADR 0033/0034). A discarded Proposal is dropped from the read model. Turn
+states are surfaced honestly (working / replied / paused), never faked as live chat (ADR 0034).
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agentflow.workspace.store import PAUSED, WORKING
+from agentflow.workspace.store import DISCARDED, PAUSED, WORKING
 
 
 def _iso(epoch: int) -> str | None:
@@ -75,6 +77,40 @@ def _conversation_json(convo) -> dict:
     }
 
 
+def _version_json(v, *, current: bool) -> dict:
+    return {
+        "version": v.version,
+        "content_hash": v.content_hash,
+        "staged_at": _iso(v.staged_at),
+        "current": current,
+    }
+
+
+def _proposal_json(prop) -> dict:
+    """One Build-Issue Proposal's read model: the latest version drives the copper card / approval
+    view; every version is listed so the operator can approve the exact hash they saw."""
+    latest = prop.latest
+    return {
+        "id": prop.conversation_id,
+        "conversation_id": prop.conversation_id,
+        "state": prop.state,
+        "title": prop.title,
+        "summary": latest.summary if latest else "",
+        "acceptance": latest.acceptance if latest else [],
+        "version": latest.version if latest else 0,
+        "content_hash": latest.content_hash if latest else None,
+        "staged_at": _iso(latest.staged_at) if latest else None,
+        "approved_hash": prop.approved_hash,
+        "versions": [_version_json(v, current=(latest is not None and v.version == latest.version))
+                     for v in prop.versions],
+        "publication": ({
+            "issue_number": prop.published_issue,
+            "issue_url": prop.published_url,
+            "published_at": _iso(prop.published_at),
+        } if prop.state == "published" else None),
+    }
+
+
 def workspace_projection(projects: list[dict], *, read_model_at: int, revision: int,
                          daemon_available: bool = True) -> dict:
     """Assemble the bounded workspace projection.
@@ -96,6 +132,8 @@ def workspace_projection(projects: list[dict], *, read_model_at: int, revision: 
                 "repo": p["repo"],
                 "profile": p.get("profile", ""),
                 "conversations": [_conversation_json(c) for c in p["conversations"]],
+                "proposals": [_proposal_json(pr) for pr in p.get("proposals", [])
+                              if pr.state != DISCARDED],
             }
             for p in projects
         ],
