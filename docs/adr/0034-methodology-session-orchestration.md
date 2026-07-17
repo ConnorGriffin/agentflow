@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-16
 - Amended: 2026-07-16 — the operator's conversation outranks background work at admission
+- Amended: 2026-07-16 — an interactive conversation turn is real-time: it is exempt from headroom pacing, and only true-zero capacity may defer it ([#161](https://github.com/ConnorGriffin/agentflow/issues/161))
 
 ## Context
 
@@ -61,8 +62,19 @@ waiting, so these turns take admission priority over background build, review, a
 pipeline stage. Truly-AFK method steps (research fan-outs, codebase-design analysis) and
 answer-and-walk-away turns are **background**: they queue at ordinary pipeline priority.
 Mockup rounds default to background, but the operator may explicitly prioritize a round while
-actively iterating on it. Priority reorders admission; it never bypasses it — attempt budgets,
-permits, and pool saturation still gate every start.
+actively iterating on it. For **background** turns, priority only reorders admission; it never
+bypasses attempt budgets, permits, or pool saturation.
+
+An **interactive** conversation turn is different in kind, and this amendment supersedes that
+limit for it. A grilling or Ask turn is hard-earned, deliberate, steerable human-and-AI work —
+the opposite of a fire-and-forget mockup round — and its entire value is real-time
+responsiveness; latency destroys it. So an interactive turn is **exempt** from the recent-session
+cooldown, the activity/headroom pacing, and the spend-ceiling deferral of
+[ADR 0025](0025-activity-adaptive-spend-ceiling.md): it is admitted **immediately**, and
+background work yields its headroom rather than making a present operator wait. The *only* thing
+that may defer an interactive turn is **true zero capacity** — no permit obtainable at all, the
+hard machine ceiling — the one limit that is physically unavoidable. Headroom exists to pace
+autonomous background work; it must never pace a human who is sitting there conversing.
 
 ### Two retention layers, cleanly split
 
