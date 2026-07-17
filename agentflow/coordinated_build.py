@@ -383,7 +383,8 @@ def build_coordinator(_log=None) -> Coordinator:
     converse = ConverseStageAdapter(
         reply_ready=coordinated_converse._reply_ready,
         adopt=coordinated_converse._adopt_turn,
-        park=coordinated_converse._park_ask)
+        park=coordinated_converse._park_ask,
+        worktree_ready=coordinated_converse._ask_worktree_ready)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse})
     return Coordinator(adapter=router, gate=_production_gate(),

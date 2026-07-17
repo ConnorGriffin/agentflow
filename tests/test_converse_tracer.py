@@ -203,3 +203,59 @@ def test_priority_never_bypasses_the_permit_ledger(make_coord, coord_state):
     ask = coord.submit_stage(_submission(coord_state, ordinal=0))
     coord.cycle("claude")
     assert record_of(coord, ask).state == "waiting"                 # no headroom — it waits its turn
+
+
+# --- worktree provisioning: the turn gets a real repo to read and write its reply into --
+
+def _repo_with_origin_main(tmp_path):
+    """A real git repo whose ``origin/main`` resolves — the ref the ask worktree detaches from."""
+    from agentflow.loop import _run
+    origin, workdir = tmp_path / "origin.git", tmp_path / "checkout"
+    _run(["git", "init", "--bare", "-b", "main", str(origin)]).check_returncode()
+    _run(["git", "clone", str(origin), str(workdir)]).check_returncode()
+    _run(["git", "-C", str(workdir), "config", "user.email", "t@t"]).check_returncode()
+    _run(["git", "-C", str(workdir), "config", "user.name", "t"]).check_returncode()
+    (workdir / "README.md").write_text("the repo")
+    _run(["git", "-C", str(workdir), "add", "-A"]).check_returncode()
+    _run(["git", "-C", str(workdir), "commit", "-m", "init"]).check_returncode()
+    _run(["git", "-C", str(workdir), "push", "-q", "origin", "main"]).check_returncode()
+    return str(workdir)
+
+
+def _provisioning_adapter():
+    return ConverseStageAdapter(
+        reply_ready=coordinated_converse._reply_ready, adopt=coordinated_converse._adopt_turn,
+        park=coordinated_converse._park_ask,
+        worktree_ready=coordinated_converse._ask_worktree_ready)
+
+
+def test_a_converse_turn_provisions_its_worktree_before_admission(tmp_path):
+    """prepare() must materialize the turn's isolated worktree — a detached ``origin/main``
+    checkout — so the launched session has a real repo to read and a place to write its reply.
+    Fails before the fix: the default ``worktree_ready`` only truthy-checks the path string and
+    creates nothing, so the session would launch into a directory that does not exist."""
+    sub = _submission(_repo_with_origin_main(tmp_path))
+    assert _provisioning_adapter().prepare(sub) is True
+    wt = Path(sub.source)
+    assert (wt / ".git").exists()                         # a real git worktree, not an empty dir
+    assert (wt / "README.md").read_text() == "the repo"   # origin/main is checked out to read
+
+
+def test_a_resumed_converse_turn_keeps_the_reply_it_already_wrote(tmp_path):
+    """A second prepare() on an existing worktree reuses it exactly as it is — it must never reset
+    or clean, or a resumed turn would lose the partial reply the interrupted session already left
+    in the worktree (ADR 0034 resume)."""
+    sub = _submission(_repo_with_origin_main(tmp_path))
+    adapter = _provisioning_adapter()
+    assert adapter.prepare(sub) is True
+    _write_reply(sub, "half-written answer")              # the interrupted session's local work
+    assert adapter.prepare(sub) is True                   # resume
+    assert coordinated_converse.read_reply(sub) == "half-written answer"
+
+
+def test_a_converse_turn_defers_when_its_worktree_cannot_be_provisioned(tmp_path):
+    """A git failure (here: no repo to add from) returns False, so admission is skipped with no
+    permit and no attempt consumed and the turn retries next cycle — never launching a session
+    into a missing checkout."""
+    sub = _submission(tmp_path / "not-a-repo")
+    assert _provisioning_adapter().prepare(sub) is False
