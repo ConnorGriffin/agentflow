@@ -94,6 +94,33 @@ def _reply_ready(record, obs) -> bool:
     return read_reply(record) is not None
 
 
+def _ask_worktree_ready(record) -> bool:
+    """Provision the turn's isolated worktree before admission (ADR 0030/0034): a detached checkout
+    of ``origin/main`` the bounded session reads to answer, and into which it writes its reply.
+
+    An existing worktree is reused *exactly as it is* — a resumed turn keeps the partial reply it
+    already wrote in the worktree, so it is never reset or cleaned (that is why this cannot reuse
+    the review stage's freshening ``prepare_worktree_detached``). An Ask owns no branch and pushes
+    nothing, so the checkout is detached. Any git failure returns False, so admission is skipped
+    with no permit and no attempt consumed — the turn simply retries next cycle."""
+    from agentflow.loop import _run
+    from agentflow.runner import _worktree_is_registered
+    src = record.source or ""
+    if "/.agentflow/worktrees/" not in src:
+        return False
+    workdir, tail = src.split("/.agentflow/worktrees/", 1)
+    if not tail.startswith(f"{record.pool}/ask-"):
+        return False
+    wt = Path(src)
+    if wt.exists():
+        return _worktree_is_registered(workdir, wt)  # reuse as-is; never rebuild a resumed turn
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    if _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).returncode != 0:
+        return False
+    return _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt),
+                 "origin/main"]).returncode == 0
+
+
 def _adopt_turn(record) -> str | None:
     """Adopt the accepted turn: append its immutable reply to the daemon-owned workspace — the
     single writer of the reply turn (ADR 0034). Returns a durable proof, or ``None`` to retry next
