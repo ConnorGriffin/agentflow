@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -149,6 +150,21 @@ def _worktree_is_disposable(workdir: str, wt: Path) -> bool:
     return remote_refs.returncode == 0 and bool(remote_refs.stdout.strip())
 
 
+def discard_orphaned_worktree(workdir: str, wt: Path) -> None:
+    """Discard a stale directory that occupies a worktree path but is not a
+    registered worktree, then prune dangling metadata so a fresh checkout can be
+    added there.
+
+    A registered worktree — which may hold committed or in-progress work — is
+    never discarded this way; callers must have already established that git
+    tracks no worktree at ``wt`` (its metadata is gone/orphaned), so nothing
+    durable is lost. Pruning also frees any same-basename metadata whose own
+    directory is already gone, which otherwise blocks the ``worktree add``.
+    """
+    shutil.rmtree(wt, ignore_errors=True)
+    _run(["git", "-C", workdir, "worktree", "prune"])
+
+
 def remove_worktree_if_safe(workdir: str, wt: Path) -> bool:
     """Remove a finished session only when Git proves all progress is durable.
 
@@ -229,18 +245,24 @@ class _WorktreeRunner:
 
         Detached avoids the "branch already checked out" collision with the
         builder's worktree, which still holds the PR branch.
+
+        A directory that exists on disk but is *not* a registered worktree is
+        orphaned — its git metadata was lost (e.g. a daemon killed mid-prepare).
+        Git holds no state for it and ``worktree add`` would fail on the existing
+        dir every cycle, so it is discarded and rebuilt. A *registered* worktree
+        is never force-discarded here: a non-disposable one still fails closed.
         """
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
-            if not _worktree_is_registered(workdir, wt):
-                raise subprocess.CalledProcessError(1, ["git", "worktree", "list"])
-            if not _worktree_is_disposable(workdir, wt):
-                raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
-            # Freshen a reused worktree to the (possibly moved) ref — otherwise a
-            # re-review after a revise push would inspect a stale checkout.
-            _run(["git", "-C", str(wt), "reset", "--hard", ref]).check_returncode()
-            _run(["git", "-C", str(wt), "clean", "-fdx"])
-            return
+            if _worktree_is_registered(workdir, wt):
+                if not _worktree_is_disposable(workdir, wt):
+                    raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
+                # Freshen a reused worktree to the (possibly moved) ref — otherwise a
+                # re-review after a revise push would inspect a stale checkout.
+                _run(["git", "-C", str(wt), "reset", "--hard", ref]).check_returncode()
+                _run(["git", "-C", str(wt), "clean", "-fdx"])
+                return
+            discard_orphaned_worktree(workdir, wt)
         wt.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
 

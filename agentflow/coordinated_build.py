@@ -366,7 +366,9 @@ def build_coordinator(_log=None) -> Coordinator:
     build = BuildStageAdapter(
         pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
     review = ReviewStageAdapter(
-        verdict_ready=_verdict_ready, worktree_reset=_review_worktree_reset, handoff=_park_pr,
+        verdict_ready=_verdict_ready,
+        worktree_reset=lambda record: _review_worktree_reset(record, _log=_log),
+        handoff=_park_pr,
         settle=_settle_review, prepare_settle=_prepare_review_settlement)
     revise = ReviseStageAdapter(
         revision_ready=_revision_ready, worktree_ready=_worktree_ready, handoff=_park_pr)
@@ -798,12 +800,20 @@ def _verdict_ready(record, obs) -> bool:
     return parse_verdict(obs.final_message or "", expected_sha=record.target).parsed
 
 
-def _review_worktree_reset(record) -> bool:
+# Consecutive review-prepare failures per source path, so a genuinely stuck
+# review (one that never checks out) surfaces once instead of silently no-op'ing
+# admission every cycle. Process-local — a daemon restart re-arms it.
+_REVIEW_PREPARE_FAILURES: dict[str, int] = {}
+
+
+def _review_worktree_reset(record, _log=None) -> bool:
     """Recreate the read-only review checkout at the exact PR head SHA before admission (ADR 0030).
     Review holds no local edits, so any stale checkout is discarded and rebuilt detached at the
-    record's immutable target SHA — the target is never touched. Any git failure returns False, so
-    admission is skipped with no permit and no attempt. Live orchestration, not unit-tested (ADR
-    0020)."""
+    record's immutable target SHA — the target is never touched. An orphaned checkout dir (present
+    on disk but with its git metadata gone) is self-healed by the detached prepare rather than
+    stalling admission forever. Any git failure returns False, so admission is skipped with no
+    permit and no attempt; a repeated failure is logged so a stuck review is visible. Live
+    orchestration, not unit-tested (ADR 0020)."""
     from agentflow.loop import _run
     from agentflow.runner import ClaudeRunner, CodexRunner
     facts = _review_source_facts(record)
@@ -819,7 +829,13 @@ def _review_worktree_reset(record) -> bool:
         runner.prepare_worktree_detached(workdir, record.target, wt)
         runner.provision(wt)
     except subprocess.CalledProcessError:
+        fails = _REVIEW_PREPARE_FAILURES[record.source] = \
+            _REVIEW_PREPARE_FAILURES.get(record.source, 0) + 1
+        if fails == 2 and _log is not None:
+            _log(f"{record.repo}: review checkout keeps failing at {record.source} — "
+                 "admission is stuck; the PR will not be reviewed until it is cleared")
         return False
+    _REVIEW_PREPARE_FAILURES.pop(record.source, None)
     return True
 
 
