@@ -7,7 +7,8 @@ import time
 import pytest
 
 from agentflow import balancer
-from agentflow.balancer import PoolStatus, choose_pair, parse_pct, pick_pair
+from agentflow.balancer import (PoolStatus, choose_pair, choose_reviewer, parse_pct,
+                                 pick_pair)
 from agentflow.dashboard_data import pools
 
 RUNNERS = {"claude": "CLAUDE", "codex": "CODEX"}
@@ -80,6 +81,36 @@ def test_neither_clear_is_no_capacity():
     claude = PoolStatus("claude", False, 100.0)
     codex = PoolStatus("codex", False, 100.0)
     assert choose_pair(claude, codex, RUNNERS) == (None, None)
+
+
+# --- choose_reviewer: ADR 0020 review under partial availability -----------------
+_CS = PoolStatus("claude", True, 20.0)
+_XS = PoolStatus("codex", True, 60.0)
+
+
+def test_reviewer_prefers_cross_tool_when_both_free():
+    assert choose_reviewer("claude", _CS, _XS) == "codex"
+    assert choose_reviewer("codex", _CS, _XS) == "claude"
+
+
+def test_reviewer_falls_back_same_tool_when_cross_tool_exhausted():
+    # Codex out of headroom (the real symptom): a claude-built PR reviews same-tool
+    # rather than stalling — the gate parks it, so it is reviewed but never auto-merged.
+    codex_dead = PoolStatus("codex", False, 100.0)
+    assert choose_reviewer("claude", _CS, codex_dead) == "claude"
+
+
+def test_reviewer_uses_cross_tool_when_builders_own_pool_is_the_dead_one():
+    codex_dead = PoolStatus("codex", False, 100.0)
+    # A codex-built PR still reviews cross-tool on the free claude pool.
+    assert choose_reviewer("codex", _CS, codex_dead) == "claude"
+
+
+def test_reviewer_defers_when_neither_pool_free():
+    claude_dead = PoolStatus("claude", False, 100.0)
+    codex_dead = PoolStatus("codex", False, 100.0)
+    assert choose_reviewer("claude", claude_dead, codex_dead) is None
+    assert choose_reviewer("codex", claude_dead, codex_dead) is None
 
 
 def test_pick_pair_block_msg_names_blocked_pools(stub_gate, monkeypatch):

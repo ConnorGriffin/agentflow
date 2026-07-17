@@ -16,9 +16,20 @@ from itertools import count
 
 import pytest
 
+from agentflow import coordinated_build
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
+
+
+@pytest.fixture(autouse=True)
+def _deterministic_reviewer(monkeypatch):
+    """Pin the reviewer to the cross-tool default so tests that drive the review-open path never
+    consult the live rate-limit gate (which is timing-sensitive and would make the suite flaky).
+    ADR 0020's same-tool fallback — when the cross-tool pool is exhausted — is exercised directly
+    in tests/test_balancer.py via ``choose_reviewer``. A test may still override this."""
+    monkeypatch.setattr(coordinated_build, "pick_reviewer",
+                        lambda builder: "codex" if builder == "claude" else "claude")
 
 
 @dataclass

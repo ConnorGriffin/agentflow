@@ -30,6 +30,7 @@ from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coor
                                    IntakeStageAdapter, MockupStageAdapter,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
                                    StageRouter, tracer)
+from agentflow.balancer import pick_reviewer
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
 
@@ -1325,7 +1326,10 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
     if context is None:
         return
     acceptance, surfaces = context
-    reviewer_tool = "codex" if build.pool == "claude" else "claude"
+    reviewer_tool = pick_reviewer(build.pool)
+    if reviewer_tool is None:
+        return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
+                # build keeps its claim and this opener re-drives next cycle.
     submission = review_submission(
         build, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"),
         acceptance=acceptance, surfaces=surfaces)
@@ -1407,7 +1411,10 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
     if context is None:
         return
     acceptance, surfaces = context
-    reviewer_tool = "codex" if revise.builder_lineage == "claude" else "claude"
+    reviewer_tool = pick_reviewer(revise.builder_lineage)
+    if reviewer_tool is None:
+        return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
+                # revise keeps its claim and this opener re-drives next cycle.
     submission = review_submission(
         revise, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"),
         acceptance=acceptance, surfaces=surfaces)
