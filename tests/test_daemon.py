@@ -25,6 +25,7 @@ def _loop(**kw):
     kw.setdefault("dispatch_pass", lambda repos, **kwargs: None)
     kw.setdefault("publish", lambda repos: None)
     kw.setdefault("enabled", lambda: True)
+    kw.setdefault("local_complete", lambda: False)   # no local-completion wake unless asserted
     kw.setdefault("spawn", lambda fn: fn())
     return PollLoop([A], **kw)
 
@@ -259,6 +260,113 @@ def test_dormant_fast_tick_only_reconciles_on_the_heartbeat(monkeypatch):
     assert probe_calls == []      # the probe (its one API call) is never made while dormant
     assert passes == [{"submit_new": False}]
     assert publishes == ["snap"]  # one republish on the heartbeat, so the paused board stays fresh
+
+
+def test_dead_provider_family_wakes_a_full_pass_within_a_fast_tick(monkeypatch):
+    """The local-completion wake (issue #158): a running record whose provider family died after
+    its last GitHub bump strands its permits until reconciliation. On a fast tick with the probe
+    reporting no change and the heartbeat not due, that locally-durable completion still wakes
+    exactly one full pass — so the finished stage advances and its permits release within ~one
+    fast tick instead of waiting out the 300s heartbeat. This fails against a tick that only wakes
+    on probe/heartbeat."""
+    monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 10_000)   # heartbeat far away
+    monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
+    passes = []
+    probe = types.SimpleNamespace(changed=lambda: False)   # no GitHub change to react to
+    # t=0 wakes on the startup heartbeat (local sweep not consulted); the sweep is consulted from
+    # t=15 on: the family is now dead, then the triggered pass reconciles it so the next is quiet.
+    dead = iter([True, False])
+    clock = iter([0, 15, 30])
+    loop = _loop(probe=probe, local_complete=lambda: next(dead),
+                 dispatch_pass=lambda repos, **kw: passes.append(kw),
+                 clock=lambda: next(clock))
+
+    loop.tick()   # t=0   startup heartbeat consumes its slot (local sweep not consulted)
+    assert len(passes) == 1
+    loop.tick()   # t=15  probe no change, heartbeat not due, family now dead → wake a full pass
+    assert len(passes) == 2
+    assert passes[1] == {"submit_new": True}
+    loop.tick()   # t=30  the pass reconciled the dead family off `running` → converged, no wake
+    assert len(passes) == 2
+
+
+def test_live_provider_family_does_not_wake_a_full_pass(monkeypatch):
+    """The mirror case: a running record whose family is still alive (or whose liveness is
+    unknown) reports no local completion, so a quiet fast tick runs no pass — the wake fires only
+    on a *proven*-dead family, never on uncertainty."""
+    monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 10_000)   # heartbeat far away
+    monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
+    passes = []
+    probe = types.SimpleNamespace(changed=lambda: False)
+    clock = iter([0, 15, 30])
+    loop = _loop(probe=probe, local_complete=lambda: False,   # family alive/unknown → no wake
+                 dispatch_pass=lambda repos, **kw: passes.append(kw),
+                 clock=lambda: next(clock))
+
+    loop.tick()   # t=0   startup heartbeat
+    loop.tick()   # t=15  nothing moved locally or on GitHub → no pass
+    loop.tick()   # t=30  still nothing → no pass
+    assert len(passes) == 1   # only the startup heartbeat
+
+
+def test_local_completion_sweep_is_gated_off_while_dormant(monkeypatch):
+    """Dormant mirrors the probe's gating: the local-completion sweep is not consulted while the
+    daemon is paused (only the heartbeat reconciles), so a paused daemon stays free of any wake
+    work between heartbeats — dormant is genuinely idle."""
+    monkeypatch.setattr(daemon, "FULL_PASS_SECONDS", 10_000)   # heartbeat far away
+    monkeypatch.setattr(live, "mark_cycle", lambda _s: None)
+    sweeps, passes = [], []
+    clock = iter([0, 15, 30])
+    loop = _loop(enabled=lambda: False,
+                 local_complete=lambda: sweeps.append(1) or True,
+                 dispatch_pass=lambda repos, **kw: passes.append(kw),
+                 clock=lambda: next(clock))
+
+    loop.tick()   # t=0   heartbeat (startup) consumes its slot
+    loop.tick()   # t=15  dormant fast tick → the local sweep is never consulted
+    loop.tick()   # t=30  dormant fast tick → still never consulted
+    assert sweeps == []
+    assert len(passes) == 1   # only the startup heartbeat, cold submission disabled
+
+
+def test_dead_family_running_ignores_unknown_liveness_and_bad_store(monkeypatch, tmp_path):
+    """The wake's local signal (issue #158) proves completion the same way reconcile does: only a
+    family `pid_family_alive` reports gone counts. An alive family, an unknown/permission-denied
+    liveness, a record that never recorded a family, and an unreadable store all report 'nothing to
+    wake' — so the sweep fails closed and never crashes the loop."""
+    from agentflow.coordinator.record import RUNNING, WAITING, Record
+
+    dead_pid, live_pid = "999999", str(os.getpid())
+    calls = []
+
+    def fake_alive(family):
+        calls.append(family)
+        return {dead_pid: False, live_pid: True}.get(family, True)  # unknown → True (fail closed)
+
+    monkeypatch.setattr("agentflow.coordinator.launcher.pid_family_alive", fake_alive)
+
+    def records(rs):
+        monkeypatch.setattr("agentflow.coordinator.tracer.load_records", lambda *a, **k: rs)
+
+    def rec(identity, state, family):
+        return Record(identity=identity, pool="claude", stage="build", demand=1,
+                      subject="1", repo="owner/a", state=state, family=family)
+
+    records([rec("a", RUNNING, live_pid)])          # alive → no wake
+    assert daemon._dead_family_running() is False
+    records([rec("b", RUNNING, "42424242")])         # unknown pid → fail closed, no wake
+    assert daemon._dead_family_running() is False
+    records([rec("c", RUNNING, None)])               # never recorded a family → no wake
+    assert daemon._dead_family_running() is False
+    records([rec("d", WAITING, dead_pid)])           # not running → no wake
+    assert daemon._dead_family_running() is False
+    records([rec("e", RUNNING, live_pid), rec("f", RUNNING, dead_pid)])  # one proven dead → wake
+    assert daemon._dead_family_running() is True
+
+    def boom(*a, **k):
+        raise RuntimeError("store unreadable")
+    monkeypatch.setattr("agentflow.coordinator.tracer.load_records", boom)
+    assert daemon._dead_family_running(_log=lambda _m: None) is False   # swallowed, no crash
 
 
 def test_change_probe_costs_one_call_per_tick_for_the_whole_fleet():
