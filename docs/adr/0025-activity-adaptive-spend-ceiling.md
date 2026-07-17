@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-13
+- Amended: 2026-07-16 — this ceiling paces autonomous **background** work only; interactive conversation turns (Ask/grilling) are exempt and admitted in real-time ([ADR 0034](0034-methodology-session-orchestration.md), [#161](https://github.com/ConnorGriffin/agentflow/issues/161))
 
 ## Context
 
