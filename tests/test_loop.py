@@ -836,3 +836,51 @@ def test_recheck_defers_when_pr_listing_fails(monkeypatch):
     # Unknown is not empty: a gh blip must defer, not read as 'no survivors'.
     monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: None)
     assert "deferring" in recheck_once(RepoConfig("o/r", "/tmp"))
+
+
+# --- issue #159: agentflow:triaging label description must not overclaim a live session ----
+
+def test_claim_triage_description_is_ownership_not_live_session(monkeypatch):
+    # Regression: the old text "A grounding session is triaging this issue" asserted active
+    # execution even when the record is waiting with 0 attempts and no provider process.
+    # The new description must be true whether the record is queued or running.
+    captured = []
+
+    def fake_run(cmd):
+        captured.append(cmd)
+        return _FakeRun()
+
+    monkeypatch.setattr(loop, "_run", fake_run)
+    result = loop._claim_triage("o/r", 7)
+
+    assert result is True
+    label_create = next(cmd for cmd in captured if "label" in cmd and "create" in cmd)
+    desc_idx = label_create.index("--description") + 1
+    description = label_create[desc_idx]
+    # Must not assert a live/active/running session (the AC: no "is triaging" phrasing)
+    assert "is triaging" not in description
+    assert "A grounding session" not in description
+    # Must convey ownership/admission purpose
+    assert any(word in description.lower() for word in ("claim", "ownership", "dispatch"))
+
+
+def test_waiting_intake_record_omitted_from_live_projection():
+    # Guards the Live-view premise: a waiting Intake record (queued for admission, no attempt,
+    # no family) must never appear as a running session on the live board. This is what keeps
+    # the console truthful when pool capacity is saturated.
+    from agentflow.coordinator.record import Record, WAITING, RUNNING
+    from agentflow.coordinator import tracer
+
+    waiting_intake = Record(identity="o/r:7:intake:None", stage="intake",
+                            pool="claude", demand=1, repo="o/r", subject="7",
+                            state=WAITING, started_at=0, family=None)
+    running_build = Record(identity="o/r:8:build:None", stage="build",
+                           pool="claude", demand=1, repo="o/r", subject="8",
+                           state=RUNNING, started_at=1_000_000)
+
+    projection = tracer.live_projection([waiting_intake, running_build])
+
+    numbers = [e["number"] for e in projection]
+    assert 7 not in numbers, "waiting Intake must not appear on the live board"
+    assert 8 in numbers, "running Build must appear on the live board"
+    assert projection[0]["started_at"] != ""

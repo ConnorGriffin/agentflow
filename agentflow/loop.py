@@ -432,7 +432,7 @@ def _claim_triage(repo: str, n: int) -> bool:
     dispatch skips it — closing intake's no-label-yet window (the state label is only stamped
     once the session finishes). Symmetric to `_claim`; ensures the label first."""
     created = _run(["gh", "label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
-                    "--description", "A grounding session is triaging this issue", "--force"])
+                    "--description", "Intake ownership claim — prevents duplicate dispatch", "--force"])
     claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", TRIAGING])
     return created.returncode == 0 and claimed.returncode == 0
 
