@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_WORKSPACE_BUSY_MS", "2000"))
 
 # Turn states are honest and bounded (ADR 0034): a turn is only ever one of these — never a
@@ -46,6 +46,15 @@ PAUSED = "paused"     # the turn exhausted its budget and parked "needs you", me
 # Command outcome statuses.
 ACCEPTED = "accepted"
 REJECTED = "rejected"
+
+# A Build-Issue Proposal's lifecycle (ADR 0033/0034). It is a series of immutable, content-hashed
+# versions: refining stages a *new* version (never mutates a prior one), so a hash is durable truth
+# for exactly the content the operator saw. Approval binds to one exact version hash; a verified
+# Publication stamps that hash into a real GitHub issue and moves the effort to PUBLISHED.
+STAGED = "staged"        # one or more versions await the operator's decision (the copper weight)
+APPROVED = "approved"    # the operator approved one exact version hash; a Publication is authorized
+PUBLISHED = "published"  # the approved hash was published to GitHub and its receipt verified
+DISCARDED = "discarded"  # the draft was dropped; the Conversation is untouched
 
 
 class WorkspaceUnavailable(RuntimeError):
@@ -77,6 +86,8 @@ class CommandOutcome:
     ordinal: int | None = None
     revision: int | None = None       # the aggregate revision after the command
     error: str | None = None          # why a command was rejected (stale revision, unknown convo)
+    version: int | None = None        # the Proposal version a stage/approve command settled on
+    content_hash: str | None = None   # the exact version hash a stage staged / an approve bound to
 
     @property
     def accepted(self) -> bool:
@@ -115,6 +126,49 @@ class Conversation:
     turns: list[Turn] = field(default_factory=list)
 
 
+@dataclass
+class ProposalVersion:
+    """One immutable Build-Issue Proposal version, bound to an exact content hash. Refining stages a
+    new version; a version's content and hash are never rewritten (ADR 0034)."""
+
+    version: int
+    content_hash: str                 # the daemon-computed provenance key (never provider-supplied)
+    title: str
+    summary: str
+    acceptance: list[str] = field(default_factory=list)
+    body: str = ""                    # the rendered issue body the hash canonicalizes
+    staged_at: int = 0
+
+
+@dataclass
+class Proposal:
+    """A Build-Issue Proposal — a versioned draft staged from an Ask (ADR 0033/0034). One per
+    Conversation for this tracer. ``approved_hash`` is the exact version the operator approved (not
+    "latest"); once published it carries the receipt of its real GitHub issue."""
+
+    conversation_id: str
+    state: str = STAGED               # staged | approved | published | discarded
+    title: str = ""                   # the latest version's title (the decision on the shelf)
+    approved_hash: str | None = None
+    published_issue: int | None = None
+    published_url: str | None = None
+    published_at: int = 0
+    staged_at: int = 0
+    updated_at: int = 0
+    versions: list[ProposalVersion] = field(default_factory=list)
+
+    @property
+    def latest(self) -> ProposalVersion | None:
+        return self.versions[-1] if self.versions else None
+
+    def version_hash(self, content_hash: str) -> ProposalVersion | None:
+        """The exact version carrying ``content_hash``, or ``None`` — approval is hash-bound."""
+        for v in self.versions:
+            if v.content_hash == content_hash:
+                return v
+        return None
+
+
 class WorkspaceStore:
     """One durable per-Project workspace database. Constructed with a repository; a fresh instance
     over the same ``AGENTFLOW_STATE`` recovers every Conversation and turn, which is how a parked
@@ -145,6 +199,11 @@ class WorkspaceStore:
             if fresh:
                 self._initialize(conn)
             version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version < SCHEMA_VERSION:
+                # An older store predates this build's Proposal tables; add them in place so a
+                # workspace from tracer #1 keeps its Conversations and turns intact (ADR 0033).
+                self._migrate(conn, version)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise WorkspaceUnavailable(
@@ -190,6 +249,48 @@ class WorkspaceStore:
                 " key TEXT PRIMARY KEY,"
                 " outcome TEXT NOT NULL)"
             )
+            WorkspaceStore._create_proposal_tables(conn)
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except sqlite3.DatabaseError:
+            conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _create_proposal_tables(conn: sqlite3.Connection) -> None:
+        # The Build-Issue Proposal aggregate (ADR 0033/0034): one Proposal per Conversation, holding
+        # its immutable content-hashed versions and staged/approved/published state.
+        conn.execute(
+            "CREATE TABLE proposals ("
+            " conversation_id TEXT PRIMARY KEY REFERENCES conversations(id),"
+            " state TEXT NOT NULL DEFAULT 'staged',"
+            " title TEXT NOT NULL DEFAULT '',"
+            " approved_hash TEXT,"
+            " published_issue INTEGER,"
+            " published_url TEXT,"
+            " published_at INTEGER NOT NULL DEFAULT 0,"
+            " staged_at INTEGER NOT NULL DEFAULT 0,"
+            " updated_at INTEGER NOT NULL DEFAULT 0)"
+        )
+        conn.execute(
+            "CREATE TABLE proposal_versions ("
+            " conversation_id TEXT NOT NULL REFERENCES proposals(conversation_id),"
+            " version INTEGER NOT NULL,"
+            " content_hash TEXT NOT NULL,"
+            " title TEXT NOT NULL DEFAULT '',"
+            " summary TEXT NOT NULL DEFAULT '',"
+            " acceptance TEXT NOT NULL DEFAULT '[]',"
+            " body TEXT NOT NULL DEFAULT '',"
+            " staged_at INTEGER NOT NULL DEFAULT 0,"
+            " PRIMARY KEY (conversation_id, version))"
+        )
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if from_version < 2:
+                WorkspaceStore._create_proposal_tables(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
@@ -241,6 +342,52 @@ class WorkspaceStore:
             return self._commit(lambda: self._park_turn(
                 conversation_id, ordinal, reason, now), None)
 
+    # --- Build-Issue Proposal commands (ADR 0033/0034) ----------------------------------
+
+    def stage_proposal(self, conversation_id: str, *, title: str, summary: str,
+                       acceptance: list[str], body: str, content_hash: str,
+                       idempotency_key: str, now: int = 0) -> CommandOutcome:
+        """Adopt an accepted build-issue turn as a **new immutable Proposal version** — the single
+        daemon-side promotion of a session draft into staged truth (ADR 0034).
+
+        The first version opens the Proposal; each later version is appended, never a mutation of a
+        prior one, so a content hash is durable for exactly the content the operator saw. A new
+        version supersedes any earlier approval (the copper card always shows the *latest* awaiting
+        decision). Idempotent on the command key: re-adopting the same turn replays its outcome and
+        never appends a duplicate version."""
+        with self._lock:
+            return self._commit(lambda: self._stage_proposal(
+                conversation_id, title, summary, acceptance, body, content_hash, now),
+                idempotency_key)
+
+    def approve_proposal(self, conversation_id: str, content_hash: str, *,
+                         idempotency_key: str, now: int = 0) -> CommandOutcome:
+        """Approve the **exact version hash** the operator saw (never "latest"), authorizing a
+        Publication (ADR 0034 two-beat, hash-bound). A hash with no matching staged version is
+        rejected. Idempotent on the command key."""
+        with self._lock:
+            return self._commit(lambda: self._approve_proposal(
+                conversation_id, content_hash, now), idempotency_key)
+
+    def record_publication(self, conversation_id: str, content_hash: str, *, issue_number: int,
+                           issue_url: str, now: int = 0) -> CommandOutcome:
+        """Record the verified receipt of the approved hash's real GitHub issue and move the
+        Proposal to PUBLISHED (ADR 0033 verify-the-external-effect). Naturally idempotent: a second
+        record for an already-published Proposal replays the receipt, never a second row. Only the
+        approved hash may be recorded — a mismatch is rejected."""
+        with self._lock:
+            return self._commit(lambda: self._record_publication(
+                conversation_id, content_hash, issue_number, issue_url, now), None)
+
+    def discard_proposal(self, conversation_id: str, *, idempotency_key: str,
+                         now: int = 0) -> CommandOutcome:
+        """Drop the staged draft, leaving the Conversation intact (ADR 0033). The Proposal moves to
+        DISCARDED — its versions are kept for audit but it no longer surfaces on the shelf.
+        Idempotent on the command key; a published Proposal cannot be discarded."""
+        with self._lock:
+            return self._commit(lambda: self._discard_proposal(conversation_id, now),
+                                idempotency_key)
+
     # --- reads (for the daemon projection builder) --------------------------------------
 
     def conversation(self, conversation_id: str) -> Conversation | None:
@@ -263,6 +410,29 @@ class WorkspaceStore:
             for convo in convos:
                 convo.turns = self._turns_of(convo.id)
             return convos
+
+    def proposal(self, conversation_id: str) -> Proposal | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT conversation_id, state, title, approved_hash, published_issue,"
+                " published_url, published_at, staged_at, updated_at FROM proposals"
+                " WHERE conversation_id = ?", (conversation_id,)).fetchone()
+            if row is None:
+                return None
+            prop = self._proposal_from_row(row)
+            prop.versions = self._versions_of(conversation_id)
+            return prop
+
+    def proposals(self) -> list[Proposal]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT conversation_id, state, title, approved_hash, published_issue,"
+                " published_url, published_at, staged_at, updated_at FROM proposals"
+                " ORDER BY updated_at DESC, conversation_id").fetchall()
+            props = [self._proposal_from_row(r) for r in rows]
+            for prop in props:
+                prop.versions = self._versions_of(prop.conversation_id)
+            return props
 
     # --- internal: transaction wrapper --------------------------------------------------
 
@@ -375,6 +545,84 @@ class WorkspaceStore:
         new_revision = self._bump(conversation_id, now)
         return CommandOutcome(ACCEPTED, conversation_id, ordinal, new_revision)
 
+    def _stage_proposal(self, conversation_id, title, summary, acceptance, body, content_hash,
+                        now) -> CommandOutcome:
+        convo = self._conn.execute(
+            "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+        if convo is None:
+            return CommandOutcome(REJECTED, conversation_id, error="unknown conversation")
+        exists = self._conn.execute(
+            "SELECT state FROM proposals WHERE conversation_id = ?", (conversation_id,)).fetchone()
+        if exists is None:
+            self._conn.execute(
+                "INSERT INTO proposals (conversation_id, state, title, staged_at, updated_at)"
+                " VALUES (?, 'staged', ?, ?, ?)", (conversation_id, title, now, now))
+        version_row = self._conn.execute(
+            "SELECT COALESCE(MAX(version) + 1, 1) FROM proposal_versions WHERE conversation_id = ?",
+            (conversation_id,)).fetchone()
+        version = version_row[0]
+        self._conn.execute(
+            "INSERT INTO proposal_versions (conversation_id, version, content_hash, title, summary,"
+            " acceptance, body, staged_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (conversation_id, version, content_hash, title, summary, json.dumps(acceptance),
+             body, now))
+        # A newer version supersedes any earlier decision: the copper card always shows the latest
+        # awaiting the operator, so staging resets an approved (but unpublished) Proposal to staged.
+        self._conn.execute(
+            "UPDATE proposals SET state = 'staged', title = ?, approved_hash = NULL, updated_at = ?"
+            " WHERE conversation_id = ? AND state != 'published'",
+            (title, now, conversation_id))
+        return CommandOutcome(ACCEPTED, conversation_id, version=version, content_hash=content_hash)
+
+    def _approve_proposal(self, conversation_id, content_hash, now) -> CommandOutcome:
+        row = self._conn.execute(
+            "SELECT state FROM proposals WHERE conversation_id = ?", (conversation_id,)).fetchone()
+        if row is None:
+            return CommandOutcome(REJECTED, conversation_id, error="unknown proposal")
+        version = self._conn.execute(
+            "SELECT version FROM proposal_versions WHERE conversation_id = ? AND content_hash = ?",
+            (conversation_id, content_hash)).fetchone()
+        if version is None:
+            # Hash-bound: approving a hash with no matching staged version is rejected, never
+            # silently redirected to "latest" (ADR 0034).
+            return CommandOutcome(REJECTED, conversation_id, error="unknown version hash")
+        self._conn.execute(
+            "UPDATE proposals SET state = 'approved', approved_hash = ?, updated_at = ?"
+            " WHERE conversation_id = ? AND state != 'published'",
+            (content_hash, now, conversation_id))
+        return CommandOutcome(ACCEPTED, conversation_id, version=version[0],
+                              content_hash=content_hash)
+
+    def _record_publication(self, conversation_id, content_hash, issue_number, issue_url,
+                            now) -> CommandOutcome:
+        row = self._conn.execute(
+            "SELECT state, approved_hash FROM proposals WHERE conversation_id = ?",
+            (conversation_id,)).fetchone()
+        if row is None:
+            return CommandOutcome(REJECTED, conversation_id, error="unknown proposal")
+        state, approved_hash = row
+        if state == "published":
+            return CommandOutcome(ACCEPTED, conversation_id, content_hash=content_hash)
+        if approved_hash != content_hash:
+            return CommandOutcome(REJECTED, conversation_id, error="hash is not the approved one")
+        self._conn.execute(
+            "UPDATE proposals SET state = 'published', published_issue = ?, published_url = ?,"
+            " published_at = ?, updated_at = ? WHERE conversation_id = ?",
+            (issue_number, issue_url, now, now, conversation_id))
+        return CommandOutcome(ACCEPTED, conversation_id, content_hash=content_hash)
+
+    def _discard_proposal(self, conversation_id, now) -> CommandOutcome:
+        row = self._conn.execute(
+            "SELECT state FROM proposals WHERE conversation_id = ?", (conversation_id,)).fetchone()
+        if row is None:
+            return CommandOutcome(REJECTED, conversation_id, error="unknown proposal")
+        if row[0] == "published":
+            return CommandOutcome(REJECTED, conversation_id, error="a published proposal stands")
+        self._conn.execute(
+            "UPDATE proposals SET state = 'discarded', approved_hash = NULL, updated_at = ?"
+            " WHERE conversation_id = ?", (now, conversation_id))
+        return CommandOutcome(ACCEPTED, conversation_id)
+
     def _bump(self, conversation_id, now) -> int:
         self._conn.execute(
             "UPDATE conversations SET revision = revision + 1, updated_at = ? WHERE id = ?",
@@ -388,6 +636,21 @@ class WorkspaceStore:
     def _conversation_from_row(row) -> Conversation:
         return Conversation(id=row[0], repo=row[1], title=row[2], verb=row[3], scope=row[4],
                             state=row[5], revision=row[6], created_at=row[7], updated_at=row[8])
+
+    @staticmethod
+    def _proposal_from_row(row) -> Proposal:
+        return Proposal(conversation_id=row[0], state=row[1], title=row[2], approved_hash=row[3],
+                        published_issue=row[4], published_url=row[5], published_at=row[6],
+                        staged_at=row[7], updated_at=row[8])
+
+    def _versions_of(self, conversation_id: str) -> list[ProposalVersion]:
+        rows = self._conn.execute(
+            "SELECT version, content_hash, title, summary, acceptance, body, staged_at"
+            " FROM proposal_versions WHERE conversation_id = ? ORDER BY version",
+            (conversation_id,)).fetchall()
+        return [ProposalVersion(version=r[0], content_hash=r[1], title=r[2], summary=r[3],
+                                acceptance=json.loads(r[4]), body=r[5], staged_at=r[6])
+                for r in rows]
 
     def _turns_of(self, conversation_id: str) -> list[Turn]:
         rows = self._conn.execute(
@@ -408,11 +671,13 @@ class WorkspaceStore:
 def _encode_outcome(outcome: CommandOutcome) -> str:
     return json.dumps({
         "status": outcome.status, "conversation_id": outcome.conversation_id,
-        "ordinal": outcome.ordinal, "revision": outcome.revision, "error": outcome.error})
+        "ordinal": outcome.ordinal, "revision": outcome.revision, "error": outcome.error,
+        "version": outcome.version, "content_hash": outcome.content_hash})
 
 
 def _decode_outcome(payload: str) -> CommandOutcome:
     data = json.loads(payload)
     return CommandOutcome(status=data["status"], conversation_id=data.get("conversation_id"),
                           ordinal=data.get("ordinal"), revision=data.get("revision"),
-                          error=data.get("error"))
+                          error=data.get("error"), version=data.get("version"),
+                          content_hash=data.get("content_hash"))

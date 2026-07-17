@@ -93,6 +93,58 @@ def test_a_stale_send_turn_is_rejected_and_submits_nothing(state):
     assert len(coord.submitted) == 1                      # only the open_ask turn was submitted
 
 
+# --- approve / discard a Build-Issue Proposal ------------------------------------------
+
+def _stage_a_proposal(cid="conv-1", hash_="sha256:v1"):
+    store = WorkspaceStore(REPO)
+    try:
+        store.open_conversation(title="Ask", conversation_id=cid, idempotency_key=f"{cid}:o", now=1)
+        store.stage_proposal(cid, title="Add a button", summary="s", acceptance=["works"],
+                             body="", content_hash=hash_, idempotency_key="s1", now=2)
+    finally:
+        store.close()
+
+
+def test_approve_command_binds_to_the_exact_hash_and_submits_no_turn(state):
+    _stage_a_proposal()
+    coord = FakeCoordinator()
+    out = coordinated_converse.apply_command(
+        {"key": "ap1", "kind": "approve_proposal", "repo": REPO, "conversation_id": "conv-1",
+         "content_hash": "sha256:v1"}, coord, workdir=str(state), now=3)
+    assert out["status"] == "accepted" and out["content_hash"] == "sha256:v1"
+    assert coord.submitted == []                          # approval is not a coordinated turn
+    store = WorkspaceStore(REPO)
+    try:
+        assert store.proposal("conv-1").approved_hash == "sha256:v1"
+    finally:
+        store.close()
+
+
+def test_approve_command_is_idempotent_on_its_key(state):
+    _stage_a_proposal()
+    coord = FakeCoordinator()
+    cmd = {"key": "ap1", "kind": "approve_proposal", "repo": REPO, "conversation_id": "conv-1",
+           "content_hash": "sha256:v1"}
+    a = coordinated_converse.apply_command(cmd, coord, workdir=str(state), now=3)
+    b = coordinated_converse.apply_command(cmd, coord, workdir=str(state), now=4)  # re-drained
+    assert a == b
+
+
+def test_discard_command_drops_the_proposal_but_keeps_the_conversation(state):
+    _stage_a_proposal()
+    coord = FakeCoordinator()
+    out = coordinated_converse.apply_command(
+        {"key": "d1", "kind": "discard_proposal", "repo": REPO, "conversation_id": "conv-1"},
+        coord, workdir=str(state), now=3)
+    assert out["status"] == "accepted"
+    store = WorkspaceStore(REPO)
+    try:
+        assert store.proposal("conv-1").state == "discarded"
+        assert store.conversation("conv-1") is not None   # the conversation survives
+    finally:
+        store.close()
+
+
 # --- draining the spool ----------------------------------------------------------------
 
 def test_drain_applies_pending_commands_and_acknowledges_them(state):
