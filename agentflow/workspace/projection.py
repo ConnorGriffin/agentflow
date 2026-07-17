@@ -86,10 +86,19 @@ def _version_json(v, *, current: bool) -> dict:
     }
 
 
-def _proposal_json(prop) -> dict:
+def _proposal_json(prop, pipeline_by_issue: dict | None = None) -> dict:
     """One Build-Issue Proposal's read model: the latest version drives the copper card / approval
-    view; every version is listed so the operator can approve the exact hash they saw."""
+    view; every version is listed so the operator can approve the exact hash they saw.
+
+    Once published, the card also mirrors the coarse pipeline state (building → PR open → in review
+    → merged) and — on merge — the landed **Acceptance Evidence** (merged PR + commit + review/CI
+    verdict). Both are joined in daemon-side from ``pipeline_by_issue`` (keyed by published issue
+    number); the web layer never reads GitHub, so when the daemon has not joined them these blocks
+    are simply absent and the card falls back to the publication receipt (ADR 0026/0033)."""
     latest = prop.latest
+    published = prop.state == "published"
+    pipe = (pipeline_by_issue or {}).get(prop.published_issue) if published else None
+    landed = pipe is not None and pipe.get("state") == "merged"
     return {
         "id": prop.conversation_id,
         "conversation_id": prop.conversation_id,
@@ -107,7 +116,20 @@ def _proposal_json(prop) -> dict:
             "issue_number": prop.published_issue,
             "issue_url": prop.published_url,
             "published_at": _iso(prop.published_at),
-        } if prop.state == "published" else None),
+        } if published else None),
+        "pipeline": ({
+            "state": pipe.get("state"),
+            "pr_number": pipe.get("pr_number"),
+            "pr_url": pipe.get("pr_url"),
+        } if pipe else None),
+        "evidence": ({
+            "merged_pr_url": pipe.get("pr_url"),
+            "pr_number": pipe.get("pr_number"),
+            "merge_commit": pipe.get("merge_commit"),
+            "merged_at": pipe.get("merged_at"),
+            "review": pipe.get("review"),
+            "ci": pipe.get("ci"),
+        } if landed else None),
     }
 
 
@@ -132,7 +154,7 @@ def workspace_projection(projects: list[dict], *, read_model_at: int, revision: 
                 "repo": p["repo"],
                 "profile": p.get("profile", ""),
                 "conversations": [_conversation_json(c) for c in p["conversations"]],
-                "proposals": [_proposal_json(pr) for pr in p.get("proposals", [])
+                "proposals": [_proposal_json(pr, p.get("pipeline")) for pr in p.get("proposals", [])
                               if pr.state != DISCARDED],
             }
             for p in projects

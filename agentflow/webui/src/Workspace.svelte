@@ -39,6 +39,24 @@
   const proposalById = (p, id) =>
     (p.proposals || []).find((x) => x.conversation_id === id);
   const shortHash = (h) => (h || '').replace(/^sha256:/, '').slice(0, 8);
+  const shortSha = (s) => (s || '').slice(0, 7);
+
+  // ---------- published card: coarse pipeline mirror (read from the daemon join) ----------
+  // The shelf weights are the locked spec's: teal for a live pipeline, ok(green) once landed.
+  function pipeLabel(pipe) {
+    if (!pipe) return 'Handed to the pipeline';
+    const n = pipe.pr_number;
+    if (pipe.state === 'merged') return 'PR #' + n + ' merged';
+    if (pipe.state === 'in_review') return 'PR #' + n + ' in review';
+    if (pipe.state === 'pr_open') return 'PR #' + n + ' open';
+    return 'Building in the pipeline…';
+  }
+  function pipeClass(pipe) {
+    if (!pipe) return '';
+    if (pipe.state === 'merged') return 'pipe-item--ok';
+    if (pipe.state === 'building') return '';
+    return 'pipe-item--teal';
+  }
 
   // ---------- routing: every view has a URL (#/<project>/ask/<id>) ----------
   function parseHash() {
@@ -443,25 +461,61 @@
               </div>
             </article>
           {/each}
-          <!-- The verified change lands back on the shelf in a non-copper "published" weight. -->
+          <!-- The verified change lands back on the shelf, then mirrors the coarse pipeline it was
+               handed to (building → PR open → in review → merged) and, once merged, its landed
+               Acceptance Evidence — all read from the daemon-published projection. -->
           {#each publishedProposals as prop}
             <article class="obj obj--published">
               <div class="obj-tags">
-                <span class="pill pill--ok">Published ✓</span>
-                <span class="obj-kind">Build issue · handed to the pipeline</span>
+                {#if prop.evidence}
+                  <span class="pill pill--ok">Landed ✓</span>
+                {:else}
+                  <span class="pill pill--teal">Handed to the pipeline</span>
+                {/if}
+                <span class="obj-kind"
+                  >Build issue{#if prop.publication && prop.publication.issue_number}{' · issue #' +
+                      prop.publication.issue_number}{/if}</span>
               </div>
               <h2 class="obj-title obj-title--sm">{prop.title || 'Build issue'}</h2>
+              {#if prop.pipeline}
+                <div class="pipeline">
+                  <span class="pipe-item {pipeClass(prop.pipeline)}"
+                    ><span>{pipeLabel(prop.pipeline)}</span></span>
+                </div>
+              {/if}
+              {#if prop.evidence}
+                <div class="ev-row">
+                  <span class="dim">Acceptance Evidence</span>
+                  <span class="landed-ev">
+                    {#if prop.evidence.pr_number}
+                      <span class="ev">merged · PR #{prop.evidence.pr_number}</span>
+                    {/if}
+                    {#if prop.evidence.merge_commit}
+                      <span class="ev">commit {shortSha(prop.evidence.merge_commit)}</span>
+                    {/if}
+                    {#if prop.evidence.review}
+                      <span class="ev">review · {prop.evidence.review.replace('_', ' ')}</span>
+                    {/if}
+                    {#if prop.evidence.ci}
+                      <span class="ev">CI · {prop.evidence.ci}</span>
+                    {/if}
+                  </span>
+                </div>
+              {/if}
               <p class="obj-meta">
-                <span class="dim"
-                  >{#if prop.publication && prop.publication.issue_number}issue #{prop.publication
-                      .issue_number} · {/if}provenance <span class="ref"
+                <span class="dim">provenance <span class="ref"
                     >{shortHash(prop.content_hash)}</span></span>
               </p>
               <div class="obj-actions">
-                {#if prop.publication && prop.publication.issue_url}
+                {#if prop.pipeline && prop.pipeline.pr_url}
+                  <a class="btn btn--teal" href={prop.pipeline.pr_url}
+                    >{prop.evidence ? 'See the merged PR ↗' : 'Open the PR ↗'}</a>
+                {:else if prop.publication && prop.publication.issue_url}
                   <a class="quiet-link" href={prop.publication.issue_url}
                     >Watch it build in the fleet console ↗</a>
                 {/if}
+                <button class="linklike" onclick={() => openConv(prop.conversation_id)}
+                  >read the Ask</button>
               </div>
             </article>
           {/each}
