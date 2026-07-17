@@ -74,5 +74,7 @@ class Record:
     auto_merge_allowed: bool = True
     root: str | None = None              # the root stage this descends from; it shares the root's reservation
     interactive: bool = False            # an operator-present turn (Ask) that outranks background
-                                         # pipeline work at admission (ADR 0034); reorders the
-                                         # queue, never bypasses budgets/permits/pool saturation
+                                         # pipeline work at admission (ADR 0034); sorts to the head
+                                         # of the queue and is exempt from the headroom/pacing/
+                                         # ceiling gate (ADR 0034/0025 as amended by #162) — only a
+                                         # true-zero-capacity permit reservation may still defer it

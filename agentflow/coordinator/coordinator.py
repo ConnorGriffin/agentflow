@@ -201,9 +201,10 @@ class Coordinator:
                        if r.pool == pool and r.state == WAITING and not r.hold_pending
                        and r.root is None]  # descendants share the root's reservation, never admit
             # An operator's interactive turn (an Ask) outranks background pipeline work at
-            # admission (ADR 0034): it sorts to the head of each queue. This only reorders
-            # admission — the permit/gate/pool checks below still gate every start unchanged, so
-            # priority never bypasses budgets, permits, or pool saturation.
+            # admission (ADR 0034): it sorts to the head of each queue. For an interactive turn the
+            # gate is also exempt from headroom/pacing/ceiling (ADR 0034/0025 as amended by #162),
+            # so only true zero capacity — no permit obtainable on the reservation ledger — can
+            # defer it. Background starts still face the full budget/gate/pool checks below.
             continuations = sorted(
                 (r for r in waiting if r.continuation and r.eligible_at <= now),
                 key=lambda r: (not r.interactive, r.eligible_at, r.created_at, r.identity))
