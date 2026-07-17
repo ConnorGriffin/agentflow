@@ -567,6 +567,32 @@ def test_pr_branch_checkout_refuses_to_reset_recoverable_work(monkeypatch, tmp_p
     assert not any("reset" in cmd for cmd in calls)
 
 
+def test_rebase_checks_out_before_claiming_the_worktree_session(monkeypatch, tmp_path):
+    # Regression: the survivor rebase must run its worktree checkout BEFORE it marks the worktree
+    # active. `_checkout_pr_branch` reuses an existing worktree only when its own idle guard passes,
+    # and that guard rejects an *active* worktree — so claiming the session first made the rebase
+    # refuse its own worktree and fail 'plumbing failed' every cycle. Fails before the fix
+    # (active_at_checkout would be True); passes after.
+    from agentflow.runner import _worktree_is_active
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    seen = {}
+
+    def fake_checkout(cfg, branch, w):
+        seen["active_at_checkout"] = _worktree_is_active(w)
+        return True
+
+    monkeypatch.setattr(loop, "_checkout_pr_branch", fake_checkout)
+    # rev-parse HEAD returns the same SHA twice → a no-op rebase, short-circuiting before push.
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun("same-head", 0))
+
+    result = loop._rebase_branch(RepoConfig("o/r", str(tmp_path)), "branch", wt)
+
+    assert seen["active_at_checkout"] is False        # checkout ran before the session was claimed
+    assert result is RebaseResult.NOOP
+    assert _worktree_is_active(wt) is False            # and the session is released afterward
+
+
 # --- issue #29: the mockup-production phase --------------------------------------------
 
 # Intake's park/kickoff comment on a needs-mockup issue: carries INTAKE_MARK, no MOCKUP_MARK.
