@@ -32,6 +32,7 @@ STAGE_NATIVE_HANDOFF = {
     "review": "pr:parked",
     "revise": "pr:parked",
     "respond": "pr:parked",
+    "converse": "ask:needs-you",
 }
 
 # Legacy orchestration labels normalize to a logical stage before lookup so the ambiguous
@@ -58,6 +59,11 @@ _ADMISSION_ROWS = {
     ("respond", "codex", "sol", "deep", None): 5,
     ("mockup", "claude", "opus", "deep", None): 5,
     ("mockup", "codex", "sol", "deep", None): 5,
+    # A Conversation turn is a bounded methodology session (ADR 0034). ADR 0034 leaves the
+    # converse admission calibration to the prototype; a modest two-permit footprint keeps
+    # headroom so an interactive Ask turn admits ahead of background work without starving it.
+    ("converse", "claude", "opus", "deep", None): 2,
+    ("converse", "codex", "sol", "deep", None): 2,
 }
 for _pool, _model, _complexity, _demands in (
     ("claude", "sonnet", "standard", (3, 4, 5, 5)),

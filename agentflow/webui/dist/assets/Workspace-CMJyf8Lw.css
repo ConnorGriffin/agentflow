@@ -1,0 +1,1 @@
+body:has(#dock){overflow:auto}#app-main.svelte-128ehk0{width:100%;max-width:var(--content-max);margin:0 auto;padding:10px var(--gutter) calc(var(--dock-h) + 36px)}

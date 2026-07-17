@@ -119,6 +119,31 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log, *, submit_new: bool = True
         cycle(repos, run=_recheck, _log=_log)
 
 
+# The repositories enrolled as Project workspaces. Only agentflow's own repo is enrolled for the
+# first workspace slice (ADR 0033/0034); the fleet-home switcher is a stub.
+WORKSPACE_REPOS = [c for c in REPOS if c.repo == "ConnorGriffin/agentflow"]
+
+
+def workspace_cycle(repos: list[RepoConfig], _log=log) -> None:
+    """Drive the Project workspace once: apply any transported commands (opening Asks, sending
+    turns) through the coordinator as ``converse`` stages, reconcile those turns, and publish the
+    bounded workspace projection (ADR 0033/0034). Isolated from the pipeline dispatch pass — it
+    shares the coordinator's durable store, so interactive Ask turns and background pipeline work
+    contend on the same permit ledger with the operator's turn ranked first."""
+    from agentflow import coordinated_build, coordinated_converse
+    if not repos:
+        return
+    try:
+        coord = coordinated_build.build_coordinator(_log=_log)
+        workdir_for = {c.repo: c.workdir for c in repos}
+        coordinated_converse.drain_commands(coord, workdir_for, _log=_log)
+        for pool in ("claude", "codex"):
+            coord.cycle(pool, now=int(time.time()))
+        coordinated_converse.publish_projection(repos)
+    except Exception as e:  # noqa: BLE001 — a bad workspace cycle must not kill the daemon
+        _log(f"workspace cycle error: {type(e).__name__}: {e}")
+
+
 def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> None:
     """Produce the GitHub-backed fleet snapshot and publish it for the console — the
     daemon is its only producer (ADR 0026), once per tick, dormant included (dormant is
@@ -186,6 +211,7 @@ class PollLoop:
         def work():
             try:
                 self._dispatch(self._repos, submit_new=submit_new)
+                workspace_cycle(WORKSPACE_REPOS)
                 self._publish(self._repos)
             finally:
                 self._running.release()
@@ -352,6 +378,7 @@ def main() -> None:
         if args.once:
             log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
             dispatch_cycle(REPOS)
+            workspace_cycle(WORKSPACE_REPOS)
             live.mark_cycle(FAST_TICK_SECONDS)
             publish_snapshot(REPOS)
             return

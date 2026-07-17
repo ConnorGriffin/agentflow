@@ -26,8 +26,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from agentflow.coordinator import (BuildStageAdapter, Coordinator, IntakeStageAdapter,
-                                   MockupStageAdapter,
+from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coordinator,
+                                   IntakeStageAdapter, MockupStageAdapter,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
                                    StageRouter, tracer)
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
@@ -379,8 +379,13 @@ def build_coordinator(_log=None) -> Coordinator:
         missing_context=_mockup_missing_context,
         handoff=_hold_mockup,
         settle=_settle_mockup)
+    from agentflow import coordinated_converse
+    converse = ConverseStageAdapter(
+        reply_ready=coordinated_converse._reply_ready,
+        adopt=coordinated_converse._adopt_turn,
+        park=coordinated_converse._park_ask)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
-                          "respond": respond, "mockup": mockup})
+                          "respond": respond, "mockup": mockup, "converse": converse})
     return Coordinator(adapter=router, gate=_production_gate(),
                        log=_log or (lambda _line: None))
 

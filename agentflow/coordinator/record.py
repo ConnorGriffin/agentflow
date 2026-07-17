@@ -73,3 +73,6 @@ class Record:
                                          # the same head SHA is still a fresh stage
     auto_merge_allowed: bool = True
     root: str | None = None              # the root stage this descends from; it shares the root's reservation
+    interactive: bool = False            # an operator-present turn (Ask) that outranks background
+                                         # pipeline work at admission (ADR 0034); reorders the
+                                         # queue, never bypasses budgets/permits/pool saturation

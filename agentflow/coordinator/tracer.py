@@ -26,9 +26,10 @@ from agentflow.coordinator.record import RUNNING, Record
 from agentflow.coordinator.store import Store, default_store_path
 
 
-# The six logical stages enabled behind the coordinator (issues #103–#108) — the one source
-# :func:`build_review_revise_gate` consumes.
-ENABLED_STAGES = ("intake", "build", "review", "revise", "mockup", "respond")
+# The logical stages enabled behind the coordinator — the one source
+# :func:`build_review_revise_gate` consumes. The six pipeline stages (issues #103–#108) plus the
+# Conversation-turn stage (``converse``) an Ask submits per operator message (ADR 0034).
+ENABLED_STAGES = ("intake", "build", "review", "revise", "mockup", "respond", "converse")
 
 
 def build_review_revise_gate(record: Record) -> bool:
