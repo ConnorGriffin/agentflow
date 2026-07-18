@@ -64,6 +64,9 @@ class ProviderObservation:
     unrecognized: tuple[dict, ...] = ()         # an opaque copy of fields we did not model
     family: str | None = None
     process_alive: bool = False
+    has_end_fact: bool = False                  # the supervisor published a durable end fact for this
+                                                # attempt — the provider family ended on its own, not
+                                                # with the daemon (the restart-resume discriminator)
 
     def classification(self) -> str:
         """The coordinator's provider label (recoverable | permanent | incomplete | unknown)."""
@@ -184,7 +187,8 @@ def _epoch(value):
 
 
 def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
-                    partial_output="", family=None, process_alive=False) -> ProviderObservation:
+                    partial_output="", family=None, process_alive=False,
+                    has_end_fact=False) -> ProviderObservation:
     """Extract facts from Claude's structured Agent SDK stream. A typed cause comes from the real
     stream shapes — an ``assistant`` message's error value, a rejected ``rate_limit_event``
     (with its ``resetsAt``), or a terminal ``result.subtype`` failure — never an invented
@@ -257,7 +261,8 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
         cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events,
-        unrecognized=tuple(unrecognized), family=family, process_alive=process_alive)
+        unrecognized=tuple(unrecognized), family=family, process_alive=process_alive,
+        has_end_fact=has_end_fact)
 
 
 # The typed Codex account/rate-limit facts (from the app-server surface or a typed companion
@@ -273,7 +278,7 @@ _CODEX_ACCOUNT_CAUSES = {
 
 def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_out=False,
                    final_message="", partial_output="", events=(), family=None,
-                   process_alive=False) -> ProviderObservation:
+                   process_alive=False, has_end_fact=False) -> ProviderObservation:
     """Extract facts from a Codex attempt. Only a typed ``account_fact`` (from the account/
     rate-limit surface) may establish capacity vs. a permanent plan problem; the model's
     prose is captured as ``final_message`` but never diagnoses. An untyped failure — even a
@@ -300,7 +305,8 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
     return ProviderObservation(
         cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
-        events=events, unrecognized=events, family=family, process_alive=process_alive)
+        events=events, unrecognized=events, family=family, process_alive=process_alive,
+        has_end_fact=has_end_fact)
 
 
 # --- the two production provider adapters (ADR 0030) ------------------------------------
@@ -343,7 +349,8 @@ class ClaudeProviderAdapter:
         return classify_claude(
             session.events, exit_status=session.exit_status, signal=session.signal,
             timed_out=session.timed_out, partial_output=session.partial_output,
-            family=record.family, process_alive=record.process_alive)
+            family=record.family, process_alive=record.process_alive,
+            has_end_fact=session.has_end_fact)
 
     def verify(self, record, obs) -> bool:
         return False
@@ -373,7 +380,8 @@ class CodexProviderAdapter:
             account_fact=account, exit_status=session.exit_status, signal=session.signal,
             timed_out=session.timed_out, partial_output=session.partial_output,
             events=session.events,
-            family=record.family, process_alive=record.process_alive)
+            family=record.family, process_alive=record.process_alive,
+            has_end_fact=session.has_end_fact)
 
     def verify(self, record, obs) -> bool:
         return False

@@ -44,6 +44,12 @@ class Record:
     effort: str | None = None
     attempts: int = 0            # provider attempts consumed (initial + up to two continuations)
     attempt_committed: bool = False  # this attempt's count is already consumed (idempotent on recovery)
+    daemon_generation: str | None = None  # the daemon-lifecycle identity that admitted the current
+                                          # attempt; a family that dies leaving no supervisor end fact
+                                          # under a *different* generation was taken down with the
+                                          # daemon (restart/reboot), so its attempt resumes uncharged
+    restart_resumes: int = 0     # consecutive restart-resumes of the current attempt — bounded, so a
+                                 # session that keeps dying with no end fact still parks eventually
     state: str = WAITING
     claim: bool = True           # holds the GitHub dedup claim while the stage is owned
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move

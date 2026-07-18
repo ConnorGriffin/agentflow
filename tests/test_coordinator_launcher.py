@@ -15,9 +15,12 @@ import time
 
 import pytest
 
-from conftest import FakeSession, NeverStartsLauncher, permits, starts_until_held
+from conftest import (FakeSession, NeverStartsLauncher, permits, record_of,
+                      starts_until_held)
 
 from agentflow.coordinator import Coordinator, Submission
+from agentflow.coordinator.admission import ATTEMPT_BUDGET
+from agentflow.coordinator.coordinator import RESTART_RESUME_CAP
 from agentflow.coordinator.launcher import LocalLauncher, pid_family_alive
 from agentflow.coordinator.providers import ProviderCause
 
@@ -64,6 +67,111 @@ def test_durable_started_and_alive_recovery_keeps_the_reservation(make_coord):
     assert permits(recovered, "codex") == 2
     assert recovered.cycle("codex") == []       # idempotent across repeated reconciliation
     assert permits(recovered, "codex") == 2
+
+
+# --- ADR 0030 / issue #175: a daemon restart resumes an attempt without charging it ---------
+
+def test_daemon_bounce_that_leaves_the_family_alive_is_recovered_not_resumed(make_coord):
+    """A plain SIGTERM bounce leaves the family alive (ADR 0030's setsid). Even under a fresh
+    daemon generation, an alive family is the healthy recovered-running path: its attempt is
+    unchanged, its reservation retained, and it is never treated as a restart resume."""
+    fake = FakeSession()
+    started = make_coord(fake, daemon_generation="daemon-1")
+    identity = started.submit_stage(review())
+    started.cycle("codex")                       # attempt 1 running, family alive
+
+    restarted = make_coord(fake, daemon_generation="daemon-2")
+    assert restarted.cycle("codex") == []        # the live family is observed, never re-launched
+    durable = record_of(restarted, identity)
+    assert durable.attempts == 1 and not durable.continuation
+    assert durable.restart_resumes == 0          # a live family is recovered, not resumed
+    assert permits(restarted, "codex") == 2      # its reservation is retained, not released
+
+
+def test_daemon_restart_that_kills_the_family_resumes_without_charging_an_attempt(make_coord):
+    """A restart/reboot that also kills the running family leaves no supervisor end fact. A fresh
+    daemon (new generation) attributes that death to the daemon lifecycle and re-runs the *same*
+    attempt in place: the attempt count stays flat, it is not a consumed continuation, and its
+    permits are released and cleanly re-reserved. This fails if the death is charged as before."""
+    fake = FakeSession()
+    started = make_coord(fake, daemon_generation="daemon-1")
+    identity = started.submit_stage(review())
+    started.cycle("codex")                       # attempt 1 running under daemon-1
+    assert record_of(started, identity).attempts == 1
+    fake.kill(identity)                          # a reboot takes the family down — no end fact
+
+    restarted = make_coord(fake, daemon_generation="daemon-2")
+    restarted.cycle("codex")
+    durable = record_of(restarted, identity)
+    assert durable.attempts == 1                 # same attempt, not charged again
+    assert durable.state == "running" and not durable.continuation
+    assert durable.restart_resumes == 1
+    assert permits(restarted, "codex") == 2      # permits released and cleanly re-reserved
+
+
+def test_repeated_daemon_bounces_keep_attempts_flat_then_genuine_retries_park(make_coord):
+    """Repeated restarts mid-session never advance the attempt count, but genuine provider
+    failures (each leaving an end fact) still consume attempts and park at the budget — the two
+    edges the fix must keep separate."""
+    fake = FakeSession()
+    coord = make_coord(fake, daemon_generation="d0")
+    identity = coord.submit_stage(review())
+    coord.cycle("codex")
+    for i in range(1, 4):
+        fake.kill(identity)                      # a restart kills the family, no end fact
+        coord = make_coord(fake, daemon_generation=f"d{i}")
+        coord.cycle("codex")
+        durable = record_of(coord, identity)
+        assert durable.attempts == 1             # flat across every bounce
+        assert durable.restart_resumes == i
+
+    # Attempt 1 is running again. Now genuine failures (end fact present) exhaust the budget.
+    parked = False
+    for _ in range(ATTEMPT_BUDGET + 2):
+        if record_of(coord, identity).state == "running":
+            fake.end(identity, cause=ProviderCause.UNKNOWN)  # a real failure — leaves an end fact
+        outcomes = coord.cycle("codex")
+        if any(o.identity == identity and o.status == "held" for o in outcomes):
+            parked = True
+            break
+    assert parked
+    assert record_of(coord, identity).attempts == ATTEMPT_BUDGET  # parked exactly at the budget
+
+
+def test_clean_but_incomplete_run_still_consumes_even_across_a_restart(make_coord):
+    """A clean exit-0 incomplete run leaves a supervisor end fact even though its cause is NONE.
+    Because the resume keys on end-fact *absence*, not on the cause, a generation change must not
+    let this masquerade as a restart kill — it still consumes an attempt and continues."""
+    fake = FakeSession()
+    started = make_coord(fake, daemon_generation="daemon-1")
+    identity = started.submit_stage(review())
+    started.cycle("codex")                       # attempt 1 running under daemon-1
+    fake.end(identity, cause=ProviderCause.NONE)  # clean-but-incomplete: an end fact is present
+
+    restarted = make_coord(fake, daemon_generation="daemon-2")
+    restarted.cycle("codex")
+    durable = record_of(restarted, identity)
+    assert durable.restart_resumes == 0          # never resumed — the end fact overrides the restart
+    assert durable.attempts == 2 and durable.continuation  # consumed and continued, as today
+
+
+def test_restart_resume_is_bounded_so_a_persistent_crash_loop_still_parks(make_coord):
+    """A family that keeps dying with no end fact under a fresh daemon each time cannot resume
+    forever: after the cap it stops resuming, consumes attempts, and parks."""
+    fake = FakeSession()
+    coord = make_coord(fake, daemon_generation="g-start")
+    identity = coord.submit_stage(review())
+    coord.cycle("codex")
+    parked = False
+    for i in range(RESTART_RESUME_CAP + ATTEMPT_BUDGET + 2):
+        fake.kill(identity)                      # a restart kills the family, no end fact
+        coord = make_coord(fake, daemon_generation=f"g{i}")
+        outcomes = coord.cycle("codex")
+        if any(o.identity == identity and o.status == "held" for o in outcomes):
+            parked = True
+            break
+    assert parked
+    assert record_of(coord, identity).restart_resumes == RESTART_RESUME_CAP
 
 
 def test_launch_that_never_creates_a_family_records_not_started(make_coord):
