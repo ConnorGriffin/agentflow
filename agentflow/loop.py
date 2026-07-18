@@ -182,10 +182,16 @@ forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the bo
 Write the PR body for the human who merges it — plain language: what changed, why, and
 what to check, in the app's own domain terms. No jargon: no file/function/test names or
 CSS/API specifics (ADR 0018). If the change touches a user-facing surface (this repo's are:
-{surfaces}), you MUST attach before/after screenshots (headless Playwright) as proof it
-matches the locked mockup — both light and dark themes where the app has them. A UI change
-with no screenshot cannot auto-merge (a mechanical gate parks it, ADR 0018), and a body full
-of jargon blocks at review. Both are charter gates, not style points.
+{surfaces}), you MUST ship before/after screenshots (headless Playwright) as proof it
+matches the locked mockup — both light and dark themes where the app has them. Attach them
+the committed way — no browser is involved and none may be used: save the PNGs under
+`docs/screenshots/issue-{n}/`, commit them on this branch, and embed each in the PR body as
+a markdown image pointing at the committed file
+(`https://github.com/{repo}/blob/<your-branch>/docs/screenshots/issue-{n}/<name>.png?raw=true`).
+NEVER try to upload images through a web browser or GitHub's drag-drop attachments — this
+host cannot do that, and an apology comment does not satisfy the gate; the committed files
+do. A UI change with no screenshot cannot auto-merge (a mechanical gate parks it, ADR 0018),
+and a body full of jargon blocks at review. Both are charter gates, not style points.
 
 Keep the change minimal and match the surrounding code. If you hit a blocker you
 cannot safely resolve, post a comment prefixed `MISSING-CONTEXT:` and stop instead
@@ -198,6 +204,11 @@ Do not degrade the two charter gates while revising (ADR 0018):
 - If the PR touches a user-facing surface (this repo's are: {surfaces}), keep before/after
   screenshots attached — both light and dark themes where the app has them. A UI change with
   no screenshot cannot auto-merge; a mechanical gate parks it regardless of the review.
+  If screenshots are missing or stale, capture them with headless Playwright, commit the
+  PNGs under `docs/screenshots/` on this branch, and embed them in the PR body as markdown
+  images pointing at the committed files (`.../blob/<branch>/<path>?raw=true`). NEVER try
+  to upload images through a web browser or GitHub's drag-drop attachments — this host
+  cannot do that; the committed files are the evidence.
 - Keep the PR body in plain app language for the human who merges — no file/function/test
   names or CSS/API specifics.
 

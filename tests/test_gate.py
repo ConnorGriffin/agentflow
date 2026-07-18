@@ -10,7 +10,8 @@ import time
 import pytest
 
 import agentflow.gate as gate
-from agentflow.gate import (MergeDecision, ci_is_green, decide_merge, has_image_evidence,
+from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
+                            has_committed_evidence, has_image_evidence,
                             maintainer_comment, maintainer_comment_id, reply_pending,
                             respond_reply_disclaimer, squash_merge,
                             touches_ui_surface)
@@ -190,6 +191,23 @@ class TestHasImageEvidence:
 
     def test_prose_only_body_has_no_image(self):
         assert not has_image_evidence("This changes the dashboard layout. Looks great.")
+
+
+class TestHasCommittedEvidence:
+    # The browserless attachment path: agents can't drag-drop into GitHub (that needs a
+    # signed-in browser), so screenshots committed on the branch count as evidence.
+    def test_committed_screenshot_under_the_convention_counts(self):
+        assert has_committed_evidence(
+            ["frontend/index.html", "docs/screenshots/issue-395/before-light.png"])
+
+    def test_an_unrelated_image_elsewhere_is_not_evidence(self):
+        assert not has_committed_evidence(["frontend/favicon.png", "frontend/app.js"])
+
+    def test_a_non_image_file_under_the_convention_is_not_evidence(self):
+        assert not has_committed_evidence(["docs/screenshots/issue-395/notes.md"])
+
+    def test_no_files_no_evidence(self):
+        assert not has_committed_evidence([])
 
 
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------

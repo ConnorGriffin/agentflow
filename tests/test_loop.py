@@ -440,6 +440,24 @@ def test_build_prompt_formats_and_tells_the_builder_the_pr_gates():
     assert "jargon" in body.lower()        # plain-language gate
 
 
+def test_build_prompt_prescribes_the_browserless_screenshot_path():
+    # PR #402 in ciq-autotune parked because the builder tried GitHub's drag-drop upload,
+    # which needs a signed-in browser this host doesn't have. The prompt now names the
+    # committed path (docs/screenshots/ on the branch) and forbids the browser route.
+    body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
+                               surfaces="`frontend/`")
+    assert "docs/screenshots/issue-7/" in body
+    assert "https://github.com/o/r/blob/" in body
+    assert "upload images through a web browser" in body
+
+
+def test_revise_prompt_prescribes_the_browserless_screenshot_path():
+    # A revise sent to fix missing screenshots must not bounce off the same browser wall.
+    body = REVISE_PROMPT.format(n=5, findings="- fix it", surfaces="`frontend/`")
+    assert "docs/screenshots/" in body
+    assert "upload images through a web browser" in body
+
+
 def test_build_prompt_names_the_charter_test_standard():
     # ADR 0022: the builder is told the bar up front, not only caught at cross-review.
     body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",

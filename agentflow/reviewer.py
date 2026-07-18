@@ -165,10 +165,13 @@ BLOCKING (only these):
   - a **PR body not framed for the human who merges** — it leans on file / function /
     test names or CSS / API specifics instead of plain app behavior (ADR 0018);
   - a **user-facing change with no screenshot** — any PR whose files touch a
-    user-facing surface ({surfaces}) must attach before/after screenshots, in the body
-    or a comment, covering both light and dark themes where the app has them; none is a
-    blocking gap (ADR 0018). Backend-only PRs need none. (Note: a mechanical gate also
-    parks such a PR independent of your verdict — you cannot waive this one.)
+    user-facing surface ({surfaces}) must ship before/after screenshots, covering both
+    light and dark themes where the app has them; none is a blocking gap (ADR 0018).
+    Screenshots committed on the branch under `docs/screenshots/` (usually also embedded
+    in the body as markdown images) COUNT as attached — open them in your checkout, don't
+    block just because an image link doesn't render inline. Backend-only PRs need none.
+    (Note: a mechanical gate also parks such a PR independent of your verdict — you
+    cannot waive this one.)
 A correctness gap BEYOND the stated acceptance — an unhandled case the issue did not
 ask for — is a NIT, not blocking; note it so it can be filed as a follow-up.
 Style, naming, and minor perf are nits.

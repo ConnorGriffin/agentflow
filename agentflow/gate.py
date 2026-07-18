@@ -187,6 +187,10 @@ _HTML_IMG_RE = re.compile(r"<img[\s>]", re.IGNORECASE)       # <img ...>
 # user-images.githubusercontent.com/... or github.com/<owner>/<repo|user-attachments>/assets/...
 _ASSET_URL_RE = re.compile(
     r"https?://(?:[\w.-]*githubusercontent\.com/|github\.com/[^\s)]+/assets/)", re.IGNORECASE)
+# The browserless attachment path builders are instructed to use: screenshots committed
+# on the branch under docs/screenshots/, viewable in the PR's Files-changed tab.
+_EVIDENCE_FILE_RE = re.compile(
+    r"(?:^|/)docs/screenshots/.+\.(?:png|jpe?g|gif|webp)$", re.IGNORECASE)
 
 
 def touches_ui_surface(changed_files: list[str], surfaces: list[str]) -> bool:
@@ -203,6 +207,13 @@ def has_image_evidence(text: str) -> bool:
                 or _ASSET_URL_RE.search(text))
 
 
+def has_committed_evidence(changed_files: list[str]) -> bool:
+    """Pure. True if the PR itself commits screenshots under the evidence convention
+    (docs/screenshots/**). Agents cannot use GitHub's drag-drop upload (it needs a
+    signed-in browser), so committed files are the first-class evidence channel."""
+    return any(_EVIDENCE_FILE_RE.search(f) for f in changed_files)
+
+
 def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     """Live: does this PR change a declared UI surface but carry no screenshot in its
     body or comments? Fail-safe — a `gh` error with surfaces declared returns True (we
@@ -216,6 +227,8 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     data = json.loads(r.stdout or "{}")
     files = [f.get("path", "") for f in data.get("files", [])]
     if not touches_ui_surface(files, surfaces):
+        return False
+    if has_committed_evidence(files):
         return False
     evidence = "\n".join([data.get("body") or ""]
                          + [c.get("body", "") for c in data.get("comments", [])])
