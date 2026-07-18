@@ -74,6 +74,8 @@ class Submission:
                                     # genuinely new stage with a fresh budget
     descendant_of: str | None = None  # a subagent shares this root stage's one reservation
     transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
+    supersede: bool = False           # the ``transfer_from`` predecessor is a still-in-flight Review
+                                      # stranded at a moved head (#208), not a completed stage
     interactive: bool = False         # operator-present (Ask) turn: admission priority over
                                       # background pipeline work (ADR 0034)
 
@@ -164,7 +166,7 @@ class Coordinator:
             interactive=submission.interactive, created_at=int(time.time()))
         with self._lock:
             successor, prior, transferred, root = self._store.submit(
-                record, submission.transfer_from)
+                record, submission.transfer_from, supersede=submission.supersede)
             self._records[identity] = successor
             if prior is not None:
                 self._records[prior.identity] = prior
@@ -199,6 +201,50 @@ class Coordinator:
                 self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed but no "
                                   f"next stage remains — parking for human; claim retained "
                                   f"pending durable handoff")
+            return self._finalize_hold(record)
+
+    def retire_stale_review(self, identity: str) -> bool:
+        """Silently retire a Review whose PR is gone — merged or closed — before any further attempt
+        is charged against a head there is no longer anything to review (#208). The record releases
+        its claim with no park comment and no notification. Idempotent: a repeat finds it already
+        retired and does nothing."""
+        with self._lock:
+            record = self._store.record_of(identity)
+            if (record is None or record.retired or record.stage != "review"
+                    or not record.claim):
+                return False
+            self._release(record)
+            record.state = COMPLETED
+            record.claim = False
+            record.retired = True
+            if not self._persist(record, retire_descendants=True):
+                return False
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} — PR merged or closed; "
+                              "nothing left to review; retired silently, claim released")
+            return True
+
+    def park_stale_review(self, identity: str) -> "StageOutcome | None":
+        """Park a Review whose PR head moved off its immutable target once the auto-revise rounds are
+        spent: the stranded record can open no bounded successor, so the PR is handed to a human
+        through the same Review-native exhaustion handoff a budget exhaustion uses (#208). Only ever
+        called for an open PR. Idempotent and crash-safe: a repeat re-observes the durable park and
+        neither re-notifies nor double-releases the claim."""
+        with self._lock:
+            record = self._store.record_of(identity)
+            if (record is None or record.retired or record.stage != "review"
+                    or not record.claim):
+                return None
+            self._records[identity] = record
+            if not record.hold_pending:
+                self._release(record)
+                record.state = COMPLETED
+                record.hold_pending = True
+                record.hold_reason = "PR head moved off the reviewed SHA and revise rounds are spent"
+                if not self._persist(record):
+                    return None
+                self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} — PR head moved and "
+                                  "revise rounds spent; parking for human; claim retained pending "
+                                  "durable handoff")
             return self._finalize_hold(record)
 
     def cycle(self, pool: str, *, now: int = 0) -> list[StageOutcome]:

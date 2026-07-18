@@ -9,6 +9,7 @@ coordinator.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from dataclasses import replace
@@ -20,6 +21,7 @@ import pytest
 from conftest import FakeSession, permits, record_of
 
 from agentflow import coordinated_build
+from agentflow.gate import MAX_REVISES
 from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, StageRouter, Submission,
                                     tracer)
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
@@ -515,7 +517,10 @@ def test_production_reconciliation_recovers_completed_build_handoff_after_restar
     coordinated_build.reconcile_and_project(restarted_again)
     assert list(fake.family_of).count(review) == 1
     assert len([r for r in _records(restarted_again) if r.stage == "review"]) == 1
-    assert len(calls) == 2
+    # The Build → Review opener resolved the branch's PR exactly once (a second readable pass);
+    # later passes only re-read the in-flight review's live head to detect a moved head (#208),
+    # never re-firing the opener.
+    assert sum(1 for c in calls if c[:3] == ["gh", "pr", "list"]) == 2
 
 
 # --- the production Review adapter wiring (issue #120) -----------------------------------
@@ -917,3 +922,123 @@ def test_review_identity_is_idempotent_per_exact_head(make_coord):
     changed = coord.submit_stage(_review(target="head-b"))
     assert changed != same
     assert {r.target for r in _records(coord) if r.stage == "review"} == {"head-a", "head-b"}
+
+
+# --- a PR head that moves off the immutable review target (issue #208) --------------------
+#
+# A Review's target SHA is immutable and verify demands a verdict for exactly that SHA. When the
+# head moves for any reason other than an auto-revise — a maintainer rebase, a manual push, a
+# conflict fix — the in-flight review can never verify: it re-reviews a dead head, burns its budget,
+# and finally parks "budget exhausted" even on a merged PR. The reconcile pass detects the
+# divergence before an attempt is charged, driven here through the production
+# ``reconcile_and_project`` seam with GitHub reads faked.
+
+
+def _diverged_review(*, target, subject="7", pool="codex", builder_lineage="claude", round=0):
+    """A cold Review holding its claim, at a read-only review worktree whose path encodes PR #26 —
+    the shape ``reconcile_and_project`` needs to recover the PR number for its live-head read."""
+    return Submission(
+        repo="o/r", subject=subject, stage="review", pool=pool, complexity="deep", target=target,
+        builder_lineage=builder_lineage, round=round, input_ptr="Review PR #26",
+        source="/work/.agentflow/worktrees/codex-review/pr-26-home-depot-probe")
+
+
+def _gh_pr(state, head):
+    """A faked GitHub edge: ``gh pr view`` reports one PR's live head and state; anything else
+    fails, so a stray call is visible rather than silently satisfied."""
+    def run(cmd):
+        if cmd[:3] == ["gh", "pr", "view"]:
+            return SimpleNamespace(returncode=0,
+                                   stdout=json.dumps({"headRefOid": head, "state": state}))
+        return SimpleNamespace(returncode=1, stdout="")
+    return run
+
+
+def test_a_merged_pr_retires_the_stranded_review_silently(make_coord, monkeypatch):
+    """Reproduces home-depot PR #26: a Review stranded at a rebased-away head on a PR the maintainer
+    already merged must retire silently — no park comment, no notification, no attempt charged. Fails
+    before the fix, where nothing detects the merge and the review parks the merged PR."""
+    fake = FakeSession()
+    fake.gate_open = False  # isolate the divergence pass from admission
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    rec = record_of(coord, ident)
+    assert rec.retired is True and rec.claim is False
+    assert rec.attempts == 0                            # the divergence charges no attempt
+    assert rec.handoffs == 0 and rec.notifications == 0  # nothing parked, nobody notified
+    assert rec.hold_pending is False
+
+
+def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(make_coord,
+                                                                             monkeypatch):
+    """An open PR whose head moved off the review target retires the stranded record and opens one
+    successor Review at the live head, at the same auto-revise round; the stranded attempt is never
+    charged. Re-running reconciliation opens nothing new (idempotent)."""
+    fake = FakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    stale = coord.submit_stage(_diverged_review(target="stale-sha", round=0))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda tool: "codex")
+
+    coordinated_build.reconcile_and_project(coord)
+
+    stale_rec = record_of(coord, stale)
+    assert stale_rec.retired is True and stale_rec.claim is False
+    assert stale_rec.attempts == 0                      # the stranded attempt is never charged
+    records = {r.identity: r for r in _records(coord)}
+    assert "o/r|7|review|live-sha" in records
+    successor = records["o/r|7|review|live-sha"]
+    assert successor.state == "waiting" and successor.claim is True
+    assert successor.target == "live-sha" and successor.round == 0
+    assert successor.builder_lineage == "claude"        # lineage carried forward
+    assert successor.handoffs == 0                      # no human park
+
+    coordinated_build.reconcile_and_project(coord)       # idempotent re-drive
+    live = [r.identity for r in _records(coord) if r.stage == "review" and not r.retired]
+    assert live == ["o/r|7|review|live-sha"]
+
+
+def test_a_moved_head_parks_once_when_the_revise_rounds_are_spent(make_coord, monkeypatch):
+    """When the auto-revise rounds are already spent, a moved head has no bounded successor to open,
+    so the open PR parks once through the existing Review exhaustion handoff."""
+    fake = FakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha", round=MAX_REVISES))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    rec = record_of(coord, ident)
+    assert rec.state == "held" and rec.handoffs == 1 and rec.notifications == 1
+    assert rec.claim is False
+    assert not [r for r in _records(coord) if r.target == "live-sha"]  # no successor opened
+
+    coordinated_build.reconcile_and_project(coord)       # the park is idempotent
+    assert record_of(coord, ident).handoffs == 1
+
+
+def test_an_unmoved_head_is_left_to_the_normal_review_flow(make_coord, monkeypatch):
+    """The live head still equals the review target: the reconcile pass leaves the record entirely
+    alone so the ordinary verify/settle flow is unchanged (no retire, no successor, no park)."""
+    fake = FakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="live-sha", round=0))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    rec = record_of(coord, ident)
+    assert rec.retired is False and rec.claim is True and rec.state == "waiting"
+    assert rec.handoffs == 0
+    assert [r.identity for r in _records(coord) if r.stage == "review"] == [ident]
