@@ -350,10 +350,16 @@ def drain_commands(coordinator, workdir_for, *, _log=None) -> list[dict]:
 # --- projection (daemon-published read model, ADR 0033) ---------------------------------
 
 def build_projection(repos: list, *, store_factory=WorkspaceStore, now=None,
-                     daemon_available: bool = True) -> dict:
+                     daemon_available: bool = True, pipeline_for=None) -> dict:
     """Assemble the bounded workspace projection over the enrolled repos. Each Project is one
     enrolled repository; only agentflow's own repo is enrolled for this tracer (the fleet-home
-    switcher is a stub)."""
+    switcher is a stub).
+
+    ``pipeline_for`` is the daemon-side GitHub join ``(repo, published_issue_numbers) -> {issue:
+    state}`` that mirrors coarse pipeline state + landed evidence onto each published proposal. It
+    is called only for the small set of published issues, and only the daemon injects it — the web
+    layer never reads GitHub (ADR 0026/0033). A failed join yields no pipeline data, so the card
+    falls back to the publication receipt rather than erroring."""
     now = int(time.time()) if now is None else now
     projects = []
     for cfg in repos:
@@ -363,18 +369,30 @@ def build_projection(repos: list, *, store_factory=WorkspaceStore, now=None,
             proposals = store.proposals()
         finally:
             store.close()
+        pipeline = {}
+        if pipeline_for is not None:
+            published = [p.published_issue for p in proposals
+                         if p.state == "published" and p.published_issue]
+            if published:
+                try:
+                    pipeline = pipeline_for(cfg.repo, published) or {}
+                except Exception:  # noqa: BLE001 — a bad join must not blank the whole projection
+                    pipeline = {}
         projects.append({
             "id": project_slug(cfg.repo), "repo": cfg.repo,
             "profile": getattr(cfg, "profile", ""), "conversations": convos,
-            "proposals": proposals})
+            "proposals": proposals, "pipeline": pipeline})
     return workspace_projection(projects, read_model_at=now, revision=now,
                                 daemon_available=daemon_available)
 
 
-def publish_projection(repos: list, *, store_factory=WorkspaceStore, now=None) -> None:
+def publish_projection(repos: list, *, store_factory=WorkspaceStore, now=None,
+                       pipeline_for=None) -> None:
     """Publish the workspace projection atomically for the console (ADR 0033), alongside the fleet
-    snapshot. A generation is current only when the whole read is durable."""
-    projection = build_projection(repos, store_factory=store_factory, now=now)
+    snapshot. A generation is current only when the whole read is durable. The daemon injects
+    ``pipeline_for`` so a published proposal's card mirrors its coarse pipeline state + evidence."""
+    projection = build_projection(repos, store_factory=store_factory, now=now,
+                                  pipeline_for=pipeline_for)
     live._write_atomic(live.STATE_DIR / WORKSPACE_PROJECTION_FILE, projection)
 
 

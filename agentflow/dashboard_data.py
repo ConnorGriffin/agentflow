@@ -8,6 +8,7 @@ test surface; the gh queries are orchestration exercised live.
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -54,6 +55,112 @@ def _prs(repo: str, state: str) -> list[dict]:
                 if p.get("headRefName", "").startswith("agentflow/")]
     except json.JSONDecodeError:
         return []
+
+
+# --- workspace pipeline join (ADR 0033): coarse pipeline state + landed evidence for the small
+# set of published Build-Issue proposals, keyed by issue number. The pure shaping is the test
+# surface; the `gh` read stays daemon-side so the web layer never queries GitHub. -------------
+
+# An agentflow build branch is `agentflow/<tool>/issue-<N>-slug` (coordinated_build), so the
+# issue a PR was cut for is recoverable from its branch.
+_ISSUE_BRANCH = re.compile(r"^agentflow/[^/]+/issue-(\d+)(?:-|$)")
+
+# The extra facts a published issue's PR carries: the merge commit, the review verdict, and the
+# CI rollup — read only for the published issues, not the whole fleet.
+_PIPELINE_JSON = "number,title,headRefName,url,mergedAt,mergeCommit,reviewDecision,statusCheckRollup"
+
+
+def issue_of_branch(head_ref: str) -> int | None:
+    """The issue number an agentflow build branch was cut for, or ``None``. Pure."""
+    m = _ISSUE_BRANCH.match(head_ref or "")
+    return int(m.group(1)) if m else None
+
+
+def _review_verdict(decision) -> str | None:
+    """Coarse agent-review verdict from a PR's ``reviewDecision``: approved / changes_requested,
+    or ``None`` when there is no clean signal (then 'in review' collapses into 'PR open'). Pure."""
+    d = (decision or "").upper()
+    if d == "APPROVED":
+        return "approved"
+    if d == "CHANGES_REQUESTED":
+        return "changes_requested"
+    return None
+
+
+def _ci_verdict(rollup) -> str | None:
+    """Coarse CI verdict from a PR's status-check rollup: passing / failing / pending, or ``None``
+    when there are no checks. Handles both check-run (``conclusion``) and status (``state``)
+    entries. Pure."""
+    checks = rollup or []
+    if not checks:
+        return None
+    states = [(c.get("conclusion") or c.get("state") or "").upper() for c in checks]
+    if any(s in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED") for s in states):
+        return "failing"
+    if any(s in ("", "PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "WAITING") for s in states):
+        return "pending"
+    return "passing"
+
+
+def _pr_for_issue(issue_number: int, prs: list[dict]) -> dict | None:
+    """The most recent agentflow PR cut for this issue, by branch, or ``None``. The highest PR
+    number is the freshest attempt (a rebuild opens a new PR). Pure."""
+    matches = [p for p in prs if issue_of_branch(p.get("headRefName", "")) == issue_number]
+    return max(matches, key=lambda p: p.get("number", 0)) if matches else None
+
+
+def pipeline_state(issue_number: int, open_prs: list[dict], merged_prs: list[dict]) -> dict:
+    """Coarse pipeline state + Acceptance Evidence for one published build issue, from the PRs that
+    reference it by branch (the daemon already read these). Merged wins over open; among open PRs a
+    review signal lifts 'PR open' to 'in review'; with no PR yet the handed-off issue is 'building'.
+    On merge the evidence is the merge commit + review/CI verdict. Pure (the test surface)."""
+    merged = _pr_for_issue(issue_number, merged_prs)
+    if merged is not None:
+        return {
+            "state": "merged",
+            "pr_number": merged.get("number"),
+            "pr_url": merged.get("url"),
+            "merged_at": merged.get("mergedAt"),
+            "merge_commit": (merged.get("mergeCommit") or {}).get("oid"),
+            "review": _review_verdict(merged.get("reviewDecision")),
+            "ci": _ci_verdict(merged.get("statusCheckRollup")),
+        }
+    openpr = _pr_for_issue(issue_number, open_prs)
+    if openpr is not None:
+        review = _review_verdict(openpr.get("reviewDecision"))
+        return {
+            "state": "in_review" if review else "pr_open",
+            "pr_number": openpr.get("number"),
+            "pr_url": openpr.get("url"),
+            "review": review,
+            "ci": _ci_verdict(openpr.get("statusCheckRollup")),
+        }
+    return {"state": "building", "pr_number": None, "pr_url": None}
+
+
+def _pipeline_prs(repo: str, state: str) -> list[dict]:
+    r = _run(["gh", "pr", "list", "--repo", repo, "--state", state, "--json",
+              _PIPELINE_JSON, "--limit", "50"])
+    if r.returncode != 0:
+        return []
+    try:
+        return [p for p in json.loads(r.stdout)
+                if p.get("headRefName", "").startswith("agentflow/")]
+    except json.JSONDecodeError:
+        return []
+
+
+def workspace_pipeline(repo: str, issue_numbers) -> dict:
+    """Resolve coarse pipeline state + landed evidence for the given published build issues, keyed
+    by issue number — the daemon-side GitHub read the workspace projection joins onto (ADR 0033).
+    Only the published issues are resolved, so this stays cheap next to the whole-fleet snapshot.
+    Returns ``{issue_number: state_dict}``; the web layer never calls this."""
+    wanted = {int(n) for n in issue_numbers if n}
+    if not wanted:
+        return {}
+    open_prs = _pipeline_prs(repo, "open")
+    merged_prs = _pipeline_prs(repo, "merged")
+    return {n: pipeline_state(n, open_prs, merged_prs) for n in wanted}
 
 
 def _dial_of(labels: list[dict], prefix: str) -> str | None:

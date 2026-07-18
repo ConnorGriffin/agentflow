@@ -142,3 +142,74 @@ def test_held_and_parked_leave_when_resolved(monkeypatch):
     view = dd.repo_view(SimpleNamespace(repo="o/app", workdir="/tmp/app"))
     assert view["held"] == []
     assert view["parked"] == []
+
+
+# --- workspace pipeline join (issue #155): coarse state + landed evidence per published issue ---
+
+def test_issue_of_branch_recovers_the_issue_number():
+    assert dd.issue_of_branch("agentflow/claude/issue-155-project-workspace") == 155
+    assert dd.issue_of_branch("agentflow/codex/issue-7") == 7
+    assert dd.issue_of_branch("agentflow/claude/hotfix") is None     # no issue-<N> segment
+    assert dd.issue_of_branch("some-human-branch") is None
+    assert dd.issue_of_branch("") is None
+
+
+def test_pipeline_state_building_when_no_pr_yet():
+    pipe = dd.pipeline_state(155, open_prs=[], merged_prs=[])
+    assert pipe["state"] == "building" and pipe["pr_number"] is None and pipe["pr_url"] is None
+
+
+def test_pipeline_state_pr_open_and_in_review():
+    open_prs = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200"}]
+    pipe = dd.pipeline_state(155, open_prs=open_prs, merged_prs=[])
+    assert pipe["state"] == "pr_open" and pipe["pr_number"] == 200 and pipe["pr_url"] == "u/200"
+
+    reviewed = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200",
+                 "reviewDecision": "APPROVED"}]
+    pipe = dd.pipeline_state(155, open_prs=reviewed, merged_prs=[])
+    assert pipe["state"] == "in_review" and pipe["review"] == "approved"
+
+
+def test_pipeline_state_merged_carries_evidence():
+    merged = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200",
+               "mergedAt": "2026-07-17T00:00:00Z", "mergeCommit": {"oid": "abc1234def"},
+               "reviewDecision": "APPROVED",
+               "statusCheckRollup": [{"conclusion": "SUCCESS"}, {"state": "SUCCESS"}]}]
+    pipe = dd.pipeline_state(155, open_prs=[], merged_prs=merged)
+    assert pipe["state"] == "merged" and pipe["pr_number"] == 200 and pipe["pr_url"] == "u/200"
+    assert pipe["merge_commit"] == "abc1234def" and pipe["merged_at"] == "2026-07-17T00:00:00Z"
+    assert pipe["review"] == "approved" and pipe["ci"] == "passing"
+
+
+def test_pipeline_state_merged_wins_over_stale_open_pr():
+    # A rebuild PR that merged supersedes any lingering open PR for the same issue.
+    open_prs = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200"}]
+    merged = [{"number": 210, "headRefName": "agentflow/codex/issue-155-y", "url": "u/210",
+               "mergeCommit": {"oid": "deadbeef"}}]
+    assert dd.pipeline_state(155, open_prs=open_prs, merged_prs=merged)["state"] == "merged"
+
+
+def test_ci_verdict_reduces_mixed_checks():
+    assert dd._ci_verdict([{"conclusion": "SUCCESS"}]) == "passing"
+    assert dd._ci_verdict([{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]) == "failing"
+    assert dd._ci_verdict([{"conclusion": "SUCCESS"}, {"state": "PENDING"}]) == "pending"
+    assert dd._ci_verdict([]) is None
+
+
+def test_workspace_pipeline_reads_only_for_wanted_issues(monkeypatch):
+    open_prs = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200"}]
+    merged = [{"number": 190, "headRefName": "agentflow/codex/issue-140-z", "url": "u/190",
+               "mergeCommit": {"oid": "cafef00d"}}]
+
+    def run(args, **kw):
+        state = args[args.index("--state") + 1]
+        return SimpleNamespace(returncode=0,
+                               stdout=json.dumps(open_prs if state == "open" else merged))
+    monkeypatch.setattr(dd, "_run", run)
+
+    out = dd.workspace_pipeline("o/app", [155, 140])
+    assert set(out) == {155, 140}
+    assert out[155]["state"] == "pr_open"
+    assert out[140]["state"] == "merged" and out[140]["merge_commit"] == "cafef00d"
+    # An empty request never touches GitHub.
+    assert dd.workspace_pipeline("o/app", []) == {}

@@ -130,7 +130,7 @@ def workspace_cycle(repos: list[RepoConfig], _log=log) -> None:
     bounded workspace projection (ADR 0033/0034). Isolated from the pipeline dispatch pass — it
     shares the coordinator's durable store, so interactive Ask turns and background pipeline work
     contend on the same permit ledger with the operator's turn ranked first."""
-    from agentflow import coordinated_build, coordinated_converse
+    from agentflow import coordinated_build, coordinated_converse, dashboard_data
     from agentflow.workspace import publish
     if not repos:
         return
@@ -144,7 +144,10 @@ def workspace_cycle(repos: list[RepoConfig], _log=log) -> None:
         # hash, so a crash between "issue created" and "receipt recorded" never files a duplicate
         # (ADR 0033). Runs after the drain so an approval taken this cycle publishes this cycle.
         publish.reconcile_publications(repos, now=int(time.time()), _log=_log)
-        coordinated_converse.publish_projection(repos)
+        # Mirror each published proposal's coarse pipeline state + landed evidence onto its card,
+        # joined from the GitHub facts the daemon already reads — never from the web layer (ADR 0033).
+        coordinated_converse.publish_projection(
+            repos, pipeline_for=dashboard_data.workspace_pipeline)
     except Exception as e:  # noqa: BLE001 — a bad workspace cycle must not kill the daemon
         _log(f"workspace cycle error: {type(e).__name__}: {e}")
 
