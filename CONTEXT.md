@@ -25,10 +25,24 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   *Avoid:* trail, roadmap, plan.
 
 - **Decision ticket** — one bounded question or prerequisite inside a decision map.
-  It is resolved through its own chat session with the whole map loaded as context.
-  Its states are `open`, `resolved`, and `discarded`; `blocked` is derived from open
-  prerequisite tickets rather than stored as a state. Resolution requires a durable
-  answer and required outputs, but the ticket itself never enters the build pipeline.
+  It is resolved in its own agent session — operator-driven for judgment tickets,
+  or daemon-dispatched and unattended for AFK-able research — with the whole map
+  loaded as context. Its states are `open`, `resolved`, and `discarded`; `blocked`
+  is derived from open prerequisite tickets rather than stored as a state.
+  Resolution requires a durable answer and required outputs, but the ticket itself
+  never enters the build pipeline.
+
+- **AFK-able ticket** — a decision ticket an unattended agent session can finish
+  alone (`wayfinder:research`), whether it reads the repository or external
+  sources. The only ticket type the daemon may dispatch; every other type needs
+  the operator in the loop. The label is a promise of AFK-ability, applied
+  honestly.
+  *Avoid:* inward/outward research (source location is not the axis).
+
+- **Ticket claim** — the `wayfinder:resolving` label marking a decision ticket in
+  progress by any session, human or daemon; one signal for both, released on
+  completion or by daemon crash recovery.
+  *Avoid:* assignment-as-claim (the daemon shares the operator's GitHub identity).
 
 - **Build issue** — one operator-approved, independently buildable GitHub issue that
   enters intake. It may be filed directly from chat or handed off from a cleared

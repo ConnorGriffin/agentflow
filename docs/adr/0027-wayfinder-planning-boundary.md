@@ -1,6 +1,6 @@
 # ADR 0027 — Wayfinder planning artifacts stay upstream of intake
 
-- Status: Accepted
+- Status: Superseded by [ADR 0037](0037-daemon-dispatch-of-afk-research.md)
 - Date: 2026-07-13
 
 ## Context
