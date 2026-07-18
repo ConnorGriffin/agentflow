@@ -93,10 +93,14 @@ class FakeSession:
         self.alive.discard(self.family_of.get(identity, ""))
 
     def end(self, identity: str, *, success: bool = False,
-            cause: ProviderCause = ProviderCause.UNKNOWN, reset_at: int | None = None) -> None:
-        """Script how ``identity``'s provider ended and mark its family dead."""
+            cause: ProviderCause = ProviderCause.UNKNOWN, reset_at: int | None = None,
+            end_fact: bool = True) -> None:
+        """Script how ``identity``'s provider ended and mark its family dead. A scripted end is a
+        provider that finished on its own, so by default it leaves a durable supervisor end fact —
+        the signal that separates a genuine failure from a family a daemon restart took down (which
+        leaves none: see :meth:`kill`)."""
         self._script[identity] = _Ending(
-            ProviderObservation(cause=cause, reset_at=reset_at), success)
+            ProviderObservation(cause=cause, reset_at=reset_at, has_end_fact=end_fact), success)
         self.kill(identity)
 
 

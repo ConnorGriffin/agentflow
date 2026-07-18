@@ -46,6 +46,9 @@ class CapturedSession:
     signal: int | None = None
     timed_out: bool = False
     partial_output: str = ""
+    has_end_fact: bool = False   # a supervisor end fact (`.result`/`.exit`) existed for this token —
+                                 # the durable proof the provider family ended on its own, not with
+                                 # the daemon. Absence is what distinguishes a restart-caused death.
 
 
 def write_result(store_path: Path | str, token: str, *, exit_status: int | None,
@@ -90,16 +93,19 @@ def read_session(store_path: Path | str, token: str | None) -> CapturedSession:
     exit_status: int | None = None
     signal: int | None = None
     timed_out = False
+    has_end_fact = False
     try:
         result = json.loads(result_path(store_path, token).read_text())
         exit_status = result.get("exit_status")
         signal = result.get("signal")
         timed_out = result.get("timed_out") is True
+        has_end_fact = True
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         # Compatibility with artifacts written before the full supervisor result existed.
         try:
             exit_status = int(exit_path(store_path, token).read_text().strip())
+            has_end_fact = True
         except (OSError, ValueError):
             exit_status = None
     return CapturedSession(tuple(events), exit_status, signal, timed_out,
-                           "\n".join(partial))
+                           "\n".join(partial), has_end_fact)

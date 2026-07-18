@@ -20,6 +20,7 @@ observer collaborators.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -38,6 +39,10 @@ from agentflow.coordinator.store import Store, default_store_path
 # stable deadline after a restart.
 CONTINUATION_BUDGET = ATTEMPT_BUDGET - 1  # the two automatic continuations after the first try
 SUPERVISOR_WINDOW = 2 * 3600              # observe-until horizon stamped at admission, for the log
+# A daemon restart/reboot that kills a running family costs no attempt — the same attempt resumes in
+# place. That resume is bounded per stage identity so a family that keeps dying with no provider end
+# fact still parks eventually instead of spinning forever at zero budget cost.
+RESTART_RESUME_CAP = 5
 
 # The required-outcome noun each stage proves, for the completion log line (ADR 0028).
 _OUTCOME_LABEL = {
@@ -104,11 +109,17 @@ class Coordinator:
     public operation — the public surface is ``submit_stage``, ``cycle``, and ``park_completed``.
     """
 
-    def __init__(self, *, launcher=None, gate=None, adapter=None, log=None) -> None:
+    def __init__(self, *, launcher=None, gate=None, adapter=None, log=None,
+                 daemon_generation: str | None = None) -> None:
         self._store = Store(default_store_path())
         self._launcher = launcher or LocalLauncher()
         self._gate = gate or _admit_everything
         self._adapter = adapter or _DefaultAdapter()
+        # This process's daemon-lifecycle identity, stamped on every attempt it admits. A restart
+        # is a new process with a new pid, so an attempt found dead under a *different* generation
+        # — and leaving no supervisor end fact — was taken down with the daemon, not by the
+        # provider. The daemon writes this same pid under STATE_DIR/daemon.lock (ADR 0030).
+        self._daemon_generation = daemon_generation or str(os.getpid())
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
         # An adapter with no prepare (the read-only default) is always ready.
@@ -268,6 +279,8 @@ class Coordinator:
                 self._consume_attempt(record)
                 if not self._launcher.is_alive(record.family):
                     record.process_alive = False
+                    if self._resume_after_restart(record):
+                        continue  # a daemon restart killed it — resumed in place, uncharged
                     outcome = self._finalize(record)
                     if outcome is not None:
                         outcomes.append(outcome)
@@ -283,6 +296,42 @@ class Coordinator:
                     if not was_committed:
                         self._persist(record)
         return outcomes
+
+    def _resume_after_restart(self, record: Record) -> bool:
+        """Resume, without charging the budget, an attempt whose family a daemon restart killed.
+
+        A durable ``started`` family proven dead that (a) left no supervisor end fact and (b) was
+        admitted under a *different* daemon generation than the one now reconciling was taken down
+        with the daemon — a restart or reboot — not by the provider. That is not an attempt
+        failure, so the same attempt re-runs in place: its permits are released and re-reserved on
+        the next admission, its attempt count stays flat (the up-front charge is refunded so the
+        resumed start re-charges to the same number), and it is *not* marked a consumed
+        continuation. A family that left an end fact (a clean-but-incomplete exit, or any typed
+        provider failure) keeps consuming attempts exactly as today, so keying is on end-fact
+        absence, never on the provider cause. The resume is bounded per identity so a session that
+        keeps dying with no end fact still parks. Returns whether it took the resume path.
+        """
+        generation = record.daemon_generation
+        if generation is None or generation == self._daemon_generation:
+            return False  # same daemon still up (or a pre-generation record): a genuine interruption
+        if record.restart_resumes >= RESTART_RESUME_CAP:
+            return False  # bounded — hand a persistent no-end-fact crash-loop to the normal park path
+        obs = self._adapter.observe(record)
+        if getattr(obs, "has_end_fact", False):
+            return False  # the provider recorded an end — a real failure, charged like any other
+        attempt_no = record.attempts
+        self._release(record)
+        record.attempts -= 1               # refund the up-front charge; the resume re-charges it
+        record.attempt_committed = False
+        record.state = WAITING
+        record.continuation = False        # a restart resume is not one of the two continuations
+        record.restart_resumes += 1
+        if not self._persist(record):
+            return True  # another instance advanced this identity; either way our pass stops here
+        self._emit(record, f"attempt {attempt_no}/{ATTEMPT_BUDGET} interrupted by daemon restart "
+                          f"— resuming in place (resume {record.restart_resumes}/"
+                          f"{RESTART_RESUME_CAP}); attempt not charged; claim retained")
+        return True
 
     # --- admission ----------------------------------------------------------------------
 
@@ -362,6 +411,7 @@ class Coordinator:
         record.family = None
         record.process_alive = False
         record.attempt_committed = False  # a fresh attempt has not been consumed yet
+        record.daemon_generation = self._daemon_generation  # who admitted this attempt (restart marker)
         record.started_at = now
         record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
         reservation_limits = getattr(self._gate, "reservation_limits", None)
