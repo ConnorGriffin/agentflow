@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -35,6 +36,25 @@ _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)\)")
 
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg")
 _REDIRECTS = (301, 302, 303, 307, 308)
+
+def _should_authenticate(url: str) -> bool:
+    """True only for `github.com/user-attachments/...` and the legacy user-images CDN.
+
+    `extract_image_urls` also matches markdown `![](url)` links on arbitrary hosts, so a
+    crafted body like `![x](https://attacker.com/x.png)` would otherwise leak the daemon's
+    `gh auth token` to an attacker-controlled server. The token authorizes GitHub asset
+    access; sending it anywhere else exfiltrates it. The signed-asset hop (S3) is fetched
+    with no auth header regardless."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return False
+    if parts.scheme != "https":
+        return False
+    host = (parts.hostname or "").lower()
+    if host == "github.com":
+        return parts.path.startswith("/user-attachments/")
+    return host == "user-images.githubusercontent.com"
 
 
 def extract_image_urls(body: str) -> list[str]:
@@ -86,18 +106,21 @@ def _build_opener() -> urllib.request.OpenerDirector:
 def fetch_image_bytes(url: str, *, timeout: float = 30.0) -> bytes | None:
     """Fetch one issue image attachment browserlessly, or ``None`` on any failure.
 
-    Authenticates the asset URL with `gh auth token`, then follows GitHub's single 302 to
-    the short-lived (~300s) signed asset URL and downloads the bytes. The signed hop is
-    fetched *without* the auth header. No browser, no OCR — just auth + redirect + bytes.
+    Authenticates the asset URL with `gh auth token` — but only for GitHub attachment
+    hosts (`_should_authenticate`); any other host is fetched with no credential so a
+    crafted off-GitHub image link can't exfiltrate the token. Then follows GitHub's single
+    302 to the short-lived (~300s) signed asset URL and downloads the bytes; the signed hop
+    is fetched *without* the auth header. No browser, no OCR — just auth + redirect + bytes.
     Fetch immediately; the signed URL is not cached."""
-    token = _gh_token()
-    if token is None:
-        return None
+    headers = {"Accept": "application/octet-stream"}
+    if _should_authenticate(url):
+        token = _gh_token()
+        if token is None:
+            return None
+        headers["Authorization"] = f"token {token}"
     opener = _build_opener()
     try:
-        req = urllib.request.Request(
-            url, headers={"Authorization": f"token {token}",
-                          "Accept": "application/octet-stream"})
+        req = urllib.request.Request(url, headers=headers)
         resp = opener.open(req, timeout=timeout)
         try:
             status = getattr(resp, "status", None) or resp.getcode()

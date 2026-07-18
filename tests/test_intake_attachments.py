@@ -96,6 +96,42 @@ def test_fetch_fails_closed_without_a_token(monkeypatch):
     assert called == []  # never even opened a connection
 
 
+def test_fetch_never_sends_the_token_to_a_non_github_host(monkeypatch):
+    """A crafted `![x](https://attacker.com/x.png)` must not leak `gh auth token`."""
+    monkeypatch.setattr(intake_attachments, "_gh_token",
+                        lambda: (_ for _ in ()).throw(AssertionError("token requested")))
+    opener = _Opener([_Resp(200, body=_PNG)])
+    monkeypatch.setattr(intake_attachments, "_build_opener", lambda: opener)
+
+    data = fetch_image_bytes("https://attacker.com/x.png")
+
+    assert data == _PNG  # the off-GitHub image still downloads, just unauthenticated
+    assert "Authorization" not in opener.opened[0][1]
+
+
+def test_legacy_user_images_host_is_authenticated(monkeypatch):
+    monkeypatch.setattr(intake_attachments, "_gh_token", lambda: "tok")
+    legacy = "https://user-images.githubusercontent.com/1/a.png"
+    opener = _Opener([_Resp(200, body=_PNG)])
+    monkeypatch.setattr(intake_attachments, "_build_opener", lambda: opener)
+
+    assert fetch_image_bytes(legacy) == _PNG
+    assert opener.opened[0][1].get("Authorization") == "token tok"
+
+
+def test_github_com_non_attachment_path_is_not_authenticated(monkeypatch):
+    """Only `/user-attachments/` on github.com gets the token, not arbitrary repo URLs."""
+    monkeypatch.setattr(intake_attachments, "_gh_token",
+                        lambda: (_ for _ in ()).throw(AssertionError("token requested")))
+    opener = _Opener([_Resp(200, body=_PNG)])
+    monkeypatch.setattr(intake_attachments, "_build_opener", lambda: opener)
+
+    data = fetch_image_bytes("https://github.com/owner/repo/raw/main/x.png")
+
+    assert data == _PNG
+    assert "Authorization" not in opener.opened[0][1]
+
+
 # --- staging into the worktree ---------------------------------------------------------
 
 def test_body_with_an_attachment_triggers_a_fetch_and_writes_the_image(monkeypatch, tmp_path):
