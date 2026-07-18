@@ -113,6 +113,18 @@ def test_untriaged_skips_state_labels_and_triage_claim():
     assert _untriaged(routed) is False     # already has a state label
 
 
+def test_untriaged_skips_downstream_claim_labels():
+    # A mid-pipeline issue whose only label is a build/mockup claim is not un-triaged, so
+    # intake never re-picks it after the reconciler strips its stale triaging label (#201).
+    building = {"number": 6, "labels": [{"name": "agentflow:building"}]}
+    drawing = {"number": 7, "labels": [{"name": "agentflow:drawing-mockup"}]}
+    unlabeled = {"number": 8, "labels": []}
+
+    assert _untriaged(building) is False
+    assert _untriaged(drawing) is False
+    assert _untriaged(unlabeled) is True
+
+
 def test_untriaged_skips_wayfinder_issues():
     map_issue = {"number": 4, "labels": [{"name": "wayfinder:map"}]}
     decision_ticket = {"number": 5, "labels": [{"name": "wayfinder:research"}]}

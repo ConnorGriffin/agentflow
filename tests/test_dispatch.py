@@ -151,6 +151,48 @@ def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):
     assert "prior change stage" in result
 
 
+def test_intake_skips_an_issue_a_live_pipeline_stage_already_owns(monkeypatch):
+    # A mid-pipeline issue whose triaging label was stripped by the reconciler but whose
+    # downstream record still owns it must not be re-claimed by intake — the ownership guard
+    # catches the label-already-stripped window (#201).
+    from agentflow import coordinated_intake
+
+    def candidate(cfg, reserved=frozenset()):
+        return None if 42 in reserved else ({"number": 42, "labels": []}, "")
+
+    monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
+                        lambda cfg, lane=None: {42})
+    monkeypatch.setattr(dispatch, "pick_pair",
+                        lambda: pytest.fail("must not pick a pool for an owned issue"))
+    monkeypatch.setattr(loop, "_claim_triage", lambda *a: pytest.fail("must not re-claim"))
+    monkeypatch.setattr(coordinated_intake, "intake_submission",
+                        lambda *a, **k: pytest.fail("must not submit an owned issue"))
+
+    result = dispatch._submit_coordinated_intake(RepoConfig("o/r", "/tmp"), SimpleNamespace(), None)
+    assert result == "no un-triaged issues"
+
+
+def test_intake_still_claims_a_genuinely_new_issue(monkeypatch):
+    from agentflow import coordinated_intake
+
+    def candidate(cfg, reserved=frozenset()):
+        return None if 42 in reserved else ({"number": 42, "labels": []}, "")
+
+    monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(coordinated_intake, "intake_submission",
+                        lambda *a, **k: SimpleNamespace(pool="claude"))
+    claimed = []
+    monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: claimed.append(n) or True)
+    coord = SimpleNamespace(submit_stage=lambda submission: None)
+
+    result = dispatch._submit_coordinated_intake(RepoConfig("o/r", "/tmp"), coord, None)
+    assert claimed == [42]
+    assert "#42 → claude" in result
+
+
 def test_live_board_is_overwritten_from_the_durable_projection(tmp_path, monkeypatch):
     from agentflow import live
 
