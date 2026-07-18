@@ -99,6 +99,12 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
         if picked is None:
             break
         issue, extra = picked
+        if issue["number"] in coordinated_build.owned_issues(cfg, lane=None):
+            # A non-retired coordinator record in some downstream lane already owns this
+            # issue — it is mid-pipeline, not a fresh intake candidate. Reserve it so the
+            # picker doesn't return it again this cycle, then skip (#201).
+            reserved.add(issue["number"])
+            continue
         builder, _reviewer, block_msg = pick_pair()
         if builder is None:
             return ("; ".join(submitted) if submitted else

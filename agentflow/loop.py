@@ -355,9 +355,13 @@ def _next_ready_issue(cfg: RepoConfig, _log=None) -> dict | None:
 
 
 TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns this issue
+DRAWING = "agentflow:drawing-mockup"   # dispatch claim — a session is drawing this issue's variants
 
-# Out of the intake queue: a resolved state label, or a live triaging claim.
-_TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING}
+# Out of the intake queue: a resolved state label, a live triaging claim, or a live
+# build/mockup claim. An issue already owned by a downstream lane (`agentflow:building`,
+# `agentflow:drawing-mockup`) is mid-pipeline, not un-triaged, so intake never re-claims it —
+# even after the reconciler strips its stale `triaging` label (#201).
+_TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING, BUILDING, DRAWING}
 
 
 def _untriaged(issue: dict) -> bool:
@@ -715,8 +719,6 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
 # screenshots posted in ONE issue comment, and the maintainer picks (or tweaks) in one reply.
 # Nobody enters an agent session. The pick resumes through intake (ADR 0019), which locks the
 # chosen variant and promotes to ready.
-
-DRAWING = "agentflow:drawing-mockup"   # dispatch claim — a session is drawing this issue's variants
 
 # The produced-variants comment carries INTAKE_MARK ("agentflow intake") so `awaiting_recheck`
 # reads it as OURS — never as a maintainer reply, which would self-trigger the resume path (the
