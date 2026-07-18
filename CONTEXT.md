@@ -5,32 +5,14 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 
 ## Terms
 
-- **Project** — the durable planning and operating workspace for exactly one
-  enrolled repository. Enrollment materializes the repository's single project;
-  removal from the fleet archives it rather than deleting it. Decision maps and
-  milestones express separate efforts within the project.
+- **Agentflow** — the headless workflow engine that moves approved GitHub build
+  issues through intake, dispatch, build, review, and merge. It does not own
+  planning conversations, issue tracking, or repository decisions.
 
-- **Conversation** — a bounded, resumable exploration inside one project, centered
-  on one question or intended outcome. It may stage related proposals,
-  but remains working history rather than authoritative project knowledge. It closes
-  only when that outcome is resolved or abandoned, and reopens only for the same outcome.
-
-- **Proposal** — one complete, atomic candidate change staged by a conversation for
-  explicit approval. It creates or updates one primary durable artifact, plus only
-  inseparable attachments. It moves `staged → approved → published` or `staged →
-  discarded`; changing content requires a new staged version, while a publication
-  error remains approved for retry.
-  *Avoid:* candidate artifact, draft.
-
-- **Wayfinder** — the interactive planning capability that explores uncertainty
-  through conversations and stages proposals for the operator's approval. It decides
-  what should become durable work; it does not build or merge that work.
-
-- **Ask** — begin a conversation with Wayfinder for open-ended exploration. An Ask
-  may stage a direct proposal or discover that a decision map is required.
-
-- **Chart** — begin a conversation with Wayfinder intending to stage a decision map.
-  A Chart may instead stage a direct proposal when no consequential uncertainty remains.
+- **Wayfinder** — the chat-invoked planning capability that explores uncertainty
+  before agentflow intake. It records multi-session efforts as GitHub decision maps
+  and hands cleared work off as ordinary build issues; it is not part of the
+  agentflow runtime or operator console.
 
 - **Decision map** — the durable record of a bounded, temporary deciding effort
   around one desired outcome. It contains decision tickets and their dependencies,
@@ -43,25 +25,21 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   *Avoid:* trail, roadmap, plan.
 
 - **Decision ticket** — one bounded question or prerequisite inside a decision map.
-  It is resolved through its own conversation with the whole map loaded as context.
+  It is resolved through its own chat session with the whole map loaded as context.
   Its states are `open`, `resolved`, and `discarded`; `blocked` is derived from open
   prerequisite tickets rather than stored as a state. Resolution requires a durable
   answer and required outputs, but the ticket itself never enters the build pipeline.
 
-- **Build issue** — one approved, independently buildable change that enters intake.
-  It may come directly from a proposal or from a cleared decision map, and belongs
-  to at most one milestone.
+- **Build issue** — one operator-approved, independently buildable GitHub issue that
+  enters intake. It may be filed directly from chat or handed off from a cleared
+  decision map, and belongs to at most one milestone.
 
-- **Publication** — the successful durable creation or update authorized by an
-  approved proposal. A publication error leaves the proposal approved and retryable.
+- **Artifact provenance** — links from a durable artifact to any related decision
+  ticket, decision map, milestone, or visual specification. Provenance provides
+  traceability; the artifact must still stand alone without following those links.
 
-- **Artifact provenance** — the links from a published artifact to its originating
-  proposal, conversation, and any related decision ticket, decision map, milestone,
-  or visual specification. Provenance provides traceability; the artifact must still
-  stand alone without following those links.
-
-- **Build handoff** — the publication of a build issue in a form eligible for
-  agentflow intake. The same approval authorizes both publication and handoff.
+- **Build handoff** — filing an operator-approved build issue in a form eligible for
+  agentflow intake. There is no second approval inside agentflow.
 
 - **Dispatch** — the scheduler launching an eligible pipeline stage when capacity
   permits. Dispatch is not a second operator approval after build handoff.
@@ -71,16 +49,15 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   to users.
   *Avoid:* shipped change, released change.
 
-- **Milestone** — a durable, observable product outcome inside one project, delivered
+- **Milestone** — a durable, observable product outcome for one repository, delivered
   through one or more build issues. It is achieved only when acceptance evidence
   demonstrates the outcome, not merely when its issues close. Its states are `planned`,
   `active`, `achieved`, and `abandoned`; it becomes active when its first build issue
-  enters the pipeline. Wayfinder stages achievement as a proposal backed by the
-  evidence; the operator approves the state change.
+  enters the pipeline. Achievement requires operator acceptance of the evidence.
   *Avoid:* sprint, deadline, release bucket, phase.
 
 - **Mockup** — one disposable interactive candidate used to explore a user-interface
-  direction, belonging to its originating decision ticket or proposal. Selecting a
+  direction during chat planning, optionally belonging to a decision ticket. Selecting a
   mockup promotes it into a visual specification; unselected variants remain
   exploration history.
 
@@ -211,9 +188,8 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 
 - **Held issue** — an issue parked at `needs-grilling` or `needs-mockup`: inert to
   agents until its missing input is durably supplied. It remains a build issue;
-  Wayfinder may resolve the hold through a conversation and issue-update proposal, or
-  link a decision map when several dependent decisions are required. No builder touches
-  a held issue.
+  the operator resolves the hold in chat and updates the issue, or uses a decision
+  map when several dependent decisions are required. No builder touches a held issue.
 
 - **Recoverable interruption** — a pipeline session ending because of a temporary
   capacity or execution condition, rather than because the work itself cannot proceed.
@@ -256,15 +232,23 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   consistently confirmed without correction. Earned, deliberate, per-repo,
   reversible. The autonomy profile is the *current* setting; the ratchet moves it.
 
-- **Operator dashboard** — agentflow's console for the fleet, sitting *over* GitHub
+- **Operator console** — agentflow's read-only console for the fleet, sitting *over* GitHub
   (the source of truth), not replacing it. Reads GitHub + scheduler state; shows
   fleet overview, two-pool headroom, the needs-you inbox, a recently-merged audit
-  feed, and ratchet state; offers control actions (merge, ratchet, pause, jump).
+  feed, ratchet state, and read-only decision maps derived from GitHub's native
+  child and dependency relationships. Actions deep-link to their authoritative
+  GitHub, chat, or CLI surface; the console performs no mutations.
 
-- **Snapshot** — the one fleet-wide view the dashboard shows: dispatch state, pool
+- **Repository view** — the operator console's derived view of one enrolled
+  repository: its decision maps and current frontier, build issues moving through
+  the pipeline, blockers, landed evidence, and contextual ADR links. It excludes
+  the repository's general backlog and stores no repository or planning state of
+  its own.
+
+- **Snapshot** — the one fleet-wide view the operator console shows: dispatch state, pool
   headroom, running sessions, and every repo's queue/in-flight/parked/merged state.
-  Produced only by the daemon, once per cycle (even dormant); the dashboard serves
-  the latest one and shows its age honestly — it never asks GitHub itself
+  Produced only by the daemon under a bounded GitHub API budget; the console serves
+  the latest projection and shows its age honestly — it never asks GitHub itself
   (ADR 0026). With the daemon down you see the last snapshot, aged, not an error.
 
 - **Needs-you inbox** — the operator's action list: `guarded` merges awaiting,

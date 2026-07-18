@@ -96,3 +96,10 @@ then Context / Decision / Alternatives / Consequences.
   logical stage behind the existing session coordinator; skills stage candidate artifacts in
   isolated working state, the daemon adopts accepted turns into immutable Proposals, and only
   an explicit operator approval + Publication crosses the promotion boundary.
+- [0035](0035-workflow-engine-read-only-operator-console.md) — Agentflow is a headless
+  workflow engine with one unified read-only operator console; chat owns planning,
+  GitHub/repositories own durable truth, the Project workspace is retired, and the
+  map viewer survives as an information model for a fully reopened UI design.
+- [0036](0036-bounded-repository-map-projection.md) — The daemon projects bounded GitHub-native
+  Decision Maps, verified handoffs, pipeline state, landed evidence, and contextual ADR links
+  under a fixed heartbeat/API budget; the browser remains a read-only file consumer.

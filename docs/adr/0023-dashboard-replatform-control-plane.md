@@ -1,6 +1,8 @@
 # ADR 0023 — Dashboard re-platform: an interactive control plane (Svelte + FastAPI, polling liveness)
 
-- Status: Accepted
+- Status: Accepted — write/control-plane direction superseded by
+  [ADR 0035](0035-workflow-engine-read-only-operator-console.md); Svelte/FastAPI and
+  headroom-governed concurrency remain
 - Date: 2026-07-13
 
 ## Context

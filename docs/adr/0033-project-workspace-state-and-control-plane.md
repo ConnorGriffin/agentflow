@@ -1,6 +1,6 @@
 # ADR 0033 — The daemon owns local Project workspace state; GitHub and git own published truth
 
-- Status: Accepted
+- Status: Superseded by [ADR 0035](0035-workflow-engine-read-only-operator-console.md)
 - Date: 2026-07-16
 
 ## Context

@@ -1,6 +1,6 @@
 # ADR 0034 — A Conversation turn is a coordinated logical stage; the daemon adopts, the operator promotes
 
-- Status: Accepted
+- Status: Superseded by [ADR 0035](0035-workflow-engine-read-only-operator-console.md)
 - Date: 2026-07-16
 - Amended: 2026-07-16 — the operator's conversation outranks background work at admission
 - Amended: 2026-07-16 — an interactive conversation turn is real-time: it is exempt from headroom pacing, and only true-zero capacity may defer it ([#161](https://github.com/ConnorGriffin/agentflow/issues/161))
