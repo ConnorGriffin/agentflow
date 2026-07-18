@@ -14,7 +14,7 @@ import subprocess
 import pytest
 
 from agentflow.workspace import publish
-from agentflow.workspace.store import PUBLISHED, WorkspaceStore
+from agentflow.workspace.store import FAILED, PUBLISHED, WorkspaceStore
 
 
 class FakeGitHub:
@@ -25,7 +25,17 @@ class FakeGitHub:
         self.issues = []           # each: {number, url, body, title}
         self.created = 0
         self._next = 100
-        self.fail_create = False   # when True, `gh issue create` reports failure (retry path)
+        self.fail_create = False   # when True, `gh issue create` reports failure (failed path)
+        self.create_stderr = "boom"  # the stderr a failed create reports (drives the plain reason)
+
+    def seed_issue(self, body):
+        """Inject an already-existing issue (e.g. one a prior attempt filed) so a search-before
+        -create finds it — used to prove Retry never files a duplicate."""
+        number = self._next
+        self._next += 1
+        url = f"https://github.com/ConnorGriffin/agentflow/issues/{number}"
+        self.issues.append({"number": number, "url": url, "body": body, "title": ""})
+        return number
 
     def __call__(self, cmd):
         if cmd[:2] == ["gh", "issue"] and cmd[2] == "list":
@@ -35,7 +45,7 @@ class FakeGitHub:
             return _ok(json.dumps(hits))
         if cmd[:2] == ["gh", "issue"] and cmd[2] == "create":
             if self.fail_create:
-                return _fail()
+                return _fail(self.create_stderr)
             self.created += 1
             number = self._next
             self._next += 1
@@ -51,8 +61,8 @@ def _ok(stdout):
     return subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
 
 
-def _fail():
-    return subprocess.CompletedProcess([], 1, stdout="", stderr="boom")
+def _fail(stderr="boom"):
+    return subprocess.CompletedProcess([], 1, stdout="", stderr=stderr)
 
 
 @pytest.fixture
@@ -114,14 +124,67 @@ def test_a_replay_between_create_and_receipt_never_files_a_duplicate(store):
     assert store.proposal(cid).state == PUBLISHED
 
 
-def test_a_failed_create_leaves_the_proposal_approved_to_retry(store):
+def test_a_hard_create_failure_parks_failed_with_a_plain_reason_and_stops_auto_retry(store):
+    """AC #3/regression: a hard ``gh issue create`` failure records a durable FAILED disposition
+    with a plain human reason and ``failed_at``, keeps the approval bound to its hash, and is NOT
+    silently re-attempted. Fails on the old code, which stayed APPROVED and republished every cycle.
+    """
+    cid = _approved(store)
+    gh = FakeGitHub()
+    gh.fail_create = True
+    gh.create_stderr = "HTTP 401: Bad credentials (https://api.github.com/repos/...)"
+
+    assert publish.publish_approved(REPO, cid, store=store, gh=gh, now=10) is None
+    prop = store.proposal(cid)
+    assert prop.state == FAILED                               # durable failed disposition, not approved
+    assert prop.fail_reason == "GitHub rejected the request — bad credentials."  # plain, not stderr
+    assert prop.failed_at == 10
+    assert prop.approved_hash == "sha256:v1"                  # still bound to the exact version
+
+    # No silent re-attempt: a parked failure is not APPROVED, so a following publish pass is a
+    # no-op that files nothing and leaves it failed until an operator Retry re-authorizes it.
+    gh.fail_create = False
+    assert publish.publish_approved(REPO, cid, store=store, gh=gh, now=20) is None
+    assert gh.created == 0 and store.proposal(cid).state == FAILED
+
+
+def test_retry_after_a_failure_republishes_the_same_version_without_a_duplicate(store):
+    """AC #5/#7: Retry = the operator re-issuing ``approve_proposal`` for the same hash. It clears
+    the failure and re-authorizes; the search-before-create idempotency still holds, so even if an
+    issue for that hash already exists it records the receipt without a second ``create_issue``.
+    """
     cid = _approved(store)
     gh = FakeGitHub()
     gh.fail_create = True
     assert publish.publish_approved(REPO, cid, store=store, gh=gh, now=10) is None
-    assert store.proposal(cid).state == "approved"            # nothing recorded — it retries
+    assert store.proposal(cid).state == FAILED
+
+    # An issue for this exact hash already exists on GitHub (e.g. a prior attempt that raced).
+    existing = gh.seed_issue(publish.render_issue_body(store.proposal(cid).versions[-1], "sha256:v1"))
+
+    # Retry: the operator re-approves the same hash. Credentials are fixed for good measure.
     gh.fail_create = False
-    publish.publish_approved(REPO, cid, store=store, gh=gh, now=11)
+    store.approve_proposal(cid, "sha256:v1", idempotency_key="retry-1", now=11)
+    assert store.proposal(cid).state == "approved"           # failure cleared; re-authorized
+    assert store.proposal(cid).fail_reason is None
+
+    issue = publish.publish_approved(REPO, cid, store=store, gh=gh, now=12)
+    assert gh.created == 0                                    # search-before-create found it — no dup
+    assert issue["number"] == existing
+    assert store.proposal(cid).state == PUBLISHED
+
+
+def test_retry_after_a_failure_creates_exactly_one_issue_when_none_exists(store):
+    """The common Retry path: the first attempt created nothing, so Retry files exactly one issue."""
+    cid = _approved(store)
+    gh = FakeGitHub()
+    gh.fail_create = True
+    publish.publish_approved(REPO, cid, store=store, gh=gh, now=10)
+    assert store.proposal(cid).state == FAILED
+
+    gh.fail_create = False
+    store.approve_proposal(cid, "sha256:v1", idempotency_key="retry-1", now=11)
+    publish.publish_approved(REPO, cid, store=store, gh=gh, now=12)
     assert gh.created == 1 and store.proposal(cid).state == PUBLISHED
 
 

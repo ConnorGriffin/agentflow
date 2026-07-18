@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_WORKSPACE_BUSY_MS", "2000"))
 
 # Turn states are honest and bounded (ADR 0034): a turn is only ever one of these — never a
@@ -54,6 +54,7 @@ REJECTED = "rejected"
 STAGED = "staged"        # one or more versions await the operator's decision (the copper weight)
 APPROVED = "approved"    # the operator approved one exact version hash; a Publication is authorized
 PUBLISHED = "published"  # the approved hash was published to GitHub and its receipt verified
+FAILED = "failed"        # a hard publish failure parked the approved hash; it awaits an operator Retry
 DISCARDED = "discarded"  # the draft was dropped; the Conversation is untouched
 
 
@@ -147,7 +148,7 @@ class Proposal:
     "latest"); once published it carries the receipt of its real GitHub issue."""
 
     conversation_id: str
-    state: str = STAGED               # staged | approved | published | discarded
+    state: str = STAGED               # staged | approved | published | failed | discarded
     title: str = ""                   # the latest version's title (the decision on the shelf)
     approved_hash: str | None = None
     published_issue: int | None = None
@@ -155,6 +156,8 @@ class Proposal:
     published_at: int = 0
     staged_at: int = 0
     updated_at: int = 0
+    fail_reason: str | None = None    # a plain, human reason for the last hard publish failure
+    failed_at: int = 0                # when that failure was parked; 0 once approved/published again
     versions: list[ProposalVersion] = field(default_factory=list)
 
     @property
@@ -270,7 +273,9 @@ class WorkspaceStore:
             " published_url TEXT,"
             " published_at INTEGER NOT NULL DEFAULT 0,"
             " staged_at INTEGER NOT NULL DEFAULT 0,"
-            " updated_at INTEGER NOT NULL DEFAULT 0)"
+            " updated_at INTEGER NOT NULL DEFAULT 0,"
+            " fail_reason TEXT,"
+            " failed_at INTEGER NOT NULL DEFAULT 0)"
         )
         conn.execute(
             "CREATE TABLE proposal_versions ("
@@ -290,7 +295,15 @@ class WorkspaceStore:
         conn.execute("BEGIN IMMEDIATE")
         try:
             if from_version < 2:
+                # A store from tracer #1 predates the Proposal tables; fresh tables already carry
+                # the failure disposition columns, so no separate v3 step is needed.
                 WorkspaceStore._create_proposal_tables(conn)
+            elif from_version < 3:
+                # A v2 store has Proposal tables but no durable failed disposition; add the two
+                # failure columns in place so a parked publish failure survives (ADR 0033).
+                conn.execute("ALTER TABLE proposals ADD COLUMN fail_reason TEXT")
+                conn.execute(
+                    "ALTER TABLE proposals ADD COLUMN failed_at INTEGER NOT NULL DEFAULT 0")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
@@ -379,6 +392,17 @@ class WorkspaceStore:
             return self._commit(lambda: self._record_publication(
                 conversation_id, content_hash, issue_number, issue_url, now), None)
 
+    def fail_publication(self, conversation_id: str, content_hash: str, *, reason: str,
+                         now: int = 0) -> CommandOutcome:
+        """Park a hard publish failure as a durable FAILED disposition, keeping the approved hash
+        bound so an operator Retry re-authorizes the exact version (ADR 0033/0034). Recorded by the
+        daemon when a create attempt fails hard, in place of silently retrying every cycle. Naturally
+        idempotent: a published Proposal ignores it, and re-parking replays the same terminal state.
+        Only the approved hash may be failed — a mismatch is rejected."""
+        with self._lock:
+            return self._commit(lambda: self._fail_publication(
+                conversation_id, content_hash, reason, now), None)
+
     def discard_proposal(self, conversation_id: str, *, idempotency_key: str,
                          now: int = 0) -> CommandOutcome:
         """Drop the staged draft, leaving the Conversation intact (ADR 0033). The Proposal moves to
@@ -415,8 +439,8 @@ class WorkspaceStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT conversation_id, state, title, approved_hash, published_issue,"
-                " published_url, published_at, staged_at, updated_at FROM proposals"
-                " WHERE conversation_id = ?", (conversation_id,)).fetchone()
+                " published_url, published_at, staged_at, updated_at, fail_reason, failed_at"
+                " FROM proposals WHERE conversation_id = ?", (conversation_id,)).fetchone()
             if row is None:
                 return None
             prop = self._proposal_from_row(row)
@@ -427,8 +451,8 @@ class WorkspaceStore:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT conversation_id, state, title, approved_hash, published_issue,"
-                " published_url, published_at, staged_at, updated_at FROM proposals"
-                " ORDER BY updated_at DESC, conversation_id").fetchall()
+                " published_url, published_at, staged_at, updated_at, fail_reason, failed_at"
+                " FROM proposals ORDER BY updated_at DESC, conversation_id").fetchall()
             props = [self._proposal_from_row(r) for r in rows]
             for prop in props:
                 prop.versions = self._versions_of(prop.conversation_id)
@@ -569,7 +593,8 @@ class WorkspaceStore:
         # A newer version supersedes any earlier decision: the copper card always shows the latest
         # awaiting the operator, so staging resets an approved (but unpublished) Proposal to staged.
         self._conn.execute(
-            "UPDATE proposals SET state = 'staged', title = ?, approved_hash = NULL, updated_at = ?"
+            "UPDATE proposals SET state = 'staged', title = ?, approved_hash = NULL,"
+            " fail_reason = NULL, failed_at = 0, updated_at = ?"
             " WHERE conversation_id = ? AND state != 'published'",
             (title, now, conversation_id))
         return CommandOutcome(ACCEPTED, conversation_id, version=version, content_hash=content_hash)
@@ -586,8 +611,11 @@ class WorkspaceStore:
             # Hash-bound: approving a hash with no matching staged version is rejected, never
             # silently redirected to "latest" (ADR 0034).
             return CommandOutcome(REJECTED, conversation_id, error="unknown version hash")
+        # Approving (or re-approving after a failure) clears any parked failure and rebinds the
+        # exact hash, so a Retry re-authorizes the same version (ADR 0034 hash-bound).
         self._conn.execute(
-            "UPDATE proposals SET state = 'approved', approved_hash = ?, updated_at = ?"
+            "UPDATE proposals SET state = 'approved', approved_hash = ?,"
+            " fail_reason = NULL, failed_at = 0, updated_at = ?"
             " WHERE conversation_id = ? AND state != 'published'",
             (content_hash, now, conversation_id))
         return CommandOutcome(ACCEPTED, conversation_id, version=version[0],
@@ -609,6 +637,23 @@ class WorkspaceStore:
             "UPDATE proposals SET state = 'published', published_issue = ?, published_url = ?,"
             " published_at = ?, updated_at = ? WHERE conversation_id = ?",
             (issue_number, issue_url, now, now, conversation_id))
+        return CommandOutcome(ACCEPTED, conversation_id, content_hash=content_hash)
+
+    def _fail_publication(self, conversation_id, content_hash, reason, now) -> CommandOutcome:
+        row = self._conn.execute(
+            "SELECT state, approved_hash FROM proposals WHERE conversation_id = ?",
+            (conversation_id,)).fetchone()
+        if row is None:
+            return CommandOutcome(REJECTED, conversation_id, error="unknown proposal")
+        state, approved_hash = row
+        if state == "published":
+            # The receipt already verified — a stale failure never unwinds published truth.
+            return CommandOutcome(ACCEPTED, conversation_id, content_hash=content_hash)
+        if approved_hash != content_hash:
+            return CommandOutcome(REJECTED, conversation_id, error="hash is not the approved one")
+        self._conn.execute(
+            "UPDATE proposals SET state = 'failed', fail_reason = ?, failed_at = ?, updated_at = ?"
+            " WHERE conversation_id = ?", (reason, now, now, conversation_id))
         return CommandOutcome(ACCEPTED, conversation_id, content_hash=content_hash)
 
     def _discard_proposal(self, conversation_id, now) -> CommandOutcome:
@@ -641,7 +686,7 @@ class WorkspaceStore:
     def _proposal_from_row(row) -> Proposal:
         return Proposal(conversation_id=row[0], state=row[1], title=row[2], approved_hash=row[3],
                         published_issue=row[4], published_url=row[5], published_at=row[6],
-                        staged_at=row[7], updated_at=row[8])
+                        staged_at=row[7], updated_at=row[8], fail_reason=row[9], failed_at=row[10])
 
     def _versions_of(self, conversation_id: str) -> list[ProposalVersion]:
         rows = self._conn.execute(

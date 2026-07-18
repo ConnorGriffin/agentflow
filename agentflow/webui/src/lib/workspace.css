@@ -18,17 +18,21 @@
     /* darker fills for solid buttons so white text clears WCAG AA 4.5:1 in light */
     --primary-strong: oklch(0.53 0.12 188);
     --accent-strong: oklch(0.55 0.15 55);
+    --danger-strong: oklch(0.50 0.16 25);  /* solid danger button face (Retry) */
 
     /* derived (recompute per theme via the vars above) */
     --on-primary: oklch(1 0 0);
     --on-accent: oklch(1 0 0);
+    --on-danger: oklch(1 0 0);
     --card: oklch(1 0 0);
     --recess: oklch(0.97 0.004 210);
     --primary-ink: color-mix(in oklab, var(--primary) 66%, var(--ink));
     --accent-ink: color-mix(in oklab, var(--accent) 60%, var(--ink));
     --success-ink: color-mix(in oklab, var(--success) 60%, var(--ink));
+    --danger-ink: color-mix(in oklab, var(--danger) 62%, var(--ink));  /* AA text on the danger wash */
     --primary-wash: color-mix(in oklab, var(--primary) 8%, var(--bg));
     --accent-wash: color-mix(in oklab, var(--accent) 9%, var(--bg));
+    --danger-wash: color-mix(in oklab, var(--danger) 8%, var(--bg));   /* failed-card tint */
     --shadow: 0 1px 2px oklch(0.25 0.02 210 / 0.05), 0 14px 30px -22px oklch(0.25 0.02 210 / 0.28);
     --dock-shadow: 0 -10px 28px -24px oklch(0.2 0.02 210 / 0.45);
 
@@ -68,8 +72,12 @@
     --danger: oklch(0.68 0.14 25);
     --on-primary: oklch(0.14 0.008 210);
     --on-accent: oklch(0.14 0.008 210);
+    --on-danger: oklch(0.14 0.008 210);
     --primary-strong: var(--primary);
     --accent-strong: var(--accent);
+    --danger-strong: var(--danger);
+    --danger-ink: color-mix(in oklab, var(--danger) 70%, var(--ink));
+    --danger-wash: color-mix(in oklab, var(--danger) 14%, var(--bg));
     --card: oklch(0.19 0.01 210);
     --recess: oklch(0.165 0.009 210);
     --shadow: 0 1px 2px oklch(0 0 0 / 0.35), 0 14px 30px -22px oklch(0 0 0 / 0.55);
@@ -90,8 +98,12 @@
       --danger: oklch(0.68 0.14 25);
       --on-primary: oklch(0.14 0.008 210);
       --on-accent: oklch(0.14 0.008 210);
+      --on-danger: oklch(0.14 0.008 210);
       --primary-strong: var(--primary);
       --accent-strong: var(--accent);
+      --danger-strong: var(--danger);
+      --danger-ink: color-mix(in oklab, var(--danger) 70%, var(--ink));
+      --danger-wash: color-mix(in oklab, var(--danger) 14%, var(--bg));
       --card: oklch(0.19 0.01 210);
       --recess: oklch(0.165 0.009 210);
       --shadow: 0 1px 2px oklch(0 0 0 / 0.35), 0 14px 30px -22px oklch(0 0 0 / 0.55);
@@ -179,8 +191,12 @@
   .btn--quiet:hover { border-color: var(--muted); }
   .btn--ghost { color: var(--muted); }
   .btn--ghost:hover { color: var(--ink); }
-  .btn--danger-quiet { color: var(--danger); }
+  /* danger-ink (not raw --danger) so the quiet link clears AA 4.5:1 on the light danger-wash card */
+  .btn--danger-quiet { color: var(--danger-ink); }
   .btn--danger-quiet:hover { text-decoration: underline; text-underline-offset: 3px; }
+  /* solid danger button for the primary Retry action (not copper — copper = awaiting only) */
+  .btn--danger { background: var(--danger-strong); color: var(--on-danger); }
+  .btn--danger:hover { background: color-mix(in oklab, var(--danger-strong) 88%, var(--ink)); }
   .btn--sm { padding: 6px 11px; }
   .linklike {
     background: none; border: none; padding: 0; cursor: pointer;
@@ -202,6 +218,7 @@
   .pill--copper { background: var(--accent-wash); color: var(--accent-ink); }
   .pill--teal   { background: var(--primary-wash); color: var(--primary-ink); }
   .pill--ok     { background: color-mix(in oklab, var(--success) 10%, var(--bg)); color: var(--success-ink); }
+  .pill--danger { background: var(--danger-wash); color: var(--danger-ink); }
   .pill--ghost  { border: 1px solid var(--border); color: var(--muted); }
   .tag {
     display: inline-flex; align-items: center; align-self: center;
@@ -278,6 +295,23 @@
     border-color: color-mix(in oklab, var(--success) 40%, var(--border));
     background: color-mix(in oklab, var(--success) 7%, var(--bg));
   }
+  /* in-flight weight — teal, calm; the optimistic beat and the daemon-confirmed publishing both
+     wear it (honest: both mean "in flight"). */
+  .obj--publishing {
+    border-color: color-mix(in oklab, var(--primary) 40%, var(--border));
+    background: var(--primary-wash);
+  }
+  /* failed weight — danger; full border + tint, no side-stripe (DESIGN.md). */
+  .obj--failed {
+    border-color: color-mix(in oklab, var(--danger) 48%, var(--border));
+    background: var(--danger-wash);
+  }
+  /* the failure explanation line inside a failed shelf card — quiet, honest */
+  .obj-fail { display: flex; gap: 8px; align-items: baseline; font-size: var(--fs-0); color: var(--danger-ink); margin-top: 10px; }
+  .obj-fail > .icon { align-self: center; }
+  .obj-fail .when { color: var(--muted); }
+  /* the pulsing in-flight pill icon on a shelf card (mirrors the pubwait note) */
+  .pulse .icon { animation: pulse 1.2s ease-in-out infinite; }
 
   /* parked-draft resume affordance */
   .resume-chip {
@@ -387,6 +421,10 @@
   }
   .decision-note .icon { color: var(--success-ink); align-self: center; }
   .pubwait .icon { color: var(--primary); animation: pulse 1.2s ease-in-out infinite; }
+  /* the failed decision note — danger tint, a plain reason; Retry stays the primary action */
+  .pubfail { background: var(--danger-wash); color: var(--danger-ink); }
+  .pubfail .reason { display: block; margin-top: 3px; color: var(--muted); }
+  .pubfail strong { color: var(--danger-ink); }
   @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
   .receipt {
     display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline;
@@ -516,6 +554,6 @@
   @media (prefers-reduced-motion: reduce) {
     .view { animation: none; }
     .btn, .sug, .dock-send { transition: none; }
-    .pubwait .icon { animation: none; }
+    .pubwait .icon, .pulse .icon { animation: none; }
     * { scroll-behavior: auto !important; }
   }

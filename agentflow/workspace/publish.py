@@ -84,18 +84,37 @@ def find_published(repo: str, content_hash_value: str, *, gh=_default_gh) -> dic
     return None
 
 
-def create_issue(repo: str, title: str, body: str, *, gh=_default_gh) -> dict | None:
-    """Create the real GitHub build issue and return its number/url, or ``None`` if creation
-    failed (the reconcile retries next cycle). No label is passed — no ``wayfinder:*`` marking, so
-    intake grounds it normally (ADR 0027)."""
+def publish_failure_reason(stderr: str) -> str:
+    """Map a raw ``gh`` failure into one plain, operator-facing sentence — never a stderr dump
+    (the console shows this verbatim). Falls back to a generic honest line."""
+    s = (stderr or "").lower()
+    if any(t in s for t in ("bad credentials", "authentication", "401", "gh auth", "not logged")):
+        return "GitHub rejected the request — bad credentials."
+    if any(t in s for t in ("403", "forbidden", "permission", "not authorized")):
+        return "GitHub refused the request — the token can't create issues here."
+    if any(t in s for t in ("404", "not found", "could not resolve to a repository")):
+        return "GitHub couldn't find the repository."
+    if "rate limit" in s or "429" in s:
+        return "GitHub rate-limited the request — try again shortly."
+    if any(t in s for t in ("could not resolve host", "timeout", "timed out", "dial tcp",
+                            "no such host", "network")):
+        return "Couldn't reach GitHub — a network problem."
+    return "GitHub rejected the request."
+
+
+def create_issue(repo: str, title: str, body: str, *, gh=_default_gh) -> dict:
+    """Create the real GitHub build issue. Returns ``{"issue": {number, url}}`` on success, or
+    ``{"error": <plain reason>}`` when creation failed hard (the daemon parks it FAILED for an
+    operator Retry). No label is passed — no ``wayfinder:*`` marking, so intake grounds it normally
+    (ADR 0027)."""
     r = gh(["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body])
     if r.returncode != 0:
-        return None
+        return {"error": publish_failure_reason(getattr(r, "stderr", ""))}
     url = (r.stdout or "").strip().splitlines()[-1].strip() if r.stdout else ""
     m = re.search(r"/issues/(\d+)", url)
     if not m:
-        return None
-    return {"number": int(m.group(1)), "url": url}
+        return {"error": "GitHub accepted the request but returned no issue link."}
+    return {"issue": {"number": int(m.group(1)), "url": url}}
 
 
 def publish_approved(repo: str, conversation_id: str, *, store: WorkspaceStore, gh=_default_gh,
@@ -105,8 +124,10 @@ def publish_approved(repo: str, conversation_id: str, *, store: WorkspaceStore, 
     Search-before-create is unconditional: found → record the receipt only; not found → create the
     issue, then record. A crash between create and record leaves the Proposal APPROVED, so the next
     cycle re-runs, finds the issue by its hash, and records the receipt — never a duplicate issue
-    (ADR 0033). Returns the issue receipt, or ``None`` when there is nothing to do / a create
-    failed and the publish should retry."""
+    (ADR 0033). A *hard* create failure instead parks the Proposal FAILED with a plain reason and
+    stops the silent every-cycle retry — it waits for an operator Retry (which re-approves the same
+    hash). Returns the issue receipt, or ``None`` when there is nothing to do / the publish parked
+    failed."""
     prop = store.proposal(conversation_id)
     if prop is None or prop.state != APPROVED or not prop.approved_hash:
         return None
@@ -116,9 +137,12 @@ def publish_approved(repo: str, conversation_id: str, *, store: WorkspaceStore, 
     key = prop.approved_hash
     issue = find_published(repo, key, gh=gh)              # ALWAYS search first (idempotency)
     if issue is None:
-        issue = create_issue(repo, version.title, render_issue_body(version, key), gh=gh)
-        if issue is None:
-            return None                                  # create failed — retry next cycle
+        created = create_issue(repo, version.title, render_issue_body(version, key), gh=gh)
+        if "error" in created:
+            # Park the failure durably instead of re-attempting forever; the approval stays bound.
+            store.fail_publication(conversation_id, key, reason=created["error"], now=now)
+            return None
+        issue = created["issue"]
     store.record_publication(conversation_id, key, issue_number=issue["number"],
                              issue_url=issue["url"], now=now)
     return issue

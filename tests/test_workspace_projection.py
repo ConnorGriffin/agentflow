@@ -128,6 +128,40 @@ def test_pipeline_absent_when_no_daemon_join(state):
     assert prop["publication"]["issue_number"] == 42          # receipt still shown, honestly aged
 
 
+def test_a_failed_proposal_surfaces_its_reason_and_stays_on_the_shelf(state):
+    """A parked publish failure must reach the console: the danger "Publish failed" weight reads
+    ``state`` + the plain ``fail_reason`` + ``failed_at``, while the approval stays bound to its
+    hash. A staged/approved/published Proposal carries no failure fields."""
+    store = WorkspaceStore(REPO)
+    try:
+        store.open_conversation(title="Ask", conversation_id="c1", idempotency_key="o", now=1)
+        store.stage_proposal("c1", title="Draft", summary="s", acceptance=["a"], body="",
+                             content_hash="sha256:v1", idempotency_key="s1", now=10)
+        store.approve_proposal("c1", "sha256:v1", idempotency_key="a1", now=20)
+        store.fail_publication("c1", "sha256:v1",
+                               reason="GitHub rejected the request — bad credentials.", now=30)
+    finally:
+        store.close()
+    prop = _project(coordinated_converse.build_projection([CFG], now=99))["proposals"][0]
+    assert prop["state"] == "failed"                           # danger weight, never copper
+    assert prop["fail_reason"] == "GitHub rejected the request — bad credentials."
+    assert prop["failed_at"] is not None
+    assert prop["approved_hash"] == "sha256:v1"                # still bound so Retry re-publishes it
+    assert prop["publication"] is None
+
+
+def test_a_staged_proposal_carries_no_failure_fields(state):
+    store = WorkspaceStore(REPO)
+    try:
+        store.open_conversation(title="Ask", conversation_id="c1", idempotency_key="o", now=1)
+        store.stage_proposal("c1", title="Draft", summary="s", acceptance=["a"], body="",
+                             content_hash="sha256:v1", idempotency_key="s1", now=10)
+    finally:
+        store.close()
+    prop = _project(coordinated_converse.build_projection([CFG], now=99))["proposals"][0]
+    assert prop["fail_reason"] is None and prop["failed_at"] is None
+
+
 def test_a_discarded_proposal_is_absent_from_the_read_model(state):
     store = WorkspaceStore(REPO)
     try:
