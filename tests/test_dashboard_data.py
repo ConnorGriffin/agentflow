@@ -1,4 +1,5 @@
 import json
+import re
 from types import SimpleNamespace
 
 import agentflow.dashboard_data as dd
@@ -10,6 +11,7 @@ from agentflow.dashboard_data import (
     park_reason,
     pr_stage,
 )
+from agentflow.gate import _RESPOND_PARK_TARGET_RE
 
 
 def test_complexity_of_labels():
@@ -194,6 +196,52 @@ def test_ci_verdict_reduces_mixed_checks():
     assert dd._ci_verdict([{"conclusion": "SUCCESS"}, {"conclusion": "FAILURE"}]) == "failing"
     assert dd._ci_verdict([{"conclusion": "SUCCESS"}, {"state": "PENDING"}]) == "pending"
     assert dd._ci_verdict([]) is None
+
+
+# --- Respond park comment detectors (issue #197) -----------------------------------------
+
+def _respond_park_body(target: str) -> str:
+    """Build a Respond park comment body the same way _park_respond does."""
+    proof = f"<!-- agentflow-respond-park-target:{target} -->"
+    return ("> *agentflow: parked for human review (Respond).*\n"
+            f"{proof}\n\n"
+            f"Respond could not finish answering maintainer comment `{target}` "
+            "within its continuation budget. The PR branch and local work were retained.")
+
+
+def test_respond_park_body_satisfies_park_reason():
+    # A Respond park comment must register as a park, not None (was broken before fix).
+    body = _respond_park_body("comment-42")
+    assert park_reason([{"body": body}]) is not None
+
+
+def test_respond_park_body_most_recent_wins():
+    # An older conflict comment followed by a newer Respond park → classify from Respond.
+    older_conflict = {"body": f"> *{_CONFLICT_MARK}.*\n\nmain advanced", "createdAt": "T1"}
+    newer_respond = {"body": _respond_park_body("comment-99"), "createdAt": "T2"}
+    reason = park_reason([older_conflict, newer_respond])
+    assert reason is not None
+    assert reason != "failed-merge"
+
+
+def test_respond_park_proof_marker_round_trips():
+    # _RESPOND_PARK_TARGET_RE must extract the target id from the new body format.
+    body = _respond_park_body("comment-42")
+    m = _RESPOND_PARK_TARGET_RE.search(body)
+    assert m is not None and m.group(1) == "comment-42"
+
+
+def test_respond_park_old_format_idempotency():
+    # A re-park against the old-format body must be a no-op: the proof marker is format-independent.
+    target = "comment-7"
+    proof = f"<!-- agentflow-respond-park-target:{target} -->"
+    old_body = ("> *agentflow: Respond parked for human review.*\n"
+                f"{proof}\n\n"
+                "Respond could not finish answering maintainer comment `comment-7` "
+                "within its continuation budget. The PR branch and local work were retained.")
+    # The idempotency check in _park_respond keys on the proof marker, not the quote text.
+    assert proof in old_body
+    assert _RESPOND_PARK_TARGET_RE.search(old_body).group(1) == target
 
 
 def test_workspace_pipeline_reads_only_for_wanted_issues(monkeypatch):

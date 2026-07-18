@@ -1115,7 +1115,7 @@ def _park_respond(record) -> str | None:
         return None
     already = any(proof in comment.get("body", "") for comment in comments)
     if not already:
-        body = ("> *agentflow: Respond parked for human review.*\n"
+        body = ("> *agentflow: parked for human review (Respond).*\n"
                 f"{proof}\n\n"
                 f"Respond could not finish answering maintainer comment `{record.target}` "
                 "within its continuation budget. The PR branch and local work were retained.")

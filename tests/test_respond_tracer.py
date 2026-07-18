@@ -368,7 +368,7 @@ def test_public_respond_exhaustion_has_its_own_durable_park_and_notification(
 
     assert [out.status for out in outcomes] == ["held"]
     respond_parks = [comment["body"] for comment in comments
-                     if "Respond parked for human review" in comment["body"]]
+                     if "agentflow-respond-park-target:" in comment["body"]]
     assert len(respond_parks) == 1
     assert "cid-1" in respond_parks[0] and "review budget" not in respond_parks[0]
     assert len(notifications) == 1
