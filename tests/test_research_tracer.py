@@ -49,6 +49,8 @@ class FakeGitHub:
         self.comments: list[dict] = []
 
     def run(self, argv):
+        if argv[0] == "git":
+            return _R(0)
         head = argv[1:3]
         if argv[1] == "api" and argv[2] == "graphql":
             data = {"data": {"repository": {"issue": {"parent": {
