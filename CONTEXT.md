@@ -136,6 +136,11 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Auto-revise round** — the single builder pass that addresses review findings
   before the pipeline re-reviews. Capped at one, to avoid revise/re-review loops.
 
+- **Conflict revise** — the builder pass that resolves a finished PR's merge
+  conflict after `main` advanced, preserving `main`'s behavior where ambiguous.
+  Budgeted separately from auto-revise rounds (two per PR, then park), followed by
+  a fresh review of the resolved head under normal merge rules (ADR 0038).
+
 - **Drop-to-reviewed** — the escape valve: an `autonomous` PR that can't clear
   review after its one revise round is demoted to `reviewed` for that issue
   (findings posted, human pinged, PR waits). Autonomy parks doubt, never forces a
