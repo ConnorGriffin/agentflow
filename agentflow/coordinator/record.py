@@ -48,6 +48,10 @@ class Record:
                                           # attempt; a family that dies leaving no supervisor end fact
                                           # under a *different* generation was taken down with the
                                           # daemon (restart/reboot), so its attempt resumes uncharged
+    collision_main_sha: str | None = None  # the `origin/main` head a Build reported an integration
+                                            # collision against; a continuation stays deferred while
+                                            # main still equals it (an identical retry), and a second
+                                            # collision hands the issue off instead of retrying (#209)
     restart_resumes: int = 0     # consecutive restart-resumes of the current attempt — bounded, so a
                                  # session that keeps dying with no end fact still parks eventually
     state: str = WAITING

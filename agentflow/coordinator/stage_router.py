@@ -58,3 +58,8 @@ class StageRouter:
         adapter = self._for(record)
         fn = getattr(adapter, "finalize_hold", None) if adapter is not None else None
         return fn(record) if fn is not None else None
+
+    def integration_collision(self, record) -> str | None:
+        adapter = self._for(record)
+        fn = getattr(adapter, "integration_collision", None) if adapter is not None else None
+        return fn(record) if fn is not None else None

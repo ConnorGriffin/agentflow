@@ -365,7 +365,8 @@ def build_coordinator(_log=None) -> Coordinator:
         worktree_dispose=coordinated_intake.dispose_worktree,
         handoff=coordinated_intake.hold_intake)
     build = BuildStageAdapter(
-        pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build)
+        pr_exists=_pr_exists, worktree_ready=_worktree_ready, handoff=_hold_build,
+        integration_collision=_integration_collision, main_head=_main_head)
     review = ReviewStageAdapter(
         verdict_ready=_verdict_ready,
         worktree_reset=lambda record: _review_worktree_reset(record, _log=_log),
@@ -481,6 +482,65 @@ def _pr_exists(record) -> bool:
         raise RuntimeError(f"cannot verify Build PR outcome for {record.repo}:{branch}")
     return any(pr.get("headRefName") == branch
                for pr in json.loads(r.stdout or "[]"))
+
+
+_COLLISION_MARK = "INTEGRATION-COLLISION"
+
+
+def _main_head(record) -> str | None:
+    """The current `origin/main` head SHA in the record's checkout, or None if unreadable. The
+    coordinator compares it to the head a collision was recorded against to tell an identical
+    retry (defer) from a main that has moved (one retry is warranted — issue #209)."""
+    from agentflow.loop import _run
+    parsed = _source_facts(record)
+    if parsed is None:
+        return None
+    workdir, _branch, _wt = parsed
+    _run(["git", "-C", workdir, "fetch", "--quiet", "origin", "main"])
+    head = _run(["git", "-C", workdir, "rev-parse", "origin/main"])
+    return head.stdout.strip() if head.returncode == 0 else None
+
+
+def _integration_collision(record) -> str | None:
+    """The `origin/main` head this Build reported an integration collision against this attempt, or
+    None. The builder rebases onto `origin/main` before opening a PR and, on conflict, stops without
+    resolving and posts a comment prefixed ``INTEGRATION-COLLISION`` (ADR 0009). A comment carrying
+    that marker at its start and created after this attempt was admitted is the durable outcome; the
+    recorded main head is what makes a subsequent identical retry detectable (issue #209)."""
+    from agentflow.loop import _run
+    try:
+        number = int(record.subject)
+    except (TypeError, ValueError):
+        return None
+    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
+                   "--json", "comments"])
+    if viewed.returncode != 0:
+        return None
+    try:
+        comments = json.loads(viewed.stdout or "{}").get("comments", [])
+    except json.JSONDecodeError:
+        return None
+    if not any(_collision_comment(comment, record.started_at) for comment in comments):
+        return None
+    return _main_head(record)
+
+
+def _collision_comment(comment: dict, admitted_at: int) -> bool:
+    """Whether one issue comment is this attempt's integration-collision report: its body starts
+    with the ``INTEGRATION-COLLISION`` marker and it was created after the attempt was admitted, so
+    a collision comment from an earlier attempt can never stand in for this one. A record from
+    before admission times were stamped carries ``started_at == 0`` and keeps the unanchored
+    behavior; an unparseable timestamp cannot be proven fresh and fails closed."""
+    if not (comment.get("body", "") or "").lstrip().startswith(_COLLISION_MARK):
+        return False
+    if not admitted_at:
+        return True
+    try:
+        created = datetime.fromisoformat(
+            str(comment.get("createdAt", "") or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    return created > admitted_at
 
 
 def _source_facts(record):
@@ -769,8 +829,10 @@ def _hold_build(record) -> str | None:
     except json.JSONDecodeError:
         return None
     labels = [label.get("name", "") for label in issue.get("labels", [])]
-    result = held_build_result(
-        "continuation budget exhausted", f"the retained worktree `{record.source}`")
+    status = ("could not rebase past a collision with newer changes on the main branch and stopped "
+              "without resolving it" if record.hold_reason == "integration collision"
+              else "continuation budget exhausted")
+    result = held_build_result(status, f"the retained worktree `{record.source}`")
     already_posted = any(
         comment.get("body", "").strip() == result.body.strip()
         for comment in issue.get("comments", [])
@@ -795,9 +857,10 @@ def _hold_build(record) -> str | None:
     if "agentflow:needs-grilling" not in final_labels or BUILDING in final_labels or not has_comment:
         return None
     url = state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
+    headline = ("Build hit an integration collision" if record.hold_reason == "integration collision"
+                else "Build continuation budget exhausted")
     if not already_posted:
-        notify("agentflow needs you",
-               f"{record.repo} #{number}: Build continuation budget exhausted", url)
+        notify("agentflow needs you", f"{record.repo} #{number}: {headline}", url)
     return str(url)
 
 

@@ -586,6 +586,9 @@ class Coordinator:
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed — "
                               f"{_OUTCOME_LABEL.get(record.stage, record.stage)}; claim retained")
             return StageOutcome(record.identity, record.stage, "completed")
+        collision = self._integration_collision(record)
+        if collision is not None:
+            return self._settle_collision(record, collision)
         label = obs.classification()
         cause = obs.cause.value
         if label == "permanent":
@@ -616,6 +619,43 @@ class Coordinator:
         # The stage adapter proves a live external handoff; the coordinator then finalizes it
         # idempotently and crash-safely.
         return self._finalize_hold(record)
+
+    def _integration_collision(self, record: Record) -> str | None:
+        """The `origin/main` head a Build reported an integration collision against this attempt,
+        or None. The stage adapter reads the durable outcome (the builder's own marked comment)
+        and the current main head; a stage with no such adapter never collides (issue #209)."""
+        fn = getattr(self._adapter, "integration_collision", None)
+        return fn(record) if fn is not None else None
+
+    def _settle_collision(self, record: Record, main_sha: str) -> StageOutcome | None:
+        """A reported integration collision is a durable outcome, not a retryable failure (issue
+        #209). The first collision against an unchanged main records that main head and defers the
+        continuation without charging the attempt — the retry would be provably identical until
+        main moves (the stage adapter's ``prepare`` holds it back while main is unchanged). A
+        second collision (main moved, the granted retry collided again) or a collision that arrives
+        with the budget already exhausted hands the issue off visibly instead of retrying blind."""
+        repeat = record.collision_main_sha is not None
+        attempt_no = record.attempts
+        record.collision_main_sha = main_sha
+        if repeat or record.attempts >= ATTEMPT_BUDGET:
+            record.hold_reason = "integration collision"
+            if not self._hold(record):
+                return None
+            self._emit(record, f"attempt {attempt_no}/{ATTEMPT_BUDGET} interrupted (integration "
+                              "collision) — unresolved against a moved main; handoff pending; "
+                              "claim retained")
+            return self._finalize_hold(record)
+        record.attempts -= 1               # refund the up-front charge; an identical retry is doomed
+        record.attempt_committed = False
+        record.state = WAITING
+        record.continuation = True
+        record.eligible_at = 0
+        if not self._persist(record):
+            return None
+        self._emit(record, f"attempt {attempt_no}/{ATTEMPT_BUDGET} hit an integration collision on "
+                          f"main {main_sha[:7]} — deferring retry until main moves; attempt "
+                          "refunded; claim retained")
+        return None
 
     def _finalize_hold(self, record: Record) -> StageOutcome | None:
         if not record.hold_pending:
