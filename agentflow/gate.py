@@ -216,8 +216,13 @@ def has_committed_evidence(changed_files: list[str]) -> bool:
 
 def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     """Live: does this PR change a declared UI surface but carry no screenshot in its
-    body or comments? Fail-safe — a `gh` error with surfaces declared returns True (we
-    can't prove a UI change is evidenced, so don't auto-merge it unseen)."""
+    body or an agentflow-marked comment? Fail-safe — a `gh` error with surfaces declared
+    returns True (we can't prove a UI change is evidenced, so don't auto-merge it unseen).
+
+    Evidence is anchored to us: it counts only in the PR body or in a comment agentflow
+    authored (`PR_MARK`, the same authorship rule `_round_evidence` uses). A maintainer's
+    unrelated image, a cross-PR asset URL, or a stray link in someone else's comment no
+    longer satisfies the gate (issue #205)."""
     if not surfaces:
         return False   # non-UI repo: gate inert
     r = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
@@ -230,9 +235,13 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
         return False
     if has_committed_evidence(files):
         return False
-    evidence = "\n".join([data.get("body") or ""]
-                         + [c.get("body", "") for c in data.get("comments", [])])
-    return not has_image_evidence(evidence)
+    if has_image_evidence(data.get("body") or ""):
+        return False
+    for comment in data.get("comments", []):
+        body = comment.get("body", "") or ""
+        if PR_MARK in body and has_image_evidence(body):
+            return False
+    return True
 
 
 # --- gh actions ----------------------------------------------------------------
