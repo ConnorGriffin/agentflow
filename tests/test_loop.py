@@ -926,6 +926,7 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
     monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool: "codex")
     submission = SimpleNamespace(stage="review", transfer_from=None)
     monkeypatch.setattr(coordinated_build, "survivor_review_submission",
                         lambda *args, **kwargs: submission)
@@ -942,6 +943,54 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
 
     assert result == "review submitted"
     assert submitted == [submission] and reconciled == [coord]
+
+
+def test_survivor_review_uses_the_reviewer_pick_not_a_hardcoded_cross_tool(monkeypatch):
+    """The survivor re-review must go to the tool the balancer picks (ADR 0020), not a hardcoded
+    cross-tool pool: when codex is out of budget, a claude-built survivor is re-reviewed by claude
+    (same-tool, no auto-merge) rather than submitted into a codex pool that cannot launch it."""
+    from agentflow import coordinated_build
+
+    monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool: "claude")   # codex out of budget
+    captured = {}
+
+    def fake_submission(cfg, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(stage="review", transfer_from=None)
+
+    monkeypatch.setattr(coordinated_build, "survivor_review_submission", fake_submission)
+    monkeypatch.setattr(coordinated_build, "build_coordinator",
+                        lambda: SimpleNamespace(submit_stage=lambda s: None))
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda current: None)
+
+    result = loop._merge_autonomous_survivor(
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
+
+    assert result == "review submitted"
+    assert captured["reviewer_tool"] == "claude"
+
+
+def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch):
+    """With neither pool able to launch a review, the survivor re-review defers to a later cycle
+    rather than submitting into a dead pool (the frozen state this path used to create)."""
+    from agentflow import coordinated_build
+
+    monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool: None)
+    submitted = []
+    monkeypatch.setattr(coordinated_build, "survivor_review_submission",
+                        lambda *a, **k: submitted.append(True))
+    claimed = []
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+
+    result = loop._merge_autonomous_survivor(
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
+
+    assert result == "no reviewer pool available — deferring"
+    assert submitted == [] and claimed == []
 
 
 def _stub_recheck(monkeypatch, prs, *, advanced, profile, comments=None):

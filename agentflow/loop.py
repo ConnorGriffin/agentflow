@@ -17,7 +17,7 @@ from enum import Enum
 from pathlib import Path
 
 from agentflow import ratchet
-from agentflow.balancer import pick_pair
+from agentflow.balancer import pick_pair, pick_reviewer
 from agentflow.gate import (maintainer_comment, maintainer_comment_id, park, reply_pending)
 from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, STATE_LABELS,
                               _DISCLAIMER, _strip_quoted_lines, awaiting_recheck,
@@ -958,7 +958,13 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
     if head.returncode != 0 or not head.stdout.strip():
         return "review head unreadable"
-    reviewer_tool = "codex" if branch_tool == "claude" else "claude"
+    # Route the re-review through the same reviewer choice the openers use (ADR 0020): prefer the
+    # cross-tool reviewer, fall back to the builder's own tool when the other pool is out of
+    # budget, and defer when neither pool can launch — never submit into a pool that cannot start
+    # it, which is exactly what froze the reviews this path used to hardcode cross-tool.
+    reviewer_tool = pick_reviewer(branch_tool)
+    if reviewer_tool is None:
+        return "no reviewer pool available — deferring"
     acceptance = _issue_acceptance(cfg, n)
     if acceptance is None:
         return "issue acceptance unreadable"

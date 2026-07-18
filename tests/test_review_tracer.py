@@ -192,6 +192,80 @@ def test_a_code_writing_continuation_never_migrates(make_coord):
     assert permits(coord, "claude") == 0
 
 
+# --- a review re-places when its home pool loses launch capacity (issue #202) -------------
+
+def _gate_blocking(*pools):
+    """An admission gate that refuses launches on the named pools (e.g. one whose weekly budget
+    is spent) while its permit ledger is untouched — the launch-gate block that froze the
+    home-depot #22/#23 reviews at zero attempts."""
+    blocked = set(pools)
+    return lambda record: record.pool not in blocked
+
+
+def test_a_frozen_fresh_review_migrates_when_its_pool_lost_launch_capacity(make_coord):
+    """A fresh review (never launched, zero attempts) whose home pool later loses launch capacity
+    — permit ledger empty but the launch gate now blocks it (weekly budget spent) — is re-placed
+    onto a pool that can launch it, keeping its immutable target and losing auto-merge when it
+    lands on the builder's own tool. Reproduces home-depot #22/#23; before the fix the record
+    freezes on codex forever because migration required a continuation and a full permit ledger."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_gate_blocking("codex"),
+                       adapter=_review_adapter(fake, verdict=[False], prep=[True]))
+    # A cross-tool review of a claude-built PR, assigned to codex while codex still had budget;
+    # codex has since lost its launch capacity with an empty ledger.
+    r = coord.submit_stage(_review("1", pool="codex", builder_lineage="claude"))
+    coord.cycle("codex", now=0)                       # codex cannot launch it; ledger untouched
+    frozen = record_of(coord, r)
+    assert frozen.state == "waiting" and frozen.attempts == 0
+    assert permits(coord, "codex") == 0
+
+    coord.cycle("claude", now=0)                      # re-placed onto claude, which can launch it
+    moved = record_of(coord, r)
+    assert moved.pool == "claude" and moved.state == "running"
+    assert moved.target == "sha-a"                    # immutable target unchanged
+    assert moved.auto_merge_allowed is False          # same-tool review cannot auto-merge
+    assert permits(coord, "claude") == 1
+
+
+def test_a_review_stays_put_when_neither_pool_can_launch_it_then_lands_home_on_recovery(
+        make_coord):
+    """No flapping: with both pools launch-blocked the review reverts cleanly to its home pool
+    each cycle (never a half-move), and once the home pool regains budget it launches at home
+    rather than being re-placed."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_gate_blocking("codex", "claude"),
+                       adapter=_review_adapter(fake, verdict=[False], prep=[True]))
+    r = coord.submit_stage(_review("1", pool="codex", builder_lineage="claude"))
+    for _ in range(3):                                # several cycles, both pools blocked
+        coord.cycle("codex", now=0)
+        coord.cycle("claude", now=0)
+    parked = record_of(coord, r)
+    assert parked.pool == "codex" and parked.state == "waiting" and parked.attempts == 0
+    assert parked.demand == 2                         # migration fields reverted — no half-move
+    assert parked.auto_merge_allowed is True          # still cross-tool while it stays home
+    assert permits(coord, "claude") == 0
+
+    coord._gate = _gate_blocking("claude")            # codex regains its weekly budget
+    coord.cycle("codex", now=0)                       # launches at home, not re-placed
+    home = record_of(coord, r)
+    assert home.pool == "codex" and home.state == "running"
+    assert permits(coord, "codex") == 2
+
+
+def test_a_gate_blocked_code_writing_stage_never_migrates(make_coord):
+    """Weekly-budget pacing of codex code-writing work is intended: a waiting revise whose codex
+    pool is launch-blocked stays on codex and is never offered to claude (only reviews move)."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_gate_blocking("codex"))
+    revise = coord.submit_stage(Submission(repo="o/r", subject="9", stage="revise", pool="codex",
+                                           builder_lineage="codex", complexity="deep"))
+    coord.cycle("codex", now=0)                        # gate-blocked; stays waiting on codex
+    coord.cycle("claude", now=0)                       # claude cycle must not adopt it
+    stayed = record_of(coord, revise)
+    assert stayed.pool == "codex" and stayed.state == "waiting"
+    assert permits(coord, "claude") == 0
+
+
 # --- exhaustion parks the PR once --------------------------------------------------------
 
 def test_exhaustion_parks_the_pr_once_with_one_handoff_and_notification(make_coord):
