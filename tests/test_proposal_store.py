@@ -13,7 +13,7 @@ import sqlite3
 
 import pytest
 
-from agentflow.workspace.store import (APPROVED, DISCARDED, PUBLISHED, REJECTED, STAGED,
+from agentflow.workspace.store import (APPROVED, DISCARDED, FAILED, PUBLISHED, REJECTED, STAGED,
                                        WorkspaceStore)
 
 
@@ -132,6 +132,62 @@ def test_only_the_approved_hash_can_be_recorded_as_published(store):
     assert store.proposal(cid).state == APPROVED
 
 
+# --- failed disposition: a parked publish failure, retried by re-approving --------------
+
+def test_a_publish_failure_parks_failed_with_a_reason_and_keeps_the_hash_bound(store):
+    cid = _convo(store)
+    _stage(store, cid, hash_="sha256:v1", key="s1")
+    store.approve_proposal(cid, "sha256:v1", idempotency_key="a1", now=2)
+    out = store.fail_publication(cid, "sha256:v1", reason="GitHub rejected the request.", now=9)
+    assert out.accepted
+    prop = store.proposal(cid)
+    assert prop.state == FAILED and prop.fail_reason == "GitHub rejected the request."
+    assert prop.failed_at == 9 and prop.approved_hash == "sha256:v1"   # still bound for Retry
+
+
+def test_failing_a_hash_that_is_not_the_approved_one_is_rejected(store):
+    cid = _convo(store)
+    _stage(store, cid, hash_="sha256:v1", key="s1", now=10)
+    _stage(store, cid, hash_="sha256:v2", key="s2", now=20)
+    store.approve_proposal(cid, "sha256:v2", idempotency_key="a1", now=30)
+    out = store.fail_publication(cid, "sha256:v1", reason="nope", now=40)
+    assert out.status == REJECTED and out.error == "hash is not the approved one"
+    assert store.proposal(cid).state == APPROVED
+
+
+def test_a_published_proposal_ignores_a_stale_failure(store):
+    cid = _convo(store)
+    _stage(store, cid, hash_="sha256:v1", key="s1")
+    store.approve_proposal(cid, "sha256:v1", idempotency_key="a1", now=2)
+    store.record_publication(cid, "sha256:v1", issue_number=7, issue_url="u", now=3)
+    out = store.fail_publication(cid, "sha256:v1", reason="late failure", now=4)
+    assert out.accepted                                        # a no-op replay, never unwinds
+    assert store.proposal(cid).state == PUBLISHED
+
+
+def test_re_approving_after_a_failure_clears_the_failure(store):
+    """Retry is the operator re-issuing approve for the same hash: it clears the parked failure and
+    re-authorizes the exact version, so publication can re-run."""
+    cid = _convo(store)
+    _stage(store, cid, hash_="sha256:v1", key="s1")
+    store.approve_proposal(cid, "sha256:v1", idempotency_key="a1", now=2)
+    store.fail_publication(cid, "sha256:v1", reason="GitHub rejected the request.", now=9)
+    assert store.proposal(cid).state == FAILED
+    store.approve_proposal(cid, "sha256:v1", idempotency_key="a2", now=11)
+    prop = store.proposal(cid)
+    assert prop.state == APPROVED and prop.fail_reason is None and prop.failed_at == 0
+    assert prop.approved_hash == "sha256:v1"
+
+
+def test_a_failed_proposal_can_be_discarded(store):
+    cid = _convo(store)
+    _stage(store, cid, hash_="sha256:v1", key="s1")
+    store.approve_proposal(cid, "sha256:v1", idempotency_key="a1", now=2)
+    store.fail_publication(cid, "sha256:v1", reason="boom", now=9)
+    out = store.discard_proposal(cid, idempotency_key="d1", now=10)
+    assert out.accepted and store.proposal(cid).state == DISCARDED
+
+
 # --- discard: drops the draft, leaves the Conversation intact --------------------------
 
 def test_discard_drops_the_proposal_but_keeps_the_conversation(store):
@@ -206,3 +262,44 @@ def test_proposal_versions_survive_a_fresh_store(tmp_path):
         assert [v.content_hash for v in prop.versions] == ["sha256:v1", "sha256:v2"]
     finally:
         reopened.close()
+
+
+def test_a_v2_store_migrates_in_place_gaining_the_failed_disposition_columns(tmp_path):
+    """A schema-2 store has Proposal tables but no durable failed disposition. Opening it must add
+    the failure columns in place, keeping its approved Proposal — then a publish failure can park it.
+    Would fail if the v3 bump fenced the old store off or dropped its rows."""
+    path = tmp_path / "agentflow.db"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY, repo TEXT NOT NULL, title TEXT NOT NULL"
+        " DEFAULT '', verb TEXT NOT NULL DEFAULT 'ask', scope TEXT, state TEXT NOT NULL DEFAULT"
+        " 'active', revision INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0,"
+        " updated_at INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE commands (key TEXT PRIMARY KEY, outcome TEXT NOT NULL);"
+        # schema-2 proposals: no fail_reason / failed_at columns
+        "CREATE TABLE proposals (conversation_id TEXT PRIMARY KEY, state TEXT NOT NULL DEFAULT"
+        " 'staged', title TEXT NOT NULL DEFAULT '', approved_hash TEXT, published_issue INTEGER,"
+        " published_url TEXT, published_at INTEGER NOT NULL DEFAULT 0, staged_at INTEGER NOT NULL"
+        " DEFAULT 0, updated_at INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE proposal_versions (conversation_id TEXT NOT NULL, version INTEGER NOT NULL,"
+        " content_hash TEXT NOT NULL, title TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT"
+        " '', acceptance TEXT NOT NULL DEFAULT '[]', body TEXT NOT NULL DEFAULT '', staged_at"
+        " INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (conversation_id, version));"
+        "INSERT INTO conversations (id, repo, title) VALUES ('c2', 'ConnorGriffin/agentflow', 'A');"
+        "INSERT INTO proposals (conversation_id, state, title, approved_hash) VALUES"
+        " ('c2', 'approved', 'Old draft', 'sha256:v1');"
+        "INSERT INTO proposal_versions (conversation_id, version, content_hash, title) VALUES"
+        " ('c2', 1, 'sha256:v1', 'Old draft');"
+        "PRAGMA user_version = 2;")
+    conn.commit()
+    conn.close()
+
+    store = WorkspaceStore("ConnorGriffin/agentflow", path=path)
+    try:
+        prop = store.proposal("c2")
+        assert prop.state == APPROVED and prop.approved_hash == "sha256:v1"  # survived the migration
+        assert prop.fail_reason is None and prop.failed_at == 0             # new columns default clean
+        out = store.fail_publication("c2", "sha256:v1", reason="GitHub rejected the request.", now=5)
+        assert out.accepted and store.proposal("c2").state == FAILED
+    finally:
+        store.close()

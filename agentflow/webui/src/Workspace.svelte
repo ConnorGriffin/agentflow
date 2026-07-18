@@ -12,6 +12,11 @@
   let projectId = $state(null);
   let view = $state({ name: 'home', param: null }); // home | dialogue | approval
   let pending = $state({}); // convId -> [operator prompts sent this session, awaiting the projection]
+  // Optimistic in-flight approve: convId -> true the instant the operator confirms, so the card
+  // flips to the teal "Publishing…" weight before the daemon drains the command a cycle later.
+  // Cleared in poll() once the projection confirms the approval (state approved/published), the
+  // same discipline the Ask-turn `pending` map uses — the real state then owns the weight.
+  let publishing = $state({});
   let notice = $state('');
   // The second beat of a hash-bound approval is UI-local: arming reveals the confirm, which sends
   // the approve command bound to the EXACT version hash on screen (never "latest").
@@ -89,6 +94,15 @@
       if (p) {
         for (const c of p.conversations) {
           if (pending[c.id]) pending[c.id] = pending[c.id].slice(c.turns_count);
+        }
+        // Drop the optimistic in-flight flag once the durable projection has adopted the approval
+        // (approved = daemon-confirmed publishing, published = verified). While it still reads
+        // staged/failed the approve command hasn't drained, so the optimistic beat stays.
+        for (const pr of p.proposals || []) {
+          if (publishing[pr.conversation_id] &&
+              (pr.state === 'approved' || pr.state === 'published')) {
+            delete publishing[pr.conversation_id];
+          }
         }
       }
     } catch (e) {
@@ -168,10 +182,25 @@
   // ---------- Build-Issue Proposal decisions (approve is hash-bound; the daemon publishes) ------
   function approveProposal(prop) {
     if (!project || !prop || !prop.content_hash) return;
+    // Optimistic in-flight beat: flip to "Publishing…" now, before the daemon drains the command.
+    publishing[prop.conversation_id] = true;
     // Bind to the EXACT version hash the operator is looking at (ADR 0034), not "latest".
     send({
       key: uuid(), kind: 'approve_proposal', repo: project.repo,
       conversation_id: prop.conversation_id, content_hash: prop.content_hash,
+    });
+    armed = false;
+  }
+  // Retry re-authorizes the SAME approved hash a failed publish parked. Idempotency (search-before
+  // -create on the hash) guarantees this never files a duplicate — it only re-runs the publish.
+  function retryProposal(prop) {
+    if (!project || !prop) return;
+    const hash = prop.approved_hash || prop.content_hash;
+    if (!hash) return;
+    publishing[prop.conversation_id] = true;
+    send({
+      key: uuid(), kind: 'approve_proposal', repo: project.repo,
+      conversation_id: prop.conversation_id, content_hash: hash,
     });
     armed = false;
   }
@@ -187,7 +216,19 @@
   // ---------- derived view data ----------
   let conversations = $derived(project ? project.conversations : []);
   let proposals = $derived(project && project.proposals ? project.proposals : []);
-  let stagedProposals = $derived(proposals.filter((x) => x.state === 'staged'));
+  // In flight = the daemon-confirmed "approved" OR a staged/failed proposal the operator just
+  // confirmed (the optimistic local beat). Both wear the same teal "Publishing…" weight (honest:
+  // both mean "in flight"). Copper (awaiting) and danger (failed) yield to it while in flight.
+  const isPublishing = (p) =>
+    p.state === 'approved' ||
+    ((p.state === 'staged' || p.state === 'failed') && !!publishing[p.conversation_id]);
+  let awaitingProposals = $derived(
+    proposals.filter((x) => x.state === 'staged' && !publishing[x.conversation_id]),
+  );
+  let publishingProposals = $derived(proposals.filter(isPublishing));
+  let failedProposals = $derived(
+    proposals.filter((x) => x.state === 'failed' && !publishing[x.conversation_id]),
+  );
   let publishedProposals = $derived(proposals.filter((x) => x.state === 'published'));
   let dockPlaceholder = $derived(
     view.name === 'dialogue' ? 'Reply to Wayfinder…' : 'What should we work on?',
@@ -315,7 +356,9 @@
           <div class="page-head-meta">
             {#if prop.state === 'published'}
               <span class="pill pill--ok">Published — verified</span>
-            {:else if prop.state === 'approved'}
+            {:else if prop.state === 'failed' && !publishing[prop.conversation_id]}
+              <span class="pill pill--danger">Publish failed</span>
+            {:else if prop.state === 'approved' || publishing[prop.conversation_id]}
               <span class="pill pill--teal">Publishing…</span>
             {:else}
               <span class="pill pill--copper">Waiting on you</span>
@@ -375,11 +418,27 @@
                 {/if}
                 <button class="linklike" onclick={toHome}>Back to the shelf →</button>
               </div>
-            {:else if prop.state === 'approved'}
+            {:else if prop.state === 'failed' && !publishing[prop.conversation_id]}
+              <div class="decision-note pubfail">
+                <span
+                  ><strong>Couldn't publish v{prop.version}.</strong>
+                  {prop.fail_reason || 'GitHub rejected the request.'}
+                  <span class="reason"
+                    >Your approval is safe: the proposal is still staged and bound to
+                    <span class="ref">{shortHash(prop.approved_hash || prop.content_hash)}</span>.
+                    Retry publishes the exact version — no duplicate can be created.</span></span>
+              </div>
+              <div class="decision-row" style="margin-top:14px">
+                <button class="btn btn--danger" onclick={() => retryProposal(prop)}
+                  >Retry publish</button>
+                <button class="btn btn--danger-quiet" onclick={() => discardProposal(prop)}
+                  >Discard proposal</button>
+              </div>
+            {:else if prop.state === 'approved' || publishing[prop.conversation_id]}
               <div class="decision-note pubwait">
                 <span
                   >Publishing v{prop.version} ·
-                  <span class="ref">{shortHash(prop.approved_hash)}</span> to
+                  <span class="ref">{shortHash(prop.approved_hash || prop.content_hash)}</span> to
                   <span class="ref">{project.repo}</span>… waiting for the publication receipt to
                   verify. The daemon creates the issue idempotently — a replay never files a
                   duplicate.</span>
@@ -441,7 +500,7 @@
       {:else}
         <section class="shelf" aria-label="Efforts, sharpest decision first">
           <!-- Copper = "awaiting your decision" only: a staged build-issue proposal awaiting you. -->
-          {#each stagedProposals as prop}
+          {#each awaitingProposals as prop}
             <article class="obj obj--awaiting">
               <div class="obj-tags">
                 <span class="pill pill--copper">Waiting on you</span>
@@ -458,6 +517,57 @@
                   >Review &amp; approve</button>
                 <button class="linklike" onclick={() => openConv(prop.conversation_id)}
                   >read the Ask</button>
+              </div>
+            </article>
+          {/each}
+          <!-- In flight (teal, not copper): the optimistic beat the instant you confirm, held
+               steady once the daemon confirms the approval. No buttons — nothing to double-click. -->
+          {#each publishingProposals as prop}
+            <article class="obj obj--publishing">
+              <div class="obj-tags">
+                <span class="pill pill--teal pulse"><span class="icon"
+                    ><svg viewBox="0 0 12 12"><circle cx="6" cy="6" r="3.6" fill="none"
+                        stroke="currentColor" stroke-width="1.6" /><path d="M6 2.4a3.6 3.6 0 0 1 0 7.2Z"
+                        fill="currentColor" /></svg></span>Publishing…</span>
+                <span class="obj-kind">Approval sent · creating the issue</span>
+              </div>
+              <h2 class="obj-title obj-title--sm">{prop.title || 'Build issue'}</h2>
+              <p class="obj-meta">
+                <span class="dim"
+                  >v{prop.version} · <span class="ref">{shortHash(prop.content_hash)}</span> ·
+                  approved just now</span>
+              </p>
+            </article>
+          {/each}
+          <!-- Danger (never copper): a hard publish failure. The approval is safe — still staged,
+               bound to the same hash — so Retry re-publishes the exact version; Discard drops it. -->
+          {#each failedProposals as prop}
+            <article class="obj obj--failed">
+              <div class="obj-tags">
+                <span class="pill pill--danger"><span class="icon"
+                    ><svg viewBox="0 0 12 12"><path d="M6 1 11 10.4H1Z" fill="none"
+                        stroke="currentColor" stroke-width="1.3" /><path d="M6 4.6v2.4"
+                        stroke="currentColor" stroke-width="1.3" /><circle cx="6" cy="8.7" r=".7"
+                        fill="currentColor" /></svg></span>Publish failed</span>
+                <span class="obj-kind">Still staged · nothing was created</span>
+              </div>
+              <h2 class="obj-title obj-title--sm">{prop.title || 'Build issue'}</h2>
+              <p class="obj-fail"><span class="icon"><svg viewBox="0 0 12 12"><path
+                      d="M6 1 11 10.4H1Z" fill="none" stroke="currentColor" stroke-width="1.3" /><path
+                      d="M6 4.6v2.4" stroke="currentColor" stroke-width="1.3" /><circle cx="6"
+                      cy="8.7" r=".7" fill="currentColor" /></svg></span>
+                <span>{prop.fail_reason || 'GitHub rejected the request.'}
+                  <span class="when">failed {ago(prop.failed_at)}</span></span></p>
+              <p class="obj-meta">
+                <span class="dim"
+                  >v{prop.version} · <span class="ref">{shortHash(prop.content_hash)}</span> ·
+                  your approval is safe</span>
+              </p>
+              <div class="obj-actions">
+                <button class="btn btn--danger" onclick={() => retryProposal(prop)}
+                  >Retry publish</button>
+                <button class="btn btn--danger-quiet" onclick={() => discardProposal(prop)}
+                  >Discard proposal</button>
               </div>
             </article>
           {/each}

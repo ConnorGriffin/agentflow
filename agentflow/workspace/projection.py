@@ -110,6 +110,10 @@ def _proposal_json(prop, pipeline_by_issue: dict | None = None) -> dict:
         "content_hash": latest.content_hash if latest else None,
         "staged_at": _iso(latest.staged_at) if latest else None,
         "approved_hash": prop.approved_hash,
+        # The durable failed disposition: a plain reason + when it parked, so the console can render
+        # the danger "Publish failed" weight with a Retry. Absent unless the Proposal is failed.
+        "fail_reason": prop.fail_reason if prop.state == "failed" else None,
+        "failed_at": _iso(prop.failed_at) if prop.state == "failed" else None,
         "versions": [_version_json(v, current=(latest is not None and v.version == latest.version))
                      for v in prop.versions],
         "publication": ({
