@@ -27,9 +27,11 @@ from agentflow.coordinator.store import Store, default_store_path
 
 
 # The logical stages enabled behind the coordinator — the one source
-# :func:`build_review_revise_gate` consumes. The six pipeline stages (issues #103–#108) plus the
-# Conversation-turn stage (``converse``) an Ask submits per operator message (ADR 0034).
-ENABLED_STAGES = ("intake", "build", "review", "revise", "mockup", "respond", "converse")
+# :func:`build_review_revise_gate` consumes. The six pipeline stages (issues #103–#108), the
+# Conversation-turn stage (``converse``) an Ask submits per operator message (ADR 0034), and the
+# unattended ``research`` stage the daemon dispatches for an AFK-able planning ticket (ADR 0037).
+ENABLED_STAGES = ("intake", "build", "review", "revise", "mockup", "respond", "converse",
+                  "research")
 
 
 def build_review_revise_gate(record: Record) -> bool:
@@ -53,7 +55,8 @@ def _issue_number(record: Record) -> int | None:
 # ``triaging`` one, or one type's live record would shield the other type's stale claim from
 # reclamation (and hide it from forward-activation evidence).
 CLAIM_LANE = {"intake": "triaging", "build": "building", "review": "building",
-              "revise": "building", "mockup": "drawing", "respond": "building"}
+              "revise": "building", "mockup": "drawing", "respond": "building",
+              "research": "resolving"}
 
 
 def owned_issues(records, repo: str, lane: str | None = None) -> set[int]:
@@ -81,7 +84,8 @@ def owned_issues(records, repo: str, lane: str | None = None) -> set[int]:
 
 # Code-writing stages retain the legacy board lane that names their operator-facing activity.
 _STAGE_LANE = {"intake": "triaging", "build": "building", "review": "reviewing",
-               "revise": "building", "mockup": "triaging", "respond": "building"}
+               "revise": "building", "mockup": "triaging", "respond": "building",
+               "research": "resolving"}
 
 
 def live_projection(records) -> list[dict]:

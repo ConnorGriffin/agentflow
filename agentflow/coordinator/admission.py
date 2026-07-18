@@ -33,6 +33,9 @@ STAGE_NATIVE_HANDOFF = {
     "revise": "pr:parked",
     "respond": "pr:parked",
     "converse": "ask:needs-you",
+    # Research holds by releasing its shared claim so the ticket is simply eligible again next
+    # cycle (ADR 0037) — there is no operator-facing park; the release itself is the handoff.
+    "research": "ticket:claim-released",
 }
 
 # Legacy orchestration labels normalize to a logical stage before lookup so the ambiguous
@@ -64,6 +67,11 @@ _ADMISSION_ROWS = {
     # headroom so an interactive Ask turn admits ahead of background work without starving it.
     ("converse", "claude", "opus", "deep", None): 2,
     ("converse", "codex", "sol", "deep", None): 2,
+    # An unattended research session is a bounded deep investigation (ADR 0037). It runs in its
+    # own stage lane with a cap of one, so a modest two-permit footprint keeps pool headroom for
+    # the builds the balancer is pacing rather than letting a single research run reserve a pool.
+    ("research", "claude", "opus", "deep", None): 2,
+    ("research", "codex", "sol", "deep", None): 2,
 }
 for _pool, _model, _complexity, _demands in (
     ("claude", "sonnet", "standard", (3, 4, 5, 5)),
