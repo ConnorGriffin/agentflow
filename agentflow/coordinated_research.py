@@ -265,7 +265,10 @@ def resolve(record) -> str | None:
     marker gates the comment, the `#N` reference gates the map line, and a closed ticket / removed
     label are no-ops. Returns a durable proof (the ticket URL) once the ticket is closed with its
     findings comment, or ``None`` to retry next cycle rather than retiring over an incomplete
-    resolution."""
+    resolution.
+
+    On durable resolution the run's isolated worktree is removed so resolved runs do not accumulate
+    on disk. Cleanup is best-effort and never blocks returning the proof."""
     from agentflow.loop import _release_resolving, _run
     try:
         number = int(record.subject)
@@ -307,13 +310,23 @@ def resolve(record) -> str | None:
     has_comment = any(marker in c.get("body", "") for c in final.get("comments", []))
     if final.get("state") != "CLOSED" or not has_comment:
         return None
+    # Resolution is durable — remove the isolated worktree so resolved runs don't accumulate.
+    src = record.source or ""
+    if "/.agentflow/worktrees/" in src:
+        workdir = src.split("/.agentflow/worktrees/", 1)[0]
+        wt = Path(src)
+        if wt.exists():
+            _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt)])
     return final.get("url") or f"https://github.com/{repo}/issues/{number}"
 
 
 def release(record) -> str | None:
     """Release the shared ``wayfinder:resolving`` claim on exhaustion so the ticket is eligible again
     next cycle (ADR 0037). Idempotent and crash-safe: a repeat re-proves the same release. Returns the
-    ticket URL as durable proof, or ``None`` to retry when the claim could not be proved released."""
+    ticket URL as durable proof, or ``None`` to retry when the claim could not be proved released.
+
+    The run's isolated worktree is intentionally kept on disk — a resumed attempt reuses it to pick up
+    partial findings rather than starting from scratch."""
     from agentflow.loop import _release_resolving, _run
     try:
         number = int(record.subject)
