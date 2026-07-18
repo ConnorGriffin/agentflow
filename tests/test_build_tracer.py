@@ -139,6 +139,36 @@ def test_interactive_flag_never_admits_a_disabled_stage(monkeypatch):
     assert gate(unknown) is False
 
 
+def test_codex_launch_honors_weekly_unattended_budget(monkeypatch):
+    # A codex stage queued while weekly headroom existed must not LAUNCH after that weekly
+    # unattended budget is exhausted. Raw `_query_pool` weighs only the short-window ceiling, so
+    # a codex pool one hour into the week is "clear" there — the launch gate must additionally
+    # apply the same `_codex_dispatch_status` pacing `pick_pair` uses at submission, or a queued
+    # build fires on codex despite intake having deferred new work for lack of weekly headroom.
+    from agentflow.balancer import PoolStatus, RateLimitWindow
+    from agentflow.coordinator.record import Record
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+
+    now = 1_000_000.0
+    monkeypatch.setattr(coordinated_build.time, "time", lambda: now)
+    short = RateLimitWindow(used_percent=10.0, window_minutes=300, resets_at=now + 3600)
+    # One hour into the week: only 11.4% of the 80% weekly cap is released for unattended day 0.
+    weekly_at = lambda used: RateLimitWindow(used_percent=used, window_minutes=10080,
+                                             resets_at=now + 10080 * 60 - 3600)
+    codex = Record(identity="392", stage="build", pool="codex", lineage="codex",
+                   demand=5, repo="o/r", subject="392")
+
+    # Short window clear, but weekly at 29% is over the 11.4% released — launch defers.
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(29.0))))
+    assert coordinated_build._production_gate()(codex) is False
+
+    # Weekly under the released budget — the same queued build launches.
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(5.0))))
+    assert coordinated_build._production_gate()(codex) is True
+
+
 def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
     return Submission(repo="o/r", subject=subject, stage="build", pool=pool,
                       complexity="deep", effort=effort, source=source)

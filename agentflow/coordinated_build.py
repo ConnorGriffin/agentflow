@@ -414,6 +414,12 @@ class _ProductionGate:
             return True
         try:
             status = balancer._query_pool(record.pool)
+            # Launch must honor the same codex unattended-spend pacing that `pick_pair` applies
+            # at submission (balancer._codex_dispatch_status): raw `_query_pool` only checks the
+            # short-window ceiling, so a codex stage queued while weekly headroom existed would
+            # otherwise launch after that weekly budget is exhausted.
+            if status is not None and record.pool == "codex":
+                status = balancer._codex_dispatch_status(status, time.time())
         except Exception:
             return False
         if not status or not status.clear:
