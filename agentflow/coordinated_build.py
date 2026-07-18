@@ -1136,13 +1136,30 @@ def _park_respond(record) -> str | None:
 
 # --- Revise stage: pushed-revision outcome on the retained branch (live; ADR 0020) ------
 
+def _worktree_owns_head(wt, head: str) -> bool:
+    """Whether the retained worktree durably owns the pushed remote ``head``: its checked-out
+    ``HEAD`` equals that SHA and its tree is clean (no dirty tracked file, staged change, or
+    untracked new file). Read after fetching the branch, this proves the reviser's own local state
+    and the pushed branch agree — a stale or third-party push cannot satisfy it. Any failed read
+    fails closed."""
+    from agentflow.loop import _run
+    local = _run(["git", "-C", str(wt), "rev-parse", "HEAD"])
+    if local.returncode != 0 or local.stdout.strip() != head:
+        return False
+    status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
+    return status.returncode == 0 and not status.stdout.strip()
+
+
 def _revision_ready(record, obs) -> bool:
     """The Revise outcome is a verified pushed revision **or** the required durable non-code proof,
     read from GitHub independently of how the reviser exited (ADR 0028, issue #105):
 
-    - a pushed revision: the PR branch head SHA has moved past the reviewed SHA the revise was
-      opened against (``record.target``) — *descends from it*, so a force-push back to an older
-      commit never counts; or
+    - a pushed revision: the PR branch head SHA has moved off the reviewed SHA the revise was opened
+      against (``record.target``). A head that *descends from* the reviewed SHA is such a revision;
+      so is a rewritten head (e.g. a rebase a finding demanded) that the retained builder worktree
+      owns — its ``HEAD`` equals the pushed head and its tree is clean after fetching the branch. A
+      force-push back to a commit that is an *ancestor* of the reviewed SHA is a rewind and never
+      counts, even when the worktree sits on it; or
     - the required non-code proof: a durable agentflow-marked PR comment carrying attached evidence
       (e.g. a before/after screenshot), the way a finding that asks to *show* something is answered
       without a code change. The comment must be *created after this revise record was submitted*
@@ -1166,15 +1183,20 @@ def _revision_ready(record, obs) -> bool:
         return False
     head = prs[0].get("headRefOid", "")
     if head and head != record.target:
-        # A different head is the pushed revision only when it descends from the reviewed SHA.
-        # The retained builder worktree answers that (fetching the branch so the remote head is
-        # local); a rewound or rewritten branch falls through to the evidence check instead of
-        # completing. With no worktree to ask, the head comparison stands alone.
+        # A moved head is the pushed revision when it descends from the reviewed SHA, or — when the
+        # history was rewritten (a rebase the finding asked for) — when the retained builder worktree
+        # proves the reviser owns that exact head. The worktree answers both (fetching the branch so
+        # the remote head is local). A rewind to an *ancestor* of the reviewed SHA still never counts,
+        # and with no worktree to ask, the head comparison stands alone.
         if not wt.exists():
             return True
         _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
         if _run(["git", "-C", str(wt), "merge-base", "--is-ancestor",
                  record.target, head]).returncode == 0:
+            return True
+        rewound = _run(["git", "-C", str(wt), "merge-base", "--is-ancestor",
+                        head, record.target]).returncode == 0
+        if not rewound and _worktree_owns_head(wt, head):
             return True
     # No new code, but an evidence-only revision still completes on its durable non-code proof: an
     # agentflow-authored PR comment (our marker, never the maintainer's) that attaches evidence
@@ -1216,12 +1238,15 @@ def _reply_ready(record, obs) -> bool:
 
     - the reply: a marked agentflow comment names this record's immutable maintainer-comment
       target, so another reply or generic agentflow comment cannot satisfy it; and
-    - verified pushed: the retained PR-branch worktree holds no commit absent from the pushed remote
-      branch head *and* no uncommitted change at all. A responder that committed a small fix but
-      never pushed it left the remote branch unchanged; one that edited a file but never committed it
-      (a modified tracked file, a staged change, or an untracked new file) never turned that change
+    - verified pushed: when the reply marks a change, its SHA must be the current pushed head (not the
+      baseline — a no-op push cannot count), and the retained PR-branch worktree holds no commit
+      absent from that head *and* no uncommitted change at all. A responder that committed a small fix
+      but never pushed it left the remote branch unchanged; one that edited a file but never committed
+      it (a modified tracked file, a staged change, or an untracked new file) never turned that change
       into a pushed commit either. Both leave the stage incomplete so it continues on that same
-      retained worktree.
+      retained worktree. History rewritten by a rebase (the fix a conflict demands) is accepted: the
+      marked head plus the clean owned worktree sitting on it prove the reviser's work either way, so
+      the baseline need not be an ancestor of the pushed head.
 
     A record without that exact targeted reply stays incomplete. Live orchestration; exercised
     through the Coordinator/Respond adapter seam in ``tests/test_respond_tracer.py``."""
@@ -1253,11 +1278,6 @@ def _reply_ready(record, obs) -> bool:
     fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
     if fetched.returncode != 0:
         return False
-    if change != "none":
-        ancestry = _run(["git", "-C", str(wt), "merge-base", "--is-ancestor",
-                         baseline, head])
-        if ancestry.returncode != 0:
-            return False
     ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
     if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
         return False

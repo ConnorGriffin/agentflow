@@ -467,6 +467,66 @@ def test_revision_ready_rejects_a_head_that_does_not_descend_from_the_reviewed_s
     assert coordinated_build._revision_ready(record, None) is True
 
 
+def _revise_head_read(tmp_path, monkeypatch, *, head, target="sha-a",
+                      descends=False, rewound=False, local_head=None, status="", comments=()):
+    """Wire ``_revision_ready`` against a real retained builder worktree on disk with a moved head.
+    ``descends``/``rewound`` fake the two ``git merge-base --is-ancestor`` reads (reviewed→head and
+    head→reviewed); ``local_head``/``status`` fake the worktree ``rev-parse``/``status`` ownership
+    reads. Returns the record so the caller asserts the outcome."""
+    wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-9-x"
+    wt.mkdir(parents=True)
+    record = Record(identity="o/r|9|revise|sha-a", stage="revise", pool="claude", lineage="claude",
+                    demand=3, repo="o/r", subject="9", target=target, source=str(wt))
+
+    def _gh(cmd, *a, **k):
+        if "merge-base" in cmd:
+            reviewed_to_head = cmd[-2:] == [target, head]
+            return SimpleNamespace(returncode=0 if (descends if reviewed_to_head else rewound) else 1,
+                                   stdout="")
+        if "rev-parse" in cmd:
+            return SimpleNamespace(returncode=0, stdout=(local_head if local_head is not None else head))
+        if "status" in cmd:
+            return SimpleNamespace(returncode=0, stdout=status)
+        if "list" in cmd:
+            return SimpleNamespace(returncode=0, stdout=json.dumps(
+                [{"headRefOid": head, "number": 42}]))
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(comments))
+    return record
+
+
+def test_revision_ready_completes_on_a_rebased_head_the_worktree_owns(tmp_path, monkeypatch):
+    """Reproduces PR #196: a finding asked for a rebase, so the pushed head does not descend from the
+    reviewed SHA. It is still a genuine revision when the retained builder worktree owns it — sitting
+    on that exact head with a clean tree — so completion must not be withheld for the rewritten
+    history and burn the continuation budget."""
+    record = _revise_head_read(tmp_path, monkeypatch, head="rebased-head",
+                               descends=False, rewound=False)
+    assert coordinated_build._revision_ready(record, None) is True
+
+
+def test_revision_ready_rejects_a_rewound_head_even_with_a_clean_worktree(tmp_path, monkeypatch):
+    """A force-push back to a commit that is an *ancestor* of the reviewed SHA is a rewind, not a
+    revision — the worktree owning that older head must not complete it, with no qualifying evidence
+    comment to fall back on either."""
+    record = _revise_head_read(tmp_path, monkeypatch, head="older-head",
+                               descends=False, rewound=True)
+    assert coordinated_build._revision_ready(record, None) is False
+
+
+def test_revision_ready_rejects_a_rewritten_head_the_worktree_does_not_own(tmp_path, monkeypatch):
+    """A rewritten head that the retained worktree does not own — the worktree sits elsewhere or is
+    dirty — is not proven the reviser's own pushed work, so it stays incomplete."""
+    elsewhere = _revise_head_read(tmp_path / "a", monkeypatch, head="rebased-head",
+                                  local_head="some-other-head")
+    assert coordinated_build._revision_ready(elsewhere, None) is False
+    dirty = _revise_head_read(tmp_path / "b", monkeypatch, head="rebased-head",
+                              status=" M changed.py\n")
+    assert coordinated_build._revision_ready(dirty, None) is False
+
+
 # --- retained worktree reuse: a miss costs nothing; an interrupt keeps local work ---------
 
 def test_worktree_miss_consumes_no_permit_or_attempt_and_keeps_local_work(make_coord):
