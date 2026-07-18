@@ -103,3 +103,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0036](0036-bounded-repository-map-projection.md) — The daemon projects bounded GitHub-native
   Decision Maps, verified handoffs, pipeline state, landed evidence, and contextual ADR links
   under a fixed heartbeat/API budget; the browser remains a read-only file consumer.
+- [0037](0037-daemon-dispatch-of-afk-research.md) — Wayfinder plans, the daemon
+  executes: the boundary is judgment vs execution; claim + type replaces the
+  `wayfinder:*` wall, and unclaimed AFK-able research tickets dispatch through the
+  coordinator under permits and recovery (supersedes 0027, amends 0035).

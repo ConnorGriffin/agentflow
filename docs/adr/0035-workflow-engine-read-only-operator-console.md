@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-07-17
+- Amended by: [ADR 0037](0037-daemon-dispatch-of-afk-research.md)
 - Supersedes: [ADR 0033](0033-project-workspace-state-and-control-plane.md),
   [ADR 0034](0034-methodology-session-orchestration.md)
 - Amends: [ADR 0010](0010-operator-dashboard.md),
@@ -38,6 +39,13 @@ After chat produces a standalone Build Issue and the operator explicitly confirm
 it, the issue is filed directly in GitHub and normal intake begins. Agentflow owns
 no durable pre-issue Project, Conversation, Proposal, approval, or Publication
 lifecycle.
+
+*Amended by [ADR 0037](0037-daemon-dispatch-of-afk-research.md):* "the operator's
+chat tool" means an agent session, attended or unattended — what this ADR retired
+is the bespoke web planning surface, not unattended cognition. The daemon may
+dispatch unattended sessions to resolve AFK-able `wayfinder:research` tickets,
+recording only to the GitHub ticket and map; build intake still begins at the
+Build Issue, and no pre-issue workspace state returns.
 
 ### The operator console is read-only
 
