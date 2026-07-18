@@ -229,9 +229,11 @@ class Coordinator:
                     return outcomes
             for record in cold:
                 self._admit(record, now)
-            # A read-only Review continuation whose home pool cannot fit it may move here (ADR
-            # 0028). It is best-effort and never blocks the pool head-of-line: a move that cannot
-            # reserve reverts, leaving the record on its home pool for that pool's own cycle.
+            # A read-only Review whose home pool cannot launch it may move here (ADR 0028/0020) —
+            # a fresh review as well as a continuation, since a pool that lost its launch capacity
+            # would otherwise freeze it forever. It is best-effort and never blocks the pool
+            # head-of-line: a move that cannot reserve reverts, leaving the record on its home pool
+            # for that pool's own cycle.
             for record in self._migratable_reviews(pool, now):
                 self._admit_migration(record, pool, now)
             return outcomes
@@ -350,17 +352,32 @@ class Coordinator:
         return STARTED if result.fact == STARTED else "not_started"
 
     def _migratable_reviews(self, pool: str, now: int) -> list[Record]:
-        """Eligible read-only Review continuations whose home pool cannot currently fit their
-        demand and that review safety lets move onto ``pool`` (ADR 0028). Ordered like any
-        continuation queue. A code-writing stage is pinned to its builder lineage and never
-        appears here; a review whose home pool still has room is left for that pool's cycle."""
+        """Eligible read-only Reviews whose home pool cannot currently launch them and that
+        review safety lets move onto ``pool`` (ADR 0028/0020). Ordered like any continuation
+        queue. A review freezes if its home pool loses launch capacity *after* the record was
+        created — the permit ledger fills, or the launcher's own admission gate now refuses it
+        (e.g. codex weekly-budget pacing) — so both are re-placement triggers, and a *fresh*
+        review (``attempts=0``, never a continuation) may move too, not only continuations:
+        without launching it could never become one, so requiring a continuation would freeze
+        it forever. A code-writing stage is pinned to its builder lineage and never appears
+        here; a review whose home pool can still launch it is left for that pool's cycle."""
         candidates = [
             r for r in self._records.values()
             if r.state == WAITING and not r.hold_pending and r.root is None
-            and r.continuation and r.eligible_at <= now
+            and r.eligible_at <= now
             and r.pool != pool and self._review_may_move(r)
-            and self._store.permits_used(r.pool) + r.demand > PERMIT_BUDGET]
+            and self._pool_cannot_fit(r)]
         return sorted(candidates, key=lambda r: (r.eligible_at, r.created_at, r.identity))
+
+    def _pool_cannot_fit(self, record: Record) -> bool:
+        """Whether ``record``'s home pool cannot launch it this cycle for a durable reason: its
+        permit ledger cannot seat the demand, or the launcher's own admission gate refuses it.
+        The gate is the very check ``_begin_start`` applies (codex weekly-budget pacing included),
+        reused here rather than re-derived, so a review pinned to a pool that lost its launch
+        capacity is re-placed instead of freezing at zero attempts (ADR 0020)."""
+        if self._store.permits_used(record.pool) + record.demand > PERMIT_BUDGET:
+            return True
+        return not self._gate(record)
 
     @staticmethod
     def _review_may_move(record: Record) -> bool:
