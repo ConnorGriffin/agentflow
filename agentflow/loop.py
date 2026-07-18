@@ -266,17 +266,53 @@ BUILDING = "agentflow:building"   # dispatch claim — an agent is building this
 _BLOCKED_BY_RE = re.compile(r"^Blocked by #(\d+)\s*$", re.MULTILINE)
 
 
+def _native_blockers(cfg: RepoConfig, number: int) -> set[int] | None:
+    """Same-repo issue numbers from an issue's native GitHub `blocked_by` edges.
+
+    A second recognized source of blockers alongside `Blocked by #N` body prose (ADR 0024):
+    planning tools express dependencies as native GitHub relationships. Returns None when the
+    edge set cannot be read (a `gh` failure or malformed response) so the caller can fail
+    closed — an unreadable dependency graph is never mistaken for "no blockers". Cross-repo
+    edges are ignored: only blockers in `cfg.repo` join the same-repo gate."""
+    r = _run(["gh", "api", f"repos/{cfg.repo}/issues/{number}/dependencies/blocked_by"])
+    if r.returncode != 0:
+        return None
+    try:
+        edges = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(edges, list):
+        return None
+    numbers: set[int] = set()
+    for edge in edges:
+        if not isinstance(edge, dict):
+            return None
+        if (edge.get("repository") or {}).get("full_name") == cfg.repo:
+            numbers.add(int(edge["number"]))
+    return numbers
+
+
 def _free_to_dispatch(cfg: RepoConfig, issue: dict, in_flight: set[int], _log=None) -> bool:
     """A ready issue is free only if no agent owns it and every declared blocker is closed.
 
-    Blocker state is read from the same repository on every selection pass. Unknown is not
-    closed: a missing issue, `gh` failure, or malformed response skips the dependent until a
-    later pass can verify it safely. Shared by queue selection and by-hand builds."""
+    The blocker set is the union of the issue's native GitHub `blocked_by` edges and its
+    `Blocked by #N` body prose (ADR 0024). Blocker state is read from the same repository on
+    every selection pass. Unknown is not closed: a missing issue, `gh` failure, or malformed
+    response — from either source — skips the dependent until a later pass can verify it
+    safely. Shared by queue selection and by-hand builds."""
     if (issue["number"] in in_flight
             or BUILDING in {lbl["name"] for lbl in issue.get("labels", [])}):
         return False
 
-    blockers = dict.fromkeys(int(n) for n in _BLOCKED_BY_RE.findall(issue.get("body") or ""))
+    native = _native_blockers(cfg, issue["number"])
+    if native is None:
+        if _log:
+            _log(f"{cfg.repo}: #{issue['number']}: skipped — native blocked-by edges "
+                 "could not be determined")
+        return False
+
+    prose = (int(n) for n in _BLOCKED_BY_RE.findall(issue.get("body") or ""))
+    blockers = dict.fromkeys([*prose, *sorted(native)])
     for blocker in blockers:
         r = _run(["gh", "issue", "view", str(blocker), "--repo", cfg.repo,
                   "--json", "state"])

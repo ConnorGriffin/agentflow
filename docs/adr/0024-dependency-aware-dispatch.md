@@ -2,6 +2,9 @@
 
 - Status: Accepted
 - Date: 2026-07-13
+- Revised: 2026-07-17 — native GitHub `blocked-by` edges added as a second
+  recognized source, unioned with the body prose (see "Native `blocked-by`
+  edges" below).
 
 ## Context
 
@@ -25,14 +28,25 @@ The dispatcher needs to respect a declared dependency.
 
 Model one relationship — **"blocked by"** — and gate dispatch on it.
 
-- **Declared in the issue body**: a `Blocked by #N` line (multiple allowed). This
-  keeps GitHub the source of truth and is parsed the way agentflow already parses
-  body markers (`MISSING-CONTEXT:`, the historical `Open as:`, the `agentflow:`
-  labels) — no new GitHub feature required.
+- **Two recognized sources, unioned.** A blocker can be declared either in the
+  issue body as a `Blocked by #N` line (multiple allowed) **or** as a native
+  GitHub `blocked-by` relationship on the issue. The dispatcher's blocker set is
+  the **union** of both, deduped; an issue is free only when *every* blocker in
+  that union is closed.
+  - *Body prose* keeps GitHub the source of truth and is parsed the way agentflow
+    already parses body markers (`MISSING-CONTEXT:`, the historical `Open as:`, the
+    `agentflow:` labels) — no new GitHub feature required. It was the original
+    (2026-07-13) sole source.
+  - *Native `blocked-by` edges* (added 2026-07-17) are read over the GitHub
+    dependencies API. Planning tools (wayfinder) already express dependencies as
+    native GitHub relationships, so honoring them directly removes the seam where a
+    native dependency had to be hand-translated into a prose line that was silently
+    ignored if mistyped. Only same-repo edges join the gate; cross-repo edges are
+    out of scope and ignored (see [#156](https://github.com/ConnorGriffin/agentflow/issues/156)).
 - **Filtered only at build dispatch**: a ready issue is not selected for a build
-  while any declared blocker is open or its state cannot be verified. Intake and
-  grounding do not apply this gate; they still prepare the whole batch up front.
-  That build-eligibility rule is the entire behavioral change.
+  while any blocker (from either source) is open or its state cannot be verified.
+  Intake and grounding do not apply this gate; they still prepare the whole batch up
+  front. That build-eligibility rule is the entire behavioral change.
 - **Stateless, no release event.** Eligibility is recomputed every cycle, so the
   moment a blocker closes (its PR merges), its dependents become dispatchable on
   the next pass. Nothing to trigger, nothing to get stuck — the same
@@ -57,7 +71,9 @@ dependent** — the behavior you actually want from a fleet.
   ordered epic, with a stateless filter instead of a release event.
 - **GitHub sub-issues / task-list relations as the dependency source.** Reasonable
   later, but it leans on a newer GitHub feature; the body marker needs nothing new
-  and matches existing parsing. Can be added as a second recognized source.
+  and matches existing parsing. Native `blocked-by` edges were subsequently added as
+  that second recognized source (2026-07-17), unioned with the prose rather than
+  replacing it.
 - **One giant issue built across many commits/PRs.** Rejected: breaks
   one-issue-one-PR and, more importantly, the **per-slice review gate** — the whole
   point of vertical slices is that each closes the loop through review + merge.
@@ -79,3 +95,10 @@ dependent** — the behavior you actually want from a fleet.
   dependents simply never dispatch) and is visible/loggable — never a wrong build.
 - The dashboard ([ADR 0023](0023-dashboard-replatform-control-plane.md)) can later
   surface a **blocked** chip in the queue so the ordering is legible.
+- **Prose is now the legacy source, kept for backward compatibility.** The native
+  edge read is additive: no existing `Blocked by #N` issue changes behavior, and
+  the same every-blocker-closed / fail-closed rules apply to both sources. The
+  intended future posture is to **deprecate the `Blocked by #N` prose** once native
+  `blocked-by` is proven reliable across the fleet's headless (daemon) runs — at
+  which point native becomes the single source and prose is retired. That
+  deprecation is deliberately out of scope here.
