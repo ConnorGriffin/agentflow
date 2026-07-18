@@ -162,6 +162,16 @@ def issue_of_branch(branch: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+_MACOS_HEADLESS_RECOVERY = """
+Known macOS recovery: if Chromium exits before navigation with
+`MachPortRendezvous` / `Permission denied (1100)`, the Codex sandbox blocked the
+browser's Mach service registration. Re-run the same browser-driver command outside
+that sandbox (`exec_command` with `sandbox_permissions=require_escalated`) and continue
+the capture. Do not reinstall Chromium, churn launch flags, or post `MISSING-CONTEXT:`
+for this recoverable host restriction.
+"""
+
+
 BUILD_PROMPT = """Implement {repo} issue #{n}: {title}
 
 {body}
@@ -186,7 +196,7 @@ CSS/API specifics (ADR 0018). If the change touches a user-facing surface (this 
 matches the locked mockup — both light and dark themes where the app has them. A UI change
 with no screenshot cannot auto-merge (a mechanical gate parks it, ADR 0018), and a body full
 of jargon blocks at review. Both are charter gates, not style points.
-
+""" + _MACOS_HEADLESS_RECOVERY + """
 Keep the change minimal and match the surrounding code. If you hit a blocker you
 cannot safely resolve, post a comment prefixed `MISSING-CONTEXT:` and stop instead
 of guessing."""
@@ -200,7 +210,7 @@ Do not degrade the two charter gates while revising (ADR 0018):
   no screenshot cannot auto-merge; a mechanical gate parks it regardless of the review.
 - Keep the PR body in plain app language for the human who merges — no file/function/test
   names or CSS/API specifics.
-
+""" + _MACOS_HEADLESS_RECOVERY + """
 Blocking findings:
 {findings}"""
 
@@ -240,7 +250,7 @@ The same comment must contain exactly one durable outcome marker:
   your comment — headless Playwright against the locked mockup for a UI surface, the same
   way a build does.
 - If they asked for a small change, make it, commit, and push to THIS SAME branch.
-
+""" + _MACOS_HEADLESS_RECOVERY + """
 Same contract as a revision: never open a new PR, never merge. If you genuinely can't
 address it, say so plainly in the reply."""
 
@@ -628,7 +638,7 @@ Run the `/ui-mockups` skill for this repo's user-facing surface(s): {surfaces}. 
 headless — ground every variant in the shipping app's own theme, library, and data; make the
 variants diverge at the CONCEPT level (layout metaphor, interaction model, hierarchy), not just
 colors; and screenshot each one. 3-4 variants is the sweet spot.
-
+""" + _MACOS_HEADLESS_RECOVERY + """
 You are on branch `{branch}` in this worktree. PRESERVE the work so it is not lost with the
 worktree: commit every variant's HTML (and any forked render/screenshot files) AND the
 screenshots to this branch, then `git push -u origin {branch}`.

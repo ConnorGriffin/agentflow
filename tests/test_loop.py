@@ -470,6 +470,22 @@ def test_revise_prompt_carries_both_evidence_gates():
     assert "plain" in body.lower()
 
 
+def test_screenshot_prompts_recover_the_known_macos_chromium_sandbox_denial():
+    prompts = [
+        BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="low",
+                            surfaces="`frontend/`"),
+        REVISE_PROMPT.format(n=7, findings="- attach proof", surfaces="`frontend/`"),
+        RESPOND_PROMPT.format(n=7, baseline="abc123", comment="show the screen",
+                              disclaimer="> *agentflow reply*"),
+        PRODUCE_PROMPT.format(repo="o/r", n=7, title="x", body="", branch="mockup-7",
+                              surfaces="`frontend/`", disclaimer="> *agentflow mockup*"),
+    ]
+    for prompt in prompts:
+        assert "MachPortRendezvous" in prompt
+        assert "require_escalated" in prompt
+        assert "MISSING-CONTEXT" in prompt
+
+
 def test_work_order_helper_is_gone():
     # ADR 0022 retired the separate frozen work-order comment; nothing should read one.
     assert not hasattr(loop, "_work_order")
