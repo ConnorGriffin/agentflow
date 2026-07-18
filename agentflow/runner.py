@@ -45,6 +45,20 @@ _CLAUDE_AUTONOMOUS_SETTINGS = json.dumps({
     },
 }, separators=(",", ":"))
 
+_CODEX_HEADLESS_RECOVERY = """
+Codex-only macOS browser recovery: when the shared drive-local-webapp driver prints
+HEADLESS-SANDBOX-BLOCKED, rerun that same driver command with
+sandbox_permissions=require_escalated and continue the required screenshot capture. The launcher
+can review this narrow request unattended. Keep the app server and every other command inside the
+workspace sandbox. Do not replace required UI evidence with a written explanation.
+"""
+
+_CODEX_AUTO_REVIEW_POLICY = (
+    "Approve sandbox escalation only for a Node command launching the shared "
+    "drive-local-webapp/driver.mjs browser driver to capture required UI evidence. "
+    "Reject every other sandbox escalation and every request to weaken the session sandbox."
+)
+
 
 class Complexity(str, Enum):
     """The model-size dial intake stamps per issue (ADR 0018). Tool-agnostic; each
@@ -297,12 +311,18 @@ class CodexRunner(_WorktreeRunner):
         common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
                        "--git-common-dir"])
         writable_roots = json.dumps([common.stdout.strip()]) if common.returncode == 0 else "[]"
+        approval_policy = (
+            "approval_policy={granular={sandbox_approval=true,rules=false,"
+            "mcp_elicitations=false,request_permissions=false,skill_approval=false}}"
+        )
         return [codex_bin, "exec", "-m", self._CLI_MODEL.get(model, model), "--json",
                 "--sandbox", "workspace-write", "--cd", worktree,
-                "--ignore-user-config", "--ephemeral", "-c", 'approval_policy="never"',
+                "--ignore-user-config", "--ephemeral", "-c", approval_policy,
+                "-c", 'approvals_reviewer="auto_review"',
+                "-c", f"auto_review.policy={json.dumps(_CODEX_AUTO_REVIEW_POLICY)}",
                 "-c", "sandbox_workspace_write.network_access=true",
                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
-                "--skip-git-repo-check", _bounded_prompt(prompt, cwd)]
+                "--skip-git-repo-check", _bounded_prompt(_CODEX_HEADLESS_RECOVERY + prompt, cwd)]
 
     def account_fact(self) -> dict | None:
         """Read the existing typed Codex limit companion. It establishes capacity only when a

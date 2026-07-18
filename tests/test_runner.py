@@ -99,7 +99,8 @@ def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert cmd[cmd.index("--sandbox") + 1] == "workspace-write"
     assert cmd[cmd.index("--cd") + 1] == str(wt.resolve())
     assert "--ignore-user-config" in cmd and "--ephemeral" in cmd
-    assert 'approval_policy="never"' in cmd
+    assert 'approvals_reviewer="auto_review"' in cmd
+    assert 'approval_policy="never"' not in cmd
     assert "sandbox_workspace_write.network_access=true" in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
     prompt = cmd[-1]
@@ -112,6 +113,43 @@ def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert structured[structured.index("--cd") + 1] == str(wt.resolve())
     assert "--json" in structured
     assert str(wt.resolve()) in structured[-1]
+
+
+def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(tmp_path):
+    from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.loop import BUILD_PROMPT, PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT
+
+    repo = _repo_with_origin(tmp_path)
+    stage_prompts = [
+        ("build", BUILD_PROMPT.format(
+            repo="o/r", n=7, title="x", body="", effort="low", surfaces="`frontend/`")),
+        ("revise", REVISE_PROMPT.format(
+            n=7, findings="- attach proof", surfaces="`frontend/`")),
+        ("respond", RESPOND_PROMPT.format(
+            n=7, baseline="abc123", comment="show the screen",
+            disclaimer="> *agentflow reply*")),
+        ("mockup", PRODUCE_PROMPT.format(
+            repo="o/r", n=7, title="x", body="", branch="mockup-7",
+            surfaces="`frontend/`", disclaimer="> *agentflow mockup*")),
+    ]
+
+    for index, (stage, prompt) in enumerate(stage_prompts):
+        codex = CodexProviderAdapter().command(Record(
+            f"codex-{index}", stage, "codex", index,
+            model="terra", source=str(repo), input_ptr=prompt))
+        claude = ClaudeProviderAdapter().command(Record(
+            f"claude-{index}", stage, "claude", index,
+            model="sonnet", source=str(repo), input_ptr=prompt))
+        codex_config = [codex[i + 1] for i, arg in enumerate(codex[:-1]) if arg == "-c"]
+
+        assert codex[codex.index("--sandbox") + 1] == "workspace-write"
+        assert any("sandbox_approval=true" in value for value in codex_config)
+        assert 'approvals_reviewer="auto_review"' in codex_config
+        assert 'approval_policy="never"' not in codex_config
+        assert "HEADLESS-SANDBOX-BLOCKED" in codex[-1]
+        assert "sandbox_permissions=require_escalated" in codex[-1]
+        assert "sandbox_permissions" not in claude[claude.index("-p") + 1]
 
 
 def test_codex_account_fact_uses_typed_limit_windows(monkeypatch):
