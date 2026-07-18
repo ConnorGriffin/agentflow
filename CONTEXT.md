@@ -141,6 +141,11 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   Budgeted separately from auto-revise rounds (two per PR, then park), followed by
   a fresh review of the resolved head under normal merge rules (ADR 0038).
 
+- **PR-bound stage** — a stage whose subject is an open PR (review, revise,
+  respond). Admission drains PR-bound work before issue-bound work (build,
+  mockup, intake): an open PR is the first thing to get over the finish line
+  (ADR 0039). Interactive turns still outrank everything (ADR 0034).
+
 - **Drop-to-reviewed** — the escape valve: an `autonomous` PR that can't clear
   review after its one revise round is demoted to `reviewed` for that issue
   (findings posted, human pinged, PR waits). Autonomy parks doubt, never forces a
