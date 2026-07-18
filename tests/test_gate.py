@@ -4,6 +4,7 @@ The one thing that must never happen: MERGE without independent review + green C
 + clean verdict.
 """
 
+import json
 import subprocess
 import time
 
@@ -14,7 +15,7 @@ from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                             has_committed_evidence, has_image_evidence,
                             maintainer_comment, maintainer_comment_id, reply_pending,
                             respond_reply_disclaimer, squash_merge,
-                            touches_ui_surface)
+                            touches_ui_surface, ui_evidence_gap)
 from agentflow.reviewer import Finding, Verdict
 
 CLEAN = Verdict(clean=True)
@@ -208,6 +209,37 @@ class TestHasCommittedEvidence:
 
     def test_no_files_no_evidence(self):
         assert not has_committed_evidence([])
+
+
+class TestUiEvidenceGapAnchorsToUs:
+    # issue #205: evidence counts only in the PR body or an agentflow-marked comment.
+    # A UI file changed with no committed screenshot, so the gate falls through to the
+    # body/comment check every time.
+    _SURFACES = ["agentflow/webui/src/"]
+    _IMG = "![before](x.png)"
+
+    def _gap(self, monkeypatch, *, body="", comments=()):
+        payload = json.dumps({
+            "files": [{"path": "agentflow/webui/src/app.svelte"}],
+            "body": body,
+            "comments": [{"body": b} for b in comments],
+        })
+        _record_commands(monkeypatch, (0, payload))
+        return ui_evidence_gap("o/r", 7, self._SURFACES)
+
+    def test_maintainer_comment_image_does_not_count(self, monkeypatch):
+        # A stray image in an unmarked (maintainer) comment must not satisfy the gate.
+        assert self._gap(monkeypatch, comments=[f"looks good {self._IMG}"]) is True
+
+    def test_image_in_the_pr_body_counts(self, monkeypatch):
+        assert self._gap(monkeypatch, body=f"proof:\n{self._IMG}") is False
+
+    def test_image_in_an_agentflow_marked_comment_counts(self, monkeypatch):
+        assert self._gap(
+            monkeypatch, comments=[f"agentflow: build agent\n{self._IMG}"]) is False
+
+    def test_no_images_anywhere_is_a_gap(self, monkeypatch):
+        assert self._gap(monkeypatch, body="prose only", comments=["nice"]) is True
 
 
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------

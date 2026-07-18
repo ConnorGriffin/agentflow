@@ -454,18 +454,19 @@ def test_build_prompt_formats_and_tells_the_builder_the_pr_gates():
 
 def test_build_prompt_prescribes_the_browserless_screenshot_path():
     # PR #402 in ciq-autotune parked because the builder tried GitHub's drag-drop upload,
-    # which needs a signed-in browser this host doesn't have. The prompt now names the
-    # committed path (docs/screenshots/ on the branch) and forbids the browser route.
+    # which needs a signed-in browser this host doesn't have. The prompt names the committed
+    # path (docs/screenshots/ on the branch), pins the image host to the immutable commit
+    # (issue #205), and forbids the browser route.
     body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
                                surfaces="`frontend/`")
     assert "docs/screenshots/issue-7/" in body
-    assert "https://github.com/o/r/blob/" in body
+    assert "https://github.com/o/r/raw/<commit-sha>/" in body
     assert "upload images through a web browser" in body
 
 
 def test_revise_prompt_prescribes_the_browserless_screenshot_path():
     # A revise sent to fix missing screenshots must not bounce off the same browser wall.
-    body = REVISE_PROMPT.format(n=5, findings="- fix it", surfaces="`frontend/`")
+    body = REVISE_PROMPT.format(n=5, repo="o/r", findings="- fix it", surfaces="`frontend/`")
     assert "docs/screenshots/" in body
     assert "upload images through a web browser" in body
 
@@ -494,7 +495,8 @@ def test_ui_surfaces_empty_when_undeclared(tmp_path):
 def test_revise_prompt_carries_both_evidence_gates():
     # A revise pass must not silently degrade compliance: it names both the screenshot
     # gate (with the repo's surfaces) and the plain-language body gate.
-    body = REVISE_PROMPT.format(n=5, findings="- fix it", surfaces="`agentflow/static/`")
+    body = REVISE_PROMPT.format(n=5, repo="o/r", findings="- fix it",
+                                surfaces="`agentflow/static/`")
     assert "screenshot" in body.lower()
     assert "agentflow/static/" in body
     assert "plain" in body.lower()
@@ -1098,3 +1100,43 @@ def test_waiting_intake_record_omitted_from_live_projection():
     assert 7 not in numbers, "waiting Intake must not appear on the live board"
     assert 8 in numbers, "running Build must appear on the live board"
     assert projection[0]["started_at"] != ""
+
+
+# --- issue #205: screenshot evidence must be hosted from an immutable commit ----
+
+class TestScreenshotHostingInstruction:
+    """Every prompt that asks for screenshots must pin them to the immutable commit that
+    added the file — never a mutable branch ref that GitHub repaints from the branch head."""
+
+    def _build(self):
+        return BUILD_PROMPT.format(
+            repo="o/r", n=205, title="t", body="b", effort="medium",
+            surfaces="agentflow/webui/src/")
+
+    def _revise(self):
+        return REVISE_PROMPT.format(
+            repo="o/r", n=205, findings="- x", surfaces="agentflow/webui/src/")
+
+    def _mockup(self):
+        return PRODUCE_PROMPT.format(
+            repo="o/r", n=205, title="t", body="b",
+            branch="agentflow/claude/issue-205-x", surfaces="agentflow/webui/src/",
+            disclaimer=_MOCKUP_DISCLAIMER)
+
+    def test_build_prompt_pins_to_the_commit_and_namespaces_the_round(self):
+        text = self._build()
+        assert "raw/<commit-sha>" in text
+        assert "refs/heads" in text                      # as the thing to never use
+        assert "docs/screenshots/issue-205/<short-sha>/" in text
+
+    def test_revise_prompt_pins_to_the_commit_and_namespaces_the_round(self):
+        text = self._revise()
+        assert "raw/<commit-sha>" in text
+        assert "refs/heads" in text
+        assert "docs/screenshots/issue-205/<short-sha>/" in text
+
+    def test_mockup_prompt_pins_to_the_commit_and_drops_the_branch_ref(self):
+        text = self._mockup()
+        assert "raw/<commit-sha>" in text
+        # the old mutable-ref host is gone entirely from the mockup image instruction
+        assert "refs/heads" not in text

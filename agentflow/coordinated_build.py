@@ -200,7 +200,7 @@ def revise_submission(review_record, complexity, findings="", *, surfaces=""):
         return None
     build_worktree, pr_number = facts
     brief = REVISE_PROMPT.format(
-        n=pr_number, findings=findings or "- (see review)",
+        n=pr_number, repo=review_record.repo, findings=findings or "- (see review)",
         surfaces=surfaces or "any user-facing surface")
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",

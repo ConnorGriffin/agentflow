@@ -125,7 +125,7 @@ def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(t
         ("build", BUILD_PROMPT.format(
             repo="o/r", n=7, title="x", body="", effort="low", surfaces="`frontend/`")),
         ("revise", REVISE_PROMPT.format(
-            n=7, findings="- attach proof", surfaces="`frontend/`")),
+            n=7, repo="o/r", findings="- attach proof", surfaces="`frontend/`")),
         ("respond", RESPOND_PROMPT.format(
             n=7, baseline="abc123", comment="show the screen",
             disclaimer="> *agentflow reply*")),

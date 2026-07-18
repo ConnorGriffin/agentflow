@@ -185,11 +185,16 @@ CSS/API specifics (ADR 0018). If the change touches a user-facing surface (this 
 {surfaces}), you MUST ship before/after screenshots (headless Playwright) as proof it
 matches the locked mockup — both light and dark themes where the app has them. Attach them
 the committed way — no browser is involved and none may be used: save the PNGs under
-`docs/screenshots/issue-{n}/`, commit them on this branch, and embed each in the PR body as
-a markdown image pointing at the committed file
-(`https://github.com/{repo}/blob/<your-branch>/docs/screenshots/issue-{n}/<name>.png?raw=true`).
-NEVER try to upload images through a web browser or GitHub's drag-drop attachments — this
-host cannot do that, and an apology comment does not satisfy the gate; the committed files
+`docs/screenshots/issue-{n}/<short-sha>/` (namespace each round by the branch's current short
+commit SHA so a later revision can never overwrite the files an earlier comment points at),
+commit and push them FIRST, then embed each in the PR body as a markdown image hosted from the
+immutable commit that added it:
+`https://github.com/{repo}/raw/<commit-sha>/docs/screenshots/issue-{n}/<short-sha>/<name>.png`,
+where `<commit-sha>` is the pushed commit's full hash. NEVER host from a mutable branch ref
+(never `refs/heads/...`, never `blob/<branch>/...`): GitHub serves those from the current branch
+head, so after any later push every historical screenshot silently repaints to the new head's
+files or 404s. NEVER try to upload images through a web browser or GitHub's drag-drop attachments
+— this host cannot do that, and an apology comment does not satisfy the gate; the committed files
 do. A UI change with no screenshot cannot auto-merge (a mechanical gate parks it, ADR 0018),
 and a body full of jargon blocks at review. Both are charter gates, not style points.
 
@@ -204,11 +209,17 @@ Do not degrade the two charter gates while revising (ADR 0018):
 - If the PR touches a user-facing surface (this repo's are: {surfaces}), keep before/after
   screenshots attached — both light and dark themes where the app has them. A UI change with
   no screenshot cannot auto-merge; a mechanical gate parks it regardless of the review.
-  If screenshots are missing or stale, capture them with headless Playwright, commit the
-  PNGs under `docs/screenshots/` on this branch, and embed them in the PR body as markdown
-  images pointing at the committed files (`.../blob/<branch>/<path>?raw=true`). NEVER try
-  to upload images through a web browser or GitHub's drag-drop attachments — this host
-  cannot do that; the committed files are the evidence.
+  If screenshots are missing or stale, capture them with headless Playwright and commit the
+  PNGs under `docs/screenshots/issue-{n}/<short-sha>/` — namespace each round by the branch's
+  current short commit SHA so this round's files never overwrite the ones an earlier comment
+  points at. Push FIRST, then embed them in the PR body as markdown images hosted from the
+  immutable commit that added them
+  (`https://github.com/{repo}/raw/<commit-sha>/docs/screenshots/issue-{n}/<short-sha>/<name>.png`,
+  `<commit-sha>` = the pushed commit's full hash). NEVER host from a mutable branch ref (never
+  `refs/heads/...`, never `blob/<branch>/...`): GitHub serves those from the current branch head,
+  so a later push repaints every historical screenshot to the new files or 404s. NEVER try to
+  upload images through a web browser or GitHub's drag-drop attachments — this host cannot do
+  that; the committed files are the evidence.
 - Keep the PR body in plain app language for the human who merges — no file/function/test
   names or CSS/API specifics.
 
@@ -759,10 +770,12 @@ edit the issue title, body, or labels; do not open a PR. The comment MUST:
 - START with this exact line, verbatim (it marks the comment as ours so the daemon never mistakes
   it for the maintainer's reply):
   {disclaimer}
-- Embed each variant's screenshot as a markdown image from its committed path on this branch,
-  using the `github.com/.../raw/refs/heads/` host (NOT `raw.githubusercontent.com`, which 404s on
-  private repos because it ignores the viewer's login):
-  `![Variant A](https://github.com/{repo}/raw/refs/heads/{branch}/mockups/<file>.png)`.
+- Commit and push the variant HTML and screenshots FIRST, then embed each screenshot as a markdown
+  image hosted from the immutable commit that added it — the pushed commit's full hash, never the
+  mutable `{branch}` ref. GitHub serves a branch-ref host from the current branch head, so a later
+  push would silently repaint or 404 every image the maintainer is looking at. Do NOT use
+  `raw.githubusercontent.com` either (it 404s on private repos because it ignores the viewer's login):
+  `![Variant A](https://github.com/{repo}/raw/<commit-sha>/mockups/<file>.png)`.
 - Name the variants A, B, C (and D), each with a ONE-LINE description of its concept.
 - End with a clear ask: reply on this issue with a pick ("B", "the second one", "A but with C's
   header") or an adjustment, and agentflow will lock the chosen design and start the build.
