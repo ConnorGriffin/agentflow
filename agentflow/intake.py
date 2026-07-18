@@ -356,10 +356,24 @@ every newline inside a string value as \\n and every quote as \\":
 For "grill"/"mockup", omit complexity and effort."""
 
 
+_IMAGE_HANDOFF = (
+    "\n\nThis issue's description carries one or more image attachments (screenshots). They "
+    "have been downloaded into `{dir}/` in your worktree — list that directory and Read every "
+    "image file so you SEE what the screenshot shows and ground your route on its actual "
+    "content, not just the surrounding text. A screenshot with no prose is a real report, not "
+    "an unreadable one — do not hold it as vague solely because the body has little text; read "
+    "the picture first. If that directory is empty or missing, the download did not succeed — "
+    "proceed with the text you have.")
+
+
 def intake_prompt(repo: str, issue: dict, extra: str = "") -> str:
     """The durable provider input for one Intake stage."""
+    from agentflow.intake_attachments import ATTACHMENTS_DIRNAME, extract_image_urls
+    body = issue.get("body") or ""
     prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(issue["number"]), disclaimer=_DISCLAIMER,
-                   title=issue.get("title", ""), body=issue.get("body") or "(no description)")
+                   title=issue.get("title", ""), body=body or "(no description)")
+    if extract_image_urls(body):
+        prompt += _IMAGE_HANDOFF.replace("{dir}", ATTACHMENTS_DIRNAME)
     if extra:
         prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier hold — treat this as their "
                    "answer or waiver: promote to ready if the issue is now settled (they answered "

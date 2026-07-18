@@ -43,7 +43,7 @@ def reset_worktree(record) -> bool:
         return False
     try:
         payload = json.loads(record.input_ptr)
-        payload["snapshot"]
+        snapshot = payload["snapshot"]
         source_ref = payload["source_ref"]
     except (ValueError, KeyError, TypeError):
         return False
@@ -62,6 +62,14 @@ def reset_worktree(record) -> bool:
         runner.provision(wt)
     except subprocess.CalledProcessError:
         return False
+    # Fetch any issue-body screenshots into the read-only worktree so the vision-capable
+    # model can Read them (issue #191). Fail closed: a fetch failure leaves no image and
+    # intake falls back to text-only routing — it never wedges preparation.
+    try:
+        from agentflow.intake_attachments import ATTACHMENTS_DIRNAME, stage_attachments
+        stage_attachments(snapshot.get("body", ""), wt / ATTACHMENTS_DIRNAME)
+    except Exception:  # noqa: BLE001 — image ingestion is best-effort, never fatal to intake
+        pass
     return True
 
 
