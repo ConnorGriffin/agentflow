@@ -513,6 +513,108 @@ def _release_triage(repo: str, n: int) -> bool:
     return claim_present() is False
 
 
+# --- research stage: dispatch an unattended session for an AFK-able planning ticket (ADR 0037) ---
+# Build intake still walls out the whole `wayfinder:*` namespace (`_untriaged`); this is the *only*
+# path that lets the daemon see and run a planning ticket, and it may run `wayfinder:research` and
+# nothing else. The shared `wayfinder:resolving` label is the claim — set before the session, so a
+# human session and the daemon never both grab the same ticket.
+
+RESEARCH_TICKET = "wayfinder:research"   # the one AFK-able planning ticket type the daemon may run
+RESOLVING = "wayfinder:resolving"        # shared claim — a session (human or daemon) owns this ticket
+
+# The wayfinder type labels the daemon must never dispatch: grilling/prototype/task stay
+# human-in-the-loop (ADR 0037). A ticket carrying any of these is refused even if it is also
+# mislabeled `wayfinder:research`, so the AFK boundary never leaks.
+_WAYFINDER_NON_RESEARCH = frozenset({"wayfinder:grilling", "wayfinder:prototype", "wayfinder:task"})
+
+
+def _research_eligible(issue: dict) -> bool:
+    """Pure (test surface). A ticket is dispatchable research only if it carries the
+    `wayfinder:research` type label, is not already claimed by `wayfinder:resolving`, and carries no
+    other `wayfinder:*` type label the daemon must never run (ADR 0037). Its blocker state is
+    verified separately against the live dependency graph."""
+    labels = {lbl["name"] for lbl in issue.get("labels", [])}
+    if RESEARCH_TICKET not in labels or RESOLVING in labels:
+        return False
+    return not (labels & _WAYFINDER_NON_RESEARCH)
+
+
+def _research_unblocked(cfg: RepoConfig, number: int, _log=None) -> bool:
+    """Whether every native `blockedBy` edge of a research ticket is closed (ADR 0037). Unreadable
+    edges (`_native_blockers` returns None) or a blocker whose state cannot be read fail closed — an
+    unknown dependency graph is never mistaken for 'unblocked', the same discipline the build queue
+    uses."""
+    native = _native_blockers(cfg, number)
+    if native is None:
+        if _log:
+            _log(f"{cfg.repo}: #{number}: skipped research — native blocked-by edges "
+                 "could not be determined")
+        return False
+    for blocker in sorted(native):
+        r = _run(["gh", "issue", "view", str(blocker), "--repo", cfg.repo, "--json", "state"])
+        try:
+            data = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
+            state = data.get("state") if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            state = None
+        if state != "CLOSED":
+            if _log:
+                _log(f"{cfg.repo}: #{number}: skipped research — blocker #{blocker} not closed")
+            return False
+    return True
+
+
+def _next_research_ticket(cfg: RepoConfig, _log=None) -> dict | None:
+    """The oldest open, unblocked, unclaimed `wayfinder:research` ticket the daemon may resolve
+    unattended (ADR 0037). Selection is by the research type label, so no other `wayfinder:*` ticket
+    is ever admitted; eligibility and blocker state are re-read on every pass and fail closed. None
+    on a `gh` blip (retry next cycle)."""
+    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
+              "--label", RESEARCH_TICKET, "--json", "number,title,body,labels", "--limit", "50"])
+    if r.returncode != 0:
+        return None
+    for issue in sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"]):
+        if _research_eligible(issue) and _research_unblocked(cfg, issue["number"], _log):
+            return issue
+    return None
+
+
+def _claim_resolving(repo: str, n: int) -> bool:
+    """Claim a research ticket with the shared `wayfinder:resolving` label *before* dispatching its
+    session, so a concurrent or next-cycle pass — human or daemon — skips it (ADR 0037). Ensures the
+    label exists first; symmetric to `_claim_triage`."""
+    created = _run(["gh", "label", "create", RESOLVING, "--repo", repo, "--color", "5319e7",
+                    "--description", "A session is resolving this planning ticket", "--force"])
+    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", RESOLVING])
+    return created.returncode == 0 and claimed.returncode == 0
+
+
+def _release_resolving(repo: str, n: int) -> bool:
+    """Drop the shared research claim once the ticket is resolved or the run gave up (ADR 0037).
+    Mirrors `_release_triage`: only the owning research finalizer releases it, and it returns durable
+    proof that GitHub no longer carries the claim so a finalizer never retires over a claim it never
+    released."""
+    def claim_present() -> bool | None:
+        viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
+        if viewed.returncode != 0:
+            return None
+        try:
+            labels = json.loads(viewed.stdout or "{}").get("labels", [])
+        except ValueError:
+            return None
+        return RESOLVING in {label.get("name") for label in labels if isinstance(label, dict)}
+
+    before = claim_present()
+    if before is None:
+        return False
+    if not before:
+        return True  # an earlier settlement released it before interruption
+    removed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", RESOLVING])
+    if removed.returncode != 0:
+        return False
+    return claim_present() is False
+
+
 def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
     """A `needs-grilling` or `needs-mockup` issue whose latest comment is the maintainer's
     reply — return it with their answer text so intake can resolve it (ADR 0019). A waiver

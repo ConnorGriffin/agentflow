@@ -23,6 +23,7 @@ STAGE_CAPS = {
     "build": BUILD_CONCURRENCY,
     "mockup": 1,
     "respond": 1,
+    "research": 1,
 }
 
 
@@ -113,12 +114,31 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
     return "; ".join(submitted) if submitted else "no un-triaged issues"
 
 
+def _submit_coordinated_research(cfg, coordinator, _log) -> str:
+    from agentflow import coordinated_research
+
+    ticket = loop._next_research_ticket(cfg, _log=_log)
+    if not ticket:
+        return "no wayfinder:research tickets to resolve"
+    builder, _reviewer, block_msg = pick_pair()
+    if builder is None:
+        return f"#{ticket['number']}: no pool has headroom to research ({block_msg}) — deferring"
+    map_context = coordinated_research.research_map_context(cfg.repo, ticket["number"])
+    submission = coordinated_research.research_submission(
+        cfg, ticket, builder.tool, map_context=map_context)
+    if not loop._claim_resolving(cfg.repo, ticket["number"]):
+        return f"#{ticket['number']}: could not claim wayfinder:resolving — refusing submission"
+    coordinator.submit_stage(submission)
+    return f"#{ticket['number']}: submitted to coordinator → {builder.tool} (research)"
+
+
 def _submit_repo(cfg, coordinator, _log) -> None:
     """Discover and durably submit each stage kind; no provider starts in this layer."""
     _run_and_log(cfg, "intake", lambda: _submit_coordinated_intake(cfg, coordinator, _log), _log)
     _run_and_log(cfg, "build", lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
     _run_and_log(cfg, "mockup", lambda: _submit_coordinated_mockup(cfg, coordinator, _log), _log)
     _run_and_log(cfg, "respond", lambda: _submit_coordinated_respond(cfg, coordinator, _log), _log)
+    _run_and_log(cfg, "research", lambda: _submit_coordinated_research(cfg, coordinator, _log), _log)
 
 
 def run_cycle(repos, *, submit_new: bool = True, coordinator=None, _log=None) -> None:

@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coordinator,
-                                   IntakeStageAdapter, MockupStageAdapter,
+                                   IntakeStageAdapter, MockupStageAdapter, ResearchStageAdapter,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
                                    StageRouter, tracer)
 from agentflow.balancer import pick_reviewer
@@ -284,7 +284,7 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
     operations. GitHub listing or verification failures likewise clear nothing.
     """
     from agentflow.coordinator.record import RUNNING
-    from agentflow.loop import BUILDING, DRAWING, TRIAGING, _run
+    from agentflow.loop import BUILDING, DRAWING, RESOLVING, TRIAGING, _run
 
     _log = _log or (lambda _line: None)
     try:
@@ -293,7 +293,8 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
         _log(f"{cfg.repo}: claim reconciliation deferred — coordinator state unreadable: {exc}")
         return 0
 
-    lane_labels = (("building", BUILDING), ("triaging", TRIAGING), ("drawing", DRAWING))
+    lane_labels = (("building", BUILDING), ("triaging", TRIAGING), ("drawing", DRAWING),
+                   ("resolving", RESOLVING))
     cleared = 0
     for lane, label in lane_labels:
         listed = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
@@ -388,8 +389,15 @@ def build_coordinator(_log=None) -> Coordinator:
         adopt=coordinated_converse._adopt_turn,
         park=coordinated_converse._park_ask,
         worktree_ready=coordinated_converse._ask_worktree_ready)
+    from agentflow import coordinated_research
+    research = ResearchStageAdapter(
+        findings_ready=coordinated_research._findings_ready,
+        resolve=coordinated_research.resolve,
+        release=coordinated_research.release,
+        worktree_ready=coordinated_research._research_worktree_ready)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
-                          "respond": respond, "mockup": mockup, "converse": converse})
+                          "respond": respond, "mockup": mockup, "converse": converse,
+                          "research": research})
     return Coordinator(adapter=router, gate=_production_gate(),
                        log=_log or (lambda _line: None))
 
@@ -432,7 +440,7 @@ class _ProductionGate:
         """The global limits the store enforces with the running-row reservation."""
         from agentflow import dispatch
         lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build",
-                "respond": "respond", "mockup": "mockup"}
+                "respond": "respond", "mockup": "mockup", "research": "research"}
         stage_lane = lane.get(record.stage, record.stage)
         return ReservationLimits(
             machine_ceiling=dispatch.MACHINE_CEILING,

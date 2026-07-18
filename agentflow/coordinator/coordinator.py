@@ -48,7 +48,7 @@ RESTART_RESUME_CAP = 5
 _OUTCOME_LABEL = {
     "intake": "route parsed", "build": "pr opened", "review": "verdict recorded",
     "revise": "revision pushed", "mockup": "mockup committed", "respond": "reply posted",
-    "converse": "reply appended"}
+    "converse": "reply appended", "research": "findings recorded"}
 
 
 @dataclass(frozen=True)

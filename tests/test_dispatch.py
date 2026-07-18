@@ -14,7 +14,8 @@ from agentflow.loop import RepoConfig
 
 
 def test_stage_caps_remain_named_inputs_to_the_coordinator_gate():
-    assert dispatch.STAGE_CAPS == {"triage": 3, "build": 2, "mockup": 1, "respond": 1}
+    assert dispatch.STAGE_CAPS == {"triage": 3, "build": 2, "mockup": 1, "respond": 1,
+                                   "research": 1}
     assert dispatch.MACHINE_CEILING > 0
 
 
