@@ -174,12 +174,14 @@ def _decisions_section(map_body: str) -> tuple[int, int, list[str]] | None:
 
 
 def decision_present(map_body: str, number: int) -> bool:
-    """Whether the map's 'Decisions so far' already records this ticket — its `#N` reference appears
-    in that section. The idempotency guard that keeps a crash-replay from appending a second line."""
+    """Whether the map's 'Decisions so far' already contains this ticket's own breadcrumb entry —
+    the exact shape decision_line() writes — not any incidental #N cross-reference elsewhere in
+    the section. The idempotency guard that keeps a crash-replay from appending a second line."""
     section = _decisions_section(map_body)
     if section is None:
         return False
-    return re.search(rf"(?<!\w)#{number}\b", "\n".join(section[2])) is not None
+    return any(re.search(rf"resolved by unattended research \(#{number}\)\.", ln)
+               for ln in section[2])
 
 
 def with_decision(map_body: str, line: str) -> str:
