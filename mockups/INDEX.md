@@ -16,6 +16,7 @@ captured to `dashboard-v2.capture.json`. Both captures are gitignored.
 | dashboard | **inbox** (needs-you-first) + **stream**'s trust-ratchet bar/glow | `retired` | was `server.py` + `static/dashboard.html`; superseded by `dashboard-v2`, deleted (ADR 0026) | `dashboard-inbox.html` |
 | dashboard-v2 | **console shell** + queue **Inbox** / live **Live** kanban / grid **Fleet** / **History** + shared drill-down | `locked` | re-platform → Svelte SPA + FastAPI, polling liveness, interactive controls (issue TBD) | `dashboard-v2-combined.html` |
 | workspace | **shelf** (efforts in 3 visual weights) + **anchored Ask composer** + **queue** prioritization | `locked` | project-workspace surface (Wayfinder #128 → PRD; build issue TBD) | `workspace-combined.html` |
+| workspace-approve-states | **approve→publish feedback**: optimistic *submitting* (teal) + *publish-failed* (danger) weights, on shelf card + approval note; copper stays awaiting-only | `locked` | fills the two states #163 left unbuilt (build issue TBD) | `workspace-approve-states.html` |
 
 **`workspace` grounding is its own language, not the console's.** The operator's
 direction: this surface deliberately departs from the terminal-native console
