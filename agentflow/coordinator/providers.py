@@ -22,6 +22,7 @@ from enum import Enum
 
 from agentflow.coordinator.session import read_session
 from agentflow.coordinator.store import default_store_path
+from agentflow.coordinator.telemetry import AttemptUsage, claude_usage, codex_usage
 
 
 class ProviderCause(str, Enum):
@@ -67,6 +68,8 @@ class ProviderObservation:
     has_end_fact: bool = False                  # the supervisor published a durable end fact for this
                                                 # attempt — the provider family ended on its own, not
                                                 # with the daemon (the restart-resume discriminator)
+    usage: AttemptUsage = AttemptUsage()        # normalized spend for this attempt (tokens/cost/turns);
+                                                # empty when the stream reported none (never zero-by-assumption)
 
     def classification(self) -> str:
         """The coordinator's provider label (recoverable | permanent | incomplete | unknown)."""
@@ -262,7 +265,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events,
         unrecognized=tuple(unrecognized), family=family, process_alive=process_alive,
-        has_end_fact=has_end_fact)
+        has_end_fact=has_end_fact, usage=claude_usage(events))
 
 
 # The typed Codex account/rate-limit facts (from the app-server surface or a typed companion
@@ -306,7 +309,7 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
         cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events, unrecognized=events, family=family, process_alive=process_alive,
-        has_end_fact=has_end_fact)
+        has_end_fact=has_end_fact, usage=codex_usage(events))
 
 
 # --- the two production provider adapters (ADR 0030) ------------------------------------
