@@ -10,6 +10,8 @@ its family is alive. A separate test exercises the real spawning launcher end to
 
 from __future__ import annotations
 
+import os
+import signal
 import sys
 import time
 
@@ -278,6 +280,35 @@ def test_real_supervisor_preserves_partial_output_signal_and_timeout(coord_state
     assert "partial stdout" in observation.partial_output
     assert "partial stderr" in observation.partial_output
     assert observation.cause is ProviderCause.TIMEOUT
+
+
+def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord_state):
+    """A reconciliation SIGTERM reaches the provider group, while the supervisor stays long
+    enough to write the normal durable end facts for the stopped attempt (#220)."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.store import Store, default_store_path
+
+    provider = lambda record: [sys.executable, "-c", "import time; time.sleep(30)"]
+    coord = Coordinator(launcher=LocalLauncher(provider, timeout=5, session_timeout=30))
+    identity = coord.submit_stage(review(subject="reconciled", pool="claude"))
+    coord.cycle("claude")
+
+    record = Store(default_store_path()).load()[identity]
+    assert pid_family_alive(record.family)
+    os.kill(int(record.family), signal.SIGTERM)
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        record = Store(default_store_path()).load()[identity]
+        if not pid_family_alive(record.family):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("provider supervisor did not finish after reconciliation SIGTERM")
+
+    observation = ClaudeProviderAdapter().observe(record)
+    assert observation.signal in {15, 9}
+    assert observation.timed_out is False
 
 
 def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tmp_path):

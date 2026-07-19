@@ -27,6 +27,10 @@ from agentflow.coordinator.session import events_path, write_result
 from agentflow.coordinator.store import Store
 
 
+class _TerminationRequested(Exception):
+    """Interrupt a provider wait so its supervisor can stop the process group cleanly."""
+
+
 def _mark_active(working_dir: str) -> Path | None:
     """Mirror the detached supervisor pid into the legacy worktree-liveness marker.
 
@@ -85,22 +89,35 @@ def main(args: list[str]) -> None:
             write_result(store_path, token, exit_status=None, signal=None, timed_out=False)
             _clear_active(marker)
             os._exit(0)
-        try:
-            returncode = process.wait(timeout=float(timeout))
-        except subprocess.TimeoutExpired:
-            timed_out = True
+
+        def stop_provider() -> int:
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
             try:
-                returncode = process.wait(timeout=5)
+                return process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                returncode = process.wait()
+                return process.wait()
+
+        def request_stop(_signum, _frame) -> None:
+            raise _TerminationRequested
+
+        # Reconciliation signals this supervisor, not the provider's separate session. Turn that
+        # request into the same orderly process-group shutdown the deadline path uses, then keep
+        # the supervisor alive to write the provider's durable end facts.
+        signal.signal(signal.SIGTERM, request_stop)
+        try:
+            returncode = process.wait(timeout=float(timeout))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            returncode = stop_provider()
+        except _TerminationRequested:
+            returncode = stop_provider()
         output.flush()
         os.fsync(output.fileno())
     ended_by_signal = -returncode if returncode < 0 else None

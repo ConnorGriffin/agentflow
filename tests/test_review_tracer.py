@@ -1121,3 +1121,46 @@ def test_a_waiting_diverged_review_does_not_attempt_a_kill(make_coord, monkeypat
 
     assert killed == []                              # no kill attempted for a WAITING record
     assert record_of(coord, ident).retired is True   # retire still happens normally
+
+
+def test_a_completed_diverged_review_does_not_attempt_a_kill(make_coord, monkeypatch):
+    """A completed review has no live provider family, even when its PR is subsequently merged."""
+    from agentflow.reviewer import Verdict
+
+    fake = FakeSession()
+    coord = make_coord(fake, adapter=_review_adapter(fake, verdict=[True], prep=[True]))
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    coord.cycle("codex")
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert [outcome.status for outcome in coord.cycle("codex")] == ["completed"]
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _rec: Verdict(clean=True))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert killed == []
+    assert record_of(coord, ident).retired is False  # normal completed-review settlement owns it
+
+
+def test_a_running_diverged_review_terminates_its_family_before_parking(make_coord, monkeypatch):
+    """The budget-exhausted park path stops its running provider before handing off (#220)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha", round=MAX_REVISES))
+    coord.cycle("codex")
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert killed == [ident]
+    assert record_of(coord, ident).state == "held"
