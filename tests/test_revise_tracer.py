@@ -797,3 +797,68 @@ def test_continuation_attempts_do_not_expand_the_auto_revise_round_policy():
     assert coordinated_build.revise_round_budget_remains(revises[:-1], "o/r", "7") is (MAX_REVISES > 1)
     # A revise for another issue never counts against this one.
     assert coordinated_build.revise_round_budget_remains(revises, "o/r", "8") is True
+
+
+# --- issue #212: a survivor conflict Revise, budgeted and re-reviewed apart (ADR 0038) --------
+
+def _conflict_revise_sub(subject="7", *, target="sha-conf", conflict_round=1, pool="claude"):
+    return Submission(repo="o/r", subject=subject, stage="revise", pool=pool, complexity="deep",
+                      target=target, conflict_round=conflict_round, builder_lineage=pool,
+                      builder_complexity="deep", continuation=True,
+                      source=f"/w/.agentflow/worktrees/{pool}/issue-{subject}-fix")
+
+
+def test_conflict_revise_round_is_budgeted_apart_from_the_finding_driven_rounds():
+    """A conflict Revise (``conflict_round`` set) never counts against the finding-driven
+    ``MAX_REVISES`` budget, and vice versa — the two failure modes are independent (ADR 0038)."""
+    findings = [Record(identity=f"o/r|7|revise|sha-{i}", stage="revise", pool="claude", demand=3,
+                       repo="o/r", subject="7") for i in range(MAX_REVISES)]
+    conflicts = [Record(identity=f"o/r|7|revise|sha-c{i}|c{i}", stage="revise", pool="claude",
+                        demand=3, repo="o/r", subject="7", conflict_round=i) for i in (1, 2)]
+    # Spent finding-driven rounds leave the conflict budget fully open, and vice versa.
+    assert coordinated_build.revise_round_budget_remains(findings + conflicts, "o/r", "7") is False
+    assert coordinated_build.revise_round_budget_remains(conflicts, "o/r", "7") is True
+    used = coordinated_build.conflict_revises_used(findings + conflicts, "o/r", "7")
+    assert [r.conflict_round for r in used] == [1, 2]         # only the conflict rounds, in order
+    assert coordinated_build.conflict_revises_used(findings, "o/r", "7") == []
+
+
+def test_completed_conflict_revise_reopens_a_review_with_the_discard_lens(make_coord, monkeypatch):
+    """AC2: a completed conflict Revise pushes the resolution, moving the head; reconcile opens a
+    fresh review at that new head whose prompt carries the discard-check lens, and the finding-driven
+    round is left untouched (a conflict resolution is not one of the auto-revise rounds)."""
+    fake = FakeSession()
+    pr, verdict, revision = [True], [False], [True]
+    coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
+                       gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-conf")
+
+    conflict = coord.submit_stage(_conflict_revise_sub(target="sha-conf"))
+    assert record_of(coord, conflict).conflict_round == 1
+    assert live.run_stage(conflict, head="sha-fixed") == ["revise"]   # pushed → opens the re-review
+
+    review = _ident("7", "review", "sha-fixed")          # round 0: the conflict round is separate
+    r = record_of(coord, review)
+    assert r.target == "sha-fixed" and r.round == 0 and r.attempts == 0
+    assert r.pool == "codex" and r.builder_lineage == "claude"
+    assert "did not silently discard `main`'s changes" in r.input_ptr
+    assert record_of(coord, conflict).retired is True
+
+
+def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
+    """The pure survivor conflict-Revise mapping: pinned to the builder's tool and retained
+    worktree, bound to the conflicting head, marked a continuation, carrying the ADR's finding."""
+    cfg = SimpleNamespace(repo="o/r", workdir="/w")
+    sub = coordinated_build.survivor_conflict_revise_submission(
+        cfg, issue=7, slug="fix", builder_tool="claude", head_sha="sha-conf", pr_number=42,
+        conflict_round=1)
+    assert sub is not None
+    assert sub.stage == "revise" and sub.pool == "claude" and sub.builder_lineage == "claude"
+    assert sub.target == "sha-conf" and sub.conflict_round == 1 and sub.continuation is True
+    assert sub.transfer_from is None                      # a survivor owns the claim directly
+    assert sub.source == "/w/.agentflow/worktrees/claude/issue-7-fix"
+    assert "resolve the merge conflicts" in sub.input_ptr and "preserve `main`" in sub.input_ptr
+    # An unknown tool has no lineage to pin the Revise to.
+    assert coordinated_build.survivor_conflict_revise_submission(
+        cfg, issue=7, slug="fix", builder_tool="gemini", head_sha="sha-conf", pr_number=42,
+        conflict_round=1) is None

@@ -57,6 +57,24 @@ def test_legacy_lane_alias_never_turns_revise_into_build(make_coord):
     assert permits(coord, "claude") == 3  # now revise (3) admitted — proving it stayed revise
 
 
+def test_conflict_revise_is_admitted_ahead_of_a_cold_build(make_coord):
+    # ADR 0038 (AC5): a conflict Revise is a continuation of nearly-merged work, so it is admitted
+    # ahead of a cold build submission competing for the same pool. The pool fits only one here —
+    # the continuation takes it. Without the continuation priority the build (sorted first by
+    # identity) would seize the pool and the conflict Revise would wait.
+    fake = FakeSession()
+    coord = make_coord(fake)
+    build = coord.submit_stage(Submission(repo="o/r", subject="1", stage="build", pool="claude",
+                                          complexity="deep"))                       # cold, 5 permits
+    conflict = coord.submit_stage(Submission(repo="o/r", subject="2", stage="revise", pool="claude",
+                                             complexity="deep", target="sha-conf", conflict_round=1,
+                                             builder_lineage="claude", continuation=True))  # 3 permits
+    assert coord.cycle("claude") == []
+    assert permits(coord, "claude") == 3                       # the conflict Revise went first
+    assert record_of(coord, conflict).state == "running"
+    assert record_of(coord, build).state == "waiting"          # the cold build was deferred
+
+
 def test_cycle_admits_intake_and_charges_one_permit(make_coord):
     fake = FakeSession()
     coord = make_coord(fake)
