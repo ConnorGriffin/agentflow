@@ -1,0 +1,31 @@
+# codebase-memory-mcp ignore (gitignore syntax).
+# Keeps daemon/agent-generated state and dependency/build output out of the
+# knowledge graph so structural queries resolve current tracked source
+# instead of stale worktree copies.
+
+# daemon + agent worktrees and their generated state (not source)
+.agentflow/
+.claude/worktrees/
+.impeccable/
+
+# dependency trees and generated frontend output
+agentflow/webui/node_modules/
+agentflow/webui/dist/
+node_modules/
+dist/
+build/
+
+# python build/test/env noise
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+*.egg-info/
+
+# git internals
+.git/

@@ -107,8 +107,15 @@ then Context / Decision / Alternatives / Consequences.
   executes: the boundary is judgment vs execution; claim + type replaces the
   `wayfinder:*` wall, and unclaimed AFK-able research tickets dispatch through the
   coordinator under permits and recovery (supersedes 0027, amends 0035).
+- [0038](0038-conflict-resolution-as-revise.md) — A survivor's re-rebase conflict opens
+  a conflict Revise on the owned PR branch instead of parking or force-resolving.
+- [0039](0039-open-prs-drain-first.md) — Admission ranks PR-bound stages (review,
+  revise, respond) ahead of issue-bound stages: open PRs drain before new work starts.
+- [0040](0040-spend-per-success-measurement-contract.md) — Spend experiments measure
+  headroom-denominated cost per verified stage and per merged issue, gated by quality
+  guardrails and cohort cells; dollars are only the cross-tool comparison signal.
 - [0041](0041-stage-model-reasoning-matrix.md) — Stage model/complexity cells stay
   mostly unchanged (Opus Build and all-deep Intake are complexity decisions owned by
   #228; deep cross-tool Review is safety, not a savings target); Respond/conflict-Revise
   carry-complexity is a directional parity note; every reasoning-effort cell is unset
-  pending #223 telemetry. (Applies ADR 0040; note 0038–0040 index entries land on PR #233.)
+  pending #223 telemetry.
