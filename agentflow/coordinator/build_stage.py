@@ -30,18 +30,36 @@ class BuildStageAdapter:
     unprepared.
     """
 
-    def __init__(self, *, pr_exists, worktree_ready=None, observer=None, handoff=None) -> None:
+    def __init__(self, *, pr_exists, worktree_ready=None, observer=None, handoff=None,
+                 integration_collision=None, main_head=None) -> None:
         self._pr_exists = pr_exists
         self._worktree_ready = worktree_ready or (lambda record: bool(record.source))
         self._observer = observer or ProviderObserver()
         self._handoff = handoff
+        self._integration_collision = integration_collision
+        self._main_head = main_head
 
     def prepare(self, record) -> bool:
         """Reuse the retained branch and worktree before admission (ADR 0030). Returns whether
         the owned worktree is present and checked out; a miss consumes no permit and no attempt,
         and the record simply waits and retries — its claim, lineage, branch, and worktree are
-        untouched."""
+        untouched.
+
+        A continuation that reported an integration collision stays unprepared while ``origin/main``
+        still equals the head it collided on: that retry is provably identical, so it is deferred —
+        never launched — until main moves (issue #209)."""
+        if record.collision_main_sha is not None and self._main_head is not None:
+            if self._main_head(record) == record.collision_main_sha:
+                return False
         return bool(self._worktree_ready(record))
+
+    def integration_collision(self, record) -> str | None:
+        """The `origin/main` head this Build reported an integration collision against this attempt,
+        or None when it reported none. Read from durable GitHub state, so it is independent of how
+        the provider exited (issue #209)."""
+        if self._integration_collision is None:
+            return None
+        return self._integration_collision(record)
 
     def observe(self, record):
         """Reconstruct the provider observation from the attempt's durable session artifacts.

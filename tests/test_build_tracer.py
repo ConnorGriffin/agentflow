@@ -174,12 +174,17 @@ def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
                       complexity="deep", effort=effort, source=source)
 
 
-def _adapter(fake, *, pr, prep, handoff=None):
+def _adapter(fake, *, pr, prep, handoff=None, collision=None, main=None):
     """A Build adapter wired to test flags: ``pr``/``prep`` are single-element lists so a test
-    flips PR existence and worktree readiness mid-flight; the fake plays observer + launcher."""
-    return BuildStageAdapter(pr_exists=lambda r: pr[0],
-                             worktree_ready=lambda r: prep[0], observer=fake,
-                             handoff=handoff)
+    flips PR existence and worktree readiness mid-flight; the fake plays observer + launcher.
+    ``collision`` scripts the `origin/main` head a reported integration collision names (or None
+    for no collision), and ``main`` the current `origin/main` head the deferral gate reads."""
+    return BuildStageAdapter(
+        pr_exists=lambda r: pr[0],
+        worktree_ready=lambda r: prep[0], observer=fake,
+        handoff=handoff,
+        integration_collision=(lambda r: collision[0]) if collision is not None else None,
+        main_head=(lambda r: main[0]) if main is not None else None)
 
 
 def _records(coord):
@@ -307,6 +312,124 @@ def test_failed_exhaustion_handoff_retries_on_a_later_cycle(make_coord):
 
     assert [outcome.status for outcome in settled] == ["held"]
     assert calls == [ident, ident]
+
+
+# --- integration collision is a durable outcome, not a retryable failure (issue #209) ----
+
+def test_collision_defers_the_retry_while_main_is_unchanged(make_coord):
+    # A build that rebases into an integration collision and stops (clean exit, no PR) must not
+    # be relaunched into the identical conflict while `origin/main` has not moved: the record
+    # defers, charges no attempt, and keeps its claim — instead of burning its budget to a hold.
+    fake = FakeSession()
+    pr, prep, collision, main = [False], [True], ["mainA"], ["mainA"]
+    coord = make_coord(fake, adapter=_adapter(fake, pr=pr, prep=prep,
+                                              collision=collision, main=main))
+    ident = coord.submit_stage(_build())
+    coord.cycle("claude")                          # attempt 1 running
+    fake.end(ident, cause=ProviderCause.NONE)      # clean exit, no PR, collision comment posted
+    assert coord.cycle("claude") == []             # no outcome — deferred, neither held nor relaunched
+    rec = record_of(coord, ident)
+    assert rec.attempts == 0                        # the doomed attempt was refunded
+    assert rec.state == "waiting" and rec.claim is True
+    assert rec.collision_main_sha == "mainA"
+    assert permits(coord, "claude") == 0            # nothing relaunched
+    # Main still unchanged across further cycles → the retry stays deferred, not charged.
+    assert coord.cycle("claude") == []
+    assert record_of(coord, ident).attempts == 0 and permits(coord, "claude") == 0
+
+
+def test_a_moved_main_grants_exactly_one_retry(make_coord):
+    fake = FakeSession()
+    pr, prep, collision, main = [False], [True], ["mainA"], ["mainA"]
+    coord = make_coord(fake, adapter=_adapter(fake, pr=pr, prep=prep,
+                                              collision=collision, main=main))
+    ident = coord.submit_stage(_build())
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.NONE)      # collision on mainA
+    coord.cycle("claude")                           # deferred
+    assert record_of(coord, ident).attempts == 0
+
+    main[0] = "mainB"                               # main moved — the conflict may be gone now
+    collision[0] = None                             # a fresh session gets a clean rebase
+    coord.cycle("claude")                           # prepare passes → the one warranted retry launches
+    rec = record_of(coord, ident)
+    assert rec.state == "running" and rec.attempts == 1
+
+
+def test_a_second_collision_after_a_retry_hands_off_visibly(make_coord):
+    fake = FakeSession()
+    handoffs = []
+    pr, prep, collision, main = [False], [True], ["mainA"], ["mainA"]
+    adapter = _adapter(fake, pr=pr, prep=prep, collision=collision, main=main,
+                       handoff=lambda record: handoffs.append(record.identity) or "issue-proof")
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_build())
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.NONE)      # first collision on mainA → deferred
+    coord.cycle("claude")
+
+    main[0] = "mainB"                               # main moves; the granted retry launches
+    collision[0] = "mainB"                          # and collides again on the new main
+    coord.cycle("claude")
+    assert record_of(coord, ident).state == "running"
+    fake.end(ident, cause=ProviderCause.NONE)      # second collision
+    settled = coord.cycle("claude")
+
+    assert [o.status for o in settled] == ["held"]
+    assert settled[0].handoff == "issue:needs-grilling"
+    rec = record_of(coord, ident)
+    assert rec.attempts == 1                         # only the real retry was ever charged
+    assert rec.claim is False                        # the building claim is released on handoff
+    assert rec.handoffs == 1 and rec.notifications == 1
+    assert rec.source == "/wt/issue-7"               # worktree retained for a human to resume
+    assert handoffs == [ident]
+    assert make_coord(fake, adapter=adapter).cycle("claude") == []
+    assert handoffs == [ident]                       # a restart never repeats the external handoff
+
+
+def test_budget_exhaustion_with_a_collision_freshest_hands_off(make_coord):
+    # The other handoff trigger: the budget runs out with a collision as the freshest outcome.
+    fake = FakeSession()
+    handoffs = []
+    pr, prep, collision, main = [False], [True], [None], ["mainA"]
+    adapter = _adapter(fake, pr=pr, prep=prep, collision=collision, main=main,
+                       handoff=lambda record: handoffs.append(record.identity) or "issue-proof")
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_build())
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.PROCESS)   # attempt 1 fails, no collision
+    coord.cycle("claude")
+    fake.end(ident, cause=ProviderCause.PROCESS)   # attempt 2 fails, no collision
+    coord.cycle("claude")
+    collision[0] = "mainA"                           # the last attempt reports a collision
+    fake.end(ident, cause=ProviderCause.NONE)
+    settled = coord.cycle("claude")
+
+    assert [o.status for o in settled] == ["held"]
+    rec = record_of(coord, ident)
+    assert rec.attempts == 3 and rec.hold_reason == "integration collision"
+    assert handoffs == [ident]
+
+
+def test_non_collision_exhaustion_is_unchanged(make_coord):
+    # A build that exhausts its budget with no collision keeps today's exhaustion handoff.
+    fake = FakeSession()
+    pr, prep, collision, main = [False], [True], [None], ["mainA"]
+    coord = make_coord(fake, adapter=_adapter(fake, pr=pr, prep=prep,
+                                              collision=collision, main=main,
+                                              handoff=lambda record: "issue-proof"))
+    ident = coord.submit_stage(_build())
+    outcome = None
+    for _ in range(6):
+        settled = coord.cycle("claude")
+        if settled:
+            outcome = settled[0]
+            break
+        fake.end(ident, cause=ProviderCause.PROCESS)
+    assert outcome is not None and outcome.status == "held"
+    rec = record_of(coord, ident)
+    assert rec.attempts == 3 and rec.hold_reason == "continuation budget exhausted"
+    assert rec.collision_main_sha is None
 
 
 # --- idempotent submission ---------------------------------------------------------------
@@ -542,3 +665,49 @@ def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(mo
     assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
     assert len(state["comments"]) == 1
     assert len(notifications) == 1
+
+
+def test_live_collision_handoff_names_the_collision_and_leaves_a_resumable_issue(monkeypatch):
+    # A collision handoff routes through the same visible stuck-build handoff, but its comment and
+    # notification name the collision — and it leaves the issue in the resume-ready state ADR 0019
+    # intake picks up on a maintainer reply (needs-grilling, no building/ready-for-agent claim).
+    from agentflow import intake, loop, notify as notify_module
+
+    state = {
+        "title": "Build it",
+        "url": "https://github.com/o/r/issues/7",
+        "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
+        "comments": [],
+    }
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        if cmd[:3] == ["gh", "issue", "view"]:
+            return subprocess.CompletedProcess(cmd, 0, json.dumps(state), "")
+        if cmd[:3] == ["gh", "issue", "edit"] and "--remove-label" in cmd:
+            state["labels"] = [label for label in state["labels"]
+                               if label["name"] != "agentflow:building"]
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        raise AssertionError(cmd)
+
+    def fake_apply(repo, number, title, labels, result):
+        state["labels"] = [{"name": "agentflow:needs-grilling"},
+                           {"name": "agentflow:building"}]
+        if not any(comment["body"] == result.body for comment in state["comments"]):
+            state["comments"].append({"body": result.body})
+        return "applied"
+
+    notifications = []
+    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(intake, "apply_intake", fake_apply)
+    monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
+    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                    repo="o/r", subject="7", source="/retained/wt", claim=True,
+                    hold_reason="integration collision")
+
+    assert coordinated_build._hold_build(record) == state["url"]
+    # Resume-ready for a maintainer reply: needs-grilling only, no build claim, no ready-for-agent.
+    assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
+    body = state["comments"][0]["body"]
+    assert "collision" in body and "/retained/wt" in body   # names the collision + retained worktree
+    assert len(notifications) == 1
+    assert "integration collision" in notifications[0][1].lower()
