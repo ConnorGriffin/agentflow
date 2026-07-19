@@ -595,6 +595,75 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     assert resumed_sub.input_ptr == "the original brief"  # the same durable brief, re-run
 
 
+def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkeypatch):
+    # The resume submits the coordinator record before claiming the issue (#245). If the claim then
+    # loses a rare race, the runnable WAITING record must be withdrawn — otherwise it is orphaned
+    # without the building label and a later cycle launches it unguarded.
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record, WAITING
+
+    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
+             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    _issue_view(monkeypatch, issue)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    monkeypatch.setattr(loop, "pick_pair",
+                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(loop, "_claim", lambda repo, n: False)   # the race is lost
+    submission = SimpleNamespace(resume=0, pool="claude")
+    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(coordinated_build, "resume_if_held", lambda sub, records: sub)
+    waiting = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
+                     state=WAITING)
+    withdrawn = []
+    coordinator = SimpleNamespace(
+        submit_stage=lambda sub: "o/r|5|build|-",
+        stage_record=lambda identity: waiting,
+        withdraw_stage=lambda identity: withdrawn.append(identity) or True)
+    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project",
+                        lambda c: pytest.fail("must not project a withdrawn submission"))
+
+    out = build_issue(RepoConfig("o/r", "/tmp"), 5)
+
+    assert "could not claim" in out and "withdrew" in out
+    assert withdrawn == ["o/r|5|build|-"]                       # the orphan was rolled back
+
+
+def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
+    # A repeated `build <N>` while a resume is already live is correctly non-duplicating — it
+    # idempotently reuses the terminal held record — but must acknowledge the running resume rather
+    # than report the issue as merely 'still held' (#245).
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import HELD, Record, WAITING
+
+    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
+             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    _issue_view(monkeypatch, issue)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    monkeypatch.setattr(loop, "pick_pair",
+                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(loop, "_claim", lambda repo, n: pytest.fail("must not claim a held record"))
+    submission = SimpleNamespace(repo="o/r", subject="5", resume=0, pool="claude")
+    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
+    # The held original at resume 0 plus a live resume successor already running at resume 1.
+    held = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
+                  repo="o/r", subject="5", state=HELD, resume=0)
+    live = Record(identity="o/r|5|build|-|s1", stage="build", pool="claude", demand=5,
+                  repo="o/r", subject="5", state=WAITING, resume=1)
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [held, live])
+    # resume_if_held runs for real: the latest live Build is not held, so the submission is unchanged
+    # and idempotently reuses the terminal held record.
+    coordinator = SimpleNamespace(
+        submit_stage=lambda sub: "o/r|5|build|-",
+        stage_record=lambda identity: held)
+    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coordinator)
+
+    out = build_issue(RepoConfig("o/r", "/tmp"), 5)
+
+    assert "already running" in out
+
+
 def test_build_issue_refuses_an_open_blocker(monkeypatch):
     issue = {"number": 42, "state": "OPEN", "title": "dependent", "body": "Blocked by #41",
              "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}

@@ -113,6 +113,19 @@ def resume_if_held(submission, records):
                    input_ptr=latest.input_ptr)
 
 
+def resume_in_flight(submission, records) -> bool:
+    """True when a resume of this issue's Build is already live — a non-retired successor at a resume
+    dimension past the original held record, still running or queued (#245). A repeated maintainer
+    `build <N>` while that resume runs is correctly non-duplicating (``resume_if_held`` leaves it
+    unchanged, so it idempotently reuses the terminal held record), but the caller should acknowledge
+    the running resume rather than report the record as merely 'still held'. Pure."""
+    from agentflow.coordinator.record import HELD
+
+    return any(r.repo == submission.repo and str(r.subject) == str(submission.subject)
+               and r.stage == "build" and not r.retired and r.resume >= 1 and r.state != HELD
+               for r in records)
+
+
 def mockup_submission(cfg, issue: dict, tool: str):
     """Translate one eligible held issue into its single durable Mockup variant round.
 

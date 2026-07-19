@@ -465,7 +465,8 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     # A `build <N>` on an issue whose latest Build exhausted its budget and `held` is the explicit,
     # durable maintainer resume (#245): open a fresh bounded execution at the next resume identity
     # instead of silently reusing the terminal held record.
-    resumed = coordinated_build.resume_if_held(submission, coordinated_build.tracer.load_records())
+    records = coordinated_build.tracer.load_records()
+    resumed = coordinated_build.resume_if_held(submission, records)
     coordinator = coordinated_build.build_coordinator()
     identity = coordinator.submit_stage(resumed)
     record = coordinator.stage_record(identity)
@@ -473,9 +474,14 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     # ordinary resubmission that reused a terminal (held/completed) record leaves nothing to run —
     # never stamp `agentflow:building` on it or claim success; redirect the maintainer to `pickup`.
     if record is None or record.state != WAITING or record.hold_pending or record.retired:
+        if coordinated_build.resume_in_flight(resumed, records):
+            return f"#{n}: a resume is already running — let it finish or reply what's missing"
         return f"#{n}: still held — resume it with `/agentflow pickup {n}`, reply what's missing"
     if not _claim(cfg.repo, n):
-        return f"#{n}: could not claim Build — refusing coordinator submission"
+        # We submitted a runnable record but never established the GitHub claim: withdraw it so no
+        # orphaned WAITING build is left for a later cycle to launch unguarded (#245).
+        coordinator.withdraw_stage(identity)
+        return f"#{n}: could not claim Build — withdrew the coordinator submission"
     coordinated_build.reconcile_and_project(coordinator)
     verb = "resumed" if resumed.resume else "submitted"
     return f"#{n}: {verb} to coordinator → {resumed.pool} (build)"
