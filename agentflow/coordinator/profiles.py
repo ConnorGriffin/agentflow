@@ -22,10 +22,12 @@ _MIN = 60
 
 # Read/search allowlists for the read-only stages (§3a). Every one omits the edit tools; the
 # scheduling/plan-mode surface history showed loaded-in-every-session-and-used-in-none is
-# omitted too. Intake needs WebFetch; Research needs both web tools; Review needs neither.
+# omitted too. Intake carries ToolSearch + WebFetch per §3a; Research adds both web tools;
+# Review is the plain read/search four (Read/Bash/Grep/Glob) the table names for it — no
+# ToolSearch, no web tools.
 _READ_ONLY_TOOLS: dict[str, tuple[str, ...]] = {
     "intake": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch"),
-    "review": ("Read", "Bash", "Grep", "Glob", "ToolSearch"),
+    "review": ("Read", "Bash", "Grep", "Glob"),
     "research": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebSearch", "WebFetch"),
 }
 

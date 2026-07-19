@@ -38,7 +38,7 @@ def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(tmp_path):
     old uniform full-surface launch carried."""
     for stage, expected_tools in (
         ("intake", ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch")),
-        ("review", ("Read", "Bash", "Grep", "Glob", "ToolSearch")),
+        ("review", ("Read", "Bash", "Grep", "Glob")),
     ):
         cmd = provider_command(_record(stage, str(tmp_path)))
         tools = _flag(cmd, "--tools").split(",")
