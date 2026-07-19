@@ -16,7 +16,6 @@ by a Codex-specific policy in the coordinator.
 from __future__ import annotations
 
 import json
-import re
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -71,9 +70,6 @@ class ProviderObservation:
                                                 # with the daemon (the restart-resume discriminator)
     usage: AttemptUsage = AttemptUsage()        # normalized spend for this attempt (tokens/cost/turns);
                                                 # empty when the stream reported none (never zero-by-assumption)
-    detail: str = ""                            # a short human description of a specific permanent
-                                                # condition (e.g. the withheld capability a read-only
-                                                # profile fail-closed on), for the human-hold reason
 
     def classification(self) -> str:
         """The coordinator's provider label (recoverable | permanent | incomplete | unknown)."""
@@ -120,36 +116,6 @@ _CLAUDE_RESULT_CAUSES = {
 # tool results, partial stream_event, telemetry, …) is preserved verbatim as unrecognized so
 # nothing is silently dropped and an unknown shape stays fail-safe.
 _CLAUDE_KNOWN_TYPES = {"assistant", "result", "rate_limit_event"}
-
-# The CLI's phrasing when a `permissions.deny` rule blocks a tool call. A daemon session runs in
-# acceptEdits, so the only denials come from a read-only profile's withheld-edit backstop — a
-# reach for a capability the stage was not given (ADR 0044 pt 5, fail closed to a human hold).
-_CLAUDE_DENIAL_RE = re.compile(r"Permission to use (\S+)")
-
-
-def _claude_withheld_capability(event: dict) -> str | None:
-    """The capability name a denied ``user`` tool_result names, or ``None``. A read-only stage
-    that reaches for a withheld tool gets an error tool_result carrying the CLI's denial phrase;
-    that is the fail-closed signal — the session asked for something its profile removed."""
-    message = event.get("message")
-    blocks = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(blocks, list):
-        return None
-    for block in blocks:
-        if not isinstance(block, dict) or block.get("type") != "tool_result":
-            continue
-        if block.get("is_error") is not True:
-            continue
-        content = block.get("content")
-        if isinstance(content, list):
-            content = " ".join(part.get("text", "") for part in content
-                               if isinstance(part, dict))
-        if not isinstance(content, str):
-            continue
-        match = _CLAUDE_DENIAL_RE.search(content)
-        if match:
-            return match.group(1)
-    return None
 
 
 def _claude_result_error(event: dict):
@@ -242,12 +208,9 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
     cause = ProviderCause.NONE
     reset_at = None
     final_message = ""
-    withheld: str | None = None
     unrecognized: list[dict] = []
     for event in events:
         etype = event.get("type")
-        if etype == "user":
-            withheld = _claude_withheld_capability(event) or withheld
         if etype == "assistant":
             text = _claude_assistant_text(event)
             if text is not None:
@@ -299,14 +262,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                     unrecognized.append(dict(event))  # an unmodeled terminal failure — preserve
         if etype not in _CLAUDE_KNOWN_TYPES:
             unrecognized.append(dict(event))
-    detail = ""
-    if withheld is not None:
-        # A reach for a withheld capability is a fail-closed human hold, not a retry — it means
-        # the profile is wrong for this stage, and the operator must see which tool it denied. It
-        # takes precedence over a timeout/process end so that signal is never lost (ADR 0044 pt 5).
-        cause = ProviderCause.PERMANENT
-        detail = f"withheld capability: {withheld}"
-    elif cause is ProviderCause.NONE:
+    if cause is ProviderCause.NONE:
         if timed_out:
             cause = ProviderCause.TIMEOUT
         elif signal is not None or (exit_status not in (None, 0)):
@@ -316,7 +272,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events,
         unrecognized=tuple(unrecognized), family=family, process_alive=process_alive,
-        has_end_fact=has_end_fact, usage=claude_usage(events), detail=detail)
+        has_end_fact=has_end_fact, usage=claude_usage(events))
 
 
 # The typed Codex account/rate-limit facts (from the app-server surface or a typed companion

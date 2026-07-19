@@ -198,14 +198,21 @@ that finding-driven Revise carries the builder's complexity.
 
 ### 3c. Fail-closed when a narrow profile is missing a capability
 
-If a stage under a narrow profile reaches for a capability the profile withholds
-(e.g. a Review tries to `Edit`, as 2 historically did), the session must **fail
-closed to a human hold** — the same durable handoff a budget exhaustion produces —
-never silently degrade and never silently "succeed." A hit on this path is a
-signal the profile is wrong for that stage, and the operator should see it. Same
-for a ceiling: hitting the wall/turn ceiling is a `TIMEOUT`-class recoverable end
-(existing behavior), and the tightened numbers make that kill *useful* instead of
-theatrical.
+The narrow profile must **fail closed** on a withheld capability (e.g. a Review
+reaching for `Edit`, as 2 historically did) — never silently degrade and never
+silently "succeed."
+
+*Correction from implementation (ADR 0044 pt 5):* the draft assumed the withheld
+tool would remain callable and produce a "permission denied" event the coordinator
+could turn into a capability-naming human hold. Verifying against the CLI init
+event showed that both the `--tools` allowlist and a `permissions.deny` block
+*remove the tool from the loaded surface entirely* — it has no schema, so the model
+cannot emit a call for it. Fail-closed is therefore delivered by **unreachability**:
+the read-only stage physically cannot exercise the capability. There is no denied
+event to catch, so there is no capability-naming hold on this path (and none is
+needed — nothing degrades because nothing can be edited). A ceiling hit is separate:
+the wall/turn ceiling is a `TIMEOUT`-class recoverable end (existing behavior), and
+the tightened numbers make that kill *useful* instead of theatrical.
 
 ## 4. What the post-#223 comparison must confirm
 

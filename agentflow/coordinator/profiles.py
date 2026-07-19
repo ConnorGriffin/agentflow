@@ -29,8 +29,13 @@ _READ_ONLY_TOOLS: dict[str, tuple[str, ...]] = {
     "research": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebSearch", "WebFetch"),
 }
 
-# The edit capabilities a read-only profile withholds — removed from the loaded surface by the
-# allowlist and denied in settings as the fail-closed backstop (ADR 0044 pt 1/5).
+# The edit capabilities a read-only profile withholds. The allowlist (``--tools``) removes them
+# from the loaded surface and the settings ``permissions.deny`` block is a second, independent
+# strip of the same tools — either mechanism alone removes them from the session's tool surface
+# entirely (verified against the CLI init event), so a read-only stage cannot exercise them. That
+# unreachability *is* the fail-closed guarantee (ADR 0044 pt 1/5): the capability is absent, not
+# present-and-caught. The deny block earns its keep as defense in depth if the allowlist ever
+# regresses.
 WITHHELD_EDIT_TOOLS: tuple[str, ...] = ("Edit", "Write", "NotebookEdit")
 
 # Wall (seconds) + turn ceilings for the non-Build stages (§3b). Thin-sample stages ship the

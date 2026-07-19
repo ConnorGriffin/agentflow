@@ -2,9 +2,13 @@
 
 Every assertion here drives the public seam a real launch uses — ``provider_command(record)``
 for the command a stage is launched with, ``LocalLauncher`` for the per-record wall ceiling,
-and ``classify_claude`` / the coordinator ``cycle`` for how a withheld-tool reach and a ceiling
-hit end. Each would fail against the pre-#242 uniform launch (one full surface, personal MCP,
-one two-hour timeout, no turn ceiling).
+and ``classify_claude`` for how a ceiling hit ends. Each would fail against the pre-#242 uniform
+launch (one full surface, personal MCP, one two-hour timeout, no turn ceiling).
+
+Fail-closed is delivered by *unreachability*, not by catching a denied call: the read-only launch
+strips the edit tools from the loaded surface (allowlist + an independent deny strip), verified at
+the command seam below. There is no "permission denied" event to key on because a stripped tool has
+no schema for the model to call — so no test fabricates one (ADR 0044 pt 5).
 """
 
 from __future__ import annotations
@@ -12,11 +16,9 @@ from __future__ import annotations
 import json
 
 from agentflow.coordinator.launcher import LocalLauncher
-from agentflow.coordinator.providers import (ProviderCause, ProviderObservation,
-                                             classify_claude, provider_command)
-from agentflow.coordinator import Submission
+from agentflow.coordinator.providers import (ProviderCause, classify_claude,
+                                             provider_command)
 from agentflow.coordinator.record import Record
-from tests.conftest import FakeSession, record_of
 
 _EDIT_TOOLS = {"Edit", "Write", "NotebookEdit"}
 
@@ -50,7 +52,9 @@ def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(tmp_path):
         # A real turn ceiling replaces the absent one; both read-only stages cap at 40 turns.
         assert _flag(cmd, "--max-turns") == "40"
 
-        # The settings deny is the fail-closed backstop for the withheld edit tools.
+        # The settings deny independently strips the same edit tools — the fail-closed backstop
+        # (ADR 0044 pt 5). Both the allowlist above and this deny remove the tools from the loaded
+        # surface, so a read-only stage has no edit-tool schema to call: unreachable, not caught.
         deny = json.loads(_flag(cmd, "--settings"))["permissions"]["deny"]
         assert set(deny) == _EDIT_TOOLS
 
@@ -97,48 +101,3 @@ def test_a_ceiling_hit_ends_as_a_recoverable_timeout():
     obs = classify_claude([{"type": "result", "subtype": "error_max_turns"}])
     assert obs.cause is ProviderCause.TIMEOUT
     assert obs.classification() == "recoverable"
-
-
-def test_withheld_tool_reach_is_classified_a_permanent_hold_naming_the_capability():
-    """A read-only session that reaches for a withheld capability gets a denial tool_result; the
-    classifier fails it closed to a PERMANENT hold whose detail names the tool — and that wins
-    even over a following clean result, so a stray edit is never silently swallowed (§3c)."""
-    obs = classify_claude([
-        {"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "id": "t1", "name": "Write",
-             "input": {"file_path": "x", "content": "y"}}]}},
-        {"type": "user", "message": {"content": [
-            {"type": "tool_result", "tool_use_id": "t1", "is_error": True,
-             "content": "Permission to use Write has been denied."}]}},
-        {"type": "result", "subtype": "success", "result": "done anyway"},
-    ])
-    assert obs.cause is ProviderCause.PERMANENT
-    assert obs.classification() == "permanent"
-    assert "Write" in obs.detail
-
-
-def test_withheld_tool_reach_holds_for_a_human_through_the_coordinator(make_coord):
-    """Through the public cycle: a read-only stage whose provider reached for a withheld tool
-    ends held for a human, with the hold reason naming the withheld capability — never a silent
-    success or degradation."""
-    fake = FakeSession()
-
-    class _WithheldEdit:
-        def observe(self, record):
-            return ProviderObservation(
-                cause=ProviderCause.PERMANENT, has_end_fact=True,
-                detail="withheld capability: Write")
-
-        def verify(self, record, obs):
-            return False
-
-    coord = make_coord(fake, adapter=_WithheldEdit())
-    identity = coord.submit_stage(Submission(
-        repo="o/r", subject="stray-edit", stage="review", pool="claude"))
-    coord.cycle("claude")          # launches the attempt
-    fake.kill(identity)            # its family ends (the scripted observation supplies the cause)
-    coord.cycle("claude")          # observed and settled
-
-    durable = record_of(coord, identity)
-    assert durable.state == "held"
-    assert "Write" in durable.hold_reason and "permanent" in durable.hold_reason
