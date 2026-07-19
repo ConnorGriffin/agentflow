@@ -648,7 +648,9 @@ class Coordinator:
         label = obs.classification()
         cause = obs.cause.value
         if label == "permanent":
-            record.hold_reason = f"permanent provider condition ({cause})"
+            detail = getattr(obs, "detail", "")
+            record.hold_reason = (f"permanent provider condition ({cause}): {detail}"
+                                  if detail else f"permanent provider condition ({cause})")
             if not self._hold(record):
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
