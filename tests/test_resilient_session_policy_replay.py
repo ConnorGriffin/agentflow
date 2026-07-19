@@ -129,12 +129,14 @@ def test_two_writers_cannot_share_one_five_permit_pool(make_coord):
 def test_near_exclusive_writer_keeps_useful_short_stage_concurrency(make_coord):
     fake = FakeSession()
     coord = make_coord(fake)
-    submit_root(coord, "claude-medium-build")                # demand 4
-    submit_root(coord, "claude-review")                      # demand 1
-    submit_root(coord, "claude-revise")                      # demand 3, cannot fit
+    submit_root(coord, "claude-medium-build")                # demand 4, issue-bound
+    submit_root(coord, "claude-review")                      # demand 1, PR-bound
+    submit_root(coord, "claude-revise")                      # demand 3, PR-bound
 
     coord.cycle("claude")
-    assert permits(coord, "claude") == 5   # a 4-permit writer still leaves room for a 1 review
+    # PR-bound stages drain first (ADR 0039): the 1-permit review and 3-permit revise run
+    # together; the 4-permit build is deferred rather than monopolizing the pool.
+    assert permits(coord, "claude") == 4
 
 
 def test_continuation_head_of_line_blocks_bypass_without_preempting_live_work(make_coord):
@@ -194,10 +196,10 @@ def test_a_closed_gate_defers_without_permits_or_attempts(make_coord):
 def test_permit_deferral_consumes_neither_permit_nor_attempt(make_coord):
     fake = FakeSession()
     coord = make_coord(fake)
-    live = submit_root(coord, "claude-medium-build")         # demand 4
-    deferred = submit_root(coord, "claude-revise")           # demand 3, cannot fit beside live
+    live = submit_root(coord, "claude-revise")               # demand 3, PR-bound → drains first
+    deferred = submit_root(coord, "claude-medium-build")     # demand 4, cannot fit beside live
     coord.cycle("claude")
-    assert permits(coord, "claude") == 4                      # only the writer started
+    assert permits(coord, "claude") == 3                      # only the PR-bound writer started
 
     fake.end(live, success=True)                             # free the pool
     # The deferred writer never spent an attempt while blocked, so it keeps its full budget.

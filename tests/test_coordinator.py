@@ -48,13 +48,14 @@ def test_legacy_lane_alias_never_turns_revise_into_build(make_coord):
                                           pool="claude", complexity="deep"))
     revise = coord.submit_stage(Submission(repo="o/r", subject="9", stage="revise",
                                            pool="claude", complexity="deep"))
-    # Build (deep, no effort) reserves the exclusive five; revise reserves three. If the alias
-    # had collapsed revise into build the pool could not have fit both — it fits exactly.
+    # Revise is PR-bound, so it drains first (ADR 0039) and reserves three — not the exclusive
+    # five a build would. That three-permit reservation is the proof the alias kept it a revise:
+    # a build (deep, no effort) would have taken all five, leaving no room to distinguish.
     assert coord.cycle("claude") == []
-    assert permits(coord, "claude") == 5  # build 5 admitted; revise deferred, pool full
-    fake.end(build, success=True)
-    assert [o.stage for o in coord.cycle("claude")] == ["build"]
-    assert permits(coord, "claude") == 3  # now revise (3) admitted — proving it stayed revise
+    assert permits(coord, "claude") == 3  # revise (3) admitted; build (5) deferred, pool full
+    fake.end(revise, success=True)
+    assert [o.stage for o in coord.cycle("claude")] == ["revise"]
+    assert permits(coord, "claude") == 5  # now the deferred build (5) admitted
 
 
 def test_conflict_revise_is_admitted_ahead_of_a_cold_build(make_coord):
@@ -567,3 +568,190 @@ def test_public_surface_keeps_completed_boundary_settlement_private(make_coord):
                       "retire_stale_review", "park_stale_review"}
     assert not hasattr(coord, "permits")      # permit accounting is an internal invariant
     assert not hasattr(coord, "records")      # the working set is private (_records)
+
+
+# --- ADR 0039: PR-bound stages drain ahead of issue-bound stages at admission ------------
+
+class _SharedLaneCap:
+    """A gate that admits every stage but caps a shared lane at one running record, so which of
+    two competitors starts is decided purely by admission ordering, not by permit arithmetic."""
+
+    def __init__(self, *stages):
+        self._lane = {stage: "shared" for stage in stages}
+
+    def __call__(self, record):
+        return True
+
+    def reservation_limits(self, record):
+        return ReservationLimits(machine_ceiling=99, stage_cap=1, stage_lane="shared",
+                                 lane_by_stage=self._lane)
+
+
+class _RefuseReviewGate:
+    """Admits every stage but review — used to freeze a PR-bound head and prove head-of-line
+    blocking (ADR 0029) still holds: a stalled review must not let a build behind it start."""
+
+    def __call__(self, record):
+        return record.stage != "review"
+
+
+def test_cold_pr_bound_review_drains_before_issue_bound_build(make_coord):
+    """A waiting cold review and a waiting cold build on one pool, the build lexically first: the
+    review (an open PR one verdict from merging) admits ahead of the brand-new build, which then
+    cannot fit the pool (ADR 0039). Fails before the fix — identity order started the build,
+    which reserved the whole pool and left no room for the review."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    build = coord.submit_stage(Submission(repo="o/r", subject="1", stage="build",
+                                          pool="claude", complexity="deep"))
+    review = coord.submit_stage(Submission(repo="o/r", subject="2", stage="review",
+                                           pool="claude"))
+    coord.cycle("claude")
+    assert record_of(coord, review).state == "running"     # PR-bound drains first
+    assert record_of(coord, build).state == "waiting"      # issue-bound waits behind it
+    assert permits(coord, "claude") == 1                    # only the review's single permit reserved
+
+
+def test_cold_pr_bound_revise_and_respond_drain_before_build(make_coord):
+    """Fresh revise and respond records are themselves cold, but as PR-bound stages they drain
+    ahead of a brand-new build even when the build sorts first by identity; within their own tier
+    they keep identity order, so revise (not respond) takes the head (ADR 0039)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    build = coord.submit_stage(Submission(repo="o/r", subject="1", stage="build",
+                                          pool="claude", complexity="deep"))
+    revise = coord.submit_stage(Submission(repo="o/r", subject="2", stage="revise",
+                                           pool="claude", complexity="deep"))
+    respond = coord.submit_stage(Submission(repo="o/r", subject="3", stage="respond",
+                                            pool="claude", complexity="deep"))
+    coord.cycle("claude")
+    assert record_of(coord, revise).state == "running"     # PR-bound, lexically first in its tier
+    assert record_of(coord, respond).state == "waiting"    # PR-bound but the pool is now full
+    assert record_of(coord, build).state == "waiting"      # issue-bound drains last
+    assert permits(coord, "claude") == 3
+
+
+def test_pr_bound_continuation_drains_before_earlier_eligible_issue_bound(make_coord):
+    """In the continuation queue a PR-bound stage still drains first, even against an issue-bound
+    continuation that became eligible earlier — and head-of-line then keeps the build behind it
+    (ADR 0039). Fails before the fix: eligible-at order ran the build and filled the pool."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    build = coord.submit_stage(Submission(repo="o/r", subject="1", stage="build",
+                                          pool="claude", complexity="deep"))
+    coord.cycle("claude", now=0)                            # build runs, reserves the pool
+    fake.end(build, cause=ProviderCause.CAPACITY, reset_at=1)
+    coord.cycle("claude", now=0)                            # build → waiting continuation (eligible 1)
+
+    review = coord.submit_stage(Submission(repo="o/r", subject="2", stage="review",
+                                           pool="claude"))
+    coord.cycle("claude", now=0)                            # build not yet eligible; review runs
+    fake.end(review, cause=ProviderCause.CAPACITY, reset_at=2)
+    coord.cycle("claude", now=0)                            # review → waiting continuation (eligible 2)
+
+    coord.cycle("claude", now=5)                            # both eligible now
+    assert record_of(coord, review).state == "running"     # PR-bound drains first
+    assert record_of(coord, build).state == "waiting"      # earlier-eligible build held behind it
+    assert permits(coord, "claude") == 1
+
+
+def test_interactive_turn_outranks_pr_bound_review_in_cold_queue(make_coord):
+    """The operator's interactive turn still sorts ahead of a PR-bound review — the PR tier sits
+    below the interactive tier, not above it (ADR 0039 keeps ADR 0034 on top). A shared one-slot
+    lane forces the choice; the interactive turn takes it."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_SharedLaneCap("converse", "review"))
+    review = coord.submit_stage(Submission(repo="o/r", subject="1", stage="review",
+                                           pool="claude"))
+    ask = coord.submit_stage(Submission(repo="o/r", subject="2", stage="converse",
+                                        pool="claude", interactive=True))
+    coord.cycle("claude")
+    assert record_of(coord, ask).state == "running"        # interactive heads the queue
+    assert record_of(coord, review).state == "waiting"     # PR-bound sits below it
+
+
+def test_interactive_continuation_outranks_pr_bound_continuation(make_coord):
+    """The same tier order holds in the continuation queue: an interactive turn heads it, and
+    head-of-line then holds a PR-bound continuation behind it (ADR 0039 / ADR 0034)."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_SharedLaneCap("converse", "review"))
+    ask = coord.submit_stage(Submission(repo="o/r", subject="1", stage="converse",
+                                        pool="claude", interactive=True))
+    coord.cycle("claude", now=0)
+    fake.end(ask, cause=ProviderCause.CAPACITY, reset_at=1)
+    coord.cycle("claude", now=0)                            # ask → waiting continuation
+
+    review = coord.submit_stage(Submission(repo="o/r", subject="2", stage="review",
+                                           pool="claude"))
+    coord.cycle("claude", now=0)                            # lane free — review runs
+    fake.end(review, cause=ProviderCause.CAPACITY, reset_at=1)
+    coord.cycle("claude", now=0)                            # review → waiting continuation
+
+    coord.cycle("claude", now=5)
+    assert record_of(coord, ask).state == "running"        # interactive heads the queue
+    assert record_of(coord, review).state == "waiting"     # PR-bound held behind it
+
+
+def test_within_tier_two_cold_builds_keep_identity_order(make_coord):
+    """Within a tier the existing tie-breakers are unchanged: two cold builds competing for a pool
+    that fits only one admit in identity order (ADR 0039 reorders across tiers, never within one)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    first = coord.submit_stage(Submission(repo="o/r", subject="1", stage="build",
+                                          pool="claude", complexity="deep"))
+    second = coord.submit_stage(Submission(repo="o/r", subject="2", stage="build",
+                                           pool="claude", complexity="deep"))
+    coord.cycle("claude")
+    assert record_of(coord, first).state == "running"      # lexically-smaller identity admits
+    assert record_of(coord, second).state == "waiting"
+    assert permits(coord, "claude") == 5
+
+
+def test_within_tier_two_pr_bound_continuations_keep_eligible_order(make_coord):
+    """Within the PR tier the continuation tie-break still orders by eligibility, not identity: the
+    earlier-eligible review admits first even though its identity sorts later, and head-of-line
+    then holds the other behind it."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_SharedLaneCap("review"))
+    # The earlier-eligible review is given the lexically-larger subject, so only eligible-at
+    # order — not identity — can explain which one admits.
+    early = coord.submit_stage(Submission(repo="o/r", subject="z", stage="review", pool="claude"))
+    coord.cycle("claude", now=0)
+    fake.end(early, cause=ProviderCause.CAPACITY, reset_at=1)
+    coord.cycle("claude", now=0)
+
+    late = coord.submit_stage(Submission(repo="o/r", subject="a", stage="review", pool="claude"))
+    coord.cycle("claude", now=0)
+    fake.end(late, cause=ProviderCause.CAPACITY, reset_at=2)
+    coord.cycle("claude", now=0)
+
+    coord.cycle("claude", now=5)
+    assert record_of(coord, early).state == "running"      # eligible_at=1 wins over identity
+    assert record_of(coord, late).state == "waiting"
+
+
+def test_blocked_pr_bound_head_does_not_let_issue_bound_leapfrog(make_coord):
+    """Head-of-line semantics are unchanged (ADR 0029): a PR-bound continuation the gate refuses
+    blocks the pool, so a ready issue-bound continuation behind it does not leapfrog — even though
+    the pool has room. Fails before the fix: eligible-at order put the build ahead of the review,
+    so it started regardless of the stalled head."""
+    fake = FakeSession()
+    seed = make_coord(fake)
+    build = seed.submit_stage(Submission(repo="o/r", subject="1", stage="build",
+                                         pool="claude", complexity="deep"))
+    seed.cycle("claude", now=0)
+    fake.end(build, cause=ProviderCause.CAPACITY, reset_at=1)
+    seed.cycle("claude", now=0)                             # build → continuation (eligible 1)
+
+    review = seed.submit_stage(Submission(repo="o/r", subject="2", stage="review", pool="claude"))
+    seed.cycle("claude", now=0)                             # review runs (build not yet eligible)
+    fake.end(review, cause=ProviderCause.CAPACITY, reset_at=2)
+    seed.cycle("claude", now=0)                             # review → continuation (eligible 2)
+
+    # A fresh coordinator whose gate now refuses reviews cycles the pool: the review heads the
+    # queue (PR tier) but the gate blocks it, so head-of-line keeps the build waiting behind it.
+    blocked = make_coord(fake, gate=_RefuseReviewGate())
+    blocked.cycle("claude", now=5)
+    assert record_of(blocked, review).state == "waiting"
+    assert record_of(blocked, build).state == "waiting"    # did not leapfrog the blocked head
+    assert permits(blocked, "claude") == 0                  # nothing started this cycle

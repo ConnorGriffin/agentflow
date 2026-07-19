@@ -447,7 +447,7 @@ def test_repeated_submission_and_restart_make_one_record(make_coord):
 
 # --- build is the only enabled stage -----------------------------------------------------
 
-def test_only_build_admits_other_stages_stay_waiting(make_coord):
+def test_pr_bound_review_admits_and_the_build_stays_waiting(make_coord):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_adapter(fake, pr=[False], prep=[True]),
                        gate=tracer.build_review_revise_gate)
@@ -455,11 +455,12 @@ def test_only_build_admits_other_stages_stay_waiting(make_coord):
     review = coord.submit_stage(Submission(repo="o/r", subject="7", stage="review",
                                            pool="claude"))
     coord.cycle("claude")
-    assert record_of(coord, build).state == "running"
-    review_rec = record_of(coord, review)
-    assert review_rec.state == "waiting"           # visibly queued
-    assert review_rec.attempts == 0                # consumed no attempt
-    assert permits(coord, "claude") == 5           # only the build's demand is reserved
+    # The PR-bound review drains first (ADR 0039); the 5-permit build cannot fit beside it.
+    assert record_of(coord, review).state == "running"
+    build_rec = record_of(coord, build)
+    assert build_rec.state == "waiting"            # visibly queued
+    assert build_rec.attempts == 0                 # consumed no attempt
+    assert permits(coord, "claude") == 1           # only the review's demand is reserved
 
 
 # --- live projection & claim ownership ---------------------------------------------------
@@ -469,7 +470,7 @@ def test_running_build_projects_to_live_board_waiting_does_not(make_coord):
     coord = make_coord(fake, adapter=_adapter(fake, pr=[False], prep=[True]),
                        gate=tracer.build_review_revise_gate)
     coord.submit_stage(_build("7"))
-    coord.submit_stage(Submission(repo="o/r", subject="8", stage="review", pool="claude"))
+    coord.submit_stage(_build("8", source="/wt/issue-8"))   # a second build cannot fit; stays waiting
     coord.cycle("claude", now=123)
     projection = tracer.live_projection(_records(coord))
     assert [e["number"] for e in projection] == [7]     # only the running build
