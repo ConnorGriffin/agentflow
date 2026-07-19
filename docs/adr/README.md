@@ -107,3 +107,8 @@ then Context / Decision / Alternatives / Consequences.
   executes: the boundary is judgment vs execution; claim + type replaces the
   `wayfinder:*` wall, and unclaimed AFK-able research tickets dispatch through the
   coordinator under permits and recovery (supersedes 0027, amends 0035).
+- [0041](0041-stage-model-reasoning-matrix.md) — Stage model/complexity cells stay
+  mostly unchanged (Opus Build and all-deep Intake are complexity decisions owned by
+  #228; deep cross-tool Review is safety, not a savings target); Respond/conflict-Revise
+  carry-complexity is a directional parity note; every reasoning-effort cell is unset
+  pending #223 telemetry. (Applies ADR 0040; note 0038–0040 index entries land on PR #233.)
