@@ -23,6 +23,11 @@ ATTEMPT_BUDGET = 3
 # and they cannot silently move to the other pool (ADR 0028).
 CODE_WRITING = frozenset({"build", "revise", "mockup", "respond"})
 
+# Stages whose subject is an open PR: getting one over the finish line is the #1
+# priority, so they drain ahead of issue-bound work (build/mockup/intake) at admission
+# (ADR 0039). The tier is a pure function of the stage name — no per-record state.
+PR_BOUND = frozenset({"review", "revise", "respond"})
+
 # The one durable human handoff each stage creates when its budget is exhausted or a
 # permanent condition holds it (ADR 0028's exhaustion table).
 STAGE_NATIVE_HANDOFF = {

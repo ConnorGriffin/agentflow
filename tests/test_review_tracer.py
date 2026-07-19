@@ -721,18 +721,19 @@ def test_all_stages_use_the_same_gate_and_pool_budget(make_coord):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_router(fake, pr=[False], verdict=[False], prep=[True]),
                        gate=tracer.build_review_revise_gate)
-    # A low-effort build (4 permits) leaves room for the review (1). Revise is enabled by the
-    # same gate, but waits because the immutable five-permit pool budget is full.
+    # The PR-bound review (1 permit) and revise (3) drain first (ADR 0039) and fill four permits.
+    # Build is enabled by the same gate, but its low-effort demand (4) waits because the immutable
+    # five-permit pool budget is full.
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
                                           complexity="deep", effort="low", source="/wt/issue-7"))
     review = coord.submit_stage(_review("8", pool="claude", builder_lineage="codex"))
     revise = coord.submit_stage(Submission(repo="o/r", subject="9", stage="revise", pool="claude",
                                            builder_lineage="claude", complexity="deep"))
     coord.cycle("claude")
-    assert record_of(coord, build).state == "running"
     assert record_of(coord, review).state == "running"
-    revise_rec = record_of(coord, revise)
-    assert revise_rec.state == "waiting" and revise_rec.attempts == 0
+    assert record_of(coord, revise).state == "running"
+    build_rec = record_of(coord, build)
+    assert build_rec.state == "waiting" and build_rec.attempts == 0
 
 
 def _completed_review_record(*, profile="reviewed"):

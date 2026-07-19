@@ -27,8 +27,8 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from agentflow.coordinator.admission import (
-    ATTEMPT_BUDGET, CODE_WRITING, MODEL_FOR, PERMIT_BUDGET, STAGE_NATIVE_HANDOFF,
-    admission_demand, normalize_stage)
+    ATTEMPT_BUDGET, CODE_WRITING, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
+    STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
@@ -257,16 +257,21 @@ class Coordinator:
             waiting = [r for r in self._records.values()
                        if r.pool == pool and r.state == WAITING and not r.hold_pending
                        and r.root is None]  # descendants share the root's reservation, never admit
-            # An operator's interactive turn (an Ask) outranks background pipeline work at
-            # admission (ADR 0034): it sorts to the head of each queue. For an interactive turn the
-            # gate is also exempt from headroom/pacing/ceiling (ADR 0034/0025 as amended by #162),
-            # so only true zero capacity — no permit obtainable on the reservation ledger — can
-            # defer it. Background starts still face the full budget/gate/pool checks below.
+            # Admission ranks each queue in three tiers (ADR 0039). An operator's interactive turn
+            # (an Ask) outranks all background pipeline work (ADR 0034): it sorts to the head of
+            # each queue, and its gate stays exempt from headroom/pacing/ceiling (ADR 0034/0025 as
+            # amended by #162), so only true zero capacity — no permit obtainable on the reservation
+            # ledger — can defer it. Below that, PR-bound stages (review/revise/respond) drain ahead
+            # of issue-bound work: an open PR is the #1 thing to get over the finish line, and
+            # starting new issues while finished work decays only creates more conflicts (ADR 0039).
+            # Within a tier the existing tie-breakers hold. Background starts still face the full
+            # budget/gate/pool checks below.
             continuations = sorted(
                 (r for r in waiting if r.continuation and r.eligible_at <= now),
-                key=lambda r: (not r.interactive, r.eligible_at, r.created_at, r.identity))
+                key=lambda r: (not r.interactive, r.stage not in PR_BOUND,
+                               r.eligible_at, r.created_at, r.identity))
             cold = sorted((r for r in waiting if not r.continuation),
-                          key=lambda r: (not r.interactive, r.identity))
+                          key=lambda r: (not r.interactive, r.stage not in PR_BOUND, r.identity))
             for record in continuations:
                 # An admission (permit/gate) refusal or a launch that never started blocks the
                 # pool head-of-line (ADR 0029); only a preparation miss is skipped, since it
