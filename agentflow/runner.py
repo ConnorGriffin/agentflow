@@ -315,7 +315,8 @@ class ClaudeRunner(_WorktreeRunner):
         argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
-                "--settings", _CLAUDE_AUTONOMOUS_SETTINGS]
+                "--settings", _CLAUDE_AUTONOMOUS_SETTINGS,
+                "--strict-mcp-config"]
         if schema is not None:
             argv += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
         return argv

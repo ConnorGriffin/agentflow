@@ -90,6 +90,18 @@ def test_claude_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert "--output-format" in cmd
 
 
+def test_claude_pins_mcp_set_to_empty_for_every_stage(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-10-mcp"
+    _branch_worktree(repo, wt, "agentflow/claude/issue-10-mcp")
+    from agentflow.intake import INTAKE_RESULT_SCHEMA
+
+    # With schema (intake/review stage) and without (build stage) — both must carry the flag.
+    for schema in (INTAKE_RESULT_SCHEMA, None):
+        cmd = ClaudeRunner().structured_argv("do work", "sonnet", str(wt), schema=schema)
+        assert "--strict-mcp-config" in cmd
+
+
 def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     repo = _repo_with_origin(tmp_path)
     branch = "agentflow/codex/issue-8-owned"
