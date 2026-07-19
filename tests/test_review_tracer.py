@@ -1043,3 +1043,81 @@ def test_an_unmoved_head_is_left_to_the_normal_review_flow(make_coord, monkeypat
     assert rec.retired is False and rec.claim is True and rec.state == "waiting"
     assert rec.handoffs == 0
     assert [r.identity for r in _records(coord) if r.stage == "review"] == [ident]
+
+
+# --- terminating a RUNNING family before the retire/park (issue #220) ----------------------
+#
+# When the PR head moves (or the PR is gone) and the reconciler retires or parks the stranded
+# review, it must first terminate the provider family if one is still running. Without the fix the
+# orphaned session keeps burning tokens on a head that can never complete. The kill is fail-open:
+# a family already gone, or an os.kill that raises, must never block the retire or park.
+
+
+def test_a_running_diverged_review_terminates_its_family_before_retiring(make_coord, monkeypatch):
+    """A diverged review that is actively RUNNING has its provider family terminated before the
+    record is retired, so the orphaned process does not burn tokens on a superseded head (#220).
+    Fails before the fix because _kill_running_family does not exist and no kill is attempted."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    coord.cycle("codex")                             # admit and start → RUNNING with live family
+    assert record_of(coord, ident).state == "running"
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert ident in killed                           # kill hook was invoked before retire
+    assert record_of(coord, ident).retired is True   # retire still completed
+
+
+def test_kill_failure_does_not_block_the_retire(make_coord, monkeypatch):
+    """An os.kill that raises (family already gone, permission denied) is swallowed; the retire
+    completes regardless — fail-open on termination (#220)."""
+    import signal
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    coord.cycle("codex")
+
+    monkeypatch.setattr("agentflow.coordinator.launcher.pid_family_alive", lambda _f: True)
+    kill_attempts = []
+
+    def raise_on_sigterm(pid, sig):
+        kill_attempts.append((pid, sig))
+        if sig == signal.SIGTERM:
+            raise OSError("no such process")
+
+    monkeypatch.setattr(coordinated_build.os, "kill", raise_on_sigterm)
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert any(sig == signal.SIGTERM for _pid, sig in kill_attempts)  # kill was attempted
+    assert record_of(coord, ident).retired is True                    # retire still completed
+
+
+def test_a_waiting_diverged_review_does_not_attempt_a_kill(make_coord, monkeypatch):
+    """A diverged review that never started (WAITING) has no provider family; the reconciler must
+    not attempt a kill — only RUNNING records carry a family to terminate (#220)."""
+    fake = FakeSession()
+    fake.gate_open = False                           # keep the review WAITING (never admitted)
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    assert record_of(coord, ident).state == "waiting"
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert killed == []                              # no kill attempted for a WAITING record
+    assert record_of(coord, ident).retired is True   # retire still happens normally

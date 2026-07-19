@@ -1647,6 +1647,20 @@ def _moved_head_review_submission(record, head_sha: str):
         transfer_from=record.identity, supersede=True)
 
 
+def _kill_running_family(record) -> None:
+    """SIGTERM the provider family of a RUNNING review before retiring or parking it, so the
+    orphaned process does not keep burning tokens on a superseded head (#220). Fail-open: a family
+    already gone or an os.kill error never blocks the retire or park."""
+    import signal
+    from agentflow.coordinator.launcher import pid_family_alive
+    if not pid_family_alive(record.family):
+        return
+    try:
+        os.kill(int(record.family), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+
+
 def _resettle_diverged_reviews(coord: Coordinator) -> None:
     """Retire a Review whose PR head has moved off its immutable target before another attempt is
     charged against a head that is no longer live (#208).
@@ -1667,7 +1681,7 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
       existing exhaustion handoff instead.
 
     A durable blocking verdict is never disturbed — its head move flows through the Revise chain."""
-    from agentflow.coordinator.record import COMPLETED
+    from agentflow.coordinator.record import COMPLETED, RUNNING
     records = {record.identity: record for record in tracer.load_records()}
     for record in list(records.values()):
         if (record.stage != "review" or record.retired or record.hold_pending
@@ -1682,12 +1696,16 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
         if state == "MERGED" and record.state == COMPLETED:
             continue  # a completed clean review of a merged PR is the normal merge path
         if state in {"MERGED", "CLOSED"}:
+            if record.state == RUNNING:
+                _kill_running_family(record)
             coord.retire_stale_review(record.identity)
             continue
         if head == record.target:
             continue  # the live head still matches the reviewed SHA — nothing to do
         if (record.round >= MAX_REVISES
                 or not revise_round_budget_remains(records.values(), record.repo, record.subject)):
+            if record.state == RUNNING:
+                _kill_running_family(record)
             coord.park_stale_review(record.identity)
             continue
         submission = _moved_head_review_submission(record, head)
