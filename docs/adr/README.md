@@ -114,3 +114,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0040](0040-spend-per-success-measurement-contract.md) — Spend experiments measure
   headroom-denominated cost per verified stage and per merged issue, gated by quality
   guardrails and cohort cells; dollars are only the cross-tool comparison signal.
+- [0042](0042-codegraph-okf-complementary-layer.md) — The curated operational
+  knowledge (OKF) layer complements, never replaces, the slim code graph: retrieval
+  gated by task shape and capped at a few concepts, kept as a derived projection of
+  CONTEXT.md and the ADRs.
