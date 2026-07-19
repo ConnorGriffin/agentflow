@@ -8,10 +8,14 @@ prose is never a diagnosis.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from agentflow.coordinator.providers import (
     PROVIDER_INPUT_V1, ClaudeProviderAdapter, ProviderCause, classify_claude, classify_codex)
+from agentflow.intake import parse_intake
+from agentflow.reviewer import parse_verdict
 
 
 @pytest.mark.parametrize(
@@ -125,6 +129,27 @@ def test_claude_clean_run_leaves_cause_to_the_stage_outcome():
     ], exit_status=0)
     assert obs.cause is ProviderCause.NONE
     assert obs.final_message == "ok"
+
+
+def test_claude_native_structured_output_reaches_stage_parsers_instead_of_result_prose():
+    intake = {
+        "route": "ready", "title": "Scoped", "body": "brief",
+        "complexity": "deep", "effort": "medium",
+    }
+    intake_obs = classify_claude([{
+        "type": "result", "subtype": "success", "result": "Routed ready.",
+        "structured_output": intake,
+    }], exit_status=0)
+    assert json.loads(intake_obs.final_message) == intake
+    assert parse_intake(intake_obs.final_message).parsed
+
+    review = {"verdict": "PASS", "reviewed_sha": "sha-a", "findings": []}
+    review_obs = classify_claude([{
+        "type": "result", "subtype": "success", "result": "PASS.",
+        "structured_output": review,
+    }], exit_status=0)
+    assert json.loads(review_obs.final_message) == review
+    assert parse_verdict(review_obs.final_message, expected_sha="sha-a").parsed
 
 
 def test_claude_preserves_unrecognized_events_and_reports_unknown():

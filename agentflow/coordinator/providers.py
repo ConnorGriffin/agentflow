@@ -197,9 +197,11 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
     (with its ``resetsAt``), or a terminal ``result.subtype`` failure — never an invented
     ``type:error`` event. A supervisor timeout or a non-zero exit without any of those is a
     recoverable process interruption; a clean exit leaves the cause to the stage outcome. The
-    real ``assistant.message.content`` text and ``result.result`` output are still parsed, and
-    every unrecognized event or unshaped error is preserved verbatim so nothing is silently
-    dropped (fail-safe)."""
+    real ``assistant.message.content`` text and terminal result output are still parsed. When
+    Claude returns a native ``structured_output``, its JSON object is the stage message; the
+    accompanying ``result`` prose is only a human-readable summary and cannot satisfy the stage
+    contract. Every unrecognized event or unshaped error is preserved verbatim so nothing is
+    silently dropped (fail-safe)."""
     events = tuple(events)
     cause = ProviderCause.NONE
     reset_at = None
@@ -233,7 +235,10 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                 reset_at = _epoch(info.get("resetsAt")) or reset_at
         elif etype == "result":
             result = event.get("result")
-            if isinstance(result, str):
+            structured_output = event.get("structured_output")
+            if structured_output is not None:
+                final_message = json.dumps(structured_output)
+            elif isinstance(result, str):
                 final_message = result
             subtype = event.get("subtype")
             result_cause, has_result_error = _claude_result_error(event)
