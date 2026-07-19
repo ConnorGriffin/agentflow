@@ -1006,6 +1006,33 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     assert live == ["o/r|7|review|live-sha"]
 
 
+def test_a_running_moved_head_review_terminates_before_opening_its_successor(make_coord,
+                                                                               monkeypatch):
+    """A live review is stopped before its moved-head successor takes the claim (#220)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    stale = coord.submit_stage(_diverged_review(target="stale-sha", round=0))
+    coord.cycle("codex")
+    assert record_of(coord, stale).state == "running"
+
+    events = []
+    submit_stage = coord.submit_stage
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: events.append(("kill", rec.identity)))
+    monkeypatch.setattr(coord, "submit_stage",
+                        lambda submission: events.append(("submit", submission.target))
+                        or submit_stage(submission))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda tool: "codex")
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert events == [("kill", stale), ("submit", "live-sha")]
+    assert record_of(coord, stale).retired is True
+    assert record_of(coord, "o/r|7|review|live-sha").claim is True
+
+
 def test_a_moved_head_parks_once_when_the_revise_rounds_are_spent(make_coord, monkeypatch):
     """When the auto-revise rounds are already spent, a moved head has no bounded successor to open,
     so the open PR parks once through the existing Review exhaustion handoff."""
@@ -1043,3 +1070,124 @@ def test_an_unmoved_head_is_left_to_the_normal_review_flow(make_coord, monkeypat
     assert rec.retired is False and rec.claim is True and rec.state == "waiting"
     assert rec.handoffs == 0
     assert [r.identity for r in _records(coord) if r.stage == "review"] == [ident]
+
+
+# --- terminating a RUNNING family before the retire/park (issue #220) ----------------------
+#
+# When the PR head moves (or the PR is gone) and the reconciler retires or parks the stranded
+# review, it must first terminate the provider family if one is still running. Without the fix the
+# orphaned session keeps burning tokens on a head that can never complete. The kill is fail-open:
+# a family already gone, or an os.kill that raises, must never block the retire or park.
+
+
+def test_a_running_diverged_review_terminates_its_family_before_retiring(make_coord, monkeypatch):
+    """A diverged review that is actively RUNNING has its provider family terminated before the
+    record is retired, so the orphaned process does not burn tokens on a superseded head (#220).
+    Fails before the fix because _kill_running_family does not exist and no kill is attempted."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    coord.cycle("codex")                             # admit and start → RUNNING with live family
+    assert record_of(coord, ident).state == "running"
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert ident in killed                           # kill hook was invoked before retire
+    assert record_of(coord, ident).retired is True   # retire still completed
+
+
+def test_kill_failure_does_not_block_the_retire(make_coord, monkeypatch):
+    """An os.kill that raises (family already gone, permission denied) is swallowed; the retire
+    completes regardless — fail-open on termination (#220)."""
+    import signal
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    coord.cycle("codex")
+
+    monkeypatch.setattr("agentflow.coordinator.launcher.pid_family_alive", lambda _f: True)
+    kill_attempts = []
+
+    def raise_on_sigterm(pid, sig):
+        kill_attempts.append((pid, sig))
+        if sig == signal.SIGTERM:
+            raise OSError("no such process")
+
+    monkeypatch.setattr(coordinated_build.os, "kill", raise_on_sigterm)
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert any(sig == signal.SIGTERM for _pid, sig in kill_attempts)  # kill was attempted
+    assert record_of(coord, ident).retired is True                    # retire still completed
+
+
+def test_a_waiting_diverged_review_does_not_attempt_a_kill(make_coord, monkeypatch):
+    """A diverged review that never started (WAITING) has no provider family; the reconciler must
+    not attempt a kill — only RUNNING records carry a family to terminate (#220)."""
+    fake = FakeSession()
+    fake.gate_open = False                           # keep the review WAITING (never admitted)
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    assert record_of(coord, ident).state == "waiting"
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert killed == []                              # no kill attempted for a WAITING record
+    assert record_of(coord, ident).retired is True   # retire still happens normally
+
+
+def test_a_completed_diverged_review_does_not_attempt_a_kill(make_coord, monkeypatch):
+    """A completed review has no live provider family, even when its PR is subsequently merged."""
+    from agentflow.reviewer import Verdict
+
+    fake = FakeSession()
+    coord = make_coord(fake, adapter=_review_adapter(fake, verdict=[True], prep=[True]))
+    ident = coord.submit_stage(_diverged_review(target="stale-sha"))
+    coord.cycle("codex")
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert [outcome.status for outcome in coord.cycle("codex")] == ["completed"]
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _rec: Verdict(clean=True))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert killed == []
+    assert record_of(coord, ident).retired is False  # normal completed-review settlement owns it
+
+
+def test_a_running_diverged_review_terminates_its_family_before_parking(make_coord, monkeypatch):
+    """The budget-exhausted park path stops its running provider before handing off (#220)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="stale-sha", round=MAX_REVISES))
+    coord.cycle("codex")
+
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert killed == [ident]
+    assert record_of(coord, ident).state == "held"
