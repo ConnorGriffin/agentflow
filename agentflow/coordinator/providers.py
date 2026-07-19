@@ -321,16 +321,22 @@ PROVIDER_INPUT_V1 = "agentflow-provider-input-v1"
 
 
 def _durable_prompt(record) -> str:
-    """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt."""
+    """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt. A
+    continuation carrying a recovery envelope (issue #225) appends those bounded durable facts so
+    the fresh session resumes from them rather than replaying the identical base prompt."""
     raw = record.input_ptr or ""
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
-        return raw
-    if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
-            and isinstance(payload.get("prompt"), str)):
-        return payload["prompt"]
-    return raw
+        prompt = raw
+    else:
+        if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
+                and isinstance(payload.get("prompt"), str)):
+            prompt = payload["prompt"]
+        else:
+            prompt = raw
+    envelope = getattr(record, "recovery_envelope", None)
+    return f"{prompt}\n\n{envelope}" if envelope else prompt
 
 
 class ClaudeProviderAdapter:

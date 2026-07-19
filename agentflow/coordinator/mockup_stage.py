@@ -38,6 +38,13 @@ class MockupStageAdapter:
         """Only committed variants/screenshots plus one marked issue comment complete Mockup."""
         return bool(self._outcome_ready(record, obs))
 
+    def recover(self, record, obs):
+        """Mockup commits its visual round into a retained worktree, so a continuation carries the
+        drawn-so-far variants forward. Continue within the budget behind a bounded recovery
+        envelope pointing the fresh session at that worktree (issue #225)."""
+        from agentflow.coordinator.recovery import durable_progress
+        return durable_progress(record, "a committed mockup round on the owned branch")
+
     def finalize_completed(self, record) -> str | None:
         """Release the drawing claim at the human-pick boundary and retire idempotently."""
         if self._settle is not None:

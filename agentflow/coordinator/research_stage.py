@@ -65,6 +65,13 @@ class ResearchStageAdapter:
         clean exit that recorded nothing does not, and the run continues within budget."""
         return bool(self._findings_ready(record, obs))
 
+    def recover(self, record, obs):
+        """Research accumulates its notes in a retained worktree, so a continuation carries the
+        gathered-so-far material forward. Continue within the budget behind a bounded recovery
+        envelope pointing the fresh session at that worktree (issue #225)."""
+        from agentflow.coordinator.recovery import durable_progress
+        return durable_progress(record, "recorded findings for the ticket")
+
     def finalize_completed(self, record) -> str | None:
         """Resolve the ticket: post the findings comment, close the ticket, append the map
         breadcrumb, and release the shared claim, retiring the record with no successor. This is the

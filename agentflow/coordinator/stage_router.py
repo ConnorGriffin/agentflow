@@ -13,6 +13,7 @@ defaults a bare coordinator uses.
 from __future__ import annotations
 
 from agentflow.coordinator.providers import ProviderObservation
+from agentflow.coordinator.recovery import Recovery
 
 
 class StageRouter:
@@ -63,3 +64,9 @@ class StageRouter:
         adapter = self._for(record)
         fn = getattr(adapter, "integration_collision", None) if adapter is not None else None
         return fn(record) if fn is not None else None
+
+    def recover(self, record, obs) -> Recovery:
+        adapter = self._for(record)
+        fn = getattr(adapter, "recover", None) if adapter is not None else None
+        result = fn(record, obs) if fn is not None else None
+        return result if isinstance(result, Recovery) else Recovery()

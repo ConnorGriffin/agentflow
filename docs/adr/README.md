@@ -114,3 +114,6 @@ then Context / Decision / Alternatives / Consequences.
 - [0040](0040-spend-per-success-measurement-contract.md) — Spend experiments measure
   headroom-denominated cost per verified stage and per merged issue, gated by quality
   guardrails and cohort cells; dollars are only the cross-tool comparison signal.
+- [0043](0043-recovery-state-before-replay.md) — A retry needs new recovery state: a
+  clean read-only exit with no outcome earns one targeted repair then parks; worktree
+  stages continue behind a bounded recovery envelope; identical stateless replays stop.

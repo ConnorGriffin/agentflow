@@ -60,6 +60,13 @@ class ReviewStageAdapter:
         clean exit whose verdict is absent or names another SHA does not."""
         return bool(self._verdict_ready(record, obs))
 
+    def recover(self, record, obs):
+        """Review is read-only: it recreates its checkout from durable source and produces no
+        partial work, so a clean exit with no verdict would replay identically. Grant one targeted
+        repair naming the missing verdict, then stop (issue #225)."""
+        from agentflow.coordinator.recovery import targeted_repair
+        return targeted_repair(record, "a recorded review verdict for the exact reviewed head SHA")
+
     def finalize_hold(self, record) -> str | None:
         """Create the Review-native human handoff and return its durable proof. Production parks
         the PR and notifies once; tests may omit the collaborator and use the coordinator's local

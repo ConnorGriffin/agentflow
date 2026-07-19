@@ -60,6 +60,13 @@ class ReviseStageAdapter:
         pushed nothing does not."""
         return bool(self._revision_ready(record, obs))
 
+    def recover(self, record, obs):
+        """Revise reuses the retained PR-branch worktree across a continuation, so a continuation
+        carries real partial work forward. Continue within the budget behind a bounded recovery
+        envelope that points the fresh session at that worktree (issue #225)."""
+        from agentflow.coordinator.recovery import durable_progress
+        return durable_progress(record, "a pushed revision on the PR branch")
+
     def finalize_hold(self, record) -> str | None:
         """Create the Revise-native human handoff and return its durable proof. Production parks the
         PR and notifies once, leaving the local work intact; tests may omit the collaborator and use

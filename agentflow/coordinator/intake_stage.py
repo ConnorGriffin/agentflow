@@ -58,6 +58,13 @@ class IntakeStageAdapter:
     def verify(self, record, obs) -> bool:
         return record.outcome is not None
 
+    def recover(self, record, obs):
+        """Intake is read-only: it owns no durable partial work, so a clean exit that parsed no
+        route would replay identically. Grant one targeted repair naming the missing route, then
+        stop (issue #225)."""
+        from agentflow.coordinator.recovery import targeted_repair
+        return targeted_repair(record, "a parsed intake route (e.g. ready / grill / close)")
+
     def finalize_completed(self, record) -> str | None:
         if not record.outcome:
             return None

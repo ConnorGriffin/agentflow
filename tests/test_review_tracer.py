@@ -290,7 +290,10 @@ def test_exhaustion_parks_the_pr_once_with_one_handoff_and_notification(make_coo
     assert outcome is not None and outcome.status == "held"
     assert outcome.handoff == "pr:parked"
     rec = record_of(coord, ident)
-    assert rec.attempts == 3 and rec.handoffs == 1 and rec.notifications == 1
+    # Review is read-only, so a clean/interrupted exit with no verdict owns no partial work to
+    # build on: after its initial attempt plus one targeted repair it parks rather than replaying
+    # an identical review a third time (#225) — still exactly one handoff and notification.
+    assert rec.attempts == 2 and rec.handoffs == 1 and rec.notifications == 1
     assert rec.claim is False                          # claim released only at the park boundary
     assert handoffs == [ident]
     assert make_coord(fake, adapter=adapter).cycle("claude") == []

@@ -72,6 +72,14 @@ class BuildStageAdapter:
         not (ADR 0028)."""
         return bool(self._pr_exists(record))
 
+    def recover(self, record, obs):
+        """Build owns a branch and worktree that ``prepare`` reuses across a continuation, so a
+        continuation carries real partial work forward — new state, not an identical replay. Keep
+        continuing within the budget, but hand the fresh session a bounded envelope pointing it at
+        the retained worktree so it resumes rather than restarts (issue #225)."""
+        from agentflow.coordinator.recovery import durable_progress
+        return durable_progress(record, "an opened pull request on the owned branch")
+
     def finalize_hold(self, record) -> str | None:
         """Create the Build-native human handoff and return its durable proof. Production moves
         the issue to ``needs-grilling`` and notifies once; tests may omit the collaborator and
