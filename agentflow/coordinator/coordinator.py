@@ -34,6 +34,7 @@ from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
 from agentflow.coordinator.recovery import PROGRESS, REPAIR, Recovery
 from agentflow.coordinator.store import Store, default_store_path
+from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
 # supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
@@ -593,11 +594,15 @@ class Coordinator:
         self._release(record)
         capture = getattr(self._adapter, "capture", None)
         outcome = capture(record, obs) if capture is not None else None
+        verified = outcome is not None or self._adapter.verify(record, obs)
+        # Every ended family — completed, superseded, or held — records its spend exactly once,
+        # keyed by this attempt's launch token (ADR 0040 per-attempt telemetry).
+        self._record_telemetry(record, obs, outcome=outcome, verified=verified)
         if outcome is not None:
             record.outcome = outcome
             if not self._persist(record):  # parsed outcome precedes any external projection
                 return None
-        if outcome is not None or self._adapter.verify(record, obs):
+        if verified:
             record.state = COMPLETED
             if not self._persist(record, retire_descendants=True):
                 return None
@@ -754,6 +759,27 @@ class Coordinator:
 
     def _release(self, record: Record) -> None:
         record.process_alive = False
+
+    def _record_telemetry(self, record: Record, obs, *, outcome, verified: bool) -> None:
+        """Stamp this ended attempt's durable spend entry, keyed by its launch token (ADR 0040).
+
+        Every attempt that ends is recorded — a completed stage, a superseded retry, a held
+        exhaustion — so no spend is lost. A telemetry write never fails a cycle: the durable
+        session artifact still carries the raw usage to re-derive later if the write is lost."""
+        entry = AttemptTelemetry(
+            token=record.launch_token or "",
+            identity=record.identity, repo=record.repo, subject=record.subject,
+            stage=record.stage, pool=record.pool, model=record.model,
+            complexity=record.complexity, effort=record.effort,
+            reasoning_effort=None,  # not reported by either provider stream today (explicit unknown)
+            attempt=record.attempts, continuation=record.continuation,
+            restart_resumes=record.restart_resumes, round=record.round,
+            conflict_round=record.conflict_round,
+            verified=verified, outcome=outcome or "",
+            cause=obs.cause.value, classification=obs.classification(),
+            started_at=record.started_at, finalized_at=int(time.time()),
+            usage=getattr(obs, "usage", AttemptUsage()))
+        record_attempt(self._store.path, entry)
 
     def _persist(self, record: Record, *, retire_descendants: bool = False) -> bool:
         if self._store.upsert(record, retire_descendants=retire_descendants):

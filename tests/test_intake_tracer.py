@@ -18,6 +18,32 @@ _READY_MESSAGE = ('{"route":"ready","title":"Scoped","body":"brief",'
                   '"complexity":"deep","effort":"medium"}')
 
 
+def _capture(final_message: str):
+    """Run one raw provider message through Intake's public stage capture."""
+    obs = ProviderObservation(cause=ProviderCause.NONE, final_message=final_message)
+    return IntakeStageAdapter(worktree_reset=lambda r: True,
+                              apply_route=lambda *a: "proof").capture(None, obs)
+
+
+def test_valid_structured_routes_capture_through_the_stage_interface():
+    from agentflow.coordinator.intake_stage import decode_result
+    from agentflow.intake import IntakeRoute
+
+    ready = decode_result(_capture(_READY_MESSAGE))
+    assert ready.route is IntakeRoute.READY and ready.complexity.value == "deep"
+    grill = decode_result(_capture('{"route":"grill","body":"which did you mean?"}'))
+    assert grill.route is IntakeRoute.GRILL
+    mockup = decode_result(_capture('{"route":"mockup","body":"kickoff"}'))
+    assert mockup.route is IntakeRoute.MOCKUP
+
+
+def test_invalid_structured_output_captures_no_outcome():
+    # A ready with no complexity, and a non-object payload, both yield no captured outcome —
+    # the stage stays incomplete and retries rather than projecting partial content.
+    assert _capture('{"route":"ready","title":"t","body":"brief"}') is None
+    assert _capture("not structured output at all") is None
+
+
 class IntakeSession(FakeSession):
     def __init__(self) -> None:
         super().__init__()

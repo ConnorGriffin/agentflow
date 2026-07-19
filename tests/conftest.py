@@ -94,13 +94,16 @@ class FakeSession:
 
     def end(self, identity: str, *, success: bool = False,
             cause: ProviderCause = ProviderCause.UNKNOWN, reset_at: int | None = None,
-            end_fact: bool = True) -> None:
+            end_fact: bool = True, usage=None) -> None:
         """Script how ``identity``'s provider ended and mark its family dead. A scripted end is a
         provider that finished on its own, so by default it leaves a durable supervisor end fact —
         the signal that separates a genuine failure from a family a daemon restart took down (which
-        leaves none: see :meth:`kill`)."""
+        leaves none: see :meth:`kill`). An optional ``usage`` scripts the normalized spend the
+        attempt reported, so a test can drive per-attempt telemetry through the public seam."""
+        from agentflow.coordinator.telemetry import AttemptUsage
         self._script[identity] = _Ending(
-            ProviderObservation(cause=cause, reset_at=reset_at, has_end_fact=end_fact), success)
+            ProviderObservation(cause=cause, reset_at=reset_at, has_end_fact=end_fact,
+                                usage=usage or AttemptUsage()), success)
         self.kill(identity)
 
 

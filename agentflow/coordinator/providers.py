@@ -22,6 +22,7 @@ from enum import Enum
 
 from agentflow.coordinator.session import read_session
 from agentflow.coordinator.store import default_store_path
+from agentflow.coordinator.telemetry import AttemptUsage, claude_usage, codex_usage
 
 
 class ProviderCause(str, Enum):
@@ -67,6 +68,8 @@ class ProviderObservation:
     has_end_fact: bool = False                  # the supervisor published a durable end fact for this
                                                 # attempt — the provider family ended on its own, not
                                                 # with the daemon (the restart-resume discriminator)
+    usage: AttemptUsage = AttemptUsage()        # normalized spend for this attempt (tokens/cost/turns);
+                                                # empty when the stream reported none (never zero-by-assumption)
 
     def classification(self) -> str:
         """The coordinator's provider label (recoverable | permanent | incomplete | unknown)."""
@@ -262,7 +265,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events,
         unrecognized=tuple(unrecognized), family=family, process_alive=process_alive,
-        has_end_fact=has_end_fact)
+        has_end_fact=has_end_fact, usage=claude_usage(events))
 
 
 # The typed Codex account/rate-limit facts (from the app-server surface or a typed companion
@@ -306,7 +309,7 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
         cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events, unrecognized=events, family=family, process_alive=process_alive,
-        has_end_fact=has_end_fact)
+        has_end_fact=has_end_fact, usage=codex_usage(events))
 
 
 # --- the two production provider adapters (ADR 0030) ------------------------------------
@@ -318,6 +321,20 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
 # outcome — that check belongs to the stage adapter (ADR 0030 completion locality).
 
 PROVIDER_INPUT_V1 = "agentflow-provider-input-v1"
+
+
+def _stage_result_schema(stage: str) -> dict | None:
+    """The provider-neutral result contract a stage's terminal decision must match, or None
+    for a code-writing stage that emits no structured decision. Intake and Review own their
+    schemas (domain validation lives with their parsers); this seam only names which stage
+    uses which, so no provider-specific schema detail leaks into coordinator policy."""
+    if stage == "intake":
+        from agentflow.intake import INTAKE_RESULT_SCHEMA
+        return INTAKE_RESULT_SCHEMA
+    if stage == "review":
+        from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
+        return REVIEW_VERDICT_SCHEMA
+    return None
 
 
 def _durable_prompt(record) -> str:
@@ -348,7 +365,8 @@ class ClaudeProviderAdapter:
     def command(self, record) -> list[str]:
         from agentflow.runner import ClaudeRunner
         return ClaudeRunner().structured_argv(
-            self._prompt_of(record), record.model, record.source)
+            self._prompt_of(record), record.model, record.source,
+            schema=_stage_result_schema(record.stage))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
@@ -373,7 +391,8 @@ class CodexProviderAdapter:
     def command(self, record) -> list[str]:
         from agentflow.runner import CodexRunner
         return CodexRunner().structured_argv(
-            self._prompt_of(record), record.model, record.source)
+            self._prompt_of(record), record.model, record.source,
+            schema=_stage_result_schema(record.stage))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)

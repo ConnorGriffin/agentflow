@@ -1,0 +1,378 @@
+"""Per-attempt spend telemetry — normalized at the provider seam, persisted durably.
+
+Every provider event stream already carries usage (Claude reports input/cache/output
+tokens, a turn count, a duration, and a harness-computed cost; Codex reports per-turn
+token usage). This module turns those raw provider shapes into one normalized
+:class:`AttemptUsage` behind the provider adapters, and the coordinator stamps a durable
+:class:`AttemptTelemetry` entry for every attempt that ends — keyed by the attempt's
+launch token, so a daemon restart that re-observes the same ended family overwrites the
+same entry instead of double-counting (persisted exactly once per attempt).
+
+The durable entries survive the record they describe: a stage record retires and is
+re-used, but its attempts' telemetry stays on disk under ``coordinator/telemetry``, so the
+bounded :func:`project` aggregate (totals and missing-data counts by stage/model/outcome)
+answers cost-per-successful-stage questions long after the records themselves have moved on.
+
+Only numbers and stage identity are ever persisted — no prompt, no provider message text,
+no event bodies. Missing usage stays explicit as ``None``; it is never assumed to be zero,
+because an attempt that produced no usage (an abort before any turn) is a real attempt whose
+spend is genuinely unknown, not free.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from uuid import uuid4
+
+# The usage sub-object keys each provider models. Everything else in a provider's usage
+# object is preserved verbatim under ``AttemptUsage.unrecognized`` so a new provider field is
+# never silently dropped — but only the usage object is read, so no message content can leak.
+_CLAUDE_USAGE_KEYS = {
+    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens"}
+_CODEX_USAGE_KEYS = {
+    "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens"}
+
+
+@dataclass(frozen=True)
+class AttemptUsage:
+    """One attempt's normalized spend, pool-agnostic in shape and faithful per pool.
+
+    Token fields are non-cached input, cache reads, cache creation, output, and (Codex-only)
+    reasoning output. ``cost_usd`` is the provider-reported dollar equivalent when one exists
+    (Claude's harness-computed figure); Codex has no provider dollar cost, so it stays
+    ``None``. Every field defaults to ``None`` — an absent value means "not reported", never
+    zero — and :attr:`present` is false only when the provider reported no usage at all.
+    """
+
+    input_tokens: int | None = None            # non-cached input (Codex input net of cached)
+    cached_input_tokens: int | None = None      # cache reads
+    cache_creation_tokens: int | None = None    # cache-creation input (Claude); Codex has none
+    output_tokens: int | None = None
+    reasoning_output_tokens: int | None = None  # Codex reasoning output; None for Claude
+    cost_usd: float | None = None               # provider-reported dollar equivalent, if any
+    turns: int | None = None
+    duration_ms: int | None = None
+    model: str | None = None                    # provider-reported model, when the stream carries it
+    unrecognized: tuple = ()                    # unmodeled usage sub-fields, preserved verbatim
+
+    @property
+    def present(self) -> bool:
+        """Whether the provider reported any usage for this attempt."""
+        return any(getattr(self, name) is not None for name in _TOKEN_FIELDS)
+
+
+_TOKEN_FIELDS = (
+    "input_tokens", "cached_input_tokens", "cache_creation_tokens",
+    "output_tokens", "reasoning_output_tokens")
+
+
+def _int(value):
+    """Coerce a token count to ``int`` without letting a bool or bad shape poison the sum."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _float(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _extra(usage: dict, known: set) -> tuple:
+    """The usage sub-fields we did not model, preserved so nothing is silently dropped."""
+    return tuple(sorted(k for k in usage if k not in known))
+
+
+def claude_usage(events) -> AttemptUsage:
+    """Normalize the usage on Claude's terminal ``result`` stream event (Agent SDK stream-json).
+
+    The final ``result`` carries ``usage`` (input / cache-creation / cache-read / output
+    tokens), a harness ``total_cost_usd``, ``num_turns``, ``duration_ms``, and ``modelUsage``
+    keyed by the model that ran. A stream with no result — or a result with no usage — yields
+    an empty :class:`AttemptUsage`, so missing usage stays explicit rather than reading as zero.
+    """
+    result = None
+    for event in events:
+        if isinstance(event, dict) and event.get("type") == "result":
+            result = event  # the terminal result wins if several appear
+    if result is None:
+        return AttemptUsage()
+    usage = result.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    model_usage = result.get("modelUsage")
+    model = None
+    if isinstance(model_usage, dict) and len(model_usage) == 1:
+        model = next(iter(model_usage))
+    return AttemptUsage(
+        input_tokens=_int(usage.get("input_tokens")),
+        cached_input_tokens=_int(usage.get("cache_read_input_tokens")),
+        cache_creation_tokens=_int(usage.get("cache_creation_input_tokens")),
+        output_tokens=_int(usage.get("output_tokens")),
+        reasoning_output_tokens=None,  # Claude does not separate reasoning output
+        cost_usd=_float(result.get("total_cost_usd")),
+        turns=_int(result.get("num_turns")),
+        duration_ms=_int(result.get("duration_ms")),
+        model=model,
+        unrecognized=_extra(usage, _CLAUDE_USAGE_KEYS))
+
+
+def codex_usage(events) -> AttemptUsage:
+    """Normalize Codex usage by summing every ``turn.completed`` event's ``usage``.
+
+    Codex reports ``input_tokens`` *including* cached input, so the normalized non-cached
+    input nets the cached count out. There is no provider dollar cost and no cache-creation
+    notion, so both stay ``None``. The turn count is the number of completed turns. A stream
+    with no completed turn (an abort before the first turn) yields an empty usage — a real
+    attempt whose spend is genuinely unknown, not free.
+    """
+    turns = 0
+    totals = {k: 0 for k in _CODEX_USAGE_KEYS}
+    seen = set()
+    extra: set = set()
+    for event in events:
+        if not (isinstance(event, dict) and event.get("type") == "turn.completed"):
+            continue
+        usage = event.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        turns += 1
+        for key, value in usage.items():
+            if key in _CODEX_USAGE_KEYS:
+                amount = _int(value)
+                if amount is not None:
+                    totals[key] += amount
+                    seen.add(key)
+            else:
+                extra.add(key)
+    if turns == 0:
+        return AttemptUsage()
+    cached = totals["cached_input_tokens"] if "cached_input_tokens" in seen else None
+    gross_input = totals["input_tokens"] if "input_tokens" in seen else None
+    net_input = gross_input
+    if gross_input is not None and cached is not None:
+        net_input = max(0, gross_input - cached)
+    reasoning = totals["reasoning_output_tokens"] if "reasoning_output_tokens" in seen else None
+    return AttemptUsage(
+        input_tokens=net_input,
+        cached_input_tokens=cached,
+        cache_creation_tokens=None,  # Codex has no cache-creation notion
+        output_tokens=totals["output_tokens"] if "output_tokens" in seen else None,
+        reasoning_output_tokens=reasoning,
+        cost_usd=None,               # Codex reports no provider dollar cost
+        turns=turns,
+        duration_ms=None,
+        model=None,                  # Codex's stream does not report the model
+        unrecognized=tuple(sorted(extra)))
+
+
+@dataclass(frozen=True)
+class AttemptTelemetry:
+    """One ended attempt's durable telemetry entry, keyed by its launch token.
+
+    It carries the stage identity and routing dials the attempt ran under, the terminal
+    provider cause and whether the stage outcome was verified, the wall-clock span the
+    coordinator owns, and the normalized :class:`AttemptUsage`. Restart replays and retries
+    each run under their own launch token, so each is a separate entry.
+    """
+
+    token: str                       # launch token — the per-attempt identity and idempotency key
+    identity: str                    # stage identity (repo|subject|stage|target|round|conflict)
+    repo: str
+    subject: str
+    stage: str
+    pool: str
+    model: str
+    complexity: str
+    effort: str | None               # work effort dial (low/medium/high/extra)
+    reasoning_effort: str | None     # provider reasoning effort, when known (else explicit None)
+    attempt: int                     # attempt number within the stage (initial + continuations)
+    continuation: bool               # this attempt was an automatic continuation of a prior one
+    restart_resumes: int             # restart replays already spent on this stage identity
+    round: int                       # finding-driven revise round behind the stage
+    conflict_round: int              # conflict-resolution revise round behind the stage
+    verified: bool                   # the stage's outcome was verified this attempt
+    outcome: str                     # the stage-native verified outcome, or "" when unverified
+    cause: str                       # terminal provider cause (none/capacity/permanent/…)
+    classification: str              # coordinator label (recoverable/permanent/incomplete/unknown)
+    started_at: int                  # epoch the attempt was admitted
+    finalized_at: int                # epoch the coordinator finalized the ended family
+    usage: AttemptUsage = field(default_factory=AttemptUsage)
+
+    def outcome_key(self) -> str:
+        """The projection's outcome dimension: the verified stage outcome, or the terminal
+        cause of an attempt that did not verify one."""
+        if self.verified:
+            return self.outcome or "verified"
+        return f"unverified:{self.cause}"
+
+
+_ENTRY_FIELDS = {f.name for f in fields(AttemptTelemetry)}
+
+
+def telemetry_dir(store_path: Path | str) -> Path:
+    """Where per-attempt telemetry entries live, beside the records database and sessions."""
+    return Path(store_path).parent / "telemetry"
+
+
+def _entry_path(store_path: Path | str, token: str) -> Path:
+    return telemetry_dir(store_path) / f"{token}.json"
+
+
+def record_attempt(store_path: Path | str, entry: AttemptTelemetry) -> None:
+    """Persist one attempt's telemetry atomically, keyed by its launch token.
+
+    Writing under the immutable launch token makes the write idempotent: a daemon restart
+    that re-observes the same ended family re-derives the identical entry and replaces it in
+    place, so an attempt's spend is persisted exactly once no matter how often reconciliation
+    re-runs. A telemetry write must never break a cycle, so an unwritable directory is
+    swallowed — the durable session artifact still holds the raw usage to re-derive later.
+    """
+    if not entry.token:
+        return
+    path = _entry_path(store_path, entry.token)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        with tmp.open("w") as stream:
+            json.dump(asdict(entry), stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except (OSError, NameError):
+            pass
+
+
+def read_attempts(store_path: Path | str) -> list[AttemptTelemetry]:
+    """Every persisted attempt entry. An unreadable or malformed file is skipped, never
+    fatal — a corrupt tail must not blind the whole projection."""
+    entries: list[AttemptTelemetry] = []
+    directory = telemetry_dir(store_path)
+    try:
+        names = sorted(p for p in directory.iterdir() if p.suffix == ".json")
+    except OSError:
+        return entries
+    for path in names:
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        usage_data = data.get("usage")
+        usage = _decode_usage(usage_data) if isinstance(usage_data, dict) else AttemptUsage()
+        fields_in = {k: v for k, v in data.items() if k in _ENTRY_FIELDS and k != "usage"}
+        try:
+            entries.append(AttemptTelemetry(usage=usage, **fields_in))
+        except TypeError:
+            continue  # an entry from an incompatible shape — skipped, not fatal
+    return entries
+
+
+def _decode_usage(data: dict) -> AttemptUsage:
+    known = {f.name for f in fields(AttemptUsage)}
+    picked = {k: v for k, v in data.items() if k in known}
+    if isinstance(picked.get("unrecognized"), list):
+        picked["unrecognized"] = tuple(picked["unrecognized"])
+    try:
+        return AttemptUsage(**picked)
+    except TypeError:
+        return AttemptUsage()
+
+
+@dataclass(frozen=True)
+class TelemetryTotals:
+    """Summed spend and explicit missing-data counts for one cell (or the fleet)."""
+
+    attempts: int = 0
+    verified: int = 0
+    missing_usage: int = 0            # attempts the provider reported no usage for
+    cost_missing: int = 0             # attempts with no provider dollar cost (all Codex, some Claude)
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_creation_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    cost_usd: float = 0.0
+
+
+@dataclass(frozen=True)
+class TelemetryCell:
+    """One (stage, model, outcome) cell of the bounded projection."""
+
+    stage: str
+    model: str
+    outcome: str
+    totals: TelemetryTotals
+
+
+@dataclass(frozen=True)
+class TelemetryProjection:
+    """The bounded aggregate: per (stage, model, outcome) cells and a fleet-wide total.
+
+    The number of cells is bounded by the small set of distinct stage × model × outcome
+    combinations, so the projection stays cheap to publish no matter how many attempts
+    accumulate. Missing usage and missing cost are first-class counts, never hidden as zero.
+    """
+
+    cells: tuple[TelemetryCell, ...] = ()
+    total: TelemetryTotals = field(default_factory=TelemetryTotals)
+
+
+def project(store_path: Path | str) -> TelemetryProjection:
+    """Aggregate every persisted attempt into the bounded stage/model/outcome projection."""
+    return project_attempts(read_attempts(store_path))
+
+
+def project_attempts(entries) -> TelemetryProjection:
+    """The pure projection over already-read entries — the fixture-testable core."""
+    cells: dict[tuple, list[int | float]] = {}
+    fleet = _blank_accumulator()
+    for entry in entries:
+        key = (entry.stage, entry.model, entry.outcome_key())
+        acc = cells.setdefault(key, _blank_accumulator())
+        _accumulate(acc, entry)
+        _accumulate(fleet, entry)
+    ordered = sorted(cells.items())
+    return TelemetryProjection(
+        cells=tuple(
+            TelemetryCell(stage=k[0], model=k[1], outcome=k[2], totals=_freeze(acc))
+            for k, acc in ordered),
+        total=_freeze(fleet))
+
+
+# The accumulator is a plain list indexed by the TelemetryTotals field order, so summing is a
+# single loop and the frozen result is built once at the end.
+_TOTALS_FIELDS = [f.name for f in fields(TelemetryTotals)]
+
+
+def _blank_accumulator() -> list:
+    return [0] * len(_TOTALS_FIELDS)
+
+
+def _accumulate(acc: list, entry: AttemptTelemetry) -> None:
+    idx = _TOTALS_FIELDS.index
+    acc[idx("attempts")] += 1
+    if entry.verified:
+        acc[idx("verified")] += 1
+    usage = entry.usage
+    if not usage.present:
+        acc[idx("missing_usage")] += 1
+    if usage.cost_usd is None:
+        acc[idx("cost_missing")] += 1
+    else:
+        acc[idx("cost_usd")] += usage.cost_usd
+    for name in _TOKEN_FIELDS:
+        value = getattr(usage, name)
+        if value is not None:
+            acc[idx(name)] += value
+
+
+def _freeze(acc: list) -> TelemetryTotals:
+    return TelemetryTotals(**dict(zip(_TOTALS_FIELDS, acc)))
