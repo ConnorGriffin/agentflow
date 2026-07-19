@@ -38,6 +38,19 @@ BUILD_POOLS = ("claude", "codex")
 _ORPHAN_CLAIM_GRACE_SECONDS = 60 * 60
 _REVIEW_CI_OBSERVED: dict[str, bool] = {}
 
+# ADR 0038: a survivor's re-rebase conflict opens a conflict Revise instead of parking, bounded to
+# two per PR lifetime and budgeted separately from the finding-driven revise rounds.
+MAX_CONFLICT_REVISES = 2
+
+# The one extra lens a re-review gains when a conflict Revise produced the head under review (ADR
+# 0038): the resolution arbitrated against `main`, so the reviewer must confirm it kept main's
+# changes rather than silently discarding them (the `-X ours` hazard).
+CONFLICT_REVIEW_LENS = (
+    "\n\nThis head was produced by resolving a merge conflict against `main`. One extra lens: "
+    "verify the resolution did not silently discard `main`'s changes — a conflict resolved by "
+    "keeping only this PR's side (the `-X ours` hazard) drops work that already merged. Where the "
+    "two sides genuinely conflicted, `main`'s behavior must be preserved.")
+
 
 def build_submission(cfg, issue: dict, tool: str):
     """Translate one ready issue and its chosen tool into a single Build stage submission — the
@@ -104,7 +117,7 @@ def _build_source_parts(record):
 
 
 def review_submission(build_record, head_sha, reviewer_tool, pr_number,
-                      *, acceptance="", surfaces=""):
+                      *, acceptance="", surfaces="", conflict_resolution=False):
     """Translate a completed Build (or completed Revise) and its PR head SHA into one Review stage
     submission — the minimal facts the coordinator needs (ADR 0030). The review is bound to the
     *exact* head SHA (its immutable target, so a new head SHA starts a fresh review stage), assumes
@@ -114,9 +127,13 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
     follows a Revise carries that revise round in its identity, so an evidence-only revision — same
     head SHA, new durable proof — still opens a genuinely new review with a fresh budget, never the
     retired prior review's record. It points at a fresh read-only review worktree the reviewer
-    checks out at that SHA. Cross-tool review is always the deep safety net. Pure: the mapping is
-    the test surface (ADR 0020). Returns ``None`` if the Build worktree or head SHA is
-    unreadable."""
+    checks out at that SHA. Cross-tool review is always the deep safety net.
+
+    ``conflict_resolution`` marks a re-review whose head a conflict Revise produced (ADR 0038): it
+    adds the discard-check lens to the prompt and leaves the finding-driven ``round`` untouched — a
+    conflict resolution is not one of the auto-revise rounds, so it neither advances nor spends that
+    budget. Pure: the mapping is the test surface (ADR 0020). Returns ``None`` if the Build worktree
+    or head SHA is unreadable."""
     from agentflow.coordinator import Submission
     from agentflow.reviewer import REVIEW_PROMPT, review_worktree
     parts = _build_source_parts(build_record)
@@ -126,7 +143,12 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
     brief = REVIEW_PROMPT.format(
         pr=pr_number, acceptance=acceptance or "(none provided)",
         surfaces=surfaces or "any user-facing surface")
-    completed_rounds = (build_record.round + 1 if build_record.stage == "revise"
+    if conflict_resolution:
+        brief += CONFLICT_REVIEW_LENS
+    # A conflict Revise did not complete a finding-driven round, so the re-review it opens carries
+    # the same finding-driven round it inherited — only a finding-driven Revise advances it.
+    completed_rounds = (build_record.round + 1
+                        if build_record.stage == "revise" and not build_record.conflict_round
                         else build_record.round)
     return Submission(
         repo=build_record.repo, subject=build_record.subject, stage="review",
@@ -161,6 +183,41 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         pool=reviewer_tool, complexity="deep",
         source=str(review_worktree(cfg.workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=prompt, builder_lineage=builder_tool)
+
+
+# ADR 0038: the single finding a survivor's conflict Revise carries — rebase, resolve, stay green,
+# and preserve `main`'s behavior wherever a resolution choice is ambiguous (main has merged; the PR
+# adapts to it, never the reverse).
+_CONFLICT_REVISE_FINDING = (
+    "Rebase this PR's branch onto the current `origin/main` and resolve the merge conflicts, then "
+    "keep the full test suite green. `main` has already merged; wherever a resolution choice is "
+    "ambiguous, preserve `main`'s behavior — the PR adapts to `main`, never the reverse. Do not "
+    "discard `main`'s changes to make the conflict go away.")
+
+
+def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_tool: str,
+                                        head_sha: str, pr_number: int, conflict_round: int):
+    """Submit a conflict Revise for an open survivor whose re-rebase no longer applies (ADR 0038).
+
+    Like a survivor re-review, a survivor has no completed coordinator predecessor to transfer from —
+    its chain already reached the PR boundary — so this creates a Revise that owns the visible claim
+    directly. It runs on the builder's own tool lineage in the retained PR-branch worktree (recovered
+    the way any Revise recovers it), bound to the conflicting head SHA it must supersede, carrying the
+    conflict round so it is budgeted apart from the finding-driven revise rounds and admitted ahead of
+    cold build work. Returns ``None`` when the tool is unknown or the head SHA is missing.
+    """
+    from agentflow.coordinator import Submission
+    from agentflow.loop import REVISE_PROMPT, _builder_worktree
+    if not head_sha or builder_tool not in BUILD_POOLS:
+        return None
+    brief = REVISE_PROMPT.format(
+        n=pr_number, repo=cfg.repo, findings=f"- {_CONFLICT_REVISE_FINDING}",
+        surfaces="any user-facing surface")
+    return Submission(
+        repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
+        pool=builder_tool, complexity="deep", conflict_round=conflict_round,
+        source=_builder_worktree(cfg, builder_tool, issue, slug), claim=True, input_ptr=brief,
+        builder_lineage=builder_tool, builder_complexity="deep", continuation=True)
 
 
 def _revise_builder_source(review_record):
@@ -242,11 +299,23 @@ def revise_round_budget_remains(records, repo, subject) -> bool:
     rounds by ADR 0020's convergence bail) still has room for this issue — fewer than
     ``MAX_REVISES`` *logical* Revise records exist for it, regardless of how many continuation
     attempts each one used. This keeps the per-stage continuation budget separate from the product
-    loop: continuation attempts never reset or expand the round cap. Pure — the test surface
+    loop: continuation attempts never reset or expand the round cap. Conflict Revises (ADR 0038) are
+    counted apart under their own two-round budget and never spend this one. Pure — the test surface
     (ADR 0020)."""
     rounds = sum(1 for r in records
-                 if r.stage == "revise" and r.repo == repo and str(r.subject) == str(subject))
+                 if r.stage == "revise" and not r.conflict_round
+                 and r.repo == repo and str(r.subject) == str(subject))
     return rounds < MAX_REVISES
+
+
+def conflict_revises_used(records, repo, subject) -> list:
+    """The conflict Revise records already opened for this PR in its lifetime (ADR 0038), oldest
+    first — the two-round conflict budget counts these, separately from the finding-driven revise
+    rounds. Includes retired ones: the budget is per PR lifetime, not per live stage. Pure."""
+    conflicts = [r for r in records
+                 if r.stage == "revise" and r.conflict_round
+                 and r.repo == repo and str(r.subject) == str(subject)]
+    return sorted(conflicts, key=lambda r: r.conflict_round)
 
 
 def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
@@ -1544,7 +1613,8 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
                 # revise keeps its claim and this opener re-drives next cycle.
     submission = review_submission(
         revise, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"),
-        acceptance=acceptance, surfaces=surfaces)
+        acceptance=acceptance, surfaces=surfaces,
+        conflict_resolution=bool(revise.conflict_round))  # ADR 0038: add the discard-check lens
     if submission is not None:
         coord.submit_stage(submission)
 

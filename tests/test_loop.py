@@ -869,11 +869,15 @@ def test_conflict_already_flagged_pings_once_not_every_cycle():
     assert conflict_already_flagged([]) is False
 
 
-def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed"):
-    """Drive _rebase_survivor with a canned rebase result; record park / merge side effects."""
+def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed", conflict_revise=None):
+    """Drive _rebase_survivor with a canned rebase result; record park / merge side effects. By
+    default a conflict falls through to the park (``conflict_revise=None``), so these tests exercise
+    the ADR 0038 fallback; pass a status to model a conflict Revise that was opened instead."""
     events = {"parked": [], "merged": []}
     monkeypatch.setattr(loop, "_builder_worktree", lambda cfg, tool, n, sl: "/tmp/wt")
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: rebase)
+    monkeypatch.setattr(loop, "_conflict_revise_survivor",
+                        lambda cfg, pr, n, sl, tool, branch: conflict_revise)
     monkeypatch.setattr(loop, "_park_conflicted_survivor",
                         lambda cfg, pr, n: events["parked"].append(pr))
     monkeypatch.setattr(loop, "_merge_autonomous_survivor",
@@ -881,20 +885,31 @@ def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed"):
     return events
 
 
-def test_rebase_survivor_conflict_parks_and_pings_on_every_profile(monkeypatch):
-    # THE acceptance criterion: a survivor that now conflicts is re-rebased within one cycle
-    # and, still conflicting, parked-and-pinged — not left silent. Fails first if the conflict
-    # branch stays silent instead of calling _park_conflicted_survivor.
+def test_rebase_survivor_conflict_parks_when_the_conflict_revise_budget_is_spent(monkeypatch):
+    # ADR 0038: the park is now the FALLBACK. Once the two-round conflict budget is spent
+    # (_conflict_revise_survivor returns None), a still-conflicting survivor is parked-and-pinged
+    # on every profile — never left silent. Fails first if the conflict branch stays silent.
     for profile in ("reviewed", "guarded", "autonomous"):
-        events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT, profile=profile)
+        events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT, profile=profile,
+                                       conflict_revise=None)
         out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", profile)
-        assert events["parked"] == [8], f"conflict must ping ({profile})"
+        assert events["parked"] == [8], f"exhausted conflict must ping ({profile})"
         assert events["merged"] == []
         assert "parked" in out
 
 
+def test_rebase_survivor_conflict_opens_a_revise_before_parking(monkeypatch):
+    # ADR 0038: a survivor's re-rebase conflict opens a conflict Revise instead of parking. When
+    # _conflict_revise_survivor handles it (returns a status), no park notice is posted.
+    events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT,
+                                   conflict_revise="#8: conflict — revise round 1 opened")
+    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed")
+    assert events["parked"] == [], "an opened conflict Revise must not also park"
+    assert out == "#8: conflict — revise round 1 opened"
+
+
 def test_conflict_rebase_disposes_only_after_the_notice_is_durable(monkeypatch):
-    _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT)
+    _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT, conflict_revise=None)
     monkeypatch.setattr(loop, "_pr_comments",
                         lambda repo, pr: [{"body": f"> *{loop._CONFLICT_MARK}.*"}])
     removed = []
@@ -993,6 +1008,103 @@ def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch)
 
     assert result == "no reviewer pool available — deferring"
     assert submitted == [] and claimed == []
+
+
+# --- issue #212: a survivor's conflict opens a conflict Revise, not a park (ADR 0038) --------
+
+def _conflict_revise(conflict_round, target, *, repo="o/r", subject="4"):
+    """A durable conflict-Revise record stand-in (the fields the budget/idempotency helpers read)."""
+    return SimpleNamespace(stage="revise", conflict_round=conflict_round, repo=repo,
+                           subject=subject, target=target)
+
+
+def _stub_conflict_env(monkeypatch, *, priors, head="sha-conf", claim=True):
+    """Fake the git head read and coordinator store for _conflict_revise_survivor; capture every
+    submission handed to the coordinator. No real process is ever launched."""
+    from agentflow import coordinated_build
+
+    monkeypatch.setattr(loop, "_run",
+                        lambda argv: _FakeRun(head + "\n") if "rev-parse" in argv else _FakeRun(""))
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: list(priors))
+    monkeypatch.setattr(loop, "_claim", lambda repo, n: claim)
+    submitted = []
+    monkeypatch.setattr(coordinated_build, "build_coordinator",
+                        lambda: SimpleNamespace(submit_stage=submitted.append))
+    reconciled = []
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project",
+                        lambda coord: reconciled.append(coord))
+    return submitted, reconciled
+
+
+def test_survivor_conflict_opens_a_conflict_revise_on_the_builder_lineage(monkeypatch):
+    """AC1: a survivor whose re-rebase conflicts opens a conflict Revise on the builder's own
+    lineage with the ADR's findings text, and posts no park comment. Reproduces the #194 park —
+    before the fix, this path called _park_conflicted_survivor and submitted nothing."""
+    submitted, reconciled = _stub_conflict_env(monkeypatch, priors=[], head="sha-conf")
+    parked = []
+    monkeypatch.setattr(loop, "_park_conflicted_survivor", lambda cfg, pr, n: parked.append(pr))
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
+
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+
+    assert parked == [], "opening a conflict Revise must not also park the PR"
+    assert len(submitted) == 1 and reconciled
+    sub = submitted[0]
+    assert sub.stage == "revise" and sub.pool == "claude" and sub.builder_lineage == "claude"
+    assert sub.subject == "4" and sub.target == "sha-conf" and sub.conflict_round == 1
+    assert sub.continuation is True                       # admitted ahead of cold build work
+    assert "resolve the merge conflicts" in sub.input_ptr
+    assert "preserve `main`" in sub.input_ptr
+    assert "revise round 1 opened" in out
+
+
+def test_second_survivor_conflict_opens_a_distinct_second_round_idempotently(monkeypatch):
+    """AC3: a second conflict on the same PR opens a second conflict Revise with a distinct round
+    identity; re-reconciling the same still-open conflict head opens nothing new (idempotent)."""
+    first = _conflict_revise(1, "sha-old")               # a prior conflict Revise already resolved
+    submitted, _ = _stub_conflict_env(monkeypatch, priors=[first], head="sha-new")
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
+
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    assert submitted[0].conflict_round == 2 and submitted[0].target == "sha-new"
+    assert "revise round 2 opened" in out
+
+    # Re-reconcile with that second conflict now open at the same head: nothing new is submitted.
+    second = _conflict_revise(2, "sha-new")
+    submitted2, _ = _stub_conflict_env(monkeypatch, priors=[first, second], head="sha-new")
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
+    out2 = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    assert submitted2 == [] and "already open" in out2
+
+
+def test_third_survivor_conflict_parks_once_and_leaves_the_conflict_budget_alone(monkeypatch):
+    """AC4: the third conflict — with both conflict rounds spent — falls back to the existing
+    conflict notice and park, exactly once, and submits no further Revise."""
+    priors = [_conflict_revise(1, "sha-1"), _conflict_revise(2, "sha-2")]
+    submitted, _ = _stub_conflict_env(monkeypatch, priors=priors, head="sha-3")
+    parked = []
+    monkeypatch.setattr(loop, "_park_conflicted_survivor", lambda cfg, pr, n: parked.append(pr))
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [])   # notice not yet durable
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
+
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+
+    assert submitted == [], "the conflict budget is spent — no third conflict Revise"
+    assert parked == [8] and "parked for human" in out
+
+
+def test_conflict_revise_defers_without_parking_when_the_head_is_unreadable(monkeypatch):
+    """A transient git failure reading the conflicting head must defer, never park: parking on a
+    blip would strand the PR for a human on a recoverable error."""
+    _stub_conflict_env(monkeypatch, priors=[])
+    monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun(returncode=1))   # rev-parse fails
+    parked = []
+    monkeypatch.setattr(loop, "_park_conflicted_survivor", lambda cfg, pr, n: parked.append(pr))
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
+
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+
+    assert parked == [] and "retry next cycle" in out
 
 
 def _stub_recheck(monkeypatch, prs, *, advanced, profile, comments=None):

@@ -81,6 +81,10 @@ class Record:
     round: int = 0                       # completed auto-revise rounds behind this stage; part of
                                          # the identity so an evidence-only revision's re-review at
                                          # the same head SHA is still a fresh stage
+    conflict_round: int = 0              # which conflict Revise this is in the PR's lifetime (ADR
+                                         # 0038); >0 marks a survivor conflict resolution, budgeted
+                                         # separately from the finding-driven `round` and joined to
+                                         # the identity so each conflict is a genuinely fresh stage
     auto_merge_allowed: bool = True
     root: str | None = None              # the root stage this descends from; it shares the root's reservation
     interactive: bool = False            # an operator-present turn (Ask) that outranks background

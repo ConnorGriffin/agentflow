@@ -994,11 +994,50 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     return "review submitted"
 
 
+def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: str,
+                              branch: str) -> str | None:
+    """A survivor's re-rebase no longer applies: open a conflict Revise on the builder's own lineage
+    to resolve it (ADR 0038) instead of parking. The Revise adopts the retained PR-branch worktree,
+    is bound to the conflicting head SHA it must supersede, and is admitted ahead of cold build work.
+    Returns a status string once a conflict Revise is opened (or is already open for this head), or
+    ``None`` when the two-round conflict budget is spent — the caller then falls back to the existing
+    conflict notice and park. Never parks or force-merges here."""
+    from agentflow import coordinated_build
+    from agentflow.coordinator.store import StoreUnavailable
+
+    head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
+    if head.returncode != 0 or not head.stdout.strip():
+        return f"#{pr}: conflict — head unreadable, retry next cycle"
+    head_sha = head.stdout.strip()
+    try:
+        records = coordinated_build.tracer.load_records()
+    except StoreUnavailable:
+        return f"#{pr}: conflict — coordinator state unreadable, retry next cycle"
+    priors = coordinated_build.conflict_revises_used(records, cfg.repo, n)
+    if any(r.target == head_sha for r in priors):
+        return f"#{pr}: conflict — revise already open"   # idempotent under re-reconcile
+    if len(priors) >= coordinated_build.MAX_CONFLICT_REVISES:
+        return None                                       # budget spent → caller parks
+    conflict_round = len(priors) + 1
+    submission = coordinated_build.survivor_conflict_revise_submission(
+        cfg, issue=n, slug=sl, builder_tool=tool, head_sha=head_sha, pr_number=pr,
+        conflict_round=conflict_round)
+    if submission is None:
+        return None                                       # unreconstructable → caller parks
+    if not _claim(cfg.repo, n):
+        return f"#{pr}: conflict — could not claim conflict revise"
+    coordinator = coordinated_build.build_coordinator()
+    coordinator.submit_stage(submission)
+    coordinated_build.reconcile_and_project(coordinator)
+    return f"#{pr}: conflict — revise round {conflict_round} opened"
+
+
 def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str:
-    """Re-rebase one survivor and route the outcome by the repo's profile. On conflict,
-    park-and-ping (every profile). On a clean re-rebase: `autonomous` reruns the merge gate
-    and lands one; `reviewed`/`guarded` just leave the PR mergeable again for the human —
-    never a merge (ADR 0002)."""
+    """Re-rebase one survivor and route the outcome by the repo's profile. On conflict, open a
+    conflict Revise to resolve it (ADR 0038); once the two-round conflict budget is spent, fall back
+    to the park-and-ping (every profile). On a clean re-rebase: `autonomous` reruns the merge gate
+    and lands one; `reviewed`/`guarded` just leave the PR mergeable again for the human — never a
+    merge (ADR 0002)."""
     m = _BRANCH_RE.match(branch)
     if not m:
         return f"#{pr}: unrecognized branch {branch}"
@@ -1006,6 +1045,9 @@ def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str
     wt = Path(_builder_worktree(cfg, tool, n, sl))
     result = _rebase_branch(cfg, branch, wt)
     if result is RebaseResult.CONFLICT:
+        revised = _conflict_revise_survivor(cfg, pr, n, sl, tool, branch)
+        if revised is not None:
+            return revised
         _park_conflicted_survivor(cfg, pr, n)
         comments = _pr_comments(cfg.repo, pr)
         if comments is not None and any(_CONFLICT_MARK in c.get("body", "") for c in comments):

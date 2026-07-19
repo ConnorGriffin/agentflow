@@ -72,12 +72,17 @@ class Submission:
     round: int = 0                  # completed auto-revise rounds behind this stage — part of the
                                     # identity, so a re-review at an unchanged head SHA is still a
                                     # genuinely new stage with a fresh budget
+    conflict_round: int = 0         # which conflict Revise this is in the PR's lifetime (ADR 0038):
+                                    # >0 joins the identity so each conflict resolution is a fresh
+                                    # stage, budgeted separately from the finding-driven `round`
     descendant_of: str | None = None  # a subagent shares this root stage's one reservation
     transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
     supersede: bool = False           # the ``transfer_from`` predecessor is a still-in-flight Review
                                       # stranded at a moved head (#208), not a completed stage
     interactive: bool = False         # operator-present (Ask) turn: admission priority over
                                       # background pipeline work (ADR 0034)
+    continuation: bool = False        # admit ahead of cold work — a conflict Revise is a
+                                      # continuation of nearly-merged work, not new build (ADR 0038)
 
 
 @dataclass(frozen=True)
@@ -145,7 +150,7 @@ class Coordinator:
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
-                             submission.round)
+                             submission.round, submission.conflict_round)
         # A code-writing stage is pinned to the tool that built its diff (or, first time, its
         # own pool) and cannot silently cross pools; a read-only stage is unpinned and may run
         # on either pool. A review by the same tool that built the diff cannot auto-merge
@@ -161,9 +166,11 @@ class Coordinator:
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
             builder_complexity=submission.builder_complexity, round=submission.round,
+            conflict_round=submission.conflict_round,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
-            interactive=submission.interactive, created_at=int(time.time()))
+            interactive=submission.interactive, continuation=submission.continuation,
+            created_at=int(time.time()))
         with self._lock:
             successor, prior, transferred, root = self._store.submit(
                 record, submission.transfer_from, supersede=submission.supersede)
@@ -715,13 +722,18 @@ class Coordinator:
         self._log(f"{record.repo}: {record.subject}: {record.stage}: {tail}")
 
 
-def _identity(repo: str, subject: str, stage: str, target: str | None, round: int = 0) -> str:
+def _identity(repo: str, subject: str, stage: str, target: str | None, round: int = 0,
+              conflict_round: int = 0) -> str:
     # The auto-revise round joins the identity once one exists, so an evidence-only revision —
     # whose re-review binds to the *same* head SHA — still opens a genuinely new stage rather
-    # than colliding with the retired prior review's record.
+    # than colliding with the retired prior review's record. A conflict Revise's own round joins
+    # it too (ADR 0038), so each conflict resolution is a fresh stage that never collides with a
+    # finding-driven revise on the same head SHA.
     parts = [repo, str(subject), stage, target or "-"]
     if round:
         parts.append(f"r{round}")
+    if conflict_round:
+        parts.append(f"c{conflict_round}")
     return "|".join(parts)
 
 
