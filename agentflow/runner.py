@@ -300,6 +300,24 @@ def _write_output_schema(schema: dict) -> str:
     return path
 
 
+def _operator_local_mcp_servers() -> dict:
+    """The operator's user-scoped local MCP servers, read from ``~/.claude.json``.
+
+    These are the deliberate local tools the operator configured — notably the codebase
+    code-graph server that Build and Review sessions lean on. The personal claude.ai
+    connectors (Gmail, Google Drive, Google Calendar) that #240 removes are *account*
+    connectors: they are attached by the signed-in claude.ai account, never stored here.
+    Re-supplying just this map under ``--strict-mcp-config`` therefore keeps the code-graph
+    tool while the personal connectors stay dropped (#244).
+    """
+    try:
+        data = json.loads((Path.home() / ".claude.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    servers = data.get("mcpServers")
+    return servers if isinstance(servers, dict) else {}
+
+
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
@@ -311,11 +329,21 @@ class ClaudeRunner(_WorktreeRunner):
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
         Claude's native ``--json-schema`` so the final response is validated structured
         output, not free text the parser must scavenge.
+
+        ``--strict-mcp-config`` pins the session to only the MCP servers we hand it, so the
+        operator's personal claude.ai connectors can never attach (#240). We then re-supply
+        the operator's local dev servers — the codebase code-graph tool — so daemon sessions
+        keep it (#244). With no local servers configured the MCP set is simply empty.
         """
         argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
-                "--settings", _CLAUDE_AUTONOMOUS_SETTINGS]
+                "--settings", _CLAUDE_AUTONOMOUS_SETTINGS,
+                "--strict-mcp-config"]
+        servers = _operator_local_mcp_servers()
+        if servers:
+            argv += ["--mcp-config",
+                     json.dumps({"mcpServers": servers}, separators=(",", ":"))]
         if schema is not None:
             argv += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
         return argv

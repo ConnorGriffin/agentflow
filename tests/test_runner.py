@@ -90,6 +90,36 @@ def test_claude_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert "--output-format" in cmd
 
 
+def test_claude_keeps_only_the_operator_local_mcp_servers(monkeypatch, tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-10-mcp"
+    _branch_worktree(repo, wt, "agentflow/claude/issue-10-mcp")
+    from agentflow.intake import INTAKE_RESULT_SCHEMA
+
+    # The operator's local code-graph server is re-supplied under strict mode; the personal
+    # claude.ai connectors (never in this map) are excluded. Holds with schema (intake/review)
+    # and without (build).
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers",
+                        lambda: {"codebase-memory-mcp": {"command": "/x/code-graph"}})
+    for schema in (INTAKE_RESULT_SCHEMA, None):
+        cmd = ClaudeRunner().structured_argv("do work", "sonnet", str(wt), schema=schema)
+        assert "--strict-mcp-config" in cmd
+        mcp = json.loads(cmd[cmd.index("--mcp-config") + 1])
+        assert list(mcp["mcpServers"]) == ["codebase-memory-mcp"]
+
+
+def test_claude_pins_mcp_empty_when_operator_has_no_local_servers(monkeypatch, tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-10-nomcp"
+    _branch_worktree(repo, wt, "agentflow/claude/issue-10-nomcp")
+
+    # No local servers → nothing to re-supply; strict mode alone keeps the set empty.
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
+    cmd = ClaudeRunner().structured_argv("do work", "sonnet", str(wt))
+    assert "--strict-mcp-config" in cmd
+    assert "--mcp-config" not in cmd
+
+
 def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     repo = _repo_with_origin(tmp_path)
     branch = "agentflow/codex/issue-8-owned"
