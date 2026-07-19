@@ -114,3 +114,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0040](0040-spend-per-success-measurement-contract.md) — Spend experiments measure
   headroom-denominated cost per verified stage and per merged issue, gated by quality
   guardrails and cohort cells; dollars are only the cross-tool comparison signal.
+- [0044](0044-stage-session-profiles-and-ceilings.md) — Every daemon session gets a
+  per-stage tool allowlist (read-only for Intake/Review/Research), an empty MCP set,
+  and per-cell wall/turn ceilings replacing the shared two-hour timeout; fail closed
+  on withheld capability. (0041–0043 land on other open PRs.)
