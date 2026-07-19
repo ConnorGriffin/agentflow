@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -285,16 +286,39 @@ class _WorktreeRunner:
                   "--state", "open", "--json", "url", "-q", ".[0].url // \"\""])
         return r.returncode == 0, r.stdout.strip() or None
 
+def _write_output_schema(schema: dict) -> str:
+    """Persist a provider-neutral result schema to a temp file for Codex's ``--output-schema``.
+
+    Codex reads the schema from a file path (unlike Claude's inline flag), so the neutral
+    schema is serialized outside the checkout — the launcher reads it, never the sandboxed
+    session — and its path handed to the CLI. Small and short-lived, like the reviewer's
+    verdict temp file.
+    """
+    fd, path = tempfile.mkstemp(prefix="agentflow-output-schema-", suffix=".json")
+    with os.fdopen(fd, "w") as handle:
+        json.dump(schema, handle)
+    return path
+
+
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
 
-    def structured_argv(self, prompt: str, model: str, cwd: str) -> list[str]:
-        """Build the structured Claude command run only by the coordinator launcher."""
-        return ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
+    def structured_argv(self, prompt: str, model: str, cwd: str,
+                        schema: dict | None = None) -> list[str]:
+        """Build the structured Claude command run only by the coordinator launcher.
+
+        A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
+        Claude's native ``--json-schema`` so the final response is validated structured
+        output, not free text the parser must scavenge.
+        """
+        argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
                 "--settings", _CLAUDE_AUTONOMOUS_SETTINGS]
+        if schema is not None:
+            argv += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
+        return argv
 
 
 class CodexRunner(_WorktreeRunner):
@@ -304,8 +328,14 @@ class CodexRunner(_WorktreeRunner):
 
     _CLI_MODEL = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra"}
 
-    def structured_argv(self, prompt: str, model: str, cwd: str) -> list[str]:
-        """Build the structured Codex command run only by the coordinator launcher."""
+    def structured_argv(self, prompt: str, model: str, cwd: str,
+                        schema: dict | None = None) -> list[str]:
+        """Build the structured Codex command run only by the coordinator launcher.
+
+        A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
+        Codex's native ``--output-schema`` file so the final response is validated structured
+        output, not free text the parser must scavenge.
+        """
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
         worktree = os.path.realpath(cwd)
         common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
@@ -315,14 +345,18 @@ class CodexRunner(_WorktreeRunner):
             "approval_policy={granular={sandbox_approval=true,rules=false,"
             "mcp_elicitations=false,request_permissions=false,skill_approval=false}}"
         )
-        return [codex_bin, "exec", "-m", self._CLI_MODEL.get(model, model), "--json",
+        argv = [codex_bin, "exec", "-m", self._CLI_MODEL.get(model, model), "--json",
                 "--sandbox", "workspace-write", "--cd", worktree,
                 "--ignore-user-config", "--ephemeral", "-c", approval_policy,
                 "-c", 'approvals_reviewer="auto_review"',
                 "-c", f"auto_review.policy={json.dumps(_CODEX_AUTO_REVIEW_POLICY)}",
                 "-c", "sandbox_workspace_write.network_access=true",
                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
-                "--skip-git-repo-check", _bounded_prompt(_CODEX_HEADLESS_RECOVERY + prompt, cwd)]
+                "--skip-git-repo-check"]
+        if schema is not None:
+            argv += ["--output-schema", _write_output_schema(schema)]
+        argv.append(_bounded_prompt(_CODEX_HEADLESS_RECOVERY + prompt, cwd))
+        return argv
 
     def account_fact(self) -> dict | None:
         """Read the existing typed Codex limit companion. It establishes capacity only when a
