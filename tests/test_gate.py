@@ -310,3 +310,50 @@ def test_respond_park_closes_only_its_target_and_leaves_later_comment_pending():
     assert reply_pending(comments) is True
     assert maintainer_comment_id(comments) == "IC_2"
     assert maintainer_comment(comments) == "Second follow-up"
+
+
+# --- park() body rendering (issue #210) ----------------------------------------
+
+def _park_body(monkeypatch, verdict):
+    """Call park() and return the body string it would have posted."""
+    captured = []
+
+    def run(cmd):
+        captured.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gate, "_run", run)
+    gate.park("o/r", 99, verdict, reason="exhausted its review budget without a durable verdict")
+    assert captured, "park() did not call _run"
+    body_arg = captured[0]
+    return body_arg[body_arg.index("--body") + 1]
+
+
+def test_no_verdict_park_says_no_review_was_completed(monkeypatch):
+    # Fails before the fix: exhaustion park posted '(no blocking findings)' instead.
+    body = _park_body(monkeypatch, None)
+    assert "(no blocking findings)" not in body
+    assert "No review was completed" in body
+
+
+def test_no_verdict_park_has_no_findings_list(monkeypatch):
+    body = _park_body(monkeypatch, None)
+    assert "Review findings:" not in body
+
+
+def test_no_verdict_park_carries_the_canonical_marker(monkeypatch):
+    body = _park_body(monkeypatch, None)
+    assert "agentflow: parked for human review" in body
+
+
+def test_clean_verdict_park_renders_no_blocking_findings(monkeypatch):
+    body = _park_body(monkeypatch, Verdict(clean=True))
+    assert "- (no blocking findings)" in body
+
+
+def test_findings_verdict_park_renders_findings(monkeypatch):
+    verdict = Verdict(clean=False, findings=(Finding("blocking", "something bad", "f.py", 10),))
+    body = _park_body(monkeypatch, verdict)
+    assert "something bad" in body
+    assert "(no blocking findings)" not in body
+    assert "No review was completed" not in body
