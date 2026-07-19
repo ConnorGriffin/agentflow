@@ -122,7 +122,9 @@ def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
     assert edited == [8]
 
 
-def test_build_submission_claims_then_enters_the_coordinator(monkeypatch):
+def test_build_submission_enters_the_coordinator_then_claims_runnable_work(monkeypatch):
+    from agentflow.coordinator.record import Record, WAITING
+
     issue = {"number": 7, "title": "Do it", "body": "brief",
              "labels": [{"name": "ready-for-agent"},
                         {"name": "agentflow:complexity:deep"},
@@ -132,11 +134,40 @@ def test_build_submission_claims_then_enters_the_coordinator(monkeypatch):
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (builder, None, ""))
     events = []
     monkeypatch.setattr(loop, "_claim", lambda repo, number: events.append("claim") or True)
-    coord = SimpleNamespace(submit_stage=lambda submission: events.append(submission.stage))
+    waiting = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                     state=WAITING)
+    coord = SimpleNamespace(
+        submit_stage=lambda submission: events.append(submission.stage) or "o/r|7|build|-",
+        stage_record=lambda identity: waiting)
 
     assert "submitted" in dispatch._submit_coordinated_build(
         RepoConfig("o/r", "/tmp"), coord, None)
-    assert events == ["claim", "build"]
+    # The submission enters the coordinator first; the issue is claimed only once admission has a
+    # runnable record — never before, so a held no-op never stamps a false building claim (#245).
+    assert events == ["build", "claim"]
+
+
+def test_daemon_does_not_claim_or_launch_when_the_build_stays_held(monkeypatch):
+    # After a maintainer `pickup` relabels an exhausted issue back to `ready-for-agent`, the daemon
+    # can pick it — but it must not auto-resume the terminal held Build. An ordinary resubmission
+    # reuses the held record, so the daemon claims nothing and reports the held state (#245).
+    from agentflow.coordinator.record import Record, HELD
+
+    issue = {"number": 7, "title": "Do it", "body": "brief",
+             "labels": [{"name": "ready-for-agent"},
+                        {"name": "agentflow:complexity:deep"},
+                        {"name": "agentflow:effort:high"}]}
+    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("must not claim a held no-op"))
+    held = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                  state=HELD, claim=False)
+    coord = SimpleNamespace(
+        submit_stage=lambda submission: "o/r|7|build|-",
+        stage_record=lambda identity: held)
+
+    result = dispatch._submit_coordinated_build(RepoConfig("o/r", "/tmp"), coord, None)
+    assert "held" in result and "submitted" not in result
 
 
 def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):

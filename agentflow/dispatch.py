@@ -50,9 +50,17 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
     submission = coordinated_build.build_submission(cfg, issue, builder.tool)
     if submission is None:
         return f"#{issue['number']}: skipped — no agentflow:complexity:* label (ADR 0018 gate)"
+    from agentflow.coordinator.record import WAITING
+    identity = coordinator.submit_stage(submission)
+    record = coordinator.stage_record(identity)
+    # The daemon never auto-resumes an exhausted Build — that needs an explicit maintainer
+    # `build <N>` (#245). An ordinary resubmission that reused a terminal `held` record produced
+    # nothing to run, so claim nothing and report the held state rather than a false launch.
+    if record is None or record.state != WAITING or record.hold_pending or record.retired:
+        return (f"#{issue['number']}: Build held — awaiting a maintainer resume "
+                f"(`/agentflow pickup {issue['number']}` then `build`)")
     if not loop._claim(cfg.repo, issue["number"]):
         return f"#{issue['number']}: could not claim Build — refusing coordinator submission"
-    coordinator.submit_stage(submission)
     return f"#{issue['number']}: submitted to coordinator → {builder.tool} (build)"
 
 
