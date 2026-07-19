@@ -188,7 +188,8 @@ def test_provider_command_unwraps_the_versioned_durable_prompt(monkeypatch):
 
     prompts = []
     monkeypatch.setattr(ClaudeRunner, "structured_argv",
-                        lambda self, prompt, model, source: prompts.append(prompt) or ["claude"])
+                        lambda self, prompt, model, source, schema=None:
+                        prompts.append(prompt) or ["claude"])
     record = Record("i", "intake", "claude", 1, model="opus", source="/wt",
                     input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,
                                           "prompt": "ground the issue",

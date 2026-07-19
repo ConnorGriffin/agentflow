@@ -26,7 +26,6 @@ worktree naming, and pure verdict parser used by that adapter.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -35,7 +34,34 @@ from pathlib import Path
 # "blocker", "high", unknown) is treated as blocking — fail safe.
 _NIT_SEVERITIES = {"nit", "nits", "info", "minor", "low", "style", "note",
                    "suggestion", "trivial", "cosmetic"}
-_FENCE_RE = re.compile(r"```[a-zA-Z]*\s*\n(.*?)\n```", re.DOTALL)
+
+# The provider-neutral shape a reviewer's terminal verdict must match. Each runner adapter
+# translates it into that CLI's native structured-output surface (Claude `--json-schema`,
+# Codex `--output-schema`); the CLI enforces it, so `parse_verdict` validates a real object
+# rather than scavenging JSON out of free text.
+REVIEW_VERDICT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "verdict": {"type": "string", "enum": ["PASS", "BLOCK"]},
+        "reviewed_sha": {"type": "string"},
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "severity": {"type": "string", "enum": ["blocking", "nit"]},
+                    "file": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "summary": {"type": "string"},
+                },
+                "required": ["severity", "file", "line", "summary"],
+            },
+        },
+    },
+    "required": ["verdict", "reviewed_sha", "findings"],
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,49 +105,21 @@ def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
     return seen
 
 
-def _verdict_dicts(text: str):
-    """Yield candidate verdict dicts best-first: fenced ```json blocks (last first),
-    the whole message, then every balanced {...} object scanning from the end. EVERY
-    parse uses the duplicate-key hook, so `{"verdict":"BLOCK","verdict":"PASS"}` still
-    fails. Robust to a verdict that trails the reviewer's reasoning prose — 'STRICT
-    JSON only' is not reliable, so we recover the object rather than drop the review."""
-    text = text.strip()
-
-    def _load(s: str):
-        try:
-            obj = json.loads(s, object_pairs_hook=_no_duplicate_keys)
-        except ValueError:
-            return None
-        return obj if isinstance(obj, dict) else None
-
-    for b in reversed(_FENCE_RE.findall(text)):
-        d = _load(b.strip())
-        if d is not None:
-            yield d
-    d = _load(text)
-    if d is not None:
-        yield d
-    dec = json.JSONDecoder(object_pairs_hook=_no_duplicate_keys)
-    for i in reversed([j for j, c in enumerate(text) if c == "{"]):
-        try:
-            obj, _end = dec.raw_decode(text[i:])
-        except ValueError:
-            continue
-        if isinstance(obj, dict):
-            yield obj
-
-
 def parse_verdict(payload: str, expected_sha: str | None = None) -> Verdict:
-    """Parse a reviewer's JSON verdict. Pure, defensive, fail-safe (test surface).
+    """Validate a reviewer's structured verdict. Pure, defensive, fail-safe (test surface).
 
-    `clean` requires: a JSON dict carrying `verdict`, verdict == PASS, no blocking
-    finding, and — when `expected_sha` is given — a matching `reviewed_sha` (proof it
-    reviewed the head we're about to merge). Recovers the verdict even when the reviewer
-    prefixes it with reasoning prose; any deviation returns not-clean.
+    The CLI enforces `REVIEW_VERDICT_SCHEMA` natively, so the payload is the verdict object
+    itself — parsed strictly (with the duplicate-key guard), never scavenged out of
+    reasoning prose. `clean` requires: a JSON dict carrying `verdict`, verdict == PASS, no
+    blocking finding, and — when `expected_sha` is given — a matching `reviewed_sha` (proof
+    it reviewed the head we're about to merge). Any deviation returns not-clean.
     """
     try:
-        data = next((d for d in _verdict_dicts(payload) if "verdict" in d), None)
-        if data is None:
+        stripped = payload.strip()
+        if not stripped:
+            return _unparseable("empty reviewer output")
+        data = json.loads(stripped, object_pairs_hook=_no_duplicate_keys)
+        if not isinstance(data, dict) or "verdict" not in data:
             return _unparseable("no usable verdict object")
 
         raw_findings = data.get("findings", [])
@@ -176,12 +174,12 @@ A correctness gap BEYOND the stated acceptance — an unhandled case the issue d
 ask for — is a NIT, not blocking; note it so it can be filed as a follow-up.
 Style, naming, and minor perf are nits.
 
-END your message with the verdict as ONE JSON object. Your reasoning may come first, but
-the JSON must be the LAST thing in your message and must parse:
-{{"verdict": "PASS" | "BLOCK",
-  "reviewed_sha": "<the headRefOid you fetched above>",
-  "findings": [{{"severity": "blocking" | "nit", "file": "path", "line": 0, "summary": "..."}}]}}
-"verdict" is PASS only if there are zero blocking findings."""
+Your final response IS the verdict as a structured object — the harness enforces its
+schema natively, so you do not hand-write or fence the JSON; just produce these fields:
+- "verdict": "PASS" | "BLOCK" — PASS only if there are zero blocking findings
+- "reviewed_sha": the headRefOid you fetched above (proof you reviewed THIS diff)
+- "findings": a list of {{"severity": "blocking" | "nit", "file": path, "line": 0,
+  "summary": the human-facing note}}"""
 
 
 def review_worktree(workdir: str, tool: str, pr_number: int, slug: str) -> Path:

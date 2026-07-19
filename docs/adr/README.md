@@ -119,3 +119,7 @@ then Context / Decision / Alternatives / Consequences.
   #228; deep cross-tool Review is safety, not a savings target); Respond/conflict-Revise
   carry-complexity is a directional parity note; every reasoning-effort cell is unset
   pending #223 telemetry.
+- [0042](0042-codegraph-okf-complementary-layer.md) — The curated operational
+  knowledge (OKF) layer complements, never replaces, the slim code graph: retrieval
+  gated by task shape and capped at a few concepts, kept as a derived projection of
+  CONTEXT.md and the ADRs.
