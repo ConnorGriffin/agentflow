@@ -115,6 +115,68 @@ def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert str(wt.resolve()) in structured[-1]
 
 
+def test_claude_wires_the_result_schema_to_its_native_json_schema_flag(tmp_path):
+    from agentflow.intake import INTAKE_RESULT_SCHEMA
+    from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
+
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-9-owned"
+    _branch_worktree(repo, wt, "agentflow/claude/issue-9-owned")
+
+    for schema in (INTAKE_RESULT_SCHEMA, REVIEW_VERDICT_SCHEMA):
+        cmd = ClaudeRunner().structured_argv("decide", "sonnet", str(wt), schema=schema)
+        assert json.loads(cmd[cmd.index("--json-schema") + 1]) == schema
+
+    # A code-writing stage passes no schema, so the flag stays absent.
+    assert "--json-schema" not in ClaudeRunner().structured_argv("build it", "sonnet", str(wt))
+
+
+def test_codex_wires_the_result_schema_to_its_native_output_schema_file(tmp_path):
+    from agentflow.intake import INTAKE_RESULT_SCHEMA
+    from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
+
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-9-owned"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-9-owned")
+
+    for schema in (INTAKE_RESULT_SCHEMA, REVIEW_VERDICT_SCHEMA):
+        cmd = CodexRunner().structured_argv("decide", "terra", str(wt), schema=schema)
+        schema_path = cmd[cmd.index("--output-schema") + 1]
+        with open(schema_path) as handle:
+            assert json.load(handle) == schema
+        # The prompt stays the final positional argument even with the schema option present.
+        assert str(wt.resolve()) in cmd[-1] and cmd[-1] != schema_path
+
+    assert "--output-schema" not in CodexRunner().structured_argv("build it", "terra", str(wt))
+
+
+def test_provider_adapters_supply_the_stage_schema_for_intake_and_review(tmp_path):
+    from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.intake import INTAKE_RESULT_SCHEMA
+    from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
+
+    repo = _repo_with_origin(tmp_path)
+    cases = {"intake": INTAKE_RESULT_SCHEMA, "review": REVIEW_VERDICT_SCHEMA}
+    for stage, schema in cases.items():
+        claude = ClaudeProviderAdapter().command(Record(
+            f"claude-{stage}", stage, "claude", 0,
+            model="sonnet", source=str(repo), input_ptr="decide"))
+        assert json.loads(claude[claude.index("--json-schema") + 1]) == schema
+
+        codex = CodexProviderAdapter().command(Record(
+            f"codex-{stage}", stage, "codex", 0,
+            model="terra", source=str(repo), input_ptr="decide"))
+        with open(codex[codex.index("--output-schema") + 1]) as handle:
+            assert json.load(handle) == schema
+
+    # A code-writing stage (build) supplies no structured-result schema to either provider.
+    build = ClaudeProviderAdapter().command(Record(
+        "claude-build", "build", "claude", 0,
+        model="sonnet", source=str(repo), input_ptr="build it"))
+    assert "--json-schema" not in build
+
+
 def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(tmp_path):
     from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
     from agentflow.coordinator.record import Record

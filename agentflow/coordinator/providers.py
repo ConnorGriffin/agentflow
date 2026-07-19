@@ -320,6 +320,20 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
 PROVIDER_INPUT_V1 = "agentflow-provider-input-v1"
 
 
+def _stage_result_schema(stage: str) -> dict | None:
+    """The provider-neutral result contract a stage's terminal decision must match, or None
+    for a code-writing stage that emits no structured decision. Intake and Review own their
+    schemas (domain validation lives with their parsers); this seam only names which stage
+    uses which, so no provider-specific schema detail leaks into coordinator policy."""
+    if stage == "intake":
+        from agentflow.intake import INTAKE_RESULT_SCHEMA
+        return INTAKE_RESULT_SCHEMA
+    if stage == "review":
+        from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
+        return REVIEW_VERDICT_SCHEMA
+    return None
+
+
 def _durable_prompt(record) -> str:
     """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt."""
     raw = record.input_ptr or ""
@@ -342,7 +356,8 @@ class ClaudeProviderAdapter:
     def command(self, record) -> list[str]:
         from agentflow.runner import ClaudeRunner
         return ClaudeRunner().structured_argv(
-            self._prompt_of(record), record.model, record.source)
+            self._prompt_of(record), record.model, record.source,
+            schema=_stage_result_schema(record.stage))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
@@ -367,7 +382,8 @@ class CodexProviderAdapter:
     def command(self, record) -> list[str]:
         from agentflow.runner import CodexRunner
         return CodexRunner().structured_argv(
-            self._prompt_of(record), record.model, record.source)
+            self._prompt_of(record), record.model, record.source,
+            schema=_stage_result_schema(record.stage))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
