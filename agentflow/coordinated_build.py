@@ -939,6 +939,8 @@ def _review_pr_facts(record) -> dict | None:
         data = json.loads(viewed.stdout or "{}")
     except json.JSONDecodeError:
         return None
+    if not isinstance(data, dict):
+        return None
     head, state = data.get("headRefOid"), data.get("state")
     if not isinstance(head, str) or not head or state not in {"OPEN", "CLOSED", "MERGED"}:
         return None
@@ -1036,10 +1038,11 @@ def _settle_review(record) -> str | None:
               "--remove-label", "ready-for-agent"])
         return f"https://github.com/{record.repo}/pull/{pr}"
     if head != record.target:
-        return _park_review_settlement(
-            record, verdict, workdir, pr, comments,
-            reason="PR head changed after the recorded review; a human must re-review",
-            autonomous=autonomous)
+        # The head moved after this clean verdict was recorded (a maintainer rebase, a manual push,
+        # a conflict fix). Do not park a superseded head: leave the completed record in place so the
+        # diverged-review reconciler opens one bounded successor Review at the live head, or parks
+        # once when the auto-revise rounds are spent (#208).
+        return None
 
     surfaces = ui_surfaces(workdir)
     ui_gap = ui_evidence_gap(record.repo, pr, surfaces)
@@ -1484,6 +1487,85 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
         coord.submit_stage(submission)
 
 
+def _moved_head_review_submission(record, head_sha: str):
+    """One successor Review Submission for a Review whose PR head moved off its immutable target for
+    a reason other than an auto-revise — a maintainer-requested rebase, a manual push, a conflict
+    fix. It carries the same auto-revise round and builder lineage, points at a fresh read-only
+    checkout at the live head, and transfers the claim from the stranded record. The identity scheme
+    is exactly the one a post-revise review uses (repo, subject, review, new SHA, round), so a repeat
+    or restart never double-opens (#208). Returns ``None`` when the source is unreadable or no
+    reviewer tool has headroom this cycle — in which case the stranded record keeps its claim and a
+    later pass retries."""
+    from agentflow.coordinator import Submission
+    from agentflow.reviewer import review_worktree
+    facts = _review_source_facts(record)
+    if facts is None or not head_sha or not record.builder_lineage:
+        return None
+    workdir, pr = facts
+    slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+    reviewer_tool = pick_reviewer(record.builder_lineage)
+    if reviewer_tool is None:
+        return None  # ADR 0020: no tool free to review this cycle — leave the record, retry later
+    return Submission(
+        repo=record.repo, subject=record.subject, stage="review", target=head_sha,
+        pool=reviewer_tool, complexity="deep",
+        source=str(review_worktree(workdir, reviewer_tool, pr, slug)),
+        claim=True, input_ptr=record.input_ptr, builder_lineage=record.builder_lineage,
+        builder_complexity=record.builder_complexity, round=record.round,
+        transfer_from=record.identity, supersede=True)
+
+
+def _resettle_diverged_reviews(coord: Coordinator) -> None:
+    """Retire a Review whose PR head has moved off its immutable target before another attempt is
+    charged against a head that is no longer live (#208).
+
+    A Review's target SHA is immutable and its verify demands a verdict for exactly that SHA, so a
+    head that moves for any reason other than an auto-revise — a maintainer-requested rebase, a
+    manual push, a conflict fix — strands the in-flight Review: each attempt re-reviews a head that
+    is no longer live, burns one of the three, and the record finally parks "budget exhausted" — even
+    on a PR the maintainer has already merged. This runs every reconcile pass, before admission, over
+    the durable records:
+
+    - A merged or closed PR retires the Review silently — there is nothing left to review, so no park
+      comment and no notification. (A *completed* clean review of a merged PR is left to the normal
+      merge path.)
+    - An open PR whose head still equals the target is left untouched — the normal review flow.
+    - An open PR whose head has diverged retires the stranded record and opens one bounded successor
+      Review at the live head; when the auto-revise rounds are spent the PR parks once through the
+      existing exhaustion handoff instead.
+
+    A durable blocking verdict is never disturbed — its head move flows through the Revise chain."""
+    from agentflow.coordinator.record import COMPLETED
+    records = {record.identity: record for record in tracer.load_records()}
+    for record in list(records.values()):
+        if (record.stage != "review" or record.retired or record.hold_pending
+                or not record.claim or not record.target):
+            continue
+        if record.state == COMPLETED and _review_verdict(record).blocking:
+            continue  # a blocking verdict flows to Revise, which owns the head move
+        pr_facts = _review_pr_facts(record)
+        if pr_facts is None:
+            continue  # GitHub unreadable — fail closed; a later pass retries
+        state, head = pr_facts["state"], pr_facts["head"]
+        if state == "MERGED" and record.state == COMPLETED:
+            continue  # a completed clean review of a merged PR is the normal merge path
+        if state in {"MERGED", "CLOSED"}:
+            coord.retire_stale_review(record.identity)
+            continue
+        if head == record.target:
+            continue  # the live head still matches the reviewed SHA — nothing to do
+        if (record.round >= MAX_REVISES
+                or not revise_round_budget_remains(records.values(), record.repo, record.subject)):
+            coord.park_stale_review(record.identity)
+            continue
+        submission = _moved_head_review_submission(record, head)
+        if submission is not None:
+            try:
+                coord.submit_stage(submission)
+            except StoreUnavailable:
+                continue  # the store moved the claim between our snapshot and this submit; retry
+
+
 # Each completed stage's claim-transfer opener, keyed by the stage it consumes.
 _OPENERS = {"build": _open_review_on_completed_build,
             "review": _open_revise_on_blocking_review,
@@ -1503,6 +1585,10 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     from agentflow.coordinator.record import COMPLETED
     outcomes = []
     now = int(time.time())
+    # Before any attempt is charged, retire a Review whose PR head has moved off its immutable
+    # target (or whose PR is gone) rather than burning the budget re-reviewing a superseded head
+    # and wrongly parking a merged PR (#208).
+    _resettle_diverged_reviews(coord)
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
     # Handoffs are driven from durable state, not only this process's outcomes. A daemon may

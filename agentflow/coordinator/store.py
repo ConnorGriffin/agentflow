@@ -240,7 +240,8 @@ class Store:
                 raise
 
     def submit(self, record: Record,
-               prior_identity: str | None = None
+               prior_identity: str | None = None, *,
+               supersede: bool = False
                ) -> tuple[Record, Record | None, bool, Record | None]:
         """Persist an idempotent stage submission. When ``prior_identity`` is supplied, the
         successor insert and completed predecessor's claim transfer are one transaction.
@@ -248,7 +249,14 @@ class Store:
         ownership, and the updated root (for a descendant). Successor creation, claim transfer,
         and descendant registration share one transaction; no crash or concurrent root write can
         expose an orphaned descendant. Any missing or ineligible predecessor/root aborts without
-        exposing a successor."""
+        exposing a successor.
+
+        ``supersede`` relaxes the predecessor eligibility to any claim-holding, not-yet-retired
+        record — not only a completed one — so a Review stranded at a head that has moved off its
+        immutable target (#208) can atomically hand its claim to a bounded successor at the live
+        head. The superseded predecessor is left completed-and-retired, exactly as a normal
+        claim-transfer leaves its completed predecessor, so it leaves the running ledger and is
+        never re-admitted or re-reconciled."""
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -268,12 +276,17 @@ class Store:
                         prior.state == COMPLETED and prior.retired and not prior.claim
                         and successor_row is not None and successor.claim)
                     if not already_transferred:
-                        if prior.state != COMPLETED or prior.retired or not prior.claim:
+                        eligible = (prior.claim and not prior.retired if supersede
+                                    else prior.state == COMPLETED and not prior.retired
+                                    and prior.claim)
+                        if not eligible:
                             raise StoreUnavailable(
                                 "cannot transfer claim: predecessor does not own a completed stage")
                         successor.claim = True
                         prior.claim = False
                         prior.retired = True
+                        if supersede:
+                            prior.state = COMPLETED  # leave the running ledger; never re-admitted
                         prior.revision += 1
                         self._write(prior)
                         transferred = True

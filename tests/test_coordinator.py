@@ -543,6 +543,9 @@ def test_public_surface_keeps_completed_boundary_settlement_private(make_coord):
     coord = make_coord(FakeSession())
     public = {name for name in dir(coord)
               if not name.startswith("_") and callable(getattr(coord, name))}
-    assert public == {"submit_stage", "cycle", "park_completed"}
+    # The deliberate public operations beside submit_stage/cycle: the completed-stage park handoff,
+    # and the two Review-native disposals for a PR head that moved off the immutable target (#208).
+    assert public == {"submit_stage", "cycle", "park_completed",
+                      "retire_stale_review", "park_stale_review"}
     assert not hasattr(coord, "permits")      # permit accounting is an internal invariant
     assert not hasattr(coord, "records")      # the working set is private (_records)
