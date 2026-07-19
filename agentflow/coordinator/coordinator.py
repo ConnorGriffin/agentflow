@@ -32,6 +32,7 @@ from agentflow.coordinator.admission import (
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
+from agentflow.coordinator.recovery import PROGRESS, REPAIR, Recovery
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 
@@ -44,6 +45,10 @@ SUPERVISOR_WINDOW = 2 * 3600              # observe-until horizon stamped at adm
 # place. That resume is bounded per stage identity so a family that keeps dying with no provider end
 # fact still parks eventually instead of spinning forever at zero budget cost.
 RESTART_RESUME_CAP = 5
+# How many targeted repairs a clean exit with a missing required outcome earns before the stage is
+# parked for a human instead of replaying an identical session (issue #225). One repair — naming the
+# exact missing proof — then no more blind replays.
+REPAIR_BUDGET = 1
 
 # The required-outcome noun each stage proves, for the completion log line (ADR 0028).
 _OUTCOME_LABEL = {
@@ -580,8 +585,11 @@ class Coordinator:
     def _finalize(self, record: Record) -> StageOutcome | None:
         """Classify an ended provider family and release its reservation atomically (ADR
         0028 precedence): a verified stage outcome completes it; a permanent provider
-        condition holds it; a recoverable, incomplete, or unknown ending waits when budget
-        remains and holds when it is exhausted. Returns the terminal outcome, if any."""
+        condition holds it; a recoverable interruption waits within budget. An incomplete or
+        unknown ending waits only when a fresh attempt would have new recovery state to act on —
+        retained partial work continues, a clean exit missing its outcome earns one targeted
+        repair — and otherwise holds rather than replaying an identical session (issue #225).
+        Returns the terminal outcome, if any."""
         obs = self._adapter.observe(record)
         self._release(record)
         capture = getattr(self._adapter, "capture", None)
@@ -614,28 +622,66 @@ class Coordinator:
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
                               f"permanent; handoff pending; claim retained")
-        elif record.attempts < ATTEMPT_BUDGET:
-            record.state = WAITING
-            record.continuation = True
-            record.eligible_at = obs.reset_at or 0
-            if not self._persist(record):
-                return None
-            done = record.attempts  # continuations begun after this interruption
-            when = f"at {record.eligible_at}" if record.eligible_at else "next cycle"
-            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
-                              f"({cause}) — continuation {done}/{CONTINUATION_BUDGET} eligible "
-                              f"{when}; claim retained")
+            # The stage adapter proves a live external handoff; the coordinator finalizes it
+            # idempotently and crash-safely.
+            return self._finalize_hold(record)
+        # A non-permanent ending only earns a fresh session when that session has new recovery
+        # state to act on (issue #225). A genuine capacity/server/timeout interruption always does
+        # — the limit lifts or the transport recovers — so it continues automatically within the
+        # budget. For every other ending the stage adapter classifies the durable world it owns:
+        # retained partial work or a changed input keeps continuing behind a recovery envelope; a
+        # clean exit that only left its required outcome missing earns one targeted repair naming
+        # that exact proof; nothing new stops the replay instead of burning a session on an
+        # identical prompt.
+        recovery = self._recover(record, obs)
+        if label == "recoverable" or recovery.kind == PROGRESS:
+            return self._continue(record, obs, recovery.envelope, cause)
+        if recovery.kind == REPAIR and record.repairs < REPAIR_BUDGET:
+            record.repairs += 1
+            return self._continue(record, obs, recovery.envelope, cause, repair=True)
+        record.hold_reason = "no new recovery state to act on"
+        if not self._hold(record):
             return None
-        else:
+        self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} ended ({cause}) with no "
+                          "new recovery state — not replaying an identical session; handoff "
+                          "pending; claim retained")
+        return self._finalize_hold(record)
+
+    def _continue(self, record: Record, obs, envelope: str, cause: str,
+                  *, repair: bool = False) -> "StageOutcome | None":
+        """Requeue one continuation when the attempt budget allows, stamping the bounded recovery
+        envelope so the fresh session resumes from durable facts rather than replaying an identical
+        prompt (issue #225). At the budget the stage holds for a human, exactly as an exhausted
+        continuation always has."""
+        if record.attempts >= ATTEMPT_BUDGET:
             record.hold_reason = "continuation budget exhausted"
             if not self._hold(record):
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
                               f"({cause}) — continuation budget exhausted; handoff pending; "
                               f"claim retained")
-        # The stage adapter proves a live external handoff; the coordinator then finalizes it
-        # idempotently and crash-safely.
-        return self._finalize_hold(record)
+            return self._finalize_hold(record)
+        record.state = WAITING
+        record.continuation = True
+        record.eligible_at = obs.reset_at or 0
+        record.recovery_envelope = envelope or None
+        if not self._persist(record):
+            return None
+        done = record.attempts  # continuations begun after this interruption
+        when = f"at {record.eligible_at}" if record.eligible_at else "next cycle"
+        kind = "targeted repair" if repair else f"continuation {done}/{CONTINUATION_BUDGET}"
+        self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
+                          f"({cause}) — {kind} eligible {when}; claim retained")
+        return None
+
+    def _recover(self, record: Record, obs) -> Recovery:
+        """The stage adapter's classification of what a fresh attempt would have new to act on. A
+        stage adapter with no ``recover`` hook keeps the historical behavior — every non-permanent
+        ending continues within the attempt budget — so only a stage that opts in stops an
+        identical replay (issue #225)."""
+        fn = getattr(self._adapter, "recover", None)
+        result = fn(record, obs) if fn is not None else None
+        return result if isinstance(result, Recovery) else Recovery(PROGRESS)
 
     def _integration_collision(self, record: Record) -> str | None:
         """The `origin/main` head a Build reported an integration collision against this attempt,

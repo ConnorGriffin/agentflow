@@ -68,6 +68,13 @@ class ConverseStageAdapter:
         exit that recorded nothing does not, and the turn continues within budget."""
         return bool(self._reply_ready(record, obs))
 
+    def recover(self, record, obs):
+        """A Converse turn works in a retained Ask worktree, so a continuation carries its
+        partial reply forward. Continue within the budget behind a bounded recovery envelope
+        pointing the fresh session at that worktree (issue #225)."""
+        from agentflow.coordinator.recovery import durable_progress
+        return durable_progress(record, "an appended reply for this conversation turn")
+
     def finalize_completed(self, record) -> str | None:
         """Adopt the accepted turn: append its immutable reply to the daemon-owned workspace and
         release the turn's claim, retiring the record with no successor. This is the *only* writer

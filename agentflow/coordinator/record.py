@@ -54,6 +54,12 @@ class Record:
                                             # collision hands the issue off instead of retrying (#209)
     restart_resumes: int = 0     # consecutive restart-resumes of the current attempt — bounded, so a
                                  # session that keeps dying with no end fact still parks eventually
+    repairs: int = 0             # targeted repairs granted for a clean exit that only left its
+                                 # required outcome missing; bounded so a read-only stage cannot
+                                 # replay an identical no-outcome session more than once (issue #225)
+    recovery_envelope: str | None = None  # bounded durable facts (attempt number, missing outcome,
+                                          # retained worktree) stamped on a continuation so the fresh
+                                          # session resumes instead of replaying the same prompt (#225)
     state: str = WAITING
     claim: bool = True           # holds the GitHub dedup claim while the stage is owned
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move

@@ -158,7 +158,10 @@ def test_unprojected_completed_intake_keeps_rollback_draining(make_coord):
     assert tracer.owned_issues(coord._store.load().values(), "o/r", lane="triaging") == {7}
 
 
-def test_unparsed_success_uses_three_started_attempts_then_one_hold(make_coord):
+def test_unparsed_clean_exit_gets_one_targeted_repair_then_holds(make_coord):
+    # A clean Intake exit that parsed no route owns no durable partial work, so a second full
+    # replay would be identical. The stage gets its initial attempt plus exactly one targeted
+    # repair (naming the missing route), then parks rather than burning a third session (#225).
     fake = IntakeSession()
     holds = []
     adapter = IntakeStageAdapter(
@@ -170,7 +173,7 @@ def test_unparsed_success_uses_three_started_attempts_then_one_hold(make_coord):
 
     starts = starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE)
 
-    assert starts == 3
+    assert starts == 2
     assert holds == [identity]
 
 
@@ -409,7 +412,7 @@ def test_production_exhaustion_notifies_once(make_coord, monkeypatch):
     coord = make_coord(fake, adapter=adapter)
     identity = coord.submit_stage(_submission())
 
-    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 3
+    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 2
     coord.cycle("claude")
 
     assert len(applied) == 1 and released == [7] and len(notified) == 1
@@ -432,7 +435,7 @@ def test_exhaustion_retries_a_failed_notification_before_holding(make_coord, mon
     coord = make_coord(fake, adapter=adapter)
     identity = coord.submit_stage(_submission())
 
-    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 3
+    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 2
     assert len(notified) == 2
     assert notified[0][3] == notified[1][3]  # ntfy replaces one stable client notification
     assert record_of(coord, identity).notifications == 1
@@ -464,7 +467,7 @@ def test_exhaustion_replay_after_accepted_delivery_updates_one_notification(make
     coord = make_coord(fake, adapter=adapter)
     identity = coord.submit_stage(_submission())
 
-    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 3
+    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 2
     assert len(notified) == 2
     assert notified[0][3] == notified[1][3]
     assert record_of(coord, identity).notifications == 1

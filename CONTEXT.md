@@ -226,6 +226,17 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   their existing changes; read-only stages restart from their durable source state.
   *Avoid:* retry (which suggests discarding the earlier attempt and starting over).
 
+- **Recovery envelope** — the bounded durable facts a continuation hands its fresh
+  session so it resumes rather than replays: the attempt number, the missing outcome, and
+  the retained worktree path. Never the prior session's event stream. A continuation with
+  no envelope would just re-run the identical prompt (ADR 0043).
+
+- **Targeted repair** — the single continuation a read-only stage (intake, review) earns
+  after a clean exit that produced no outcome. Its envelope names the exact missing proof.
+  A read-only stage owns no partial work, so beyond one repair a fresh session would replay
+  identically — so it parks for a human instead (ADR 0043).
+  *Avoid:* retry, replay (both imply re-running the same empty attempt).
+
 - **Stage outcome** — the durable fact a pipeline stage must produce before the pipeline
   can advance, such as an intake route, opened PR, or review verdict. A clean process exit
   without that fact is incomplete, not success; a human hold is a separate terminal handoff.

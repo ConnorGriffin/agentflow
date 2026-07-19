@@ -123,7 +123,10 @@ then Context / Decision / Alternatives / Consequences.
   knowledge (OKF) layer complements, never replaces, the slim code graph: retrieval
   gated by task shape and capped at a few concepts, kept as a derived projection of
   CONTEXT.md and the ADRs.
+- [0043](0043-recovery-state-before-replay.md) — A retry needs new recovery state: a
+  clean read-only exit with no outcome earns one targeted repair then parks; worktree
+  stages continue behind a bounded recovery envelope; identical stateless replays stop.
 - [0044](0044-stage-session-profiles-and-ceilings.md) — Every daemon session gets a
   per-stage tool allowlist (read-only for Intake/Review/Research), an empty MCP set,
   and per-cell wall/turn ceilings replacing the shared two-hour timeout; fail closed
-  on withheld capability. (ADR 0043 is on PR #241.)
+  on withheld capability.

@@ -65,6 +65,13 @@ class RespondStageAdapter:
         no reply, or left an unpushed local change, does not."""
         return bool(self._reply_ready(record, obs))
 
+    def recover(self, record, obs):
+        """Respond reuses the PR-branch worktree across a continuation, so a continuation carries
+        any partial reply/change forward. Continue within the budget behind a bounded recovery
+        envelope pointing the fresh session at that worktree (issue #225)."""
+        from agentflow.coordinator.recovery import durable_progress
+        return durable_progress(record, "a posted reply to the answered comment (and any pushed change)")
+
     def finalize_completed(self, record) -> str | None:
         """Release the change claim once the reply is durable, retiring the record with no
         successor and no human handoff — an answered PR simply returns to the normal merge
