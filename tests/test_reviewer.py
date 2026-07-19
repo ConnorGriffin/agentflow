@@ -62,30 +62,23 @@ def test_empty_payload_is_not_clean():
     assert parse_verdict("").clean is False
 
 
-def test_prose_then_fenced_json_is_parsed():
-    payload = "Here is my review:\n```json\n{\"verdict\": \"PASS\", \"findings\": []}\n```\nDone."
-    assert parse_verdict(payload).clean is True
-
-
-def test_prose_then_bare_json_verdict_is_recovered():
-    # The live loop failure (PR #7): the reviewer reasons, then emits a bare verdict.
-    payload = ("I checked the diff against the acceptance criteria — word_count is correct\n"
-               "and the test covers empty + multi-word. No blocking issues.\n\n"
-               '{"verdict": "PASS", "reviewed_sha": "abc123", "findings": []}')
-    v = parse_verdict(payload, expected_sha="abc123")
+def test_pure_structured_verdict_parses_with_surrounding_whitespace():
+    # Native schema output is the verdict object itself; only surrounding whitespace is tolerated.
+    v = parse_verdict('\n\n{"verdict": "PASS", "reviewed_sha": "abc123", "findings": []}\n\n',
+                      expected_sha="abc123")
     assert v.clean is True and v.parsed is True
 
 
-def test_prose_then_bare_json_block_recovers_findings():
-    payload = 'Looks off.\n{"verdict": "BLOCK", "findings": [{"severity": "blocking", "summary": "off-by-one"}]}'
-    v = parse_verdict(payload)
-    assert v.clean is False and len(v.blocking) == 1
-
-
-# adversarial: dup-key protection must survive even with leading reasoning prose
-def test_prose_then_duplicate_verdict_keys_is_not_clean():
-    payload = 'Reasoning first...\n{"verdict": "BLOCK", "verdict": "PASS", "findings": []}'
-    assert parse_verdict(payload).clean is False
+@pytest.mark.parametrize("payload", [
+    'Here is my review:\n```json\n{"verdict": "PASS", "findings": []}\n```\nDone.',
+    "No blocking issues.\n\n{\"verdict\": \"PASS\", \"reviewed_sha\": \"abc123\", \"findings\": []}",
+    'Reasoning first...\n{"verdict": "BLOCK", "verdict": "PASS", "findings": []}',
+])
+def test_prose_wrapped_verdict_is_no_longer_scavenged(payload):
+    # The prompt-only JSON extraction is gone: with a native schema the verdict is pure
+    # structured output, so a verdict buried in reasoning prose is unreadable and never clean.
+    v = parse_verdict(payload, expected_sha="abc123")
+    assert v.clean is False and v.parsed is False
 
 
 # adversarial #2 — proof-of-work: the verdict must name the head SHA we're merging

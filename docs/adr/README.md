@@ -114,7 +114,16 @@ then Context / Decision / Alternatives / Consequences.
 - [0040](0040-spend-per-success-measurement-contract.md) — Spend experiments measure
   headroom-denominated cost per verified stage and per merged issue, gated by quality
   guardrails and cohort cells; dollars are only the cross-tool comparison signal.
+- [0041](0041-stage-model-reasoning-matrix.md) — Stage model/complexity cells stay
+  mostly unchanged (Opus Build and all-deep Intake are complexity decisions owned by
+  #228; deep cross-tool Review is safety, not a savings target); Respond/conflict-Revise
+  carry-complexity is a directional parity note; every reasoning-effort cell is unset
+  pending #223 telemetry.
+- [0042](0042-codegraph-okf-complementary-layer.md) — The curated operational
+  knowledge (OKF) layer complements, never replaces, the slim code graph: retrieval
+  gated by task shape and capped at a few concepts, kept as a derived projection of
+  CONTEXT.md and the ADRs.
 - [0044](0044-stage-session-profiles-and-ceilings.md) — Every daemon session gets a
   per-stage tool allowlist (read-only for Intake/Review/Research), an empty MCP set,
   and per-cell wall/turn ceilings replacing the shared two-hour timeout; fail closed
-  on withheld capability. (0041–0043 land on other open PRs.)
+  on withheld capability. (ADR 0043 is on PR #241.)
