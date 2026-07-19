@@ -311,6 +311,38 @@ def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord
     assert observation.timed_out is False
 
 
+def test_real_supervisor_remembers_sigterm_from_provider_spawn(coord_state):
+    """A provider can run immediately after Popen creates it, before the supervisor reaches
+    its wait. Its SIGTERM request is remembered, reaches the real provider group, and still
+    leaves the durable end facts reconciliation depends on."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.store import Store, default_store_path
+
+    script = (
+        "import os,signal,time\n"
+        "os.kill(os.getppid(), signal.SIGTERM)\n"
+        "time.sleep(30)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(provider, timeout=5, session_timeout=30))
+    identity = coord.submit_stage(review(subject="spawn-term", pool="claude"))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        record = Store(default_store_path()).load()[identity]
+        if not pid_family_alive(record.family):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("provider supervisor did not finish after spawn-time SIGTERM")
+
+    observation = ClaudeProviderAdapter().observe(record)
+    assert observation.signal in {signal.SIGTERM, signal.SIGKILL}
+    assert observation.timed_out is False
+    assert observation.has_end_fact is True
+
+
 def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tmp_path):
     """The path named in the boundary is also the provider process's real working directory,
     which is what the Claude project settings and OS workspace sandbox confine."""

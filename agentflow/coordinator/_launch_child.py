@@ -21,14 +21,11 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from agentflow.coordinator.session import events_path, write_result
 from agentflow.coordinator.store import Store
-
-
-class _TerminationRequested(Exception):
-    """Interrupt a provider wait so its supervisor can stop the process group cleanly."""
 
 
 def _mark_active(working_dir: str) -> Path | None:
@@ -64,6 +61,16 @@ def main(args: list[str]) -> None:
     if os.fork() > 0:
         os._exit(0)
     os.setsid()
+    stop_requested = False
+
+    def request_stop(_signum, _frame) -> None:
+        nonlocal stop_requested
+        stop_requested = True
+
+    # Once child_start publishes this pid, reconciliation may signal it immediately. Install
+    # the handler before that family becomes externally visible; it only records intent so a
+    # request arriving inside store or process startup cannot strand an async exception there.
+    signal.signal(signal.SIGTERM, request_stop)
     store = Store(store_path)
     won = store.child_start(identity, token, os.getpid())
     store.close()
@@ -104,20 +111,24 @@ def main(args: list[str]) -> None:
                     pass
                 return process.wait()
 
-        def request_stop(_signum, _frame) -> None:
-            raise _TerminationRequested
-
         # Reconciliation signals this supervisor, not the provider's separate session. Turn that
         # request into the same orderly process-group shutdown the deadline path uses, then keep
         # the supervisor alive to write the provider's durable end facts.
-        signal.signal(signal.SIGTERM, request_stop)
-        try:
-            returncode = process.wait(timeout=float(timeout))
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            returncode = stop_provider()
-        except _TerminationRequested:
-            returncode = stop_provider()
+        deadline = time.monotonic() + float(timeout)
+        while True:
+            if stop_requested:
+                returncode = stop_provider()
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                returncode = stop_provider()
+                break
+            try:
+                returncode = process.wait(timeout=min(remaining, 0.1))
+                break
+            except subprocess.TimeoutExpired:
+                pass
         output.flush()
         os.fsync(output.fileno())
     ended_by_signal = -returncode if returncode < 0 else None

@@ -1710,6 +1710,8 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
             continue
         submission = _moved_head_review_submission(record, head)
         if submission is not None:
+            if record.state == RUNNING:
+                _kill_running_family(record)
             try:
                 coord.submit_stage(submission)
             except StoreUnavailable:

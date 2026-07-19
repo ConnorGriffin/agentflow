@@ -1006,6 +1006,33 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     assert live == ["o/r|7|review|live-sha"]
 
 
+def test_a_running_moved_head_review_terminates_before_opening_its_successor(make_coord,
+                                                                               monkeypatch):
+    """A live review is stopped before its moved-head successor takes the claim (#220)."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    stale = coord.submit_stage(_diverged_review(target="stale-sha", round=0))
+    coord.cycle("codex")
+    assert record_of(coord, stale).state == "running"
+
+    events = []
+    submit_stage = coord.submit_stage
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: events.append(("kill", rec.identity)))
+    monkeypatch.setattr(coord, "submit_stage",
+                        lambda submission: events.append(("submit", submission.target))
+                        or submit_stage(submission))
+    monkeypatch.setattr("agentflow.loop._run", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda tool: "codex")
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert events == [("kill", stale), ("submit", "live-sha")]
+    assert record_of(coord, stale).retired is True
+    assert record_of(coord, "o/r|7|review|live-sha").claim is True
+
+
 def test_a_moved_head_parks_once_when_the_revise_rounds_are_spent(make_coord, monkeypatch):
     """When the auto-revise rounds are already spent, a moved head has no bounded successor to open,
     so the open PR parks once through the existing Review exhaustion handoff."""
