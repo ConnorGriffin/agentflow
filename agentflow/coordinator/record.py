@@ -91,6 +91,10 @@ class Record:
                                          # 0038); >0 marks a survivor conflict resolution, budgeted
                                          # separately from the finding-driven `round` and joined to
                                          # the identity so each conflict is a genuinely fresh stage
+    resume: int = 0                      # which deliberate maintainer resume of an exhausted Build
+                                         # this is (#245); >0 joins the identity so a resume opens a
+                                         # genuinely fresh bounded execution rather than colliding
+                                         # with the terminal `held` record whose identity stays live
     auto_merge_allowed: bool = True
     root: str | None = None              # the root stage this descends from; it shares the root's reservation
     interactive: bool = False            # an operator-present turn (Ask) that outranks background

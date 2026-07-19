@@ -78,6 +78,54 @@ def build_submission(cfg, issue: dict, tool: str):
         source=_builder_worktree(cfg, tool, n, sl), claim=True, input_ptr=brief)
 
 
+def resume_if_held(submission, records):
+    """Turn a deliberate maintainer `build <N>` into an explicit, durable resume when the issue's
+    latest Build is a budget-exhausted ``held`` record (#245).
+
+    A ``held`` Build is terminal but never retired, so its stable identity (``repo|issue|build|-``)
+    stays live: an ordinary resubmission reuses it unwritten and no provider ever launches. When the
+    latest Build for this issue is that held record, this bumps the submission to the next resume
+    dimension, whose fresh identity opens a genuinely new bounded execution (a fresh
+    ``ATTEMPT_BUDGET``) that still reuses the same issue, brief, builder lineage, and retained
+    worktree ``source``. Otherwise the submission is returned unchanged, so an ordinary duplicate
+    stays idempotent and a repeated resume — whose successor is already live — never opens a second
+    concurrent Build. Pure: the resume decision is the test surface."""
+    from dataclasses import replace
+    from agentflow.coordinator.record import HELD
+
+    builds = [r for r in records
+              if r.repo == submission.repo and str(r.subject) == str(submission.subject)
+              and r.stage == "build"]
+    live = [r for r in builds if not r.retired]
+    if not live:
+        return submission                       # no live Build — an ordinary cold submission
+    latest = max(live, key=lambda r: r.resume)
+    if latest.state != HELD:
+        return submission                       # a live or completed Build — nothing to resume
+    # The next resume dimension is one past *every* Build ever opened for this issue — retired
+    # successors included — so a resume can never collide with a prior successor's identity.
+    next_resume = max(r.resume for r in builds) + 1
+    # Reuse the held builder's pinned pool, retained worktree, and durable brief so the resume
+    # *recovers* the same branch/worktree the stage adapter left on disk — and re-runs the same
+    # build brief — rather than re-deriving a fresh path from a possibly re-picked tool (#245).
+    return replace(submission, resume=next_resume, pool=latest.pool,
+                   source=latest.source, builder_lineage=latest.builder_lineage,
+                   input_ptr=latest.input_ptr)
+
+
+def resume_in_flight(submission, records) -> bool:
+    """True when a resume of this issue's Build is already live — a non-retired successor at a resume
+    dimension past the original held record, still running or queued (#245). A repeated maintainer
+    `build <N>` while that resume runs is correctly non-duplicating (``resume_if_held`` leaves it
+    unchanged, so it idempotently reuses the terminal held record), but the caller should acknowledge
+    the running resume rather than report the record as merely 'still held'. Pure."""
+    from agentflow.coordinator.record import HELD
+
+    return any(r.repo == submission.repo and str(r.subject) == str(submission.subject)
+               and r.stage == "build" and not r.retired and r.resume >= 1 and r.state != HELD
+               for r in records)
+
+
 def mockup_submission(cfg, issue: dict, tool: str):
     """Translate one eligible held issue into its single durable Mockup variant round.
 

@@ -81,6 +81,10 @@ class Submission:
     conflict_round: int = 0         # which conflict Revise this is in the PR's lifetime (ADR 0038):
                                     # >0 joins the identity so each conflict resolution is a fresh
                                     # stage, budgeted separately from the finding-driven `round`
+    resume: int = 0                 # which deliberate maintainer resume of an exhausted `held` Build
+                                    # this is (#245): >0 joins the identity so the resume opens a
+                                    # fresh bounded execution instead of colliding with the terminal
+                                    # held record still living at the base identity
     descendant_of: str | None = None  # a subagent shares this root stage's one reservation
     transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
     supersede: bool = False           # the ``transfer_from`` predecessor is a still-in-flight Review
@@ -156,7 +160,7 @@ class Coordinator:
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
-                             submission.round, submission.conflict_round)
+                             submission.round, submission.conflict_round, submission.resume)
         # A code-writing stage is pinned to the tool that built its diff (or, first time, its
         # own pool) and cannot silently cross pools; a read-only stage is unpinned and may run
         # on either pool. A review by the same tool that built the diff cannot auto-merge
@@ -172,7 +176,7 @@ class Coordinator:
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
             builder_complexity=submission.builder_complexity, round=submission.round,
-            conflict_round=submission.conflict_round,
+            conflict_round=submission.conflict_round, resume=submission.resume,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
@@ -190,6 +194,33 @@ class Coordinator:
                            f"{_OUTCOME_LABEL.get(prior.stage, prior.stage)}; "
                            f"claim transferred to {successor.stage}")
         return identity
+
+    def stage_record(self, identity: str) -> "Record | None":
+        """Public read of one durable stage record by its identity — fresh from the store — so the
+        dispatch layer can check whether a submission actually produced work eligible to run before
+        it claims the issue and reports success (#245). An ordinary resubmission of a terminal `held`
+        Build reuses that held record unchanged; the caller reads it here and neither claims nor
+        reports a launch. ``None`` when the identity is absent."""
+        with self._lock:
+            return self._store.record_of(identity)
+
+    def withdraw_stage(self, identity: str) -> bool:
+        """Roll back a freshly-submitted stage the dispatcher never managed to guard on GitHub, so no
+        orphaned ``waiting`` record is left for a later cycle to launch without the ownership claim
+        (#245). Retires only a never-started record — one that has consumed no attempt and holds no
+        live family — so a genuine in-flight Build is untouched; retiring it out of ``waiting`` keeps
+        a subsequent cycle from admitting it. Idempotent and a no-op for any started or absent record:
+        a repeat finds it already retired."""
+        with self._lock:
+            record = self._store.record_of(identity)
+            if (record is None or record.retired or record.state != WAITING
+                    or record.attempts != 0 or record.start_fact is not None
+                    or record.process_alive):
+                return False
+            record.state = COMPLETED
+            record.claim = False
+            record.retired = True
+            return self._persist(record, retire_descendants=True)
 
     def park_completed(self, identity: str) -> "StageOutcome | None":
         """Terminally park a completed stage the product policy leaves with no next stage to take
@@ -800,17 +831,21 @@ class Coordinator:
 
 
 def _identity(repo: str, subject: str, stage: str, target: str | None, round: int = 0,
-              conflict_round: int = 0) -> str:
+              conflict_round: int = 0, resume: int = 0) -> str:
     # The auto-revise round joins the identity once one exists, so an evidence-only revision —
     # whose re-review binds to the *same* head SHA — still opens a genuinely new stage rather
     # than colliding with the retired prior review's record. A conflict Revise's own round joins
     # it too (ADR 0038), so each conflict resolution is a fresh stage that never collides with a
-    # finding-driven revise on the same head SHA.
+    # finding-driven revise on the same head SHA. A deliberate maintainer resume of an exhausted
+    # Build joins its resume number the same way (#245): the terminal `held` record keeps the base
+    # identity live, so the successor must carry a distinct dimension or it would silently reuse it.
     parts = [repo, str(subject), stage, target or "-"]
     if round:
         parts.append(f"r{round}")
     if conflict_round:
         parts.append(f"c{conflict_round}")
+    if resume:
+        parts.append(f"s{resume}")
     return "|".join(parts)
 
 

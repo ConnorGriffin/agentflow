@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 
 import pytest
 
-from conftest import FakeSession, permits, record_of
+from conftest import FakeSession, permits, record_of, starts_until_held
 
 from agentflow import coordinated_build
 from agentflow.coordinator import BuildStageAdapter, Submission
@@ -430,6 +431,68 @@ def test_non_collision_exhaustion_is_unchanged(make_coord):
     rec = record_of(coord, ident)
     assert rec.attempts == 3 and rec.hold_reason == "continuation budget exhausted"
     assert rec.collision_main_sha is None
+
+
+# --- maintainer resume of an exhausted held build (#245) ---------------------------------
+
+def test_a_naive_resubmission_of_a_held_build_never_relaunches(make_coord):
+    # A Build held after exhausting its budget keeps its stable identity live but terminal. An
+    # ordinary resubmission of that same identity (transfer_from=None, supersede=False, resume=0)
+    # reuses the held record and launches nothing — the #245 collision the resume path must fix.
+    fake = FakeSession()
+    adapter = _adapter(fake, pr=[False], prep=[True], handoff=lambda record: "issue-proof")
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_build())
+    starts_until_held(coord, fake, ident, "claude")
+    held = record_of(coord, ident)
+    assert held.state == "held" and not held.retired and held.attempts == 3
+
+    resubmitted = coord.submit_stage(_build())
+    assert resubmitted == ident                    # same stable identity — no successor record
+    assert len(_records(coord)) == 1
+    assert coord.cycle("claude") == []             # nothing admitted — still terminal
+    after = record_of(coord, ident)
+    assert after.state == "held" and after.attempts == 3   # no fresh attempt was charged
+
+
+def test_a_maintainer_resume_opens_a_fresh_bounded_build_on_the_retained_worktree(make_coord):
+    fake = FakeSession()
+    adapter = _adapter(fake, pr=[False], prep=[True], handoff=lambda record: "issue-proof")
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_build())
+    starts_until_held(coord, fake, ident, "claude")
+    assert record_of(coord, ident).state == "held"
+
+    # The deliberate maintainer resume opens the next resume dimension — a genuinely new identity.
+    resume_ident = coord.submit_stage(replace(_build(), resume=1))
+    assert resume_ident != ident and resume_ident.endswith("|s1")
+    resumed = record_of(coord, resume_ident)
+    assert resumed.state == "waiting"              # eligible to run, unlike the held record
+    assert resumed.attempts == 0                   # a fresh bounded attempt budget
+    assert resumed.source == "/wt/issue-7"         # same retained worktree recovered, not re-created
+    assert resumed.lineage == "claude"             # builder lineage preserved
+
+    coord.cycle("claude")                          # admits and launches a provider session
+    started = record_of(coord, resume_ident)
+    assert started.state == "running" and started.attempts == 1
+    assert record_of(coord, ident).state == "held"  # the held predecessor is left untouched
+
+
+def test_a_repeated_resume_never_opens_a_second_concurrent_build(make_coord):
+    # Idempotency: once a resume is live, re-issuing the same resume returns it unchanged rather
+    # than spawning a second concurrent Build at the same resume identity.
+    fake = FakeSession()
+    adapter = _adapter(fake, pr=[False], prep=[True], handoff=lambda record: "issue-proof")
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_build())
+    starts_until_held(coord, fake, ident, "claude")
+
+    first = coord.submit_stage(replace(_build(), resume=1))
+    coord.cycle("claude")
+    again = coord.submit_stage(replace(_build(), resume=1))
+    assert first == again
+    builds = [r for r in _records(coord) if r.stage == "build" and r.resume == 1]
+    assert len(builds) == 1                        # one resume record, not two
 
 
 # --- idempotent submission ---------------------------------------------------------------

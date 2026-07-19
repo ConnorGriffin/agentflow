@@ -40,6 +40,35 @@ def test_submit_stage_is_idempotent_on_the_logical_stage_identity(make_coord):
     assert first == again
 
 
+def test_withdraw_stage_retires_an_unstarted_record_so_no_cycle_launches_it(make_coord):
+    # The by-hand build path submits the coordinator record before it can guard the issue on GitHub;
+    # a lost claim race must be able to withdraw the un-started record so a later cycle never launches
+    # it without the ownership claim (#245).
+    coord = make_coord(FakeSession())
+    identity = coord.submit_stage(Submission(repo="o/r", subject="5", stage="build", pool="claude",
+                                             complexity="deep"))
+    assert record_of(coord, identity).state == "waiting"
+
+    assert coord.withdraw_stage(identity) is True
+    withdrawn = record_of(coord, identity)
+    assert withdrawn.retired and withdrawn.state == "completed" and not withdrawn.claim
+    assert coord.cycle("claude") == []                     # the withdrawn record is never admitted
+    assert permits(coord, "claude") == 0
+    assert coord.withdraw_stage(identity) is False          # idempotent: a repeat is a no-op
+
+
+def test_withdraw_stage_refuses_a_started_build(make_coord):
+    # Withdrawal only rolls back a never-started submission; a Build that already consumed an attempt
+    # is untouched, so a genuine in-flight build is never silently retired (#245).
+    coord = make_coord(FakeSession())
+    identity = coord.submit_stage(Submission(repo="o/r", subject="6", stage="build", pool="claude",
+                                             complexity="deep"))
+    assert coord.cycle("claude") == []                     # the build starts
+    assert record_of(coord, identity).state == "running"
+    assert coord.withdraw_stage(identity) is False
+    assert record_of(coord, identity).state == "running"   # left in flight
+
+
 def test_legacy_lane_alias_never_turns_revise_into_build(make_coord):
     fake = FakeSession()
     coord = make_coord(fake)
@@ -564,8 +593,11 @@ def test_public_surface_keeps_completed_boundary_settlement_private(make_coord):
               if not name.startswith("_") and callable(getattr(coord, name))}
     # The deliberate public operations beside submit_stage/cycle: the completed-stage park handoff,
     # and the two Review-native disposals for a PR head that moved off the immutable target (#208).
-    assert public == {"submit_stage", "cycle", "park_completed",
-                      "retire_stale_review", "park_stale_review"}
+    # ``stage_record`` is a read-only observation, not a transition — the dispatch layer checks
+    # whether a submission produced runnable work before claiming the issue (#245); ``withdraw_stage``
+    # rolls back a never-started submission whose GitHub claim was lost to a race (#245).
+    assert public == {"submit_stage", "cycle", "park_completed", "retire_stale_review",
+                      "park_stale_review", "stage_record", "withdraw_stage"}
     assert not hasattr(coord, "permits")      # permit accounting is an internal invariant
     assert not hasattr(coord, "records")      # the working set is private (_records)
 
