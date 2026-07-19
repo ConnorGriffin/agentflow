@@ -293,12 +293,22 @@ def squash_merge(repo: str, pr_number: int) -> bool:
         return r.returncode == 0
 
 
-def park(repo: str, pr_number: int, verdict: Verdict,
+def park(repo: str, pr_number: int, verdict: Verdict | None,
          reason: str = "could not be auto-merged after review") -> None:
     """Post the review findings so a human can pick the PR up (drop-to-reviewed, or
-    the normal hand-off for a `reviewed`/`guarded` repo)."""
-    lines = [f"- **{f.severity}** {f.file}:{f.line} — {f.summary}".rstrip(" —:0")
-             for f in verdict.findings] or ["- (no blocking findings)"]
+    the normal hand-off for a `reviewed`/`guarded` repo).
+
+    Pass ``verdict=None`` when no review completed (budget exhaustion): the body
+    will say so explicitly rather than listing an empty findings section that
+    reads as a clean review.
+    """
+    if verdict is None:
+        findings_block = ("**No review was completed — do not treat this as a "
+                          "clean review.**")
+    else:
+        lines = [f"- **{f.severity}** {f.file}:{f.line} — {f.summary}".rstrip(" —:0")
+                 for f in verdict.findings] or ["- (no blocking findings)"]
+        findings_block = "Review findings:\n" + "\n".join(lines)
     body = ("> *agentflow: parked for human review.*\n\n"
-            f"This PR {reason}. Review findings:\n" + "\n".join(lines))
+            f"This PR {reason}. {findings_block}")
     _run(["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body", body])

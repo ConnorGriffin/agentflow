@@ -965,7 +965,6 @@ def _park_pr(record) -> str | None:
     from agentflow.gate import park
     from agentflow.loop import _pr_comments
     from agentflow.notify import notify
-    from agentflow.reviewer import Verdict
     pr = _park_pr_number(record)
     if pr is None:
         return None
@@ -975,7 +974,7 @@ def _park_pr(record) -> str | None:
         return None
     already = any(marker in comment.get("body", "") for comment in comments)
     if not already:
-        park(record.repo, pr, Verdict(clean=False),
+        park(record.repo, pr, None,
              reason="exhausted its review budget without a durable verdict")
     proved = _pr_comments(record.repo, pr)
     if proved is None or not any(marker in comment.get("body", "") for comment in proved):
