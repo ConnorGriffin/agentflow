@@ -126,3 +126,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0043](0043-recovery-state-before-replay.md) — A retry needs new recovery state: a
   clean read-only exit with no outcome earns one targeted repair then parks; worktree
   stages continue behind a bounded recovery envelope; identical stateless replays stop.
+- [0044](0044-stage-session-profiles-and-ceilings.md) — Every daemon session gets a
+  per-stage tool allowlist (read-only for Intake/Review/Research), an empty MCP set,
+  and per-cell wall/turn ceilings replacing the shared two-hour timeout; fail closed
+  on withheld capability.
