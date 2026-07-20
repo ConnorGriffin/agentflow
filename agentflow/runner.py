@@ -374,10 +374,13 @@ def _codex_local_mcp_config(servers: dict) -> list[str]:
     code-graph server Claude re-supplies via ``--mcp-config``. Codex takes MCP servers under the
     ``mcp_servers.<name>`` config table, so re-supply the *same* map here as dotted ``-c``
     overrides — applied on top of the ignored user config — giving both providers the code-graph
-    tool from one source while the account connectors stay excluded. Each ``-c`` value is parsed as
-    TOML: ``json.dumps`` renders strings and lists as valid TOML scalars/arrays, and env vars go in
-    one key at a time so no inline table has to be hand-built. A server without a ``command`` is
-    skipped; an empty map yields no overrides (nothing to attach)."""
+    tool from one source while the account connectors stay excluded. Each ``-c`` *value* is parsed
+    as TOML: ``json.dumps`` renders strings and lists as valid TOML scalars/arrays, and env vars go
+    in one key at a time so no inline table has to be hand-built. The server name is used verbatim
+    as a dotted-key segment, which is correct for the fleet's bare-word (dash-separated) server
+    names; a name containing a ``.`` would nest as sub-tables — not a shape any operator config
+    uses, so it is left unescaped rather than guarded speculatively. A server without a ``command``
+    is skipped; an empty map yields no overrides (nothing to attach)."""
     argv: list[str] = []
     for name, spec in servers.items():
         if not isinstance(spec, dict):
