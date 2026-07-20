@@ -11,6 +11,7 @@ from agentflow.coordinator import MockupStageAdapter, StageRouter
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator import tracer
 from agentflow.coordinator.record import Record
+from agentflow.worktree_ref import WorktreeRef
 
 
 def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage():
@@ -24,9 +25,28 @@ def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage()
     assert first.stage == "mockup" and first.subject == "11" and first.target is None
     assert first.pool == first.builder_lineage == "claude"
     assert first.complexity == "deep" and first.claim is True
-    assert first.source == "/home/w/.agentflow/worktrees/claude/mockup-11-compare-navigation-concepts"
+    # State the owned worktree through the layout owner, not a hand-written path: the submission
+    # and the assertion read the same convention, and the drawing/review pair reads as one issue.
+    expected = WorktreeRef.for_mockup("/home/w", "claude", 11, "compare-navigation-concepts")
+    assert first.source == expected.path
     assert "/ui-mockups" in first.input_ptr and "EXACTLY ONE comment" in first.input_ptr
     assert "continuation" in first.input_ptr and "NEVER post another" in first.input_ptr
+
+
+def test_mockup_source_reads_back_to_its_own_branch_through_the_layout_owner():
+    """The worktree a Mockup submission builds and the branch the admission parser later derives
+    from it are two directions of one convention, so they cannot drift: parsing the submitted
+    source back must yield the same branch the checkout is registered on."""
+    cfg = SimpleNamespace(repo="o/r", workdir="/home/w")
+    issue = {"number": 11, "title": "A screen", "body": "Draw it"}
+
+    sub = coordinated_build.mockup_submission(cfg, issue, "claude")
+    record = SimpleNamespace(source=sub.source, pool="claude", lineage="claude",
+                             stage="mockup", subject="11")
+    workdir, branch, path = coordinated_build._source_facts(record)
+
+    expected = WorktreeRef.for_mockup("/home/w", "claude", 11, "a-screen")
+    assert (workdir, branch, str(path)) == (expected.workdir, expected.branch, expected.path)
 
 
 def test_resubmission_cannot_switch_the_original_mockup_lineage(make_coord):
