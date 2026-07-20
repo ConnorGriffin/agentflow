@@ -33,8 +33,7 @@ from typing import Callable, Literal, Sequence
 
 from agentflow import github, notify as _notify
 
-# One fixed length for every derived notify key, replacing the copy-pasted 12-versus-24
-# character hashes the scattered sites used.
+# One fixed length for every derived notify key (see module docstring).
 _SEQUENCE_ID_LENGTH = 24
 
 
@@ -61,7 +60,7 @@ class Notification:
 
 # Seams, defaulting to the real GitHub-access module (ADR 0040) and the ntfy push. Tests
 # state GitHub's answer and observe the ping by substituting these.
-CommentReader = Callable[[Subject], "Sequence[github.Comment] | None"]
+CommentReader = Callable[[Subject], Sequence[github.Comment] | None]
 Notifier = Callable[[str, str, str, str], bool]
 
 
