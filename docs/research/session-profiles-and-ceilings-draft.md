@@ -78,8 +78,10 @@ fail-closed argument arriving for free.
 Drive`, `claude.ai Google Calendar`, `claude.ai Gmail` — and 12 sessions had their
 tool schemas fully expanded into the surface (that is where the 59-tool maximum
 comes from). None of these are relevant to any agentflow stage. `--setting-sources
-project` was meant to exclude user config, yet the MCP servers still attach; a
-narrow profile that pins the MCP set to empty closes this leak outright.
+project` was meant to exclude user config, yet the MCP servers still attach;
+launching under strict MCP mode and re-supplying only the operator's local dev
+servers (the code-graph tool) closes this leak outright while keeping code-graph
+available to daemon sessions (#244).
 
 ### 2c. Ceiling: the 2-hour timeout is dead — it never fires, and it can't kill early
 
@@ -158,7 +160,9 @@ The seam is `provider_command(record)` → `ClaudeRunner.structured_argv(...)`
 | **Research** | read-only + only the external tool its question needs (`WebSearch`/`WebFetch`); no edit tools | none | research skill only |
 | **Build / Respond / Revise** | full edit/test surface (`Read`/`Edit`/`Write`/`Bash`/`Grep`/`Glob`/…) | none | keep repo-relevant skills; drop personal/scheduling ones |
 
-Rules for every profile: **MCP server set pinned to empty** (closes §2b), and
+Rules for every profile: **MCP set pinned to strict mode, re-supplying only the
+operator's local servers** — the code-graph tool, allowlisted for read-only stages
+too (closes §2b, keeps code-graph; #244) — and
 `Cron*`/`Schedule*`/`RemoteTrigger`/`PushNotification`/`Monitor`/`Task*`/plan-mode
 tools dropped everywhere — history shows them loaded in every stage and used in
 none.
@@ -198,14 +202,21 @@ that finding-driven Revise carries the builder's complexity.
 
 ### 3c. Fail-closed when a narrow profile is missing a capability
 
-If a stage under a narrow profile reaches for a capability the profile withholds
-(e.g. a Review tries to `Edit`, as 2 historically did), the session must **fail
-closed to a human hold** — the same durable handoff a budget exhaustion produces —
-never silently degrade and never silently "succeed." A hit on this path is a
-signal the profile is wrong for that stage, and the operator should see it. Same
-for a ceiling: hitting the wall/turn ceiling is a `TIMEOUT`-class recoverable end
-(existing behavior), and the tightened numbers make that kill *useful* instead of
-theatrical.
+The narrow profile must **fail closed** on a withheld capability (e.g. a Review
+reaching for `Edit`, as 2 historically did) — never silently degrade and never
+silently "succeed."
+
+*Correction from implementation (ADR 0044 pt 5):* the draft assumed the withheld
+tool would remain callable and produce a "permission denied" event the coordinator
+could turn into a capability-naming human hold. Verifying against the CLI init
+event showed that both the `--tools` allowlist and a `permissions.deny` block
+*remove the tool from the loaded surface entirely* — it has no schema, so the model
+cannot emit a call for it. Fail-closed is therefore delivered by **unreachability**:
+the read-only stage physically cannot exercise the capability. There is no denied
+event to catch, so there is no capability-naming hold on this path (and none is
+needed — nothing degrades because nothing can be edited). A ceiling hit is separate:
+the wall/turn ceiling is a `TIMEOUT`-class recoverable end (existing behavior), and
+the tightened numbers make that kill *useful* instead of theatrical.
 
 ## 4. What the post-#223 comparison must confirm
 

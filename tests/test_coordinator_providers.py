@@ -73,8 +73,10 @@ def test_claude_allowed_rate_limit_event_establishes_no_cause():
 
 
 def test_claude_terminal_result_subtype_failures_are_process_interruptions():
+    # A max-turns end is now a real per-stage ceiling hit — recoverable TIMEOUT, not incomplete
+    # PROCESS (ADR 0044): the same class as the wall-clock deadline.
     assert classify_claude(
-        [{"type": "result", "subtype": "error_max_turns"}]).cause is ProviderCause.PROCESS
+        [{"type": "result", "subtype": "error_max_turns"}]).cause is ProviderCause.TIMEOUT
     assert classify_claude(
         [{"type": "result", "subtype": "error_during_execution"}]).cause is ProviderCause.PROCESS
     assert classify_claude(
@@ -213,7 +215,7 @@ def test_provider_command_unwraps_the_versioned_durable_prompt(monkeypatch):
 
     prompts = []
     monkeypatch.setattr(ClaudeRunner, "structured_argv",
-                        lambda self, prompt, model, source, schema=None:
+                        lambda self, prompt, model, source, schema=None, profile=None:
                         prompts.append(prompt) or ["claude"])
     record = Record("i", "intake", "claude", 1, model="opus", source="/wt",
                     input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,

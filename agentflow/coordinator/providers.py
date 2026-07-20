@@ -103,8 +103,10 @@ _CLAUDE_ERROR_CAUSES = {
 # Terminal `result.subtype` failures (SDKResultMessage). `success` is a clean end; the error
 # subtypes are a process-level interruption that no typed provider cause explains, so they map to
 # the recoverable/incomplete PROCESS cause rather than being guessed at as capacity or permanent.
+# ``error_max_turns`` is now a real per-stage ceiling (ADR 0044): hitting it is a recoverable
+# TIMEOUT-class end, the same class as the wall-clock deadline, not an incomplete PROCESS end.
 _CLAUDE_RESULT_CAUSES = {
-    "error_max_turns": ProviderCause.PROCESS,
+    "error_max_turns": ProviderCause.TIMEOUT,
     "error_during_execution": ProviderCause.PROCESS,
     "error_max_budget_usd": ProviderCause.PERMANENT,
     "error_max_structured_output_retries": ProviderCause.PROCESS,
@@ -368,10 +370,11 @@ class ClaudeProviderAdapter:
         self._prompt_of = prompt_of or _durable_prompt
 
     def command(self, record) -> list[str]:
+        from agentflow.coordinator.profiles import profile_for
         from agentflow.runner import ClaudeRunner
         return ClaudeRunner().structured_argv(
             self._prompt_of(record), record.model, record.source,
-            schema=_stage_result_schema(record.stage))
+            schema=_stage_result_schema(record.stage), profile=profile_for(record))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
@@ -394,10 +397,11 @@ class CodexProviderAdapter:
         self._account_of = account_of
 
     def command(self, record) -> list[str]:
+        from agentflow.coordinator.profiles import profile_for
         from agentflow.runner import CodexRunner
         return CodexRunner().structured_argv(
             self._prompt_of(record), record.model, record.source,
-            schema=_stage_result_schema(record.stage))
+            schema=_stage_result_schema(record.stage), profile=profile_for(record))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)

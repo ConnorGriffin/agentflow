@@ -15,9 +15,15 @@ one-size surface and single two-hour timeout:
    (Build, Respond, Revise, Mockup) keep the full edit/test surface. Withheld
    tools are **removed from the loaded surface** (that is where the cache-creation
    savings live), with a settings-level deny as backstop — not deny-only.
-2. **MCP servers are pinned to empty** for every stage. Personal connectors never
-   attach to daemon sessions (tracked independently as
-   [#240](https://github.com/ConnorGriffin/agentflow/issues/240)).
+2. **MCP servers are pinned to strict mode** for every stage: only the servers the
+   launcher hands the session attach, so the operator's personal claude.ai connectors
+   never leak in ([#240](https://github.com/ConnorGriffin/agentflow/issues/240)). The
+   operator's *local* dev servers — notably the codebase code-graph tool — are
+   re-supplied so daemon sessions keep them ([#244](https://github.com/ConnorGriffin/agentflow/issues/244)),
+   and a read-only stage's allowlist includes those local servers so an exploration
+   stage (Intake, Review, Research) keeps the same code-graph access Build has. It is
+   the withheld *edit* tools, not the local read-only MCP tools, that a read-only stage
+   loses.
 3. **Per-stage wall-clock and turn ceilings replace the shared two-hour timeout**,
    sized ~1.5–2× the observed maximum per (stage, complexity, effort) cell — the
    table in the research doc is the source of truth. Thin-sample stages (Respond,
@@ -26,9 +32,16 @@ one-size surface and single two-hour timeout:
    inherits the original builder's Build ceiling (consistent with ADR 0041).
 4. **No dollar-denominated session cap.** The objective is prepaid headroom
    (ADR 0040); wall + turn ceilings are the only kill switches.
-5. **Fail closed.** A stage that reaches for a capability its profile withholds
-   ends in a human hold, never silent degradation. Hitting a ceiling remains a
-   recoverable timeout-class ending.
+5. **Fail closed by construction.** A withheld capability is *removed from the
+   session's loaded tool surface* (allowlist strip, with the settings deny as an
+   independent second strip), verified against the CLI init event: the tool has no
+   schema, so a read-only stage cannot emit a call for it at all. The fail-closed
+   guarantee is that the capability is **unreachable** — not that a reach is caught
+   and converted to a hold. (An earlier draft assumed a denied tool stayed callable
+   and produced a "permission denied" event the coordinator could turn into a
+   capability-naming human hold; the CLI does not work that way — a denied or
+   un-allowlisted tool is absent, not present-and-refused — so no such event exists
+   to key on.) Hitting a ceiling remains a recoverable timeout-class ending.
 
 ## Consequences
 

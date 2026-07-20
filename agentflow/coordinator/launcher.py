@@ -28,7 +28,6 @@ from agentflow.coordinator.record import NOT_STARTED, STARTED  # re-exported for
 # Bounded wait for the spawned child to durably record `started` before we treat the launch
 # as one that never produced a provider family.
 _HANDSHAKE_TIMEOUT_S = float(os.environ.get("AGENTFLOW_COORD_HANDSHAKE_S", "10"))
-_SESSION_TIMEOUT_S = float(os.environ.get("AGENTFLOW_SESSION_TIMEOUT", str(2 * 3600)))
 
 
 @dataclass(frozen=True)
@@ -63,11 +62,24 @@ class LocalLauncher:
     """
 
     def __init__(self, provider_command=None, *, timeout: float = _HANDSHAKE_TIMEOUT_S,
-                 session_timeout: float = _SESSION_TIMEOUT_S) -> None:
+                 session_timeout: float | None = None) -> None:
         from agentflow.coordinator.providers import provider_command as real_command
         self._provider_command = provider_command or real_command
         self._timeout = timeout
+        # ``None`` (the production default) sizes each launch's wall ceiling from its stage
+        # profile (ADR 0044); an explicit value pins one ceiling for all launches (tests/ops).
         self._session_timeout = session_timeout
+
+    def _session_timeout_for(self, record) -> float:
+        """The wall-clock ceiling for this launch: an explicit constructor override, else the
+        ``AGENTFLOW_SESSION_TIMEOUT`` ops override, else the record's stage-profile wall ceiling."""
+        if self._session_timeout is not None:
+            return self._session_timeout
+        override = os.environ.get("AGENTFLOW_SESSION_TIMEOUT")
+        if override:
+            return float(override)
+        from agentflow.coordinator.profiles import profile_for
+        return float(profile_for(record).wall_ceiling_s)
 
     @staticmethod
     def is_alive(family: str | None) -> bool:
@@ -81,7 +93,8 @@ class LocalLauncher:
         try:
             child = subprocess.Popen(
                 [sys.executable, "-m", "agentflow.coordinator._launch_child",
-                 str(store.path), record.identity, str(token), str(self._session_timeout),
+                 str(store.path), record.identity, str(token),
+                 str(self._session_timeout_for(record)),
                  record.source or "", *argv])
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence

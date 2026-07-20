@@ -25,7 +25,7 @@ from pathlib import Path
 
 _ACTIVE_WORKTREES: dict[str, int] = {}
 
-_CLAUDE_AUTONOMOUS_SETTINGS = json.dumps({
+_CLAUDE_SANDBOX_SETTINGS = {
     "sandbox": {
         "enabled": True,
         "failIfUnavailable": True,
@@ -44,7 +44,19 @@ _CLAUDE_AUTONOMOUS_SETTINGS = json.dumps({
             ],
         },
     },
-}, separators=(",", ":"))
+}
+
+
+def _claude_settings(deny_tools: tuple[str, ...] = ()) -> str:
+    """Serialize the autonomous session settings, adding a ``permissions.deny`` block for the
+    tools a read-only profile withholds. The allowlist (``--tools``) already removes those tools
+    from the loaded surface; the deny block is the fail-closed backstop ADR 0044 pt 1 requires,
+    not the mechanism."""
+    settings = dict(_CLAUDE_SANDBOX_SETTINGS)
+    if deny_tools:
+        settings["permissions"] = {"deny": list(deny_tools)}
+    return json.dumps(settings, separators=(",", ":"))
+
 
 _CODEX_HEADLESS_RECOVERY = """
 Codex-only macOS browser recovery: when the shared drive-local-webapp driver prints
@@ -323,7 +335,7 @@ class ClaudeRunner(_WorktreeRunner):
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
-                        schema: dict | None = None) -> list[str]:
+                        schema: dict | None = None, profile=None) -> list[str]:
         """Build the structured Claude command run only by the coordinator launcher.
 
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
@@ -334,16 +346,34 @@ class ClaudeRunner(_WorktreeRunner):
         operator's personal claude.ai connectors can never attach (#240). We then re-supply
         the operator's local dev servers — the codebase code-graph tool — so daemon sessions
         keep it (#244). With no local servers configured the MCP set is simply empty.
+
+        A ``profile`` (ADR 0044) narrows the session to its stage: a read-only stage's
+        allowlist is handed to ``--tools`` so the withheld edit tools are absent from the
+        loaded surface (with a ``permissions.deny`` backstop in the settings), and the turn
+        ceiling is handed to ``--max-turns``. The read-only allowlist is the research §3a
+        read/search set plus the operator's re-supplied local servers (the code-graph tool):
+        an exploration stage keeps the same code-graph access Build has — it is the withheld
+        *edit* tools, not the local read-only MCP tools, that a read-only stage loses.
         """
+        from agentflow.coordinator.profiles import WITHHELD_EDIT_TOOLS
+
+        deny: tuple[str, ...] = ()
         argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
-                "--settings", _CLAUDE_AUTONOMOUS_SETTINGS,
                 "--strict-mcp-config"]
         servers = _operator_local_mcp_servers()
         if servers:
             argv += ["--mcp-config",
                      json.dumps({"mcpServers": servers}, separators=(",", ":"))]
+        if profile is not None:
+            if profile.allowed_tools is not None:
+                tools = list(profile.allowed_tools)
+                tools += [f"mcp__{name}" for name in servers]
+                argv += ["--tools", ",".join(tools)]
+                deny = WITHHELD_EDIT_TOOLS
+            argv += ["--max-turns", str(profile.turn_ceiling)]
+        argv += ["--settings", _claude_settings(deny)]
         if schema is not None:
             argv += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
         return argv
@@ -357,12 +387,18 @@ class CodexRunner(_WorktreeRunner):
     _CLI_MODEL = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra"}
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
-                        schema: dict | None = None) -> list[str]:
+                        schema: dict | None = None, profile=None) -> list[str]:
         """Build the structured Codex command run only by the coordinator launcher.
 
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
         Codex's native ``--output-schema`` file so the final response is validated structured
         output, not free text the parser must scavenge.
+
+        A read-only ``profile`` (ADR 0044) launches the session in the ``read-only`` Codex
+        sandbox so it cannot edit the checkout — Codex's own shape of the read-only stage
+        surface (there is no Claude-style per-tool allowlist flag). Codex already runs
+        ``--ignore-user-config``, so no personal MCP leaks in; the wall ceiling is applied
+        per-record by the launcher, the same as for Claude.
         """
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
         worktree = os.path.realpath(cwd)
@@ -373,8 +409,10 @@ class CodexRunner(_WorktreeRunner):
             "approval_policy={granular={sandbox_approval=true,rules=false,"
             "mcp_elicitations=false,request_permissions=false,skill_approval=false}}"
         )
+        read_only = profile is not None and profile.allowed_tools is not None
+        sandbox = "read-only" if read_only else "workspace-write"
         argv = [codex_bin, "exec", "-m", self._CLI_MODEL.get(model, model), "--json",
-                "--sandbox", "workspace-write", "--cd", worktree,
+                "--sandbox", sandbox, "--cd", worktree,
                 "--ignore-user-config", "--ephemeral", "-c", approval_policy,
                 "-c", 'approvals_reviewer="auto_review"',
                 "-c", f"auto_review.policy={json.dumps(_CODEX_AUTO_REVIEW_POLICY)}",
