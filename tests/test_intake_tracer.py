@@ -325,7 +325,9 @@ def test_production_projection_applies_once_then_releases_claim(make_coord, monk
     fake.end(identity, cause=ProviderCause.PROCESS)
     coord.cycle("claude")
     monkeypatch.setattr(loop, "_run", gh)
-    monkeypatch.setattr(intake_mod, "_run", gh)
+    # Intake's GitHub access now flows through the shared github module (ADR 0040); patch the
+    # one `_run` it shells out through so this fake still serves its reads and writes.
+    monkeypatch.setattr(intake_mod.github, "_run", gh)
     def release(repo, number):
         released.append(number)
         issue["labels"].remove("agentflow:triaging")

@@ -33,7 +33,8 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from agentflow.runner import Complexity, Effort, _run
+from agentflow import github
+from agentflow.runner import Complexity, Effort
 from agentflow.shell_crib import SHELL_CRIB
 
 # The provider-neutral shape Intake's terminal decision must match. Each runner adapter
@@ -403,24 +404,7 @@ def intake_prompt(repo: str, issue: dict, extra: str = "") -> str:
 def _ensure_label(repo: str, name: str) -> None:
     """Idempotently create the label so `--add-label` can't fail on a fresh repo."""
     color = _LABEL_COLORS.get(name, "ededed")
-    _run(["gh", "label", "create", name, "--repo", repo, "--color", color, "--force"])
-
-
-def _issue_body(repo: str, issue_number: int) -> str | None:
-    """The issue's current body text, or ``None`` when it can't be read. Impure.
-
-    Unreadable is deliberately distinct from an empty body: on a ready routing the current
-    body IS the original text we must preserve verbatim, so treating an unreadable read as ""
-    would silently replace the real original with the "no description as filed" placeholder.
-    A ready projection therefore fails closed on ``None`` (defer, retry next cycle) rather than
-    clobbering the original."""
-    r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "body"])
-    if r.returncode != 0:
-        return None
-    try:
-        return json.loads(r.stdout or "{}").get("body") or ""
-    except ValueError:
-        return None
+    github.create_label(repo, name, color)
 
 
 def _result_comment(result: IntakeResult) -> str:
@@ -448,15 +432,10 @@ def _result_comment_exists(repo: str, issue_number: int,
     Unreadable is deliberately distinct from absent: treating uncertainty as absence could
     post a duplicate while replaying a partially projected route.
     """
-    r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo, "--json", "comments"])
-    if r.returncode != 0:
+    comments = github.issue_comments(repo, issue_number)
+    if comments is None:
         return None
-    try:
-        comments = json.loads(r.stdout or "{}").get("comments", [])
-    except ValueError:
-        return None
-    return any(_comment_matches_result(c.get("body", ""), result)
-               for c in comments if isinstance(c, dict))
+    return any(_comment_matches_result(c.body, result) for c in comments)
 
 
 def apply_intake(repo: str, issue_number: int, current_title: str,
@@ -495,7 +474,7 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
                       and name not in set(labels) for name in current_labels)
     title_done = not retitled_from
     if result.route is IntakeRoute.READY:
-        current_body = _issue_body(repo, issue_number)
+        current_body = github.issue_body(repo, issue_number)
         if current_body is None:
             # Fail closed: we cannot compose the brief without the original to preserve.
             return f"routed -> {result.route.value} deferred (body unreadable)"
@@ -516,26 +495,23 @@ def apply_intake(repo: str, issue_number: int, current_title: str,
         return f"unchanged -> {result.route.value} (already posted)"
 
     if retitled_from is not None:
-        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo, "--title", target_title])
+        github.edit_title(repo, issue_number, target_title)
     if result.route is IntakeRoute.READY:
-        _run(["gh", "issue", "edit", str(issue_number), "--repo", repo,
-              "--body", expected_body])
+        github.edit_body(repo, issue_number, expected_body)
     if not comment_done:
-        _run(["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", comment])
+        github.comment(repo, issue_number, comment)
 
     for name in labels:
         _ensure_label(repo, name)
     new_labels_set = set(labels)
-    args = ["gh", "issue", "edit", str(issue_number), "--repo", repo]
     for name in labels:
-        args += ["--add-label", name]
+        github.add_label(repo, issue_number, name)
     for name in STATE_LABELS:  # keep exactly one state label — clear stale holds on promote
         if name not in new_labels_set and name in current_labels:
-            args += ["--remove-label", name]
+            github.remove_label(repo, issue_number, name)
     for name in current_labels:  # clear stale dials — a re-route leaves exactly one of each
         if any(name.startswith(p) for p in _DIAL_PREFIXES) and name not in new_labels_set:
-            args += ["--remove-label", name]
-    _run(args)
+            github.remove_label(repo, issue_number, name)
     tail = "" if result.parsed else " (fail-safe hold)"
     return f"routed -> {result.route.value}{tail}"
 
@@ -546,13 +522,11 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult,
     """Verify that the routing decision is visible on GitHub before disposal."""
     if result.route is IntakeRoute.NOTHING_NEW:
         return True
-    r = _run(["gh", "issue", "view", str(issue_number), "--repo", repo,
-              "--json", "title,body,labels,comments"])
-    if r.returncode != 0:
-        return False
-    try:
-        issue = json.loads(r.stdout or "{}")
-    except json.JSONDecodeError:
+    # Title+body+labels+comments in one read doesn't fit the typed single-field surface, so
+    # this verification reads through the escape hatch and owns GitHub's shape for this call.
+    issue = github.api(["issue", "view", str(issue_number), "--repo", repo,
+                        "--json", "title,body,labels,comments"], parse_json=True)
+    if not isinstance(issue, dict):
         return False
     labels = {label.get("name") for label in issue.get("labels", [])
               if isinstance(label, dict)}
@@ -588,14 +562,13 @@ def sweep_legacy_labels(repo: str) -> list[str]:
     """Migrate bare pre-enrollment needs-* labels to the agentflow:* vocabulary on open
     issues. Idempotent — safe to run more than once. Returns one-line change descriptions,
     one per issue touched."""
-    r = _run(["gh", "issue", "list", "--repo", repo, "--state", "open",
-              "--json", "number,labels", "--limit", "500"])
-    if r.returncode != 0:
-        return [f"error: could not list issues (exit {r.returncode})"]
+    issues = github.list_issues(repo, limit=500)
+    if issues is None:
+        return ["error: could not list issues"]
     changed = []
-    for issue in json.loads(r.stdout or "[]"):
-        n = issue["number"]
-        names = {lbl["name"] for lbl in issue.get("labels", [])}
+    for issue in issues:
+        n = issue.number
+        names = set(issue.labels)
         to_add: list[str] = []
         to_remove: list[str] = []
         for bare, namespaced in _LEGACY_LABEL_MAP.items():
@@ -605,13 +578,11 @@ def sweep_legacy_labels(repo: str) -> list[str]:
                 to_remove.append(bare)
         if not to_remove:
             continue
-        args = ["gh", "issue", "edit", str(n), "--repo", repo]
         for name in to_add:
             _ensure_label(repo, name)
-            args += ["--add-label", name]
+            github.add_label(repo, n, name)
         for name in to_remove:
-            args += ["--remove-label", name]
-        _run(args)
+            github.remove_label(repo, n, name)
         parts = []
         if to_add:
             parts.append(f"added {', '.join(sorted(to_add))}")

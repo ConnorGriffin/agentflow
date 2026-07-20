@@ -1,14 +1,17 @@
 """Test intake through its interface — the pure, fail-safe decision parser and the
 label mapping. Like the reviewer: anything we cannot read as a confident build-ready
 decision must fall back to holding for a human, never an accidental `ready`.
-"""
 
-import json
-from types import SimpleNamespace
+The GitHub-touching tests state facts through the shared `github` module's interface
+(ADR 0040) — a canned typed read, or a recorded typed write — never a `gh` argument
+vector. A read that returns ``None`` models the module's fail-closed "unreadable"
+contract, which intake must never confuse with an empty subject.
+"""
 
 import pytest
 
 from agentflow import intake as intake_mod
+from agentflow.github import Comment, IssueRow
 from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, apply_intake,
                               awaiting_recheck, compose_ready_body, intake_labels,
                               intake_prompt, intake_result_is_durable, parse_intake,
@@ -216,83 +219,128 @@ def test_compose_ready_body_updates_in_place_on_reintake():
     assert second.count("the one-line as-filed text") == 1
 
 
-class _GhRecorder:
-    """Capture the gh commands apply_intake runs, and answer its body fetch."""
+# --- GitHub projection through the shared module -----------------------------------
 
-    def __init__(self, current_body=""):
-        self.calls = []
-        self.current_body = current_body
+class FakeGH:
+    """Stand-in for the `github` module intake calls: records the typed writes and serves
+    canned typed reads. A ``None`` read answer models the module's fail-closed unreadable
+    contract, distinct from an empty subject."""
 
-    def __call__(self, cmd, cwd=None):
-        self.calls.append(cmd)
-        if "issue" in cmd and "view" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"body": self.current_body}))
-        return SimpleNamespace(returncode=0, stdout="")
+    def __init__(self, *, body="", comment_bodies=(), comments_readable=True,
+                 issue=None, issues=None):
+        self._read_body = body                  # issue_body answer (None => unreadable)
+        self._comment_bodies = comment_bodies   # bodies present on the issue thread
+        self._comments_readable = comments_readable
+        self._durability_issue = issue          # api(parse_json=True) answer for durability read
+        self._issues = issues                   # list_issues answer (None => unreadable)
+        self.added: list[str] = []
+        self.removed: list[str] = []
+        self.created: list[str] = []
+        self.title = None
+        self.written_body = None
+        self.posted_comment = None
 
-    def _edit_body(self):
-        for c in self.calls:
-            if "edit" in c and "--body" in c:
-                return c[c.index("--body") + 1]
-        return None
+    # reads
+    def issue_body(self, repo, issue):
+        return self._read_body
 
-    def _edit_title(self):
-        for c in self.calls:
-            if "edit" in c and "--title" in c:
-                return c[c.index("--title") + 1]
-        return None
+    def issue_comments(self, repo, issue):
+        if not self._comments_readable:
+            return None
+        return [Comment(body=b, created_at="") for b in self._comment_bodies]
 
-    def _comment(self):
-        for c in self.calls:
-            if "comment" in c and "--body" in c:
-                return c[c.index("--body") + 1]
-        return None
+    def list_issues(self, repo, *, label=None, limit=100):
+        return self._issues
+
+    def api(self, args, *, parse_json=False):
+        return self._durability_issue
+
+    # writes
+    def create_label(self, repo, name, color):
+        self.created.append(name)
+        return True
+
+    def add_label(self, repo, issue, label):
+        self.added.append(label)
+        return True
+
+    def remove_label(self, repo, issue, label):
+        self.removed.append(label)
+        return True
+
+    def edit_title(self, repo, issue, title):
+        self.title = title
+        return True
+
+    def edit_body(self, repo, issue, body):
+        self.written_body = body
+        return True
+
+    def comment(self, repo, issue, body):
+        self.posted_comment = body
+        return True
+
+    def wrote_anything(self):
+        return bool(self.added or self.removed
+                    or self.written_body is not None
+                    or self.posted_comment is not None
+                    or self.title is not None)
+
+
+_GH_NAMES = ("issue_body", "issue_comments", "list_issues", "api", "create_label",
+             "add_label", "remove_label", "edit_title", "edit_body", "comment")
+
+
+def _install(monkeypatch, fake):
+    for name in _GH_NAMES:
+        monkeypatch.setattr(intake_mod.github, name, getattr(fake, name))
+    return fake
 
 
 def test_apply_intake_ready_writes_brief_to_body_and_a_short_comment(monkeypatch):
-    rec = _GhRecorder(current_body="original one-liner as filed")
-    monkeypatch.setattr(intake_mod, "_run", rec)
+    fake = _install(monkeypatch, FakeGH(body="original one-liner as filed"))
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\n### Summary\nthe full grounded brief",
                           "area: specific change", Complexity.DEEP, Effort.MEDIUM)
     apply_intake("owner/repo", 16, "old title", [], result)
 
-    body = rec._edit_body()
-    assert body is not None, "ready routing must edit the issue body"
-    assert body.startswith("## Agent Brief")
-    assert "original one-liner as filed" in body and "<details>" in body
+    assert fake.written_body is not None, "ready routing must edit the issue body"
+    assert fake.written_body.startswith("## Agent Brief")
+    assert "original one-liner as filed" in fake.written_body and "<details>" in fake.written_body
 
-    comment = rec._comment()
-    assert comment is not None and INTAKE_MARK in comment
-    assert "the full grounded brief" not in comment          # not the wall
-    assert comment.count("\n") <= 8                            # short
+    assert fake.posted_comment is not None and INTAKE_MARK in fake.posted_comment
+    assert "the full grounded brief" not in fake.posted_comment   # not the wall
+    assert fake.posted_comment.count("\n") <= 8                    # short
 
 
 def test_coordinated_ready_projects_title_and_original_from_durable_source(monkeypatch):
-    rec = _GhRecorder(current_body="later mutable body")
-    monkeypatch.setattr(intake_mod, "_run", rec)
+    fake = _install(monkeypatch, FakeGH(body="later mutable body"))
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "",
                           Complexity.DEEP, Effort.MEDIUM)
 
     apply_intake("owner/repo", 16, "later mutable title", [], result,
                  "Filed title", "original as filed")
 
-    assert rec._edit_title() == "Filed title"
-    assert rec._edit_body() == compose_ready_body(result.body, "original as filed")
+    assert fake.title == "Filed title"
+    assert fake.written_body == compose_ready_body(result.body, "original as filed")
+
+
+def _durable_issue(result, *, title, body, comment=None):
+    return {"title": title, "body": body,
+            "labels": [{"name": name} for name in intake_labels(result)],
+            "comments": [{"body": comment if comment is not None else intake_mod._READY_COMMENT}]}
 
 
 def test_intake_result_must_be_visible_before_its_worktree_is_disposable(monkeypatch):
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
                           Complexity.DEEP, Effort.MEDIUM)
     # The durable body is the canonical composition — the brief over the preserved original.
-    issue = {"title": "Scoped",
-             "body": compose_ready_body(result.body, "the original as filed"),
-             "labels": [{"name": name} for name in intake_labels(result)],
-             "comments": [{"body": intake_mod._READY_COMMENT}]}
-    monkeypatch.setattr(intake_mod, "_run",
-                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(issue)))
+    issue = _durable_issue(result, title="Scoped",
+                           body=compose_ready_body(result.body, "the original as filed"))
+    _install(monkeypatch, FakeGH(issue=issue))
     assert intake_result_is_durable("owner/repo", 5, result) is True
 
-    monkeypatch.setattr(intake_mod, "_run",
-                        lambda *a, **k: SimpleNamespace(returncode=1, stdout=""))
+    # An unreadable issue (the module returns None) must never read as durable.
+    _install(monkeypatch, FakeGH(issue=None))
     assert intake_result_is_durable("owner/repo", 5, result) is False
 
 
@@ -307,9 +355,7 @@ def test_intake_durability_requires_exact_title_and_routing_labels(monkeypatch):
                       {"name": "agentflow:effort:high"}]),
         "comments": [{"body": intake_mod._READY_COMMENT}],
     }
-    monkeypatch.setattr(intake_mod, "_run",
-                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(issue)))
-
+    _install(monkeypatch, FakeGH(issue=issue))
     assert intake_result_is_durable("owner/repo", 5, result) is False
 
 
@@ -318,9 +364,7 @@ def test_intake_durability_requires_this_routes_exact_comment(monkeypatch):
                           "> *agentflow intake — generated by AI.*\n\nnew question")
     issue = {"title": "t", "body": "", "labels": [{"name": "agentflow:needs-grilling"}],
              "comments": [{"body": f"{INTAKE_MARK}\n\nold question"}]}
-    monkeypatch.setattr(intake_mod, "_run",
-                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(issue)))
-
+    _install(monkeypatch, FakeGH(issue=issue))
     assert intake_result_is_durable("owner/repo", 5, result) is False
 
 
@@ -329,36 +373,30 @@ def test_ready_durability_requires_the_exact_composed_body_not_a_substring(monke
     # the original) must not read as durable — only the exact composed body does.
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
                           Complexity.DEEP, Effort.MEDIUM)
-    base = {"title": "Scoped",
-            "labels": [{"name": name} for name in intake_labels(result)],
-            "comments": [{"body": intake_mod._READY_COMMENT}]}
 
-    substring_only = dict(base, body=f"noise\n{result.body}\nmore noise")  # brief present, not canonical
-    monkeypatch.setattr(intake_mod, "_run",
-                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(substring_only)))
+    substring_only = _durable_issue(result, title="Scoped",
+                                    body=f"noise\n{result.body}\nmore noise")
+    _install(monkeypatch, FakeGH(issue=substring_only))
     assert intake_result_is_durable("owner/repo", 5, result) is False
 
-    canonical = dict(base, body=compose_ready_body(result.body, "original as filed"))
-    monkeypatch.setattr(intake_mod, "_run",
-                        lambda *a, **k: SimpleNamespace(returncode=0, stdout=json.dumps(canonical)))
+    canonical = _durable_issue(result, title="Scoped",
+                               body=compose_ready_body(result.body, "original as filed"))
+    _install(monkeypatch, FakeGH(issue=canonical))
     assert intake_result_is_durable("owner/repo", 5, result) is True
 
 
 def test_ready_durability_binds_original_body_and_title_to_the_submission(monkeypatch):
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "",
                           Complexity.DEEP, Effort.MEDIUM)
-    base = {"title": "Filed title",
-            "labels": [{"name": name} for name in intake_labels(result)],
-            "comments": [{"body": intake_mod._READY_COMMENT}]}
-    wrong_original = dict(base, body=compose_ready_body(result.body, "different text"))
-    monkeypatch.setattr(intake_mod, "_run", lambda *a, **k: SimpleNamespace(
-        returncode=0, stdout=json.dumps(wrong_original)))
+    wrong_original = _durable_issue(result, title="Filed title",
+                                    body=compose_ready_body(result.body, "different text"))
+    _install(monkeypatch, FakeGH(issue=wrong_original))
     assert intake_result_is_durable(
         "owner/repo", 5, result, source_title="Filed title", source_body="as filed") is False
 
-    exact = dict(base, body=compose_ready_body(result.body, "as filed"))
-    monkeypatch.setattr(intake_mod, "_run", lambda *a, **k: SimpleNamespace(
-        returncode=0, stdout=json.dumps(exact)))
+    exact = _durable_issue(result, title="Filed title",
+                           body=compose_ready_body(result.body, "as filed"))
+    _install(monkeypatch, FakeGH(issue=exact))
     assert intake_result_is_durable(
         "owner/repo", 5, result, source_title="Filed title", source_body="as filed") is True
 
@@ -366,53 +404,32 @@ def test_ready_durability_binds_original_body_and_title_to_the_submission(monkey
 def test_apply_intake_ready_defers_and_preserves_original_when_body_unreadable(monkeypatch):
     # An unreadable body must fail closed — we cannot compose the brief without the original to
     # preserve, and treating unreadable as "" would clobber the real original text.
-    calls = []
-
-    def gh(cmd, cwd=None):
-        calls.append(cmd)
-        if "view" in cmd and "comments" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"comments": []}))
-        if "view" in cmd and "body" in cmd:
-            return SimpleNamespace(returncode=1, stdout="")  # body read fails
-        return SimpleNamespace(returncode=0, stdout="")
-
-    monkeypatch.setattr(intake_mod, "_run", gh)
+    fake = _install(monkeypatch, FakeGH(body=None))
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
                           Complexity.DEEP, Effort.MEDIUM)
     summary = apply_intake("owner/repo", 5, "old", [], result)
 
     assert "deferred" in summary
-    # Nothing was written: no body edit (which would clobber the original), no labels, no comment.
-    assert not any("edit" in c or "comment" in c and "view" not in c for c in calls)
+    assert not fake.wrote_anything(), "nothing may be written when the original is unknown"
 
 
 def test_ready_projection_rejects_a_malformed_original_envelope(monkeypatch):
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "Scoped",
                           Complexity.DEEP, Effort.MEDIUM)
     malformed = f"old brief\n\n{intake_mod._ORIGINAL_MARK}\noriginal without details"
-    calls = []
+    fake = _install(monkeypatch, FakeGH(body=malformed))
 
-    def gh(cmd, cwd=None):
-        calls.append(cmd)
-        if "view" in cmd and "comments" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"comments": []}))
-        if "view" in cmd and "body" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"body": malformed}))
-        return SimpleNamespace(returncode=0, stdout="")
-
-    monkeypatch.setattr(intake_mod, "_run", gh)
     assert "deferred" in apply_intake("owner/repo", 5, "old", [], result)
-    assert not any("edit" in cmd or "comment" in cmd and "view" not in cmd for cmd in calls)
+    assert not fake.wrote_anything()
 
 
 def test_apply_intake_grill_keeps_the_full_comment_and_never_touches_the_body(monkeypatch):
-    rec = _GhRecorder()
-    monkeypatch.setattr(intake_mod, "_run", rec)
+    fake = _install(monkeypatch, FakeGH())
     result = IntakeResult(IntakeRoute.GRILL, "> *agentflow intake — generated by AI.*\n\nwhich did you mean?")
     apply_intake("owner/repo", 7, "t", [], result)
 
-    assert rec._edit_body() is None, "a hold must not rewrite the body"
-    assert "which did you mean?" in rec._comment()
+    assert fake.written_body is None, "a hold must not rewrite the body"
+    assert "which did you mean?" in fake.posted_comment
 
 
 # --- no-spam: nothing-new, idempotence, infra failures (issue #23) ----------------
@@ -424,227 +441,162 @@ def test_nothing_new_route_parses_without_a_body():
     assert v.route is IntakeRoute.NOTHING_NEW and v.parsed
 
 
-class _GhSpy:
-    """Records every gh command and answers the comments/body fetches with a canned tail."""
-
-    def __init__(self, latest_comment="", current_body=""):
-        self.calls = []
-        self.latest_comment = latest_comment
-        self.current_body = current_body
-
-    def __call__(self, cmd, cwd=None):
-        self.calls.append(cmd)
-        if "view" in cmd and "comments" in cmd:
-            return SimpleNamespace(returncode=0,
-                                   stdout=json.dumps({"comments": [{"body": self.latest_comment}]}))
-        if "view" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps({"body": self.current_body}))
-        return SimpleNamespace(returncode=0, stdout="")
-
-    def wrote_anything(self):
-        return any(("comment" in c) or ("--add-label" in c) or ("--remove-label" in c)
-                   or ("--body" in c) or ("--title" in c) for c in self.calls)
-
-
 def test_apply_intake_nothing_new_writes_absolutely_nothing(monkeypatch):
-    spy = _GhSpy()
-    monkeypatch.setattr(intake_mod, "_run", spy)
+    fake = _install(monkeypatch, FakeGH())
     apply_intake("owner/repo", 5, "t", ["agentflow:needs-grilling"],
                  IntakeResult(IntakeRoute.NOTHING_NEW, ""))
-    assert not spy.wrote_anything(), "a nothing-new recheck must post no comment and touch no labels"
+    assert not fake.wrote_anything(), "a nothing-new recheck must post no comment and touch no labels"
 
 
 def test_apply_intake_skips_a_re_post_of_the_same_hold(monkeypatch):
     # The exact spam vector: our last word already says this. Re-applying it changes
     # nothing, so it must post no comment and churn no labels.
     question = "> *agentflow intake — generated by AI.*\n\nwhich window did you mean?"
-    spy = _GhSpy(latest_comment=question)
-    monkeypatch.setattr(intake_mod, "_run", spy)
+    fake = _install(monkeypatch, FakeGH(comment_bodies=(question,)))
     apply_intake("owner/repo", 5, "t", ["agentflow:needs-grilling"],
                  IntakeResult(IntakeRoute.GRILL, question))
-    assert not spy.wrote_anything(), "an identical re-apply must be a no-op"
+    assert not fake.wrote_anything(), "an identical re-apply must be a no-op"
 
 
 def test_apply_intake_finishes_partial_labels_without_duplicate_comment(monkeypatch):
     question = "> *agentflow intake — generated by AI.*\n\nwhich window did you mean?"
-    spy = _GhSpy(latest_comment=question)
-    monkeypatch.setattr(intake_mod, "_run", spy)
+    fake = _install(monkeypatch, FakeGH(comment_bodies=(question,)))
 
     apply_intake("owner/repo", 5, "t", [], IntakeResult(IntakeRoute.GRILL, question))
 
-    assert not any("comment" in c and "view" not in c for c in spy.calls)
-    assert any("--add-label" in c for c in spy.calls)
+    assert fake.posted_comment is None, "the comment already exists — no duplicate"
+    assert fake.added, "the missing label must still be applied"
 
 
 def test_apply_intake_writes_nothing_when_comment_history_is_unreadable(monkeypatch):
-    calls = []
-
-    def gh(cmd, cwd=None):
-        calls.append(cmd)
-        if "view" in cmd and "comments" in cmd:
-            return SimpleNamespace(returncode=1, stdout="")
-        return SimpleNamespace(returncode=0, stdout="")
-
-    monkeypatch.setattr(intake_mod, "_run", gh)
+    fake = _install(monkeypatch, FakeGH(comments_readable=False))
     result = IntakeResult(
         IntakeRoute.GRILL,
         "> *agentflow intake — generated by AI.*\n\nwhich window did you mean?",
     )
 
     assert "deferred" in apply_intake("owner/repo", 5, "t", [], result)
-    assert not any(("comment" in cmd and "view" not in cmd) or "edit" in cmd for cmd in calls)
+    assert not fake.wrote_anything()
 
 
 def test_apply_intake_finishes_partial_ready_body_without_duplicate_comment(monkeypatch):
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief\nship it", "t",
                           Complexity.DEEP, Effort.MEDIUM)
-    spy = _GhSpy(latest_comment=intake_mod._READY_COMMENT, current_body="original")
-    monkeypatch.setattr(intake_mod, "_run", spy)
+    fake = _install(monkeypatch, FakeGH(comment_bodies=(intake_mod._READY_COMMENT,),
+                                        body="original"))
 
     apply_intake("owner/repo", 5, "t", intake_labels(result), result)
 
-    assert not any("comment" in c and "view" not in c for c in spy.calls)
-    assert any("--body" in c for c in spy.calls)
+    assert fake.posted_comment is None, "the ready comment already exists — no duplicate"
+    assert fake.written_body is not None, "the body still needs the composed brief"
 
 
 def test_apply_intake_still_posts_a_genuinely_new_question(monkeypatch):
     # Idempotence must not silence a real re-post — a different question still goes out.
-    spy = _GhSpy(latest_comment="> *agentflow intake — generated by AI.*\n\nold question")
-    monkeypatch.setattr(intake_mod, "_run", spy)
+    fake = _install(monkeypatch, FakeGH(
+        comment_bodies=("> *agentflow intake — generated by AI.*\n\nold question",)))
     apply_intake("owner/repo", 5, "t", [],
                  IntakeResult(IntakeRoute.GRILL, "> *agentflow intake — generated by AI.*\n\na new question"))
-    assert any("comment" in c for c in spy.calls), "a new question must still post"
+    assert fake.posted_comment is not None, "a new question must still post"
 
 
 # --- dial label cleanup on re-route (issue #27) ----------------------------------
 
-def _label_edit_cmd(rec: _GhRecorder) -> list[str]:
-    """The gh issue edit call that sets labels (has --add-label or just removes)."""
-    for c in rec.calls:
-        if "edit" in c and ("--add-label" in c or "--remove-label" in c) and "--body" not in c:
-            return c
-    return []
-
-
 def test_apply_intake_clears_stale_dial_labels_on_reroute(monkeypatch):
     # Before fix: only STATE_LABELS were stripped; old dials accreted.
     # After fix: stale agentflow:complexity:* and agentflow:effort:* are removed too.
-    rec = _GhRecorder(current_body="brief v1")
-    monkeypatch.setattr(intake_mod, "_run", rec)
+    fake = _install(monkeypatch, FakeGH(body="brief v1"))
     result = IntakeResult(IntakeRoute.READY, "## Agent Brief v2\nnew scope",
                           "", Complexity.STANDARD, Effort.LOW)
     apply_intake("owner/repo", 7, "t",
                  ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:medium"],
                  result)
 
-    cmd = _label_edit_cmd(rec)
-    assert cmd, "should have a label edit command"
-    adds = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--add-label"]
-    removes = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--remove-label"]
-
-    assert "agentflow:complexity:standard" in adds
-    assert "agentflow:effort:low" in adds
-    assert "agentflow:complexity:deep" in removes, "stale complexity dial must be stripped"
-    assert "agentflow:effort:medium" in removes, "stale effort dial must be stripped"
+    assert "agentflow:complexity:standard" in fake.added
+    assert "agentflow:effort:low" in fake.added
+    assert "agentflow:complexity:deep" in fake.removed, "stale complexity dial must be stripped"
+    assert "agentflow:effort:medium" in fake.removed, "stale effort dial must be stripped"
 
 
 def test_apply_intake_unchanged_dials_not_removed(monkeypatch):
-    # Re-routing with the same dials should not generate spurious --remove-label calls.
-    rec = _GhRecorder(current_body="brief v1")
-    monkeypatch.setattr(intake_mod, "_run", rec)
+    # Re-routing with the same dials should not generate spurious removals.
+    fake = _install(monkeypatch, FakeGH(body="brief v1"))
     result = IntakeResult(IntakeRoute.READY, "## Brief v2", "", Complexity.DEEP, Effort.MEDIUM)
     apply_intake("owner/repo", 9, "t",
                  ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:medium"],
                  result)
 
-    cmd = _label_edit_cmd(rec)
-    removes = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--remove-label"]
-    assert "agentflow:complexity:deep" not in removes
-    assert "agentflow:effort:medium" not in removes
+    assert "agentflow:complexity:deep" not in fake.removed
+    assert "agentflow:effort:medium" not in fake.removed
 
 
 def test_apply_intake_strips_dials_when_routing_to_hold(monkeypatch):
     # Transitioning from ready to grill should clear dial labels — they belong only on ready.
-    rec = _GhRecorder()
-    monkeypatch.setattr(intake_mod, "_run", rec)
+    fake = _install(monkeypatch, FakeGH())
     result = IntakeResult(IntakeRoute.GRILL, "> *agentflow intake*\n\nwhich did you mean?")
     apply_intake("owner/repo", 5, "t",
                  ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:high"],
                  result)
 
-    cmd = _label_edit_cmd(rec)
-    removes = [cmd[i + 1] for i, x in enumerate(cmd) if x == "--remove-label"]
-    assert "agentflow:complexity:deep" in removes
-    assert "agentflow:effort:high" in removes
+    assert "agentflow:complexity:deep" in fake.removed
+    assert "agentflow:effort:high" in fake.removed
 
 
 # --- legacy label sweep (issue #27) ----------------------------------------------
 
-def _fake_run_for_sweep(issues_payload: str):
-    """Return a fake _run that serves the given payload for list calls."""
-    calls: list[list[str]] = []
-
-    def _run(cmd, cwd=None):
-        calls.append(cmd)
-        if "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=issues_payload)
-        return SimpleNamespace(returncode=0, stdout="")
-
-    return _run, calls
-
-
 def test_sweep_migrates_bare_grilling_label(monkeypatch):
-    issues = [{"number": 1, "labels": [{"name": "needs-grilling"}]}]
-    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
-    monkeypatch.setattr(intake_mod, "_run", fake_run)
+    fake = _install(monkeypatch, FakeGH(issues=[
+        IssueRow(number=1, title="", body="", labels=frozenset({"needs-grilling"}))]))
 
     changed = sweep_legacy_labels("owner/repo")
 
     assert len(changed) == 1 and "#1" in changed[0]
     assert "agentflow:needs-grilling" in changed[0]
-    edit_calls = [c for c in calls if "edit" in c]
-    assert any("--add-label" in c and "agentflow:needs-grilling" in c for c in edit_calls)
-    assert any("--remove-label" in c and "needs-grilling" in c for c in edit_calls)
+    assert "agentflow:needs-grilling" in fake.added
+    assert "needs-grilling" in fake.removed
 
 
 def test_sweep_removes_bare_when_namespaced_already_present(monkeypatch):
     # Issue already has the namespaced form — just drop the bare one, don't re-add.
-    issues = [{"number": 2, "labels": [{"name": "needs-mockup"},
-                                        {"name": "agentflow:needs-mockup"}]}]
-    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
-    monkeypatch.setattr(intake_mod, "_run", fake_run)
+    fake = _install(monkeypatch, FakeGH(issues=[
+        IssueRow(number=2, title="", body="",
+                 labels=frozenset({"needs-mockup", "agentflow:needs-mockup"}))]))
 
     changed = sweep_legacy_labels("owner/repo")
 
     assert len(changed) == 1
-    cmd = next(c for c in calls if "edit" in c)
-    assert "--remove-label" in cmd and "needs-mockup" in cmd
-    assert "--add-label" not in cmd, "should not re-add the namespaced label that's already there"
+    assert "needs-mockup" in fake.removed
+    assert "agentflow:needs-mockup" not in fake.added, "must not re-add a label that's already there"
 
 
 def test_sweep_leaves_already_correct_and_unrelated_labels_alone(monkeypatch):
-    issues = [
-        {"number": 3, "labels": [{"name": "agentflow:needs-grilling"}]},  # already namespaced
-        {"number": 4, "labels": [{"name": "ready-for-agent"}, {"name": "bug"}]},  # unrelated
-    ]
-    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
-    monkeypatch.setattr(intake_mod, "_run", fake_run)
+    fake = _install(monkeypatch, FakeGH(issues=[
+        IssueRow(number=3, title="", body="", labels=frozenset({"agentflow:needs-grilling"})),
+        IssueRow(number=4, title="", body="", labels=frozenset({"ready-for-agent", "bug"}))]))
 
     changed = sweep_legacy_labels("owner/repo")
 
     assert changed == [], "nothing to change"
-    edit_calls = [c for c in calls if "edit" in c]
-    assert edit_calls == [], "no edits should be issued"
+    assert fake.added == [] and fake.removed == [], "no edits should be issued"
 
 
 def test_sweep_ready_for_agent_stays_bare(monkeypatch):
     # ready-for-agent is intentionally bare (ADR 0018) — sweep must not touch it.
-    issues = [{"number": 5, "labels": [{"name": "ready-for-agent"}]}]
-    fake_run, calls = _fake_run_for_sweep(json.dumps(issues))
-    monkeypatch.setattr(intake_mod, "_run", fake_run)
+    fake = _install(monkeypatch, FakeGH(issues=[
+        IssueRow(number=5, title="", body="", labels=frozenset({"ready-for-agent"}))]))
+
+    assert sweep_legacy_labels("owner/repo") == []
+    assert fake.added == [] and fake.removed == []
+
+
+def test_sweep_reports_error_when_the_issue_list_is_unreadable(monkeypatch):
+    # Fail closed: an unreadable listing (the module returns None) is an error, not "no issues".
+    fake = _install(monkeypatch, FakeGH(issues=None))
 
     changed = sweep_legacy_labels("owner/repo")
-    assert changed == []
+
+    assert changed and "error" in changed[0].lower()
+    assert not fake.wrote_anything()
 
 
 def test_intake_prompt_carries_the_effort_rubric():
