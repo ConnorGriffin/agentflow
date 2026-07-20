@@ -130,3 +130,7 @@ then Context / Decision / Alternatives / Consequences.
   per-stage tool allowlist (read-only for Intake/Review/Research), an empty MCP set,
   and per-cell wall/turn ceilings replacing the shared two-hour timeout; fail closed
   on withheld capability.
+- [0045](0045-intake-stays-all-deep.md) — Intake stays all-deep: a live pilot showed
+  standard-first Intake doesn't cut headroom (grounding output dominates, not model
+  tier), and the #228 corpus can't score a live run (grounding-SHA ≠ label-SHA), so the
+  step-up is rejected.
