@@ -169,6 +169,21 @@ def test_issues_in_flight_is_unknown_when_gh_fails(monkeypatch):
     assert _issues_in_flight(RepoConfig("o/r", ".")) is None
 
 
+def test_issues_in_flight_recognizes_closing_reference_off_convention_branch(monkeypatch):
+    # A hand-driven build opens a PR on an off-convention branch (`codex/40-foo`) that the
+    # branch regex can't parse — but its declared closing reference #40 must still dedup.
+    prs = [{"headRefName": "codex/40-foo",
+            "closingIssuesReferences": [{"number": 40}]}]
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(prs)))
+    assert 40 in _issues_in_flight(RepoConfig("o/r", "."))
+
+
+def test_issues_in_flight_still_recognizes_conventional_branch(monkeypatch):
+    prs = [{"headRefName": "agentflow/codex/issue-7-slug", "closingIssuesReferences": []}]
+    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(prs)))
+    assert 7 in _issues_in_flight(RepoConfig("o/r", "."))
+
+
 def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
     ready = [{"number": 5, "title": "t", "body": "", "labels": [{"name": "ready-for-agent"}]}]
     monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(ready)))

@@ -278,11 +278,22 @@ def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
     blip as "nothing in flight" would re-dispatch every in-review issue; callers fail closed
     (skip, retry next cycle)."""
     r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
-              "--json", "headRefName", "--limit", "100"])
+              "--json", "headRefName,closingIssuesReferences", "--limit", "100"])
     if r.returncode != 0:
         return None
-    return {n for pr in json.loads(r.stdout or "[]")
-            if (n := issue_of_branch(pr.get("headRefName", ""))) is not None}
+    in_flight: set[int] = set()
+    for pr in json.loads(r.stdout or "[]"):
+        # A PR's declared closing-issue reference marks that issue in-flight regardless of
+        # how its head branch is named — a hand-driven build on an off-convention branch
+        # (e.g. `codex/40-foo`) still dedups. The field is same-repo scoped, so it can't be
+        # fooled by a `Closes #N` meaning another repo.
+        for ref in pr.get("closingIssuesReferences") or []:
+            if (n := ref.get("number")) is not None:
+                in_flight.add(n)
+        # Fallback: recognize the conventional branch even if no closing reference is declared.
+        if (n := issue_of_branch(pr.get("headRefName", ""))) is not None:
+            in_flight.add(n)
+    return in_flight
 
 
 BUILDING = "agentflow:building"   # dispatch claim — an agent is building this issue
