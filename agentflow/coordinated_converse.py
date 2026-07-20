@@ -35,6 +35,7 @@ from agentflow.shell_crib import SHELL_CRIB
 from agentflow.workspace import channel, publish
 from agentflow.workspace.projection import workspace_projection
 from agentflow.workspace.store import ACCEPTED, WorkspaceStore, project_slug
+from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 # The prompt a Conversation turn runs. The turn's isolated worktree is the session's only durable
 # write path; it must land its answer at exactly this per-turn artifact, which is the outcome the
@@ -111,8 +112,7 @@ def _short(cid: str) -> str:
 
 def ask_worktree(workdir: str, pool: str, conversation_id: str) -> str:
     """The isolated worktree one conversation's turns reuse across attempts (resume context)."""
-    return os.path.join(workdir, ".agentflow", "worktrees", pool,
-                        f"ask-{_short(conversation_id)}")
+    return WorktreeRef.for_converse(workdir, pool, _short(conversation_id)).path
 
 
 def reply_path(record) -> str:
@@ -185,11 +185,10 @@ def _ask_worktree_ready(record) -> bool:
     from agentflow.loop import _run
     from agentflow.runner import _worktree_is_registered
     src = record.source or ""
-    if "/.agentflow/worktrees/" not in src:
+    ref = WorktreeRef.parse(src)
+    if ref is None or ref.kind is not WorktreeKind.CONVERSE or ref.tool != record.pool:
         return False
-    workdir, tail = src.split("/.agentflow/worktrees/", 1)
-    if not tail.startswith(f"{record.pool}/ask-"):
-        return False
+    workdir = ref.workdir
     wt = Path(src)
     if wt.exists():
         return _worktree_is_registered(workdir, wt)  # reuse as-is; never rebuild a resumed turn
