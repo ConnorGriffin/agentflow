@@ -111,18 +111,55 @@ def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> 
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
 
 
+def _canonical_graph_project(cwd: str) -> str | None:
+    """The maintained code-graph project identity for the repository this worktree belongs to.
+
+    codebase-memory names a project by the real path of its checkout (``/a/b/c`` → ``a-b-c``) and
+    resolves the active project from the caller's directory. A per-stage worktree therefore
+    resolves to its *own* path — a separate, empty-or-stale project — not the maintained graph the
+    operator keeps at the repository's main checkout. Resolve that shared main checkout from the
+    worktree (the git common dir's parent) and derive its project name, so a session can target the
+    maintained graph from whichever worktree it runs in. Repo- and provider-neutral: the same
+    derivation names every fleet repository's graph, with no owner, path, or project id hardcoded.
+    ``None`` when ``cwd`` is not inside a git checkout (there is no graph to name)."""
+    common = _run(["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if common.returncode != 0 or not common.stdout.strip():
+        return None
+    main_checkout = os.path.realpath(os.path.dirname(common.stdout.strip()))
+    return main_checkout.strip("/").replace("/", "-") or None
+
+
 def _bounded_prompt(prompt: str, cwd: str) -> str:
-    """Tell the provider which checkout it owns; the CLI sandbox enforces the same boundary."""
+    """Tell the provider which checkout it owns and how to ground structural questions.
+
+    The CLI sandbox enforces the worktree boundary; the appended discovery protocol points
+    structural discovery at the repository's maintained main-checkout code graph instead of shell
+    orientation, and is identical for both providers. When the worktree resolves to no graph
+    identity the protocol is omitted and the session simply keeps searching files."""
     worktree = os.path.realpath(cwd)
     current = _run(["git", "-C", worktree, "branch", "--show-current"])
     branch = current.stdout.strip() if current.returncode == 0 else ""
     branch = branch or "detached HEAD"
+    project = _canonical_graph_project(worktree)
+    discovery = "" if project is None else f"""
+Discovery protocol (ground structural questions in the code graph first):
+- The maintained code graph for this repository is the codebase-memory project `{project}`. Pass
+  `project={project}` to the codebase-memory tools — do not let them resolve the project from this
+  worktree, which is a separate, empty copy.
+- For any structural question — where a function/class/route is defined, who calls it, what it
+  calls, the impact of a change, the shape of a module — query that graph first (search_graph,
+  trace_path, get_code_snippet, get_architecture) before falling back to grep/find/ls orientation.
+- Fall back to searching the worktree files when the graph is unavailable or has no result for a
+  symbol, or when the question is about prose/config rather than code structure.
+- Graph results name paths in the repository's main checkout. Use them only to orient; every file
+  you read and every edit you make stays inside your assigned worktree above.
+"""
     return f"""Session boundary (enforced by the launcher):
 - Your assigned worktree is `{worktree}`.
 - Your assigned branch is `{branch}`.
 - Work only in that worktree and do not switch or create branches.
 - Never use another checkout, even if an index, hook, or search result names one.
-
+{discovery}
 {prompt}"""
 
 
@@ -330,6 +367,35 @@ def _operator_local_mcp_servers() -> dict:
     return servers if isinstance(servers, dict) else {}
 
 
+def _codex_local_mcp_config(servers: dict) -> list[str]:
+    """Render the operator's local MCP servers as Codex ``-c`` config overrides.
+
+    Codex launches with ``--ignore-user-config`` (no personal MCP leaks in), which also drops the
+    code-graph server Claude re-supplies via ``--mcp-config``. Codex takes MCP servers under the
+    ``mcp_servers.<name>`` config table, so re-supply the *same* map here as dotted ``-c``
+    overrides — applied on top of the ignored user config — giving both providers the code-graph
+    tool from one source while the account connectors stay excluded. Each ``-c`` value is parsed as
+    TOML: ``json.dumps`` renders strings and lists as valid TOML scalars/arrays, and env vars go in
+    one key at a time so no inline table has to be hand-built. A server without a ``command`` is
+    skipped; an empty map yields no overrides (nothing to attach)."""
+    argv: list[str] = []
+    for name, spec in servers.items():
+        if not isinstance(spec, dict):
+            continue
+        command = spec.get("command")
+        if not command:
+            continue
+        argv += ["-c", f"mcp_servers.{name}.command={json.dumps(command)}"]
+        args = spec.get("args")
+        if isinstance(args, list) and args:
+            argv += ["-c", f"mcp_servers.{name}.args={json.dumps(args)}"]
+        env = spec.get("env")
+        if isinstance(env, dict):
+            for key, value in env.items():
+                argv += ["-c", f"mcp_servers.{name}.env.{key}={json.dumps(str(value))}"]
+    return argv
+
+
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
@@ -396,9 +462,12 @@ class CodexRunner(_WorktreeRunner):
 
         A read-only ``profile`` (ADR 0044) launches the session in the ``read-only`` Codex
         sandbox so it cannot edit the checkout — Codex's own shape of the read-only stage
-        surface (there is no Claude-style per-tool allowlist flag). Codex already runs
-        ``--ignore-user-config``, so no personal MCP leaks in; the wall ceiling is applied
-        per-record by the launcher, the same as for Claude.
+        surface (there is no Claude-style per-tool allowlist flag). Codex runs
+        ``--ignore-user-config`` so no personal MCP leaks in, which also drops the code-graph
+        server; we re-supply *only* that operator-local map as ``mcp_servers`` ``-c`` overrides,
+        so both providers get the code graph from one source while the account connectors stay
+        excluded, on every stage including read-only ones. The wall ceiling is applied per-record
+        by the launcher, the same as for Claude.
         """
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
         worktree = os.path.realpath(cwd)
@@ -419,6 +488,7 @@ class CodexRunner(_WorktreeRunner):
                 "-c", "sandbox_workspace_write.network_access=true",
                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
                 "--skip-git-repo-check"]
+        argv += _codex_local_mcp_config(_operator_local_mcp_servers())
         if schema is not None:
             argv += ["--output-schema", _write_output_schema(schema)]
         argv.append(_bounded_prompt(_CODEX_HEADLESS_RECOVERY + prompt, cwd))
