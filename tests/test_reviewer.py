@@ -8,7 +8,7 @@ this module (see reviewer.py docstring / git history).
 
 import pytest
 
-from agentflow.reviewer import REVIEW_PROMPT, parse_verdict
+from agentflow.reviewer import REVIEW_PROMPT, parse_verdict, review_worktree
 
 
 def test_pass_with_no_findings_is_clean():
@@ -96,6 +96,12 @@ def test_sha_match_required_when_expected():
                                      "\x00\xff not utf clean", '{"verdict"}'])
 def test_parse_never_raises(payload):
     assert parse_verdict(payload).clean is False  # returns, does not throw
+
+
+def test_review_worktree_path_matches_worktree_ref_convention():
+    # The path must encode (workdir, tool, pr_number, slug) in the shared layout.
+    p = review_worktree("/work", "claude", 42, "fix-thing")
+    assert str(p) == "/work/.agentflow/worktrees/claude-review/pr-42-fix-thing"
 
 
 def test_review_prompt_formats_and_carries_the_evidence_gates():
