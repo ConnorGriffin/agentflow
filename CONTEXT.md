@@ -111,7 +111,11 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   (Supersedes the earlier single `tier` dial; `light`/haiku dropped — ADR 0018.)
 
 - **Effort** — the second dial intake stamps alongside complexity: `low | medium |
-  high | extra` — how much work the issue warrants, independent of model size.
+  high | extra` — how much work the issue warrants, independent of model size. It
+  also configures the **builder's** provider reasoning effort (`extra` maps to the
+  ladder's Extra High and clamps there; Max/Ultracode stay manual-only — ADR 0046).
+  Revise inherits the original builder's effort. Non-build stages take
+  provider-default reasoning (tunable cells, ADR 0044/0046).
 
 - **Runner** — the interchangeable executor that performs a pipeline stage:
   Claude (Opus) or Codex (GPT-5.6 Sol). Chosen per stage by cost / availability /

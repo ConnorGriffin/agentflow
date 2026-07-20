@@ -134,3 +134,9 @@ then Context / Decision / Alternatives / Consequences.
   standard-first Intake doesn't cut headroom (grounding output dominates, not model
   tier), and the #228 corpus can't score a live run (grounding-SHA ≠ label-SHA), so the
   step-up is rejected.
+- [0046](0046-production-routing-and-spend-policy.md) — The production routing and
+  spend policy locks (map #226 terminal): ship on provider-default reasoning +
+  placeholder ceilings and tune later; the `effort` dial drives the builder's
+  reasoning effort (extra → Extra High, clamped; Max/Ultracode manual-only); intake
+  effort coaching is an anchored rubric; recalibration is a monthly by-hand pass
+  with manual guardrail rollback.
