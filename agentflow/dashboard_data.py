@@ -7,12 +7,11 @@ test surface; the gh queries are orchestration exercised live.
 
 from __future__ import annotations
 
-import json
 import re
 from collections import Counter
 from datetime import datetime, timezone
 
-from agentflow import live, ratchet
+from agentflow import github, live, ratchet
 from agentflow.balancer import _query_pool
 from agentflow.gate import reply_pending
 from agentflow.loop import (
@@ -23,7 +22,6 @@ from agentflow.loop import (
     _pr_comments,
     repo_profile,
 )
-from agentflow.runner import _run
 
 
 def pools() -> list[dict]:
@@ -45,16 +43,9 @@ def pr_stage(head_ref: str) -> str:
     return "other"
 
 
-def _prs(repo: str, state: str) -> list[dict]:
-    r = _run(["gh", "pr", "list", "--repo", repo, "--state", state, "--json",
-              "number,title,headRefName,mergedAt", "--limit", "30"])
-    if r.returncode != 0:
-        return []
-    try:
-        return [p for p in json.loads(r.stdout)
-                if p.get("headRefName", "").startswith("agentflow/")]
-    except json.JSONDecodeError:
-        return []
+def _prs(repo: str, state: str) -> list[github.SnapshotPrRow]:
+    rows = github.list_prs(repo, state)
+    return [] if rows is None else [r for r in rows if r.head_ref_name.startswith("agentflow/")]
 
 
 # --- workspace pipeline join (ADR 0033): coarse pipeline state + landed evidence for the small
@@ -64,10 +55,6 @@ def _prs(repo: str, state: str) -> list[dict]:
 # An agentflow build branch is `agentflow/<tool>/issue-<N>-slug` (coordinated_build), so the
 # issue a PR was cut for is recoverable from its branch.
 _ISSUE_BRANCH = re.compile(r"^agentflow/[^/]+/issue-(\d+)(?:-|$)")
-
-# The extra facts a published issue's PR carries: the merge commit, the review verdict, and the
-# CI rollup — read only for the published issues, not the whole fleet.
-_PIPELINE_JSON = "number,title,headRefName,url,mergedAt,mergeCommit,reviewDecision,statusCheckRollup"
 
 
 def issue_of_branch(head_ref: str) -> int | None:
@@ -102,14 +89,17 @@ def _ci_verdict(rollup) -> str | None:
     return "passing"
 
 
-def _pr_for_issue(issue_number: int, prs: list[dict]) -> dict | None:
+def _pr_for_issue(issue_number: int,
+                  prs: list[github.PipelinePrRow]) -> github.PipelinePrRow | None:
     """The most recent agentflow PR cut for this issue, by branch, or ``None``. The highest PR
     number is the freshest attempt (a rebuild opens a new PR). Pure."""
-    matches = [p for p in prs if issue_of_branch(p.get("headRefName", "")) == issue_number]
-    return max(matches, key=lambda p: p.get("number", 0)) if matches else None
+    matches = [p for p in prs if issue_of_branch(p.head_ref_name) == issue_number]
+    return max(matches, key=lambda p: p.number) if matches else None
 
 
-def pipeline_state(issue_number: int, open_prs: list[dict], merged_prs: list[dict]) -> dict:
+def pipeline_state(issue_number: int,
+                   open_prs: list[github.PipelinePrRow],
+                   merged_prs: list[github.PipelinePrRow]) -> dict:
     """Coarse pipeline state + Acceptance Evidence for one published build issue, from the PRs that
     reference it by branch (the daemon already read these). Merged wins over open; among open PRs a
     review signal lifts 'PR open' to 'in review'; with no PR yet the handed-off issue is 'building'.
@@ -118,36 +108,29 @@ def pipeline_state(issue_number: int, open_prs: list[dict], merged_prs: list[dic
     if merged is not None:
         return {
             "state": "merged",
-            "pr_number": merged.get("number"),
-            "pr_url": merged.get("url"),
-            "merged_at": merged.get("mergedAt"),
-            "merge_commit": (merged.get("mergeCommit") or {}).get("oid"),
-            "review": _review_verdict(merged.get("reviewDecision")),
-            "ci": _ci_verdict(merged.get("statusCheckRollup")),
+            "pr_number": merged.number,
+            "pr_url": merged.url,
+            "merged_at": merged.merged_at,
+            "merge_commit": merged.merge_commit_oid,
+            "review": _review_verdict(merged.review_decision),
+            "ci": _ci_verdict(merged.ci_rollup),
         }
     openpr = _pr_for_issue(issue_number, open_prs)
     if openpr is not None:
-        review = _review_verdict(openpr.get("reviewDecision"))
+        review = _review_verdict(openpr.review_decision)
         return {
             "state": "in_review" if review else "pr_open",
-            "pr_number": openpr.get("number"),
-            "pr_url": openpr.get("url"),
+            "pr_number": openpr.number,
+            "pr_url": openpr.url,
             "review": review,
-            "ci": _ci_verdict(openpr.get("statusCheckRollup")),
+            "ci": _ci_verdict(openpr.ci_rollup),
         }
     return {"state": "building", "pr_number": None, "pr_url": None}
 
 
-def _pipeline_prs(repo: str, state: str) -> list[dict]:
-    r = _run(["gh", "pr", "list", "--repo", repo, "--state", state, "--json",
-              _PIPELINE_JSON, "--limit", "50"])
-    if r.returncode != 0:
-        return []
-    try:
-        return [p for p in json.loads(r.stdout)
-                if p.get("headRefName", "").startswith("agentflow/")]
-    except json.JSONDecodeError:
-        return []
+def _pipeline_prs(repo: str, state: str) -> list[github.PipelinePrRow]:
+    rows = github.list_pipeline_prs(repo, state)
+    return [] if rows is None else [r for r in rows if r.head_ref_name.startswith("agentflow/")]
 
 
 def workspace_pipeline(repo: str, issue_numbers) -> dict:
@@ -180,17 +163,13 @@ def _effort_of(labels: list[dict]) -> str | None:
 
 def _ready_issues(repo: str) -> list[dict]:
     """Open issues labeled ready-for-agent — the queue waiting to be built."""
-    r = _run(["gh", "issue", "list", "--repo", repo, "--state", "open",
-              "--label", "ready-for-agent", "--json", "number,title,labels", "--limit", "20"])
-    if r.returncode != 0:
+    rows = github.list_issues(repo, label="ready-for-agent", limit=20)
+    if rows is None:
         return []
-    try:
-        issues = json.loads(r.stdout)
-    except json.JSONDecodeError:
-        return []
-    return [{"number": i["number"], "title": i["title"],
-             "complexity": _complexity_of(i["labels"]), "effort": _effort_of(i["labels"])}
-            for i in issues]
+    return [{"number": r.number, "title": r.title,
+             "complexity": _complexity_of([{"name": n} for n in r.labels]),
+             "effort": _effort_of([{"name": n} for n in r.labels])}
+            for r in rows]
 
 
 # Why a `needs-grilling` / `needs-mockup` issue is held — the meaning of the label,
@@ -252,18 +231,13 @@ def _held_issues(repo: str) -> list[dict]:
     (no builder touches a held issue). `since` is the issue's last activity."""
     out = []
     for label in sorted(HELD_LABELS):
-        r = _run(["gh", "issue", "list", "--repo", repo, "--state", "open",
-                  "--label", label, "--json", "number,title,updatedAt", "--limit", "20"])
-        if r.returncode != 0:
+        rows = github.list_issues(repo, label=label, limit=20)
+        if rows is None:
             continue
-        try:
-            issues = json.loads(r.stdout)
-        except json.JSONDecodeError:
-            continue
-        for i in issues:
-            out.append({"number": i["number"], "title": i["title"],
+        for r in rows:
+            out.append({"number": r.number, "title": r.title,
                         "state": label.split(":")[-1], "reason": _HELD_REASON[label],
-                        "since": i.get("updatedAt")})
+                        "since": r.updated_at})
     return out
 
 
@@ -272,14 +246,14 @@ def _parked_prs(repo: str) -> list[dict]:
     already posted, then classified into one reason (never by re-running the pipeline)."""
     out = []
     for p in _prs(repo, "open"):
-        comments = _pr_comments(repo, p["number"])
+        comments = _pr_comments(repo, p.number)
         if comments is None:  # a `gh` blip reads as 'unknown', not 'not parked'
             continue
         reason = park_reason(comments)
         if reason is None:
             continue
-        builder = pr_stage(p.get("headRefName", ""))
-        out.append({"number": p["number"], "title": p["title"], "reason": reason,
+        builder = pr_stage(p.head_ref_name)
+        out.append({"number": p.number, "title": p.title, "reason": reason,
                     "builder": builder, "reviewer": _reviewer_of(builder),
                     "since": _park_since(comments)})
     return out
@@ -291,12 +265,12 @@ def repo_view(cfg: RepoConfig) -> dict:
         "profile": repo_profile(cfg.workdir),
         "ready": _ready_issues(cfg.repo),
         "held": _held_issues(cfg.repo),
-        "in_flight": [{"number": p["number"], "title": p["title"],
-                       "builder": pr_stage(p.get("headRefName", ""))}
+        "in_flight": [{"number": p.number, "title": p.title,
+                       "builder": pr_stage(p.head_ref_name)}
                       for p in _prs(cfg.repo, "open")],
         "parked": _parked_prs(cfg.repo),
-        "recent_merges": [{"number": p["number"], "title": p["title"],
-                           "merged_at": p.get("mergedAt")}
+        "recent_merges": [{"number": p.number, "title": p.title,
+                           "merged_at": p.merged_at}
                           for p in _prs(cfg.repo, "merged")][:10],
         "ratchet": ratchet.status(cfg.repo),
     }
