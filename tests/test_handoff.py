@@ -133,11 +133,18 @@ def test_notify_key_is_stable_and_one_fixed_length():
 
 
 def test_notify_key_differs_by_stage_and_identity():
-    # Two stages of the same work, or the same stage of two works, must not collapse to one key.
-    handoff = DurableHandoff(read_comments=lambda s: [], notify=lambda *a: True)
-    review = handoff._sequence_id(IDENTITY, "review")
-    respond = handoff._sequence_id(IDENTITY, "respond")
-    other_work = handoff._sequence_id("owner/repo#9:review", "review")
+    # Two stages of the same work, or the same stage of two works, must not collapse to one
+    # key — observed through the ping the public call emits, not the private derivation.
+    def key_for(identity, stage):
+        thread = _Thread([[], [_comment(MARKER)]])
+        thread.handoff().hand_off(
+            SUBJECT, identity=identity, stage=stage, marker=MARKER,
+            action=thread.post_marker, notification=NOTE)
+        return thread.pings[0][3]
+
+    review = key_for(IDENTITY, "review")
+    respond = key_for(IDENTITY, "respond")
+    other_work = key_for("owner/repo#9:review", "review")
     assert review != respond
     assert review != other_work
 
