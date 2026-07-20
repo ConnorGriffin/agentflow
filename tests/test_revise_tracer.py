@@ -27,6 +27,7 @@ from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import Record
 from agentflow.gate import MAX_REVISES
 from agentflow.reviewer import Finding, Verdict
+from agentflow.worktree_ref import WorktreeRef
 
 BUILD_WT = "/w/.agentflow/worktrees/claude/issue-7-x"
 REVIEW_WT = "/w/.agentflow/worktrees/codex-review/pr-42-x"
@@ -756,7 +757,9 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
     assert sub.complexity == "deep"                                   # the original builder complexity
     assert sub.round == review.round                                  # stays in the review's round
     assert sub.transfer_from == "o/r|7|review|sha-a"                  # assumes the review's claim
-    assert sub.source == "/home/w/.agentflow/worktrees/claude/issue-7-fix-thing"  # retained build wt
+    # The retained build worktree is recovered from the review path's slug through the layout owner,
+    # so the review (pr-42-fix-thing) and the builder (issue-7-fix-thing) read as the same issue.
+    assert sub.source == WorktreeRef.for_build("/home/w", "claude", 7, "fix-thing").path
     # A review with no builder lineage, an unreadable source, or a missing SHA yields no submission.
     assert coordinated_build.revise_submission(
         Record(identity="x", stage="review", pool="codex", demand=2, repo="o/r", subject="7",

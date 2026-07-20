@@ -33,6 +33,7 @@ from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coor
 from agentflow.balancer import pick_reviewer
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
+from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 BUILD_POOLS = ("claude", "codex")
 _ORPHAN_CLAIM_GRACE_SECONDS = 60 * 60
@@ -139,8 +140,9 @@ def mockup_submission(cfg, issue: dict, tool: str):
 
     n = int(issue["number"])
     sl = slug(issue.get("title", ""))
-    branch = f"agentflow/{tool}/mockup-{n}-{sl}"
-    source = f"{cfg.workdir}/.agentflow/worktrees/{tool}/mockup-{n}-{sl}"
+    ref = WorktreeRef.for_mockup(cfg.workdir, tool, n, sl)
+    branch = ref.branch
+    source = ref.path
     prompt = PRODUCE_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         branch=branch, surfaces=_surfaces_phrase(ui_surfaces(cfg.workdir)),
@@ -153,15 +155,10 @@ def mockup_submission(cfg, issue: dict, tool: str):
 def _build_source_parts(record):
     """The ``(workdir, slug)`` behind a Build record's owned worktree, or ``None``. The slug is
     reused to name the review worktree so both stages of one issue read as a pair on disk."""
-    if not record.source or "/.agentflow/worktrees/" not in record.source:
+    ref = WorktreeRef.parse(record.source)
+    if ref is None:
         return None
-    workdir, tail = record.source.split("/.agentflow/worktrees/", 1)
-    parts = tail.split("/", 1)
-    if len(parts) != 2:
-        return None
-    name = parts[1]
-    prefix = f"issue-{record.subject}-"
-    return workdir, (name[len(prefix):] if name.startswith(prefix) else name)
+    return ref.workdir, ref.slug
 
 
 def review_submission(build_record, head_sha, reviewer_tool, pr_number,
@@ -273,20 +270,12 @@ def _revise_builder_source(review_record):
     revise reuses the *builder's* retained branch/worktree — ``.../<builder_lineage>/issue-<subject>
     -<slug>`` — which the review source (``.../<tool>-review/pr-<pr>-<slug>``) and the record's
     builder lineage together recover, so no second durable field is needed. ``None`` if unreadable."""
-    if (not review_record.source or "/.agentflow/worktrees/" not in review_record.source
-            or not review_record.builder_lineage):
+    review = WorktreeRef.parse(review_record.source)
+    if review is None or review.kind is not WorktreeKind.REVIEW or not review_record.builder_lineage:
         return None
-    workdir, tail = review_record.source.split("/.agentflow/worktrees/", 1)
-    parts = tail.split("/")
-    if len(parts) != 2 or not parts[0].endswith("-review"):
-        return None
-    match = re.match(r"pr-(\d+)-(.+)$", parts[1])
-    if match is None:
-        return None
-    pr_number, slug = int(match.group(1)), match.group(2)
-    build_worktree = (f"{workdir}/.agentflow/worktrees/{review_record.builder_lineage}/"
-                      f"issue-{review_record.subject}-{slug}")
-    return build_worktree, pr_number
+    build = WorktreeRef.for_build(
+        review.workdir, review_record.builder_lineage, int(review_record.subject), review.slug)
+    return build.path, review.number
 
 
 def revise_submission(review_record, complexity, findings="", *, surfaces=""):
@@ -648,17 +637,15 @@ def _collision_comment(comment: github.Comment, admitted_at: int) -> bool:
 
 
 def _source_facts(record):
-    if not record.source or "/.agentflow/worktrees/" not in record.source:
+    ref = WorktreeRef.parse(record.source)
+    if ref is None or ref.tool != record.pool or record.lineage != record.pool:
         return None
-    workdir, tail = record.source.split("/.agentflow/worktrees/", 1)
-    if not tail.startswith(f"{record.pool}/") or record.lineage != record.pool:
+    if record.stage == "mockup":
+        if ref.kind is not WorktreeKind.MOCKUP or str(ref.number) != str(record.subject):
+            return None
+    elif ref.kind is not WorktreeKind.BUILD:
         return None
-    name = tail.split("/", 1)[1] if "/" in tail else ""
-    valid_name = (name.startswith(f"mockup-{record.subject}-")
-                  if record.stage == "mockup" else name.startswith("issue-"))
-    if not valid_name:
-        return None
-    return workdir, f"agentflow/{tail}", Path(record.source)
+    return ref.workdir, ref.branch, Path(record.source)
 
 
 def _worktree_ready(record) -> bool:
@@ -1005,16 +992,18 @@ def _review_source_facts(record):
     """The ``(workdir, pr_number)`` a review worktree encodes, or ``None``. The review source is
     ``.../<tool>-review/pr-<pr>-<slug>``, so the PR number is recoverable for the park handoff
     without a second durable field."""
-    if not record.source or "/.agentflow/worktrees/" not in record.source:
+    ref = WorktreeRef.parse(record.source)
+    if ref is None or ref.kind is not WorktreeKind.REVIEW:
         return None
-    workdir, tail = record.source.split("/.agentflow/worktrees/", 1)
-    parts = tail.split("/")
-    if len(parts) != 2 or not parts[0].endswith("-review"):
-        return None
-    match = re.match(r"pr-(\d+)-", parts[1])
-    if match is None:
-        return None
-    return workdir, int(match.group(1))
+    return ref.workdir, ref.number
+
+
+def _review_slug(record) -> str:
+    """The slug in a Review record's read-only checkout path (``.../pr-<pr>-<slug>``), reused to
+    name the finished worktree so a review reads as the same issue's pair on disk. ``""`` when the
+    source is not a well-formed review path."""
+    ref = WorktreeRef.parse(record.source)
+    return ref.slug if ref is not None else ""
 
 
 def _park_pr_number(record) -> int | None:
@@ -1130,7 +1119,7 @@ def _park_review_settlement(record, verdict, workdir: str, pr: int, comments: li
     proved = _pr_comments(record.repo, pr)
     if proved is None or not any(marker in comment.get("body", "") for comment in proved):
         return None
-    slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+    slug = _review_slug(record)
     _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir), record.pool, pr, slug)
     if autonomous:
         ratchet.record_once(record.repo, "parked", record.identity)
@@ -1167,7 +1156,7 @@ def _settle_review(record) -> str | None:
         return None
     head = pr_facts["head"]
     if pr_facts["state"] == "MERGED":
-        slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+        slug = _review_slug(record)
         _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
                        record.pool, pr, slug, merged=True)
         ratchet.record_once(
@@ -1225,7 +1214,7 @@ def _settle_review(record) -> str | None:
             record, verdict, workdir, pr, comments,
             reason="could not be squash-merged (branch protection, conflict, or transient error)",
             autonomous=True)
-    slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+    slug = _review_slug(record)
     _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
                    record.pool, pr, slug, merged=True)
     ratchet.record_once(
@@ -1616,7 +1605,7 @@ def _moved_head_review_submission(record, head_sha: str):
     if facts is None or not head_sha or not record.builder_lineage:
         return None
     workdir, pr = facts
-    slug = Path(record.source).name.split(f"pr-{pr}-", 1)[-1]
+    slug = _review_slug(record)
     reviewer_tool = pick_reviewer(record.builder_lineage)
     if reviewer_tool is None:
         return None  # ADR 0020: no tool free to review this cycle — leave the record, retry later
