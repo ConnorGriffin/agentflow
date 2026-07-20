@@ -11,8 +11,8 @@ import pytest
 from agentflow import intake as intake_mod
 from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, apply_intake,
                               awaiting_recheck, compose_ready_body, intake_labels,
-                              intake_result_is_durable, parse_intake, replies_since_intake,
-                              sweep_legacy_labels)
+                              intake_prompt, intake_result_is_durable, parse_intake,
+                              replies_since_intake, sweep_legacy_labels)
 from agentflow.runner import Complexity, Effort
 
 
@@ -645,3 +645,17 @@ def test_sweep_ready_for_agent_stays_bare(monkeypatch):
 
     changed = sweep_legacy_labels("owner/repo")
     assert changed == []
+
+
+def test_intake_prompt_carries_the_effort_rubric():
+    # ADR 0046: the effort dial needs anchored rungs, not a bare "how much work it warrants"
+    # line, plus the two misrating warnings from the backtest's real misses.
+    prompt = intake_prompt("owner/repo", {"number": 1, "title": "t", "body": "b"})
+
+    for anchor in ("~70-line diff", "~180 lines", "~390 lines", "1800+ lines"):
+        assert anchor in prompt, f"missing effort rubric anchor: {anchor}"
+    assert "blast radius" in prompt, "missing the brevity-vs-blast-radius misrating warning"
+    assert "doesn't make the change big" in prompt, "missing the scary-name misrating warning"
+    assert "builder reasoning depth" in prompt, "missing the over-rating-burns-capacity note"
+    # the JSON output-field contract for effort must stay untouched
+    assert '"effort": "low" | "medium" | "high" | "extra" — for "ready"; null for a hold' in prompt

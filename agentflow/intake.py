@@ -339,7 +339,16 @@ WRITE the body for your route (Markdown), starting with this exact line:
 DIALS (only for "ready"):
 - complexity: "standard" (ordinary logic -> sonnet/Terra) or "deep" (correctness-sensitive,
   design-heavy -> opus/Sol). If this repo is correctness-sensitive (e.g. medical), lean deep.
-- effort: "low" | "medium" | "high" | "extra" — how much work it warrants.
+- effort: "low" | "medium" | "high" | "extra" — anchor to real merged-PR history, not the
+  ask's brevity or a scary-sounding subsystem name:
+  - low: one focused fix, a handful of files (~70-line diff, ~3 files) — the #240 class.
+  - medium: a contained feature or fix with tests, a few files (~180 lines, ~4 files).
+  - high: cross-module design work (~390 lines, ~8 files, the long-tail builds) — the #208 class.
+  - extra: subsystem-scale — experiment rigs, migrations (1800+ lines, ~25 files) — the #228 class.
+  Rate the blast radius of the change, not the brevity of the ask (#220/#27 read low but landed
+  ~230-270 lines). A scary subsystem name doesn't make the change big (#119/#112 were rated high
+  but landed ~80-150 lines). The dial now also sets builder reasoning depth (ADR 0046) — over-
+  rating burns real capacity, so don't round up "to be safe".
 
 Your final response IS the decision as a structured object — the harness enforces its
 schema natively, so you do not hand-write or fence the JSON; just produce these fields:
