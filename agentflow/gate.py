@@ -9,15 +9,14 @@ the pure decision.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
 import time
 from enum import Enum
 
+from agentflow import github
 from agentflow.reviewer import Verdict
-from agentflow.runner import _run
 
 # Merges stay serialized even as builds run concurrently (ADR 0009 collision floor): two
 # PRs never squash-merge at the same instant. Concurrent dispatch (ADR 0023) multiplies
@@ -225,11 +224,13 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     longer satisfies the gate (issue #205)."""
     if not surfaces:
         return False   # non-UI repo: gate inert
-    r = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
-              "--json", "files,body,comments"])
-    if r.returncode != 0:
+    # The one read that spans files + body + comments in a single snapshot doesn't fit a
+    # typed helper, so it goes through the module's named escape hatch (ADR 0040). A read
+    # that couldn't reach GitHub comes back as None — fail closed to a gap.
+    data = github.api(["pr", "view", str(pr_number), "--repo", repo,
+                       "--json", "files,body,comments"], parse_json=True)
+    if not isinstance(data, dict):
         return True
-    data = json.loads(r.stdout or "{}")
     files = [f.get("path", "") for f in data.get("files", [])]
     if not touches_ui_surface(files, surfaces):
         return False
@@ -260,8 +261,9 @@ def ci_is_green(repo: str, pr_number: int, *,
     iv = interval if interval is not None else int(os.environ.get("AGENTFLOW_CI_INTERVAL", "30"))
     deadline = time.monotonic() + t
     while True:
-        r = _run(["gh", "pr", "checks", str(pr_number), "--repo", repo])
-        if r.returncode == 0:
+        # `gh pr checks` exits non-zero until every required check is green; the escape
+        # hatch surfaces that as None, so a non-None result means all checks passed.
+        if github.api(["pr", "checks", str(pr_number), "--repo", repo]) is not None:
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -274,23 +276,19 @@ def squash_merge(repo: str, pr_number: int) -> bool:
     # survivor re-rebase pass, so merges never overlap (ADR 0009). Held only around the
     # merge itself — never during CI polling — so it can't stall other builds.
     with _MERGE_LOCK:
-        state = _run(["gh", "pr", "view", str(pr_number), "--repo", repo,
-                      "--json", "isDraft"])
-        if state.returncode != 0:
+        data = github.api(["pr", "view", str(pr_number), "--repo", repo,
+                           "--json", "isDraft"], parse_json=True)
+        if not isinstance(data, dict):
             return False
-        try:
-            is_draft = json.loads(state.stdout or "{}").get("isDraft")
-        except (json.JSONDecodeError, AttributeError):
-            return False
+        is_draft = data.get("isDraft")
         if not isinstance(is_draft, bool):
             return False
-        if is_draft:
-            ready = _run(["gh", "pr", "ready", str(pr_number), "--repo", repo])
-            if ready.returncode != 0:
-                return False
-        r = _run(["gh", "pr", "merge", str(pr_number), "--repo", repo,
-                  "--squash", "--delete-branch"])
-        return r.returncode == 0
+        if is_draft and not github.pr_ready(repo, pr_number):
+            return False
+        # No typed merge helper exists (squash + delete-branch is gate-specific), so the
+        # land itself goes through the escape hatch: None means the merge command failed.
+        return github.api(["pr", "merge", str(pr_number), "--repo", repo,
+                           "--squash", "--delete-branch"]) is not None
 
 
 def park(repo: str, pr_number: int, verdict: Verdict | None,
@@ -311,4 +309,4 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
         findings_block = "Review findings:\n" + "\n".join(lines)
     body = ("> *agentflow: parked for human review.*\n\n"
             f"This PR {reason}. {findings_block}")
-    _run(["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body", body])
+    github.pr_comment(repo, pr_number, body)
