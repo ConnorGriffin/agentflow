@@ -15,9 +15,15 @@ one-size surface and single two-hour timeout:
    (Build, Respond, Revise, Mockup) keep the full edit/test surface. Withheld
    tools are **removed from the loaded surface** (that is where the cache-creation
    savings live), with a settings-level deny as backstop — not deny-only.
-2. **MCP servers are pinned to empty** for every stage. Personal connectors never
-   attach to daemon sessions (tracked independently as
-   [#240](https://github.com/ConnorGriffin/agentflow/issues/240)).
+2. **MCP servers are pinned to strict mode** for every stage: only the servers the
+   launcher hands the session attach, so the operator's personal claude.ai connectors
+   never leak in ([#240](https://github.com/ConnorGriffin/agentflow/issues/240)). The
+   operator's *local* dev servers — notably the codebase code-graph tool — are
+   re-supplied so daemon sessions keep them ([#244](https://github.com/ConnorGriffin/agentflow/issues/244)),
+   and a read-only stage's allowlist includes those local servers so an exploration
+   stage (Intake, Review, Research) keeps the same code-graph access Build has. It is
+   the withheld *edit* tools, not the local read-only MCP tools, that a read-only stage
+   loses.
 3. **Per-stage wall-clock and turn ceilings replace the shared two-hour timeout**,
    sized ~1.5–2× the observed maximum per (stage, complexity, effort) cell — the
    table in the research doc is the source of truth. Thin-sample stages (Respond,

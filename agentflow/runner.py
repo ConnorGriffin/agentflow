@@ -350,7 +350,10 @@ class ClaudeRunner(_WorktreeRunner):
         A ``profile`` (ADR 0044) narrows the session to its stage: a read-only stage's
         allowlist is handed to ``--tools`` so the withheld edit tools are absent from the
         loaded surface (with a ``permissions.deny`` backstop in the settings), and the turn
-        ceiling is handed to ``--max-turns``.
+        ceiling is handed to ``--max-turns``. The read-only allowlist is the research §3a
+        read/search set plus the operator's re-supplied local servers (the code-graph tool):
+        an exploration stage keeps the same code-graph access Build has — it is the withheld
+        *edit* tools, not the local read-only MCP tools, that a read-only stage loses.
         """
         from agentflow.coordinator.profiles import WITHHELD_EDIT_TOOLS
 
@@ -365,7 +368,9 @@ class ClaudeRunner(_WorktreeRunner):
                      json.dumps({"mcpServers": servers}, separators=(",", ":"))]
         if profile is not None:
             if profile.allowed_tools is not None:
-                argv += ["--tools", ",".join(profile.allowed_tools)]
+                tools = list(profile.allowed_tools)
+                tools += [f"mcp__{name}" for name in servers]
+                argv += ["--tools", ",".join(tools)]
                 deny = WITHHELD_EDIT_TOOLS
             argv += ["--max-turns", str(profile.turn_ceiling)]
         argv += ["--settings", _claude_settings(deny)]

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+from agentflow import runner as runner_mod
 from agentflow.coordinator.launcher import LocalLauncher
 from agentflow.coordinator.providers import (ProviderCause, classify_claude,
                                              provider_command)
@@ -32,10 +33,13 @@ def _flag(cmd: list[str], name: str) -> str:
     return cmd[cmd.index(name) + 1]
 
 
-def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(tmp_path):
+def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(monkeypatch, tmp_path):
     """An Intake or Review is launched with a read/search allowlist (edit tools absent from the
-    loaded surface), an empty MCP set, a turn ceiling, and a deny backstop — none of which the
-    old uniform full-surface launch carried."""
+    loaded surface), an MCP set pinned to strict mode, a turn ceiling, and a deny backstop — none
+    of which the old uniform full-surface launch carried."""
+    # No operator-local servers → strict mode alone keeps the personal connectors out (#244); the
+    # local code-graph re-supply is exercised in test_runner.py.
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
     for stage, expected_tools in (
         ("intake", ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch")),
         ("review", ("Read", "Bash", "Grep", "Glob")),
@@ -45,9 +49,9 @@ def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(tmp_path):
         assert tuple(tools) == expected_tools
         assert not (_EDIT_TOOLS & set(tools))  # no edit tools in the loaded surface
 
-        # MCP pinned empty (the personal-connector leak closes here), not merely project-scoped.
+        # Strict mode closes the personal-connector leak; with no local servers nothing is re-supplied.
         assert "--strict-mcp-config" in cmd
-        assert json.loads(_flag(cmd, "--mcp-config")) == {"mcpServers": {}}
+        assert "--mcp-config" not in cmd
 
         # A real turn ceiling replaces the absent one; both read-only stages cap at 40 turns.
         assert _flag(cmd, "--max-turns") == "40"
@@ -57,6 +61,24 @@ def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(tmp_path):
         # surface, so a read-only stage has no edit-tool schema to call: unreachable, not caught.
         deny = json.loads(_flag(cmd, "--settings"))["permissions"]["deny"]
         assert set(deny) == _EDIT_TOOLS
+
+
+def test_read_only_stages_keep_the_operators_local_code_graph_server(monkeypatch, tmp_path):
+    """A read-only stage reaches the operator's re-supplied local servers (the code-graph tool):
+    each supplied server is allowlisted alongside the §3a read/search tools, so an exploration
+    stage keeps the same code-graph access Build has (#244) while still losing the edit tools."""
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers",
+                        lambda: {"codebase-memory-mcp": {"command": "/x/code-graph"}})
+    cmd = provider_command(_record("review", str(tmp_path)))
+
+    tools = _flag(cmd, "--tools").split(",")
+    assert "mcp__codebase-memory-mcp" in tools           # code-graph reachable in the read-only surface
+    assert tools[:4] == ["Read", "Bash", "Grep", "Glob"]  # §3a read/search set, verbatim, still first
+    assert not (_EDIT_TOOLS & set(tools))                # edit tools still absent
+
+    # The server itself is re-supplied under strict mode (#244), not merely allowlisted.
+    mcp = json.loads(_flag(cmd, "--mcp-config"))
+    assert list(mcp["mcpServers"]) == ["codebase-memory-mcp"]
 
 
 def test_build_keeps_the_full_edit_surface(tmp_path):

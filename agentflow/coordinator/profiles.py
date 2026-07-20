@@ -9,8 +9,10 @@ values are taken verbatim from the research table
 are expected to ratchet once per-attempt telemetry (#223) fills the thin cells.
 
 Read-only stages (Intake, Review, Research) get a read/search allowlist and no edit tools;
-every other stage keeps the full edit/test surface (``allowed_tools is None``). The MCP set is
-pinned empty for every stage by the runner regardless of this table. Revise inherits the
+every other stage keeps the full edit/test surface (``allowed_tools is None``). The runner
+pins the MCP set to strict mode and re-supplies the operator's local servers (the code-graph
+tool) to every stage, and adds those local servers to a read-only stage's ``--tools`` allowlist
+so an exploration stage keeps the same code-graph access Build has (#244). Revise inherits the
 original builder's Build ceiling via ``builder_complexity`` (ADR 0041).
 """
 

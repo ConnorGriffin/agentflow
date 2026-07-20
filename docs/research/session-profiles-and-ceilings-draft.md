@@ -78,8 +78,10 @@ fail-closed argument arriving for free.
 Drive`, `claude.ai Google Calendar`, `claude.ai Gmail` — and 12 sessions had their
 tool schemas fully expanded into the surface (that is where the 59-tool maximum
 comes from). None of these are relevant to any agentflow stage. `--setting-sources
-project` was meant to exclude user config, yet the MCP servers still attach; a
-narrow profile that pins the MCP set to empty closes this leak outright.
+project` was meant to exclude user config, yet the MCP servers still attach;
+launching under strict MCP mode and re-supplying only the operator's local dev
+servers (the code-graph tool) closes this leak outright while keeping code-graph
+available to daemon sessions (#244).
 
 ### 2c. Ceiling: the 2-hour timeout is dead — it never fires, and it can't kill early
 
@@ -158,7 +160,9 @@ The seam is `provider_command(record)` → `ClaudeRunner.structured_argv(...)`
 | **Research** | read-only + only the external tool its question needs (`WebSearch`/`WebFetch`); no edit tools | none | research skill only |
 | **Build / Respond / Revise** | full edit/test surface (`Read`/`Edit`/`Write`/`Bash`/`Grep`/`Glob`/…) | none | keep repo-relevant skills; drop personal/scheduling ones |
 
-Rules for every profile: **MCP server set pinned to empty** (closes §2b), and
+Rules for every profile: **MCP set pinned to strict mode, re-supplying only the
+operator's local servers** — the code-graph tool, allowlisted for read-only stages
+too (closes §2b, keeps code-graph; #244) — and
 `Cron*`/`Schedule*`/`RemoteTrigger`/`PushNotification`/`Monitor`/`Task*`/plan-mode
 tools dropped everywhere — history shows them loaded in every stage and used in
 none.
