@@ -1,0 +1,87 @@
+# ADR 0042 — One module owns the crash-safe human-handoff envelope
+
+- Status: Accepted
+- Date: 2026-07-19
+
+## Context
+
+Whenever a stage hands work to a human — parks a reviewed PR, holds an issue at intake or
+mockup, settles a respond — it runs the same crash-safe recipe so a daemon that dies
+mid-handoff and restarts does not double-act:
+
+1. read the subject's comments;
+2. post a marker comment **only if it is not already present**;
+3. re-read and **prove** the marker landed — if it cannot be proven, return nothing so the
+   next cycle retries (proof is deliberately withheld to force the retry);
+4. notify the operator **exactly once**, only when the marker was newly posted, keyed by a
+   sequence id derived from the record identity.
+
+This envelope is re-implemented across `_hold_build`, `_hold_mockup`, `_park_pr`,
+`_park_respond`, `_park_review_settlement`, `_settle_respond`, `_settle_mockup`, and intake's
+two holds. The `sha256(record.identity)` sequence-id idiom is copy-pasted with inconsistent
+lengths (12 versus 24 characters). The hard invariant — exactly-once notification across
+crashes, proof withheld to force a retry — therefore has seven-plus homes, and this is the
+highest-stakes duplication in the engine: a double-ping or a park that notifies before the
+comment is proven is an operator-facing failure.
+
+## Decision
+
+### One call owns the whole envelope
+
+Introduce a `DurableHandoff` module whose single operation runs the entire crash-safe
+envelope. The caller supplies the marker text, the action to perform when the marker is
+absent, and the notification payload; the module does read → act-iff-absent → re-read-and-
+prove → notify-once and returns the durable proof (the subject URL) or `None`. The ordering —
+the exact thing that must never be reassembled wrong — lives in one place and is impossible
+for a stage to get out of order.
+
+Separate composable primitives (`ensure_comment`, `prove`, `notify_once`) were rejected: they
+would let each stage re-wire the ordering and reintroduce the double-ping / prove-before-notify
+class of bug this module exists to delete.
+
+### The module owns the notify-once key
+
+`DurableHandoff` derives the notification sequence id itself, from the record identity plus a
+stage tag, at one fixed length — replacing the copy-pasted 12-versus-24-character hashes. The
+marker comment's presence remains the idempotency signal for the *action*; the derived
+sequence id is the idempotency signal for the *notification*. Both are owned here.
+
+### The envelope is thin; stage bookkeeping stays with the stage
+
+The module owns only the comment-marker-plus-notify-once envelope. Stage-specific bookkeeping
+that some paths do — removing a finished review checkout, recording ratchet state — stays in
+the stage and runs after the call confirms (returns non-`None`). It therefore runs a moment
+after the notification instead of before, which is immaterial: both are idempotent and
+independent. Keeping bookkeeping out preserves the module's focus and locality, mirroring the
+thin-seam choice in [ADR 0040](0040-github-access-module.md) (mutations report status; proof
+is layered, not baked into every write).
+
+### Built on the GitHub-access module; additive keystone
+
+`DurableHandoff` reads comments and posts the marker through the `github` module
+([ADR 0040](0040-github-access-module.md)), so its introduction is ordered after that module
+exists. The keystone adds `DurableHandoff` and its tests and migrates zero callers, so it
+cannot change pipeline behavior. The seven-plus hold/park/settle sites migrate to it later, in
+behavior-preserving batches, serialized on `coordinated_build.py` against the other
+candidates' migrations ([ADR 0038](0038-conflict-resolution-as-revise.md)). It directly
+implements [ADR 0028](0028-stage-scoped-continuations.md)'s exhaustion-handoff contract.
+
+## Alternatives considered
+
+- **Composable primitives instead of one call.** Rejected: the ordering is the bug; loose
+  pieces let stages get it wrong again.
+- **Prove-on-write baked into the `github` module's mutations.** Rejected in
+  [ADR 0040](0040-github-access-module.md): fire-and-forget callers would change behavior and
+  the prove-then-notify recipe belongs here, layered on top.
+- **Pull stage bookkeeping (worktree cleanup, ratchet) into the shared call.** Rejected: it is
+  stage-specific and would widen the envelope's interface with per-stage concerns, eroding the
+  locality the module exists to create.
+
+## Consequences
+
+- The crash-safe notify-once ordering is fixed once and cannot be reassembled wrong; one
+  exhaustive crash-window test replaces the partial re-verification scattered across four
+  tracer test files.
+- Notification keying becomes uniform across every handoff.
+- Ordered after the `github` module; additive keystone. Its migrations (holds, parks, settles,
+  intake holds) serialize with the other candidates on shared files.
