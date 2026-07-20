@@ -31,6 +31,7 @@ from pathlib import Path
 
 from agentflow import live
 from agentflow.coordinator import Submission
+from agentflow.shell_crib import SHELL_CRIB
 from agentflow.workspace import channel, publish
 from agentflow.workspace.projection import workspace_projection
 from agentflow.workspace.store import ACCEPTED, WorkspaceStore, project_slug
@@ -54,7 +55,7 @@ as needed:
 
 Writing that file is the sole durable outcome of this turn. If you exit without writing it, the
 turn is incomplete and will run again — never write it twice.
-"""
+""" + SHELL_CRIB
 
 # When the operator asks for a build-issue write-up, the turn produces a *complete* draft itself
 # (decide-then-review, ADR 0034) — no interrogation, one input surface. The session writes the
@@ -87,7 +88,7 @@ project state — this is a conversation, not a build. Writing those two files i
 outcome of this turn; the daemon adopts the draft into an immutable, content-hashed proposal you
 can then review and approve. If you exit without writing them, the turn is incomplete and will run
 again — never write them twice.
-"""
+""" + SHELL_CRIB
 
 # Build-issue intent is detected from the operator's own words (one input surface, no draft
 # button). "write this up as a build issue", "draft a build-issue", etc. all trip it.
