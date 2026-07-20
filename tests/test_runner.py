@@ -20,9 +20,9 @@ def _git(cwd: Path, *args: str) -> str:
                           capture_output=True).stdout.strip()
 
 
-def _repo_with_origin(tmp_path: Path) -> Path:
-    origin = tmp_path / "origin.git"
-    repo = tmp_path / "repo"
+def _repo_with_origin(tmp_path: Path, name: str = "repo") -> Path:
+    origin = tmp_path / f"{name}.origin.git"
+    repo = tmp_path / name
     subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
     subprocess.run(["git", "clone", str(origin), str(repo)], check=True, capture_output=True)
     _git(repo, "config", "user.email", "agentflow@example.com")
@@ -453,3 +453,90 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
     registered = _git(repo, "worktree", "list", "--porcelain")
     assert str(completed) not in registered and str(legacy) not in registered
     assert str(foreign_wt) not in registered  # ownership comes from the foreign repo's metadata
+
+
+def _graph_project(path: Path) -> str:
+    """The codebase-memory project name for a checkout: its real path with the leading slash
+    dropped and every separator turned into a dash — the same transform the graph itself uses."""
+    return os.path.realpath(str(path)).strip("/").replace("/", "-")
+
+
+def _session_prompt(cmd: list[str]) -> str:
+    """The bounded session prompt handed to either provider (Claude's ``-p`` value, Codex's
+    trailing argument) — the one argument carrying the session boundary."""
+    return next(arg for arg in cmd if "Session boundary" in arg)
+
+
+def test_daemon_sessions_ground_in_the_maintained_main_checkout_graph(tmp_path):
+    """Both providers are told to query the *maintained main-checkout* code graph — named from the
+    repository the worktree belongs to, not the empty per-worktree copy — before shell orientation,
+    and to keep every read and edit inside the worktree. Proven for two differently-named repos, so
+    no owner, path, or project id is hardcoded and the same launch grounds every fleet repository."""
+    for name in ("alpha-service", "beta-tool"):
+        repo = _repo_with_origin(tmp_path, name)
+        wt = repo / ".agentflow" / "worktrees" / "codex" / f"issue-3-{name}"
+        _branch_worktree(repo, wt, f"agentflow/codex/issue-3-{name}")
+
+        main_project = _graph_project(repo)
+        worktree_project = _graph_project(wt)
+        assert main_project != worktree_project  # the worktree is a distinct path/project
+
+        for runner in (ClaudeRunner(), CodexRunner()):
+            prompt = _session_prompt(
+                runner.structured_argv("build it", runner.model_for(Complexity.DEEP), str(wt)))
+            # Names the maintained main-checkout graph and pins queries to it, not the worktree copy.
+            assert f"project={main_project}" in prompt
+            assert worktree_project not in prompt
+            # Graph-first for structural discovery, with the concrete graph tools named.
+            assert "code graph" in prompt.lower() and "search_graph" in prompt
+            # Reads and edits stay in the worktree even though graph results name the main checkout.
+            assert str(wt.resolve()) in prompt
+            assert "stays inside your assigned worktree" in prompt
+
+
+def test_codex_resupplies_the_operator_code_graph_server_on_every_stage(monkeypatch, tmp_path):
+    """Codex drops all user config to keep the personal connectors out (``--ignore-user-config``),
+    which also drops the code-graph server. It is re-supplied as an ``mcp_servers`` ``-c`` override
+    on every stage — Build (workspace-write) and read-only alike — so Codex reaches the same graph
+    Claude does, while the account connectors stay excluded and a read-only stage keeps its sandbox
+    boundary. With no operator-local servers there is nothing to attach."""
+    from agentflow.coordinator.profiles import StageProfile
+
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-11-graph"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-11-graph")
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers",
+                        lambda: {"codebase-memory-mcp": {"command": "/x/code-graph"}})
+
+    read_only = StageProfile(("Read", "Bash", "Grep", "Glob"), 900, 40)
+    for profile, sandbox in ((None, "workspace-write"), (read_only, "read-only")):
+        cmd = CodexRunner().structured_argv("do work", "sol", str(wt), profile=profile)
+        override = 'mcp_servers.codebase-memory-mcp.command="/x/code-graph"'
+        assert override in cmd and cmd[cmd.index(override) - 1] == "-c"
+        assert "--ignore-user-config" in cmd            # personal account connectors stay excluded
+        assert cmd[cmd.index("--sandbox") + 1] == sandbox  # read-only stage keeps its boundary
+
+    # No operator-local servers → nothing is re-supplied (the personal connectors were the risk).
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
+    cmd = CodexRunner().structured_argv("do work", "sol", str(wt))
+    assert not any(str(arg).startswith("mcp_servers.") for arg in cmd)
+
+
+def test_codex_resupplies_a_full_server_spec_as_valid_toml_overrides(monkeypatch, tmp_path):
+    """A launched server may carry ``args`` and ``env`` (the common ``npx``-style shape), not just a
+    bare ``command`` — Claude honors them because it hands the whole map to ``--mcp-config``, so
+    Codex must carry the same map across. Each is rendered as a Codex ``-c`` override whose value is
+    valid TOML: a string command, a TOML array of args, and one env key per entry (no hand-built
+    inline table). This guards the parity that keeps both providers on one server definition."""
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-12-fullspec"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-12-fullspec")
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {
+        "code-graph": {"command": "npx", "args": ["-y", "code-graph-mcp"],
+                       "env": {"GRAPH_TOKEN": "abc123"}}})
+
+    cmd = CodexRunner().structured_argv("do work", "sol", str(wt))
+    overrides = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-c"]
+    assert 'mcp_servers.code-graph.command="npx"' in overrides
+    assert 'mcp_servers.code-graph.args=["-y", "code-graph-mcp"]' in overrides
+    assert 'mcp_servers.code-graph.env.GRAPH_TOKEN="abc123"' in overrides
