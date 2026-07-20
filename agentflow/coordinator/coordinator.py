@@ -330,12 +330,13 @@ class Coordinator:
                     return outcomes
             for record in cold:
                 self._admit(record, now)
-            # A read-only Review whose home pool cannot launch it may move here (ADR 0028/0020) —
-            # a fresh review as well as a continuation, since a pool that lost its launch capacity
-            # would otherwise freeze it forever. It is best-effort and never blocks the pool
-            # head-of-line: a move that cannot reserve reverts, leaving the record on its home pool
-            # for that pool's own cycle.
-            for record in self._migratable_reviews(pool, now):
+            # A stage whose home pool cannot launch it may move here (ADR 0028/0020) — a read-only
+            # Review (fresh or continuation) whose review safety allows either pool, and a
+            # *never-started* Build (attempts=0, no branch/worktree/PR yet, so its lineage pin is
+            # vacuous), since a pool that lost its launch capacity would otherwise freeze it forever
+            # (#273). It is best-effort and never blocks the pool head-of-line: a move that cannot
+            # reserve reverts, leaving the record on its home pool for that pool's own cycle.
+            for record in self._migratable(pool, now):
                 self._admit_migration(record, pool, now)
             return outcomes
 
@@ -452,21 +453,21 @@ class Coordinator:
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
 
-    def _migratable_reviews(self, pool: str, now: int) -> list[Record]:
-        """Eligible read-only Reviews whose home pool cannot currently launch them and that
-        review safety lets move onto ``pool`` (ADR 0028/0020). Ordered like any continuation
-        queue. A review freezes if its home pool loses launch capacity *after* the record was
-        created — the permit ledger fills, or the launcher's own admission gate now refuses it
-        (e.g. codex weekly-budget pacing) — so both are re-placement triggers, and a *fresh*
-        review (``attempts=0``, never a continuation) may move too, not only continuations:
-        without launching it could never become one, so requiring a continuation would freeze
-        it forever. A code-writing stage is pinned to its builder lineage and never appears
-        here; a review whose home pool can still launch it is left for that pool's cycle."""
+    def _migratable(self, pool: str, now: int) -> list[Record]:
+        """Eligible stages whose home pool cannot currently launch them and that safety lets move
+        onto ``pool`` (ADR 0028/0020, #273). Ordered like any continuation queue. A stage freezes
+        if its home pool loses launch capacity *after* the record was created — the permit ledger
+        fills, or the launcher's own admission gate now refuses it (e.g. codex weekly-budget
+        pacing) — so both are re-placement triggers, and a *fresh* record (``attempts=0``, never a
+        continuation) may move too, not only continuations: without launching it could never become
+        one, so requiring a continuation would freeze it forever. See ``_may_migrate`` for which
+        stages are safe to move; a stage whose home pool can still launch it is left for that
+        pool's cycle."""
         candidates = [
             r for r in self._records.values()
             if r.state == WAITING and not r.hold_pending and r.root is None
             and r.eligible_at <= now
-            and r.pool != pool and self._review_may_move(r)
+            and r.pool != pool and self._may_migrate(r)
             and self._pool_cannot_fit(r)]
         return sorted(candidates, key=lambda r: (r.eligible_at, r.created_at, r.identity))
 
@@ -481,18 +482,29 @@ class Coordinator:
         return not self._gate(record)
 
     @staticmethod
-    def _review_may_move(record: Record) -> bool:
-        """Review safety for a cross-pool move: a read-only review is unpinned (no code-writing
-        lineage), so it may run on either pool. A same-tool review that moves onto the builder's
-        pool may still finish, but the coordinator strips its auto-merge eligibility (ADR 0028)."""
-        return record.stage == "review" and record.lineage is None
+    def _may_migrate(record: Record) -> bool:
+        """Whether a stage is safe to move off its home pool. A read-only review is unpinned (no
+        code-writing lineage), so it may run on either pool; a same-tool review that lands on the
+        builder's pool may still finish, but the coordinator strips its auto-merge eligibility
+        (ADR 0028). A *never-started* Build (``attempts=0``) has no branch/worktree/PR, so its
+        lineage pin is vacuous and the move is safe (#273): once it launches, the pin is
+        re-established on the destination pool. A Build that already made a real attempt, and
+        ``revise``/``respond`` continuations bound to an existing PR on a specific lineage, stay
+        pinned; only a genuinely fresh Build moves."""
+        if record.stage == "review" and record.lineage is None:
+            return True
+        return record.stage == "build" and record.attempts == 0
 
     def _admit_migration(self, record: Record, dest_pool: str, now: int) -> None:
-        """Move a Review continuation to ``dest_pool``, recomputing its admission demand and
-        model for the destination and re-deriving auto-merge (a review by the builder's own tool
-        can finish but never auto-merges — ADR 0028). A move that does not start reverts every
-        moved field, so a record that could not reserve is never stranded off its home pool."""
-        home = (record.pool, record.model, record.demand, record.auto_merge_allowed)
+        """Move a migratable stage to ``dest_pool``, recomputing its admission demand and model
+        for the destination and re-deriving auto-merge (a review by the builder's own tool can
+        finish but never auto-merges — ADR 0028). A code-writing Build also carries a pool-keyed
+        lineage and worktree source, so its move re-pins the lineage to ``dest_pool`` and rewrites
+        the tool segment of the source path — without both, ``_source_facts`` rejects the moved
+        record and it never admits (#273). A move that does not start reverts every moved field, so
+        a record that could not reserve is never stranded off its home pool."""
+        home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
+                record.lineage, record.source)
         record.pool = dest_pool
         record.model = MODEL_FOR.get((dest_pool, record.complexity), "opus")
         demand = admission_demand(
@@ -500,8 +512,12 @@ class Coordinator:
         record.demand = demand if demand is not None else PERMIT_BUDGET
         record.auto_merge_allowed = not (record.builder_lineage is not None
                                          and dest_pool == record.builder_lineage)
+        if record.stage in CODE_WRITING:
+            record.lineage = dest_pool
+            record.source = _repool_source(record.source, dest_pool)
         if self._admit(record, now) != STARTED:
-            (record.pool, record.model, record.demand, record.auto_merge_allowed) = home
+            (record.pool, record.model, record.demand, record.auto_merge_allowed,
+             record.lineage, record.source) = home
             record.state = WAITING
             self._persist(record)
 
@@ -857,6 +873,22 @@ def _identity(repo: str, subject: str, stage: str, target: str | None, round: in
     if resume:
         parts.append(f"s{resume}")
     return "|".join(parts)
+
+
+_WORKTREES_MARKER = "/.agentflow/worktrees/"
+
+
+def _repool_source(source: str | None, dest_pool: str) -> str | None:
+    """Rewrite the tool segment of a Build's worktree source path to ``dest_pool`` when a
+    never-started Build migrates pools (#273). The path is ``<workdir>/.agentflow/worktrees/
+    <tool>/issue-<n>-<slug>``; only the ``<tool>`` segment changes. A pure string rewrite local to
+    the coordinator — the loop layer that first built the path must not be imported here (ADR 0030
+    layering). A source with no worktree marker is left untouched (nothing to re-pin)."""
+    if not source or _WORKTREES_MARKER not in source:
+        return source
+    head, tail = source.split(_WORKTREES_MARKER, 1)
+    name = tail.split("/", 1)[1] if "/" in tail else ""
+    return f"{head}{_WORKTREES_MARKER}{dest_pool}/{name}" if name else source
 
 
 def _admit_everything(record: Record) -> bool:

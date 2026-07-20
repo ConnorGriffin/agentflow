@@ -526,6 +526,90 @@ def test_pr_bound_review_admits_and_the_build_stays_waiting(make_coord):
     assert permits(coord, "claude") == 1           # only the review's demand is reserved
 
 
+# --- a never-started build migrates off a throttled pool (#273) --------------------------
+
+def _gate_blocking(*pools):
+    """An admission gate that refuses launches on the named pools (e.g. one whose codex weekly
+    budget is spent) while its permit ledger is untouched — the launch-gate block that froze the
+    ciq-autotune #391/#396/#397 builds at zero attempts."""
+    blocked = set(pools)
+    return lambda record: record.pool not in blocked
+
+
+# A worktree source in the pool-keyed layout the real builder bakes (loop._builder_worktree),
+# so the migration's source rewrite is checked against the actual _source_facts parser.
+_SRC = "/work/o-r/.agentflow/worktrees/codex/issue-7-fix"
+
+
+def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlocking(make_coord):
+    """A waiting, zero-attempt build pinned to codex whose codex launch gate is blocked (weekly
+    pacing) while claude has headroom migrates to claude within a single cycle and starts, rather
+    than freezing forever behind its own live claim. Reproduces ciq-autotune #391/#396/#397: before
+    the fix the build could neither launch on codex nor fall back to claude, and its live claim
+    shielded the building label from reclaim."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_gate_blocking("codex"),
+                       adapter=_adapter(fake, pr=[False], prep=[True]))
+    ident = coord.submit_stage(_build("7", pool="codex", source=_SRC))
+    coord.cycle("codex", now=0)                        # codex cannot launch it; ledger untouched
+    frozen = record_of(coord, ident)
+    assert frozen.state == "waiting" and frozen.attempts == 0
+    assert frozen.claim is True                        # the live claim that shields the label
+    assert permits(coord, "codex") == 0
+
+    coord.cycle("claude", now=0)                       # re-placed onto claude, which can launch it
+    moved = record_of(coord, ident)
+    assert moved.pool == "claude" and moved.state == "running"
+    assert moved.lineage == "claude"                   # lineage re-pinned to the destination
+    assert moved.source == "/work/o-r/.agentflow/worktrees/claude/issue-7-fix"
+    assert coordinated_build._source_facts(moved) is not None  # the real parser accepts the move
+    assert permits(coord, "claude") == moved.demand
+
+
+def test_a_started_build_never_migrates_off_its_pinned_pool(make_coord):
+    """A build that already made a real attempt (branch/worktree/PR may exist) stays pinned to its
+    builder lineage even when that pool is later throttled — only a genuinely never-started build
+    is safe to move (#273)."""
+    fake = FakeSession()
+    coord = make_coord(fake, adapter=_adapter(fake, pr=[False], prep=[True]))
+    ident = coord.submit_stage(_build("7", pool="codex", source=_SRC))
+    coord.cycle("codex", now=0)                        # first attempt starts
+    fake.end(ident, cause=ProviderCause.PROCESS)       # interrupted → continuation on codex
+    coord._gate = _gate_blocking("codex")              # codex now throttled before it can relaunch
+    coord.cycle("codex", now=0)                        # reconciles to a waiting continuation
+    assert record_of(coord, ident).attempts == 1
+    coord.cycle("claude", now=0)                       # claude cycle must not adopt it
+    stayed = record_of(coord, ident)
+    assert stayed.pool == "codex" and stayed.lineage == "codex"
+    assert permits(coord, "claude") == 0
+
+
+def test_a_never_started_build_stays_home_when_both_pools_are_throttled(make_coord):
+    """With both pools launch-blocked the build reverts every moved field cleanly to its home pool
+    each cycle (never a half-move or cross-pool leak), and once codex regains budget it launches at
+    home from the un-rewritten source — proving the revert restored it intact (#273)."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_gate_blocking("codex", "claude"),
+                       adapter=_adapter(fake, pr=[False], prep=[True]))
+    ident = coord.submit_stage(_build("7", pool="codex", source=_SRC))
+    coord.cycle("codex", now=0)
+    home_demand = record_of(coord, ident).demand
+    for _ in range(3):                                 # several cycles, both pools blocked
+        coord.cycle("codex", now=0)
+        coord.cycle("claude", now=0)
+    parked = record_of(coord, ident)
+    assert parked.pool == "codex" and parked.state == "waiting" and parked.attempts == 0
+    assert parked.lineage == "codex" and parked.source == _SRC   # migration fields reverted
+    assert parked.demand == home_demand                          # no half-move
+    assert permits(coord, "claude") == 0
+
+    coord._gate = _gate_blocking("claude")             # codex regains its weekly budget
+    coord.cycle("codex", now=0)                        # launches at home from the intact source
+    launched = record_of(coord, ident)
+    assert launched.pool == "codex" and launched.state == "running"
+    assert coordinated_build._source_facts(launched) is not None
+
+
 # --- live projection & claim ownership ---------------------------------------------------
 
 def test_running_build_projects_to_live_board_waiting_does_not(make_coord):
