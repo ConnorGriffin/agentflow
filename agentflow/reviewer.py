@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentflow.shell_crib import SHELL_CRIB
+from agentflow.worktree_ref import WorktreeRef
 
 
 # Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
@@ -185,5 +186,4 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
 
 
 def review_worktree(workdir: str, tool: str, pr_number: int, slug: str) -> Path:
-    return (Path(workdir) / ".agentflow" / "worktrees" / f"{tool}-review" /
-            f"pr-{pr_number}-{slug}")
+    return Path(WorktreeRef.for_review(workdir, tool, pr_number, slug).path)
