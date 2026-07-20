@@ -1,21 +1,6 @@
+# >>> cbm-onboard managed baseline — do not edit inside this block >>>
 # codebase-memory-mcp ignore (gitignore syntax).
-# Keeps daemon/agent-generated state and dependency/build output out of the
-# knowledge graph so structural queries resolve current tracked source
-# instead of stale worktree copies.
-
-# daemon + agent worktrees and their generated state (not source)
-.agentflow/
-.claude/worktrees/
-.impeccable/
-
-# dependency trees and generated frontend output
-agentflow/webui/node_modules/
-agentflow/webui/dist/
-node_modules/
-dist/
-build/
-
-# python build/test/env noise
+# Keeps non-source noise out of the knowledge graph and query results.
 .venv/
 venv/
 env/
@@ -25,7 +10,35 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .tox/
+node_modules/
+dist/
+build/
 *.egg-info/
+# generated agent workspaces
+.agentflow/
+.claude/worktrees/
+.impeccable/
+# data & secrets
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.parquet
+.env
+*.log
+# <<< cbm-onboard managed baseline <<<
+
+# Keeps daemon/agent-generated state and dependency/build output out of the
+# knowledge graph so structural queries resolve current tracked source
+# instead of stale worktree copies.
+
+# daemon + agent worktrees and their generated state (not source)
+
+# dependency trees and generated frontend output
+agentflow/webui/node_modules/
+agentflow/webui/dist/
+
+# python build/test/env noise
 
 # git internals
 .git/
