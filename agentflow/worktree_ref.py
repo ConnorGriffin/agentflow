@@ -1,0 +1,184 @@
+"""One value type owns the per-session worktree-path layout (ADR 0041).
+
+Every pipeline session's checkout lives at a path that encodes a
+``(workdir, tool, kind, issue-or-PR number, slug)`` tuple::
+
+    {workdir}/.agentflow/worktrees/{lane}/{name}
+
+where ``lane`` is ``{tool}``, ``{tool}-review``, or ``{tool}-intake``, ``name`` is
+``issue-{n}-{slug}``, ``mockup-{n}-{slug}``, ``pr-{pr}-{slug}``, ``issue-{n}``,
+``research-{n}``, or ``ask-{token}``, and the branch is ``agentflow/{lane}/{name}``.
+
+:class:`WorktreeRef` is the single owner of that convention. It reads a path apart
+(:meth:`WorktreeRef.parse`) and builds one up (the ``for_*`` constructors), so the two
+directions cannot drift — a round-trip (``parse(ref.path) == ref``) pins the whole layout
+in one place. Parse owns only the *shape* rule: a malformed or unrecognized path reads as
+``None`` (the fail-closed convention every current site uses), never a raise. Whether a
+path's tool or lane agrees with a particular record's expectations is the caller's
+judgment — the type never takes a record.
+
+This module is purely additive (ADR 0041): it migrates no existing caller.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+
+_MARKER = "/.agentflow/worktrees/"
+
+
+class WorktreeKind(str, Enum):
+    """The kind of work a checkout holds — the layout's typed discriminator."""
+
+    BUILD = "build"
+    REVISE = "revise"
+    REVIEW = "review"
+    MOCKUP = "mockup"
+    INTAKE = "intake"
+    RESEARCH = "research"
+    CONVERSE = "converse"
+
+
+@dataclass(frozen=True)
+class _Shape:
+    """How one kind's ``name`` reads apart and builds up — the single per-kind rule."""
+
+    lane_suffix: str  # "", "-review", or "-intake"
+    head: str  # the name's leading token: "issue", "pr", "mockup", ...
+    pattern: re.Pattern  # parses a name into ("num"?, "slug"?) groups
+    has_number: bool
+    has_slug: bool
+
+    def render(self, number: int | None, slug: str) -> str:
+        """The ``name`` segment for these parts."""
+        if self.has_number and self.has_slug:
+            return f"{self.head}-{number}-{slug}"
+        if self.has_number:
+            return f"{self.head}-{number}"
+        return f"{self.head}-{slug}"
+
+
+# Build's and revise's on-disk shape are identical — a revise reuses the builder's
+# retained worktree — so only build appears here; revise round-trips through it.
+_SHAPES: dict[WorktreeKind, _Shape] = {
+    WorktreeKind.BUILD: _Shape("", "issue", re.compile(r"^issue-(?P<num>\d+)-(?P<slug>.+)$"), True, True),
+    WorktreeKind.MOCKUP: _Shape("", "mockup", re.compile(r"^mockup-(?P<num>\d+)-(?P<slug>.+)$"), True, True),
+    WorktreeKind.RESEARCH: _Shape("", "research", re.compile(r"^research-(?P<num>\d+)$"), True, False),
+    WorktreeKind.CONVERSE: _Shape("", "ask", re.compile(r"^ask-(?P<slug>.+)$"), False, True),
+    WorktreeKind.REVIEW: _Shape("-review", "pr", re.compile(r"^pr-(?P<num>\d+)-(?P<slug>.+)$"), True, True),
+    WorktreeKind.INTAKE: _Shape("-intake", "issue", re.compile(r"^issue-(?P<num>\d+)$"), True, False),
+}
+
+
+@dataclass(frozen=True)
+class WorktreeRef:
+    """A per-session checkout path decomposed into its typed parts (ADR 0041).
+
+    ``number`` is the issue or PR number (``None`` for a conversation, which has no number);
+    ``slug`` is the trailing descriptor (empty for an intake or research checkout, and the
+    conversation token for a converse checkout).
+    """
+
+    workdir: str
+    tool: str
+    kind: WorktreeKind
+    number: int | None
+    slug: str
+
+    # --- build up -----------------------------------------------------------------------
+
+    @classmethod
+    def for_build(cls, workdir: str, tool: str, number: int, slug: str) -> "WorktreeRef":
+        return cls(workdir, tool, WorktreeKind.BUILD, number, slug)
+
+    @classmethod
+    def for_revise(cls, workdir: str, tool: str, number: int, slug: str) -> "WorktreeRef":
+        """A revise reuses the builder's retained build worktree, so its ref *is* a build
+        ref — the review→build sibling derivation is ``for_build`` from the parsed review
+        ref plus the record's builder lineage (ADR 0041)."""
+        return cls.for_build(workdir, tool, number, slug)
+
+    @classmethod
+    def for_mockup(cls, workdir: str, tool: str, number: int, slug: str) -> "WorktreeRef":
+        return cls(workdir, tool, WorktreeKind.MOCKUP, number, slug)
+
+    @classmethod
+    def for_review(cls, workdir: str, tool: str, pr_number: int, slug: str) -> "WorktreeRef":
+        return cls(workdir, tool, WorktreeKind.REVIEW, pr_number, slug)
+
+    @classmethod
+    def for_intake(cls, workdir: str, tool: str, number: int) -> "WorktreeRef":
+        return cls(workdir, tool, WorktreeKind.INTAKE, number, "")
+
+    @classmethod
+    def for_research(cls, workdir: str, tool: str, number: int) -> "WorktreeRef":
+        return cls(workdir, tool, WorktreeKind.RESEARCH, number, "")
+
+    @classmethod
+    def for_converse(cls, workdir: str, tool: str, token: str) -> "WorktreeRef":
+        return cls(workdir, tool, WorktreeKind.CONVERSE, None, token)
+
+    # --- read apart ---------------------------------------------------------------------
+
+    @classmethod
+    def parse(cls, source: str | None) -> "WorktreeRef | None":
+        """The parts behind a checkout path, or ``None`` if it is not a well-formed worktree
+        path. Judges *shape* only; never raises."""
+        if not source or _MARKER not in source:
+            return None
+        workdir, tail = source.split(_MARKER, 1)
+        parts = tail.split("/")
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            return None
+        lane, name = parts
+        for kind, shape in _SHAPES.items():
+            tool = _lane_tool(lane, shape.lane_suffix)
+            if tool is None:
+                continue
+            match = shape.pattern.match(name)
+            if match is None:
+                continue
+            number = int(match.group("num")) if shape.has_number else None
+            slug = match.group("slug") if shape.has_slug else ""
+            return cls(workdir, tool, kind, number, slug)
+        return None
+
+    # --- render -------------------------------------------------------------------------
+
+    @property
+    def lane(self) -> str:
+        return f"{self.tool}{_SHAPES[self._shape_kind].lane_suffix}"
+
+    @property
+    def name(self) -> str:
+        return _SHAPES[self._shape_kind].render(self.number, self.slug)
+
+    @property
+    def path(self) -> str:
+        return str(Path(self.workdir) / ".agentflow" / "worktrees" / self.lane / self.name)
+
+    @property
+    def branch(self) -> str:
+        return f"agentflow/{self.lane}/{self.name}"
+
+    @property
+    def _shape_kind(self) -> WorktreeKind:
+        # Revise shares build's on-disk shape.
+        return WorktreeKind.BUILD if self.kind is WorktreeKind.REVISE else self.kind
+
+
+def _lane_tool(lane: str, suffix: str) -> str | None:
+    """The tool a lane names once its kind's reserved suffix is stripped, or ``None`` if the
+    lane does not carry that suffix (or leaves no tool). The *name* — not the lane — fixes the
+    kind (only a ``pr-…`` name is a review, only a slug-less ``issue-…`` name is an intake), so
+    a plain lane is read as the whole tool even when that tool's own name ends in ``-review`` or
+    ``-intake``. That keeps such a tool's build representable instead of mistaking it for a
+    stripped review/intake lane."""
+    if suffix:
+        if not lane.endswith(suffix):
+            return None
+        lane = lane[: -len(suffix)]
+    return lane or None
