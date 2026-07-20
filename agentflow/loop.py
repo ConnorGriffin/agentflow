@@ -24,6 +24,7 @@ from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, STATE_LABE
                               replies_since_intake)
 from agentflow.notify import notify
 from agentflow.reviewer import Verdict, review_worktree
+from agentflow.shell_crib import SHELL_CRIB
 from agentflow.runner import (Complexity, Effort, _run,
                               _worktree_is_disposable, _worktree_is_registered,
                               remove_worktree_if_safe, worktree_session)
@@ -200,7 +201,7 @@ and a body full of jargon blocks at review. Both are charter gates, not style po
 
 Keep the change minimal and match the surrounding code. If you hit a blocker you
 cannot safely resolve, post a comment prefixed `MISSING-CONTEXT:` and stop instead
-of guessing."""
+of guessing.""" + SHELL_CRIB
 
 REVISE_PROMPT = """Address the blocking review findings on PR #{n} in this worktree,
 push to the same branch, and keep the test suite green. Do NOT open a new PR.
@@ -224,7 +225,7 @@ Do not degrade the two charter gates while revising (ADR 0018):
   names or CSS/API specifics.
 
 Blocking findings:
-{findings}"""
+{findings}""" + SHELL_CRIB
 
 RESPOND_PROMPT = """A maintainer left a comment on PR #{n} in this worktree and it is
 still unanswered. Read the full conversation first (`gh pr view {n} --json comments`),
@@ -264,7 +265,7 @@ The same comment must contain exactly one durable outcome marker:
 - If they asked for a small change, make it, commit, and push to THIS SAME branch.
 
 Same contract as a revision: never open a new PR, never merge. If you genuinely can't
-address it, say so plainly in the reply."""
+address it, say so plainly in the reply.""" + SHELL_CRIB
 
 
 def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
@@ -800,7 +801,7 @@ edit the issue title, body, or labels; do not open a PR. The comment MUST:
 
 One variant round is enough to unblock — do not loop. If you genuinely cannot produce the
 variants (no runnable surface, missing grounding), post one comment starting with {disclaimer}
-and prefixed `MISSING-CONTEXT:`, then stop."""
+and prefixed `MISSING-CONTEXT:`, then stop.""" + SHELL_CRIB
 
 
 def _claim_mockup(repo: str, n: int) -> bool:

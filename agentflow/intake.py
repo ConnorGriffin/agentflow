@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from agentflow.runner import Complexity, Effort, _run
+from agentflow.shell_crib import SHELL_CRIB
 
 # The provider-neutral shape Intake's terminal decision must match. Each runner adapter
 # translates it into that CLI's native structured-output surface; the CLI enforces it, so
@@ -357,7 +358,7 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
 - "body": the Markdown to post (put all human-facing prose here)
 - "complexity": "standard" | "deep" — REQUIRED for "ready"; null for a hold
 - "effort": "low" | "medium" | "high" | "extra" — for "ready"; null for a hold
-For "grill"/"mockup" set complexity and effort to null."""
+For "grill"/"mockup" set complexity and effort to null.""" + SHELL_CRIB
 
 
 _IMAGE_HANDOFF = (

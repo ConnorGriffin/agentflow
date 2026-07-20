@@ -26,6 +26,7 @@ import re
 from pathlib import Path
 
 from agentflow.coordinator import Submission
+from agentflow.shell_crib import SHELL_CRIB
 
 # The findings comment marker (per-ticket, stable across attempts and restarts) and the visible
 # disclaimer that fronts it, so a replay recognizes its own prior comment and never posts a second.
@@ -64,7 +65,7 @@ investigated, what you found, and the concrete decision or recommendation it sup
 prose the map's owner can read without re-deriving it. It becomes the ticket comment verbatim, so
 write it as the answer, not as a note to yourself. If you exit without writing it, the run is
 incomplete and will run again — never write it twice.
-"""
+""" + SHELL_CRIB
 
 
 # --- paths / artifacts ------------------------------------------------------------------

@@ -29,6 +29,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from agentflow.shell_crib import SHELL_CRIB
+
 
 # Severities we accept as non-blocking. ANYTHING else (incl. "", "critical",
 # "blocker", "high", unknown) is treated as blocking — fail safe.
@@ -179,7 +181,7 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
 - "verdict": "PASS" | "BLOCK" — PASS only if there are zero blocking findings
 - "reviewed_sha": the headRefOid you fetched above (proof you reviewed THIS diff)
 - "findings": a list of {{"severity": "blocking" | "nit", "file": path, "line": 0,
-  "summary": the human-facing note}}"""
+  "summary": the human-facing note}}""" + SHELL_CRIB
 
 
 def review_worktree(workdir: str, tool: str, pr_number: int, slug: str) -> Path:
