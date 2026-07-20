@@ -58,41 +58,38 @@ def test_active_cycle_submits_each_repo_then_reconciles_once(monkeypatch):
 
 
 def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch):
-    from agentflow import coordinated_build
+    from agentflow import coordinated_build, github
 
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
-    calls = []
-
-    def run(argv):
-        calls.append(argv)
-        if argv[1:3] == ["issue", "list"]:
-            label = argv[argv.index("--label") + 1]
-            payload = ('[{"number":7,"updatedAt":"2020-01-01T00:00:00Z"}]'
-                       if label == "agentflow:building" else "[]")
-            return SimpleNamespace(returncode=0, stdout=payload)
-        if argv[1:3] == ["issue", "view"]:
-            return SimpleNamespace(returncode=0, stdout='{"labels":[]}')
-        return SimpleNamespace(returncode=0, stdout="")
-
-    monkeypatch.setattr(loop, "_run", run)
+    # The four claim lanes are listed in order (building, triaging, drawing, resolving); only the
+    # building lane holds a stale-claimed issue. The proof read back shows the label gone.
+    listings = iter([[{"number": 7, "updatedAt": "2020-01-01T00:00:00Z"}], [], [], []])
+    monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
+    removed = []
+    monkeypatch.setattr(github, "remove_label",
+                        lambda repo, issue, label: removed.append((issue, label)) or True)
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
     assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
-    assert any(argv[1:3] == ["issue", "edit"] for argv in calls)
+    assert removed == [(7, "agentflow:building")]
 
 
 def test_unreadable_coordinator_state_clears_no_claim(monkeypatch):
-    from agentflow import coordinated_build
+    from agentflow import coordinated_build, github
     from agentflow.coordinator.store import StoreUnavailable
 
     monkeypatch.setattr(coordinated_build.tracer, "load_records",
                         lambda: (_ for _ in ()).throw(StoreUnavailable("locked")))
-    monkeypatch.setattr(loop, "_run", lambda argv: pytest.fail("must not inspect or clear claims"))
+    monkeypatch.setattr(github, "api",
+                        lambda *a, **k: pytest.fail("must not inspect or clear claims"))
+    monkeypatch.setattr(github, "remove_label",
+                        lambda *a, **k: pytest.fail("must not clear claims"))
 
     assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
 
 
 def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
-    from agentflow import coordinated_build
+    from agentflow import coordinated_build, github
     from agentflow.coordinator.record import HELD, WAITING, Record
 
     waiting = Record(identity="wait", stage="build", pool="claude", demand=5,
@@ -100,26 +97,17 @@ def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
     held = Record(identity="held", stage="review", pool="codex", demand=2,
                   repo="o/r", subject="8", state=HELD, claim=False)
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [waiting, held])
-    edited = []
-
-    def run(argv):
-        if argv[1:3] == ["issue", "list"]:
-            label = argv[argv.index("--label") + 1]
-            payload = ('[{"number":7,"updatedAt":"2020-01-01T00:00:00Z"},'
-                       '{"number":8,"updatedAt":"2020-01-01T00:00:00Z"}]'
-                       if label == "agentflow:building" else "[]")
-            return SimpleNamespace(returncode=0, stdout=payload)
-        if argv[1:3] == ["issue", "edit"]:
-            edited.append(int(argv[3]))
-            return SimpleNamespace(returncode=0, stdout="")
-        if argv[1:3] == ["issue", "view"]:
-            return SimpleNamespace(returncode=0, stdout='{"labels":[]}')
-        raise AssertionError(argv)
-
-    monkeypatch.setattr(loop, "_run", run)
+    # The building lane lists both issues; #7 is shielded by the live waiting build, #8 is not.
+    listings = iter([[{"number": 7, "updatedAt": "2020-01-01T00:00:00Z"},
+                      {"number": 8, "updatedAt": "2020-01-01T00:00:00Z"}], [], [], []])
+    monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
+    removed = []
+    monkeypatch.setattr(github, "remove_label",
+                        lambda repo, issue, label: removed.append(issue) or True)
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
     assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
-    assert edited == [8]
+    assert removed == [8]
 
 
 def test_build_submission_enters_the_coordinator_then_claims_runnable_work(monkeypatch):

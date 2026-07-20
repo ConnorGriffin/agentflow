@@ -7,7 +7,6 @@ the coordinator interface — never by poking private transitions.
 
 from __future__ import annotations
 
-import json
 import subprocess
 from dataclasses import replace
 
@@ -785,22 +784,21 @@ def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
 
 
 def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monkeypatch):
-    from agentflow import loop
+    from agentflow import github
 
     wt = tmp_path / ".agentflow" / "worktrees" / "claude" / "issue-7-owned"
     record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
                     repo="o/r", subject="7", source=str(wt), claim=True, lineage="claude")
-    monkeypatch.setattr(
-        loop, "_run",
-        lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 1, "", "offline"),
-    )
+    # An unreadable PR listing comes back as None from the module — the Build outcome stays
+    # unknown, so it must raise, never be mistaken for an absent PR.
+    monkeypatch.setattr(github, "api", lambda *a, **k: None)
 
     with pytest.raises(RuntimeError, match="cannot verify Build PR outcome"):
         coordinated_build._pr_exists(record)
 
 
 def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(monkeypatch):
-    from agentflow import intake, loop, notify as notify_module
+    from agentflow import github, intake, notify as notify_module
 
     state = {
         "title": "Build it",
@@ -809,14 +807,9 @@ def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(mo
         "comments": [],
     }
 
-    def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "issue", "view"]:
-            return subprocess.CompletedProcess(cmd, 0, json.dumps(state), "")
-        if cmd[:3] == ["gh", "issue", "edit"] and "--remove-label" in cmd:
-            state["labels"] = [label for label in state["labels"]
-                               if label["name"] != "agentflow:building"]
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        raise AssertionError(cmd)
+    def drop_building(repo, number, label):
+        state["labels"] = [entry for entry in state["labels"] if entry["name"] != label]
+        return True
 
     def fake_apply(repo, number, title, labels, result):
         state["labels"] = [{"name": "agentflow:needs-grilling"},
@@ -826,7 +819,10 @@ def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(mo
         return "applied"
 
     notifications = []
-    monkeypatch.setattr(loop, "_run", fake_run)
+    # The handoff states the issue's title/labels/comments through the module and drops the
+    # building claim through it — never by matching gh argument vectors.
+    monkeypatch.setattr(github, "api", lambda *a, **k: state)
+    monkeypatch.setattr(github, "remove_label", drop_building)
     monkeypatch.setattr(intake, "apply_intake", fake_apply)
     monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
     record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
@@ -843,7 +839,7 @@ def test_live_collision_handoff_names_the_collision_and_leaves_a_resumable_issue
     # A collision handoff routes through the same visible stuck-build handoff, but its comment and
     # notification name the collision — and it leaves the issue in the resume-ready state ADR 0019
     # intake picks up on a maintainer reply (needs-grilling, no building/ready-for-agent claim).
-    from agentflow import intake, loop, notify as notify_module
+    from agentflow import github, intake, notify as notify_module
 
     state = {
         "title": "Build it",
@@ -852,14 +848,9 @@ def test_live_collision_handoff_names_the_collision_and_leaves_a_resumable_issue
         "comments": [],
     }
 
-    def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "issue", "view"]:
-            return subprocess.CompletedProcess(cmd, 0, json.dumps(state), "")
-        if cmd[:3] == ["gh", "issue", "edit"] and "--remove-label" in cmd:
-            state["labels"] = [label for label in state["labels"]
-                               if label["name"] != "agentflow:building"]
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        raise AssertionError(cmd)
+    def drop_building(repo, number, label):
+        state["labels"] = [entry for entry in state["labels"] if entry["name"] != label]
+        return True
 
     def fake_apply(repo, number, title, labels, result):
         state["labels"] = [{"name": "agentflow:needs-grilling"},
@@ -869,7 +860,8 @@ def test_live_collision_handoff_names_the_collision_and_leaves_a_resumable_issue
         return "applied"
 
     notifications = []
-    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(github, "api", lambda *a, **k: state)
+    monkeypatch.setattr(github, "remove_label", drop_building)
     monkeypatch.setattr(intake, "apply_intake", fake_apply)
     monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
     record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
