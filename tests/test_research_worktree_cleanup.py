@@ -116,6 +116,7 @@ def test_resolve_removes_the_isolated_worktree_on_durable_resolution(tmp_path, m
         return gh_run(argv)
 
     monkeypatch.setattr("agentflow.loop._run", fake_run)
+    monkeypatch.setattr("agentflow.github._run", fake_run)
 
     proof = coordinated_research.resolve(record)
 
@@ -149,6 +150,7 @@ def test_resolve_tolerates_already_missing_worktree(tmp_path, monkeypatch):
         return gh_run(argv)
 
     monkeypatch.setattr("agentflow.loop._run", fake_run)
+    monkeypatch.setattr("agentflow.github._run", fake_run)
 
     proof = coordinated_research.resolve(record)
 
@@ -190,6 +192,7 @@ def test_release_does_not_remove_the_worktree(tmp_path, monkeypatch):
         raise AssertionError(f"unexpected call in release test: {argv}")
 
     monkeypatch.setattr("agentflow.loop._run", fake_run)
+    monkeypatch.setattr("agentflow.github._run", fake_run)
 
     proof = coordinated_research.release(record)
 

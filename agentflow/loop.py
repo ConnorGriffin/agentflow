@@ -9,14 +9,13 @@ ADR 0018) — intake stamps it; the loop reads it and skips an issue that has no
 
 from __future__ import annotations
 
-import json
 import re
 import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from agentflow import ratchet
+from agentflow import github, ratchet
 from agentflow.balancer import pick_pair, pick_reviewer
 from agentflow.gate import (maintainer_comment, maintainer_comment_id, park, reply_pending)
 from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, STATE_LABELS,
@@ -28,6 +27,7 @@ from agentflow.shell_crib import SHELL_CRIB
 from agentflow.runner import (Complexity, Effort, _run,
                               _worktree_is_disposable, _worktree_is_registered,
                               remove_worktree_if_safe, worktree_session)
+from agentflow.worktree_ref import WorktreeRef
 
 
 def _pr_url(repo: str, pr: int) -> str:
@@ -35,25 +35,34 @@ def _pr_url(repo: str, pr: int) -> str:
 
 
 def _pr_comments(repo: str, pr: int) -> list[dict] | None:
-    """The PR's comments, or None when they cannot be verified."""
-    r = _run(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "comments"])
-    if r.returncode != 0:
+    """The PR's comments, or None when they cannot be verified. The comment rows flow on to
+    gate/intake predicates that read GitHub's own `body`/`author` keys, so this keeps the raw
+    row shape while routing the read through the shared module's escape hatch."""
+    data = github.api(["pr", "view", str(pr), "--repo", repo, "--json", "comments"],
+                      parse_json=True)
+    if not isinstance(data, dict):
         return None
-    try:
-        return json.loads(r.stdout or "{}").get("comments", [])
-    except json.JSONDecodeError:
-        return None
+    return data.get("comments", [])
 
 
 def _issue_comments(repo: str, n: int) -> list[dict]:
     """The issue's comments, or [] if they can't be read. Impure."""
-    r = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "comments"])
-    if r.returncode != 0:
+    data = github.api(["issue", "view", str(n), "--repo", repo, "--json", "comments"],
+                      parse_json=True)
+    if not isinstance(data, dict):
         return []
-    try:
-        return json.loads(r.stdout or "{}").get("comments", [])
-    except json.JSONDecodeError:
-        return []
+    return data.get("comments", [])
+
+
+def _issue_comments_or_none(repo: str, n: int) -> list[dict] | None:
+    """The issue's comment rows, or None when they can't be read — the fail-closed variant a
+    per-issue selection pass needs, so an unreadable thread skips the issue instead of reading
+    as an empty (and therefore 'eligible') one."""
+    data = github.api(["issue", "view", str(n), "--repo", repo, "--json", "comments"],
+                      parse_json=True)
+    if not isinstance(data, dict):
+        return None
+    return data.get("comments", [])
 
 
 _COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
@@ -268,6 +277,16 @@ Same contract as a revision: never open a new PR, never merge. If you genuinely 
 address it, say so plainly in the reply.""" + SHELL_CRIB
 
 
+def _row_dict(row: github.IssueRow) -> dict:
+    """Adapt a typed issue row back to the raw mapping the coordinator's build/mockup submission
+    builders and the pure dispatch predicates still read (they consume GitHub's own
+    `labels[].name` shape). The discovery listings return typed rows now; this is the single
+    bridge to the not-yet-migrated consumers, so the wire shape is reassembled once here rather
+    than at every call site."""
+    return {"number": row.number, "title": row.title, "body": row.body,
+            "labels": [{"name": name} for name in row.labels]}
+
+
 def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
     """Issues that already have an OPEN agentflow PR — an agent is on them, so don't
     re-dispatch a duplicate. Dispatch dedup, distinct from ADR 0009's merge-time floor:
@@ -277,12 +296,15 @@ def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
     Returns None when the listing itself failed — unknown is NOT empty. Treating a `gh`
     blip as "nothing in flight" would re-dispatch every in-review issue; callers fail closed
     (skip, retry next cycle)."""
-    r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
-              "--json", "headRefName,closingIssuesReferences", "--limit", "100"])
-    if r.returncode != 0:
+    # closingIssuesReferences isn't part of the typed PR row, so this discovery listing goes
+    # through the module's escape hatch rather than `list_open_prs`.
+    data = github.api(["pr", "list", "--repo", cfg.repo, "--state", "open",
+                       "--json", "headRefName,closingIssuesReferences", "--limit", "100"],
+                      parse_json=True)
+    if not isinstance(data, list):
         return None
     in_flight: set[int] = set()
-    for pr in json.loads(r.stdout or "[]"):
+    for pr in data:
         # A PR's declared closing-issue reference marks that issue in-flight regardless of
         # how its head branch is named — a hand-driven build on an off-convention branch
         # (e.g. `codex/40-foo`) still dedups. The field is same-repo scoped, so it can't be
@@ -308,13 +330,9 @@ def _native_blockers(cfg: RepoConfig, number: int) -> set[int] | None:
     edge set cannot be read (a `gh` failure or malformed response) so the caller can fail
     closed — an unreadable dependency graph is never mistaken for "no blockers". Cross-repo
     edges are ignored: only blockers in `cfg.repo` join the same-repo gate."""
-    r = _run(["gh", "api", f"repos/{cfg.repo}/issues/{number}/dependencies/blocked_by"])
-    if r.returncode != 0:
-        return None
-    try:
-        edges = json.loads(r.stdout or "[]")
-    except json.JSONDecodeError:
-        return None
+    # A REST dependency read — one of the escape hatch's named uses (ADR 0040).
+    edges = github.api(["api", f"repos/{cfg.repo}/issues/{number}/dependencies/blocked_by"],
+                       parse_json=True)
     if not isinstance(edges, list):
         return None
     numbers: set[int] = set()
@@ -348,13 +366,7 @@ def _free_to_dispatch(cfg: RepoConfig, issue: dict, in_flight: set[int], _log=No
     prose = (int(n) for n in _BLOCKED_BY_RE.findall(issue.get("body") or ""))
     blockers = dict.fromkeys([*prose, *sorted(native)])
     for blocker in blockers:
-        r = _run(["gh", "issue", "view", str(blocker), "--repo", cfg.repo,
-                  "--json", "state"])
-        try:
-            data = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
-            state = data.get("state") if isinstance(data, dict) else None
-        except json.JSONDecodeError:
-            state = None
+        state = github.issue_state(cfg.repo, blocker)
         if state != "CLOSED":
             if _log:
                 reason = f"open blocker #{blocker}" if state == "OPEN" \
@@ -365,15 +377,13 @@ def _free_to_dispatch(cfg: RepoConfig, issue: dict, in_flight: set[int], _log=No
 
 
 def _next_ready_issue(cfg: RepoConfig, _log=None) -> dict | None:
-    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-              "--label", "ready-for-agent", "--json", "number,title,body,labels",
-              "--limit", "50"])
-    if r.returncode != 0:
+    rows = github.list_issues(cfg.repo, label="ready-for-agent", limit=50)
+    if rows is None:
         return None
     in_flight = _issues_in_flight(cfg)
     if in_flight is None:
         return None   # can't see what's in flight — fail closed, dispatch next cycle
-    issues = sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"])
+    issues = sorted((_row_dict(r) for r in rows), key=lambda i: i["number"])
     return next((i for i in issues if _free_to_dispatch(cfg, i, in_flight, _log)), None)
 
 
@@ -403,17 +413,16 @@ def _next_untriaged_issue(cfg: RepoConfig, reserved: set[int] = frozenset()) -> 
     with none of intake's state labels and unclaimed by a live grounding session (ADR 0016).
     `reserved` skips issues a concurrent triage fan-out already claimed this cycle, before
     their `agentflow:triaging` label is visible."""
-    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-              "--json", "number,title,body,labels", "--limit", "50"])
-    if r.returncode != 0:
+    rows = github.list_issues(cfg.repo, limit=50)
+    if rows is None:
         return None
-    untriaged = [i for i in json.loads(r.stdout or "[]")
+    untriaged = [i for i in (_row_dict(r) for r in rows)
                  if _untriaged(i) and i["number"] not in reserved]
     return min(untriaged, key=lambda i: i["number"]) if untriaged else None
 
 
 def _builder_worktree(cfg: RepoConfig, tool: str, n: int, sl: str) -> str:
-    return str(Path(cfg.workdir) / ".agentflow" / "worktrees" / tool / f"issue-{n}-{sl}")
+    return WorktreeRef.for_build(cfg.workdir, tool, n, sl).path
 
 
 def _finish_review(cfg: RepoConfig, reviewer_tool: str, pr: int, sl: str,
@@ -448,11 +457,12 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     an un-triaged one → `triage`/`scope`), refuses one already claimed or in flight, then
     submits the same durable Build record as the daemon. Provider launch, review, continuation,
     and permits remain behind the coordinator."""
-    r = _run(["gh", "issue", "view", str(n), "--repo", cfg.repo,
-              "--json", "number,title,body,labels,state"])
-    if r.returncode != 0:
+    # A single-issue read that pulls state alongside the build fields; the row is handed to the
+    # coordinator's build submission, which reads GitHub's own keys, so it goes through the hatch.
+    issue = github.api(["issue", "view", str(n), "--repo", cfg.repo,
+                        "--json", "number,title,body,labels,state"], parse_json=True)
+    if not isinstance(issue, dict):
         return f"#{n}: not found in {cfg.repo}"
-    issue = json.loads(r.stdout)
     if issue.get("state") != "OPEN":
         return f"#{n}: closed — nothing to build"
     labels = {lbl["name"] for lbl in issue.get("labels", [])}
@@ -504,29 +514,29 @@ def _claim(repo: str, n: int) -> bool:
     next-cycle dispatch skips it (closes the no-PR-yet window). Ensures the label first and
     reports whether ownership was actually made visible; coordinated Build refuses submission
     when it cannot establish this guard."""
-    created = _run(["gh", "label", "create", BUILDING, "--repo", repo, "--color", "fbca04",
-                    "--description", "An agent is building this issue", "--force"])
-    if created.returncode != 0:
+    # The typed `create_label` write carries no description; these claim labels want one, so the
+    # create goes through the module's escape hatch while the add-label is the typed write.
+    if github.api(["label", "create", BUILDING, "--repo", repo, "--color", "fbca04",
+                   "--description", "An agent is building this issue", "--force"]) is None:
         return False
-    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo,
-                    "--add-label", BUILDING])
-    return claimed.returncode == 0
+    return github.add_label(repo, n, BUILDING)
 
 
 def _release(repo: str, n: int) -> None:
     """Drop the build claim when the build is done, whatever the outcome. A parked PR
     stays skipped via the open-PR check; a failed build is free to retry next cycle."""
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", BUILDING])
+    github.remove_label(repo, n, BUILDING)
 
 
 def _claim_triage(repo: str, n: int) -> bool:
     """Claim issue n for intake *before* its grounding session, so a concurrent or next-cycle
     dispatch skips it — closing intake's no-label-yet window (the state label is only stamped
     once the session finishes). Symmetric to `_claim`; ensures the label first."""
-    created = _run(["gh", "label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
-                    "--description", "Intake ownership claim — prevents duplicate dispatch", "--force"])
-    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", TRIAGING])
-    return created.returncode == 0 and claimed.returncode == 0
+    created = github.api(["label", "create", TRIAGING, "--repo", repo, "--color", "d4c5f9",
+                          "--description", "Intake ownership claim — prevents duplicate dispatch",
+                          "--force"]) is not None
+    claimed = github.add_label(repo, n, TRIAGING)
+    return created and claimed
 
 
 def _release_triage(repo: str, n: int) -> bool:
@@ -535,25 +545,17 @@ def _release_triage(repo: str, n: int) -> bool:
     therefore clears nothing.
     Returns durable proof that GitHub no longer carries the claim."""
     def claim_present() -> bool | None:
-        viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
-        if viewed.returncode != 0:
+        labels = github.issue_labels(repo, n)
+        if labels is None:
             return None
-        try:
-            labels = json.loads(viewed.stdout or "{}").get("labels", [])
-        except ValueError:
-            return None
-        return TRIAGING in {
-            label.get("name") for label in labels if isinstance(label, dict)
-        }
+        return TRIAGING in labels
 
     before = claim_present()
     if before is None:
         return False
     if not before:
         return True  # an earlier settlement released it before interruption
-    removed = _run(["gh", "issue", "edit", str(n), "--repo", repo,
-                    "--remove-label", TRIAGING])
-    if removed.returncode != 0:
+    if not github.remove_label(repo, n, TRIAGING):
         return False
     return claim_present() is False
 
@@ -596,12 +598,7 @@ def _research_unblocked(cfg: RepoConfig, number: int, _log=None) -> bool:
                  "could not be determined")
         return False
     for blocker in sorted(native):
-        r = _run(["gh", "issue", "view", str(blocker), "--repo", cfg.repo, "--json", "state"])
-        try:
-            data = json.loads(r.stdout or "{}") if r.returncode == 0 else {}
-            state = data.get("state") if isinstance(data, dict) else None
-        except json.JSONDecodeError:
-            state = None
+        state = github.issue_state(cfg.repo, blocker)
         if state != "CLOSED":
             if _log:
                 _log(f"{cfg.repo}: #{number}: skipped research — blocker #{blocker} not closed")
@@ -614,11 +611,10 @@ def _next_research_ticket(cfg: RepoConfig, _log=None) -> dict | None:
     unattended (ADR 0037). Selection is by the research type label, so no other `wayfinder:*` ticket
     is ever admitted; eligibility and blocker state are re-read on every pass and fail closed. None
     on a `gh` blip (retry next cycle)."""
-    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-              "--label", RESEARCH_TICKET, "--json", "number,title,body,labels", "--limit", "50"])
-    if r.returncode != 0:
+    rows = github.list_issues(cfg.repo, label=RESEARCH_TICKET, limit=50)
+    if rows is None:
         return None
-    for issue in sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"]):
+    for issue in sorted((_row_dict(r) for r in rows), key=lambda i: i["number"]):
         if _research_eligible(issue) and _research_unblocked(cfg, issue["number"], _log):
             return issue
     return None
@@ -628,10 +624,11 @@ def _claim_resolving(repo: str, n: int) -> bool:
     """Claim a research ticket with the shared `wayfinder:resolving` label *before* dispatching its
     session, so a concurrent or next-cycle pass — human or daemon — skips it (ADR 0037). Ensures the
     label exists first; symmetric to `_claim_triage`."""
-    created = _run(["gh", "label", "create", RESOLVING, "--repo", repo, "--color", "5319e7",
-                    "--description", "A session is resolving this planning ticket", "--force"])
-    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", RESOLVING])
-    return created.returncode == 0 and claimed.returncode == 0
+    created = github.api(["label", "create", RESOLVING, "--repo", repo, "--color", "5319e7",
+                          "--description", "A session is resolving this planning ticket",
+                          "--force"]) is not None
+    claimed = github.add_label(repo, n, RESOLVING)
+    return created and claimed
 
 
 def _release_resolving(repo: str, n: int) -> bool:
@@ -640,22 +637,17 @@ def _release_resolving(repo: str, n: int) -> bool:
     proof that GitHub no longer carries the claim so a finalizer never retires over a claim it never
     released."""
     def claim_present() -> bool | None:
-        viewed = _run(["gh", "issue", "view", str(n), "--repo", repo, "--json", "labels"])
-        if viewed.returncode != 0:
+        labels = github.issue_labels(repo, n)
+        if labels is None:
             return None
-        try:
-            labels = json.loads(viewed.stdout or "{}").get("labels", [])
-        except ValueError:
-            return None
-        return RESOLVING in {label.get("name") for label in labels if isinstance(label, dict)}
+        return RESOLVING in labels
 
     before = claim_present()
     if before is None:
         return False
     if not before:
         return True  # an earlier settlement released it before interruption
-    removed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", RESOLVING])
-    if removed.returncode != 0:
+    if not github.remove_label(repo, n, RESOLVING):
         return False
     return claim_present() is False
 
@@ -668,12 +660,10 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
     either interactively instead."""
     issues: list[dict] = []
     for label in ("agentflow:needs-grilling", "agentflow:needs-mockup"):
-        r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-                  "--label", label, "--json", "number,title,body,labels",
-                  "--limit", "50"])
-        if r.returncode != 0:
+        rows = github.list_issues(cfg.repo, label=label, limit=50)
+        if rows is None:
             return None
-        issues.extend(json.loads(r.stdout or "[]"))
+        issues.extend(_row_dict(r) for r in rows)
     seen: set[int] = set()
     deduped = []
     for issue in sorted(issues, key=lambda i: i["number"]):
@@ -684,10 +674,9 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
         claims = {lbl["name"] for lbl in issue["labels"]}
         if TRIAGING in claims or DRAWING in claims:
             continue   # Intake or the current Mockup round already owns this held issue
-        cr = _run(["gh", "issue", "view", str(issue["number"]), "--repo", cfg.repo, "--json", "comments"])
-        if cr.returncode != 0:
+        comments = _issue_comments_or_none(cfg.repo, issue["number"])
+        if comments is None:
             continue
-        comments = json.loads(cr.stdout or "{}").get("comments", [])
         allowlist = intake_allowlist(cfg.repo, cfg.workdir)
         if awaiting_recheck(comments, allowlist):
             qualifying = [c for c in comments
@@ -719,21 +708,19 @@ def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str, str, str] |
     unanswered target. A target-aware reply removes only that comment, so later comments become
     fresh Respond stages instead of being collapsed into one run. Generic legacy markers retain
     their old run-level meaning, and the responder never wakes on its own comments (#18/#107)."""
-    r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
-              "--json", "number,headRefName,headRefOid", "--limit", "100"])
-    if r.returncode != 0:
+    prs = github.list_open_prs(cfg.repo, limit=100)
+    if prs is None:
         return None
-    for pr in sorted(json.loads(r.stdout or "[]"), key=lambda p: p.get("number", 0)):
-        branch = pr.get("headRefName", "")
-        baseline = pr.get("headRefOid", "")
+    for pr in sorted(prs, key=lambda p: p.number):
+        branch = pr.head_ref_name
+        baseline = pr.head_ref_oid
         if issue_of_branch(branch) is None or not baseline:
             continue   # not an agentflow PR — a human's own branch
-        cr = _run(["gh", "pr", "view", str(pr["number"]), "--repo", cfg.repo, "--json", "comments"])
-        if cr.returncode != 0:
+        comments = _pr_comments(cfg.repo, pr.number)
+        if comments is None:
             continue
-        comments = json.loads(cr.stdout or "{}").get("comments", [])
         if reply_pending(comments):
-            return (pr["number"], branch, maintainer_comment(comments),
+            return (pr.number, branch, maintainer_comment(comments),
                     maintainer_comment_id(comments), baseline)
     return None
 
@@ -820,17 +807,17 @@ def _claim_mockup(repo: str, n: int) -> bool:
     next-cycle pass skips it (no double-draw). Symmetric to `_claim_triage`; ensures the label
     first. A crash before release strands the claim — fail-safe (skipped, never double-drawn),
     cleared by hand, since the session opens no PR to check liveness against."""
-    created = _run(["gh", "label", "create", DRAWING, "--repo", repo, "--color", "fef2c0",
-                    "--description", "A session is drawing mockup variants for this issue",
-                    "--force"])
-    claimed = _run(["gh", "issue", "edit", str(n), "--repo", repo, "--add-label", DRAWING])
-    return created.returncode == 0 and claimed.returncode == 0
+    created = github.api(["label", "create", DRAWING, "--repo", repo, "--color", "fef2c0",
+                          "--description", "A session is drawing mockup variants for this issue",
+                          "--force"]) is not None
+    claimed = github.add_label(repo, n, DRAWING)
+    return created and claimed
 
 
 def _release_mockup(repo: str, n: int) -> None:
     """Drop the drawing claim once the variant round is posted (the mockup comment dedups from
     here via MOCKUP_MARK) or the session ended."""
-    _run(["gh", "issue", "edit", str(n), "--repo", repo, "--remove-label", DRAWING])
+    github.remove_label(repo, n, DRAWING)
 
 
 def _has_mockup_variants(comments: list[dict]) -> bool:
@@ -854,17 +841,14 @@ def _mockup_eligible(issue: dict, comments: list[dict], allowlist: set[str] | No
 def _next_mockup_issue(cfg: RepoConfig) -> dict | None:
     """The oldest open `needs-mockup` issue ready for a variant round — none drawn yet, no
     pending maintainer reply, unclaimed. None on a `gh` blip (fail closed — try next cycle)."""
-    r = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-              "--label", "agentflow:needs-mockup", "--json", "number,title,body,labels",
-              "--limit", "50"])
-    if r.returncode != 0:
+    rows = github.list_issues(cfg.repo, label="agentflow:needs-mockup", limit=50)
+    if rows is None:
         return None
     allowlist = intake_allowlist(cfg.repo, cfg.workdir)
-    for issue in sorted(json.loads(r.stdout or "[]"), key=lambda i: i["number"]):
-        cr = _run(["gh", "issue", "view", str(issue["number"]), "--repo", cfg.repo, "--json", "comments"])
-        if cr.returncode != 0:
+    for issue in sorted((_row_dict(r) for r in rows), key=lambda i: i["number"]):
+        comments = _issue_comments_or_none(cfg.repo, issue["number"])
+        if comments is None:
             continue
-        comments = json.loads(cr.stdout or "{}").get("comments", [])
         if _mockup_eligible(issue, comments, allowlist):
             return issue
     return None
@@ -924,13 +908,12 @@ def _open_agentflow_prs(cfg: RepoConfig) -> list[tuple[int, str]] | None:
     """Open agentflow PRs as (number, head_branch), oldest first. None on a `gh` blip —
     unknown is not empty, so a listing failure defers the whole pass rather than reading as
     'no survivors to re-rebase'."""
-    r = _run(["gh", "pr", "list", "--repo", cfg.repo, "--state", "open",
-              "--json", "number,headRefName", "--limit", "100"])
-    if r.returncode != 0:
+    rows = github.list_open_prs(cfg.repo, limit=100)
+    if rows is None:
         return None
-    prs = [(pr["number"], pr.get("headRefName", ""))
-           for pr in json.loads(r.stdout or "[]")
-           if issue_of_branch(pr.get("headRefName", "")) is not None]
+    prs = [(row.number, row.head_ref_name)
+           for row in rows
+           if issue_of_branch(row.head_ref_name) is not None]
     return sorted(prs, key=lambda p: p[0])
 
 
@@ -974,7 +957,7 @@ def _park_conflicted_survivor(cfg: RepoConfig, pr: int, n: int) -> None:
     """A survivor that no longer rebases clean: post one conflict notice (carrying our
     marker) and ping, so a conflicted survivor is never silent."""
     body = f"> *{_CONFLICT_MARK}.*\n\n{_CONFLICT_REASON}"
-    _run(["gh", "pr", "comment", str(pr), "--repo", cfg.repo, "--body", body])
+    github.pr_comment(cfg.repo, pr, body)
     ratchet.record(cfg.repo, "parked")
     notify("agentflow needs you",
            f"{cfg.repo} #{n}: PR #{pr} conflicts after main advanced — rebase by hand",
@@ -983,14 +966,7 @@ def _park_conflicted_survivor(cfg: RepoConfig, pr: int, n: int) -> None:
 
 def _issue_acceptance(cfg: RepoConfig, number: int) -> str | None:
     """The current issue body anchoring a survivor re-review; unreadable fails closed."""
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", cfg.repo, "--json", "body"])
-    if viewed.returncode != 0:
-        return None
-    try:
-        body = json.loads(viewed.stdout or "{}").get("body")
-    except json.JSONDecodeError:
-        return None
-    return body if isinstance(body, str) else None
+    return github.issue_body(cfg.repo, number)
 
 
 def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
