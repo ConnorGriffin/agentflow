@@ -520,3 +520,23 @@ def test_codex_resupplies_the_operator_code_graph_server_on_every_stage(monkeypa
     monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
     cmd = CodexRunner().structured_argv("do work", "sol", str(wt))
     assert not any(str(arg).startswith("mcp_servers.") for arg in cmd)
+
+
+def test_codex_resupplies_a_full_server_spec_as_valid_toml_overrides(monkeypatch, tmp_path):
+    """A launched server may carry ``args`` and ``env`` (the common ``npx``-style shape), not just a
+    bare ``command`` — Claude honors them because it hands the whole map to ``--mcp-config``, so
+    Codex must carry the same map across. Each is rendered as a Codex ``-c`` override whose value is
+    valid TOML: a string command, a TOML array of args, and one env key per entry (no hand-built
+    inline table). This guards the parity that keeps both providers on one server definition."""
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-12-fullspec"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-12-fullspec")
+    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {
+        "code-graph": {"command": "npx", "args": ["-y", "code-graph-mcp"],
+                       "env": {"GRAPH_TOKEN": "abc123"}}})
+
+    cmd = CodexRunner().structured_argv("do work", "sol", str(wt))
+    overrides = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-c"]
+    assert 'mcp_servers.code-graph.command="npx"' in overrides
+    assert 'mcp_servers.code-graph.args=["-y", "code-graph-mcp"]' in overrides
+    assert 'mcp_servers.code-graph.env.GRAPH_TOKEN="abc123"' in overrides
