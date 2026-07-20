@@ -1,9 +1,10 @@
-"""Per-stage session profiles: tool allowlist, empty MCP pin, and wall/turn ceilings (ADR 0044).
+"""Per-stage session profiles: tool allowlist, wall/turn ceilings (ADR 0044), and reasoning effort (ADR 0046).
 
 Every daemon session used to launch with one full tool surface, personal MCP connectors
 leaking in, and a single stage-blind two-hour timeout. This table keys a profile on the
 record's ``(stage, complexity, effort)`` — the keys the record already carries — and returns
-the read/search allowlist, the wall-clock ceiling, and the turn ceiling for that cell. The
+the read/search allowlist, the wall-clock ceiling, the turn ceiling, and the provider
+reasoning-effort rung (build/revise only; every other stage stays provider-default) for that cell. The
 values are taken verbatim from the research table
 (``docs/research/session-profiles-and-ceilings-draft.md`` §3a/§3b); they are calibration and
 are expected to ratchet once per-attempt telemetry (#223) fills the thin cells.
@@ -53,6 +54,19 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
     "mockup": (60 * _MIN, 200),
 }
 
+# The reasoning-effort rung each work-effort dial maps to at launch (ADR 0046). Build and revise
+# launch the provider at the mapped rung; every other stage leaves the provider default (``None``).
+# ``extra`` maps to the provider "extra high" rung (``xhigh``). ``max`` is never wired by the
+# daemon (manual-only escape hatch, ADR 0046). The argv builders clamp a rung above a provider's
+# own ladder to its top rung rather than failing the launch — inert for today's models, which all
+# accept these rungs, but kept as defensive design for a future model with a shorter ladder.
+_REASONING_BY_EFFORT: dict[str, str] = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "extra": "xhigh",
+}
+
 # Build ceilings keyed on (complexity, effort) (§3b). A cell the research table does not name
 # falls back to the most conservative ceiling of its complexity.
 _BUILD_CEILINGS: dict[tuple[str, str], tuple[int, int]] = {
@@ -75,11 +89,13 @@ _DEFAULT_CEILING = (2 * 3600, 200)
 @dataclass(frozen=True, slots=True)
 class StageProfile:
     """The launch envelope for one session: its read/search allowlist (``None`` keeps the full
-    edit/test surface), its wall-clock ceiling, and its turn ceiling."""
+    edit/test surface), its wall-clock ceiling, its turn ceiling, and the provider reasoning-effort
+    rung set at launch (``None`` leaves the provider default)."""
 
     allowed_tools: tuple[str, ...] | None
     wall_ceiling_s: int
     turn_ceiling: int
+    reasoning_effort: str | None = None
 
     @property
     def read_only(self) -> bool:
@@ -104,9 +120,9 @@ def profile_for(record) -> StageProfile:
     stage = record.stage
     if stage == "build":
         wall, turns = _build_ceiling(record.complexity, record.effort)
-        return StageProfile(None, wall, turns)
+        return StageProfile(None, wall, turns, _REASONING_BY_EFFORT.get(record.effort))
     if stage == "revise":
         wall, turns = _build_ceiling(record.builder_complexity or record.complexity, record.effort)
-        return StageProfile(None, wall, turns)
+        return StageProfile(None, wall, turns, _REASONING_BY_EFFORT.get(record.effort))
     wall, turns = _STAGE_CEILINGS.get(stage, _DEFAULT_CEILING)
     return StageProfile(_READ_ONLY_TOOLS.get(stage), wall, turns)

@@ -803,12 +803,16 @@ class Coordinator:
         Every attempt that ends is recorded — a completed stage, a superseded retry, a held
         exhaustion — so no spend is lost. A telemetry write never fails a cycle: the durable
         session artifact still carries the raw usage to re-derive later if the write is lost."""
+        from agentflow.coordinator.profiles import profile_for
+
         entry = AttemptTelemetry(
             token=record.launch_token or "",
             identity=record.identity, repo=record.repo, subject=record.subject,
             stage=record.stage, pool=record.pool, model=record.model,
             complexity=record.complexity, effort=record.effort,
-            reasoning_effort=None,  # not reported by either provider stream today (explicit unknown)
+            # The reasoning effort actually set at launch (ADR 0046) — the mapped rung for
+            # build/revise, explicit ``None`` for every other stage (provider default).
+            reasoning_effort=profile_for(record).reasoning_effort,
             attempt=record.attempts, continuation=record.continuation,
             restart_resumes=record.restart_resumes, round=record.round,
             conflict_round=record.conflict_round,
