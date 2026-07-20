@@ -44,6 +44,37 @@ stages jump, uniformly.
 - The tier is a property of the stage, not a per-record flag — no new state, no
   new knob, and reviews migrating across pools (#202) keep their tier.
 
+## Amendment (2026-07-20, #293) — enforce the order at the permit ledger
+
+Per-cycle tier ordering is not enough once effort is wired to permits (ADR 0046):
+a single high-effort build reserves all five permits of a pool, and while it runs
+no review can start — a review needs one permit and there are zero free. Because
+the ledger is shared per pool across every enrolled repo, one repo's high-effort
+build starves reviews fleet-wide, and when the other tool is also out of headroom
+(e.g. codex weekly pacing) the reviews cannot migrate either. The tier sort only
+helps when both records are waiting in the *same* cycle; it does nothing for a
+build that already holds the pool, or a build *continuation* (which admits ahead
+of a cold review regardless of tier, because continuations drain before cold work).
+
+So the drain-first order is now also enforced at the reservation gate: an
+issue-bound stage (build, mockup, intake) may not reserve permits on a pool while
+any PR-bound stage (review, revise, respond) is waiting to start on that **same
+pool**. When no PR-bound work is waiting, an issue-bound stage may still claim the
+whole pool — high-effort builds are unaffected when the review queue is empty.
+
+The check is scoped to the same pool only. It deliberately does not reach across
+pools or account for migratable reviews: the existing review-migration path already
+re-places a review whose home pool cannot seat it, and coupling the two pools here
+would invite a cross-pool deadlock.
+
+**Why this cannot deadlock.** Reviews are the *product* of builds, so "builds wait
+behind reviews" cannot deadlock in the normal case. A genuinely stuck review is
+bounded: it exhausts its attempt budget and parks (`pr:parked`), leaving the
+waiting set — at which point builds resume. The worst case is a fleet-wide build
+pause until a stuck review parks, never a permanent freeze. A build held back this
+way yields the pool without reserving anything, so it does not block the pool
+head-of-line — the very review it yields to is reached in the same cycle.
+
 ## Alternatives considered
 
 - **Status quo (identity-ordered cold queue).** Rejected: arbitrary interleaving
