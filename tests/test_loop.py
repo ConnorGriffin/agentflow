@@ -664,6 +664,36 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
     assert "already running" in out
 
 
+def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkeypatch, tmp_path):
+    # A by-hand build whose claim race is lost withdraws the never-run record; a later `build <N>`
+    # must dispatch a genuinely runnable build rather than reporting the issue 'still held' forever
+    # (#251). Drives the real coordinator over an isolated store so the withdraw/resubmit seam is
+    # exercised end-to-end, not faked.
+    from agentflow import coordinated_build
+    from agentflow.coordinator import Submission
+
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
+             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    _issue_view(monkeypatch, issue)
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    monkeypatch.setattr(loop, "pick_pair",
+                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(coordinated_build, "build_submission",
+                        lambda *_: Submission(repo="o/r", subject="5", stage="build",
+                                              pool="claude", complexity="deep"))
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda c: None)
+    claim = {"ok": False}
+    monkeypatch.setattr(loop, "_claim", lambda repo, n: claim["ok"])
+
+    lost = build_issue(RepoConfig("o/r", "/tmp"), 5)          # the claim race is lost
+    assert "could not claim" in lost and "withdrew" in lost
+
+    claim["ok"] = True
+    out = build_issue(RepoConfig("o/r", "/tmp"), 5)           # a fresh by-hand build
+    assert out == "#5: submitted to coordinator → claude (build)"  # dispatches, not 'still held'
+
+
 def test_build_issue_refuses_an_open_blocker(monkeypatch):
     issue = {"number": 42, "state": "OPEN", "title": "dependent", "body": "Blocked by #41",
              "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}

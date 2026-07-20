@@ -207,20 +207,26 @@ class Coordinator:
     def withdraw_stage(self, identity: str) -> bool:
         """Roll back a freshly-submitted stage the dispatcher never managed to guard on GitHub, so no
         orphaned ``waiting`` record is left for a later cycle to launch without the ownership claim
-        (#245). Retires only a never-started record — one that has consumed no attempt and holds no
-        live family — so a genuine in-flight Build is untouched; retiring it out of ``waiting`` keeps
-        a subsequent cycle from admitting it. Idempotent and a no-op for any started or absent record:
-        a repeat finds it already retired."""
+        (#245). Withdraws only a never-started record — one that has consumed no attempt and holds no
+        live family — so a genuine in-flight Build is untouched; a subsequent cycle can never admit it.
+
+        The withdrawal *frees the identity* rather than leaving a terminal tombstone (#251): a
+        never-run rollback must not permanently occupy the issue's build slot, so the record is
+        deleted and the next cold ``build <N>`` — by hand or by the daemon — opens a genuinely
+        runnable build exactly as if the failed attempt had never happened. The delete is a durable
+        compare-and-set on the never-started row, so a concurrent cycle that just admitted the record
+        (or a completed transfer) is never freed or revived. Idempotent and a no-op for any started
+        or absent record: a repeat finds the slot already free."""
         with self._lock:
             record = self._store.record_of(identity)
             if (record is None or record.retired or record.state != WAITING
                     or record.attempts != 0 or record.start_fact is not None
                     or record.process_alive):
                 return False
-            record.state = COMPLETED
-            record.claim = False
-            record.retired = True
-            return self._persist(record, retire_descendants=True)
+            if not self._store.discard(record):
+                return False
+            self._records.pop(identity, None)
+            return True
 
     def park_completed(self, identity: str) -> "StageOutcome | None":
         """Terminally park a completed stage the product policy leaves with no next stage to take

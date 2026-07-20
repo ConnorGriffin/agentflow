@@ -391,6 +391,39 @@ class Store:
                     pass
                 raise StoreUnavailable(f"cannot reserve on continuation store: {e}") from e
 
+    def discard(self, expected: Record) -> bool:
+        """Remove a never-started record from the ledger under a revision compare-and-set, freeing
+        its identity so a later cold submission opens a genuinely fresh stage rather than colliding
+        with a terminal tombstone (#251).
+
+        The delete is guarded exactly like a reservation: the durable row must still be the
+        never-started ``waiting`` record the caller loaded — same revision, no attempt consumed, no
+        start fact, no live family. A concurrent instance that already advanced this identity (a
+        cycle that admitted it, a completed transfer) fails the compare-and-set, so a genuine
+        in-flight or completed build is never freed. Returns whether the row was removed.
+        """
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (expected.identity,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                current = self._decode(row[0])
+                if (current.revision != expected.revision or current.state != WAITING
+                        or current.attempts != 0 or current.start_fact is not None
+                        or current.process_alive):
+                    self._conn.execute("ROLLBACK")
+                    return False
+                self._conn.execute(
+                    "DELETE FROM records WHERE identity = ?", (expected.identity,))
+                self._conn.execute("COMMIT")
+                return True
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot discard continuation: {e}") from e
+
     def record_of(self, identity: str) -> Record | None:
         """One record re-read from the ledger, or ``None``. The launcher polls this to observe
         the child's cross-process ``started`` write and its recorded family before it treats a
