@@ -20,13 +20,14 @@ findings comment or appends a second map line.
 
 from __future__ import annotations
 
-import json
 import os
 import re
 from pathlib import Path
 
+from agentflow import github
 from agentflow.coordinator import Submission
 from agentflow.shell_crib import SHELL_CRIB
+from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 # The findings comment marker (per-ticket, stable across attempts and restarts) and the visible
 # disclaimer that fronts it, so a replay recognizes its own prior comment and never posts a second.
@@ -72,7 +73,7 @@ incomplete and will run again — never write it twice.
 
 def research_worktree(workdir: str, pool: str, number: int) -> str:
     """The isolated worktree one research run reuses across attempts (resume context)."""
-    return os.path.join(workdir, ".agentflow", "worktrees", pool, f"research-{number}")
+    return WorktreeRef.for_research(workdir, pool, number).path
 
 
 def findings_path(record) -> str:
@@ -128,13 +129,11 @@ def _research_worktree_ready(record) -> bool:
     and no attempt consumed — the run simply retries next cycle."""
     from agentflow.loop import _run
     from agentflow.runner import _worktree_is_registered
-    src = record.source or ""
-    if "/.agentflow/worktrees/" not in src:
+    ref = WorktreeRef.parse(record.source)
+    if ref is None or ref.kind is not WorktreeKind.RESEARCH or ref.tool != record.pool:
         return False
-    workdir, tail = src.split("/.agentflow/worktrees/", 1)
-    if not tail.startswith(f"{record.pool}/research-"):
-        return False
-    wt = Path(src)
+    workdir = ref.workdir
+    wt = Path(ref.path)
     if wt.exists():
         return _worktree_is_registered(workdir, wt)  # reuse as-is; never rebuild a resumed run
     wt.parent.mkdir(parents=True, exist_ok=True)
@@ -205,18 +204,16 @@ def _parent_map(repo: str, number: int) -> tuple[int, str] | None:
     """The ``(map number, map body)`` of a research ticket's parent Decision Map — its native GitHub
     parent that carries the ``wayfinder:map`` label (ADR 0036/0037). ``None`` when the parent cannot
     be read or is not a map, so the finalizer fails closed rather than editing the wrong issue."""
-    from agentflow.loop import _run
     owner, _, name = repo.partition("/")
     query = ("query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name)"
              "{issue(number:$number){parent{number body labels(first:20){nodes{name}}}}}}")
-    r = _run(["gh", "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
-              "-f", f"name={name}", "-F", f"number={number}"])
-    if r.returncode != 0:
+    # A parent lookup is a GraphQL shape the typed surface doesn't cover, so it goes through the
+    # module's escape hatch; None (an unreachable read) fails closed to the caller.
+    data = github.api(["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+                       "-f", f"name={name}", "-F", f"number={number}"], parse_json=True)
+    if not isinstance(data, dict):
         return None
-    try:
-        issue = (json.loads(r.stdout or "{}").get("data") or {}).get("repository", {}).get("issue")
-    except (ValueError, AttributeError):
-        return None
+    issue = ((data.get("data") or {}).get("repository") or {}).get("issue")
     parent = issue.get("parent") if isinstance(issue, dict) else None
     if not isinstance(parent, dict) or not isinstance(parent.get("number"), int):
         return None
@@ -242,7 +239,6 @@ def _append_map_decision(repo: str, number: int, title: str) -> bool:
     """Append this ticket's one titled line to the parent map's 'Decisions so far' idempotently.
     Returns whether the breadcrumb is durably present. A missing/unreadable parent map fails closed
     (retry), so resolution never retires without the breadcrumb the map's owner reconciles from."""
-    from agentflow.loop import _run
     found = _parent_map(repo, number)
     if found is None:
         return False
@@ -250,8 +246,7 @@ def _append_map_decision(repo: str, number: int, title: str) -> bool:
     if decision_present(map_body, number):
         return True  # already recorded — idempotent
     new_body = with_decision(map_body, decision_line(title, number))
-    edited = _run(["gh", "issue", "edit", str(map_number), "--repo", repo, "--body", new_body])
-    if edited.returncode != 0:
+    if not github.edit_body(repo, map_number, new_body):
         return False
     reread = _parent_map(repo, number)
     return reread is not None and decision_present(reread[1], number)
@@ -279,45 +274,37 @@ def resolve(record) -> str | None:
     if findings is None:
         return None  # verify proved findings exist; if the artifact is gone, retry rather than retire
     repo = record.repo
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", repo,
-                   "--json", "state,title,comments,url"])
-    if viewed.returncode != 0:
-        return None
-    try:
-        issue = json.loads(viewed.stdout or "{}")
-    except json.JSONDecodeError:
+    # The idempotency read spans state+title+comments+url in one snapshot, which the typed surface
+    # does not offer, so it goes through the module's escape hatch; an unreadable read (None) retries.
+    issue = github.api(["issue", "view", str(number), "--repo", repo,
+                        "--json", "state,title,comments,url"], parse_json=True)
+    if not isinstance(issue, dict):
         return None
     marker = _findings_marker(number)
     if not any(marker in c.get("body", "") for c in issue.get("comments", [])):
         body = f"{_RESEARCH_DISCLAIMER}\n{marker}\n\n{findings}"
-        if _run(["gh", "issue", "comment", str(number), "--repo", repo,
-                 "--body", body]).returncode != 0:
+        if not github.comment(repo, number, body):
             return None
     if not _append_map_decision(repo, number, issue.get("title", "")):
         return None
     if issue.get("state") != "CLOSED":
-        if _run(["gh", "issue", "close", str(number), "--repo", repo]).returncode != 0:
+        if not github.close(repo, number):
             return None
     if not _release_resolving(repo, number):
         return None
-    proved = _run(["gh", "issue", "view", str(number), "--repo", repo,
-                   "--json", "state,comments,url"])
-    if proved.returncode != 0:
-        return None
-    try:
-        final = json.loads(proved.stdout or "{}")
-    except json.JSONDecodeError:
+    final = github.api(["issue", "view", str(number), "--repo", repo,
+                        "--json", "state,comments,url"], parse_json=True)
+    if not isinstance(final, dict):
         return None
     has_comment = any(marker in c.get("body", "") for c in final.get("comments", []))
     if final.get("state") != "CLOSED" or not has_comment:
         return None
     # Resolution is durable — remove the isolated worktree so resolved runs don't accumulate.
-    src = record.source or ""
-    if "/.agentflow/worktrees/" in src:
-        workdir = src.split("/.agentflow/worktrees/", 1)[0]
-        wt = Path(src)
+    ref = WorktreeRef.parse(record.source)
+    if ref is not None:
+        wt = Path(ref.path)
         if wt.exists():
-            _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt)])
+            _run(["git", "-C", ref.workdir, "worktree", "remove", "--force", str(wt)])
     return final.get("url") or f"https://github.com/{repo}/issues/{number}"
 
 
@@ -328,19 +315,15 @@ def release(record) -> str | None:
 
     The run's isolated worktree is intentionally kept on disk — a resumed attempt reuses it to pick up
     partial findings rather than starting from scratch."""
-    from agentflow.loop import _release_resolving, _run
+    from agentflow.loop import _release_resolving
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
     if not _release_resolving(record.repo, number):
         return None
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo, "--json", "url"])
-    if viewed.returncode == 0:
-        try:
-            url = json.loads(viewed.stdout or "{}").get("url")
-        except json.JSONDecodeError:
-            url = None
-        if url:
-            return url
+    viewed = github.api(["issue", "view", str(number), "--repo", record.repo, "--json", "url"],
+                        parse_json=True)
+    if isinstance(viewed, dict) and viewed.get("url"):
+        return viewed["url"]
     return f"https://github.com/{record.repo}/issues/{number}"
