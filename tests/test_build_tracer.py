@@ -627,6 +627,30 @@ def test_running_build_projects_to_live_board_waiting_does_not(make_coord):
     assert projection[0]["started_at"].startswith("1970-01-01T00:02:03")
 
 
+def test_live_projection_derives_branch_from_worktree_path(make_coord):
+    # live_projection must derive the branch name from the WorktreeRef layout, not by hand-rolling
+    # the path split. Fails against the hand-rolled form if the WorktreeRef round-trip disagrees.
+    fake = FakeSession()
+    coord = make_coord(fake, adapter=_adapter(fake, pr=[False], prep=[True]),
+                       gate=tracer.build_review_revise_gate)
+    coord.submit_stage(_build("7", source="/repo/.agentflow/worktrees/claude/issue-7-owned"))
+    coord.cycle("claude")
+    projection = tracer.live_projection(_records(coord))
+    assert projection[0]["branch"] == "agentflow/claude/issue-7-owned"
+    assert projection[0]["worktree"] == "/repo/.agentflow/worktrees/claude/issue-7-owned"
+
+
+def test_live_projection_branch_is_none_for_non_worktree_source(make_coord):
+    # A source path that does not follow the worktree layout yields branch=None.
+    fake = FakeSession()
+    coord = make_coord(fake, adapter=_adapter(fake, pr=[False], prep=[True]),
+                       gate=tracer.build_review_revise_gate)
+    coord.submit_stage(_build("7", source="/wt/issue-7"))
+    coord.cycle("claude")
+    projection = tracer.live_projection(_records(coord))
+    assert projection[0]["branch"] is None
+
+
 def test_owned_issues_track_coordinator_ownership(make_coord):
     fake = FakeSession()
     pr, prep = [False], [True]

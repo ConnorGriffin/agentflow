@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 
 from agentflow.coordinator.record import RUNNING, Record
 from agentflow.coordinator.store import Store, default_store_path
+from agentflow.worktree_ref import WorktreeRef
 
 
 # The logical stages enabled behind the coordinator — the one source
@@ -98,9 +99,8 @@ def live_projection(records) -> list[dict]:
         if record.state != RUNNING or record.stage not in _STAGE_LANE:
             continue
         number = _issue_number(record)
-        branch = None
-        if record.source and "/.agentflow/worktrees/" in record.source:
-            branch = "agentflow/" + record.source.split("/.agentflow/worktrees/", 1)[1]
+        ref = WorktreeRef.parse(record.source)
+        branch = ref.branch if ref else None
         started_at = (datetime.fromtimestamp(record.started_at, timezone.utc).isoformat()
                       if record.started_at else "")
         entries.append({
