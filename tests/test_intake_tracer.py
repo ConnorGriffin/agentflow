@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, record_of, starts_until_held
 
-from agentflow import coordinated_intake, intake as intake_mod, loop
+from agentflow import coordinated_intake, github, intake as intake_mod, loop
 from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
@@ -89,11 +89,28 @@ def test_preparation_proves_the_triaging_claim_before_admission(make_coord):
 
 
 def test_production_claim_proof_fails_closed_on_missing_label(monkeypatch):
-    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(
-        returncode=0, stdout='{"labels":[{"name":"ready-for-agent"}]}'))
+    monkeypatch.setattr(github, "issue_labels",
+                        lambda repo, issue: frozenset({"ready-for-agent"}))
     record = SimpleNamespace(repo="o/r", subject="7")
 
     assert coordinated_intake.intake_claim_ready(record) is False
+
+
+def test_production_claim_proof_fails_closed_when_labels_unreadable(monkeypatch):
+    # A read that couldn't reach GitHub comes back as None (unknown) — the claim proof
+    # refuses to admit rather than treating unknown as "claim absent".
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: None)
+    record = SimpleNamespace(repo="o/r", subject="7")
+
+    assert coordinated_intake.intake_claim_ready(record) is False
+
+
+def test_production_claim_proof_admits_on_present_triaging_label(monkeypatch):
+    from agentflow.loop import TRIAGING
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset({TRIAGING}))
+    record = SimpleNamespace(repo="o/r", subject="7")
+
+    assert coordinated_intake.intake_claim_ready(record) is True
 
 
 def test_parsed_route_is_durable_before_projection_even_after_bad_exit(make_coord):
@@ -284,6 +301,8 @@ def test_production_projection_applies_once_then_releases_claim(make_coord, monk
     label_failures = [1]
 
     def gh(cmd, cwd=None, timeout=None):
+        # Both intake and coordinated_intake now reach GitHub through the shared module
+        # (ADR 0040), so this fake serves every read and write via github's one `_run`.
         if cmd[:3] == ["gh", "issue", "view"]:
             payload = {
                 "title": issue["title"], "body": issue["body"],
@@ -325,9 +344,9 @@ def test_production_projection_applies_once_then_releases_claim(make_coord, monk
     fake.end(identity, cause=ProviderCause.PROCESS)
     coord.cycle("claude")
     monkeypatch.setattr(loop, "_run", gh)
-    # Intake's GitHub access now flows through the shared github module (ADR 0040); patch the
-    # one `_run` it shells out through so this fake still serves its reads and writes.
-    monkeypatch.setattr(intake_mod.github, "_run", gh)
+    # Intake and coordinated_intake both shell out through the shared github module's one
+    # `_run` (ADR 0040); patching it here lets this fake serve every read and write.
+    monkeypatch.setattr(github, "_run", gh)
     def release(repo, number):
         released.append(number)
         issue["labels"].remove("agentflow:triaging")
@@ -347,8 +366,8 @@ def test_route_notification_retries_with_one_stable_delivery_identity(make_coord
     fake = IntakeSession()
     deliveries = iter((False, True))
     notified = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(
-        returncode=0, stdout='{"title":"old","labels":[],"comments":[]}'))
+    monkeypatch.setattr(github, "api",
+                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
     monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
     monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
@@ -399,8 +418,8 @@ def test_production_preparation_recreates_read_only_worktree(make_coord, monkeyp
 def test_production_exhaustion_notifies_once(make_coord, monkeypatch):
     fake = IntakeSession()
     applied, released, notified = [], [], []
-    monkeypatch.setattr(loop, "_run", lambda cmd: type("R", (), {
-        "returncode": 0, "stdout": '{"title":"old","labels":[],"comments":[]}'})())
+    monkeypatch.setattr(github, "api",
+                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
     monkeypatch.setattr(coordinated_intake, "apply_intake",
                         lambda *args: applied.append(args))
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
@@ -424,8 +443,8 @@ def test_exhaustion_retries_a_failed_notification_before_holding(make_coord, mon
     fake = IntakeSession()
     deliveries = iter((False, True))
     notified = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(
-        returncode=0, stdout='{"title":"old","labels":[],"comments":[]}'))
+    monkeypatch.setattr(github, "api",
+                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
     monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
     monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
@@ -447,8 +466,8 @@ def test_exhaustion_replay_after_accepted_delivery_updates_one_notification(make
                                                                             monkeypatch):
     fake = IntakeSession()
     notified = []
-    monkeypatch.setattr(loop, "_run", lambda cmd: SimpleNamespace(
-        returncode=0, stdout='{"title":"old","labels":[],"comments":[]}'))
+    monkeypatch.setattr(github, "api",
+                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
     monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
     monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
