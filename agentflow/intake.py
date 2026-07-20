@@ -79,6 +79,20 @@ class IntakeRoute(str, Enum):
     GRILL = "grill"     # hold: a real fork only the human can settle
     MOCKUP = "mockup"   # hold: needs a locked visual spec first
     NOTHING_NEW = "nothing-new"  # resume found nothing genuinely open changed — stay quiet
+    ESCALATE = "escalate"  # standard-first only: hand up to a deep attempt with bounded evidence
+
+
+class EscalationReason(str, Enum):
+    """The enumerated set of reasons a standard-first Intake steps up to a deep attempt
+    (Wayfinder #2, #228). Reasons are typed, not free text — a string reason field is a
+    charter-level regression, so escalation always carries members of *this* closed set,
+    decided by the standard attempt's own signal or by a deterministic direct-deep trigger.
+    Whoever adds a reason adds it here; nothing else may invent one."""
+
+    LOW_CONFIDENCE_ROUTE = "low-confidence-route"  # standard attempt is unsure which route fits
+    UNRESOLVED_FORK = "unresolved-fork"            # a real outcome-changing choice it can't settle
+    EVIDENCE_GAP = "evidence-gap"                  # grounding is incomplete; premise not verified
+    COMPLEXITY_SIGNALS = "complexity-signals"      # correctness-sensitive / design-heavy signals
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +105,10 @@ class IntakeResult:
     parsed: bool = True
     detail: str = ""
     infra_failed: bool = False       # a worktree/provision/launch failure, not a model decision
+    # Standard-first (#228) only: when route is ESCALATE, the typed reasons the standard
+    # attempt hands up. Always an enumerated tuple — never a free-text reason. Empty for
+    # every terminal route.
+    escalation_reasons: tuple[EscalationReason, ...] = ()
 
 
 def _held(detail: str) -> IntakeResult:
@@ -113,11 +131,46 @@ def _infra_failed(detail: str) -> IntakeResult:
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail, infra_failed=True)
 
 
+# The standard-first (#228) schema: the production `INTAKE_RESULT_SCHEMA` above is left
+# byte-identical so a production deep Intake can never emit `escalate` (that terminal-default
+# decision is #232's). Only a standard-first attempt runs under this schema, which adds the
+# `escalate` route and the typed `escalation_reasons` array so the step-up stays enumerated.
+STANDARD_FIRST_INTAKE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "route": {"type": "string",
+                  "enum": ["ready", "grill", "mockup", "nothing-new", "escalate"]},
+        "title": {"type": "string"},
+        "body": {"type": "string"},
+        "complexity": {"type": ["string", "null"], "enum": ["standard", "deep", None]},
+        "effort": {"type": ["string", "null"],
+                   "enum": ["low", "medium", "high", "extra", None]},
+        "escalation_reasons": {
+            "type": "array",
+            "items": {"type": "string",
+                      "enum": [r.value for r in EscalationReason]},
+        },
+    },
+    "required": ["route", "title", "body", "complexity", "effort"],
+}
+
+
 def _enum_or_none(enum, raw):
     try:
         return enum(str(raw).strip().lower())
     except ValueError:
         return None
+
+
+def _escalation_reasons(raw) -> tuple[EscalationReason, ...]:
+    """The typed, de-duplicated reasons off a standard-first decision. Unknown strings are
+    dropped (never coerced into a free-text reason); order is the enum's own so the result is
+    deterministic. Pure."""
+    if not isinstance(raw, list):
+        return ()
+    picked = {r for r in (_enum_or_none(EscalationReason, x) for x in raw) if r is not None}
+    return tuple(r for r in EscalationReason if r in picked)
 
 
 def parse_intake(payload: str) -> IntakeResult:
@@ -139,6 +192,18 @@ def parse_intake(payload: str) -> IntakeResult:
             return _held("intake decision carried no valid route")
         if route is IntakeRoute.NOTHING_NEW:
             return IntakeResult(route, "")  # a no-op resume: no body, nothing to post
+        if route is IntakeRoute.ESCALATE:
+            # Standard-first step-up (#228): a valid escalate must carry at least one typed
+            # reason. With none, the standard attempt has given the deep attempt nothing to act
+            # on, which would degenerate into a blind rerun — so fail safe to a human hold.
+            reasons = _escalation_reasons(data.get("escalation_reasons"))
+            if not reasons:
+                return _held("escalate decision carried no typed reason")
+            body = str(data.get("body", "")).strip()
+            title = str(data.get("title", "")).strip()
+            complexity = _enum_or_none(Complexity, data.get("complexity"))
+            return IntakeResult(route, body, title, complexity,
+                                escalation_reasons=reasons)
         body = str(data.get("body", "")).strip()
         if not body:
             return _held("intake decision carried no body")
