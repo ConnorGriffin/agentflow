@@ -4,8 +4,6 @@ The one thing that must never happen: MERGE without independent review + green C
 + clean verdict.
 """
 
-import json
-import subprocess
 import time
 
 import pytest
@@ -69,77 +67,78 @@ def test_unusable_review_parks_never_revises():
     assert d(verdict=unparsed, revises_used=0) is MergeDecision.PARK
 
 
-def _fail(_cmd, **_kw):
-    return subprocess.CompletedProcess(_cmd, returncode=1, stdout="", stderr="pending")
+class _FakeGitHub:
+    """Drive the gate through the agentflow.github interface it now leans on.
 
+    The gate states facts (are the checks green? is the PR a draft? did the merge land?)
+    by calling typed helpers and the named escape hatch — never by shelling out to `gh`.
+    So these tests replay helper results and read back which helpers ran, rather than
+    matching gh argument vectors (the whole point of the migration, ADR 0040)."""
 
-def _pass(_cmd, **_kw):
-    return subprocess.CompletedProcess(_cmd, returncode=0, stdout="", stderr="")
+    def __init__(self, monkeypatch, *, api=(), pr_ready=True):
+        self.api_calls = []
+        self.pr_ready_calls = []
+        self._api = iter(api)
+        self._pr_ready = pr_ready
+        monkeypatch.setattr(gate.github, "api", self._api_stub)
+        monkeypatch.setattr(gate.github, "pr_ready", self._pr_ready_stub)
+
+    def _api_stub(self, args, *, parse_json=False):
+        self.api_calls.append(args)
+        return next(self._api)
+
+    def _pr_ready_stub(self, repo, pr):
+        self.pr_ready_calls.append((repo, pr))
+        return self._pr_ready
 
 
 def test_ci_poll_returns_false_at_deadline(monkeypatch):
     """Checks that never complete return False once the deadline expires."""
-    monkeypatch.setattr(gate, "_run", _fail)
+    monkeypatch.setattr(gate.github, "api", lambda *a, **k: None)  # never green
     monkeypatch.setattr(time, "sleep", lambda _: None)
     assert ci_is_green("o/r", 1, timeout=0) is False
 
 
 def test_ci_poll_returns_true_when_checks_pass(monkeypatch):
     """Checks that pass on the first poll return True immediately."""
-    monkeypatch.setattr(gate, "_run", _pass)
+    monkeypatch.setattr(gate.github, "api", lambda *a, **k: "")  # all checks green
     assert ci_is_green("o/r", 1, timeout=30, interval=1) is True
 
 
-_VIEW_DRAFT = ["gh", "pr", "view", "7", "--repo", "o/r", "--json", "isDraft"]
-_MARK_READY = ["gh", "pr", "ready", "7", "--repo", "o/r"]
-_SQUASH_MERGE = [
-    "gh", "pr", "merge", "7", "--repo", "o/r", "--squash", "--delete-branch",
-]
-
-
-def _record_commands(monkeypatch, *responses):
-    commands = []
-    results = iter(responses)
-
-    def run(cmd):
-        commands.append(cmd)
-        returncode, stdout = next(results)
-        return subprocess.CompletedProcess(
-            cmd, returncode=returncode, stdout=stdout, stderr="")
-
-    monkeypatch.setattr(gate, "_run", run)
-    return commands
-
-
 def test_squash_merge_marks_a_draft_ready_before_merging(monkeypatch):
-    commands = _record_commands(
-        monkeypatch, (0, '{"isDraft": true}'), (0, ""), (0, ""))
+    gh = _FakeGitHub(monkeypatch, api=[{"isDraft": True}, ""], pr_ready=True)
 
     assert squash_merge("o/r", 7) is True
-    assert commands == [_VIEW_DRAFT, _MARK_READY, _SQUASH_MERGE]
+    assert gh.pr_ready_calls == [("o/r", 7)]   # a draft was undrafted before the merge
+    assert len(gh.api_calls) == 2              # draft read, then the merge
 
 
 def test_squash_merge_merges_an_already_ready_pr(monkeypatch):
-    commands = _record_commands(monkeypatch, (0, '{"isDraft": false}'), (0, ""))
+    gh = _FakeGitHub(monkeypatch, api=[{"isDraft": False}, ""])
 
     assert squash_merge("o/r", 7) is True
-    assert commands == [_VIEW_DRAFT, _SQUASH_MERGE]
+    assert gh.pr_ready_calls == []             # already ready — no undraft
+    assert len(gh.api_calls) == 2
 
 
-@pytest.mark.parametrize("response", [(1, ""), (0, "{}"), (0, "not json")])
+@pytest.mark.parametrize("draft_read", [None, {}, {"isDraft": "true"}])
 def test_squash_merge_does_not_merge_when_draft_state_cannot_be_determined(
-        monkeypatch, response):
-    commands = _record_commands(monkeypatch, response)
+        monkeypatch, draft_read):
+    # An unreadable PR (None), a read missing the field ({}), or a non-boolean value all
+    # leave the draft state unknown — fail closed, never merge, never even read on.
+    gh = _FakeGitHub(monkeypatch, api=[draft_read])
 
     assert squash_merge("o/r", 7) is False
-    assert commands == [_VIEW_DRAFT]
+    assert len(gh.api_calls) == 1              # stopped after the draft read
+    assert gh.pr_ready_calls == []
 
 
 def test_squash_merge_does_not_merge_when_marking_ready_fails(monkeypatch):
-    commands = _record_commands(monkeypatch, (0, '{"isDraft": true}'), (1, ""))
+    gh = _FakeGitHub(monkeypatch, api=[{"isDraft": True}], pr_ready=False)
 
     assert squash_merge("o/r", 7) is False
-    assert commands == [_VIEW_DRAFT, _MARK_READY]
+    assert gh.pr_ready_calls == [("o/r", 7)]   # tried to undraft, then bailed
+    assert len(gh.api_calls) == 1              # never reached the merge
 
 
 # --- the mechanical UI-evidence gate (ADR 0018) --------------------------------
@@ -219,12 +218,12 @@ class TestUiEvidenceGapAnchorsToUs:
     _IMG = "![before](x.png)"
 
     def _gap(self, monkeypatch, *, body="", comments=()):
-        payload = json.dumps({
+        data = {
             "files": [{"path": "agentflow/webui/src/app.svelte"}],
             "body": body,
             "comments": [{"body": b} for b in comments],
-        })
-        _record_commands(monkeypatch, (0, payload))
+        }
+        monkeypatch.setattr(gate.github, "api", lambda *a, **k: data)
         return ui_evidence_gap("o/r", 7, self._SURFACES)
 
     def test_maintainer_comment_image_does_not_count(self, monkeypatch):
@@ -240,6 +239,13 @@ class TestUiEvidenceGapAnchorsToUs:
 
     def test_no_images_anywhere_is_a_gap(self, monkeypatch):
         assert self._gap(monkeypatch, body="prose only", comments=["nice"]) is True
+
+    def test_unreadable_pr_fails_closed_to_a_gap(self, monkeypatch):
+        # The load-bearing rule: a read that couldn't reach GitHub stays unknown, and
+        # unknown must never pass as "no UI change / evidence present". The escape hatch
+        # returns None on failure, so the gate reports a gap rather than auto-merging blind.
+        monkeypatch.setattr(gate.github, "api", lambda *a, **k: None)
+        assert ui_evidence_gap("o/r", 7, self._SURFACES) is True
 
 
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------
@@ -315,18 +321,17 @@ def test_respond_park_closes_only_its_target_and_leaves_later_comment_pending():
 # --- park() body rendering (issue #210) ----------------------------------------
 
 def _park_body(monkeypatch, verdict):
-    """Call park() and return the body string it would have posted."""
+    """Call park() and return the body string it posted through the PR-comment helper."""
     captured = []
 
-    def run(cmd):
-        captured.append(cmd)
-        return subprocess.CompletedProcess(cmd, returncode=0, stdout="", stderr="")
+    def pr_comment(repo, pr, body):
+        captured.append(body)
+        return True
 
-    monkeypatch.setattr(gate, "_run", run)
+    monkeypatch.setattr(gate.github, "pr_comment", pr_comment)
     gate.park("o/r", 99, verdict, reason="exhausted its review budget without a durable verdict")
-    assert captured, "park() did not call _run"
-    body_arg = captured[0]
-    return body_arg[body_arg.index("--body") + 1]
+    assert captured, "park() did not post a PR comment"
+    return captured[0]
 
 
 def test_no_verdict_park_says_no_review_was_completed(monkeypatch):
