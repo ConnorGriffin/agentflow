@@ -182,6 +182,36 @@ def test_completed_attempt_persists_its_spend_through_the_seam(make_coord, coord
     assert entry.attempt == 1
 
 
+def test_attempt_records_the_reasoning_effort_set_at_launch(make_coord, coord_state):
+    """A build attempt's telemetry carries the reasoning effort actually set at launch (ADR 0046):
+    an extra-effort build reasons at ``xhigh``. Fails if the field regresses to always-``None``."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(Submission(repo="o/r", subject="5", stage="build",
+                                             pool="claude", complexity="deep", effort="extra"))
+    assert coord.cycle("claude") == []
+    fake.end(identity, success=True, usage=AttemptUsage(output_tokens=900))
+    coord.cycle("claude")
+
+    (entry,) = read_attempts(coord._store.path)
+    assert entry.reasoning_effort == "xhigh"           # not the old unconditional None
+
+
+def test_non_build_attempt_records_reasoning_effort_as_explicit_none(make_coord, coord_state):
+    """A Review keeps the provider default, so its telemetry records reasoning effort as an
+    explicit ``None`` — the recalibration pass reads "unset", not a mapped rung."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(Submission(repo="o/r", subject="8", stage="review",
+                                             pool="claude", complexity="deep", effort="extra"))
+    coord.cycle("claude")
+    fake.end(identity, success=True, usage=AttemptUsage(output_tokens=200))
+    coord.cycle("claude")
+
+    (entry,) = read_attempts(coord._store.path)
+    assert entry.reasoning_effort is None
+
+
 def test_retries_remain_separately_attributable(make_coord, coord_state):
     fake = FakeSession()
     coord = make_coord(fake)

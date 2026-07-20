@@ -335,6 +335,16 @@ class _WorktreeRunner:
                   "--state", "open", "--json", "url", "-q", ".[0].url // \"\""])
         return r.returncode == 0, r.stdout.strip() or None
 
+def _clamp_reasoning(level: str, ladder: tuple[str, ...]) -> str:
+    """The reasoning rung this provider actually accepts for ``level``.
+
+    A rung the provider's ladder does not carry clamps to the ladder's top rung rather than
+    failing the launch (ADR 0046). Inert for today's models — both providers accept every rung
+    the daemon maps — but defensive for a future model whose ladder stops short.
+    """
+    return level if level in ladder else ladder[-1]
+
+
 def _write_output_schema(schema: dict) -> str:
     """Persist a provider-neutral result schema to a temp file for Codex's ``--output-schema``.
 
@@ -402,6 +412,8 @@ def _codex_local_mcp_config(servers: dict) -> list[str]:
 class ClaudeRunner(_WorktreeRunner):
     tool = "claude"
     MODELS = {Complexity.STANDARD: "sonnet", Complexity.DEEP: "opus"}
+    # Claude's reasoning ladder for ``--effort`` (ascending). ``max`` is manual-only (ADR 0046).
+    _REASONING_LADDER = ("low", "medium", "high", "xhigh", "max")
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
                         schema: dict | None = None, profile=None) -> list[str]:
@@ -423,6 +435,10 @@ class ClaudeRunner(_WorktreeRunner):
         read/search set plus the operator's re-supplied local servers (the code-graph tool):
         an exploration stage keeps the same code-graph access Build has — it is the withheld
         *edit* tools, not the local read-only MCP tools, that a read-only stage loses.
+
+        A build/revise profile also carries a reasoning-effort rung (ADR 0046), handed to Claude's
+        first-class ``--effort`` flag; every other stage leaves it ``None`` (provider default). A
+        rung above Claude's ladder clamps to its top rather than failing the launch.
         """
         from agentflow.coordinator.profiles import WITHHELD_EDIT_TOOLS
 
@@ -442,6 +458,9 @@ class ClaudeRunner(_WorktreeRunner):
                 argv += ["--tools", ",".join(tools)]
                 deny = WITHHELD_EDIT_TOOLS
             argv += ["--max-turns", str(profile.turn_ceiling)]
+            if profile.reasoning_effort is not None:
+                argv += ["--effort",
+                         _clamp_reasoning(profile.reasoning_effort, self._REASONING_LADDER)]
         argv += ["--settings", _claude_settings(deny)]
         if schema is not None:
             argv += ["--json-schema", json.dumps(schema, separators=(",", ":"))]
@@ -454,6 +473,9 @@ class CodexRunner(_WorktreeRunner):
     MODELS = {Complexity.STANDARD: "gpt-5.6-terra", Complexity.DEEP: "gpt-5.6-sol"}
 
     _CLI_MODEL = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra"}
+    # Codex's reasoning ladder for ``model_reasoning_effort`` (ascending). ``max`` is manual-only
+    # (ADR 0046); the daemon never maps below ``low``, so the sub-``low`` rungs are inert here.
+    _REASONING_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
                         schema: dict | None = None, profile=None) -> list[str]:
@@ -471,6 +493,12 @@ class CodexRunner(_WorktreeRunner):
         so both providers get the code graph from one source while the account connectors stay
         excluded, on every stage including read-only ones. The wall ceiling is applied per-record
         by the launcher, the same as for Claude.
+
+        A build/revise profile also carries a reasoning-effort rung (ADR 0046). Codex has no
+        ``--effort`` flag — reasoning effort is a config override — so it is appended as another
+        ``-c model_reasoning_effort=<level>`` alongside the existing ``-c`` overrides, before the
+        positional prompt. Every other stage leaves it ``None`` (provider default); a rung above
+        Codex's ladder clamps to its top rather than failing the launch.
         """
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
         worktree = os.path.realpath(cwd)
@@ -492,6 +520,9 @@ class CodexRunner(_WorktreeRunner):
                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
                 "--skip-git-repo-check"]
         argv += _codex_local_mcp_config(_operator_local_mcp_servers())
+        if profile is not None and profile.reasoning_effort is not None:
+            level = _clamp_reasoning(profile.reasoning_effort, self._REASONING_LADDER)
+            argv += ["-c", f"model_reasoning_effort={level}"]
         if schema is not None:
             argv += ["--output-schema", _write_output_schema(schema)]
         argv.append(_bounded_prompt(_CODEX_HEADLESS_RECOVERY + prompt, cwd))
