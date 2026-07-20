@@ -17,7 +17,6 @@ worktrees, following the same stage-native completion contracts the earlier pipe
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import subprocess
@@ -26,6 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+from agentflow import github
 from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coordinator,
                                    IntakeStageAdapter, MockupStageAdapter, ResearchStageAdapter,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
@@ -401,7 +401,7 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
     operations. GitHub listing or verification failures likewise clear nothing.
     """
     from agentflow.coordinator.record import RUNNING
-    from agentflow.loop import BUILDING, DRAWING, RESOLVING, TRIAGING, _run
+    from agentflow.loop import BUILDING, DRAWING, RESOLVING, TRIAGING
 
     _log = _log or (lambda _line: None)
     try:
@@ -414,15 +414,14 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
                    ("resolving", RESOLVING))
     cleared = 0
     for lane, label in lane_labels:
-        listed = _run(["gh", "issue", "list", "--repo", cfg.repo, "--state", "open",
-                       "--label", label, "--json", "number,updatedAt", "--limit", "100"])
-        if listed.returncode != 0:
+        # The per-label listing reads number+updatedAt in one call, which the typed surface does
+        # not offer, so it goes through the module's escape hatch. An unreadable listing (None)
+        # defers this lane rather than clearing anything (ADR 0040).
+        claimed = github.api(["issue", "list", "--repo", cfg.repo, "--state", "open",
+                              "--label", label, "--json", "number,updatedAt", "--limit", "100"],
+                             parse_json=True)
+        if not isinstance(claimed, list):
             _log(f"{cfg.repo}: {lane} claim reconciliation deferred — GitHub unreadable")
-            continue
-        try:
-            claimed = json.loads(listed.stdout or "[]")
-        except json.JSONDecodeError:
-            _log(f"{cfg.repo}: {lane} claim reconciliation deferred — GitHub response unreadable")
             continue
         for issue in claimed:
             number = issue.get("number")
@@ -443,18 +442,10 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
             if any((not record.retired and record.claim) or record.state == RUNNING
                    for record in related):
                 continue
-            removed = _run(["gh", "issue", "edit", str(number), "--repo", cfg.repo,
-                            "--remove-label", label])
-            if removed.returncode != 0:
+            if not github.remove_label(cfg.repo, number, label):
                 continue
-            proved = _run(["gh", "issue", "view", str(number), "--repo", cfg.repo,
-                           "--json", "labels"])
-            if proved.returncode != 0:
-                continue
-            try:
-                labels = {item.get("name")
-                          for item in json.loads(proved.stdout or "{}").get("labels", [])}
-            except json.JSONDecodeError:
+            labels = github.issue_labels(cfg.repo, number)
+            if labels is None:
                 continue
             if label not in labels:
                 cleared += 1
@@ -588,17 +579,19 @@ def _production_gate():
 
 def _pr_exists(record) -> bool:
     """Whether the expected PR is open for the record's owned branch (the Build outcome)."""
-    from agentflow.loop import _run
     parsed = _source_facts(record)
     if parsed is None:
         return False
     _workdir, branch, _wt = parsed
-    r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch,
-              "--state", "all", "--json", "headRefName,url", "--limit", "1"])
-    if r.returncode != 0:
+    # A PR opened for this branch in *any* state (open/closed/merged) is the Build outcome, which
+    # the typed open-only listing cannot express, so this goes through the module's escape hatch. An
+    # unreadable read stays unknown — raise rather than mistake it for an absent PR (ADR 0040).
+    data = github.api(["pr", "list", "--repo", record.repo, "--head", branch,
+                       "--state", "all", "--json", "headRefName,url", "--limit", "1"],
+                      parse_json=True)
+    if not isinstance(data, list):
         raise RuntimeError(f"cannot verify Build PR outcome for {record.repo}:{branch}")
-    return any(pr.get("headRefName") == branch
-               for pr in json.loads(r.stdout or "[]"))
+    return any(pr.get("headRefName") == branch for pr in data)
 
 
 _COLLISION_MARK = "INTEGRATION-COLLISION"
@@ -624,37 +617,31 @@ def _integration_collision(record) -> str | None:
     resolving and posts a comment prefixed ``INTEGRATION-COLLISION`` (ADR 0009). A comment carrying
     that marker at its start and created after this attempt was admitted is the durable outcome; the
     recorded main head is what makes a subsequent identical retry detectable (issue #209)."""
-    from agentflow.loop import _run
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "comments"])
-    if viewed.returncode != 0:
-        return None
-    try:
-        comments = json.loads(viewed.stdout or "{}").get("comments", [])
-    except json.JSONDecodeError:
+    comments = github.issue_comments(record.repo, number)
+    if comments is None:
         return None
     if not any(_collision_comment(comment, record.started_at) for comment in comments):
         return None
     return _main_head(record)
 
 
-def _collision_comment(comment: dict, admitted_at: int) -> bool:
+def _collision_comment(comment: github.Comment, admitted_at: int) -> bool:
     """Whether one issue comment is this attempt's integration-collision report: its body starts
     with the ``INTEGRATION-COLLISION`` marker and it was created after the attempt was admitted, so
     a collision comment from an earlier attempt can never stand in for this one. A record from
     before admission times were stamped carries ``started_at == 0`` and keeps the unanchored
     behavior; an unparseable timestamp cannot be proven fresh and fails closed."""
-    if not (comment.get("body", "") or "").lstrip().startswith(_COLLISION_MARK):
+    if not (comment.body or "").lstrip().startswith(_COLLISION_MARK):
         return False
     if not admitted_at:
         return True
     try:
         created = datetime.fromisoformat(
-            str(comment.get("createdAt", "") or "").replace("Z", "+00:00")).timestamp()
+            (comment.created_at or "").replace("Z", "+00:00")).timestamp()
     except ValueError:
         return False
     return created > admitted_at
@@ -786,19 +773,14 @@ def _mockup_missing_context(record) -> bool:
 
 def _mockup_claim_ready(record) -> bool:
     """Prove Mockup's visible drawing claim immediately before admission."""
-    from agentflow.loop import DRAWING, _run
+    from agentflow.loop import DRAWING
 
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return False
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "labels"])
-    if viewed.returncode != 0:
-        return False
-    try:
-        labels = {label.get("name") for label in json.loads(viewed.stdout or "{}").get("labels", [])}
-    except json.JSONDecodeError:
+    labels = github.issue_labels(record.repo, number)
+    if labels is None:
         return False
     return DRAWING in labels and "agentflow:needs-mockup" in labels
 
@@ -811,7 +793,7 @@ def _settle_mockup(record) -> str | None:
     choice, and disposes the clean pushed worktree before coordinator ownership disappears.
     Every step is idempotent; an unreadable label or stubborn worktree retries next cycle.
     """
-    from agentflow.loop import DRAWING, _run
+    from agentflow.loop import DRAWING
     from agentflow.runner import remove_worktree_if_safe
 
     parsed = _source_facts(record)
@@ -822,15 +804,12 @@ def _settle_mockup(record) -> str | None:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    _run(["gh", "issue", "edit", str(number), "--repo", record.repo,
-          "--remove-label", DRAWING])
-    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "labels,url"])
-    if proved.returncode != 0:
-        return None
-    try:
-        state = json.loads(proved.stdout or "{}")
-    except json.JSONDecodeError:
+    github.remove_label(record.repo, number, DRAWING)
+    # The proof read spans labels+url in one snapshot, which the typed surface does not offer, so
+    # it goes through the module's escape hatch; an unreadable read (None) retries next cycle.
+    state = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "labels,url"], parse_json=True)
+    if not isinstance(state, dict):
         return None
     labels = {label.get("name") for label in state.get("labels", [])}
     if DRAWING in labels or "agentflow:needs-mockup" not in labels:
@@ -849,20 +828,18 @@ def _hold_mockup(record) -> str | None:
     marked comment. Both leave ``needs-mockup`` in place, release and prove the drawing claim,
     retain the worktree, and use a stable notification sequence across crash retries.
     """
-    from agentflow.loop import DRAWING, MOCKUP_MARK, _MOCKUP_DISCLAIMER, _run
+    from agentflow.loop import DRAWING, MOCKUP_MARK, _MOCKUP_DISCLAIMER
     from agentflow.notify import notify
 
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "labels,comments,url"])
-    if viewed.returncode != 0:
-        return None
-    try:
-        issue = json.loads(viewed.stdout or "{}")
-    except json.JSONDecodeError:
+    # Labels+comments+url in one snapshot doesn't fit the typed surface, so this read (and the
+    # matching proof read below) goes through the module's escape hatch; None means unreadable.
+    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "labels,comments,url"], parse_json=True)
+    if not isinstance(issue, dict):
         return None
     comments = issue.get("comments", [])
     marked = next((comment for comment in comments
@@ -878,9 +855,7 @@ def _hold_mockup(record) -> str | None:
                                if proof in comment.get("body", "")), None)
     if existing is None:
         body = f"{_MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}"
-        posted = _run(["gh", "issue", "comment", str(number), "--repo", record.repo,
-                       "--body", body])
-        if posted.returncode != 0:
+        if not github.comment(record.repo, number, body):
             return None
     elif missing is None and proof not in existing.get("body", ""):
         comment_id = existing.get("id")
@@ -889,19 +864,17 @@ def _hold_mockup(record) -> str | None:
         body = f"{existing.get('body', '').rstrip()}\n\n{proof}\n\n{explanation}"
         mutation = ("mutation($id:ID!,$body:String!){updateIssueComment("
                     "input:{id:$id,body:$body}){issueComment{id}}}")
-        edited = _run(["gh", "api", "graphql", "-f", f"query={mutation}",
-                       "-f", f"id={comment_id}", "-f", f"body={body}"])
-        if edited.returncode != 0:
+        # A GraphQL comment edit is one of the escape hatch's named exotic cases (ADR 0040).
+        if github.api(["api", "graphql", "-f", f"query={mutation}",
+                       "-f", f"id={comment_id}", "-f", f"body={body}"]) is None:
             return None
-    _run(["gh", "issue", "edit", str(number), "--repo", record.repo,
-          "--add-label", "agentflow:needs-mockup", "--remove-label", DRAWING])
-    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "labels,comments,url"])
-    if proved.returncode != 0:
-        return None
-    try:
-        state = json.loads(proved.stdout or "{}")
-    except json.JSONDecodeError:
+    # A single edit that both adds and removes a label is not on the typed surface, so the write
+    # goes through the escape hatch; the proof read below is authoritative either way.
+    github.api(["issue", "edit", str(number), "--repo", record.repo,
+                "--add-label", "agentflow:needs-mockup", "--remove-label", DRAWING])
+    state = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "labels,comments,url"], parse_json=True)
+    if not isinstance(state, dict):
         return None
     labels = {label.get("name") for label in state.get("labels", [])}
     final_comments = state.get("comments", [])
@@ -930,20 +903,18 @@ def _hold_build(record) -> str | None:
     claim is released only after the hold exists.
     """
     from agentflow.intake import apply_intake
-    from agentflow.loop import BUILDING, _run, held_build_result
+    from agentflow.loop import BUILDING, held_build_result
     from agentflow.notify import notify
 
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "title,labels,comments"])
-    if viewed.returncode != 0:
-        return None
-    try:
-        issue = json.loads(viewed.stdout or "{}")
-    except json.JSONDecodeError:
+    # Title+labels+comments in one snapshot (and labels+comments+url for the proof read below) does
+    # not fit the typed surface, so both go through the module's escape hatch; None is unreadable.
+    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "title,labels,comments"], parse_json=True)
+    if not isinstance(issue, dict):
         return None
     labels = [label.get("name", "") for label in issue.get("labels", [])]
     status = ("could not rebase past a collision with newer changes on the main branch and stopped "
@@ -955,16 +926,11 @@ def _hold_build(record) -> str | None:
         for comment in issue.get("comments", [])
     )
     apply_intake(record.repo, number, issue.get("title", ""), labels, result)
-    _run(["gh", "issue", "edit", str(number), "--repo", record.repo,
-          "--remove-label", BUILDING])
+    github.remove_label(record.repo, number, BUILDING)
 
-    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "labels,comments,url"])
-    if proved.returncode != 0:
-        return None
-    try:
-        state = json.loads(proved.stdout or "{}")
-    except json.JSONDecodeError:
+    state = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "labels,comments,url"], parse_json=True)
+    if not isinstance(state, dict):
         return None
     final_labels = {label.get("name") for label in state.get("labels", [])}
     has_comment = any(
@@ -1060,16 +1026,16 @@ def _park_pr_number(record) -> int | None:
     facts = _review_source_facts(record)
     if facts is not None:
         return facts[1]
-    from agentflow.loop import _run
     parsed = _source_facts(record)
     if parsed is None:
         return None
     _workdir, branch, _wt = parsed
-    r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch, "--state", "all",
-              "--json", "number", "--limit", "1"])
-    if r.returncode != 0:
+    # A Revise's builder branch PR may already be closed/merged, so this spans all states — not the
+    # typed open-only listing — and goes through the module's escape hatch; None stays unresolved.
+    prs = github.api(["pr", "list", "--repo", record.repo, "--head", branch, "--state", "all",
+                      "--json", "number", "--limit", "1"], parse_json=True)
+    if not isinstance(prs, list):
         return None
-    prs = json.loads(r.stdout or "[]")
     return prs[0].get("number") if prs else None
 
 
@@ -1104,20 +1070,14 @@ def _park_pr(record) -> str | None:
 
 def _review_pr_facts(record) -> dict | None:
     """The PR's current head and state, or ``None`` when GitHub is unreadable."""
-    from agentflow.loop import _run
-
     facts = _review_source_facts(record)
     if facts is None:
         return None
     _workdir, pr = facts
-    viewed = _run(["gh", "pr", "view", str(pr), "--repo", record.repo,
-                   "--json", "headRefOid,state"])
-    if viewed.returncode != 0:
-        return None
-    try:
-        data = json.loads(viewed.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
+    # Head SHA + state in one snapshot doesn't fit the typed surface, so this read goes through the
+    # module's escape hatch; None means GitHub was unreadable (ADR 0040).
+    data = github.api(["pr", "view", str(pr), "--repo", record.repo,
+                       "--json", "headRefOid,state"], parse_json=True)
     if not isinstance(data, dict):
         return None
     head, state = data.get("headRefOid"), data.get("state")
@@ -1187,7 +1147,7 @@ def _settle_review(record) -> str | None:
     from agentflow import ratchet
     from agentflow.gate import (MergeDecision, ci_is_green, decide_merge, reply_pending,
                                 squash_merge, ui_evidence_gap)
-    from agentflow.loop import (_UI_GAP_REASON, _finish_review, _pr_comments, _run,
+    from agentflow.loop import (_UI_GAP_REASON, _finish_review, _pr_comments,
                                 repo_profile, ui_surfaces)
 
     facts = _review_source_facts(record)
@@ -1213,8 +1173,7 @@ def _settle_review(record) -> str | None:
         ratchet.record_once(
             record.repo, ratchet.CLEAN_MERGE if record.round == 0 else "merge_after_revise",
             record.identity)
-        _run(["gh", "issue", "edit", str(record.subject), "--repo", record.repo,
-              "--remove-label", "ready-for-agent"])
+        github.remove_label(record.repo, record.subject, "ready-for-agent")
         return f"https://github.com/{record.repo}/pull/{pr}"
     if head != record.target:
         # The head moved after this clean verdict was recorded (a maintainer rebase, a manual push,
@@ -1272,8 +1231,7 @@ def _settle_review(record) -> str | None:
     ratchet.record_once(
         record.repo, ratchet.CLEAN_MERGE if record.round == 0 else "merge_after_revise",
         record.identity)
-    _run(["gh", "issue", "edit", str(record.subject), "--repo", record.repo,
-          "--remove-label", "ready-for-agent"])
+    github.remove_label(record.repo, record.subject, "ready-for-agent")
     return f"https://github.com/{record.repo}/pull/{pr}"
 
 
@@ -1285,7 +1243,7 @@ def _park_respond(record) -> str | None:
     crash window between posting the durable comment and recording completion locally: a replay
     replaces the same notification instead of multiplying it.
     """
-    from agentflow.loop import _pr_comments, _run
+    from agentflow.loop import _pr_comments
     from agentflow.notify import notify
 
     pr = _park_pr_number(record)
@@ -1301,9 +1259,7 @@ def _park_respond(record) -> str | None:
                 f"{proof}\n\n"
                 f"Respond could not finish answering maintainer comment `{record.target}` "
                 "within its continuation budget. The PR branch and local work were retained.")
-        posted = _run(["gh", "pr", "comment", str(pr), "--repo", record.repo,
-                       "--body", body])
-        if posted.returncode != 0:
+        if not github.pr_comment(record.repo, pr, body):
             return None
     proved = _pr_comments(record.repo, pr)
     if proved is None or not any(proof in comment.get("body", "") for comment in proved):
@@ -1356,14 +1312,12 @@ def _revision_ready(record, obs) -> bool:
     if parsed is None or not record.target:
         return False
     _workdir, branch, wt = parsed
-    r = _run(["gh", "pr", "list", "--repo", record.repo, "--head", branch, "--state", "open",
-              "--json", "headRefOid,number", "--limit", "1"])
-    if r.returncode != 0:
+    prs = github.list_open_prs(record.repo, head=branch)
+    if prs is None:
         raise RuntimeError(f"cannot verify Revise outcome for {record.repo}:{branch}")
-    prs = json.loads(r.stdout or "[]")
     if not prs:
         return False
-    head = prs[0].get("headRefOid", "")
+    head = prs[0].head_ref_oid
     if head and head != record.target:
         # A moved head is the pushed revision when it descends from the reviewed SHA, or — when the
         # history was rewritten (a rebase the finding asked for) — when the retained builder worktree
@@ -1383,7 +1337,7 @@ def _revision_ready(record, obs) -> bool:
     # No new code, but an evidence-only revision still completes on its durable non-code proof: an
     # agentflow-authored PR comment (our marker, never the maintainer's) that attaches evidence
     # and postdates this revise round.
-    comments = _pr_comments(record.repo, prs[0].get("number"))
+    comments = _pr_comments(record.repo, prs[0].number)
     if comments is None:
         return False
     return any(_round_evidence(c, record.created_at) for c in comments)
@@ -1441,7 +1395,7 @@ def _reply_ready(record, obs) -> bool:
     pr = _open_pr_for_branch(record.repo, branch)
     if pr is None:
         return False
-    comments = _pr_comments(record.repo, pr.get("number"))
+    comments = _pr_comments(record.repo, pr.number)
     if comments is None or not respond_reply_posted(comments, record.target or ""):
         return False   # no durable reply bound to this record's maintainer-comment target
     change = respond_reply_change(comments, record.target or "")
@@ -1454,7 +1408,7 @@ def _reply_ready(record, obs) -> bool:
     # let preparation recover the PR branch before another attempt.
     if not wt.exists():
         return False
-    head = pr.get("headRefOid") or ""
+    head = pr.head_ref_oid or ""
     if change != "none" and (change == baseline or change != head):
         return False
     fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
@@ -1481,18 +1435,17 @@ def _settle_respond(record) -> str | None:
     no-op, so a repeat re-proves the same release. Returns ``None`` when the issue is unreadable or
     the label is still present, so settlement retries next cycle rather than retiring over a claim it
     never released. Live orchestration, not unit-tested (ADR 0020)."""
-    from agentflow.loop import BUILDING, _run
+    from agentflow.loop import BUILDING
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    _run(["gh", "issue", "edit", str(number), "--repo", record.repo, "--remove-label", BUILDING])
-    proved = _run(["gh", "issue", "view", str(number), "--repo", record.repo, "--json", "labels,url"])
-    if proved.returncode != 0:
-        return None
-    try:
-        state = json.loads(proved.stdout or "{}")
-    except json.JSONDecodeError:
+    github.remove_label(record.repo, number, BUILDING)
+    # Labels+url in one snapshot isn't on the typed surface, so this proof read goes through the
+    # module's escape hatch; None means unreadable — retry rather than retire over a live claim.
+    state = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "labels,url"], parse_json=True)
+    if not isinstance(state, dict):
         return None
     if BUILDING in {label.get("name") for label in state.get("labels", [])}:
         return None   # the claim label is still present — retry rather than retire over it
@@ -1502,29 +1455,20 @@ def _settle_respond(record) -> str | None:
     return state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
 
 
-def _open_pr_for_branch(repo: str, branch: str) -> dict | None:
-    """The one open PR for the owned branch — its ``number`` and ``headRefOid`` — or ``None`` when
-    there is none or the read fails. The shared lookup behind every claim-transfer opener; a
-    ``None`` leaves the completed record still claimed, so the next reconcile pass retries the
-    transfer rather than stranding it."""
-    from agentflow.loop import _run
-    listed = _run(["gh", "pr", "list", "--repo", repo, "--head", branch, "--state", "open",
-                   "--json", "number,headRefOid", "--limit", "1"])
-    if listed.returncode != 0:
-        return None
-    try:
-        prs = json.loads(listed.stdout or "[]")
-    except json.JSONDecodeError:
-        return None
-    if (not isinstance(prs, list) or not prs or not isinstance(prs[0], dict)
-            or not isinstance(prs[0].get("number"), int)):
+def _open_pr_for_branch(repo: str, branch: str) -> github.PrRow | None:
+    """The one open PR for the owned branch — its number and head SHA — or ``None`` when there is
+    none or the read fails. The shared lookup behind every claim-transfer opener; a ``None`` leaves
+    the completed record still claimed, so the next reconcile pass retries the transfer rather than
+    stranding it."""
+    prs = github.list_open_prs(repo, head=branch)
+    if not prs:
         return None
     return prs[0]
 
 
 def _review_context(record) -> tuple[str, str] | None:
     """The issue-anchored acceptance brief and declared UI surfaces for a Review."""
-    from agentflow.loop import _run, _surfaces_phrase, ui_surfaces
+    from agentflow.loop import _surfaces_phrase, ui_surfaces
 
     parts = _build_source_parts(record)
     if parts is None:
@@ -1532,18 +1476,8 @@ def _review_context(record) -> tuple[str, str] | None:
     workdir, _slug = parts
     acceptance = record.input_ptr if record.stage == "build" and record.input_ptr else None
     if acceptance is None:
-        viewed = _run(["gh", "issue", "view", str(record.subject), "--repo", record.repo,
-                       "--json", "body"])
-        if viewed.returncode != 0:
-            return None
-        try:
-            payload = json.loads(viewed.stdout or "{}")
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(payload, dict):
-            return None
-        acceptance = payload.get("body")
-        if not isinstance(acceptance, str):
+        acceptance = github.issue_body(record.repo, record.subject)
+        if acceptance is None:   # unreadable stays unknown — the opener refuses rather than guesses
             return None
     return acceptance, _surfaces_phrase(ui_surfaces(workdir))
 
@@ -1575,7 +1509,7 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
         return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
                 # build keeps its claim and this opener re-drives next cycle.
     submission = review_submission(
-        build, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"),
+        build, pr.head_ref_oid, reviewer_tool, pr.number,
         acceptance=acceptance, surfaces=surfaces)
     if submission is not None:
         coord.submit_stage(submission)
@@ -1660,7 +1594,7 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
         return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
                 # revise keeps its claim and this opener re-drives next cycle.
     submission = review_submission(
-        revise, pr.get("headRefOid", ""), reviewer_tool, pr.get("number"),
+        revise, pr.head_ref_oid, reviewer_tool, pr.number,
         acceptance=acceptance, surfaces=surfaces,
         conflict_resolution=bool(revise.conflict_round))  # ADR 0038: add the discard-check lens
     if submission is not None:

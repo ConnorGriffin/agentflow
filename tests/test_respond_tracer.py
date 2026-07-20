@@ -16,12 +16,11 @@ exercised directly with only their external GitHub/worktree reads faked (ADR 002
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_build
+from agentflow import coordinated_build, github
 from agentflow.coordinator import RespondStageAdapter, StageRouter, Submission, tracer
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import Record
@@ -211,10 +210,7 @@ def test_public_respond_seam_requires_targeted_reply_and_clean_pushed_worktree(
     wt.mkdir(parents=True)
     dirty = [" M requested-change.py\n"]
 
-    def external_read(argv):
-        if argv[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps([
-                {"number": 42, "headRefOid": "remote-head"}]))
+    def git(argv):
         if argv[:3] == ["git", "-C", str(wt)]:
             if "rev-list" in argv:
                 return SimpleNamespace(returncode=0, stdout="0\n")
@@ -223,7 +219,9 @@ def test_public_respond_seam_requires_targeted_reply_and_clean_pushed_worktree(
             return SimpleNamespace(returncode=0, stdout="")
         return real_run(argv)
 
-    monkeypatch.setattr("agentflow.loop._run", external_read)
+    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.github.list_open_prs",
+                        lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-1") + "\n" +
@@ -253,8 +251,8 @@ def test_public_respond_seam_fails_closed_when_owned_worktree_is_missing(
 
     fake = FakeSession()
     missing = tmp_path / ".agentflow/worktrees/claude/issue-7-missing"
-    monkeypatch.setattr("agentflow.loop._run", lambda argv: SimpleNamespace(
-        returncode=0, stdout=json.dumps([{"number": 42, "headRefOid": "remote-head"}])))
+    monkeypatch.setattr("agentflow.github.list_open_prs",
+                        lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-1") + "\n" +
@@ -281,15 +279,14 @@ def test_public_respond_seam_rejects_a_reply_for_a_different_comment_target(
     wt = tmp_path / ".agentflow/worktrees/claude/issue-7-x"
     wt.mkdir(parents=True)
 
-    def external_read(argv):
-        if argv[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps([
-                {"number": 42, "headRefOid": "remote-head"}]))
+    def git(argv):
         if "rev-list" in argv:
             return SimpleNamespace(returncode=0, stdout="0\n")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", external_read)
+    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.github.list_open_prs",
+                        lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
         {"body": "first question", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-2") + "\n" +
@@ -341,15 +338,12 @@ def test_public_respond_exhaustion_has_its_own_durable_park_and_notification(
     comments = [{"body": "> *agentflow: parked for human review.*\n\nOld review park."}]
     notifications = []
 
-    def github(argv):
-        if argv[:3] == ["gh", "pr", "list"]:
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"number": 42}]))
-        if argv[:3] == ["gh", "pr", "comment"]:
-            comments.append({"body": argv[argv.index("--body") + 1]})
-            return SimpleNamespace(returncode=0, stdout="")
-        return SimpleNamespace(returncode=1, stdout="")
+    def pr_comment(repo, pr, body):
+        comments.append({"body": body})
+        return True
 
-    monkeypatch.setattr("agentflow.loop._run", github)
+    monkeypatch.setattr(coordinated_build, "_park_pr_number", lambda record: 42)
+    monkeypatch.setattr("agentflow.github.pr_comment", pr_comment)
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(comments))
     monkeypatch.setattr("agentflow.notify.notify",
                         lambda *args, **kwargs: notifications.append((args, kwargs)) or True)
@@ -455,10 +449,9 @@ def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
                  repo="o/r", subject="7", target="cid", lineage="claude", source=str(wt),
                  input_ptr=f"<!-- agentflow-respond-baseline:{baseline} -->")
 
+    head_sha = head
+
     def _run(cmd, *a, **k):
-        if "pr" in cmd and "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps([
-                {"number": 42, "headRefOid": head}]))
         if "rev-list" in cmd:
             return SimpleNamespace(returncode=0, stdout=ahead)
         if "status" in cmd:
@@ -469,7 +462,11 @@ def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
             return SimpleNamespace(returncode=1, stdout="")
         return SimpleNamespace(returncode=0, stdout="")               # fetch and anything else
 
+    def list_open_prs(repo, *, head=None, limit=100):
+        return [github.PrRow(42, head or "", head_sha)]
+
     monkeypatch.setattr("agentflow.loop._run", _run)
+    monkeypatch.setattr("agentflow.github.list_open_prs", list_open_prs)
     monkeypatch.setattr("agentflow.loop._pr_comments",
                         lambda repo, pr: [
                             {"body": "please tweak the copy", "id": "cid"},
@@ -555,19 +552,18 @@ def test_settle_respond_releases_the_building_claim_and_proves_it(monkeypatch):
     labels = ["agentflow:building"]
     removed = []
 
-    def _run(cmd, *a, **k):
-        if "edit" in cmd and "--remove-label" in cmd:
-            removed.append(cmd[-1])
-            labels.clear()
-            return SimpleNamespace(returncode=0, stdout="")
-        if "issue" in cmd and "view" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                {"labels": [{"name": n} for n in labels], "url": "https://github.com/o/r/issues/7"}))
-        if "pr" in cmd and "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"number": 42}]))
-        return SimpleNamespace(returncode=0, stdout="")
+    def remove_label(repo, number, label):
+        removed.append(label)
+        labels.clear()
+        return True
 
-    monkeypatch.setattr("agentflow.loop._run", _run)
+    def api(args, *, parse_json=False):
+        return {"labels": [{"name": n} for n in labels],
+                "url": "https://github.com/o/r/issues/7"}
+
+    monkeypatch.setattr("agentflow.github.remove_label", remove_label)
+    monkeypatch.setattr("agentflow.github.api", api)
+    monkeypatch.setattr(coordinated_build, "_park_pr_number", lambda record: 42)
     assert coordinated_build._settle_respond(rec) == "https://github.com/o/r/pull/42"
     assert removed == ["agentflow:building"]                       # the change claim is dropped
     # Idempotent: a repeat with the label already gone re-proves the same release.

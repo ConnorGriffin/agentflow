@@ -16,12 +16,11 @@ the coordinator's public seam behind the same stage router that runs all three l
 
 from __future__ import annotations
 
-import json
 from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_build
+from agentflow import coordinated_build, github
 from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
                                     StageRouter, Submission, tracer)
 from agentflow.coordinator.providers import ProviderCause
@@ -96,22 +95,23 @@ class _Live:
         self.verdict = verdict
         self.fail_gh = False            # flip to make every gh read fail (a transient outage)
         self.projections = []
-        monkeypatch.setattr("agentflow.loop._run", self._gh)
+        # The transitions state PR/issue facts through the github module now, never by shelling
+        # out: the open PR for a branch, the issue's acceptance body, and (kept unreadable so the
+        # diverged-review reconciler stays inert here) the PR head/state escape-hatch read.
+        monkeypatch.setattr("agentflow.github.list_open_prs", self._list_open_prs)
+        monkeypatch.setattr("agentflow.github.issue_body", self._issue_body)
+        monkeypatch.setattr("agentflow.github.api", lambda *a, **k: None)
         monkeypatch.setattr(coordinated_build, "_review_verdict", lambda review: self.verdict)
         monkeypatch.setattr("agentflow.live.replace_projection",
                             lambda entries, **kw: self.projections.append(entries))
 
-    def _gh(self, cmd, *args, **kwargs):
+    def _list_open_prs(self, repo, *, head=None, limit=100):
         if self.fail_gh:
-            return SimpleNamespace(returncode=1, stdout="")
-        if "list" in cmd:               # gh pr list --head ... --json number,headRefOid
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                [{"number": self.number, "headRefOid": self.head}]))
-        if "view" in cmd:               # gh issue view <n> --json labels
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                {"labels": [{"name": name} for name in self.labels],
-                 "body": "Issue acceptance"}))
-        return SimpleNamespace(returncode=0, stdout="")
+            return None
+        return [github.PrRow(self.number, head or "", self.head)]
+
+    def _issue_body(self, repo, issue):
+        return None if self.fail_gh else "Issue acceptance"
 
     def step(self):
         return coordinated_build.reconcile_and_project(self.coord)
@@ -306,12 +306,10 @@ def test_revise_completes_on_durable_non_code_evidence_with_no_pushed_head(make_
     verifier (:func:`coordinated_build._revision_ready`) must accept an evidence-only revision whose
     head never moved, not consume its continuations and park (the reported behavior)."""
     comments = [[]]                                       # the PR carries no evidence yet
-    def _gh(cmd, *a, **k):                                # gh pr list → head is unchanged (== target)
-        if "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                [{"headRefOid": "sha-a", "number": 42}]))
-        return SimpleNamespace(returncode=0, stdout="")
-    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+                        lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
+    monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
+                        lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
 
     fake = FakeSession()
@@ -345,12 +343,10 @@ def test_evidence_predating_the_revise_round_cannot_complete_it(make_coord, monk
                      "![old shot](https://user-images.githubusercontent.com/1/old.png)",
              "createdAt": BEFORE_ROUND}
     comments = [[stale]]                                  # the stale proof already sits on the PR
-    def _gh(cmd, *a, **k):                                # gh pr list → head is unchanged (== target)
-        if "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                [{"headRefOid": "sha-a", "number": 42}]))
-        return SimpleNamespace(returncode=0, stdout="")
-    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+                        lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
+    monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
+                        lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
 
     fake = FakeSession()
@@ -382,12 +378,10 @@ def test_restart_between_evidence_and_completion_still_completes_exactly_once(ma
     comments = [[{"body": "> *agentflow: reply from the build agent.*\n\n"
                           "![before/after](https://user-images.githubusercontent.com/1/x.png)",
                   "createdAt": AFTER_ROUND}]]
-    def _gh(cmd, *a, **k):                                # gh pr list → head is unchanged (== target)
-        if "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                [{"headRefOid": "sha-a", "number": 42}]))
-        return SimpleNamespace(returncode=0, stdout="")
-    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+                        lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
+    monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
+                        lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
 
     fake = FakeSession()
@@ -452,14 +446,13 @@ def test_revision_ready_rejects_a_head_that_does_not_descend_from_the_reviewed_s
     record = Record(identity="o/r|9|revise|sha-a", stage="revise", pool="claude", lineage="claude",
                     demand=3, repo="o/r", subject="9", target="sha-a", source=str(wt))
     ancestor = [1]                                        # git merge-base --is-ancestor exit code
-    def _gh(cmd, *a, **k):
+    def _git(cmd, *a, **k):
         if "merge-base" in cmd:
             return SimpleNamespace(returncode=ancestor[0], stdout="")
-        if "list" in cmd:                                 # gh pr list → a DIFFERENT head
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                [{"headRefOid": "sha-rewound", "number": 42}]))
         return SimpleNamespace(returncode=0, stdout="")
-    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.loop._run", _git)
+    monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR exposes a DIFFERENT head
+                        lambda repo, head=None: [github.PrRow(42, head or "", "sha-rewound")])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [])
 
     assert coordinated_build._revision_ready(record, None) is False  # rewound head, no evidence
@@ -478,21 +471,25 @@ def _revise_head_read(tmp_path, monkeypatch, *, head, target="sha-a",
     record = Record(identity="o/r|9|revise|sha-a", stage="revise", pool="claude", lineage="claude",
                     demand=3, repo="o/r", subject="9", target=target, source=str(wt))
 
-    def _gh(cmd, *a, **k):
+    head_sha = head
+
+    def _git(cmd, *a, **k):
         if "merge-base" in cmd:
-            reviewed_to_head = cmd[-2:] == [target, head]
+            reviewed_to_head = cmd[-2:] == [target, head_sha]
             return SimpleNamespace(returncode=0 if (descends if reviewed_to_head else rewound) else 1,
                                    stdout="")
         if "rev-parse" in cmd:
-            return SimpleNamespace(returncode=0, stdout=(local_head if local_head is not None else head))
+            return SimpleNamespace(returncode=0,
+                                   stdout=(local_head if local_head is not None else head_sha))
         if "status" in cmd:
             return SimpleNamespace(returncode=0, stdout=status)
-        if "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps(
-                [{"headRefOid": head, "number": 42}]))
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", _gh)
+    def list_open_prs(repo, *, head=None, limit=100):
+        return [github.PrRow(42, head or "", head_sha)]
+
+    monkeypatch.setattr("agentflow.loop._run", _git)
+    monkeypatch.setattr("agentflow.github.list_open_prs", list_open_prs)
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(comments))
     return record
 
@@ -609,14 +606,11 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
     not return no proof and leave the handoff pending with the claim retained (the reported
     behavior)."""
     parked, notified, pr_comments = [], [], []
-    def _gh(cmd, *a, **k):                                # gh pr list --head <branch> → PR number 42
-        if "list" in cmd:
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"number": 42}]))
-        return SimpleNamespace(returncode=0, stdout="")
     def _park(repo, pr, verdict, *, reason):
         parked.append((repo, pr))
         pr_comments.append({"body": "> *agentflow: parked for human review.*"})
-    monkeypatch.setattr("agentflow.loop._run", _gh)
+    monkeypatch.setattr("agentflow.github.api",          # the open PR for the builder branch is #42
+                        lambda args, *, parse_json=False: [{"number": 42}])
     monkeypatch.setattr("agentflow.gate.park", _park)
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(pr_comments))
     monkeypatch.setattr("agentflow.notify.notify", lambda *a, **k: notified.append(a))

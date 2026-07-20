@@ -292,22 +292,17 @@ def test_a_dead_research_run_releases_the_resolving_claim_a_live_one_retains_it(
                   subject="6", state=RUNNING, claim=True)
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [dead, live])
     edited = []
+    from agentflow import github
 
-    def run(argv):
-        if argv[1:3] == ["issue", "list"]:
-            label = argv[argv.index("--label") + 1]
-            payload = ('[{"number":5,"updatedAt":"2020-01-01T00:00:00Z"},'
-                       '{"number":6,"updatedAt":"2020-01-01T00:00:00Z"}]'
-                       if label == "wayfinder:resolving" else "[]")
-            return _R(0, payload)
-        if argv[1:3] == ["issue", "edit"]:
-            edited.append(int(argv[3]))
-            return _R(0)
-        if argv[1:3] == ["issue", "view"]:
-            return _R(0, '{"labels":[]}')
-        raise AssertionError(argv)
+    # The claim lanes are listed in order (building, triaging, drawing, resolving); only the
+    # resolving lane holds the two research-claimed issues. The proof read shows the label gone.
+    listings = iter([[], [], [], [{"number": 5, "updatedAt": "2020-01-01T00:00:00Z"},
+                                   {"number": 6, "updatedAt": "2020-01-01T00:00:00Z"}]])
+    monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
+    monkeypatch.setattr(github, "remove_label",
+                        lambda repo, issue, label: edited.append(issue) or True)
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
-    monkeypatch.setattr(loop, "_run", run)
     assert coordinated_build.reconcile_orphaned_claims(RepoConfig(REPO, "/tmp")) == 1
     assert edited == [5]                                               # dead run released; live retained
 
