@@ -61,6 +61,21 @@ def test_parse_exposes_typed_parts():
     assert ref.slug == "conflict-revise"
 
 
+@pytest.mark.parametrize(
+    "ref",
+    [
+        WorktreeRef.for_build(WORKDIR, "codex-review", 5, "x"),
+        WorktreeRef.for_build(WORKDIR, "claude-intake", 9, "y"),
+    ],
+    ids=["tool-ends-review", "tool-ends-intake"],
+)
+def test_tool_name_ending_in_reserved_suffix_round_trips(ref):
+    """A tool whose own name ends in a reserved lane suffix still round-trips: the name, not
+    the lane, fixes the kind, so its build is represented rather than mistaken for a stripped
+    review/intake lane."""
+    assert WorktreeRef.parse(ref.path) == ref
+
+
 def test_revise_reuses_the_build_worktree():
     """A revise's checkout is the builder's retained build worktree, so it parses back as a
     build ref — the sibling derivation the ADR calls for."""
@@ -82,9 +97,7 @@ def test_revise_reuses_the_build_worktree():
         "/srv/agentflow/.agentflow/worktrees/claude/issue-abc-x",  # non-numeric number
         "/srv/agentflow/.agentflow/worktrees/claude/issue-5",  # build name without a slug
         "/srv/agentflow/.agentflow/worktrees/claude/issue-5-",  # build name with empty slug
-        "/srv/agentflow/.agentflow/worktrees/claude-review/issue-5-x",  # review lane, build name
         "/srv/agentflow/.agentflow/worktrees/claude/pr-5-x",  # pr name off a review lane
-        "/srv/agentflow/.agentflow/worktrees/claude-intake/issue-5-x",  # intake lane, slugged name
         "/srv/agentflow/.agentflow/worktrees/-review/pr-5-x",  # lane leaves no tool
         "/srv/agentflow/.agentflow/worktrees/claude/mystery-5-x",  # unknown name head
     ],

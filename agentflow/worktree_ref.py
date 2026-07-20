@@ -171,14 +171,14 @@ class WorktreeRef:
 
 
 def _lane_tool(lane: str, suffix: str) -> str | None:
-    """The tool a lane names for a given expected suffix, or ``None`` if the lane does not
-    carry that suffix (or leaves no tool)."""
+    """The tool a lane names once its kind's reserved suffix is stripped, or ``None`` if the
+    lane does not carry that suffix (or leaves no tool). The *name* — not the lane — fixes the
+    kind (only a ``pr-…`` name is a review, only a slug-less ``issue-…`` name is an intake), so
+    a plain lane is read as the whole tool even when that tool's own name ends in ``-review`` or
+    ``-intake``. That keeps such a tool's build representable instead of mistaking it for a
+    stripped review/intake lane."""
     if suffix:
         if not lane.endswith(suffix):
             return None
-        tool = lane[: -len(suffix)]
-    else:
-        if lane.endswith("-review") or lane.endswith("-intake"):
-            return None
-        tool = lane
-    return tool or None
+        lane = lane[: -len(suffix)]
+    return lane or None
