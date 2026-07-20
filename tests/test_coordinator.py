@@ -40,7 +40,7 @@ def test_submit_stage_is_idempotent_on_the_logical_stage_identity(make_coord):
     assert first == again
 
 
-def test_withdraw_stage_retires_an_unstarted_record_so_no_cycle_launches_it(make_coord):
+def test_withdraw_stage_frees_the_slot_so_no_cycle_launches_it(make_coord):
     # The by-hand build path submits the coordinator record before it can guard the issue on GitHub;
     # a lost claim race must be able to withdraw the un-started record so a later cycle never launches
     # it without the ownership claim (#245).
@@ -50,11 +50,29 @@ def test_withdraw_stage_retires_an_unstarted_record_so_no_cycle_launches_it(make
     assert record_of(coord, identity).state == "waiting"
 
     assert coord.withdraw_stage(identity) is True
-    withdrawn = record_of(coord, identity)
-    assert withdrawn.retired and withdrawn.state == "completed" and not withdrawn.claim
-    assert coord.cycle("claude") == []                     # the withdrawn record is never admitted
+    assert coord._store.record_of(identity) is None        # the slot is freed, not tombstoned
+    assert coord.cycle("claude") == []                     # nothing to admit
     assert permits(coord, "claude") == 0
     assert coord.withdraw_stage(identity) is False          # idempotent: a repeat is a no-op
+
+
+def test_a_withdrawn_never_run_build_reopens_on_the_next_cold_submission(make_coord):
+    # A build withdrawn before it ever ran must not permanently strand the issue (#251): a subsequent
+    # cold submission at the same identity must produce a runnable (waiting) build, exactly as if the
+    # failed attempt never happened — not reuse a terminal tombstone the daemon can never launch.
+    # Fails on the pre-#251 code, where withdrawal left a retired/completed record the resubmission
+    # returned unchanged.
+    coord = make_coord(FakeSession())
+    sub = Submission(repo="o/r", subject="5", stage="build", pool="claude", complexity="deep")
+    identity = coord.submit_stage(sub)
+    assert coord.withdraw_stage(identity) is True
+
+    reopened = coord.submit_stage(sub)                      # a fresh cold build for the same issue
+    assert reopened == identity
+    record = coord.stage_record(identity)
+    assert record is not None and record.state == "waiting" and not record.retired
+    assert coord.cycle("claude") == []                     # admitted this cycle — a real launch
+    assert record_of(coord, identity).state == "running"
 
 
 def test_withdraw_stage_refuses_a_started_build(make_coord):
