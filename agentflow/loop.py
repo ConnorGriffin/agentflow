@@ -192,9 +192,12 @@ forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the bo
 Write the PR body for the human who merges it — plain language: what changed, why, and
 what to check, in the app's own domain terms. No jargon: no file/function/test names or
 CSS/API specifics (ADR 0018). If the change touches a user-facing surface (this repo's are:
-{surfaces}), you MUST ship before/after screenshots (headless Playwright) as proof it
-matches the locked mockup — both light and dark themes where the app has them. Attach them
-the committed way — no browser is involved and none may be used: save the PNGs under
+{surfaces}), you MUST ship before/after screenshots as proof it matches the locked mockup —
+both light and dark themes where the app has them. Capture them with the canonical harness:
+`node scripts/screenshots.mjs <config.json>` — write a small per-issue config (url, theme,
+out per shot) and run the script. Do NOT write your own harness; every session that does
+rediscovers the same sandbox walls. Attach the PNGs the committed way — no browser is
+involved and none may be used: save them under
 `docs/screenshots/issue-{n}/<short-sha>/` (namespace each round by the branch's current short
 commit SHA so a later revision can never overwrite the files an earlier comment points at),
 commit and push them FIRST, then embed each in the PR body as a markdown image hosted from the
@@ -219,7 +222,8 @@ Do not degrade the two charter gates while revising (ADR 0018):
 - If the PR touches a user-facing surface (this repo's are: {surfaces}), keep before/after
   screenshots attached — both light and dark themes where the app has them. A UI change with
   no screenshot cannot auto-merge; a mechanical gate parks it regardless of the review.
-  If screenshots are missing or stale, capture them with headless Playwright and commit the
+  If screenshots are missing or stale, capture them with the canonical harness
+  (`node scripts/screenshots.mjs <config.json>` — do NOT write your own) and commit the
   PNGs under `docs/screenshots/issue-{n}/<short-sha>/` — namespace each round by the branch's
   current short commit SHA so this round's files never overwrite the ones an earlier comment
   points at. Push FIRST, then embed them in the PR body as markdown images hosted from the
@@ -269,8 +273,8 @@ The same comment must contain exactly one durable outcome marker:
 
 - Answer in plain language, in the app's own terms — no code symbols or file paths.
 - If they asked for evidence (e.g. "show me a screenshot"), produce it and ATTACH it to
-  your comment — headless Playwright against the locked mockup for a UI surface, the same
-  way a build does.
+  your comment — run `node scripts/screenshots.mjs <config.json>` (the canonical harness,
+  do NOT write your own) against the locked mockup for a UI surface, the same way a build does.
 - If they asked for a small change, make it, commit, and push to THIS SAME branch.
 
 Same contract as a revision: never open a new PR, never merge. If you genuinely can't
@@ -770,7 +774,8 @@ The issue as filed / scoped:
 Run the `/ui-mockups` skill for this repo's user-facing surface(s): {surfaces}. Follow it
 headless — ground every variant in the shipping app's own theme, library, and data; make the
 variants diverge at the CONCEPT level (layout metaphor, interaction model, hierarchy), not just
-colors; and screenshot each one. 3-4 variants is the sweet spot.
+colors; and screenshot each one using `node scripts/screenshots.mjs <config.json>` (the
+canonical harness — do NOT write your own). 3-4 variants is the sweet spot.
 
 You are on branch `{branch}` in this worktree. PRESERVE the work so it is not lost with the
 worktree: commit every variant's HTML (and any forked render/screenshot files) AND the
