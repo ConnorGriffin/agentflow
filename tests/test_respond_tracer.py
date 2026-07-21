@@ -344,7 +344,9 @@ def test_public_respond_exhaustion_has_its_own_durable_park_and_notification(
 
     monkeypatch.setattr(coordinated_build, "_park_pr_number", lambda record: 42)
     monkeypatch.setattr("agentflow.github.pr_comment", pr_comment)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(comments))
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda repo, pr: [github.Comment(body=c["body"], created_at="")
+                                          for c in comments])
     monkeypatch.setattr("agentflow.notify.notify",
                         lambda *args, **kwargs: notifications.append((args, kwargs)) or True)
     adapter = RespondStageAdapter(
@@ -366,7 +368,7 @@ def test_public_respond_exhaustion_has_its_own_durable_park_and_notification(
     assert len(respond_parks) == 1
     assert "cid-1" in respond_parks[0] and "review budget" not in respond_parks[0]
     assert len(notifications) == 1
-    assert notifications[0][1]["sequence_id"]
+    assert notifications[0][0][3]                       # a derived sequence id keys the one-shot ping
 
     make_coord(fake, adapter=adapter).cycle("claude")
     assert len(respond_parks) == 1 and len(notifications) == 1

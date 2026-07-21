@@ -694,7 +694,9 @@ def test_production_park_resolves_the_pr_from_the_review_worktree_and_parks_once
         pr_comments.append({"body": "> *agentflow: parked for human review.*"})
 
     monkeypatch.setattr("agentflow.gate.park", _park)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(pr_comments))
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda repo, pr: [github.Comment(body=c["body"], created_at="")
+                                          for c in pr_comments])
     monkeypatch.setattr("agentflow.notify.notify", lambda *a, **k: notified.append(a))
 
     fake = FakeSession()
@@ -717,6 +719,21 @@ def test_production_park_resolves_the_pr_from_the_review_worktree_and_parks_once
     # Idempotent across a restart: the durable park comment is the proof — no second park/notify.
     assert make_coord(fake, adapter=adapter).cycle("claude") == []
     assert parked == [("o/r", 42)] and len(notified) == 1
+
+
+def test_park_refuses_when_the_pr_thread_is_unreadable(monkeypatch):
+    """Fail-closed (ADR 0040/0042): a comments read that could not reach GitHub stays *unknown*, so
+    the park refuses to act — it neither posts the marker, proves it, nor pings — rather than reading
+    the silence as an empty thread and parking blind. Exercises ``_park_pr`` through the shared
+    :class:`DurableHandoff` envelope."""
+    record = _completed_review_record()
+    parked, notified = [], []
+    monkeypatch.setattr("agentflow.github.pr_comments", lambda _repo, _pr: None)
+    monkeypatch.setattr("agentflow.gate.park", lambda *a, **k: parked.append(a))
+    monkeypatch.setattr("agentflow.notify.notify", lambda *a, **k: notified.append(a) or True)
+
+    assert coordinated_build._park_pr(record) is None
+    assert parked == [] and notified == []               # unreadable stays unknown — no blind park
 
 
 # --- all production stages share the one gate --------------------------------------------
@@ -760,6 +777,9 @@ def test_clean_reviewed_settlement_parks_once_and_returns_durable_proof(monkeypa
     monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
+                                            for c in comments])
 
     def park(_repo, pr, _verdict, *, reason):
         parked.append((pr, reason))
@@ -817,6 +837,9 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
     monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
     monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
+                                            for c in comments])
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
 
     def park(_repo, pr, _verdict, *, reason):
@@ -857,6 +880,9 @@ def test_same_tool_autonomous_review_settles_to_park_without_waiting_for_ci(
     monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
     monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
+                                            for c in comments])
     monkeypatch.setattr("agentflow.gate.ci_is_green",
                         lambda *args, **kwargs: pytest.fail("same-tool review must park before CI"))
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
