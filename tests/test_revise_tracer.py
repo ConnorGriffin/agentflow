@@ -613,7 +613,9 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
     monkeypatch.setattr("agentflow.github.api",          # the open PR for the builder branch is #42
                         lambda args, *, parse_json=False: [{"number": 42}])
     monkeypatch.setattr("agentflow.gate.park", _park)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(pr_comments))
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda repo, pr: [github.Comment(body=c["body"], created_at="")
+                                          for c in pr_comments])
     monkeypatch.setattr("agentflow.notify.notify", lambda *a, **k: notified.append(a))
 
     fake = FakeSession()

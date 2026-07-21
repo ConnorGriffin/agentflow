@@ -1031,30 +1031,23 @@ def _park_pr_number(record) -> int | None:
 def _park_pr(record) -> str | None:
     """Park the reviewed PR for a human and notify once (ADR 0028's exhaustion table). Serves both
     the Review-native park and the Revise-native park — Revise owns a builder worktree, so the PR is
-    resolved by branch (:func:`_park_pr_number`). The park comment is the durable proof; a repeat
-    after a daemon crash observes the same comment and does not notify again. Live orchestration;
-    exercised with faked GitHub reads in ``tests/test_revise_tracer.py``."""
+    resolved by branch (:func:`_park_pr_number`). The crash-safe post-once → prove → notify-once
+    recipe is the shared :class:`DurableHandoff` envelope (ADR 0042): the park comment is the durable
+    proof, so a repeat after a daemon crash observes the same comment and neither parks nor pings
+    again. Live orchestration; exercised with faked GitHub reads in ``tests/test_revise_tracer.py``."""
     from agentflow.gate import park
-    from agentflow.loop import _pr_comments
-    from agentflow.notify import notify
+    from agentflow.handoff import DurableHandoff, Notification, Subject
     pr = _park_pr_number(record)
     if pr is None:
         return None
-    marker = "agentflow: parked for human review"
-    comments = _pr_comments(record.repo, pr)
-    if comments is None:
-        return None
-    already = any(marker in comment.get("body", "") for comment in comments)
-    if not already:
-        park(record.repo, pr, None,
-             reason="exhausted its review budget without a durable verdict")
-    proved = _pr_comments(record.repo, pr)
-    if proved is None or not any(marker in comment.get("body", "") for comment in proved):
-        return None
-    url = f"https://github.com/{record.repo}/pull/{pr}"
-    if not already:
-        notify("agentflow needs you", f"{record.repo} PR #{pr}: review parked for your action", url)
-    return url
+    return DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=pr, kind="pr"),
+        identity=record.identity, stage=record.stage,
+        marker="agentflow: parked for human review",
+        action=lambda: park(record.repo, pr, None,
+                            reason="exhausted its review budget without a durable verdict"),
+        notification=Notification(
+            "agentflow needs you", f"{record.repo} PR #{pr}: review parked for your action"))
 
 
 def _review_pr_facts(record) -> dict | None:
@@ -1104,30 +1097,32 @@ def _prepare_review_settlement(record) -> bool:
     return True
 
 
-def _park_review_settlement(record, verdict, workdir: str, pr: int, comments: list[dict],
+def _park_review_settlement(record, verdict, workdir: str, pr: int,
                             *, reason: str, autonomous: bool) -> str | None:
-    """Idempotently park, prove, clean up, and notify one completed Review."""
+    """Idempotently park, prove, clean up, and notify one completed Review.
+
+    The park-comment-plus-notify-once envelope is the shared :class:`DurableHandoff` recipe (ADR
+    0042); the Review-specific bookkeeping — disposing the finished read-only checkout and recording
+    the parked ratchet — stays here and runs after the handoff confirms (returns non-``None``).
+    """
     from agentflow.gate import park
-    from agentflow.loop import _finish_review, _pr_comments
-    from agentflow.notify import notify
+    from agentflow.handoff import DurableHandoff, Notification, Subject
+    from agentflow.loop import _finish_review
     from agentflow import ratchet
 
-    marker = "agentflow: parked for human review"
-    already = any(marker in comment.get("body", "") for comment in comments)
-    if not already:
-        park(record.repo, pr, verdict, reason=reason)
-    proved = _pr_comments(record.repo, pr)
-    if proved is None or not any(marker in comment.get("body", "") for comment in proved):
+    url = DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=pr, kind="pr"),
+        identity=record.identity, stage="review",
+        marker="agentflow: parked for human review",
+        action=lambda: park(record.repo, pr, verdict, reason=reason),
+        notification=Notification(
+            "agentflow needs you", f"{record.repo} PR #{pr}: reviewed — your action"))
+    if url is None:
         return None
     slug = _review_slug(record)
     _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir), record.pool, pr, slug)
     if autonomous:
         ratchet.record_once(record.repo, "parked", record.identity)
-    url = f"https://github.com/{record.repo}/pull/{pr}"
-    if not already:
-        sequence = "review-" + hashlib.sha256(record.identity.encode()).hexdigest()[:24]
-        notify("agentflow needs you", f"{record.repo} PR #{pr}: reviewed — your action", url,
-               sequence_id=sequence)
     return url
 
 
@@ -1176,16 +1171,16 @@ def _settle_review(record) -> str | None:
     if not autonomous:
         reason = _UI_GAP_REASON if ui_gap else f"is a `{profile}` repo — a human merges"
         return _park_review_settlement(
-            record, verdict, workdir, pr, comments, reason=reason, autonomous=False)
+            record, verdict, workdir, pr, reason=reason, autonomous=False)
     if not verdict.clean:
         return _park_review_settlement(
-            record, verdict, workdir, pr, comments,
+            record, verdict, workdir, pr,
             reason="review did not produce an actionable clean verdict", autonomous=True)
     pending_reply = reply_pending(comments)
     if not record.auto_merge_allowed or ui_gap or pending_reply:
         reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
         return _park_review_settlement(
-            record, verdict, workdir, pr, comments, reason=reason, autonomous=True)
+            record, verdict, workdir, pr, reason=reason, autonomous=True)
 
     # CI already completed in prepare_completed, outside SQLite's write transaction. Recheck it
     # once without polling, together with the exact head, immediately before merge.
@@ -1194,7 +1189,7 @@ def _settle_review(record) -> str | None:
         return None
     if not ci_green:
         return _park_review_settlement(
-            record, verdict, workdir, pr, comments,
+            record, verdict, workdir, pr,
             reason="CI did not complete successfully within the review settlement window",
             autonomous=True)
     decision = decide_merge(
@@ -1203,7 +1198,7 @@ def _settle_review(record) -> str | None:
         ui_evidence_missing=False, reply_pending=False)
     if decision is not MergeDecision.MERGE:
         return _park_review_settlement(
-            record, verdict, workdir, pr, comments,
+            record, verdict, workdir, pr,
             reason="could not be auto-merged after review", autonomous=True)
     if _review_pr_head(record) != record.target:
         return None
@@ -1211,7 +1206,7 @@ def _settle_review(record) -> str | None:
         return None
     if not squash_merge(record.repo, pr):
         return _park_review_settlement(
-            record, verdict, workdir, pr, comments,
+            record, verdict, workdir, pr,
             reason="could not be squash-merged (branch protection, conflict, or transient error)",
             autonomous=True)
     slug = _review_slug(record)
@@ -1227,38 +1222,31 @@ def _settle_review(record) -> str | None:
 def _park_respond(record) -> str | None:
     """Create Respond's record-specific park proof and idempotent phone notification.
 
-    A generic Review park may already be present on the PR, so it cannot prove that this exact
-    maintainer-comment target exhausted its Respond budget. The stable ntfy sequence id closes the
-    crash window between posting the durable comment and recording completion locally: a replay
-    replaces the same notification instead of multiplying it.
+    A generic Review park may already be present on the PR, so this uses its own target-scoped
+    marker to prove that this exact maintainer-comment target exhausted its Respond budget. The
+    crash-safe post-once → prove → notify-once recipe is the shared :class:`DurableHandoff` envelope
+    (ADR 0042): it derives the stable ntfy sequence id, so a replay across the window between posting
+    the durable comment and recording completion locally replaces the same notification rather than
+    multiplying it.
     """
-    from agentflow.loop import _pr_comments
-    from agentflow.notify import notify
+    from agentflow.handoff import DurableHandoff, Notification, Subject
 
     pr = _park_pr_number(record)
     if pr is None or not record.target:
         return None
     proof = f"<!-- agentflow-respond-park-target:{record.target} -->"
-    comments = _pr_comments(record.repo, pr)
-    if comments is None:
-        return None
-    already = any(proof in comment.get("body", "") for comment in comments)
-    if not already:
-        body = ("> *agentflow: parked for human review (Respond).*\n"
-                f"{proof}\n\n"
-                f"Respond could not finish answering maintainer comment `{record.target}` "
-                "within its continuation budget. The PR branch and local work were retained.")
-        if not github.pr_comment(record.repo, pr, body):
-            return None
-    proved = _pr_comments(record.repo, pr)
-    if proved is None or not any(proof in comment.get("body", "") for comment in proved):
-        return None
-    url = f"https://github.com/{record.repo}/pull/{pr}"
-    sequence = "respond-" + hashlib.sha256(record.identity.encode()).hexdigest()[:24]
-    notify("agentflow needs you",
-           f"{record.repo} PR #{pr}: Respond parked for maintainer comment {record.target}",
-           url, sequence_id=sequence)
-    return url
+    body = ("> *agentflow: parked for human review (Respond).*\n"
+            f"{proof}\n\n"
+            f"Respond could not finish answering maintainer comment `{record.target}` "
+            "within its continuation budget. The PR branch and local work were retained.")
+    return DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=pr, kind="pr"),
+        identity=record.identity, stage="respond",
+        marker=proof,
+        action=lambda: github.pr_comment(record.repo, pr, body),
+        notification=Notification(
+            "agentflow needs you",
+            f"{record.repo} PR #{pr}: Respond parked for maintainer comment {record.target}"))
 
 
 # --- Revise stage: pushed-revision outcome on the retained branch (live; ADR 0020) ------
