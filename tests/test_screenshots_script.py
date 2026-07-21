@@ -12,6 +12,8 @@ message, not at browser-launch time with an opaque Chrome error.
 from __future__ import annotations
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -64,15 +66,21 @@ def test_no_session_time_npm(code):
         )
 
 
-def test_uses_playwright_global(src):
-    """The harness must use Playwright's globally installed module, not a local node_modules.
+def test_uses_playwright_global(code):
+    """The harness must resolve Playwright's globally installed module, not a local node_modules.
 
     The global install has its own managed Chromium — short profile dirs, no crashpad
-    path issues, and no --user-data-dir pointing into the deep worktree tree.
+    path issues, and no --user-data-dir pointing into the deep worktree tree. Resolution
+    is dynamic (bare import, then `npm root -g`) with the Homebrew path as a last fallback,
+    so the harness stays portable across machines with different install locations.
     """
-    assert "/opt/homebrew/lib/node_modules/playwright" in src, (
-        "harness does not reference the globally installed playwright path — "
-        "sessions may try a local install or raw chrome, both of which fail in the sandbox."
+    assert "npm root -g" in code, (
+        "harness does not resolve the global playwright path dynamically — a single "
+        "hardcoded path breaks on any machine whose install location differs."
+    )
+    assert "/opt/homebrew/lib/node_modules/playwright" in code, (
+        "harness dropped the Homebrew global path fallback — the macOS dev machines "
+        "rely on it when npm is not on PATH."
     )
 
 
@@ -128,6 +136,45 @@ def test_no_user_data_dir_deep_path(code):
         "harness sets --user-data-dir — if that path is inside the worktree it will "
         "exceed the 104-char sockaddr_un limit and crash the browser at socket bind."
     )
+
+
+# --- through the harness's own interface -------------------------------------
+
+# Nonzero exits that mean "this environment can't run the harness" (Playwright or its
+# managed Chromium absent) rather than "the harness is broken" — we skip on these.
+_ENV_UNAVAILABLE = (
+    "Cannot load playwright",
+    "Executable doesn't exist",
+    "playwright install",
+    "Host system is missing",
+    "browserType.launch",
+)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not available to run the harness")
+def test_self_check_produces_png_through_interface(tmp_path):
+    """Drive the harness through its real --self-check interface and confirm a PNG lands.
+
+    The other tests assert source patterns; this one actually runs the recipe, so a runtime
+    regression that keeps the strings intact still fails here. It also uses a *relative*
+    --out-dir (run from tmp_path) to exercise the path that used to abort with an invalid
+    file:// URL. Skips cleanly where Playwright/Chromium isn't installed.
+    """
+    result = subprocess.run(
+        ["node", str(SCRIPT), "--self-check", "--out-dir", "sc_out"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode != 0 and any(marker in output for marker in _ENV_UNAVAILABLE):
+        pytest.skip("Playwright/Chromium not available in this environment")
+
+    assert result.returncode == 0, f"self-check exited nonzero:\n{output}"
+    pngs = list((tmp_path / "sc_out").glob("*.png"))
+    assert pngs, f"self-check wrote no PNG under a relative --out-dir:\n{output}"
+    assert pngs[0].stat().st_size > 0, "self-check produced a zero-byte PNG"
 
 
 # --- the prompts reference the script ----------------------------------------

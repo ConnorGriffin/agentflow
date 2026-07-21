@@ -31,9 +31,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve, dirname } from 'path';
-
-// Pre-installed globally — no npm at session time.
-const PLAYWRIGHT_ESM = '/opt/homebrew/lib/node_modules/playwright/index.mjs';
+import { execSync } from 'child_process';
 
 // Flags that survive the Claude agent sandbox. Do NOT add --user-data-dir with a deep
 // path — the worktree nesting pushes the socket name past the 104-char sockaddr_un limit.
@@ -50,13 +48,36 @@ function die(msg) {
   process.exit(1);
 }
 
-async function loadPlaywright() {
+// Where the globally-managed Playwright ESM might live, tried in order. Resolving
+// it dynamically keeps the harness portable — the fleet's Node/Playwright install
+// location need not match any one machine's.
+//   1. bare 'playwright'          — resolves when it's on NODE_PATH or node's search path
+//   2. `npm root -g`/playwright   — the actual global install dir on this machine
+//   3. the Homebrew global path   — the known location on the macOS dev machines
+function playwrightCandidates() {
+  const candidates = ['playwright'];
   try {
-    const mod = await import(PLAYWRIGHT_ESM);
-    return mod.default || mod;
-  } catch (e) {
-    die('Cannot load playwright from ' + PLAYWRIGHT_ESM + ':\n  ' + e.message);
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+    if (globalRoot) candidates.push(join(globalRoot, 'playwright', 'index.mjs'));
+  } catch {
+    // npm not on PATH — fall through to the known fixed locations below.
   }
+  candidates.push('/opt/homebrew/lib/node_modules/playwright/index.mjs');
+  return candidates;
+}
+
+async function loadPlaywright() {
+  const tried = [];
+  for (const candidate of playwrightCandidates()) {
+    try {
+      const mod = await import(candidate);
+      return mod.default || mod;
+    } catch (e) {
+      tried.push('  ' + candidate + '  (' + (e.code || e.message) + ')');
+    }
+  }
+  die('Cannot load playwright. Tried:\n' + tried.join('\n') +
+      '\nInstall Playwright where node can resolve it (a global install), or set NODE_PATH.');
 }
 
 /**
@@ -143,7 +164,9 @@ async function captureShots(shots) {
 }
 
 async function selfCheck(outDir) {
-  outDir = outDir || join(tmpdir(), 'af-selfcheck-' + Date.now());
+  // Resolve to absolute up front: a relative --out-dir would otherwise produce
+  // 'file://selfcheck.html' (no leading slash), an invalid URL that aborts goto.
+  outDir = resolve(outDir || join(tmpdir(), 'af-selfcheck-' + Date.now()));
   mkdirSync(outDir, { recursive: true });
 
   const htmlPath = join(outDir, 'selfcheck.html');
