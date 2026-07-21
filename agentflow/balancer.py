@@ -4,23 +4,26 @@ Both plans are prepaid, so the scarce resource is rate-limit headroom. The build
 goes to the pool with more headroom right now; the reviewer is the *other* tool
 (cross-tool independence, ADR 0003, which also spreads load across both budgets).
 
-It reuses the existing per-agent gate `triage-gate.sh` (the reuse map's balancer
-source): that adapter reports Claude's calibrated trailing-5h spend and Codex's
-reported rate-limit windows. If only one pool has headroom, the builder runs there
-and the reviewer is None: the caller must NOT auto-merge (single-tool fallback,
-ADR 0003). If neither has headroom, no capacity this cycle.
+Claude's dispatch authority is the provider's own five-hour quota fact — the utilization
+and reset time Claude Code reports on its structured stream, persisted durably by the
+coordinator (`agentflow.coordinator.quota`, issue #305). The retired trailing-5h transcript
+proxy (`triage-gate.sh spend`) is a diagnostic only: it cannot gate dispatch, and it can
+never keep the pool blocked after the provider's five-hour window has reset. Codex still
+reports its rate-limit windows through the gate adapter. If only one pool has headroom, the
+builder runs there and the reviewer is None: the caller must NOT auto-merge (single-tool
+fallback, ADR 0003). If neither has headroom, no capacity this cycle.
 
-**Activity-adaptive ceiling (ADR 0025).** The gate no longer *hard-stops* dispatch when
-the operator is working interactively — that guard now only *selects the ceiling*. Facts
-live in the gate (trailing-5h spend, operator active/idle); the policy lives here: an idle
-pool dispatches up to `IDLE_CEILING_PCT` spent, an operator-active pool only up to
-`ACTIVE_CEILING_PCT` and paced to `ACTIVE_PACE` new sessions/cycle (the pace is enforced
-by the dispatcher, which counts per cycle — see `agentflow.dispatch`). Until the gate
-grows an explicit activity fact, activity is *derived* from the gate's own check: a block
-that clears once the recent-activity guard is skipped was an activity block, so it lowers
-the ceiling instead of stopping the pool; any other block (genuine no-capacity) still
-defers. Unknown facts fail toward the idle ceiling. The gate keeps excluding agentflow's
-own sessions (`AGENTFLOW_WT_MARK`) so the fleet never reads *itself* as the operator.
+**Activity-adaptive ceiling (ADR 0025).** One named policy owns the effective ceiling: an idle
+pool dispatches up to `IDLE_CEILING_PCT` utilization, an operator-active pool only up to
+`ACTIVE_CEILING_PCT` and paced to `ACTIVE_PACE` new sessions/cycle (the pace is enforced by the
+dispatcher, which counts per cycle — see `agentflow.dispatch`). For Claude the utilization is the
+provider's own five-hour quota fact (#305); the personal-tooling gate contributes only the
+operator active/idle fact and can no longer independently block Claude below this ceiling. Activity
+is *derived* from that gate's check: a block that clears once the recent-activity guard is skipped
+was an activity block, so it lowers the ceiling; genuine no-capacity for Claude is expressed by the
+quota fact (over-ceiling utilization, or a missing/stale fact that fails closed). The gate keeps
+excluding agentflow's own sessions (`AGENTFLOW_WT_MARK`) so the fleet never reads *itself* as the
+operator.
 
 `pick_pair` is the public dispatch test surface; `choose_pair` and `parse_pct`
 remain pure compatibility interfaces.
@@ -36,6 +39,8 @@ import subprocess
 import time
 from dataclasses import dataclass
 
+from agentflow.coordinator import quota
+from agentflow.coordinator.store import default_store_path
 from agentflow.runner import ClaudeRunner, CodexRunner, _WorktreeRunner
 
 _GATE = os.environ.get(
@@ -54,6 +59,14 @@ _WEEKLY_DAYS = _WEEKLY_WINDOW_MIN * 60 // _DAY_SECONDS
 IDLE_CEILING_PCT = float(os.environ.get("AGENTFLOW_IDLE_CEILING_PCT", "85"))
 ACTIVE_CEILING_PCT = float(os.environ.get("AGENTFLOW_ACTIVE_CEILING_PCT", "50"))
 ACTIVE_PACE = int(os.environ.get("AGENTFLOW_ACTIVE_PACE", "1"))
+
+# Conservative in-flight reservation (#305). Claude's provider quota fact is only observed after
+# a session ends, so work admitted from one below-ceiling reading is not yet reflected in it. Each
+# permit already running on the Claude pool therefore reserves this much five-hour headroom before
+# another Claude session admits — so several launches cannot all pass one stale observation and
+# collectively drive the pool to 100%. Env-overridable production config.
+CLAUDE_INFLIGHT_RESERVE_PCT = float(
+    os.environ.get("AGENTFLOW_CLAUDE_INFLIGHT_RESERVE_PCT", "15"))
 
 def ceiling_for(active: bool) -> float:
     """The spend ceiling a pool dispatches under, given whether the operator is active on
@@ -231,18 +244,17 @@ def _gate_facts(env: dict, operator: bool) -> tuple[bool, bool, str, str]:
     return True, False, reason, ck.stdout    # a real block remains once activity is skipped
 
 
-def _query_pool(tool: str, operator: bool = False) -> PoolStatus:
+def _query_pool(tool: str, operator: bool = False, *,
+                reserved_pct: float = 0.0, now: float | None = None) -> PoolStatus:
+    now = time.time() if now is None else now
     env = {**os.environ, "TRIAGE_AGENT": tool}
     if operator:
         env["TRIAGE_SKIP_ACTIVITY"] = "1"
     try:
-        # `spend` reports the REAL trailing-5h % even when the interactive-use guard
-        # would block dispatch — so headroom is honest while you're active.
-        sp = subprocess.run([_GATE, "spend"], env=env, text=True, capture_output=True, timeout=30)
         limits = (subprocess.run([_GATE, "limits"], env=env, text=True,
                                  capture_output=True, timeout=30)
                   if tool == "codex" else None)
-        blocked, active, block_reason, ck_stdout = _gate_facts(env, operator)
+        blocked, active, block_reason, _ck_stdout = _gate_facts(env, operator)
     except (OSError, subprocess.TimeoutExpired):
         return PoolStatus(tool, False, 100.0, "gate unavailable")
     ceiling = ceiling_for(active)
@@ -252,23 +264,34 @@ def _query_pool(tool: str, operator: bool = False) -> PoolStatus:
     if tool == "codex":
         facts = (_parse_codex_facts(limits.stdout)
                  if limits is not None and limits.returncode == 0 else None)
-        if facts is not None:
-            windows, observed_at = facts
-            pct = _codex_spent_pct(windows)
-            under = pct < ceiling
-            reason = block_reason if blocked else (yield_reason if active and not under else "")
-            return PoolStatus(tool, (not blocked) and under, pct, reason,
-                              windows, active, ceiling, observed_at)
+        if facts is None:
+            # Structured Codex facts are mandatory for unattended dispatch; an older or
+            # unavailable adapter fails closed rather than dispatching blind.
+            return PoolStatus(tool, False, 100.0, "limit facts unavailable", None, active, ceiling)
+        windows, observed_at = facts
+        pct = _codex_spent_pct(windows)
+        under = pct < ceiling
+        reason = block_reason if blocked else (yield_reason if active and not under else "")
+        return PoolStatus(tool, (not blocked) and under, pct, reason,
+                          windows, active, ceiling, observed_at)
 
-    legacy = sp.stdout if sp.stdout.strip().startswith("spend:") else ck_stdout
-    pct = parse_pct(legacy, 0)
-    parsed = _PCT_RE.search(legacy) is not None
-    under = parsed and pct < ceiling
-    reason = (block_reason if blocked else
-              ("limit facts unavailable" if not parsed else
-               (yield_reason if active and not under else "")))
-    return PoolStatus(tool, (not blocked) and under, pct, reason,
-                      None if tool == "codex" else (), active, ceiling)
+    # Claude's dispatch authority is the provider's own five-hour quota fact (#305), read from the
+    # durable store the coordinator writes — never the trailing transcript proxy, and never the
+    # gate's own independent spend block. The single `ceiling_for` policy owns the effective
+    # ceiling: no lower gate can silently override it. The transcript proxy stays a diagnostic.
+    fact = quota.read_quota(default_store_path(), "claude")
+    usage = quota.effective_usage(fact, now) if fact is not None else None
+    if usage is None:
+        # A missing, malformed, or stale provider fact fails closed — it is never read as zero.
+        return PoolStatus(tool, False, 100.0, "five-hour quota fact unavailable",
+                          (), active, ceiling)
+    # Reserve conservative headroom for Claude work already admitted from the same observation, so
+    # several launches cannot all pass one below-ceiling reading and collectively reach 100% (#305).
+    under = usage + max(0.0, reserved_pct) < ceiling
+    reason = (yield_reason if active and not under else
+              ("" if under else
+               f"five-hour utilization at {usage:.0f}% (ceiling {ceiling:.0f}%)"))
+    return PoolStatus(tool, under, usage, reason, (), active, ceiling, fact.observed_at)
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,

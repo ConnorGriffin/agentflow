@@ -218,8 +218,10 @@ def test_retries_remain_separately_attributable(make_coord, coord_state):
     identity = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build",
                                              pool="claude", complexity="deep"))
     # First attempt burns spend then hits a recoverable interruption → an automatic continuation.
+    # A non-capacity recoverable end keeps consuming the budget, so the two attempts stay distinctly
+    # numbered — a provider capacity reset would refund the attempt (#305) and muddy this test.
     coord.cycle("claude")
-    fake.end(identity, cause=ProviderCause.CAPACITY,
+    fake.end(identity, cause=ProviderCause.SERVER,
              usage=AttemptUsage(output_tokens=400, cost_usd=0.10))
     assert coord.cycle("claude") == []                # continuation waits, then re-admits
     # Second attempt completes.

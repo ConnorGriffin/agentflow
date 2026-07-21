@@ -72,6 +72,40 @@ def test_claude_allowed_rate_limit_event_establishes_no_cause():
     assert obs.cause is ProviderCause.NONE and obs.final_message == "done"
 
 
+def test_claude_allowed_rate_limit_event_still_yields_the_five_hour_quota_fact():
+    """The five-hour utilization/reset fact is extracted on every status — an ``allowed`` reading
+    is the fresh headroom the balancer needs, not only a rejection (#305). Utilization arrives as a
+    0..1 fraction and is normalized to a percentage; the observation time is stamped from the clock."""
+    obs = classify_claude(
+        [{"type": "rate_limit_event",
+          "rate_limit_info": {"status": "allowed", "resetsAt": 5_000, "utilization": 0.42}}],
+        observed_at=1_000)
+    assert obs.cause is ProviderCause.NONE          # an allowed reading is not a capacity cause
+    assert obs.quota is not None
+    assert obs.quota.used_percent == 42.0 and obs.quota.resets_at == 5_000
+    assert obs.quota.observed_at == 1_000 and obs.quota.provenance == "claude:rate_limit_event"
+
+
+def test_claude_rejected_event_carries_both_the_capacity_cause_and_the_quota_fact():
+    obs = classify_claude(
+        [{"type": "rate_limit_event",
+          "rate_limit_info": {"status": "rejected", "resetsAt": 5_000, "utilization": 98.0}}],
+        observed_at=1_000)
+    assert obs.cause is ProviderCause.CAPACITY and obs.reset_at == 5_000
+    assert obs.quota is not None and obs.quota.used_percent == 98.0
+
+
+def test_claude_rate_limit_event_without_a_utilization_yields_no_quota_fact():
+    """A malformed or absent utilization never becomes a fabricated reading — the fact stays
+    ``None`` and the balancer fails closed on it rather than admitting at a bogus percentage."""
+    no_util = classify_claude(
+        [{"type": "rate_limit_event", "rate_limit_info": {"status": "allowed", "resetsAt": 5_000}}])
+    bad_util = classify_claude(
+        [{"type": "rate_limit_event",
+          "rate_limit_info": {"status": "allowed", "resetsAt": 5_000, "utilization": "lots"}}])
+    assert no_util.quota is None and bad_util.quota is None
+
+
 def test_claude_terminal_result_subtype_failures_are_process_interruptions():
     # A max-turns end is now a real per-stage ceiling hit — recoverable TIMEOUT, not incomplete
     # PROCESS (ADR 0044): the same class as the wall-clock deadline.

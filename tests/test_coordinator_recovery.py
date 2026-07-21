@@ -122,14 +122,24 @@ def test_a_worktree_stage_keeps_its_full_continuation_budget(make_coord):
 
 # --- genuine capacity interruption: always continues -------------------------------------
 
-def test_a_capacity_interruption_always_continues_even_with_no_new_state(make_coord):
-    """A rate/quota interruption is an external event, not an identical replay: it continues
-    automatically within the budget even when the stage reports no new recovery state (AC5)."""
+def test_a_capacity_interruption_never_holds_and_never_spends_the_budget(make_coord):
+    """A provider-declared five-hour capacity interruption is an automatic reset wait, not a spent
+    attempt (AC5, #305): it refunds the attempt and requeues eligible at the reset, so it never
+    consumes the bounded continuation budget and never hardens into a durable hold — even after far
+    more interruptions than the attempt budget, and even when the stage reports no new state."""
     fake = ClassifyingSession(Recovery(NO_NEW_STATE))
     coord = make_coord(fake)
     identity = coord.submit_stage(_review())
-    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.CAPACITY) == 3
-    assert record_of(coord, identity).repairs == 0
+    for i in range(6):                                   # twice the attempt budget
+        base = i * 1000                                  # monotonic clock across iterations
+        coord.cycle("claude", now=base)                  # the reset wait re-admits a fresh attempt
+        assert permits(coord, "claude") == 1
+        fake.end(identity, cause=ProviderCause.CAPACITY, reset_at=base + 100)
+        assert coord.cycle("claude", now=base + 50) == []  # free reset wait — never held, not eligible yet
+        rec = record_of(coord, identity)
+        assert rec.state == "waiting" and not rec.hold_pending
+        assert rec.attempts == 0                         # the reset wait refunded the attempt
+        assert rec.eligible_at == base + 100 and rec.repairs == 0
 
 
 # --- no new state at all: park at once, no replay ----------------------------------------

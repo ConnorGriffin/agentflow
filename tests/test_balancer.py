@@ -9,12 +9,32 @@ import pytest
 from agentflow import balancer
 from agentflow.balancer import (PoolStatus, choose_pair, choose_reviewer, parse_pct,
                                  pick_pair)
+from agentflow.coordinator import quota
+from agentflow.coordinator.store import default_store_path
 from agentflow.dashboard_data import pools
 
 RUNNERS = {"claude": "CLAUDE", "codex": "CODEX"}
 
 def _limits(observed_at, windows):
     return json.dumps({"observed_at": observed_at, "windows": windows})
+
+
+@pytest.fixture
+def isolate_state(tmp_path, monkeypatch):
+    """Point the durable store (and the Claude quota fact beside it) at a scratch dir."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    return tmp_path
+
+
+def _seed_claude_quota(used_percent, *, now=None, resets_at=None, observed_at=None):
+    """Persist a fresh Claude five-hour quota fact — the provider-authored dispatch authority the
+    balancer now reads instead of the retired transcript proxy (#305)."""
+    now = int(time.time()) if now is None else int(now)
+    resets_at = now + 4 * 60 * 60 if resets_at is None else int(resets_at)
+    observed_at = now if observed_at is None else int(observed_at)
+    quota.record_quota(default_store_path(), quota.QuotaFact(
+        pool="claude", used_percent=used_percent, resets_at=resets_at,
+        observed_at=observed_at, provenance="claude:rate_limit_event"))
 
 
 # A stand-in for `triage-gate.sh` that models the two gates independently: `check`
@@ -113,20 +133,22 @@ def test_reviewer_defers_when_neither_pool_free():
     assert choose_reviewer("codex", claude_dead, codex_dead) is None
 
 
-def test_pick_pair_block_msg_names_blocked_pools(stub_gate, monkeypatch):
+def test_pick_pair_block_msg_names_blocked_pools(stub_gate, isolate_state, monkeypatch):
     """When both pools are blocked the third return value names each pool and its reason
     so callers can surface it in deferral log lines instead of a bare 'no headroom'."""
-    monkeypatch.setenv("TEST_SPEND_PCT", "88")   # both pools genuinely over the ceiling
+    monkeypatch.setenv("TEST_SPEND_PCT", "88")   # codex genuinely over the ceiling
+    _seed_claude_quota(95)                        # Claude's provider fact is over its ceiling too
     _, _, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
     assert "claude" in block_msg
     assert "codex" in block_msg
-    # Each pool should carry something from the gate's check output
-    assert "spend" in block_msg or "trailing" in block_msg
+    # Claude's block cites the provider five-hour utilization, not the retired transcript proxy.
+    assert "utilization" in block_msg
 
 
-def test_pick_pair_block_msg_empty_when_headroom(stub_gate, monkeypatch):
+def test_pick_pair_block_msg_empty_when_headroom(stub_gate, isolate_state, monkeypatch):
     """block_msg is empty string when at least one pool is clear and a builder is returned."""
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
+    _seed_claude_quota(19)                         # Claude's provider fact is well under its ceiling
     builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX")
     assert builder is not None
     assert block_msg == ""
@@ -303,21 +325,23 @@ def test_ceiling_policy_is_named_config():
     assert balancer.ceiling_for(active=True) == 50.0
 
 
-def test_idle_pool_reports_not_active(stub_gate, monkeypatch):
+def test_idle_pool_reports_not_active(stub_gate, isolate_state, monkeypatch):
     """With no operator activity a pool reports idle and dispatches under the 85% ceiling."""
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
+    _seed_claude_quota(19)
     status = balancer._query_pool("claude")
     assert status.active is False
     assert status.ceiling == 85.0
     assert status.clear is True
 
 
-def test_operator_dispatch_ignores_active_session(stub_gate, monkeypatch):
+def test_operator_dispatch_ignores_active_session(stub_gate, isolate_state, monkeypatch):
     """A by-hand build fired while a session is active (and spend well under the
     ceiling) still gets a full pair — the recent-activity guard is skipped. Fails
     for the daemon (operator=False) below, which is the point of the flag."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
+    _seed_claude_quota(19)
     builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=True)
     assert builder is not None
 
@@ -338,35 +362,39 @@ def test_operator_dispatch_is_not_weekly_paced(stub_gate, monkeypatch):
     assert builder == "CODEX"
 
 
-def test_active_operator_lowers_the_ceiling_but_does_not_stop_dispatch(stub_gate, monkeypatch):
+def test_active_operator_lowers_the_ceiling_but_does_not_stop_dispatch(
+        stub_gate, isolate_state, monkeypatch):
     """ADR 0025: an operator working interactively no longer hard-stops the daemon — it
     yields to a lower ceiling. With spend well under the active ceiling, unattended dispatch
     still gets a full pair, and each pool reports the operator-active fact."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
+    _seed_claude_quota(19)
     builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
     assert builder is not None
     assert balancer._query_pool("claude").active is True
 
 
 def test_active_operator_defers_above_the_active_ceiling_yielding_not_stopping(
-        stub_gate, monkeypatch):
+        stub_gate, isolate_state, monkeypatch):
     """Above the (lowered) active ceiling the daemon defers — but the reason says it is
     yielding to the operator at the active ceiling, not a mute 'busy' (ADR 0025)."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "19")
-    monkeypatch.setattr(balancer, "ACTIVE_CEILING_PCT", 10.0)   # push spend above it
+    _seed_claude_quota(19)
+    monkeypatch.setattr(balancer, "ACTIVE_CEILING_PCT", 10.0)   # push utilization above it
     builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
     assert builder is None
     assert "yielding to operator" in block_msg
     assert "ceiling 10%" in block_msg
 
 
-def test_operator_dispatch_still_honors_spend_ceiling(stub_gate, monkeypatch):
-    """The spend ceiling is NOT bypassed: a genuinely rate-limited pool still defers
+def test_operator_dispatch_still_honors_spend_ceiling(stub_gate, isolate_state, monkeypatch):
+    """The utilization ceiling is NOT bypassed: a genuinely rate-limited pool still defers
     even for a by-hand build."""
     monkeypatch.setenv("TEST_ACTIVE", "1")
-    monkeypatch.setenv("TEST_SPEND_PCT", "88")   # over the 40% ceiling
+    monkeypatch.setenv("TEST_SPEND_PCT", "88")   # codex over its ceiling
+    _seed_claude_quota(95)                        # Claude's provider fact over its ceiling
     builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=True)
     assert builder is None
 

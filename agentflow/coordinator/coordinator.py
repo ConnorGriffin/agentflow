@@ -30,6 +30,7 @@ from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
+from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
 from agentflow.coordinator.recovery import PROGRESS, REPAIR, Recovery
@@ -710,6 +711,12 @@ class Coordinator:
         # that exact proof; nothing new stops the replay instead of burning a session on an
         # identical prompt.
         recovery = self._recover(record, obs)
+        if obs.cause is ProviderCause.CAPACITY:
+            # A provider-declared five-hour capacity interruption is an automatic reset wait, not a
+            # spent attempt or a durable human hold (#305). It refunds the attempt and requeues
+            # eligible at the reset, so a pure quota pause resumes on its own without draining the
+            # bounded continuation budget. Non-capacity recoverable ends keep the budgeted path.
+            return self._capacity_wait(record, obs, recovery.envelope)
         if label == "recoverable" or recovery.kind == PROGRESS:
             return self._continue(record, obs, recovery.envelope, cause)
         if recovery.kind == REPAIR and record.repairs < REPAIR_BUDGET:
@@ -748,6 +755,27 @@ class Coordinator:
         kind = "targeted repair" if repair else f"continuation {done}/{CONTINUATION_BUDGET}"
         self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
                           f"({cause}) — {kind} eligible {when}; claim retained")
+        return None
+
+    def _capacity_wait(self, record: Record, obs, envelope: str) -> "StageOutcome | None":
+        """Requeue a provider-declared five-hour capacity interruption as a free automatic reset
+        wait (#305). It refunds the up-front attempt charge and sets ``eligible_at`` to the reset,
+        so a pure quota pause never drains the bounded continuation budget or hardens into a
+        durable human hold — it simply resumes once the provider window rolls over. The bounded
+        recovery envelope is still stamped so the fresh session resumes from durable facts."""
+        attempt_no = record.attempts
+        if record.attempt_committed:
+            record.attempts -= 1
+            record.attempt_committed = False
+        record.state = WAITING
+        record.continuation = True
+        record.eligible_at = obs.reset_at or 0
+        record.recovery_envelope = envelope or None
+        if not self._persist(record):
+            return None
+        when = f"at {record.eligible_at}" if record.eligible_at else "next cycle"
+        self._emit(record, f"attempt {attempt_no}/{ATTEMPT_BUDGET} interrupted (capacity) — "
+                          f"automatic reset wait eligible {when}; attempt refunded; claim retained")
         return None
 
     def _recover(self, record: Record, obs) -> Recovery:
@@ -860,6 +888,14 @@ class Coordinator:
             started_at=record.started_at, finalized_at=int(time.time()),
             usage=getattr(obs, "usage", AttemptUsage()))
         record_attempt(self._store.path, entry)
+        # The provider's own five-hour quota fact, when this attempt's stream reported one, is the
+        # persisted Claude dispatch authority (#305). Writing it here — on every observed attempt —
+        # keeps the freshest reading durable so the balancer sizes headroom (and honors the reset)
+        # from the provider, not a trailing transcript proxy. A missing fact leaves the prior one.
+        quota = getattr(obs, "quota", None)
+        if quota is not None:
+            from agentflow.coordinator.quota import record_quota
+            record_quota(self._store.path, quota)
 
     def _persist(self, record: Record, *, retire_descendants: bool = False) -> bool:
         if self._store.upsert(record, retire_descendants=retire_descendants):
