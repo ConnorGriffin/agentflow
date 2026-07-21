@@ -85,20 +85,6 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
     return f"#{number}: submitted PR #{pr} to coordinator → {submission.pool} (respond)"
 
 
-def _submit_coordinated_mockup(cfg, coordinator, _log) -> str:
-    issue = loop._next_mockup_issue(cfg)
-    if not issue:
-        return "no needs-mockup issues to draw"
-    builder, _reviewer, block_msg = pick_pair()
-    if builder is None:
-        return f"#{issue['number']}: no pool has headroom to draw mockups ({block_msg}) — deferring"
-    submission = coordinated_build.mockup_submission(cfg, issue, builder.tool)
-    coordinator.submit_stage(submission)
-    if not loop._claim_mockup(cfg.repo, issue["number"]):
-        return f"#{issue['number']}: Mockup record saved; drawing claim pending"
-    return f"#{issue['number']}: submitted to coordinator → {builder.tool} (mockup)"
-
-
 def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
     from agentflow import coordinated_intake
 
@@ -152,7 +138,9 @@ def _submit_repo(cfg, coordinator, _log) -> None:
     """Discover and durably submit each stage kind; no provider starts in this layer."""
     _run_and_log(cfg, "intake", lambda: _submit_coordinated_intake(cfg, coordinator, _log), _log)
     _run_and_log(cfg, "build", lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
-    _run_and_log(cfg, "mockup", lambda: _submit_coordinated_mockup(cfg, coordinator, _log), _log)
+    # ``needs-mockup`` is a human hold, not permission to spend a five-permit deep session.
+    # A maintainer enters that phase through `/agentflow pickup N` (ADR 0019); the coordinator
+    # only recovers Mockups that had already started before this gate was restored.
     _run_and_log(cfg, "respond", lambda: _submit_coordinated_respond(cfg, coordinator, _log), _log)
     _run_and_log(cfg, "research", lambda: _submit_coordinated_research(cfg, coordinator, _log), _log)
 

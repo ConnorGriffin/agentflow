@@ -497,6 +497,7 @@ def build_coordinator(_log=None) -> Coordinator:
                           "respond": respond, "mockup": mockup, "converse": converse,
                           "research": research})
     return Coordinator(adapter=router, gate=_production_gate(),
+                       disabled_cold_stages=frozenset({"mockup"}),
                        log=_log or (lambda _line: None))
 
 

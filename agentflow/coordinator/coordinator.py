@@ -128,7 +128,8 @@ class Coordinator:
     """
 
     def __init__(self, *, launcher=None, gate=None, adapter=None, log=None,
-                 daemon_generation: str | None = None) -> None:
+                 daemon_generation: str | None = None,
+                 disabled_cold_stages: frozenset[str] = frozenset()) -> None:
         self._store = Store(default_store_path())
         self._launcher = launcher or LocalLauncher()
         self._gate = gate or _admit_everything
@@ -138,6 +139,10 @@ class Coordinator:
         # — and leaving no supervisor end fact — was taken down with the daemon, not by the
         # provider. The daemon writes this same pid under STATE_DIR/daemon.lock (ADR 0030).
         self._daemon_generation = daemon_generation or str(os.getpid())
+        # Product policy may stop unattended admission for a stage without abandoning work that
+        # already started. The coordinator owns the distinction: only truly cold, never-started
+        # records are discarded; continuations and restart-resumes remain eligible.
+        self._disabled_cold_stages = disabled_cold_stages
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
         # An adapter with no prepare (the read-only default) is always ready.
@@ -221,7 +226,7 @@ class Coordinator:
         with self._lock:
             record = self._store.record_of(identity)
             if (record is None or record.retired or record.state != WAITING
-                    or record.attempts != 0 or record.start_fact is not None
+                    or record.attempts != 0 or record.start_fact not in {None, NOT_STARTED}
                     or record.process_alive):
                 return False
             if not self._store.discard(record):
@@ -305,6 +310,7 @@ class Coordinator:
         a later cycle's reconciliation."""
         with self._lock:
             outcomes = self._reconcile()
+            self._discard_disabled_cold_stages()
             waiting = [r for r in self._records.values()
                        if r.pool == pool and r.state == WAITING and not r.hold_pending
                        and r.root is None]  # descendants share the root's reservation, never admit
@@ -340,6 +346,21 @@ class Coordinator:
             for record in self._migratable(pool, now):
                 self._admit_migration(record, pool, now)
             return outcomes
+
+    def _discard_disabled_cold_stages(self) -> None:
+        """Discard disabled stages that have never owned a provider family.
+
+        Run after reconciliation so a reservation crash first becomes ``waiting``. Durable
+        restart evidence keeps a previously-started attempt eligible even when its refunded
+        attempt count is zero and capacity delays its restart.
+        """
+        for record in list(self._records.values()):
+            if (record.stage not in self._disabled_cold_stages or record.state != WAITING
+                    or record.continuation or record.attempts != 0 or record.restart_resumes != 0
+                    or record.start_fact not in {None, NOT_STARTED} or record.process_alive):
+                continue
+            if self._store.discard(record):
+                self._records.pop(record.identity, None)
 
     # --- reconciliation -----------------------------------------------------------------
 
