@@ -159,6 +159,62 @@ def test_pick_pair_block_msg_empty_when_headroom(stub_gate, isolate_state, monke
     assert block_msg == ""
 
 
+# --- issue #309: a cold/parked fleet must seed its own Claude dispatch --------------------
+def test_cold_pool_bootstraps_from_transcript_estimate(stub_gate, isolate_state, monkeypatch):
+    """A cold daemon has never persisted a Claude quota fact (empty quota/). Before #309 this
+    wedged the pool closed ('pool bootstrapping') until an operator ran an interactive turn — an
+    unattended fleet never did, so the whole thing deadlocked. Now the trailing-five-hour proxy
+    seeds a bootstrap estimate so a cold pool dispatches on its own."""
+    monkeypatch.setenv("TEST_SPEND_PCT", "20")   # proxy well under the idle ceiling
+    claude = next(p for p in pools() if p["tool"] == "claude")
+    assert claude["clear"]
+    assert claude["spent_pct"] == 20.0
+
+
+def test_cold_pool_bootstrap_estimate_still_respects_ceiling(
+        stub_gate, isolate_state, monkeypatch):
+    """The bootstrap estimate is a real gate, not an open door: an over-ceiling proxy still holds
+    a cold pool closed rather than dispatching blind, and the deferral reason marks it an estimate
+    so it is not mistaken for a measured provider utilization."""
+    monkeypatch.setenv("TEST_SPEND_PCT", "90")
+    _, _, block_msg = pick_pair("CLAUDE", "CODEX", operator=False)
+    assert "claude" in block_msg
+    assert "bootstrap estimate" in block_msg
+
+
+def test_provider_fact_wins_over_bootstrap_estimate(stub_gate, isolate_state, monkeypatch):
+    """A real provider fact always wins: a healthy 19% provider reading keeps the pool clear even
+    though the trailing-five-hour estimate alone would read over-ceiling."""
+    monkeypatch.setenv("TEST_SPEND_PCT", "90")   # estimate alone would block
+    _seed_claude_quota(19)                        # but the provider fact says there is headroom
+    claude = next(p for p in pools() if p["tool"] == "claude")
+    assert claude["clear"]
+    assert claude["spent_pct"] == 19.0
+
+
+def test_provider_fact_blocks_even_when_estimate_would_clear(
+        stub_gate, isolate_state, monkeypatch):
+    """The converse: an over-ceiling provider fact holds the pool closed even when the estimate
+    alone would clear — the estimate is only consulted when there is no provider fact."""
+    monkeypatch.setenv("TEST_SPEND_PCT", "10")   # estimate alone would clear
+    _seed_claude_quota(95)                        # provider fact is over its ceiling
+    claude = next(p for p in pools() if p["tool"] == "claude")
+    assert not claude["clear"]
+
+
+def test_parked_pool_resumes_after_window_reset(stub_gate, isolate_state, monkeypatch):
+    """Acceptance #2: a fully parked fleet writes no new fact, but once the observed five-hour
+    window has reset the last fact reads as fresh (0%), so dispatch resumes on the next cycle
+    without a human seeding it — regardless of the estimate proxy."""
+    now = time.time()
+    _seed_claude_quota(95, now=now - 6 * 3600, resets_at=int(now - 3600),
+                       observed_at=int(now - 6 * 3600))
+    monkeypatch.setenv("TEST_SPEND_PCT", "90")   # estimate is irrelevant once the fact resets
+    claude = next(p for p in pools() if p["tool"] == "claude")
+    assert claude["clear"]
+    assert claude["spent_pct"] == 0.0
+
+
 def test_weekly_only_codex_ahead_of_pace_cannot_start_unattended_work(
         stub_gate, monkeypatch):
     """The observed weekly-only report must not become a new Codex session."""
@@ -276,7 +332,7 @@ def test_short_window_block_wins_while_weekly_window_is_below_pace(
     '{"windows":[{"used_percent":10,"window_minutes":1e309,"resets_at":1784566349}]}',
     '{"windows":[{"used_percent":10,"window_minutes":10080}]}',
 ])
-def test_unknown_codex_limit_facts_fail_closed(stub_gate, monkeypatch, facts):
+def test_unknown_codex_limit_facts_fail_closed(stub_gate, isolate_state, monkeypatch, facts):
     monkeypatch.setenv("TEST_CLAUDE_BLOCKED", "1")
     monkeypatch.setenv("TEST_CODEX_CLEAR", "1")
     monkeypatch.setenv("TEST_LIMITS", facts)
@@ -288,7 +344,7 @@ def test_unknown_codex_limit_facts_fail_closed(stub_gate, monkeypatch, facts):
 
 
 @pytest.mark.parametrize("field", ["used_percent", "window_minutes", "resets_at"])
-def test_oversized_codex_limit_facts_fail_closed(stub_gate, monkeypatch, field):
+def test_oversized_codex_limit_facts_fail_closed(stub_gate, isolate_state, monkeypatch, field):
     monkeypatch.setenv("TEST_CLAUDE_BLOCKED", "1")
     monkeypatch.setenv("TEST_CODEX_CLEAR", "1")
     facts = {
