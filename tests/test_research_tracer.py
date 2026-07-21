@@ -155,6 +155,7 @@ def test_next_research_ticket_picks_the_oldest_eligible_unblocked_ticket(monkeyp
         raise AssertionError(argv)
 
     monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr("agentflow.github._run", run)
     picked = loop._next_research_ticket(RepoConfig(REPO, "/tmp"))
     assert picked["number"] == 5
 
@@ -171,6 +172,7 @@ def test_next_research_ticket_skips_a_ticket_with_an_open_native_blocker(monkeyp
         raise AssertionError(argv)
 
     monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr("agentflow.github._run", run)
     assert loop._next_research_ticket(RepoConfig(REPO, "/tmp")) is None
 
 
@@ -184,6 +186,7 @@ def test_next_research_ticket_fails_closed_on_an_unreadable_blocker_graph(monkey
         raise AssertionError(argv)
 
     monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr("agentflow.github._run", run)
     assert loop._next_research_ticket(RepoConfig(REPO, "/tmp")) is None  # unreadable ≠ unblocked
 
 
@@ -193,6 +196,7 @@ def test_a_dispatched_ticket_ends_closed_with_findings_and_one_map_line(make_coo
                                                                         tmp_path, monkeypatch):
     gh = FakeGitHub()
     monkeypatch.setattr(loop, "_run", gh.run)
+    monkeypatch.setattr("agentflow.github._run", gh.run)
     fake = FakeSession()
     coord = _coord(make_coord, fake)
     cfg = RepoConfig(REPO, str(tmp_path / "wd"))
@@ -226,6 +230,7 @@ def test_resolution_replays_without_a_duplicate_comment_or_map_line(tmp_path, mo
     double-write: replaying the finalizer over the already-closed ticket is a no-op."""
     gh = FakeGitHub()
     monkeypatch.setattr(loop, "_run", gh.run)
+    monkeypatch.setattr("agentflow.github._run", gh.run)
     record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
     _write_findings(record, "the finding and its decision")
 
@@ -243,6 +248,7 @@ def test_exhaustion_releases_the_claim_so_the_ticket_is_eligible_again(make_coor
                                                                        tmp_path, monkeypatch):
     gh = FakeGitHub()
     monkeypatch.setattr(loop, "_run", gh.run)
+    monkeypatch.setattr("agentflow.github._run", gh.run)
     fake = FakeSession()
     coord = _coord(make_coord, fake)
     cfg = RepoConfig(REPO, str(tmp_path / "wd"))

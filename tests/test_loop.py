@@ -1,7 +1,6 @@
 """Pure helpers of the M0 loop. The live orchestration (build/review/merge) is
 proven by the first live run; these are the parsing bits that must be exact."""
 
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +26,18 @@ class _FakeRun:
     def __init__(self, stdout="", returncode=0):
         self.stdout = stdout
         self.returncode = returncode
+
+
+def _issue_row(number, labels=(), title="t", body="b"):
+    """A typed issue row as the shared GitHub module's discovery listing returns."""
+    return loop.github.IssueRow(number=number, title=title, body=body,
+                               labels=frozenset(labels))
+
+
+def _pr_row(number, head_ref_name, head_ref_oid=""):
+    """A typed open-PR row as the shared GitHub module's discovery listing returns."""
+    return loop.github.PrRow(number=number, head_ref_name=head_ref_name,
+                            head_ref_oid=head_ref_oid)
 
 
 def test_complexity_from_labels_reads_the_label():
@@ -81,7 +92,7 @@ def test_issue_of_branch_is_none_for_non_agentflow_branches():
 
 
 def test_free_to_dispatch_skips_claimed_or_in_flight(monkeypatch):
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun("[]"))   # no native edges
+    monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())   # no native edges
     cfg = RepoConfig("o/r", ".")
     ready = {"number": 5, "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
     assert _free_to_dispatch(cfg, ready, set()) is True
@@ -93,13 +104,11 @@ def test_free_to_dispatch_skips_claimed_or_in_flight(monkeypatch):
 def test_free_to_dispatch_ignores_blocked_by_in_incidental_prose(monkeypatch):
     issue = {"number": 5, "body": "This may be Blocked by #41 after the next review.",
              "labels": [{"name": "ready-for-agent"}]}
-
-    def fake_run(cmd):
-        if cmd[1] == "api":
-            return _FakeRun("[]")   # no native edges
-        pytest.fail("prose is not a declaration")
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    # No native edges, and the prose isn't a real `Blocked by #N` declaration — so no blocker
+    # state is ever read (a read here would mean the incidental prose was treated as a blocker).
+    monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
+    monkeypatch.setattr(loop.github, "issue_state",
+                        lambda repo, n: pytest.fail("prose is not a declaration"))
 
     assert _free_to_dispatch(RepoConfig("o/r", "."), issue, set()) is True
 
@@ -165,7 +174,7 @@ def test_intake_allowlist_falls_back_to_claude_md(tmp_path):
 def test_issues_in_flight_is_unknown_when_gh_fails(monkeypatch):
     # Unknown is not empty (ADR 0021): a `gh` blip must not read as "nothing in flight",
     # or every in-review issue gets a duplicate dispatch.
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(returncode=1))
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)
     assert _issues_in_flight(RepoConfig("o/r", ".")) is None
 
 
@@ -174,19 +183,20 @@ def test_issues_in_flight_recognizes_closing_reference_off_convention_branch(mon
     # branch regex can't parse — but its declared closing reference #40 must still dedup.
     prs = [{"headRefName": "codex/40-foo",
             "closingIssuesReferences": [{"number": 40}]}]
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(prs)))
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: prs)
     assert 40 in _issues_in_flight(RepoConfig("o/r", "."))
 
 
 def test_issues_in_flight_still_recognizes_conventional_branch(monkeypatch):
     prs = [{"headRefName": "agentflow/codex/issue-7-slug", "closingIssuesReferences": []}]
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(prs)))
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: prs)
     assert 7 in _issues_in_flight(RepoConfig("o/r", "."))
 
 
 def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
-    ready = [{"number": 5, "title": "t", "body": "", "labels": [{"name": "ready-for-agent"}]}]
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(json.dumps(ready)))
+    ready = [_issue_row(5, ["ready-for-agent"], body="")]
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())   # no blockers
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
     # sanity: same listing dispatches once in-flight is actually known
@@ -194,26 +204,18 @@ def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
     assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 5
 
 
-def _ready_dispatch_run(ready, blocker_states, native=None):
-    """Fake `_run` for the dispatch gate. `blocker_states` maps blocker number → state
-    (None ⇒ `gh` failure). `native` maps issue number → the raw `blocked_by` edge array the
-    native endpoint returns (default: an empty array, i.e. no native edges)."""
+def _ready_dispatch(monkeypatch, ready, blocker_states, native=None):
+    """Install the ready-issue dispatch gate through the module interface: the labelled listing
+    (`github.list_issues` → typed rows), each issue's native blocked-by set (`loop._native_blockers`),
+    and each blocker's state (`github.issue_state`). `blocker_states` maps blocker number → state
+    (absent ⇒ unreadable → None). `native` maps issue number → its resolved same-repo blocker set."""
     native = native or {}
-
-    def fake_run(cmd):
-        if cmd[1:3] == ["issue", "list"]:
-            return _FakeRun(json.dumps(ready))
-        if cmd[1] == "api" and cmd[2].endswith("/dependencies/blocked_by"):
-            number = int(cmd[2].split("/issues/")[1].split("/")[0])
-            return _FakeRun(json.dumps(native.get(number, [])))
-        if cmd[1:3] == ["issue", "view"]:
-            state = blocker_states.get(int(cmd[3]))
-            if state is None:
-                return _FakeRun(returncode=1)
-            return _FakeRun(json.dumps({"state": state}))
-        raise AssertionError(cmd)
-
-    return fake_run
+    rows = [_issue_row(d["number"], [lbl["name"] for lbl in d.get("labels", [])],
+                       title=d.get("title", "t"), body=d.get("body", ""))
+            for d in ready]
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(rows))
+    monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set(native.get(n, set())))
+    monkeypatch.setattr(loop.github, "issue_state", lambda repo, n: blocker_states.get(n))
 
 
 def _native_edge(number, state, repo="o/r"):
@@ -223,7 +225,7 @@ def _native_edge(number, state, repo="o/r"):
 def test_next_ready_issue_skips_an_issue_blocked_by_an_open_issue(monkeypatch):
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
               "labels": [{"name": "ready-for-agent"}]}]
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}))
+    _ready_dispatch(monkeypatch, ready, {41: "OPEN"})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
@@ -237,7 +239,7 @@ def test_next_ready_issue_logs_blocked_skip_and_selects_next_issue(monkeypatch):
          "labels": [{"name": "ready-for-agent"}]},
     ]
     logs = []
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}))
+    _ready_dispatch(monkeypatch, ready, {41: "OPEN"})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     selected = _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append)
@@ -251,7 +253,7 @@ def test_next_ready_issue_rechecks_all_blockers_each_pass(monkeypatch):
               "body": "Blocked by #40\n\nBlocked by #41",
               "labels": [{"name": "ready-for-agent"}]}]
     blocker_states = {40: "CLOSED", 41: "OPEN"}
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, blocker_states))
+    _ready_dispatch(monkeypatch, ready, blocker_states)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     cfg = RepoConfig("o/r", ".")
 
@@ -264,7 +266,7 @@ def test_next_ready_issue_fails_closed_when_blocker_state_is_unknown(monkeypatch
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
               "labels": [{"name": "ready-for-agent"}]}]
     logs = []
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: None}))
+    _ready_dispatch(monkeypatch, ready, {41: None})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append) is None
@@ -276,17 +278,8 @@ def test_next_ready_issue_fails_closed_on_malformed_blocker_state(monkeypatch):
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
               "labels": [{"name": "ready-for-agent"}]}]
     logs = []
-
-    def fake_run(cmd):
-        if cmd[1:3] == ["issue", "list"]:
-            return _FakeRun(json.dumps(ready))
-        if cmd[1] == "api":
-            return _FakeRun("[]")
-        if cmd[1:4] == ["issue", "view", "41"]:
-            return _FakeRun("[]")
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    # A malformed blocker-state response reads back as None (unknown) through the module.
+    _ready_dispatch(monkeypatch, ready, {41: None})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append) is None
@@ -299,34 +292,28 @@ def test_next_ready_issue_sees_blocker_preserved_by_intake(monkeypatch):
                               "Original request.\n\nBlocked by #41")
     ready = [{"number": 42, "title": "dependent", "body": body,
               "labels": [{"name": "ready-for-agent"}]}]
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}))
+    _ready_dispatch(monkeypatch, ready, {41: "OPEN"})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert "Blocked by #41" in body
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
 
 
-def test_native_blockers_reads_over_the_daemons_real_gh_path(monkeypatch):
-    # Headless-read evidence: drive `_native_blockers` through the daemon's *actual* `_run`
-    # (agentflow.runner._run), not a fake, capturing the argv it hands to gh. Proves the
-    # unattended run context reads native blocked-by via `gh api .../dependencies/blocked_by`.
-    import subprocess as real_subprocess
-
-    from agentflow import runner
-
-    seen = {}
-
-    def fake_subprocess_run(cmd, **kwargs):
-        seen["cmd"] = cmd
-        payload = json.dumps([_native_edge(41, "OPEN"), _native_edge(7, "CLOSED", "other/repo")])
-        return real_subprocess.CompletedProcess(cmd, returncode=0, stdout=payload, stderr="")
-
-    monkeypatch.setattr(runner.subprocess, "run", fake_subprocess_run)
+def test_native_blockers_unions_same_repo_edges_and_ignores_cross_repo(monkeypatch):
+    # The native blocked-by read, exercised through the shared GitHub module: the endpoint's
+    # edges come back via `github.api`, and only same-repo edges join the gate.
+    edges = [_native_edge(41, "OPEN"), _native_edge(7, "CLOSED", "other/repo")]
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: edges)
 
     blockers = _native_blockers(RepoConfig("o/r", "."), 42)
 
-    assert seen["cmd"] == ["gh", "api", "repos/o/r/issues/42/dependencies/blocked_by"]
     assert blockers == {41}   # same-repo edge unioned; cross-repo edge ignored
+
+
+def test_native_blockers_is_unknown_when_the_read_fails(monkeypatch):
+    # Unreadable edges are None (unknown), never an empty set — the caller then fails closed.
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)
+    assert _native_blockers(RepoConfig("o/r", "."), 42) is None
 
 
 def test_next_ready_issue_holds_on_open_native_blocker(monkeypatch):
@@ -334,8 +321,8 @@ def test_next_ready_issue_holds_on_open_native_blocker(monkeypatch):
     # the regression this ticket exists to fix (native edges were invisible before).
     ready = [{"number": 42, "title": "dependent", "body": "",
               "labels": [{"name": "ready-for-agent"}]}]
-    native = {42: [_native_edge(41, "OPEN")]}
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "OPEN"}, native))
+    native = {42: {41}}
+    _ready_dispatch(monkeypatch, ready, {41: "OPEN"}, native)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
@@ -344,8 +331,8 @@ def test_next_ready_issue_holds_on_open_native_blocker(monkeypatch):
 def test_next_ready_issue_frees_on_closed_native_blocker(monkeypatch):
     ready = [{"number": 42, "title": "dependent", "body": "",
               "labels": [{"name": "ready-for-agent"}]}]
-    native = {42: [_native_edge(41, "CLOSED")]}
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {41: "CLOSED"}, native))
+    native = {42: {41}}
+    _ready_dispatch(monkeypatch, ready, {41: "CLOSED"}, native)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 42
@@ -355,9 +342,9 @@ def test_next_ready_issue_unions_prose_and_native_blockers(monkeypatch):
     # Prose blocker #40 is closed; a native blocker #41 is open. Either open source holds.
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #40",
               "labels": [{"name": "ready-for-agent"}]}]
-    native = {42: [_native_edge(41, "OPEN")]}
+    native = {42: {41}}
     blocker_states = {40: "CLOSED", 41: "OPEN"}
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, blocker_states, native))
+    _ready_dispatch(monkeypatch, ready, blocker_states, native)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     cfg = RepoConfig("o/r", ".")
 
@@ -367,18 +354,10 @@ def test_next_ready_issue_unions_prose_and_native_blockers(monkeypatch):
 
 
 def test_next_ready_issue_fails_closed_when_native_read_fails(monkeypatch):
-    ready = [{"number": 42, "title": "dependent", "body": "",
-              "labels": [{"name": "ready-for-agent"}]}]
+    ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
     logs = []
-
-    def fake_run(cmd):
-        if cmd[1:3] == ["issue", "list"]:
-            return _FakeRun(json.dumps(ready))
-        if cmd[1] == "api":
-            return _FakeRun(returncode=1)   # native fetch failed — unknown, not "no blockers"
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)   # native fetch failed — unknown
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append) is None
@@ -386,17 +365,10 @@ def test_next_ready_issue_fails_closed_when_native_read_fails(monkeypatch):
 
 
 def test_next_ready_issue_fails_closed_on_malformed_native_response(monkeypatch):
-    ready = [{"number": 42, "title": "dependent", "body": "",
-              "labels": [{"name": "ready-for-agent"}]}]
-
-    def fake_run(cmd):
-        if cmd[1:3] == ["issue", "list"]:
-            return _FakeRun(json.dumps(ready))
-        if cmd[1] == "api":
-            return _FakeRun("not json")
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
+    # A malformed native response reads back as None through the module — never "no blockers".
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
@@ -404,46 +376,42 @@ def test_next_ready_issue_fails_closed_on_malformed_native_response(monkeypatch)
 
 def test_next_ready_issue_ignores_cross_repo_native_blocker(monkeypatch):
     # A native edge pointing at another repo does not by itself hold the issue.
-    ready = [{"number": 42, "title": "dependent", "body": "",
-              "labels": [{"name": "ready-for-agent"}]}]
-    native = {42: [_native_edge(41, "OPEN", repo="other/repo")]}
-    monkeypatch.setattr(loop, "_run", _ready_dispatch_run(ready, {}, native))
+    ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
+    edges = [_native_edge(41, "OPEN", repo="other/repo")]
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: edges)   # real filtering drops it
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 42
 
 
 def test_release_triage_proves_the_claim_is_absent(monkeypatch):
-    calls = iter((
-        _FakeRun('{"labels":[{"name":"agentflow:triaging"}]}'),
-        _FakeRun(),
-        _FakeRun('{"labels":[]}'),
-    ))
-    monkeypatch.setattr(loop, "_run", lambda cmd: next(calls))
+    # The claim is present, the removal succeeds, and a re-read confirms it's gone.
+    reads = iter((frozenset({"agentflow:triaging"}), frozenset()))
+    monkeypatch.setattr(loop.github, "issue_labels", lambda repo, n: next(reads))
+    monkeypatch.setattr(loop.github, "remove_label", lambda repo, n, label: True)
 
     assert loop._release_triage("o/r", 69) is True
 
 
 def test_release_triage_fails_closed_when_github_still_reports_the_claim(monkeypatch):
-    calls = iter((
-        _FakeRun('{"labels":[{"name":"agentflow:triaging"}]}'),
-        _FakeRun(),
-        _FakeRun('{"labels":[{"name":"agentflow:triaging"}]}'),
-    ))
-    monkeypatch.setattr(loop, "_run", lambda cmd: next(calls))
+    # The re-read still shows the claim — the release cannot be proven, so it fails closed.
+    reads = iter((frozenset({"agentflow:triaging"}), frozenset({"agentflow:triaging"})))
+    monkeypatch.setattr(loop.github, "issue_labels", lambda repo, n: next(reads))
+    monkeypatch.setattr(loop.github, "remove_label", lambda repo, n, label: True)
 
     assert loop._release_triage("o/r", 69) is False
 
 
 def test_release_triage_accepts_an_already_absent_claim(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        loop, "_run",
-        lambda cmd: calls.append(cmd) or _FakeRun('{"labels":[]}'),
-    )
+    reads = []
+    monkeypatch.setattr(loop.github, "issue_labels",
+                        lambda repo, n: reads.append(n) or frozenset())
+    monkeypatch.setattr(loop.github, "remove_label",
+                        lambda repo, n, label: pytest.fail("nothing to remove"))
 
     assert loop._release_triage("o/r", 69) is True
-    assert len(calls) == 1
+    assert len(reads) == 1
 
 
 def test_held_build_result_holds_instead_of_requeueing():
@@ -523,13 +491,10 @@ def test_work_order_helper_is_gone():
 
 
 def _issue_view(monkeypatch, issue):
-    """Point loop._run at a canned `gh issue view` payload for build_issue's fetch, with no
-    native blocked-by edges (the dispatch gate reads those too)."""
-    def fake_run(argv):
-        if argv[1] == "api":
-            return _FakeRun("[]")
-        return _FakeRun(json.dumps(issue))
-    monkeypatch.setattr(loop, "_run", fake_run)
+    """Serve build_issue's single-issue read (the module's escape hatch) a canned issue row,
+    with no native blocked-by edges (the dispatch gate reads those too)."""
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: issue)
+    monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
 
 
 def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
@@ -712,17 +677,9 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
 def test_build_issue_refuses_an_open_blocker(monkeypatch):
     issue = {"number": 42, "state": "OPEN", "title": "dependent", "body": "Blocked by #41",
              "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
-
-    def fake_run(cmd):
-        if cmd[1] == "api":
-            return _FakeRun("[]")
-        if cmd[1:4] == ["issue", "view", "42"]:
-            return _FakeRun(json.dumps(issue))
-        if cmd[1:4] == ["issue", "view", "41"]:
-            return _FakeRun(json.dumps({"state": "OPEN"}))
-        raise AssertionError(cmd)
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop.github, "api", lambda *a, **k: issue)   # the single-issue read
+    monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
+    monkeypatch.setattr(loop.github, "issue_state", lambda repo, n: "OPEN")   # blocker #41 open
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     out = build_issue(RepoConfig("o/r", "/tmp"), 42)
 
@@ -748,31 +705,30 @@ _INTAKE_COMMENT = f"{INTAKE_MARK} — generated by AI.\n\nHold message."
 _MAINTAINER_REPLY = "Here is my answer / waiver."
 
 
-def _make_resumable_run(grilling_issues, mockup_issues, reply=_MAINTAINER_REPLY):
-    """A fake _run that serves canned issue listings and a single-reply comment thread."""
+def _install_resumable(monkeypatch, grilling_issues, mockup_issues, reply=_MAINTAINER_REPLY,
+                       comments=None):
+    """Install a resumable-issue queue through the module interface: the held-label listings
+    (`github.list_issues`) and each issue's comment thread (`loop._issue_comments_or_none`)."""
     # The reply is from the repo owner (always allowlisted), so it counts as a resume-
     # triggering maintainer reply under the allowlist filter (issue #25).
-    comments = [{"body": _INTAKE_COMMENT}, {"body": reply, "author": {"login": "o"}}]
+    if comments is None:
+        comments = [{"body": _INTAKE_COMMENT}, {"body": reply, "author": {"login": "o"}}]
 
-    def fake_run(cmd):
-        if "--label" in cmd:
-            label_idx = cmd.index("--label") + 1
-            label = cmd[label_idx]
-            if label == "agentflow:needs-grilling":
-                return _FakeRun(json.dumps(grilling_issues))
-            if label == "agentflow:needs-mockup":
-                return _FakeRun(json.dumps(mockup_issues))
-        if "comments" in cmd:
-            return _FakeRun(json.dumps({"comments": comments}))
-        return _FakeRun("[]")
+    def rows(dicts):
+        return [_issue_row(d["number"], [lbl["name"] for lbl in d.get("labels", [])],
+                           title=d.get("title", "t"), body=d.get("body", "b")) for d in dicts]
 
-    return fake_run
+    by_label = {"agentflow:needs-grilling": rows(grilling_issues),
+                "agentflow:needs-mockup": rows(mockup_issues)}
+    monkeypatch.setattr(loop.github, "list_issues",
+                        lambda repo, *, label=None, limit=100: list(by_label.get(label, [])))
+    monkeypatch.setattr(loop, "_issue_comments_or_none", lambda repo, n: comments)
 
 
 def test_next_resumable_issue_picks_up_needs_grilling_reply(monkeypatch):
     issue = {"number": 10, "title": "t", "body": "b",
              "labels": [{"name": "agentflow:needs-grilling"}]}
-    monkeypatch.setattr(loop, "_run", _make_resumable_run([issue], []))
+    _install_resumable(monkeypatch, [issue], [])
     result = _next_resumable_issue(RepoConfig("o/r", "."))
     assert result is not None
     found, reply = result
@@ -785,7 +741,7 @@ def test_next_resumable_issue_picks_up_needs_mockup_reply(monkeypatch):
     # needs-mockup issue was silently dropped and the mockup queue stalled forever.
     issue = {"number": 11, "title": "t", "body": "b",
              "labels": [{"name": "agentflow:needs-mockup"}]}
-    monkeypatch.setattr(loop, "_run", _make_resumable_run([], [issue]))
+    _install_resumable(monkeypatch, [], [issue])
     result = _next_resumable_issue(RepoConfig("o/r", "."))
     assert result is not None
     found, reply = result
@@ -796,7 +752,7 @@ def test_next_resumable_issue_picks_up_needs_mockup_reply(monkeypatch):
 def test_next_resumable_issue_waits_while_mockup_owns_the_drawing_claim(monkeypatch):
     issue = {"number": 11, "title": "t", "body": "b",
              "labels": [{"name": "agentflow:needs-mockup"}, {"name": DRAWING}]}
-    monkeypatch.setattr(loop, "_run", _make_resumable_run([], [issue]))
+    _install_resumable(monkeypatch, [], [issue])
 
     assert _next_resumable_issue(RepoConfig("o/r", ".")) is None
 
@@ -805,23 +761,12 @@ def test_next_resumable_issue_returns_none_when_last_comment_is_ours(monkeypatch
     issue = {"number": 12, "title": "t", "body": "b",
              "labels": [{"name": "agentflow:needs-mockup"}]}
     # last comment is ours (contains INTAKE_MARK) — not awaiting a reply
-    our_last = [{"body": _INTAKE_COMMENT}]
-
-    def fake_run(cmd):
-        if "--label" in cmd and "agentflow:needs-grilling" in cmd:
-            return _FakeRun(json.dumps([]))
-        if "--label" in cmd and "agentflow:needs-mockup" in cmd:
-            return _FakeRun(json.dumps([issue]))
-        if "comments" in cmd:
-            return _FakeRun(json.dumps({"comments": our_last}))
-        return _FakeRun("[]")
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    _install_resumable(monkeypatch, [], [issue], comments=[{"body": _INTAKE_COMMENT}])
     assert _next_resumable_issue(RepoConfig("o/r", ".")) is None
 
 
 def test_next_resumable_issue_returns_none_on_gh_error(monkeypatch):
-    monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun(returncode=1))
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: None)
     assert _next_resumable_issue(RepoConfig("o/r", ".")) is None
 
 
@@ -841,21 +786,15 @@ _MAINT = "Show me a screenshot please?"
 
 
 def _pr_gh(monkeypatch, prs, comments_by_pr):
-    """Route loop._run's `gh pr list` / `gh pr view <n>` at canned payloads."""
-    def fake_run(argv):
-        if argv[:3] == ["gh", "pr", "list"]:
-            return _FakeRun(json.dumps(prs))
-        if argv[:3] == ["gh", "pr", "view"]:
-            return _FakeRun(json.dumps({"comments": comments_by_pr.get(int(argv[3]), [])}))
-        return _FakeRun("")
-    monkeypatch.setattr(loop, "_run", fake_run)
+    """Serve _next_pr_awaiting_reply canned open-PR rows (`github.list_open_prs`) and per-PR
+    comment threads (`loop._pr_comments`) through the module interface."""
+    monkeypatch.setattr(loop.github, "list_open_prs", lambda repo, **k: list(prs))
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: comments_by_pr.get(pr, []))
 
 
 def test_next_pr_awaiting_reply_picks_the_unanswered_one(monkeypatch):
-    prs = [{"number": 7, "headRefName": "agentflow/claude/issue-3-do-thing",
-            "headRefOid": "head-7"},
-           {"number": 8, "headRefName": "agentflow/codex/issue-4-other",
-            "headRefOid": "head-8"}]
+    prs = [_pr_row(7, "agentflow/claude/issue-3-do-thing", "head-7"),
+           _pr_row(8, "agentflow/codex/issue-4-other", "head-8")]
     comments = {7: [{"body": _PARK}],                                    # our marker last — answered
                 8: [{"body": _PARK}, {"body": _MAINT, "id": "IC_8"}]}    # maintainer last — pending
     _pr_gh(monkeypatch, prs, comments)
@@ -871,8 +810,7 @@ def test_next_pr_awaiting_reply_advances_one_comment_target_at_a_time(monkeypatc
         {"body": "First question", "id": "IC_1"},
         {"body": "Second question", "id": "IC_2"},
     ]
-    _pr_gh(monkeypatch, [{"number": 8, "headRefName": branch, "headRefOid": "head-8"}],
-           {8: comments})
+    _pr_gh(monkeypatch, [_pr_row(8, branch, "head-8")], {8: comments})
     assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) == (
         8, branch, "First question", "IC_1", "head-8")
 
@@ -883,7 +821,7 @@ def test_next_pr_awaiting_reply_advances_one_comment_target_at_a_time(monkeypatc
 
 def test_next_pr_awaiting_reply_ignores_human_branches(monkeypatch):
     # A maintainer's own branch is not an agentflow PR — never spawn a responder on it.
-    prs = [{"number": 9, "headRefName": "my-hotfix"}]
+    prs = [_pr_row(9, "my-hotfix")]
     _pr_gh(monkeypatch, prs, {9: [{"body": _MAINT}]})
     assert _next_pr_awaiting_reply(RepoConfig("o/r", ".")) is None
 
@@ -986,16 +924,10 @@ def test_mockup_eligible_skips_a_pending_reply_and_a_live_claim():
 def test_next_mockup_issue_picks_the_fresh_parked_issue(monkeypatch):
     # Regression (would fail before this change — the phase didn't exist): a needs-mockup issue
     # with only intake's park comment is selected for a variant round.
-    issue = {"number": 11, "title": "t", "body": "b", "labels": [{"name": "agentflow:needs-mockup"}]}
-
-    def fake_run(cmd):
-        if cmd[:3] == ["gh", "issue", "list"]:
-            return _FakeRun(json.dumps([issue]))
-        if cmd[:4] == ["gh", "issue", "view", "11"]:
-            return _FakeRun(json.dumps({"comments": [{"body": _MOCKUP_PARK, "author": {"login": "o"}}]}))
-        return _FakeRun("[]")
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    row = _issue_row(11, ["agentflow:needs-mockup"])
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: [row])
+    monkeypatch.setattr(loop, "_issue_comments_or_none",
+                        lambda repo, n: [{"body": _MOCKUP_PARK, "author": {"login": "o"}}])
     monkeypatch.setattr(loop, "intake_allowlist", lambda repo, wd: {"o"})
     found = _next_mockup_issue(RepoConfig("o/r", "."))
     assert found is not None and found["number"] == 11
@@ -1340,16 +1272,12 @@ def test_claim_triage_description_is_ownership_not_live_session(monkeypatch):
     # execution even when the record is waiting with 0 attempts and no provider process.
     # The new description must be true whether the record is queued or running.
     captured = []
-
-    def fake_run(cmd):
-        captured.append(cmd)
-        return _FakeRun()
-
-    monkeypatch.setattr(loop, "_run", fake_run)
+    monkeypatch.setattr(loop.github, "api", lambda args, **k: captured.append(args) or "ok")
+    monkeypatch.setattr(loop.github, "add_label", lambda repo, n, label: True)
     result = loop._claim_triage("o/r", 7)
 
     assert result is True
-    label_create = next(cmd for cmd in captured if "label" in cmd and "create" in cmd)
+    label_create = next(args for args in captured if "label" in args and "create" in args)
     desc_idx = label_create.index("--description") + 1
     description = label_create[desc_idx]
     # Must not assert a live/active/running session (the AC: no "is triaging" phrasing)
