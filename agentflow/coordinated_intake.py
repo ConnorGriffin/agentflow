@@ -152,29 +152,41 @@ def apply_route(record, result: IntakeResult) -> str | None:
 
 
 def hold_intake(record) -> str | None:
-    """Create Intake's single exhaustion handoff and notification."""
+    """Create Intake's single exhaustion handoff and notification.
+
+    The crash-safe post-once → prove → notify-once recipe is the shared
+    :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042): the held-route comment is
+    the durable marker, so a repeat after a daemon crash observes the same comment and neither
+    re-holds nor pings again. Projecting that comment (and its state label) is the marker-posting
+    ``action``; releasing the triaging claim is stage bookkeeping that runs once the handoff
+    confirms the marker landed."""
+    from agentflow.handoff import DurableHandoff, Notification, Subject
     from agentflow.intake import _held
     from agentflow.loop import _release_triage
-    from agentflow.notify import notify
     number = int(record.subject)
     reason = record.hold_reason or "continuation budget exhausted"
     result = _held(reason)
-    # Multi-field live read via the named escape hatch (ADR 0040); None means GitHub
-    # couldn't be reached, so the hold is not projected.
-    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "title,labels,comments"], parse_json=True)
-    if not isinstance(issue, dict):
-        return None
-    apply_intake(record.repo, number, issue.get("title", ""),
-                 [x.get("name", "") for x in issue.get("labels", [])], result)
-    if not intake_result_is_durable(record.repo, number, result):
+
+    def project() -> None:
+        # Title+labels in one live read via the named escape hatch (ADR 0040); a read that
+        # couldn't reach GitHub leaves the hold unprojected, so the envelope proves no marker
+        # and retries next cycle — it never holds over an empty read.
+        issue = github.api(["issue", "view", str(number), "--repo", record.repo,
+                            "--json", "title,labels"], parse_json=True)
+        if not isinstance(issue, dict):
+            return
+        apply_intake(record.repo, number, issue.get("title", ""),
+                     [x.get("name", "") for x in issue.get("labels", [])], result)
+
+    url = DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=number, kind="issue"),
+        identity=record.identity, stage="intake-hold",
+        marker=result.body,
+        action=project,
+        notification=Notification(
+            "agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}"))
+    if url is None:
         return None
     if not _release_triage(record.repo, number):
         return None
-    url = f"https://github.com/{record.repo}/issues/{number}"
-    if record.notifications == 0:
-        sequence_id = sha256(f"{record.identity}:intake-hold".encode()).hexdigest()[:12]
-        if not notify("agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}",
-                      url, sequence_id):
-            return None
     return url
