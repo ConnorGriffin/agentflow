@@ -526,7 +526,10 @@ class _ProductionGate:
             # Claude admission reserves conservative five-hour headroom for work already running on
             # the pool before another session starts (#305): its provider quota fact only updates
             # after a session ends, so several launches must not all pass one stale below-ceiling
-            # reading. Codex reports live per-window facts, so it needs no such reservation.
+            # reading. The reservation scales with running *permits* (the ledger's SUM(demand)), not
+            # session count, so a heavier session reserves proportionally more — see
+            # balancer.CLAUDE_INFLIGHT_RESERVE_PCT for the intent and calibration. Codex reports live
+            # per-window facts, so it needs no such reservation.
             reserved_pct = (self._running_permits(record.pool) * balancer.CLAUDE_INFLIGHT_RESERVE_PCT
                             if record.pool == "claude" else 0.0)
             status = balancer._query_pool(record.pool, reserved_pct=reserved_pct)

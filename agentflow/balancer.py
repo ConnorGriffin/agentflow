@@ -61,10 +61,14 @@ ACTIVE_CEILING_PCT = float(os.environ.get("AGENTFLOW_ACTIVE_CEILING_PCT", "50"))
 ACTIVE_PACE = int(os.environ.get("AGENTFLOW_ACTIVE_PACE", "1"))
 
 # Conservative in-flight reservation (#305). Claude's provider quota fact is only observed after
-# a session ends, so work admitted from one below-ceiling reading is not yet reflected in it. Each
-# permit already running on the Claude pool therefore reserves this much five-hour headroom before
-# another Claude session admits — so several launches cannot all pass one stale observation and
-# collectively drive the pool to 100%. Env-overridable production config.
+# a session ends, so work admitted from one below-ceiling reading is not yet reflected in it. The
+# reservation is charged *per running permit* (demand unit), not per running session: a heavier
+# session already reserved more of the pool's five permits and consumes proportionally more of the
+# five-hour quota, so a demand-4 deep build reserves 4x this before another session admits. This is
+# deliberate — it errs on the safe side of the conservative-reservation criterion. It is also
+# calibrated against the pool's own five-permit ledger: at the 15% default a fully-seated pool
+# (five permits) reserves 75%, which stays just under the 85% idle ceiling, so the hard permit
+# ledger — not this soft reservation — remains the real concurrency cap. Env-overridable.
 CLAUDE_INFLIGHT_RESERVE_PCT = float(
     os.environ.get("AGENTFLOW_CLAUDE_INFLIGHT_RESERVE_PCT", "15"))
 
@@ -282,9 +286,15 @@ def _query_pool(tool: str, operator: bool = False, *,
     fact = quota.read_quota(default_store_path(), "claude")
     usage = quota.effective_usage(fact, now) if fact is not None else None
     if usage is None:
-        # A missing, malformed, or stale provider fact fails closed — it is never read as zero.
-        return PoolStatus(tool, False, 100.0, "five-hour quota fact unavailable",
-                          (), active, ceiling)
+        # A missing, malformed, or stale provider fact fails closed — it is never read as zero. The
+        # reason distinguishes a cold start (no fact persisted yet) from a stale one, so a first
+        # deploy's bootstrapping pool is not mistaken for a wedged one. Bootstrap path: the first
+        # Claude session to run writes the fact. An operator-present/interactive turn is exempt from
+        # this gate (see the coordinator's production gate), so a human session seeds the first fact
+        # even before any unattended background session can pass.
+        reason = ("five-hour quota fact not yet observed — pool bootstrapping" if fact is None
+                  else "five-hour quota fact stale — holding")
+        return PoolStatus(tool, False, 100.0, reason, (), active, ceiling)
     # Reserve conservative headroom for Claude work already admitted from the same observation, so
     # several launches cannot all pass one below-ceiling reading and collectively reach 100% (#305).
     under = usage + max(0.0, reserved_pct) < ceiling
