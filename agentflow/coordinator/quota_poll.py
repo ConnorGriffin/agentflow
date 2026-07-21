@@ -23,10 +23,9 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
 from pathlib import Path
 
-from agentflow.coordinator.quota import build_fact, read_quota, record_quota
+from agentflow.coordinator.quota import build_fact, epoch_seconds, read_quota, record_quota
 
 _USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 _KEYCHAIN_SERVICE = "Claude Code-credentials"
@@ -72,25 +71,17 @@ def _file_blob() -> str | None:
         return None
 
 
-def _epoch(value) -> int | None:
-    """Coerce the endpoint's ``resets_at`` (ISO-8601 or epoch seconds) to epoch seconds, or
-    ``None`` for any other shape."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str) and value:
-        try:
-            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
-        except ValueError:
-            return None
-    return None
-
-
 def _fetch_five_hour(token: str) -> tuple[float, int] | None:
     """GET the OAuth usage endpoint and return ``(used_percent, resets_at)`` for the five-hour
-    window, or ``None`` on any transport/shape failure. The endpoint reports ``utilization`` as a
-    0..100 percent (unlike the stream event's 0..1 fraction), so it is used unscaled."""
+    window, or ``None`` on any transport/shape failure.
+
+    The endpoint reports ``utilization`` as a **0..100 percent** and is used unscaled. This is the
+    load-bearing assumption of the whole gate — if it were a 0..1 fraction, a busy pool would record
+    a fraction-of-a-percent and the ceiling would silently never bite — so it is grounded in the
+    live payload, not inferred: the endpoint returned ``9.0``/``10.0``/``26.0`` for a pool visibly
+    tracking real spend (issue #309). It is deliberately *not* run through the stream extractor's
+    ``value*100 if value<=1`` normalization, which would corrupt a genuine sub-1% reading here; the
+    endpoint and the stream event share the field name ``utilization`` but not its scale."""
     request = urllib.request.Request(
         _USAGE_URL,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
@@ -103,9 +94,9 @@ def _fetch_five_hour(token: str) -> tuple[float, int] | None:
     if not isinstance(five_hour, dict):
         return None
     used = five_hour.get("utilization")
-    if isinstance(used, bool) or not isinstance(used, (int, float)):
+    if isinstance(used, bool) or not isinstance(used, (int, float)) or not 0 <= used <= 100:
         return None
-    resets_at = _epoch(five_hour.get("resets_at") or five_hour.get("resetsAt"))
+    resets_at = epoch_seconds(five_hour.get("resets_at") or five_hour.get("resetsAt"))
     if resets_at is None:
         return None
     return float(used), resets_at

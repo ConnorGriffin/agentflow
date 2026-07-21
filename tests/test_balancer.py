@@ -19,9 +19,14 @@ def _limits(observed_at, windows):
     return json.dumps({"observed_at": observed_at, "windows": windows})
 
 
-@pytest.fixture
+@pytest.fixture(autouse=True)
 def isolate_state(tmp_path, monkeypatch):
-    """Point the durable store (and the Claude quota fact beside it) at a scratch dir."""
+    """Point the durable store (and the Claude quota fact beside it) at a scratch dir, for *every*
+    balancer test. Claude's clear/blocked status is now read from the persisted five-hour quota
+    fact (#305/#307), so a test that leaves the store to the ambient `~/.agentflow` reads whatever
+    the live daemon last wrote there — order-dependent and machine-dependent. Autouse makes each
+    test hermetic: it starts with an empty store (Claude bootstrapping/blocked) and seeds a fact
+    with `_seed_claude_quota` only when it wants Claude to have headroom."""
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
     return tmp_path
 

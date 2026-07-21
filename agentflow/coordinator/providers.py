@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 
-from agentflow.coordinator.quota import QuotaFact, build_fact
+from agentflow.coordinator.quota import QuotaFact, build_fact, epoch_seconds
 from agentflow.coordinator.session import read_session
 from agentflow.coordinator.store import default_store_path
 from agentflow.coordinator.telemetry import AttemptUsage, claude_usage, codex_usage
@@ -180,20 +180,6 @@ def _claude_error_type(event: dict):
     return None, True  # a truthy but unshaped error — present, but no typed cause
 
 
-def _epoch(value):
-    """Coerce a ``resetsAt`` (Unix seconds or ISO-8601) into epoch seconds, or ``None``."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return int(value)
-    if isinstance(value, str) and value:
-        from datetime import datetime
-        try:
-            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
-        except ValueError:
-            return None
-    return None
-
 
 def _claude_utilization_pct(info: dict):
     """The five-hour utilization percentage on a ``rate_limit_info``, normalized to 0..100.
@@ -214,15 +200,17 @@ def _claude_quota_fact(info: dict, observed_at: int) -> QuotaFact | None:
     for every status (allowed and rejected alike): an ``allowed`` reading is exactly the fresh
     utilization the balancer needs to size headroom, not only the rejection that stops a run.
 
-    Only a genuine ``five_hour`` event contributes: Claude Code's headless stream emits one window
-    at a time (the one in warning — often ``seven_day``), so without this guard a seven_day reading
-    would be mis-persisted as the five-hour authority (issue #309). The independent OAuth poll is
-    the primary producer; this stream fact only corroborates it when a five_hour event happens to
-    arrive."""
+    A non-five-hour window never contributes: Claude Code's headless stream emits one window at a
+    time (the one in warning — often ``seven_day``), so without this guard a seven_day reading would
+    be mis-persisted as the five-hour authority (issue #309). An event that omits ``rateLimitType``
+    is still admitted — that preserves the pre-existing contract (#305) — because ``build_fact``'s
+    window check is the backstop: a seven_day reset lands ~7 days out, far outside the five-hour
+    window an ``observed_at`` sits in, so it is rejected there anyway. The independent OAuth poll is
+    the primary producer; this stream fact only corroborates it when a five-hour event arrives."""
     if info.get("rateLimitType") not in (None, "five_hour"):
         return None
     pct = _claude_utilization_pct(info)
-    resets_at = _epoch(info.get("resetsAt") or info.get("resets_at"))
+    resets_at = epoch_seconds(info.get("resetsAt") or info.get("resets_at"))
     if pct is None or resets_at is None:
         return None
     return build_fact("claude", pct, resets_at, observed_at, "claude:rate_limit_event")
@@ -280,7 +268,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                 # informational and establishes no cause.
                 if cause is ProviderCause.NONE:
                     cause = ProviderCause.CAPACITY
-                reset_at = _epoch(info.get("resetsAt")) or reset_at
+                reset_at = epoch_seconds(info.get("resetsAt")) or reset_at
         elif etype == "result":
             result = event.get("result")
             structured_output = event.get("structured_output")

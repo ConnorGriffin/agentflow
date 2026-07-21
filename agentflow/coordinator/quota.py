@@ -28,11 +28,28 @@ import math
 import os
 import time
 from dataclasses import asdict, dataclass, fields
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
 # The Claude/Codex short window both providers gate dispatch on is five hours.
 FIVE_HOUR_SECONDS = 5 * 60 * 60
+
+
+def epoch_seconds(value) -> int | None:
+    """Coerce a provider ``resets_at`` (epoch seconds or an ISO-8601 string) into epoch seconds,
+    or ``None`` for any other shape. Shared by both quota producers — the stream extractor
+    (`providers`) and the independent poll (`quota_poll`) — which each read a provider reset time."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value:
+        try:
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
+        except ValueError:
+            return None
+    return None
 
 # A little clock skew tolerance so a fact observed at the exact window edge is not judged
 # temporally impossible by a sub-second scheduling difference.
