@@ -17,9 +17,11 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from dataclasses import dataclass
 from enum import Enum
 
+from agentflow.coordinator.quota import QuotaFact, build_fact
 from agentflow.coordinator.session import read_session
 from agentflow.coordinator.store import default_store_path
 from agentflow.coordinator.telemetry import AttemptUsage, claude_usage, codex_usage
@@ -70,6 +72,8 @@ class ProviderObservation:
                                                 # with the daemon (the restart-resume discriminator)
     usage: AttemptUsage = AttemptUsage()        # normalized spend for this attempt (tokens/cost/turns);
                                                 # empty when the stream reported none (never zero-by-assumption)
+    quota: QuotaFact | None = None              # the provider's five-hour utilization/reset fact, when the
+                                                # stream reported one; the persisted Claude dispatch authority (#305)
 
     def classification(self) -> str:
         """The coordinator's provider label (recoverable | permanent | incomplete | unknown)."""
@@ -191,9 +195,34 @@ def _epoch(value):
     return None
 
 
+def _claude_utilization_pct(info: dict):
+    """The five-hour utilization percentage on a ``rate_limit_info``, normalized to 0..100.
+
+    Claude Code reports ``utilization`` on the documented ``rate_limit_event.rate_limit_info``
+    surface (docs/research/provider-interruption-signals.md). It may arrive as a 0..1 fraction
+    or an already-scaled percentage; either is normalized here. Any other shape yields ``None``
+    so a malformed field never becomes a fabricated reading."""
+    value = info.get("utilization")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    pct = value * 100 if value <= 1 else value
+    return pct if 0 <= pct <= 100 else None
+
+
+def _claude_quota_fact(info: dict, observed_at: int) -> QuotaFact | None:
+    """Build a validated five-hour quota fact from a ``rate_limit_info``, or ``None``. Extracted
+    for every status (allowed and rejected alike): an ``allowed`` reading is exactly the fresh
+    utilization the balancer needs to size headroom, not only the rejection that stops a run."""
+    pct = _claude_utilization_pct(info)
+    resets_at = _epoch(info.get("resetsAt") or info.get("resets_at"))
+    if pct is None or resets_at is None:
+        return None
+    return build_fact("claude", pct, resets_at, observed_at, "claude:rate_limit_event")
+
+
 def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                     partial_output="", family=None, process_alive=False,
-                    has_end_fact=False) -> ProviderObservation:
+                    has_end_fact=False, observed_at=None) -> ProviderObservation:
     """Extract facts from Claude's structured Agent SDK stream. A typed cause comes from the real
     stream shapes — an ``assistant`` message's error value, a rejected ``rate_limit_event``
     (with its ``resetsAt``), or a terminal ``result.subtype`` failure — never an invented
@@ -205,9 +234,11 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
     contract. Every unrecognized event or unshaped error is preserved verbatim so nothing is
     silently dropped (fail-safe)."""
     events = tuple(events)
+    observed_at = int(observed_at if observed_at is not None else time.time())
     cause = ProviderCause.NONE
     reset_at = None
     final_message = ""
+    quota: QuotaFact | None = None
     unrecognized: list[dict] = []
     for event in events:
         etype = event.get("type")
@@ -227,6 +258,13 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                     unrecognized.append(dict(event))  # an error we could not type — preserve it
         elif etype == "rate_limit_event":
             info = event.get("rate_limit_info")
+            if isinstance(info, dict):
+                # The five-hour utilization/reset fact is the persisted dispatch authority (#305).
+                # It is read on every status — an ``allowed`` reading is the fresh headroom the
+                # balancer needs, not only the rejection that stops a run. The freshest wins.
+                fact = _claude_quota_fact(info, observed_at)
+                if fact is not None:
+                    quota = fact
             rejected = (isinstance(info, dict)
                         and (info.get("status") == "rejected" or info.get("rejected") is True))
             if rejected:
@@ -272,7 +310,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events,
         unrecognized=tuple(unrecognized), family=family, process_alive=process_alive,
-        has_end_fact=has_end_fact, usage=claude_usage(events))
+        has_end_fact=has_end_fact, usage=claude_usage(events), quota=quota)
 
 
 # The typed Codex account/rate-limit facts (from the app-server surface or a typed companion

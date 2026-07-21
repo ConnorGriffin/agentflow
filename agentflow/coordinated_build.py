@@ -503,10 +503,14 @@ def build_coordinator(_log=None) -> Coordinator:
 class _ProductionGate:
     """One dispatch cycle's composed durable admission policy."""
 
-    def __init__(self) -> None:
+    def __init__(self, running_permits=None) -> None:
         from collections import Counter
         self._paced = Counter()
         self._active: dict[str, bool] = {}
+        # How many permits are already running on a pool, from the durable ledger. Injected so the
+        # in-flight Claude reservation is exercised without a live store; production reads the same
+        # running rows the reservation itself charges.
+        self._running_permits = running_permits or _durable_running_permits
 
     def __call__(self, record) -> bool:
         from agentflow import balancer
@@ -519,7 +523,16 @@ class _ProductionGate:
         if record.interactive:
             return True
         try:
-            status = balancer._query_pool(record.pool)
+            # Claude admission reserves conservative five-hour headroom for work already running on
+            # the pool before another session starts (#305): its provider quota fact only updates
+            # after a session ends, so several launches must not all pass one stale below-ceiling
+            # reading. The reservation scales with running *permits* (the ledger's SUM(demand)), not
+            # session count, so a heavier session reserves proportionally more — see
+            # balancer.CLAUDE_INFLIGHT_RESERVE_PCT for the intent and calibration. Codex reports live
+            # per-window facts, so it needs no such reservation.
+            reserved_pct = (self._running_permits(record.pool) * balancer.CLAUDE_INFLIGHT_RESERVE_PCT
+                            if record.pool == "claude" else 0.0)
+            status = balancer._query_pool(record.pool, reserved_pct=reserved_pct)
             # Launch must honor the same codex unattended-spend pacing that `pick_pair` applies
             # at submission (balancer._codex_dispatch_status): raw `_query_pool` only checks the
             # short-window ceiling, so a codex stage queued while weekly headroom existed would
@@ -555,6 +568,22 @@ class _ProductionGate:
             return
         if self._active.get(record.pool, False):
             self._paced[record.pool] += 1
+
+
+def _durable_running_permits(pool: str) -> int:
+    """The permits already running on ``pool``, read from the durable ledger. A read failure
+    reserves nothing (the hard permit ledger in ``_begin_start`` still caps concurrency), so a
+    transient store hiccup never wedges dispatch."""
+    from agentflow.coordinator.store import Store
+
+    try:
+        store = Store(default_store_path())
+        try:
+            return store.permits_used(pool)
+        finally:
+            store.close()
+    except (StoreUnavailable, OSError):
+        return 0
 
 
 def _production_gate():

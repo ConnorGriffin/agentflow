@@ -255,7 +255,10 @@ def test_stale_waiting_generation_cannot_reset_a_newer_attempt(make_coord):
 
     current.cycle("claude", now=0)
     winning_token = record_of(current, identity).launch_token
-    fake.end(identity, cause=ProviderCause.CAPACITY, reset_at=100)
+    # A recoverable (non-capacity) interruption exercises the stale-generation guard while still
+    # consuming the attempt — a provider-declared capacity reset now refunds it (#305), which would
+    # muddy this test's subject.
+    fake.end(identity, cause=ProviderCause.SERVER, reset_at=100)
     current.cycle("claude", now=0)
     advanced = record_of(current, identity)
     assert advanced.state == "waiting" and advanced.attempts == 1

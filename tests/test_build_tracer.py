@@ -28,7 +28,7 @@ def test_operator_pacing_is_charged_only_after_a_confirmed_start(make_coord, mon
     gate = coordinated_build._production_gate()
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool: PoolStatus(tool, True, 10.0, active=True))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0, active=True))
     fake = FakeSession()
 
     class FirstLaunchMisses:
@@ -67,7 +67,7 @@ def test_interactive_turn_admits_under_a_not_clear_pool(make_coord, monkeypatch)
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
     monkeypatch.setattr(
         "agentflow.balancer._query_pool",
-        lambda tool: PoolStatus(tool, False, 47.0, reason="a session was active in the last 10m"))
+        lambda tool, **_: PoolStatus(tool, False, 47.0, reason="a session was active in the last 10m"))
     fake = FakeSession()
     coord = make_coord(fake, gate=gate)
     ask = coord.submit_stage(_converse())
@@ -87,7 +87,7 @@ def test_interactive_turn_defers_only_when_no_permit_fits(make_coord, monkeypatc
     gate = coordinated_build._production_gate()
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool: PoolStatus(tool, True, 10.0))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0))
     fake = FakeSession()
     coord = make_coord(fake, gate=gate)
     background = coord.submit_stage(_build())  # demand 5 — the whole pool
@@ -108,7 +108,7 @@ def test_interactive_start_leaves_the_background_pace_slot_intact(monkeypatch):
     from agentflow.coordinator.record import Record
     gate = coordinated_build._production_gate()
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool: PoolStatus(tool, True, 10.0, active=True))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0, active=True))
     ask = Record(identity="ask", stage="converse", pool="claude", demand=2, repo="o/r",
                  subject="c1", interactive=True)
     background_a = Record(identity="a", stage="build", pool="claude", demand=5, repo="o/r",
@@ -130,7 +130,7 @@ def test_interactive_flag_never_admits_a_disabled_stage(monkeypatch):
     from agentflow.coordinator.record import Record
     gate = coordinated_build._production_gate()
 
-    def _boom(tool):
+    def _boom(tool, **_):
         raise AssertionError("stage gate must refuse before the pool is queried")
 
     monkeypatch.setattr("agentflow.balancer._query_pool", _boom)
@@ -160,12 +160,12 @@ def test_codex_launch_honors_weekly_unattended_budget(monkeypatch):
 
     # Short window clear, but weekly at 29% is over the 11.4% released — launch defers.
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(29.0))))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(29.0))))
     assert coordinated_build._production_gate()(codex) is False
 
     # Weekly under the released budget — the same queued build launches.
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(5.0))))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(5.0))))
     assert coordinated_build._production_gate()(codex) is True
 
 
