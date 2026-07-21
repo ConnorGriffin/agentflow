@@ -7,9 +7,11 @@ import subprocess
 from hashlib import sha256
 from pathlib import Path
 
+from agentflow import github
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import PROVIDER_INPUT_V1
 from agentflow.intake import IntakeResult, apply_intake, intake_prompt, intake_result_is_durable
+from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 
 def intake_submission(cfg, issue: dict, extra: str, tool: str) -> Submission | None:
@@ -17,7 +19,7 @@ def intake_submission(cfg, issue: dict, extra: str, tool: str) -> Submission | N
     from agentflow.loop import _run
     n = issue["number"]
     target = issue.get("_intake_target") if extra else None
-    source_path = Path(cfg.workdir) / ".agentflow" / "worktrees" / f"{tool}-intake" / f"issue-{n}"
+    source_path = WorktreeRef.for_intake(cfg.workdir, tool, n).path
     snapshot = {
         "number": n, "title": issue.get("title", ""), "body": issue.get("body") or "",
         "labels": [label.get("name", "") for label in issue.get("labels", [])],
@@ -49,11 +51,11 @@ def reset_worktree(record) -> bool:
         return False
     if not isinstance(source_ref, str) or not source_ref:
         return False
-    wt = Path(record.source)
-    marker = f"/.agentflow/worktrees/{record.pool}-intake/issue-{record.subject}"
-    if marker not in record.source:
+    ref = _intake_ref(record)
+    if ref is None:
         return False
-    workdir = record.source.split("/.agentflow/worktrees/", 1)[0]
+    workdir = ref.workdir
+    wt = Path(ref.path)
     if wt.exists():
         _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt)])
     runner = ClaudeRunner() if record.pool == "claude" else CodexRunner()
@@ -83,45 +85,51 @@ def dispose_worktree(record) -> bool:
     gone — a stubborn checkout that could not be removed returns ``False`` so settlement retries
     rather than retiring over ambiguous evidence."""
     from agentflow.loop import _run
-    if not record.source:
+    ref = _intake_ref(record)
+    if ref is None:
         return False
-    marker = f"/.agentflow/worktrees/{record.pool}-intake/issue-{record.subject}"
-    if marker not in record.source:
-        return False
-    workdir = record.source.split("/.agentflow/worktrees/", 1)[0]
-    wt = Path(record.source)
+    workdir = ref.workdir
+    wt = Path(ref.path)
     if wt.exists():
         _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt)])
     return not wt.exists()
 
 
+def _intake_ref(record) -> WorktreeRef | None:
+    """The record's source parsed as its own ``<pool>-intake/issue-<subject>`` checkout, or
+    ``None`` if the source is absent, malformed, or belongs to a different subject/pool/kind —
+    the single guard both worktree operations share (ADR 0041)."""
+    ref = WorktreeRef.parse(record.source)
+    if ref is None or ref.kind is not WorktreeKind.INTAKE \
+            or ref.tool != record.pool or str(ref.number) != str(record.subject):
+        return None
+    return ref
+
+
 def intake_claim_ready(record) -> bool:
     """Prove the durable Intake record still owns GitHub's triaging claim before admission."""
-    from agentflow.loop import TRIAGING, _run
-    viewed = _run(["gh", "issue", "view", str(record.subject), "--repo", record.repo,
-                   "--json", "labels"])
-    if viewed.returncode != 0:
+    from agentflow.loop import TRIAGING
+    labels = github.issue_labels(record.repo, int(record.subject))
+    if labels is None:   # fail closed: a read that couldn't reach GitHub stays unknown
         return False
-    try:
-        labels = json.loads(viewed.stdout or "{}").get("labels", [])
-    except ValueError:
-        return False
-    return TRIAGING in {label.get("name") for label in labels if isinstance(label, dict)}
+    return TRIAGING in labels
 
 
 def apply_route(record, result: IntakeResult) -> str | None:
     """Idempotently project the already-durable route, proving it before claim release."""
-    from agentflow.loop import _release_triage, _run
+    from agentflow.loop import _release_triage
     try:
         snapshot = json.loads(record.input_ptr or "")["snapshot"]
         number = int(record.subject)
     except (ValueError, KeyError, TypeError):
         return None
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "title,labels"])
-    if viewed.returncode != 0:
+    # The live title + labels read in one snapshot doesn't fit a typed helper, so it goes
+    # through the module's named escape hatch (ADR 0040); None means GitHub couldn't be
+    # reached and the route is not projected.
+    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "title,labels"], parse_json=True)
+    if not isinstance(issue, dict):
         return None
-    issue = json.loads(viewed.stdout or "{}")
     labels = [label.get("name", "") for label in issue.get("labels", [])]
     source_title = snapshot.get("title", "")
     source_body = snapshot.get("body", "")
@@ -146,16 +154,17 @@ def apply_route(record, result: IntakeResult) -> str | None:
 def hold_intake(record) -> str | None:
     """Create Intake's single exhaustion handoff and notification."""
     from agentflow.intake import _held
-    from agentflow.loop import _release_triage, _run
+    from agentflow.loop import _release_triage
     from agentflow.notify import notify
     number = int(record.subject)
     reason = record.hold_reason or "continuation budget exhausted"
     result = _held(reason)
-    viewed = _run(["gh", "issue", "view", str(number), "--repo", record.repo,
-                   "--json", "title,labels,comments"])
-    if viewed.returncode != 0:
+    # Multi-field live read via the named escape hatch (ADR 0040); None means GitHub
+    # couldn't be reached, so the hold is not projected.
+    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
+                        "--json", "title,labels,comments"], parse_json=True)
+    if not isinstance(issue, dict):
         return None
-    issue = json.loads(viewed.stdout or "{}")
     apply_intake(record.repo, number, issue.get("title", ""),
                  [x.get("name", "") for x in issue.get("labels", [])], result)
     if not intake_result_is_durable(record.repo, number, result):
