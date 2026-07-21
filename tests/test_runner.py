@@ -336,7 +336,7 @@ def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
     _branch_worktree(repo, wt, branch, push=False)
     head = _git(wt, "rev-parse", "HEAD")
 
-    runner._open_pr_for_branch = lambda *_: (True, None)
+    runner._open_pr_for_branch = lambda *_: (True, False)
     with pytest.raises(subprocess.CalledProcessError):
         runner.prepare_worktree(str(repo), branch, wt, "owner/repo")
     assert wt.exists() and _git(wt, "rev-parse", "HEAD") == head
@@ -355,7 +355,7 @@ def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
     assert detached.exists() and _git(detached, "rev-parse", "HEAD") == detached_head
 
     _git(wt, "push", "-u", "origin", branch)
-    runner._open_pr_for_branch = lambda *_: (False, None)
+    runner._open_pr_for_branch = lambda *_: (False, False)
     with pytest.raises(subprocess.CalledProcessError):
         runner.prepare_worktree(str(repo), branch, wt, "owner/repo")
     assert wt.exists() and _git(wt, "rev-parse", "HEAD") == head
@@ -402,33 +402,31 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
     _git(foreign, "worktree", "add", "-b", "codex/foreign-open-pr", str(foreign_wt),
          "origin/main")
 
-    original_run = runner_mod._run
+    # State the GitHub facts through the github module's typed helpers (and the runner's own
+    # branch→PR-state helper) — never by matching a `gh` command line. Git plumbing stays real.
+    from agentflow import github
 
-    def fake_run(cmd, cwd=None, timeout=None):
-        if cmd[:3] == ["gh", "pr", "list"]:
-            branch = cmd[cmd.index("--head") + 1]
-            state = {
-                "agentflow/codex/issue-10-done": "OPEN",
-                "codex/legacy-fix": "MERGED",
-                "codex/second-legacy-fix": "MERGED",
-                "agentflow/codex/issue-11-dirty": "OPEN",
-                "agentflow/codex/issue-12-unpushed": "OPEN",
-                "agentflow/codex/issue-14-active-open-pr": "OPEN",
-                "codex/active-legacy": "OPEN",
-            }.get(branch, "")
-            return subprocess.CompletedProcess(cmd, 0, f"{state}\n" if state else "", "")
-        if cmd[:3] == ["gh", "pr", "view"]:
-            body = ('{"state":"OPEN","comments":['
-                    '{"body":"> *agentflow: parked for human review.*"}]}')
-            return subprocess.CompletedProcess(cmd, 0, body, "")
-        if cmd[:3] == ["gh", "issue", "view"]:
-            issue = int(cmd[3])
-            label = "agentflow:building" if issue == 14 else "ready-for-agent"
-            body = f'{{"state":"OPEN","labels":[{{"name":"{label}"}}],"comments":[]}}'
-            return subprocess.CompletedProcess(cmd, 0, body, "")
-        return original_run(cmd, cwd=cwd, timeout=timeout)
+    def fake_issue_labels(repo, issue):
+        return frozenset({"agentflow:building"}) if issue == 14 else frozenset({"ready-for-agent"})
 
-    monkeypatch.setattr(runner_mod, "_run", fake_run)
+    pr_state_by_branch = {
+        "agentflow/codex/issue-10-done": "OPEN",
+        "codex/legacy-fix": "MERGED",
+        "codex/second-legacy-fix": "MERGED",
+        "agentflow/codex/issue-11-dirty": "OPEN",
+        "agentflow/codex/issue-12-unpushed": "OPEN",
+        "agentflow/codex/issue-14-active-open-pr": "OPEN",
+        "codex/active-legacy": "OPEN",
+    }
+
+    monkeypatch.setattr(github, "issue_labels", fake_issue_labels)
+    monkeypatch.setattr(github, "issue_state", lambda repo, issue: "OPEN")
+    monkeypatch.setattr(github, "issue_comments", lambda repo, issue: [])
+    monkeypatch.setattr(github, "pr_state", lambda repo, pr: "OPEN")
+    monkeypatch.setattr(github, "pr_comments", lambda repo, pr: [
+        github.Comment(body="> *agentflow: parked for human review.*", created_at="")])
+    monkeypatch.setattr(runner_mod, "_pr_state_for_branch",
+                        lambda repo, branch: pr_state_by_branch.get(branch))
     child = subprocess.Popen(["sleep", "30"])
     try:
         with worktree_session(active_legacy):
@@ -453,6 +451,49 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
     registered = _git(repo, "worktree", "list", "--porcelain")
     assert str(completed) not in registered and str(legacy) not in registered
     assert str(foreign_wt) not in registered  # ownership comes from the foreign repo's metadata
+
+
+def test_open_pr_lookup_reports_presence_and_fails_closed(monkeypatch):
+    from agentflow import github
+
+    runner = ClaudeRunner()
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, head=None: None)
+    assert runner._open_pr_for_branch("o/r", "b") == (False, False)  # unreadable → unknown
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, head=None: [])
+    assert runner._open_pr_for_branch("o/r", "b") == (True, False)  # read ok, no open PR
+    monkeypatch.setattr(github, "list_open_prs",
+                        lambda repo, head=None: [github.PrRow(1, head, "sha")])
+    assert runner._open_pr_for_branch("o/r", "b") == (True, True)
+
+
+def test_pr_state_for_branch_reads_through_the_api_hatch_and_fails_closed(monkeypatch):
+    from agentflow import github
+
+    monkeypatch.setattr(github, "api", lambda args, parse_json=False: None)
+    assert runner_mod._pr_state_for_branch("o/r", "b") is None  # lookup failed → unknown
+    monkeypatch.setattr(github, "api", lambda args, parse_json=False: [])
+    assert runner_mod._pr_state_for_branch("o/r", "b") is None  # no PR ever opened
+    monkeypatch.setattr(github, "api", lambda args, parse_json=False: [{"state": "MERGED"}])
+    assert runner_mod._pr_state_for_branch("o/r", "b") == "MERGED"
+
+
+def test_recovery_retains_a_session_whose_github_facts_are_unreadable(tmp_path, monkeypatch):
+    repo = _repo_with_origin(tmp_path)
+    root = repo / ".agentflow" / "worktrees"
+    build = root / "codex" / "issue-30-unknown"
+    _branch_worktree(repo, build, "agentflow/codex/issue-30-unknown")
+
+    from agentflow import github
+
+    # A PR exists for the branch, but the issue's labels cannot be read, so completion is
+    # unknown. A fail-closed recovery keeps the session; it never removes it on an unconfirmed
+    # fact (an "empty == done" reading would wrongly delete recoverable work here).
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: None)
+    monkeypatch.setattr(runner_mod, "_pr_state_for_branch", lambda repo, branch: "OPEN")
+    report = recover_stale_worktrees("owner/repo", str(repo))
+    assert str(build) in report.retained
+    assert str(build) not in report.removed
+    assert build.exists()
 
 
 def _graph_project(path: Path) -> str:

@@ -23,6 +23,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from agentflow.worktree_ref import WorktreeKind, WorktreeRef
+
 _ACTIVE_WORKTREES: dict[str, int] = {}
 
 _CLAUDE_SANDBOX_SETTINGS = {
@@ -286,10 +288,10 @@ class _WorktreeRunner:
         if wt.exists():
             if not _worktree_is_registered(workdir, wt):
                 raise subprocess.CalledProcessError(1, ["git", "worktree", "list"])
-            verified, pr_url = self._open_pr_for_branch(repo, branch) if repo else (False, None)
+            verified, has_open_pr = self._open_pr_for_branch(repo, branch) if repo else (False, False)
             if not verified:
                 raise subprocess.CalledProcessError(1, ["gh", "pr", "list"])
-            if pr_url:
+            if has_open_pr:
                 return
             if not remove_worktree_if_safe(workdir, wt):
                 raise subprocess.CalledProcessError(1, ["git", "worktree", "remove"])
@@ -330,10 +332,16 @@ class _WorktreeRunner:
         wt.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
 
-    def _open_pr_for_branch(self, repo: str, branch: str) -> tuple[bool, str | None]:
-        r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
-                  "--state", "open", "--json", "url", "-q", ".[0].url // \"\""])
-        return r.returncode == 0, r.stdout.strip() or None
+    def _open_pr_for_branch(self, repo: str, branch: str) -> tuple[bool, bool]:
+        """Whether the open-PR lookup for ``branch`` could be made, and whether one exists.
+        Fail-closed: the first element is ``False`` only when the lookup itself failed, so an
+        unreadable answer never reads as "no open PR"."""
+        from agentflow import github
+
+        prs = github.list_open_prs(repo, head=branch)
+        if prs is None:
+            return False, False
+        return True, bool(prs)
 
 def _clamp_reasoning(level: str, ladder: tuple[str, ...]) -> str:
     """The reasoning rung this provider actually accepts for ``level``.
@@ -561,33 +569,17 @@ class CodexRunner(_WorktreeRunner):
 
 def _pr_state_for_branch(repo: str, branch: str) -> str | None:
     """The current state of the most recent PR for this branch across all states
-    (OPEN, MERGED, or CLOSED), or None when no PR has ever been opened for it."""
-    r = _run(["gh", "pr", "list", "--repo", repo, "--head", branch,
-              "--state", "all", "--json", "state", "-q", ".[0].state // \"\""])
-    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+    (OPEN, MERGED, or CLOSED), or None when no PR has ever been opened for it — or when
+    the lookup could not be made (fail-closed). Branch-scoped, all-state PR lookup has no
+    typed reader on the module, so it goes through the named ``api`` escape hatch."""
+    from agentflow import github
 
-
-def _pr_info(repo: str, pr: int) -> dict | None:
-    r = _run(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "state,comments"])
-    if r.returncode != 0:
+    rows = github.api(["pr", "list", "--repo", repo, "--head", branch,
+                       "--state", "all", "--json", "state"], parse_json=True)
+    if not isinstance(rows, list) or not rows:
         return None
-    try:
-        value = json.loads(r.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def _issue_state(repo: str, issue: int) -> dict | None:
-    r = _run(["gh", "issue", "view", str(issue), "--repo", repo,
-              "--json", "state,labels,comments"])
-    if r.returncode != 0:
-        return None
-    try:
-        value = json.loads(r.stdout or "{}")
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
+    state = rows[0].get("state") if isinstance(rows[0], dict) else None
+    return state if isinstance(state, str) and state else None
 
 
 def _registered_worktrees(workdir: str) -> list[tuple[str, str | None]] | None:
@@ -613,57 +605,91 @@ def _worktree_is_registered(workdir: str, wt: Path) -> bool:
     return any(os.path.realpath(path) == target for path, _ in registered)
 
 
-def _completed_agentflow_session(repo: str, lane: str, name: str,
-                                 branch: str | None) -> bool:
-    intake = re.fullmatch(r"(?:claude|codex)-intake", lane)
-    issue_match = re.fullmatch(r"issue-(\d+)", name)
-    if intake and issue_match and branch is None:
-        state = _issue_state(repo, int(issue_match.group(1)))
-        if state is None:
-            return False
-        labels = {label.get("name") for label in state.get("labels", [])
-                  if isinstance(label, dict)}
-        return (state.get("state") == "CLOSED" or bool(labels & {
-            "ready-for-agent", "agentflow:needs-grilling", "agentflow:needs-mockup"
-        })) and "agentflow:triaging" not in labels
+def _intake_done(repo: str, issue: int) -> bool:
+    """An intake is finished when the issue is closed or carries a post-triage label, and is
+    no longer mid-triage. Fail-closed: an unreadable state or label set reads as not-done."""
+    from agentflow import github
 
-    review = re.fullmatch(r"(?:claude|codex)-review", lane)
-    pr_match = re.fullmatch(r"pr-(\d+)-.+", name)
-    if review and pr_match and branch is None:
-        info = _pr_info(repo, int(pr_match.group(1)))
-        if info is None:
-            return False
-        return info.get("state") in ("MERGED", "CLOSED") or any(
-            "agentflow: parked for human review" in comment.get("body", "")
-            for comment in info.get("comments", []) if isinstance(comment, dict))
-
-    if lane not in ("claude", "codex") or branch is None:
+    state = github.issue_state(repo, issue)
+    labels = github.issue_labels(repo, issue)
+    if state is None or labels is None:
         return False
-    mockup = re.fullmatch(rf"agentflow/{lane}/mockup-(\d+)-.+", branch)
-    if mockup and name == branch.rsplit("/", 1)[-1]:
-        state = _issue_state(repo, int(mockup.group(1)))
-        if state is None:
-            return False
-        labels = {label.get("name") for label in state.get("labels", [])
-                  if isinstance(label, dict)}
-        if "agentflow:drawing-mockup" in labels:
-            return False
-        return any("mockup variants" in comment.get("body", "")
-                   for comment in state.get("comments", []) if isinstance(comment, dict))
-    current = re.fullmatch(rf"agentflow/{lane}/issue-(\d+)-.+", branch)
-    legacy = re.fullmatch(rf"{lane}/[^/]+", branch)
-    if current and name == branch.rsplit("/", 1)[-1]:
-        state = _issue_state(repo, int(current.group(1)))
-        if state is None:
-            return False
-        labels = {label.get("name") for label in state.get("labels", [])
-                  if isinstance(label, dict)}
-        if "agentflow:building" in labels:
-            return False
-        return _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED")
-    if legacy and name == branch.rsplit("/", 1)[-1]:
-        return _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED")
+    return (state == "CLOSED" or bool(labels & {
+        "ready-for-agent", "agentflow:needs-grilling", "agentflow:needs-mockup"
+    })) and "agentflow:triaging" not in labels
+
+
+def _review_done(repo: str, pr: int) -> bool:
+    """A review is finished when its PR has merged/closed or a parked-for-human note was posted.
+    Fail-closed: an unreadable state or comment thread reads as not-done."""
+    from agentflow import github
+
+    state = github.pr_state(repo, pr)
+    comments = github.pr_comments(repo, pr)
+    if state is None or comments is None:
+        return False
+    return state in ("MERGED", "CLOSED") or any(
+        "agentflow: parked for human review" in comment.body for comment in comments)
+
+
+def _mockup_done(repo: str, issue: int) -> bool:
+    """A mockup is finished when it is no longer being drawn and its variants have been posted.
+    Fail-closed: an unreadable label set or comment thread reads as not-done."""
+    from agentflow import github
+
+    labels = github.issue_labels(repo, issue)
+    comments = github.issue_comments(repo, issue)
+    if labels is None or comments is None:
+        return False
+    if "agentflow:drawing-mockup" in labels:
+        return False
+    return any("mockup variants" in comment.body for comment in comments)
+
+
+def _build_done(repo: str, issue: int, branch: str) -> bool:
+    """A build is finished when the issue is no longer building and a PR exists for its branch.
+    Fail-closed: an unreadable label set (or PR state) reads as not-done."""
+    from agentflow import github
+
+    labels = github.issue_labels(repo, issue)
+    if labels is None:
+        return False
+    if "agentflow:building" in labels:
+        return False
+    return _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED")
+
+
+def _session_is_complete(repo: str, ref: WorktreeRef, branch: str | None) -> bool:
+    """Whether the recognized agentflow session at ``ref`` (with git ``branch``, ``None`` when
+    detached) has finished all its work. The path's typed parts fix the kind and issue/PR number;
+    each kind's completion is confirmed against GitHub and fails closed. An intake and a review run
+    on detached checkouts (no branch); the build and mockup kinds must sit on the branch the layout
+    derives for them. Kinds with no completion rule (research, converse) are never auto-complete."""
+    if ref.kind is WorktreeKind.INTAKE:
+        return branch is None and _intake_done(repo, ref.number)
+    if ref.kind is WorktreeKind.REVIEW:
+        return branch is None and _review_done(repo, ref.number)
+    if ref.kind is WorktreeKind.MOCKUP:
+        return branch == ref.branch and _mockup_done(repo, ref.number)
+    if ref.kind is WorktreeKind.BUILD:
+        return branch == ref.branch and _build_done(repo, ref.number, branch)
     return False
+
+
+def _legacy_session_tool(owned_path: str, branch: str | None) -> str | None:
+    """The tool owning a pre-``agentflow/``-prefix legacy session, recognized by a
+    ``{tool}/{slug}`` branch whose tool names the checkout's lane and whose slug is the checkout's
+    own directory name; ``None`` for anything else (including the main checkout). Such a branch is
+    not a shape :class:`WorktreeRef` models, so it is matched here rather than through the layout
+    type."""
+    if branch is None:
+        return None
+    lane = Path(owned_path).parent.name
+    if lane not in ("claude", "codex"):
+        return None
+    if re.fullmatch(rf"{re.escape(lane)}/[^/]+", branch) and Path(owned_path).name == branch.rsplit("/", 1)[-1]:
+        return lane
+    return None
 
 
 def recover_stale_worktrees(repo: str, workdir: str,
@@ -680,26 +706,25 @@ def recover_stale_worktrees(repo: str, workdir: str,
     registered = _registered_worktrees(workdir)
     if registered is None:
         return WorktreeRecovery((), ())
-    root = os.path.realpath(Path(workdir) / ".agentflow" / "worktrees")
     removed: list[str] = []
     retained: list[str] = []
     for path, branch in registered:
         owned_path = os.path.realpath(path)
-        try:
-            relative = Path(owned_path).relative_to(root)
-        except ValueError:
-            continue
-        if len(relative.parts) != 2:
-            continue
-        lane, name = relative.parts
+        ref = WorktreeRef.parse(owned_path)
+        legacy_tool = _legacy_session_tool(owned_path, branch)
+        if ref is None and legacy_tool is None:
+            continue  # the main checkout or a path agentflow does not own
+        tool = ref.tool if ref is not None else legacy_tool
         if owned_path in protected:
             retained.append(path)
             continue
         if _worktree_is_active(Path(path)):
             retained.append(path)
             continue
-        if not _completed_agentflow_session(repo, lane, name, branch):
-            if lane.startswith(("claude", "codex")):
+        complete = (_session_is_complete(repo, ref, branch) if ref is not None
+                    else _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED"))
+        if not complete:
+            if tool in ("claude", "codex"):
                 retained.append(path)
             continue
         if remove_worktree_if_safe(workdir, Path(path)):
