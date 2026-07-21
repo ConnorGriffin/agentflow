@@ -12,6 +12,8 @@ import threading
 
 from agentflow import coordinated_build, loop
 from agentflow.balancer import pick_pair
+from agentflow.coordinator.quota_poll import refresh_claude_quota
+from agentflow.coordinator.store import default_store_path
 
 # Production limits are named here for the coordinator's one composed admission gate. They are
 # not counters: durable running rows are the only concurrency/permit ledger.
@@ -155,6 +157,17 @@ def _submit_repo(cfg, coordinator, _log) -> None:
     _run_and_log(cfg, "research", lambda: _submit_coordinated_research(cfg, coordinator, _log), _log)
 
 
+def _refresh_claude_quota(_log) -> None:
+    """Keep Claude's five-hour dispatch authority fresh from the provider before this pass reads it
+    (issue #309). `refresh_claude_quota` already owns its TTL and swallows every failure to a
+    ``None``; this outer guard is defense-in-depth for the dispatch-critical path (the poll shells
+    out via subprocess/urllib), so no unforeseen error there can ever sink a cycle."""
+    try:
+        refresh_claude_quota(default_store_path())
+    except Exception as e:  # noqa: BLE001 — a quota poll must never break dispatch
+        _log(f"claude quota poll error: {type(e).__name__}: {e}")
+
+
 def run_cycle(repos, *, submit_new: bool = True, coordinator=None, _log=None) -> None:
     """Submit new work when active, then always reconcile durable records.
 
@@ -163,6 +176,7 @@ def run_cycle(repos, *, submit_new: bool = True, coordinator=None, _log=None) ->
     the live board from durable running rows. There is no legacy or bypass mode.
     """
     _log = _log or (lambda _m: None)
+    _refresh_claude_quota(_log)
     coord = coordinator if coordinator is not None else coordinated_build.build_coordinator(_log)
     if submit_new:
         threads = [_spawn(lambda cfg=cfg: _submit_repo(cfg, coord, _log)) for cfg in repos]
