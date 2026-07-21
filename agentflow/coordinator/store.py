@@ -398,9 +398,11 @@ class Store:
 
         The delete is guarded exactly like a reservation: the durable row must still be the
         never-started ``waiting`` record the caller loaded — same revision, no attempt consumed, no
-        start fact, no live family. A concurrent instance that already advanced this identity (a
-        cycle that admitted it, a completed transfer) fails the compare-and-set, so a genuine
-        in-flight or completed build is never freed. Returns whether the row was removed.
+        successful start fact, no live family. ``not_started`` is safe to discard: the guarded
+        launcher proved that no provider family came into existence. A concurrent instance that
+        already advanced this identity (a cycle that admitted it, a completed transfer) fails the
+        compare-and-set, so genuine in-flight or completed work is never freed. Returns whether the
+        row was removed.
         """
         with self._lock:
             try:
@@ -412,7 +414,7 @@ class Store:
                     return False
                 current = self._decode(row[0])
                 if (current.revision != expected.revision or current.state != WAITING
-                        or current.attempts != 0 or current.start_fact is not None
+                        or current.attempts != 0 or current.start_fact not in {None, NOT_STARTED}
                         or current.process_alive):
                     self._conn.execute("ROLLBACK")
                     return False

@@ -11,7 +11,6 @@ from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck, compose
 from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
                             REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
                             _free_to_dispatch, _issues_in_flight, _native_blockers,
-                            _mockup_eligible, _next_mockup_issue,
                             _next_pr_awaiting_reply, _next_ready_issue, _next_resumable_issue,
                             _rebase_survivor, _untriaged, base_advanced, build_issue,
                             complexity_from_labels, conflict_already_flagged, effort_from_labels,
@@ -892,45 +891,6 @@ def test_awaiting_recheck_false_right_after_our_variant_comment():
     # ...and True only once the maintainer actually replies with a pick
     comments.append({"body": "B please", "author": {"login": "o"}})
     assert awaiting_recheck(comments, {"o"}) is True
-
-
-def test_mockup_eligible_picks_a_freshly_parked_issue():
-    # A needs-mockup issue with only intake's park comment (no variants drawn, no reply, no
-    # claim) is eligible for the produce phase.
-    issue = {"number": 5, "labels": [{"name": "agentflow:needs-mockup"}]}
-    comments = [{"body": _MOCKUP_PARK, "author": {"login": "o"}}]
-    assert _mockup_eligible(issue, comments, {"o"}) is True
-
-
-def test_mockup_eligible_skips_when_variants_already_drawn():
-    # One round per issue — a drawn issue (our MOCKUP_MARK comment) is never re-drawn.
-    issue = {"number": 5, "labels": [{"name": "agentflow:needs-mockup"}]}
-    comments = [{"body": _MOCKUP_PARK, "author": {"login": "o"}},
-                {"body": _MOCKUP_VARIANTS, "author": {"login": "o"}}]
-    assert _mockup_eligible(issue, comments, {"o"}) is False
-
-
-def test_mockup_eligible_skips_a_pending_reply_and_a_live_claim():
-    # A pending maintainer reply belongs to the resume path, not a re-draw; a live drawing claim
-    # means a session already owns it (no double-draw).
-    issue = {"number": 5, "labels": [{"name": "agentflow:needs-mockup"}]}
-    replied = [{"body": _MOCKUP_VARIANTS, "author": {"login": "o"}},
-               {"body": "the second one", "author": {"login": "o"}}]
-    assert _mockup_eligible(issue, replied, {"o"}) is False
-    claimed = {"number": 6, "labels": [{"name": "agentflow:needs-mockup"}, {"name": DRAWING}]}
-    assert _mockup_eligible(claimed, [{"body": _MOCKUP_PARK, "author": {"login": "o"}}], {"o"}) is False
-
-
-def test_next_mockup_issue_picks_the_fresh_parked_issue(monkeypatch):
-    # Regression (would fail before this change — the phase didn't exist): a needs-mockup issue
-    # with only intake's park comment is selected for a variant round.
-    row = _issue_row(11, ["agentflow:needs-mockup"])
-    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: [row])
-    monkeypatch.setattr(loop, "_issue_comments_or_none",
-                        lambda repo, n: [{"body": _MOCKUP_PARK, "author": {"login": "o"}}])
-    monkeypatch.setattr(loop, "intake_allowlist", lambda repo, wd: {"o"})
-    found = _next_mockup_issue(RepoConfig("o/r", "."))
-    assert found is not None and found["number"] == 11
 
 
 def test_produce_prompt_drives_ui_mockups_headless_and_one_marked_comment():

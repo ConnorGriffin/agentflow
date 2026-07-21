@@ -825,40 +825,6 @@ def _release_mockup(repo: str, n: int) -> None:
     github.remove_label(repo, n, DRAWING)
 
 
-def _has_mockup_variants(comments: list[dict]) -> bool:
-    """Pure. True once we've posted the variant round on this issue (a comment carrying
-    MOCKUP_MARK) — so the produce phase draws exactly one round, never a re-draw. Distinct from
-    intake's park/kickoff comment, which carries INTAKE_MARK but not this marker."""
-    return any(MOCKUP_MARK in c.get("body", "") for c in comments)
-
-
-def _mockup_eligible(issue: dict, comments: list[dict], allowlist: set[str] | None) -> bool:
-    """Pure (test surface). A `needs-mockup` issue is ready to draw when no variant round has
-    been posted yet, no maintainer reply is pending (that belongs to the resume path, ADR 0019),
-    and no drawing claim is live (dispatch dedup — no double-draw across cycles)."""
-    if DRAWING in {lbl["name"] for lbl in issue.get("labels", [])}:
-        return False
-    if _has_mockup_variants(comments):
-        return False
-    return not awaiting_recheck(comments, allowlist)
-
-
-def _next_mockup_issue(cfg: RepoConfig) -> dict | None:
-    """The oldest open `needs-mockup` issue ready for a variant round — none drawn yet, no
-    pending maintainer reply, unclaimed. None on a `gh` blip (fail closed — try next cycle)."""
-    rows = github.list_issues(cfg.repo, label="agentflow:needs-mockup", limit=50)
-    if rows is None:
-        return None
-    allowlist = intake_allowlist(cfg.repo, cfg.workdir)
-    for issue in sorted((_row_dict(r) for r in rows), key=lambda i: i["number"]):
-        comments = _issue_comments_or_none(cfg.repo, issue["number"])
-        if comments is None:
-            continue
-        if _mockup_eligible(issue, comments, allowlist):
-            return issue
-    return None
-
-
 # --- ADR 0009 merge-time floor: re-rebase survivors after main advances (issue #45) ---
 # When one PR merges, `main` moves and every other open agentflow PR that was parked
 # clean can silently go CONFLICTING. This pass re-rebases those survivors each cycle so a

@@ -9,7 +9,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentflow import dispatch, loop
+from conftest import FakeSession, record_of
+
+from agentflow import coordinated_build, dispatch, live, loop
+from agentflow.coordinator import MockupStageAdapter
+from agentflow.coordinator.providers import ProviderCause
 from agentflow.loop import RepoConfig
 
 
@@ -55,6 +59,97 @@ def test_active_cycle_submits_each_repo_then_reconciles_once(monkeypatch):
     assert sorted(submitted) == [("o/a", coord), ("o/b", coord)]
     assert reconciled == [coord]
     assert sorted(claims) == ["o/a", "o/b"]
+
+
+def test_cycle_withdraws_cold_mockup_but_recovers_started_continuation(
+        make_coord, monkeypatch):
+    fake = FakeSession()
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: True,
+        observer=fake,
+    )
+    old = make_coord(fake, adapter=adapter)
+    running = old.submit_stage(coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 11, "title": "Started", "body": "Draw it"}, "claude"))
+    old.cycle("claude")
+    fake.end(running, cause=ProviderCause.PROCESS)
+    cold = old.submit_stage(coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 12, "title": "Still held", "body": "Draw it"}, "claude"))
+    coord = make_coord(fake, adapter=adapter,
+                       disabled_cold_stages=frozenset({"mockup"}))
+    monkeypatch.setattr(live, "replace_projection", lambda records: None)
+    monkeypatch.setattr(coordinated_build, "reconcile_orphaned_claims", lambda *a, **k: 0)
+
+    dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
+                       coordinator=coord, _log=lambda _line: None)
+
+    assert coord.stage_record(cold) is None
+    resumed = record_of(coord, running)
+    assert resumed.state == "running" and resumed.continuation and resumed.attempts == 2
+
+
+def test_cycle_withdraws_a_mockup_reservation_that_never_started(
+        make_coord, monkeypatch):
+    fake = FakeSession()
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: True,
+        observer=fake,
+    )
+    old = make_coord(fake, adapter=adapter)
+    identity = old.submit_stage(coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 13, "title": "Reserved", "body": "Draw it"}, "claude"))
+    fake.crash_start = True
+    with pytest.raises(RuntimeError):
+        old.cycle("claude")
+    fake.crash_start = False
+    coord = make_coord(fake, adapter=adapter,
+                       disabled_cold_stages=frozenset({"mockup"}))
+    monkeypatch.setattr(live, "replace_projection", lambda records: None)
+    monkeypatch.setattr(coordinated_build, "reconcile_orphaned_claims", lambda *a, **k: 0)
+
+    dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
+                       coordinator=coord, _log=lambda _line: None)
+
+    assert coord.stage_record(identity) is None
+
+
+def test_cycle_keeps_a_capacity_blocked_mockup_restart_resume(
+        make_coord, monkeypatch):
+    fake = FakeSession()
+    adapter = MockupStageAdapter(
+        outcome_ready=lambda record, obs: False,
+        worktree_ready=lambda record: True,
+        observer=fake,
+    )
+    old = make_coord(fake, adapter=adapter, daemon_generation="old")
+    identity = old.submit_stage(coordinated_build.mockup_submission(
+        SimpleNamespace(repo="o/r", workdir="/w"),
+        {"number": 14, "title": "Restart", "body": "Draw it"}, "claude"))
+    old.cycle("claude")
+    fake.kill(identity)
+    fake.gate_open = False
+    restarted = make_coord(fake, adapter=adapter, daemon_generation="new",
+                           disabled_cold_stages=frozenset({"mockup"}))
+    monkeypatch.setattr(live, "replace_projection", lambda records: None)
+    monkeypatch.setattr(coordinated_build, "reconcile_orphaned_claims", lambda *a, **k: 0)
+
+    dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
+                       coordinator=restarted, _log=lambda _line: None)
+    dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
+                       coordinator=restarted, _log=lambda _line: None)
+
+    waiting = record_of(restarted, identity)
+    assert waiting.state == "waiting" and waiting.restart_resumes == 1
+    fake.gate_open = True
+    dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
+                       coordinator=restarted, _log=lambda _line: None)
+    resumed = record_of(restarted, identity)
+    assert resumed.state == "running" and resumed.restart_resumes == 1
 
 
 def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch):

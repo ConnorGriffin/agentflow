@@ -87,6 +87,17 @@ def test_withdraw_stage_refuses_a_started_build(make_coord):
     assert record_of(coord, identity).state == "running"   # left in flight
 
 
+def test_withdraw_stage_accepts_a_launch_proven_not_started(make_coord):
+    coord = make_coord(FakeSession(), launcher=NeverStartsLauncher())
+    identity = coord.submit_stage(Submission(repo="o/r", subject="7", stage="mockup",
+                                             pool="claude", complexity="deep"))
+    coord.cycle("claude")
+    assert record_of(coord, identity).start_fact == "not_started"
+
+    assert coord.withdraw_stage(identity) is True
+    assert coord.stage_record(identity) is None
+
+
 def test_legacy_lane_alias_never_turns_revise_into_build(make_coord):
     fake = FakeSession()
     coord = make_coord(fake)
