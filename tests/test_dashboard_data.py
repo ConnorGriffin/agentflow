@@ -1,6 +1,5 @@
-import json
-import re
-from types import SimpleNamespace
+from agentflow import github
+from agentflow.github import IssueRow, PipelinePrRow, SnapshotPrRow
 
 import agentflow.dashboard_data as dd
 from agentflow.dashboard_data import (
@@ -59,18 +58,22 @@ def test_park_reason_none_when_not_parked():
 
 # One repo's worth of live GitHub state: a ready issue (with effort), two held issues, four
 # parked PRs (one per reason) + one still-building PR that is NOT parked.
-_HELD = {
-    "agentflow:needs-grilling": [{"number": 10, "title": "held: real fork",
-                                  "updatedAt": "2026-07-13T10:00:00Z"}],
-    "agentflow:needs-mockup": [{"number": 11, "title": "held: needs a mockup",
-                                "updatedAt": "2026-07-13T11:00:00Z"}],
+_HELD_ROWS = {
+    "agentflow:needs-grilling": [
+        IssueRow(number=10, title="held: real fork", body="", labels=frozenset(),
+                 updated_at="2026-07-13T10:00:00Z"),
+    ],
+    "agentflow:needs-mockup": [
+        IssueRow(number=11, title="held: needs a mockup", body="", labels=frozenset(),
+                 updated_at="2026-07-13T11:00:00Z"),
+    ],
 }
-_OPEN_PRS = [
-    {"number": 20, "title": "drop pr", "headRefName": "agentflow/claude/issue-1", "mergedAt": None},
-    {"number": 21, "title": "merge-fail pr", "headRefName": "agentflow/codex/issue-2", "mergedAt": None},
-    {"number": 22, "title": "question pr", "headRefName": "agentflow/claude/issue-3", "mergedAt": None},
-    {"number": 23, "title": "ui-gap pr", "headRefName": "agentflow/codex/issue-4", "mergedAt": None},
-    {"number": 24, "title": "still building", "headRefName": "agentflow/claude/issue-5", "mergedAt": None},
+_OPEN_PR_ROWS = [
+    SnapshotPrRow(number=20, title="drop pr", head_ref_name="agentflow/claude/issue-1", merged_at=None),
+    SnapshotPrRow(number=21, title="merge-fail pr", head_ref_name="agentflow/codex/issue-2", merged_at=None),
+    SnapshotPrRow(number=22, title="question pr", head_ref_name="agentflow/claude/issue-3", merged_at=None),
+    SnapshotPrRow(number=23, title="ui-gap pr", head_ref_name="agentflow/codex/issue-4", merged_at=None),
+    SnapshotPrRow(number=24, title="still building", head_ref_name="agentflow/claude/issue-5", merged_at=None),
 ]
 _COMMENTS = {
     20: [_park("is a `reviewed` repo — a human merges") | {"createdAt": "2026-07-13T09:00:00Z"}],
@@ -81,30 +84,24 @@ _COMMENTS = {
     24: [{"body": "> *agentflow: reviewing…*\n\nno block yet", "createdAt": "2026-07-13T05:00:00Z"}],
 }
 
-
-def _fake_run(held=None):
-    held = _HELD if held is None else held
-
-    def run(args, **kw):
-        def ok(payload):
-            return SimpleNamespace(returncode=0, stdout=json.dumps(payload))
-        if args[1] == "issue":
-            if "ready-for-agent" in args:
-                return ok([{"number": 1, "title": "ready one",
-                            "labels": [{"name": "agentflow:complexity:standard"},
-                                       {"name": "agentflow:effort:heavy"}]}])
-            label = args[args.index("--label") + 1]
-            return ok(held.get(label, []))
-        if args[1] == "pr":
-            state = args[args.index("--state") + 1]
-            return ok(_OPEN_PRS if state == "open" else [])
-        return SimpleNamespace(returncode=0, stdout="[]")
-
-    return run
+_READY_ROW = IssueRow(number=1, title="ready one", body="", labels=frozenset([
+    "agentflow:complexity:standard", "agentflow:effort:heavy",
+]))
 
 
 def _patch(monkeypatch, held=None):
-    monkeypatch.setattr(dd, "_run", _fake_run(held))
+    held_rows = _HELD_ROWS if held is None else held
+
+    def fake_list_issues(repo, *, label=None, limit=100):
+        if label == "ready-for-agent":
+            return [_READY_ROW]
+        return held_rows.get(label, [])
+
+    def fake_list_prs(repo, state, *, limit=30):
+        return _OPEN_PR_ROWS if state == "open" else []
+
+    monkeypatch.setattr(github, "list_issues", fake_list_issues)
+    monkeypatch.setattr(github, "list_prs", fake_list_prs)
     monkeypatch.setattr(dd, "_pr_comments", lambda repo, n: _COMMENTS.get(n, []))
     monkeypatch.setattr(dd, "repo_profile", lambda workdir: "reviewed")
     monkeypatch.setattr(dd.ratchet, "status",
@@ -113,6 +110,7 @@ def _patch(monkeypatch, held=None):
 
 def test_repo_view_derives_held_and_parked(monkeypatch):
     _patch(monkeypatch)
+    from types import SimpleNamespace
     view = dd.repo_view(SimpleNamespace(repo="o/app", workdir="/tmp/app"))
 
     # effort rides alongside complexity on ready issues.
@@ -141,6 +139,7 @@ def test_held_and_parked_leave_when_resolved(monkeypatch):
     # Label removed → no held issues; every PR merged/closed → nothing open to park.
     _patch(monkeypatch, held={})
     monkeypatch.setattr(dd, "_prs", lambda repo, state: [])
+    from types import SimpleNamespace
     view = dd.repo_view(SimpleNamespace(repo="o/app", workdir="/tmp/app"))
     assert view["held"] == []
     assert view["parked"] == []
@@ -156,27 +155,42 @@ def test_issue_of_branch_recovers_the_issue_number():
     assert dd.issue_of_branch("") is None
 
 
+def _open_pr(number, head_ref, *, review_decision=None) -> PipelinePrRow:
+    return PipelinePrRow(number=number, title="", head_ref_name=head_ref, url=f"u/{number}",
+                         merged_at=None, merge_commit_oid=None,
+                         review_decision=review_decision, ci_rollup=[])
+
+
+def _merged_pr(number, head_ref, *, merge_commit_oid=None, review_decision=None,
+               ci_rollup=None) -> PipelinePrRow:
+    return PipelinePrRow(number=number, title="", head_ref_name=head_ref, url=f"u/{number}",
+                         merged_at="2026-07-17T00:00:00Z",
+                         merge_commit_oid=merge_commit_oid,
+                         review_decision=review_decision,
+                         ci_rollup=ci_rollup or [])
+
+
 def test_pipeline_state_building_when_no_pr_yet():
     pipe = dd.pipeline_state(155, open_prs=[], merged_prs=[])
     assert pipe["state"] == "building" and pipe["pr_number"] is None and pipe["pr_url"] is None
 
 
 def test_pipeline_state_pr_open_and_in_review():
-    open_prs = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200"}]
-    pipe = dd.pipeline_state(155, open_prs=open_prs, merged_prs=[])
+    pipe = dd.pipeline_state(155, open_prs=[_open_pr(200, "agentflow/claude/issue-155-x")],
+                             merged_prs=[])
     assert pipe["state"] == "pr_open" and pipe["pr_number"] == 200 and pipe["pr_url"] == "u/200"
 
-    reviewed = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200",
-                 "reviewDecision": "APPROVED"}]
-    pipe = dd.pipeline_state(155, open_prs=reviewed, merged_prs=[])
+    pipe = dd.pipeline_state(155,
+                             open_prs=[_open_pr(200, "agentflow/claude/issue-155-x",
+                                                review_decision="APPROVED")],
+                             merged_prs=[])
     assert pipe["state"] == "in_review" and pipe["review"] == "approved"
 
 
 def test_pipeline_state_merged_carries_evidence():
-    merged = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200",
-               "mergedAt": "2026-07-17T00:00:00Z", "mergeCommit": {"oid": "abc1234def"},
-               "reviewDecision": "APPROVED",
-               "statusCheckRollup": [{"conclusion": "SUCCESS"}, {"state": "SUCCESS"}]}]
+    merged = [_merged_pr(200, "agentflow/claude/issue-155-x",
+                         merge_commit_oid="abc1234def", review_decision="APPROVED",
+                         ci_rollup=[{"conclusion": "SUCCESS"}, {"state": "SUCCESS"}])]
     pipe = dd.pipeline_state(155, open_prs=[], merged_prs=merged)
     assert pipe["state"] == "merged" and pipe["pr_number"] == 200 and pipe["pr_url"] == "u/200"
     assert pipe["merge_commit"] == "abc1234def" and pipe["merged_at"] == "2026-07-17T00:00:00Z"
@@ -185,9 +199,8 @@ def test_pipeline_state_merged_carries_evidence():
 
 def test_pipeline_state_merged_wins_over_stale_open_pr():
     # A rebuild PR that merged supersedes any lingering open PR for the same issue.
-    open_prs = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200"}]
-    merged = [{"number": 210, "headRefName": "agentflow/codex/issue-155-y", "url": "u/210",
-               "mergeCommit": {"oid": "deadbeef"}}]
+    open_prs = [_open_pr(200, "agentflow/claude/issue-155-x")]
+    merged = [_merged_pr(210, "agentflow/codex/issue-155-y", merge_commit_oid="deadbeef")]
     assert dd.pipeline_state(155, open_prs=open_prs, merged_prs=merged)["state"] == "merged"
 
 
@@ -245,15 +258,13 @@ def test_respond_park_old_format_idempotency():
 
 
 def test_workspace_pipeline_reads_only_for_wanted_issues(monkeypatch):
-    open_prs = [{"number": 200, "headRefName": "agentflow/claude/issue-155-x", "url": "u/200"}]
-    merged = [{"number": 190, "headRefName": "agentflow/codex/issue-140-z", "url": "u/190",
-               "mergeCommit": {"oid": "cafef00d"}}]
+    open_pr = _open_pr(200, "agentflow/claude/issue-155-x")
+    merged_pr = _merged_pr(190, "agentflow/codex/issue-140-z", merge_commit_oid="cafef00d")
 
-    def run(args, **kw):
-        state = args[args.index("--state") + 1]
-        return SimpleNamespace(returncode=0,
-                               stdout=json.dumps(open_prs if state == "open" else merged))
-    monkeypatch.setattr(dd, "_run", run)
+    def fake_list_pipeline_prs(repo, state, *, limit=50):
+        return [open_pr] if state == "open" else [merged_pr]
+
+    monkeypatch.setattr(github, "list_pipeline_prs", fake_list_pipeline_prs)
 
     out = dd.workspace_pipeline("o/app", [155, 140])
     assert set(out) == {155, 140}

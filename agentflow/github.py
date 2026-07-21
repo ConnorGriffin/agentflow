@@ -46,6 +46,7 @@ class IssueRow:
     title: str
     body: str
     labels: frozenset[str]
+    updated_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,28 @@ class PrRow:
     number: int
     head_ref_name: str
     head_ref_oid: str
+
+
+@dataclass(frozen=True)
+class SnapshotPrRow:
+    """One PR row for the fleet snapshot — title and merge timestamp included."""
+    number: int
+    title: str
+    head_ref_name: str
+    merged_at: str | None
+
+
+@dataclass(frozen=True)
+class PipelinePrRow:
+    """One PR row for the workspace pipeline join — full evidence fields included."""
+    number: int
+    title: str
+    head_ref_name: str
+    url: str
+    merged_at: str | None
+    merge_commit_oid: str | None
+    review_decision: str | None
+    ci_rollup: list
 
 
 @dataclass(frozen=True)
@@ -164,9 +187,9 @@ def list_issues(repo: str, *, label: str | None = None,
                 limit: int = 100) -> list[IssueRow] | None:
     """The open issues in ``repo`` (optionally filtered to one ``label``) as typed rows,
     or ``None`` if the listing failed. An empty repo returns an empty list. This is a
-    discovery collection: it reads number/title/body/labels in one call by design."""
+    discovery collection: it reads number/title/body/labels/updatedAt in one call by design."""
     args = ["issue", "list", "--repo", repo, "--state", "open",
-            "--json", "number,title,body,labels", "--limit", str(limit)]
+            "--json", "number,title,body,labels,updatedAt", "--limit", str(limit)]
     if label is not None:
         args += ["--label", label]
     data = _read_json(args)
@@ -174,7 +197,8 @@ def list_issues(repo: str, *, label: str | None = None,
         return None
     return [
         IssueRow(number=row["number"], title=row.get("title", "") or "",
-                 body=row.get("body", "") or "", labels=_labels_of(row))
+                 body=row.get("body", "") or "", labels=_labels_of(row),
+                 updated_at=row.get("updatedAt") or None)
         for row in data if isinstance(row, dict) and isinstance(row.get("number"), int)
     ]
 
@@ -193,6 +217,42 @@ def list_open_prs(repo: str, *, head: str | None = None,
     return [
         PrRow(number=row["number"], head_ref_name=row.get("headRefName", "") or "",
               head_ref_oid=row.get("headRefOid", "") or "")
+        for row in data if isinstance(row, dict) and isinstance(row.get("number"), int)
+    ]
+
+
+def list_prs(repo: str, state: str, *, limit: int = 30) -> list[SnapshotPrRow] | None:
+    """PRs in ``repo`` with the given ``state`` as snapshot rows (number, title, branch,
+    merge timestamp), or ``None`` if the listing failed. No PRs returns an empty list."""
+    data = _read_json(["pr", "list", "--repo", repo, "--state", state,
+                       "--json", "number,title,headRefName,mergedAt", "--limit", str(limit)])
+    if not isinstance(data, list):
+        return None
+    return [
+        SnapshotPrRow(number=row["number"], title=row.get("title", "") or "",
+                      head_ref_name=row.get("headRefName", "") or "",
+                      merged_at=row.get("mergedAt") or None)
+        for row in data if isinstance(row, dict) and isinstance(row.get("number"), int)
+    ]
+
+
+def list_pipeline_prs(repo: str, state: str, *, limit: int = 50) -> list[PipelinePrRow] | None:
+    """PRs in ``repo`` with the given ``state`` as pipeline rows — full evidence fields
+    (review decision, CI rollup, merge commit) included for the workspace pipeline join
+    (ADR 0033). Returns ``None`` if the listing failed; no PRs returns an empty list."""
+    data = _read_json(["pr", "list", "--repo", repo, "--state", state, "--json",
+                       "number,title,headRefName,url,mergedAt,mergeCommit,"
+                       "reviewDecision,statusCheckRollup", "--limit", str(limit)])
+    if not isinstance(data, list):
+        return None
+    return [
+        PipelinePrRow(number=row["number"], title=row.get("title", "") or "",
+                      head_ref_name=row.get("headRefName", "") or "",
+                      url=row.get("url", "") or "",
+                      merged_at=row.get("mergedAt") or None,
+                      merge_commit_oid=(row.get("mergeCommit") or {}).get("oid") or None,
+                      review_decision=row.get("reviewDecision") or None,
+                      ci_rollup=row.get("statusCheckRollup") or [])
         for row in data if isinstance(row, dict) and isinstance(row.get("number"), int)
     ]
 
