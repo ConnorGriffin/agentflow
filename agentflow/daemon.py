@@ -90,6 +90,8 @@ REPOS = [
                os.path.expanduser("~/Code/ConnorGriffin/homelab")),
     RepoConfig("ConnorGriffin/dotfiles",  # reviewed: install.sh mutates the live machine
                os.path.expanduser("~/Code/ConnorGriffin/dotfiles")),
+    RepoConfig("ConnorGriffin/packing-checklist",  # reviewed: human merges
+               os.path.expanduser("~/Code/ConnorGriffin/packing-checklist")),
 ]
 
 
