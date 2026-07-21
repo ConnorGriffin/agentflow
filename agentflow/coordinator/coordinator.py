@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from agentflow.coordinator.admission import (
-    ATTEMPT_BUDGET, CODE_WRITING, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
+    ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
@@ -326,7 +326,7 @@ class Coordinator:
                 # An admission (permit/gate) refusal or a launch that never started blocks the
                 # pool head-of-line (ADR 0029); only a preparation miss is skipped, since it
                 # reserved nothing and can retry next cycle without holding capacity hostage.
-                if self._admit(record, now) not in ("started", "unprepared"):
+                if self._admit(record, now) not in ("started", "unprepared", "deferred"):
                     return outcomes
             for record in cold:
                 self._admit(record, now)
@@ -441,12 +441,18 @@ class Coordinator:
 
     def _admit(self, record: Record, now: int) -> str:
         """Try to start one attempt. Returns ``unprepared`` (the stage adapter refused before
-        admission — no permit, no attempt), ``blocked`` (admission/permits refused), ``started``
-        (a provider family exists and an attempt was consumed), or ``not_started`` (admitted but
-        no provider came into existence — no attempt consumed)."""
+        admission — no permit, no attempt), ``deferred`` (an issue-bound stage yielded the pool to
+        a waiting PR-bound stage — no permit, non-blocking, #293), ``blocked`` (admission/permits
+        refused), ``started`` (a provider family exists and an attempt was consumed), or
+        ``not_started`` (admitted but no provider came into existence — no attempt consumed)."""
         if not self._prepare(record):
             return "unprepared"
         if not self._begin_start(record, now):
+            # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
+            # deliberate yield, not a capacity refusal: it must not block the pool head-of-line, or
+            # the very review it is yielding to (processed later in the cycle) is never reached (#293).
+            if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
+                return "deferred"
             return "blocked"
         result = self._launcher.start(record, self._store)
         self._started_here.add(record.identity)
@@ -521,6 +527,21 @@ class Coordinator:
             record.state = WAITING
             self._persist(record)
 
+    def _pr_bound_waiting(self, pool: str, now: int) -> bool:
+        """Whether a PR-bound stage (review/revise/respond) is waiting and eligible to start on
+        ``pool`` right now. Issue-bound new work (build/mockup/intake) defers behind it at the
+        reservation ledger so one high-effort build cannot reserve all five permits while a
+        review that needs a single permit waits (#293, ADR 0039). Scoped to the same pool only —
+        permits are per-pool, and the review-migration path already re-places a review whose home
+        pool cannot seat it, so coupling pools here would invite a cross-pool deadlock. This
+        cannot deadlock: a genuinely stuck review exhausts its attempts and parks, leaving the
+        waiting set, at which point builds resume — a bounded pause, never a freeze."""
+        return any(
+            r.stage in PR_BOUND and r.pool == pool and r.state == WAITING
+            and not r.hold_pending and r.root is None
+            and r.attempts < ATTEMPT_BUDGET and r.eligible_at <= now
+            for r in self._records.values())
+
     def _begin_start(self, record: Record, now: int) -> bool:
         if (record.state != WAITING or record.hold_pending
                 or record.attempts >= ATTEMPT_BUDGET):
@@ -529,6 +550,8 @@ class Coordinator:
             return False  # no permit ledger to charge an unknown pool (ADR 0029)
         if record.stage in CODE_WRITING and record.pool != record.lineage:
             return False  # a code-writing stage may not silently leave its pinned lineage
+        if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
+            return False  # new issue work defers while a PR-bound stage waits to start (#293)
         if not self._gate(record):
             return False  # an independent admission gate (headroom, ceiling, cap, pacing)
         # Flip to a reservation and atomically claim demand plus any global admission limits

@@ -805,3 +805,42 @@ def test_blocked_pr_bound_head_does_not_let_issue_bound_leapfrog(make_coord):
     assert record_of(blocked, review).state == "waiting"
     assert record_of(blocked, build).state == "waiting"    # did not leapfrog the blocked head
     assert permits(blocked, "claude") == 0                  # nothing started this cycle
+
+
+# --- #293: issue-bound new work defers behind a waiting PR-bound stage at the reservation gate ---
+
+def test_a_waiting_review_defers_an_issue_bound_build_across_repos(make_coord):
+    """#293: a high-effort build continuation is admitted ahead of cold work (continuations run
+    first) and, at demand five, would reserve the whole pool — starving a review in *another* repo
+    that shares the pool. The reservation gate now holds any issue-bound stage back while a PR-bound
+    stage is waiting to start on the same pool, and the ledger is shared per pool, so the deferral
+    holds across repos: the review starts and the high-effort build waits. Fails before the fix —
+    the build continuation ran and left no permit for the review."""
+    fake = FakeSession()
+    seed = make_coord(fake)
+    build = seed.submit_stage(Submission(repo="o/b", subject="1", stage="build",
+                                         pool="claude", complexity="deep", effort="high"))
+    seed.cycle("claude", now=0)                             # build runs, reserves all five
+    assert permits(seed, "claude") == 5
+    fake.end(build, cause=ProviderCause.CAPACITY, reset_at=1)
+    seed.cycle("claude", now=0)                             # build → waiting continuation (eligible 1)
+
+    coord = make_coord(fake)
+    review = coord.submit_stage(Submission(repo="o/a", subject="9", stage="review", pool="claude"))
+    coord.cycle("claude", now=5)                            # both eligible; the review must win the pool
+    assert record_of(coord, review).state == "running"     # PR-bound admits, even from another repo
+    assert record_of(coord, build).state == "waiting"      # the high-effort build defers (#293)
+    assert permits(coord, "claude") == 1                    # only the review's single permit reserved
+
+
+def test_high_effort_build_still_takes_the_whole_pool_when_no_review_waits(make_coord):
+    """The #293 guard is scoped to a *waiting* PR-bound stage: with the review queue empty a
+    high-effort build (demand five) still reserves the entire pool, so builds are unaffected when
+    nothing is waiting to finish."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    build = coord.submit_stage(Submission(repo="o/r", subject="1", stage="build",
+                                          pool="claude", complexity="deep", effort="high"))
+    coord.cycle("claude")
+    assert record_of(coord, build).state == "running"      # no PR-bound stage waiting to defer it
+    assert permits(coord, "claude") == 5                    # full pool reserved

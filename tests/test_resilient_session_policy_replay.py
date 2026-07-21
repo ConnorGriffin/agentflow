@@ -150,7 +150,11 @@ def test_continuation_head_of_line_blocks_bypass_without_preempting_live_work(ma
     assert coord.cycle("claude", now=0) == []                # big not eligible yet; live runs
     assert permits(coord, "claude") == 1
 
-    cold = submit_root(coord, "claude-review")               # demand 1, could fit beside live
+    # The bypasser is issue-bound (a second intake): head-of-line blocking still holds it behind the
+    # blocked build continuation. A *PR-bound* bypasser (review/revise/respond) is the deliberate
+    # #293 exception — an issue-bound continuation yields the pool to waiting finishing-work rather
+    # than blocking it — and is exercised in tests/test_coordinator.py.
+    cold = submit_root(coord, "claude-intake", suffix="-2")  # demand 1, could fit beside live
     assert coord.cycle("claude", now=100) == []              # big is eligible but cannot fit
     assert permits(coord, "claude") == 1                      # cold did NOT bypass the blocked big
 

@@ -28,6 +28,12 @@ CODE_WRITING = frozenset({"build", "revise", "mockup", "respond"})
 # (ADR 0039). The tier is a pure function of the stage name — no per-record state.
 PR_BOUND = frozenset({"review", "revise", "respond"})
 
+# Stages whose subject is an issue with no PR yet — they create new work. At the reservation
+# gate one of these must defer while any PR-bound stage is waiting to start on the same pool,
+# so a single high-effort build cannot seize all five permits and starve a review that needs
+# one (#293, ADR 0039). Converse/research run in their own capped lanes and are out of scope.
+ISSUE_BOUND = frozenset({"build", "mockup", "intake"})
+
 # The one durable human handoff each stage creates when its budget is exhausted or a
 # permanent condition holds it (ADR 0028's exhaustion table).
 STAGE_NATIVE_HANDOFF = {
