@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
-from conftest import FakeSession, record_of, starts_until_held
+from conftest import FakeSession, permits, record_of, starts_until_held
 
 from agentflow import coordinated_intake, github, intake as intake_mod, loop
 from agentflow.coordinator import IntakeStageAdapter, Submission
@@ -415,18 +415,31 @@ def test_production_preparation_recreates_read_only_worktree(make_coord, monkeyp
     assert prepared == [("abc123", source)]
 
 
-def test_production_exhaustion_notifies_once(make_coord, monkeypatch):
-    fake = IntakeSession()
-    applied, released, notified = [], [], []
-    monkeypatch.setattr(github, "api",
-                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
-    monkeypatch.setattr(coordinated_intake, "apply_intake",
-                        lambda *args: applied.append(args))
-    monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
+def _hold_seams(monkeypatch, comments, *, applied, released, notified,
+                deliver=lambda: True):
+    """Wire the intake hold's shared-envelope seams: the durable comment thread it reads and
+    proves through (ADR 0042), the projection that posts the held-route comment, the claim
+    release, and the operator ping — all stated as facts, none as ``gh`` argument vectors."""
+    monkeypatch.setattr(github, "api", lambda *a, **k: {"title": "old", "labels": []})
+    monkeypatch.setattr(github, "issue_comments",
+                        lambda repo, number: None if comments is None
+                        else [github.Comment(body=body, created_at="") for body in comments])
+
+    def apply(repo, number, title, labels, result):
+        applied.append(number)
+        comments.append(result.body)  # the held-route comment is the durable handoff marker
+
+    monkeypatch.setattr(coordinated_intake, "apply_intake", apply)
     monkeypatch.setattr(loop, "_release_triage",
                         lambda repo, number: released.append(number) or True)
     monkeypatch.setattr("agentflow.notify.notify",
-                        lambda *args: notified.append(args) or True)
+                        lambda *args: notified.append(args) or deliver())
+
+
+def test_production_exhaustion_holds_and_notifies_once(make_coord, monkeypatch):
+    fake = IntakeSession()
+    applied, released, notified, comments = [], [], [], []
+    _hold_seams(monkeypatch, comments, applied=applied, released=released, notified=notified)
     adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
                                  apply_route=lambda *args: "proof",
                                  handoff=coordinated_intake.hold_intake)
@@ -436,20 +449,14 @@ def test_production_exhaustion_notifies_once(make_coord, monkeypatch):
     assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 2
     coord.cycle("claude")
 
-    assert len(applied) == 1 and released == [7] and len(notified) == 1
+    # The hold is posted once, the claim released, and the operator pinged exactly once.
+    assert applied == [7] and released == [7] and len(notified) == 1
 
 
-def test_exhaustion_retries_a_failed_notification_before_holding(make_coord, monkeypatch):
+def test_exhaustion_hold_is_idempotent_across_a_restart(make_coord, monkeypatch):
     fake = IntakeSession()
-    deliveries = iter((False, True))
-    notified = []
-    monkeypatch.setattr(github, "api",
-                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
-    monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
-    monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
-    monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
-    monkeypatch.setattr("agentflow.notify.notify",
-                        lambda *args: notified.append(args) or next(deliveries))
+    applied, released, notified, comments = [], [], [], []
+    _hold_seams(monkeypatch, comments, applied=applied, released=released, notified=notified)
     adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
                                  apply_route=lambda *args: "proof",
                                  handoff=coordinated_intake.hold_intake)
@@ -457,38 +464,34 @@ def test_exhaustion_retries_a_failed_notification_before_holding(make_coord, mon
     identity = coord.submit_stage(_submission())
 
     assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 2
-    assert len(notified) == 2
-    assert notified[0][3] == notified[1][3]  # ntfy replaces one stable client notification
-    assert record_of(coord, identity).notifications == 1
+    assert applied == [7] and len(notified) == 1
+
+    # A daemon restart replays the handoff over the durable comment marker: it re-proves the
+    # same hold and neither posts a second time nor pings again.
+    make_coord(fake, adapter=adapter).cycle("claude")
+    assert applied == [7] and len(notified) == 1
 
 
-def test_exhaustion_replay_after_accepted_delivery_updates_one_notification(make_coord,
-                                                                            monkeypatch):
+def test_exhaustion_holds_nothing_when_the_thread_is_unreadable(make_coord, monkeypatch):
+    """Fail closed: a comment read that could not reach GitHub stays unknown, so the hold is
+    never proven, no ping is sent, and the triaging claim is retained for a retry — an
+    unreadable thread is never silently treated as an empty one that completes the hold."""
     fake = IntakeSession()
-    notified = []
-    monkeypatch.setattr(github, "api",
-                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
-    monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
-    monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
-    monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
-    monkeypatch.setattr("agentflow.notify.notify",
-                        lambda *args: notified.append(args) or True)
-    delivered = [False]
-
-    def crash_after_first_delivery(record):
-        proof = coordinated_intake.hold_intake(record)
-        if proof is not None and not delivered[0]:
-            delivered[0] = True
-            return None  # daemon died before the coordinator persisted notification state
-        return proof
-
+    applied, released, notified = [], [], []
+    _hold_seams(monkeypatch, None, applied=applied, released=released, notified=notified)
     adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
                                  apply_route=lambda *args: "proof",
-                                 handoff=crash_after_first_delivery)
+                                 handoff=coordinated_intake.hold_intake)
     coord = make_coord(fake, adapter=adapter)
     identity = coord.submit_stage(_submission())
 
-    assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 2
-    assert len(notified) == 2
-    assert notified[0][3] == notified[1][3]
-    assert record_of(coord, identity).notifications == 1
+    held = False
+    for _ in range(12):
+        outcomes = coord.cycle("claude")
+        if any(o.identity == identity and o.status == "held" for o in outcomes):
+            held = True
+            break
+        if permits(coord, "claude") > 0:
+            fake.end(identity, cause=ProviderCause.NONE)
+    assert not held
+    assert applied == [] and released == [] and notified == []
