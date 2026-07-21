@@ -35,8 +35,11 @@ def _R(returncode=0, stdout=""):
 
 
 class FakeGitHub:
-    """A stateful stand-in for the ticket, its parent Decision Map, and the shared claim, routed by
-    the ``gh`` argv the finalizer runs through ``loop._run``."""
+    """A stateful stand-in for the ticket, its parent Decision Map, and the shared claim. The
+    finalizer's GitHub reads/writes are stated through the GitHub module's helpers (ADR 0040) —
+    the typed ``comment``/``close``/``edit_body`` writes and the ``api`` escape hatch — never by
+    matching a ``gh`` argument vector. ``run`` stands in for ``loop._run`` for the git worktree
+    cleanup that remains loop-owned."""
 
     def __init__(self, *, state="OPEN", title="Audit the widget path",
                  labels=("wayfinder:research", "wayfinder:resolving"),
@@ -48,48 +51,46 @@ class FakeGitHub:
         self.map_body = map_body
         self.comments: list[dict] = []
 
-    def run(self, argv):
-        if argv[0] == "git":
-            return _R(0)
-        head = argv[1:3]
-        if argv[1] == "api" and argv[2] == "graphql":
-            data = {"data": {"repository": {"issue": {"parent": {
+    # --- GitHub module seam (ADR 0040) ------------------------------------------------
+    def api(self, args, *, parse_json=False):
+        # The two escape-hatch reads the finalizer still reaches through — routed by their leading
+        # verb (a GraphQL parent-map lookup vs. an issue snapshot), never by matching a field vector.
+        if args[0] == "api":                       # GraphQL parent-map read
+            return {"data": {"repository": {"issue": {"parent": {
                 "number": self.map_number, "body": self.map_body,
                 "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
-            return _R(0, json.dumps(data))
-        if head == ["issue", "view"]:
-            fields = argv[argv.index("--json") + 1].split(",")
-            out = {}
-            if "state" in fields:
-                out["state"] = self.state
-            if "title" in fields:
-                out["title"] = self.title
-            if "comments" in fields:
-                out["comments"] = list(self.comments)
-            if "labels" in fields:
-                out["labels"] = [{"name": n} for n in self.labels]
-            if "url" in fields:
-                out["url"] = f"https://github.com/{REPO}/issues/{argv[3]}"
-            return _R(0, json.dumps(out))
-        if head == ["issue", "comment"]:
-            self.comments.append({"body": argv[argv.index("--body") + 1]})
-            return _R(0)
-        if head == ["issue", "close"]:
-            self.state = "CLOSED"
-            return _R(0)
-        if head == ["issue", "edit"]:
-            if "--body" in argv:
-                self.map_body = argv[argv.index("--body") + 1]
-            if "--remove-label" in argv:
-                lbl = argv[argv.index("--remove-label") + 1]
-                if lbl in self.labels:
-                    self.labels.remove(lbl)
-            if "--add-label" in argv:
-                self.labels.append(argv[argv.index("--add-label") + 1])
-            return _R(0)
-        if head == ["label", "create"]:
-            return _R(0)
-        raise AssertionError(f"unexpected gh call: {argv}")
+        return {"state": self.state, "title": self.title, "comments": list(self.comments),
+                "url": f"https://github.com/{REPO}/issues/{args[2]}"}
+
+    def comment(self, repo, number, body):
+        self.comments.append({"body": body})
+        return True
+
+    def close(self, repo, number):
+        self.state = "CLOSED"
+        return True
+
+    def edit_body(self, repo, number, body):       # the parent map's breadcrumb edit
+        self.map_body = body
+        return True
+
+    def release(self, repo, number):               # stands in for loop._release_resolving
+        if "wayfinder:resolving" in self.labels:
+            self.labels.remove("wayfinder:resolving")
+        return True
+
+    def run(self, argv):                           # loop._run: only the git worktree cleanup remains
+        assert argv and argv[0] == "git", f"unexpected non-git loop._run call: {argv}"
+        return _R(0)
+
+    def install(self, monkeypatch):
+        from agentflow import github
+        monkeypatch.setattr(github, "api", self.api)
+        monkeypatch.setattr(github, "comment", self.comment)
+        monkeypatch.setattr(github, "close", self.close)
+        monkeypatch.setattr(github, "edit_body", self.edit_body)
+        monkeypatch.setattr(loop, "_release_resolving", self.release)
+        monkeypatch.setattr(loop, "_run", self.run)
 
 
 def _adapter(fake):
@@ -195,8 +196,7 @@ def test_next_research_ticket_fails_closed_on_an_unreadable_blocker_graph(monkey
 def test_a_dispatched_ticket_ends_closed_with_findings_and_one_map_line(make_coord, coord_state,
                                                                         tmp_path, monkeypatch):
     gh = FakeGitHub()
-    monkeypatch.setattr(loop, "_run", gh.run)
-    monkeypatch.setattr("agentflow.github._run", gh.run)
+    gh.install(monkeypatch)
     fake = FakeSession()
     coord = _coord(make_coord, fake)
     cfg = RepoConfig(REPO, str(tmp_path / "wd"))
@@ -229,8 +229,7 @@ def test_resolution_replays_without_a_duplicate_comment_or_map_line(tmp_path, mo
     """A crash between the comment and the map edit (or after the ticket is closed) must not
     double-write: replaying the finalizer over the already-closed ticket is a no-op."""
     gh = FakeGitHub()
-    monkeypatch.setattr(loop, "_run", gh.run)
-    monkeypatch.setattr("agentflow.github._run", gh.run)
+    gh.install(monkeypatch)
     record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
     _write_findings(record, "the finding and its decision")
 
@@ -247,8 +246,7 @@ def test_resolution_replays_without_a_duplicate_comment_or_map_line(tmp_path, mo
 def test_exhaustion_releases_the_claim_so_the_ticket_is_eligible_again(make_coord, coord_state,
                                                                        tmp_path, monkeypatch):
     gh = FakeGitHub()
-    monkeypatch.setattr(loop, "_run", gh.run)
-    monkeypatch.setattr("agentflow.github._run", gh.run)
+    gh.install(monkeypatch)
     fake = FakeSession()
     coord = _coord(make_coord, fake)
     cfg = RepoConfig(REPO, str(tmp_path / "wd"))
