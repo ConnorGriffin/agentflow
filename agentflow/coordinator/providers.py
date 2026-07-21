@@ -212,7 +212,15 @@ def _claude_utilization_pct(info: dict):
 def _claude_quota_fact(info: dict, observed_at: int) -> QuotaFact | None:
     """Build a validated five-hour quota fact from a ``rate_limit_info``, or ``None``. Extracted
     for every status (allowed and rejected alike): an ``allowed`` reading is exactly the fresh
-    utilization the balancer needs to size headroom, not only the rejection that stops a run."""
+    utilization the balancer needs to size headroom, not only the rejection that stops a run.
+
+    Only a genuine ``five_hour`` event contributes: Claude Code's headless stream emits one window
+    at a time (the one in warning — often ``seven_day``), so without this guard a seven_day reading
+    would be mis-persisted as the five-hour authority (issue #309). The independent OAuth poll is
+    the primary producer; this stream fact only corroborates it when a five_hour event happens to
+    arrive."""
+    if info.get("rateLimitType") not in (None, "five_hour"):
+        return None
     pct = _claude_utilization_pct(info)
     resets_at = _epoch(info.get("resetsAt") or info.get("resets_at"))
     if pct is None or resets_at is None:

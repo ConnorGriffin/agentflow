@@ -243,7 +243,8 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
 
     allowed_spawners = {root / "coordinator" / "launcher.py",
                         root / "coordinator" / "_launch_child.py"}
-    allowed_subprocess_run = {root / "balancer.py", root / "notify.py", root / "runner.py"}
+    allowed_subprocess_run = {root / "balancer.py", root / "notify.py", root / "runner.py",
+                              root / "coordinator" / "quota_poll.py"}
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):

@@ -95,6 +95,30 @@ def test_claude_rejected_event_carries_both_the_capacity_cause_and_the_quota_fac
     assert obs.quota is not None and obs.quota.used_percent == 98.0
 
 
+def test_claude_seven_day_event_does_not_seed_the_five_hour_fact():
+    """The headless stream emits one window at a time — often ``seven_day`` (#309). Only a genuine
+    five-hour event may seed the five-hour dispatch authority, so a seven_day reading yields no
+    quota fact rather than being mis-persisted as five-hour headroom."""
+    obs = classify_claude(
+        [{"type": "rate_limit_event",
+          "rate_limit_info": {"status": "allowed_warning", "resetsAt": 5_000,
+                              "rateLimitType": "seven_day", "utilization": 0.59}}],
+        observed_at=1_000)
+    assert obs.cause is ProviderCause.NONE
+    assert obs.quota is None
+
+
+def test_claude_explicit_five_hour_event_still_seeds_the_fact():
+    """A genuine five-hour event is the one the extractor keeps — the corroborating source for the
+    independent poll (#309)."""
+    obs = classify_claude(
+        [{"type": "rate_limit_event",
+          "rate_limit_info": {"status": "allowed", "resetsAt": 5_000,
+                              "rateLimitType": "five_hour", "utilization": 0.42}}],
+        observed_at=1_000)
+    assert obs.quota is not None and obs.quota.used_percent == 42.0
+
+
 def test_claude_rate_limit_event_without_a_utilization_yields_no_quota_fact():
     """A malformed or absent utilization never becomes a fabricated reading — the fact stays
     ``None`` and the balancer fails closed on it rather than admitting at a bogus percentage."""
