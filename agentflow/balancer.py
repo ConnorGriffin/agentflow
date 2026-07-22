@@ -8,7 +8,12 @@ Claude's dispatch authority is the provider's own five-hour quota fact — the u
 and reset time Claude Code reports on its structured stream, persisted durably by the
 coordinator (`agentflow.coordinator.quota`, issue #305). The retired trailing-5h transcript
 proxy (`triage-gate.sh spend`) is a diagnostic only: it cannot gate dispatch, and it can
-never keep the pool blocked after the provider's five-hour window has reset. Codex still
+never keep the pool blocked after the provider's five-hour window has reset. Its one narrow
+exception is *bootstrap* (issue #309): when no provider fact exists yet — a cold pool, or a
+parked window that never observed its own reset — the balancer seeds dispatch from that proxy
+as an explicit estimate rather than deadlocking the whole fleet closed until an operator
+happens to run an interactive Claude turn. The estimate is never persisted as a provider fact,
+and the moment a real provider fact lands it wins. Codex still
 reports its rate-limit windows through the gate adapter. If only one pool has headroom, the
 builder runs there and the reviewer is None: the caller must NOT auto-merge (single-tool
 fallback, ADR 0003). If neither has headroom, no capacity this cycle.
@@ -21,7 +26,8 @@ provider's own five-hour quota fact (#305); the personal-tooling gate contribute
 operator active/idle fact and can no longer independently block Claude below this ceiling. Activity
 is *derived* from that gate's check: a block that clears once the recent-activity guard is skipped
 was an activity block, so it lowers the ceiling; genuine no-capacity for Claude is expressed by the
-quota fact (over-ceiling utilization, or a missing/stale fact that fails closed). The gate keeps
+quota fact (over-ceiling utilization; a missing fact falls back to the bootstrap estimate above,
+and only unknown gate output fails closed). The gate keeps
 excluding agentflow's own sessions (`AGENTFLOW_WT_MARK`) so the fleet never reads *itself* as the
 operator.
 
@@ -285,23 +291,35 @@ def _query_pool(tool: str, operator: bool = False, *,
     # ceiling: no lower gate can silently override it. The transcript proxy stays a diagnostic.
     fact = quota.read_quota(default_store_path(), "claude")
     usage = quota.effective_usage(fact, now) if fact is not None else None
+    observed_at = fact.observed_at if fact is not None else None
+    bootstrapping = False
     if usage is None:
-        # A missing, malformed, or stale provider fact fails closed — it is never read as zero. The
-        # reason distinguishes a cold start (no fact persisted yet) from a stale one, so a first
-        # deploy's bootstrapping pool is not mistaken for a wedged one. Bootstrap path: the first
-        # Claude session to run writes the fact. An operator-present/interactive turn is exempt from
-        # this gate (see the coordinator's production gate), so a human session seeds the first fact
-        # even before any unattended background session can pass.
-        reason = ("five-hour quota fact not yet observed — pool bootstrapping" if fact is None
-                  else "five-hour quota fact stale — holding")
-        return PoolStatus(tool, False, 100.0, reason, (), active, ceiling)
+        # No trustworthy provider fact yet — a cold pool before any Claude session has emitted
+        # one, or a parked window that never observed its own reset (issue #309). The provider
+        # fact has a single producer (a completed Claude session), and the only session allowed
+        # to run Claude *without* a fact is an interactive operator turn; an unattended fleet
+        # never produces one, so failing closed here deadlocks the whole pool. Instead of
+        # wedging, seed dispatch from a *bootstrap estimate*: the trailing-five-hour transcript
+        # proxy the gate already computes. It is explicitly an estimate — never persisted as a
+        # provider fact — and it is superseded the instant a real provider fact lands (the
+        # provider fact always wins, above). This lets a cold/parked fleet dispatch and thereby
+        # produce that first real fact instead of deadlocking on its absence. Unknown gate
+        # output still fails closed (parse_pct → 100%).
+        usage = parse_pct(_ck_stdout, 0)
+        observed_at = None
+        bootstrapping = True
     # Reserve conservative headroom for Claude work already admitted from the same observation, so
     # several launches cannot all pass one below-ceiling reading and collectively reach 100% (#305).
     under = usage + max(0.0, reserved_pct) < ceiling
     reason = (yield_reason if active and not under else
               ("" if under else
                f"five-hour utilization at {usage:.0f}% (ceiling {ceiling:.0f}%)"))
-    return PoolStatus(tool, under, usage, reason, (), active, ceiling, fact.observed_at)
+    if bootstrapping and reason:
+        # Mark that this reading is the bootstrap estimate, not a provider fact, so a deferral
+        # line reads "…· bootstrap estimate (no provider fact yet)" rather than looking like a
+        # measured over-ceiling utilization.
+        reason += " · bootstrap estimate (no provider fact yet)"
+    return PoolStatus(tool, under, usage, reason, (), active, ceiling, observed_at)
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,
