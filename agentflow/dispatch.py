@@ -87,6 +87,7 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
 
 def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
     from agentflow import coordinated_intake
+    from agentflow.coordinator.record import WAITING
 
     reserved: set[int] = set()
     submitted = []
@@ -108,8 +109,19 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
         submission = coordinated_intake.intake_submission(cfg, issue, extra, builder.tool)
         if submission is None:
             return f"#{issue['number']}: Intake source unreadable — deferring"
-        coordinator.submit_stage(submission)
+        identity = coordinator.submit_stage(submission)
+        record = coordinator.stage_record(identity)
+        # An idempotent resubmission whose stable identity already points at a terminal
+        # (completed/held/retired) Intake record created nothing to run. Claiming would
+        # stamp agentflow:triaging with no coordinator owner; orphan reconciliation would
+        # strip it and the next cycle would recreate it forever (#308). Reserve and skip.
+        if record is None or record.state != WAITING or record.hold_pending or record.retired:
+            reserved.add(issue["number"])
+            continue
         if not loop._claim_triage(cfg.repo, issue["number"]):
+            # Runnable submission but the claim mutation failed: withdraw the never-started
+            # WAITING record so no unowned Intake work survives, mirroring build_issue.
+            coordinator.withdraw_stage(identity)
             return f"#{issue['number']}: Intake record saved; claim pending — deferring admission"
         reserved.add(issue["number"])
         submitted.append(f"#{issue['number']} → {builder.tool}")

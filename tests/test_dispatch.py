@@ -289,6 +289,7 @@ def test_intake_skips_an_issue_a_live_pipeline_stage_already_owns(monkeypatch):
 
 def test_intake_still_claims_a_genuinely_new_issue(monkeypatch):
     from agentflow import coordinated_intake
+    from agentflow.coordinator.record import Record, WAITING
 
     def candidate(cfg, reserved=frozenset()):
         return None if 42 in reserved else ({"number": 42, "labels": []}, "")
@@ -300,11 +301,76 @@ def test_intake_still_claims_a_genuinely_new_issue(monkeypatch):
                         lambda *a, **k: SimpleNamespace(pool="claude"))
     claimed = []
     monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: claimed.append(n) or True)
-    coord = SimpleNamespace(submit_stage=lambda submission: None)
+    waiting = Record(identity="o/r|42|intake|-", stage="triage", pool="claude", demand=5,
+                     state=WAITING)
+    coord = SimpleNamespace(
+        submit_stage=lambda submission: "o/r|42|intake|-",
+        stage_record=lambda identity: waiting)
 
     result = dispatch._submit_coordinated_intake(RepoConfig("o/r", "/tmp"), coord, None)
     assert claimed == [42]
     assert "#42 → claude" in result
+
+
+def test_intake_does_not_claim_a_dedup_hit_on_a_completed_record(monkeypatch):
+    # An orphan-reclaim pass strips the triaging label of an already-completed Intake identity;
+    # the next cycle reselects the issue and resubmits the same stable identity. submit_stage is
+    # idempotent, so it reuses the terminal completed record and creates nothing to run. Dispatch
+    # must not re-stamp agentflow:triaging or report a false launch, or the label recreates
+    # forever (#308). Covers both a fresh-issue identity (target=None) and a reply-targeted one.
+    from agentflow import coordinated_intake
+    from agentflow.coordinator.record import Record, COMPLETED
+
+    for target, extra in (("-", ""), ("IC_kwreply", {"_intake_target": "IC_kwreply"})):
+        def candidate(cfg, reserved=frozenset(), extra=extra):
+            return None if 393 in reserved else ({"number": 393, "labels": []}, extra)
+
+        monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+        monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
+                            lambda cfg, lane=None: set())
+        monkeypatch.setattr(dispatch, "pick_pair",
+                            lambda: (SimpleNamespace(tool="claude"), None, ""))
+        monkeypatch.setattr(coordinated_intake, "intake_submission",
+                            lambda *a, **k: SimpleNamespace(pool="claude"))
+        monkeypatch.setattr(loop, "_claim_triage",
+                            lambda *a: pytest.fail("must not claim a terminal dedup no-op"))
+        completed = Record(identity=f"o/r|393|intake|{target}", stage="triage", pool="claude",
+                           demand=5, state=COMPLETED)
+        coord = SimpleNamespace(
+            submit_stage=lambda submission, target=target: f"o/r|393|intake|{target}",
+            stage_record=lambda identity: completed)
+
+        result = dispatch._submit_coordinated_intake(RepoConfig("o/r", "/tmp"), coord, None)
+        assert result == "no un-triaged issues"
+
+
+def test_intake_withdraws_the_submission_when_the_claim_fails(monkeypatch):
+    # A runnable submission whose GitHub claim mutation fails must withdraw the never-started
+    # WAITING record, so no unowned Intake work survives — mirrors build_issue's fail-closed
+    # rollback (#308).
+    from agentflow import coordinated_intake
+    from agentflow.coordinator.record import Record, WAITING
+
+    def candidate(cfg, reserved=frozenset()):
+        return None if 42 in reserved else ({"number": 42, "labels": []}, "")
+
+    monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(coordinated_intake, "intake_submission",
+                        lambda *a, **k: SimpleNamespace(pool="claude"))
+    monkeypatch.setattr(loop, "_claim_triage", lambda *a: False)
+    waiting = Record(identity="o/r|42|intake|-", stage="triage", pool="claude", demand=5,
+                     state=WAITING)
+    withdrawn = []
+    coord = SimpleNamespace(
+        submit_stage=lambda submission: "o/r|42|intake|-",
+        stage_record=lambda identity: waiting,
+        withdraw_stage=lambda identity: withdrawn.append(identity))
+
+    result = dispatch._submit_coordinated_intake(RepoConfig("o/r", "/tmp"), coord, None)
+    assert withdrawn == ["o/r|42|intake|-"]
+    assert "claim pending" in result
 
 
 def test_live_board_is_overwritten_from_the_durable_projection(tmp_path, monkeypatch):
