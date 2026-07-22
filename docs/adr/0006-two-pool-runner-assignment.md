@@ -56,6 +56,32 @@ If both durations are present, that short-window decision and weekly pacing must
 both permit dispatch. The gate reports usage, duration, and reset facts; it does
 not duplicate the weekly pacing decision.
 
+## Amendment (2026-07-22) — Claude is gated the same way: immediate headroom + a paced week
+
+Claude and Codex now assign under the **same two-part rule**: a new unattended
+session may start only when both an immediate-window headroom check and a paced
+weekly allowance permit it. The two constraints are independent and both must
+hold.
+
+- **Immediate headroom.** Claude uses its provider five-hour window (utilization
+  plus conservative in-flight reservations must stay below the activity-adaptive
+  ceiling, [ADR 0025](0025-activity-adaptive-spend-ceiling.md)); Codex uses its
+  reported short window. This is the load-balancing signal and the dashboard
+  headroom reading — weekly pacing never replaces it.
+- **Paced weekly allowance.** Claude also carries a provider **seven-day** window,
+  paced by the identical rule Codex uses: 80% released in seven equal daily steps
+  from the window's own start, the first tranche available immediately, one more at
+  each 24-hour boundary, and reported usage must be *strictly* below the released
+  allowance.
+
+Each window is a separate durable fact with its own utilization, reset time,
+observation time, and provenance; updating one never erases the other, and a
+reset affects only its own constraint. Both windows are enforced when assigning
+builders and reviewers and again immediately before launch, so a queued Claude
+session defers if either window loses capacity between assignment and launch.
+Missing, malformed, stale, or temporally impossible required facts fail closed.
+Interactive turns keep their exemption; work already in flight is never stopped.
+
 ## Alternatives considered
 
 - **Cheapest tool builds.** Rejected: no marginal cost under flat-rate plans.

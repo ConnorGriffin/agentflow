@@ -31,15 +31,30 @@ def isolate_state(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _seed_claude_quota(used_percent, *, now=None, resets_at=None, observed_at=None):
+def _seed_claude_quota(used_percent, *, now=None, resets_at=None, observed_at=None,
+                       weekly_percent=1.0):
     """Persist a fresh Claude five-hour quota fact — the provider-authored dispatch authority the
-    balancer now reads instead of the retired transcript proxy (#305)."""
+    balancer reads instead of the retired transcript proxy (#305) — plus a fresh seven-day fact
+    under its released weekly allowance, so a pool with headroom clears both windows the balancer
+    now enforces (#315). A test that means to block on weekly pacing seeds a high `weekly_percent`
+    or its own seven-day fact with `_seed_claude_weekly`."""
     now = int(time.time()) if now is None else int(now)
     resets_at = now + 4 * 60 * 60 if resets_at is None else int(resets_at)
     observed_at = now if observed_at is None else int(observed_at)
     quota.record_quota(default_store_path(), quota.QuotaFact(
         pool="claude", used_percent=used_percent, resets_at=resets_at,
         observed_at=observed_at, provenance="claude:rate_limit_event"))
+    _seed_claude_weekly(weekly_percent, now=now)
+
+
+def _seed_claude_weekly(used_percent, *, now=None, resets_at=None, observed_at=None):
+    """Persist a fresh Claude seven-day quota fact — the paced weekly allowance window (#315)."""
+    now = int(time.time()) if now is None else int(now)
+    resets_at = now + 3 * 24 * 60 * 60 if resets_at is None else int(resets_at)
+    observed_at = now if observed_at is None else int(observed_at)
+    quota.record_quota(default_store_path(), quota.QuotaFact(
+        pool="claude", used_percent=used_percent, resets_at=resets_at,
+        observed_at=observed_at, provenance="oauth:seven_day", window=quota.SEVEN_DAY))
 
 
 # A stand-in for `triage-gate.sh` that models the two gates independently: `check`

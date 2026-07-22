@@ -18,6 +18,16 @@ reports its rate-limit windows through the gate adapter. If only one pool has he
 builder runs there and the reviewer is None: the caller must NOT auto-merge (single-tool
 fallback, ADR 0003). If neither has headroom, no capacity this cycle.
 
+**Paced weekly allowance (ADR 0006, issue #315).** Claude, like Codex, also gates on a *paced
+weekly allowance*: the provider's seven-day window, released 80% in seven equal daily steps from
+the window's own start. `_query_pool` reports the five-hour utilization (the load-balancing and
+dashboard signal — weekly pacing never replaces it) and carries the seven-day window along;
+`_claude_dispatch_status` (mirroring `_codex_dispatch_status`) layers the weekly constraint on at
+each dispatch decision — builder/reviewer assignment and the final launch recheck — so a queued
+Claude session defers if its weekly allowance is spent between assignment and launch. The
+seven-day window is a required fact: a missing or stale one fails closed independently of the
+five-hour bootstrap estimate.
+
 **Activity-adaptive ceiling (ADR 0025).** One named policy owns the effective ceiling: an idle
 pool dispatches up to `IDLE_CEILING_PCT` utilization, an operator-active pool only up to
 `ACTIVE_CEILING_PCT` and paced to `ACTIVE_PACE` new sessions/cycle (the pace is enforced by the
@@ -144,6 +154,30 @@ def _parse_codex_facts(
         return None
 
 
+def _weekly_released(elapsed_seconds: float) -> float:
+    """The unattended weekly allowance released ``elapsed_seconds`` into a seven-day window: 80%
+    split into seven equal daily steps, the first available immediately and one more at each
+    24-hour boundary measured from the window's own start (ADR 0006). Shared by both pools' weekly
+    pacing (#315) so Claude and Codex release the same allowance the same way."""
+    day = min(int(elapsed_seconds // _DAY_SECONDS), _WEEKLY_DAYS - 1)
+    return _WEEKLY_UNATTENDED_PCT * (day + 1) / _WEEKLY_DAYS
+
+
+def _weekly_over_pace(window: RateLimitWindow, now: float) -> str | None:
+    """The deferral reason when a seven-day window is over its released allowance right now, or
+    ``None`` when it permits unattended dispatch. A window whose fact does not sit inside its own
+    live span is stale and fails closed. Reported usage must be *strictly* below the released
+    allowance — usage equal to it blocks."""
+    starts_at = window.resets_at - window.window_minutes * 60
+    if not starts_at <= now < window.resets_at:
+        return "weekly limit facts are stale"
+    released = _weekly_released(now - starts_at)
+    if window.used_percent >= released:
+        return (f"weekly spend at {window.used_percent:g}% exceeds "
+                f"{released:.1f}% released for unattended work")
+    return None
+
+
 def _codex_pacing(windows: tuple[RateLimitWindow, ...], now: float) -> tuple[bool, str]:
     for window in windows:
         starts_at = window.resets_at - window.window_minutes * 60
@@ -151,14 +185,9 @@ def _codex_pacing(windows: tuple[RateLimitWindow, ...], now: float) -> tuple[boo
             return False, f"{window.window_minutes}-minute limit facts are stale"
         if window.window_minutes != _WEEKLY_WINDOW_MIN:
             continue
-        elapsed = now - starts_at
-        day = min(int(elapsed // _DAY_SECONDS), _WEEKLY_DAYS - 1)
-        released = _WEEKLY_UNATTENDED_PCT * (day + 1) / _WEEKLY_DAYS
-        if window.used_percent >= released:
-            return False, (
-                f"weekly spend at {window.used_percent:g}% exceeds "
-                f"{released:.1f}% released for unattended work"
-            )
+        over = _weekly_over_pace(window, now)
+        if over is not None:
+            return False, over
     return True, ""
 
 
@@ -177,6 +206,40 @@ def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
         status.clear and paced,
         status.spent_pct,
         status.reason if not status.clear else pace_reason,
+        status.windows,
+        status.active,
+        status.ceiling,
+        status.observed_at,
+    )
+
+
+def _claude_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
+    """Layer Claude's paced weekly allowance onto a five-hour `PoolStatus` (#315), the way
+    `_codex_dispatch_status` does for Codex. The five-hour decision already in `status` sizes
+    headroom and load-balances the pool; this ANDs in the independent seven-day constraint so a
+    queued Claude session defers if its weekly allowance was consumed since assignment.
+
+    The seven-day window is a *required* fact: a pool with no trustworthy weekly window fails
+    closed here, independent of any five-hour bootstrap estimate — matching the fail-closed
+    contract when a required window is unavailable or stale. A five-hour block keeps its own
+    reason; only a pool that clears the five-hour gate surfaces the weekly reason, so a deferral
+    line distinguishes a headroom block from a pacing block."""
+    weekly = next((w for w in (status.windows or ())
+                   if w.window_minutes == _WEEKLY_WINDOW_MIN), None)
+    if weekly is None:
+        # A five-hour block already blocking keeps its own reason (so a cold-pool bootstrap
+        # estimate still reads as such); only a pool that cleared five-hour surfaces the weekly
+        # fail-closed reason.
+        reason = status.reason if not status.clear else "weekly limit facts unavailable"
+        return PoolStatus(status.tool, False, status.spent_pct, reason,
+                          status.windows, status.active, status.ceiling, status.observed_at)
+    over = _weekly_over_pace(weekly, now)
+    paced = over is None
+    return PoolStatus(
+        status.tool,
+        status.clear and paced,
+        status.spent_pct,
+        status.reason if not status.clear else (over or ""),
         status.windows,
         status.active,
         status.ceiling,
@@ -227,8 +290,9 @@ def pick_reviewer(builder_tool: str) -> str | None:
     """Live: query both pools under the same unattended pacing `pick_pair` uses, then choose the
     reviewer per ADR 0020. See `choose_reviewer`. Returns None when no pool has headroom to
     review this cycle."""
-    cs = _query_pool("claude")
-    xs = _codex_dispatch_status(_query_pool("codex"), time.time())
+    now = time.time()
+    cs = _claude_dispatch_status(_query_pool("claude"), now)
+    xs = _codex_dispatch_status(_query_pool("codex"), now)
     return choose_reviewer(builder_tool, cs, xs)
 
 
@@ -319,7 +383,16 @@ def _query_pool(tool: str, operator: bool = False, *,
         # line reads "…· bootstrap estimate (no provider fact yet)" rather than looking like a
         # measured over-ceiling utilization.
         reason += " · bootstrap estimate (no provider fact yet)"
-    return PoolStatus(tool, under, usage, reason, (), active, ceiling, observed_at)
+    # Carry the provider's seven-day window (the paced weekly allowance, #315) so a dispatch site
+    # can layer weekly pacing on with `_claude_dispatch_status`. Raw `_query_pool` still reports the
+    # five-hour utilization as `spent_pct` for load balancing and dashboard headroom — weekly pacing
+    # never replaces it. A missing seven-day fact leaves the windows empty, so the wrapper fails
+    # closed on it independently of the five-hour bootstrap.
+    weekly_fact = quota.read_quota(default_store_path(), "claude", quota.SEVEN_DAY)
+    weekly_windows = (
+        (RateLimitWindow(weekly_fact.used_percent, _WEEKLY_WINDOW_MIN, weekly_fact.resets_at),)
+        if weekly_fact is not None else ())
+    return PoolStatus(tool, under, usage, reason, weekly_windows, active, ceiling, observed_at)
 
 
 def pick_pair(claude: _WorktreeRunner | None = None,
@@ -336,7 +409,9 @@ def pick_pair(claude: _WorktreeRunner | None = None,
     cs = _query_pool("claude", operator)
     xs = _query_pool("codex", operator)
     if not operator:
-        xs = _codex_dispatch_status(xs, time.time())
+        now = time.time()
+        cs = _claude_dispatch_status(cs, now)
+        xs = _codex_dispatch_status(xs, now)
     builder, reviewer = choose_pair(cs, xs, {"claude": claude, "codex": codex})
     if builder is not None:
         return builder, reviewer, ""
