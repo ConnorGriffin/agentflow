@@ -1,9 +1,10 @@
-"""The provider-authored five-hour quota fact — the Claude dispatch authority (#305).
+"""The provider-authored quota facts — the Claude dispatch authority (#305, #315).
 
-The fact is persisted per pool beside the records database, validated before use, and read
-reset-aware: once the observed window's reset has passed it reports no usage. A missing,
-malformed, or window-inconsistent fact fails closed (``None``) — it is never coerced into a
-fabricated zero-usage reading.
+Each window (five-hour and seven-day) is persisted as its own fact per pool beside the records
+database, validated against its own window length before use, and read reset-aware: once the
+observed window's reset has passed it reports no usage. Updating one window never erases the
+other. A missing, malformed, or window-inconsistent fact fails closed (``None``) — it is never
+coerced into a fabricated zero-usage reading.
 """
 
 from __future__ import annotations
@@ -11,12 +12,18 @@ from __future__ import annotations
 import json
 
 from agentflow.coordinator import quota
-from agentflow.coordinator.quota import FIVE_HOUR_SECONDS, QuotaFact, build_fact
+from agentflow.coordinator.quota import (FIVE_HOUR_SECONDS, SEVEN_DAY, SEVEN_DAY_SECONDS,
+                                         QuotaFact, build_fact)
 
 
 def _fresh(pool="claude", used=30.0, *, now=1_000_000):
     return QuotaFact(pool=pool, used_percent=used, resets_at=now + 4 * 3600,
                      observed_at=now, provenance="claude:rate_limit_event")
+
+
+def _fresh_weekly(pool="claude", used=10.0, *, now=1_000_000):
+    return QuotaFact(pool=pool, used_percent=used, resets_at=now + 3 * SEVEN_DAY_SECONDS // 7,
+                     observed_at=now, provenance="oauth:seven_day", window=SEVEN_DAY)
 
 
 def test_a_persisted_fact_survives_a_fresh_read(tmp_path):
@@ -81,7 +88,7 @@ def test_a_malformed_persisted_fact_reads_as_none(tmp_path):
     store = tmp_path / "records.db"
     quota.record_quota(store, _fresh())
     # Corrupt the on-disk fact: a bad utilization must fail closed, not admit at a bogus reading.
-    path = quota.quota_dir(store) / "claude.json"
+    path = quota.quota_dir(store) / "claude-five_hour.json"
     data = json.loads(path.read_text())
     data["used_percent"] = "lots"
     path.write_text(json.dumps(data))
@@ -93,5 +100,45 @@ def test_the_freshest_write_replaces_the_pool_fact_in_place(tmp_path):
     quota.record_quota(store, _fresh(used=20.0))
     quota.record_quota(store, _fresh(used=70.0))
     files = list(quota.quota_dir(store).iterdir())
-    assert len(files) == 1                                  # one fact per pool, replaced in place
+    assert len(files) == 1                                  # one fact per window, replaced in place
     assert quota.read_quota(store, "claude").used_percent == 70.0
+
+
+def test_the_two_windows_are_independent_durable_facts(tmp_path):
+    """Each window is its own fact: writing the seven-day fact never erases the five-hour one, and
+    each round-trips independently (#315)."""
+    store = tmp_path / "records.db"
+    quota.record_quota(store, _fresh(used=42.0))
+    quota.record_quota(store, _fresh_weekly(used=8.0))
+    assert {p.name for p in quota.quota_dir(store).iterdir()} == {
+        "claude-five_hour.json", "claude-seven_day.json"}
+    assert quota.read_quota(store, "claude").used_percent == 42.0                # untouched
+    assert quota.read_quota(store, "claude", SEVEN_DAY).used_percent == 8.0
+    # Refreshing one window leaves the other in place.
+    quota.record_quota(store, _fresh(used=55.0))
+    assert quota.read_quota(store, "claude").used_percent == 55.0
+    assert quota.read_quota(store, "claude", SEVEN_DAY).used_percent == 8.0
+
+
+def test_a_seven_day_fact_is_validated_against_its_own_window_length(tmp_path):
+    """The seven-day window is validated with its own length: a reset a few days out (temporally
+    fine for seven days but impossible for five hours) is a trustworthy weekly fact and reads back
+    reset-aware."""
+    store = tmp_path / "records.db"
+    now = 1_000_000
+    weekly = _fresh_weekly(used=12.0, now=now)
+    quota.record_quota(store, weekly)
+    assert quota.read_quota(store, "claude", SEVEN_DAY) == weekly
+    assert quota.effective_usage(weekly, now) == 12.0
+    # The same reset time would be temporally impossible for a five-hour window.
+    assert build_fact("claude", 12.0, weekly.resets_at, now, "p") is None
+
+
+def test_an_unknown_window_fails_closed(tmp_path):
+    """A fact naming a window with no defined length cannot be trusted, so it never builds or
+    reads back (fail closed)."""
+    now = 1_000_000
+    assert build_fact("claude", 10.0, now + 100, now, "p", window="fortnight") is None
+    store = tmp_path / "records.db"
+    quota.record_quota(store, QuotaFact("claude", 10.0, now + 100, now, "p", window="fortnight"))
+    assert quota.read_quota(store, "claude", "fortnight") is None

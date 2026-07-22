@@ -534,12 +534,15 @@ class _ProductionGate:
             reserved_pct = (self._running_permits(record.pool) * balancer.CLAUDE_INFLIGHT_RESERVE_PCT
                             if record.pool == "claude" else 0.0)
             status = balancer._query_pool(record.pool, reserved_pct=reserved_pct)
-            # Launch must honor the same codex unattended-spend pacing that `pick_pair` applies
-            # at submission (balancer._codex_dispatch_status): raw `_query_pool` only checks the
-            # short-window ceiling, so a codex stage queued while weekly headroom existed would
-            # otherwise launch after that weekly budget is exhausted.
+            # Launch must honor the same unattended weekly pacing that `pick_pair` applies at
+            # submission: raw `_query_pool` only checks the short/five-hour ceiling, so a stage
+            # queued while weekly headroom existed would otherwise launch after that weekly budget
+            # is exhausted. Both pools now carry a paced weekly allowance (#315), so each recheck is
+            # pool-specific — Codex via `_codex_dispatch_status`, Claude via `_claude_dispatch_status`.
             if status is not None and record.pool == "codex":
                 status = balancer._codex_dispatch_status(status, time.time())
+            elif status is not None and record.pool == "claude":
+                status = balancer._claude_dispatch_status(status, time.time())
         except Exception:
             return False
         if not status or not status.clear:

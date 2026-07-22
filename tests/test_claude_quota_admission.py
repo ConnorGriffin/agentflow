@@ -31,10 +31,16 @@ def _clear_activity_gate(tmp_path, monkeypatch):
     monkeypatch.setattr(balancer, "_GATE", str(gate))
 
 
-def _seed_claude_quota(used_percent, *, now, resets_at, observed_at):
+def _seed_claude_quota(used_percent, *, now, resets_at, observed_at, weekly_percent=1.0):
     quota.record_quota(default_store_path(), quota.QuotaFact(
         pool="claude", used_percent=used_percent, resets_at=resets_at,
         observed_at=observed_at, provenance="claude:rate_limit_event"))
+    # A fresh seven-day fact under its released weekly allowance, so admission clears both windows
+    # the balancer now enforces (#315) and these five-hour reproductions stay about the five-hour
+    # gate. A test that means to block on weekly pacing passes a high `weekly_percent`.
+    quota.record_quota(default_store_path(), quota.QuotaFact(
+        pool="claude", used_percent=weekly_percent, resets_at=now + 3 * 24 * 60 * 60,
+        observed_at=now, provenance="oauth:seven_day", window=quota.SEVEN_DAY))
 
 
 def test_a_new_provider_window_admits_claude_despite_a_high_transcript_proxy(

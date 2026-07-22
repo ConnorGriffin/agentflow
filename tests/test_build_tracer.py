@@ -8,6 +8,7 @@ the coordinator interface — never by poking private transitions.
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import replace
 
 import pytest
@@ -22,13 +23,23 @@ from agentflow.coordinator.record import Record
 from agentflow.loop import RepoConfig
 
 
+def _weekly_clear():
+    """A fresh Claude seven-day window well under its released weekly allowance, so a stubbed
+    clear pool also passes the paced weekly gate the launch admission now enforces (#315)."""
+    from agentflow.balancer import RateLimitWindow
+    now = time.time()
+    return RateLimitWindow(used_percent=1.0, window_minutes=10080,
+                           resets_at=now + 10080 * 60 - 3600)
+
+
 def test_operator_pacing_is_charged_only_after_a_confirmed_start(make_coord, monkeypatch):
     from agentflow.balancer import PoolStatus
     from agentflow.coordinator.launcher import NOT_STARTED, StartResult
     gate = coordinated_build._production_gate()
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool, **_: PoolStatus(tool, True, 10.0, active=True))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0, active=True,
+                                                     windows=(_weekly_clear(),)))
     fake = FakeSession()
 
     class FirstLaunchMisses:
@@ -87,7 +98,7 @@ def test_interactive_turn_defers_only_when_no_permit_fits(make_coord, monkeypatc
     gate = coordinated_build._production_gate()
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool, **_: PoolStatus(tool, True, 10.0))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(_weekly_clear(),)))
     fake = FakeSession()
     coord = make_coord(fake, gate=gate)
     background = coord.submit_stage(_build())  # demand 5 — the whole pool
@@ -108,7 +119,8 @@ def test_interactive_start_leaves_the_background_pace_slot_intact(monkeypatch):
     from agentflow.coordinator.record import Record
     gate = coordinated_build._production_gate()
     monkeypatch.setattr("agentflow.balancer._query_pool",
-                        lambda tool, **_: PoolStatus(tool, True, 10.0, active=True))
+                        lambda tool, **_: PoolStatus(tool, True, 10.0, active=True,
+                                                     windows=(_weekly_clear(),)))
     ask = Record(identity="ask", stage="converse", pool="claude", demand=2, repo="o/r",
                  subject="c1", interactive=True)
     background_a = Record(identity="a", stage="build", pool="claude", demand=5, repo="o/r",
