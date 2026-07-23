@@ -35,11 +35,13 @@ class ReviseStageAdapter:
     Production reuses the retained builder worktree and checks the real PR branch head.
     """
 
-    def __init__(self, *, revision_ready, worktree_ready=None, observer=None, handoff=None) -> None:
+    def __init__(self, *, revision_ready, worktree_ready=None, observer=None, handoff=None,
+                 uncertainty=None) -> None:
         self._revision_ready = revision_ready
         self._worktree_ready = worktree_ready or (lambda record: bool(record.source))
         self._observer = observer or ProviderObserver()
         self._handoff = handoff
+        self._uncertainty = uncertainty
 
     def prepare(self, record) -> bool:
         """Reuse the retained PR branch and worktree before admission (ADR 0030). Returns whether
@@ -59,6 +61,12 @@ class ReviseStageAdapter:
         how the reviser exited: a bad exit with the revision pushed completes; a clean exit that
         pushed nothing does not."""
         return bool(self._revision_ready(record, obs))
+
+    def capture(self, record, obs) -> str | None:
+        """Capture genuine conflict ambiguity as private durable state, never a PR comment."""
+        if self._uncertainty is None or not record.conflict_round:
+            return None
+        return self._uncertainty(record, obs)
 
     def recover(self, record, obs):
         """Revise reuses the retained PR-branch worktree across a continuation, so a continuation

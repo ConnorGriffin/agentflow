@@ -1,7 +1,7 @@
 """Review as the second coordinated stage (issue #104), driven through the public
-``submit_stage`` / ``cycle`` seam. Review binds to the exact PR head SHA, recreates its read-only
-checkout on continuation, completes only on a durable verdict for that SHA, may move pools when
-review safety allows it, and parks the PR on exhaustion — all asserted at the coordinator
+``submit_stage`` / ``cycle`` seam. Review binds to the exact PR head SHA, retains its writable
+checkout on continuation, completes only on a durable verdict for the final SHA, may move pools
+before starting when review safety allows it, and parks the PR on exhaustion — all asserted at the coordinator
 interface, never by poking private transitions. The Build → Review claim transfer and its crash
 boundaries are exercised here too, through a stage router that runs both live stages behind one
 coordinator.
@@ -25,13 +25,16 @@ from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, StageR
                                     tracer)
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
 from agentflow.coordinator.record import Record
+from agentflow.review_policy import ReviewState
 
 
 def _review(subject="7", *, pool="claude", target="sha-a", builder_lineage="codex",
-            source="/wt/pr-7-x", transfer_from=None):
+            source="/wt/pr-7-x", transfer_from=None, review_tainted=False):
     return Submission(repo="o/r", subject=subject, stage="review", pool=pool, complexity="deep",
                       target=target, source=source, builder_lineage=builder_lineage,
-                      transfer_from=transfer_from)
+                      transfer_from=transfer_from,
+                      review=ReviewState(
+                          change_author_tool=builder_lineage, tainted=review_tainted))
 
 
 def _review_adapter(fake, *, verdict, prep, handoff=None):
@@ -149,10 +152,9 @@ def test_checkout_recreation_failure_consumes_no_permit_or_attempt_and_keeps_the
 
 # --- a review continuation may move pools ------------------------------------------------
 
-def test_review_continuation_moves_to_an_available_pool_and_cannot_same_tool_auto_merge(
-        make_coord):
-    """A read-only review whose home pool cannot fit it moves to the available pool, recomputing
-    its admission demand there; landing on the builder's own tool strips auto-merge (ADR 0028)."""
+def test_writable_review_continuation_stays_on_its_reviewer_tool(make_coord):
+    """Once Review has launched it may own partial fixes, so a continuation stays on that reviewer
+    tool instead of silently handing writable work to the builder's pool (ADR 0047)."""
     fake = FakeSession()
     coord = make_coord(fake, adapter=_review_adapter(fake, verdict=[False], prep=[True]))
     # A cross-tool review of a claude-built PR, assigned to codex (demand 2). Cross-tool, so it
@@ -169,19 +171,18 @@ def test_review_continuation_moves_to_an_available_pool_and_cannot_same_tool_aut
     coord.cycle("codex", now=0)
     assert permits(coord, "codex") == 4
 
-    # r1 becomes eligible but codex is full, so it moves to claude — recomputing demand (1) and,
-    # because claude is the builder's tool, it can no longer auto-merge.
+    # r1 becomes eligible but codex is full. It must wait there: moving to claude could hand
+    # partially-authored review fixes to a different tool and erase cross-tool ownership.
     coord.cycle("claude", now=100)
     moved = record_of(coord, r1)
-    assert moved.pool == "claude" and moved.state == "running"
-    assert moved.demand == 1                          # recomputed for the destination pool
-    assert moved.auto_merge_allowed is False          # same-tool review cannot auto-merge
-    assert permits(coord, "claude") == 1
+    assert moved.pool == "codex" and moved.state == "waiting"
+    assert moved.lineage == "codex" and moved.auto_merge_allowed is True
+    assert permits(coord, "claude") == 0
 
 
 def test_a_code_writing_continuation_never_migrates(make_coord):
-    """Only a read-only review moves pools; a code-writing stage stays on its builder lineage even
-    when its pool is full (ADR 0028). A revise pinned to codex is never offered to claude."""
+    """A code-writing stage stays on its builder lineage after launch even when its pool is full
+    (ADR 0028). A revise pinned to codex is never offered to claude."""
     fake = FakeSession()
     coord = make_coord(fake)
     revise = coord.submit_stage(Submission(repo="o/r", subject="9", stage="revise", pool="codex",
@@ -193,7 +194,7 @@ def test_a_code_writing_continuation_never_migrates(make_coord):
     assert permits(coord, "claude") == 0
 
 
-# --- a review re-places when its home pool loses launch capacity (issue #202) -------------
+# --- a review waits for its selected independence tool -------------------------------------
 
 def _gate_blocking(*pools):
     """An admission gate that refuses launches on the named pools (e.g. one whose weekly budget
@@ -203,12 +204,10 @@ def _gate_blocking(*pools):
     return lambda record: record.pool not in blocked
 
 
-def test_a_frozen_fresh_review_migrates_when_its_pool_lost_launch_capacity(make_coord):
-    """A fresh review (never launched, zero attempts) whose home pool later loses launch capacity
-    — permit ledger empty but the launch gate now blocks it (weekly budget spent) — is re-placed
-    onto a pool that can launch it, keeping its immutable target and losing auto-merge when it
-    lands on the builder's own tool. Reproduces home-depot #22/#23; before the fix the record
-    freezes on codex forever because migration required a continuation and a full permit ledger."""
+def test_a_fresh_review_waits_when_its_selected_tool_lost_launch_capacity(make_coord):
+    """Reviewer selection is the independence gate. A fresh cross-tool review whose selected pool
+    later loses capacity waits there without consuming permits; the coordinator must not silently
+    turn autonomous work into a same-tool review."""
     fake = FakeSession()
     coord = make_coord(fake, gate=_gate_blocking("codex"),
                        adapter=_review_adapter(fake, verdict=[False], prep=[True]))
@@ -220,19 +219,17 @@ def test_a_frozen_fresh_review_migrates_when_its_pool_lost_launch_capacity(make_
     assert frozen.state == "waiting" and frozen.attempts == 0
     assert permits(coord, "codex") == 0
 
-    coord.cycle("claude", now=0)                      # re-placed onto claude, which can launch it
-    moved = record_of(coord, r)
-    assert moved.pool == "claude" and moved.state == "running"
-    assert moved.target == "sha-a"                    # immutable target unchanged
-    assert moved.auto_merge_allowed is False          # same-tool review cannot auto-merge
-    assert permits(coord, "claude") == 1
+    coord.cycle("claude", now=0)                      # same-tool pool must not adopt it
+    waiting = record_of(coord, r)
+    assert waiting.pool == "codex" and waiting.state == "waiting"
+    assert waiting.target == "sha-a" and waiting.auto_merge_allowed is True
+    assert permits(coord, "claude") == 0
 
 
 def test_a_review_stays_put_when_neither_pool_can_launch_it_then_lands_home_on_recovery(
         make_coord):
-    """No flapping: with both pools launch-blocked the review reverts cleanly to its home pool
-    each cycle (never a half-move), and once the home pool regains budget it launches at home
-    rather than being re-placed."""
+    """With both pools launch-blocked the review stays on its selected pool, then launches there
+    once that pool recovers."""
     fake = FakeSession()
     coord = make_coord(fake, gate=_gate_blocking("codex", "claude"),
                        adapter=_review_adapter(fake, verdict=[False], prep=[True]))
@@ -242,7 +239,7 @@ def test_a_review_stays_put_when_neither_pool_can_launch_it_then_lands_home_on_r
         coord.cycle("claude", now=0)
     parked = record_of(coord, r)
     assert parked.pool == "codex" and parked.state == "waiting" and parked.attempts == 0
-    assert parked.demand == 2                         # migration fields reverted — no half-move
+    assert parked.demand == 2
     assert parked.auto_merge_allowed is True          # still cross-tool while it stays home
     assert permits(coord, "claude") == 0
 
@@ -255,7 +252,7 @@ def test_a_review_stays_put_when_neither_pool_can_launch_it_then_lands_home_on_r
 
 def test_a_gate_blocked_code_writing_stage_never_migrates(make_coord):
     """Weekly-budget pacing of codex code-writing work is intended: a waiting revise whose codex
-    pool is launch-blocked stays on codex and is never offered to claude (only reviews move)."""
+    pool is launch-blocked stays on codex and is never offered to claude."""
     fake = FakeSession()
     coord = make_coord(fake, gate=_gate_blocking("codex"))
     revise = coord.submit_stage(Submission(repo="o/r", subject="9", stage="revise", pool="codex",
@@ -289,10 +286,9 @@ def test_exhaustion_parks_the_pr_once_with_one_handoff_and_notification(make_coo
     assert outcome is not None and outcome.status == "held"
     assert outcome.handoff == "pr:parked"
     rec = record_of(coord, ident)
-    # Review is read-only, so a clean/interrupted exit with no verdict owns no partial work to
-    # build on: after its initial attempt plus one targeted repair it parks rather than replaying
-    # an identical review a third time (#225) — still exactly one handoff and notification.
-    assert rec.attempts == 2 and rec.handoffs == 1 and rec.notifications == 1
+    # Review may retain partial fixes, so it gets the full initial + two continuation budget before
+    # parking — still exactly one handoff and notification.
+    assert rec.attempts == 3 and rec.handoffs == 1 and rec.notifications == 1
     assert rec.claim is False                          # claim released only at the park boundary
     assert handoffs == [ident]
     assert make_coord(fake, adapter=adapter).cycle("claude") == []
@@ -583,11 +579,12 @@ def _repo_with_origin(tmp_path: Path) -> Path:
     return repo
 
 
-def test_production_checkout_recreation_rebuilds_read_only_at_the_exact_sha(make_coord, tmp_path):
+def test_production_checkout_continuation_preserves_review_fixes_at_the_exact_sha(make_coord,
+                                                                                   tmp_path):
     """The PRODUCTION checkout edge (issue #120): ``coordinated_build._review_worktree_reset``
     wired as the Review adapter's prepare and driven through admission over a real git repo. It
-    creates the read-only checkout detached at the record's immutable target SHA, and a
-    continuation discards stale state and rebuilds at the SAME SHA even after the branch moved."""
+    creates a detached writable checkout at the record's immutable target SHA, and a continuation
+    preserves local review work even after the branch moved."""
     repo = _repo_with_origin(tmp_path)
     reviewed_sha = _git(repo, "rev-parse", "HEAD")
     wt = repo / ".agentflow" / "worktrees" / "codex-review" / "pr-42-x"
@@ -602,8 +599,8 @@ def test_production_checkout_recreation_rebuilds_read_only_at_the_exact_sha(make
     assert _git(wt, "rev-parse", "HEAD") == reviewed_sha   # the exact reviewed SHA
     assert _git(wt, "branch", "--show-current") == ""      # detached — review holds no branch
 
-    # The checkout goes stale and the branch moves on; the continuation's prepare discards the
-    # leftover state and rebuilds at the same immutable target SHA — never the moved head.
+    # The reviewer leaves a partial fix and the branch moves on; continuation preparation keeps the
+    # partial fix and same starting SHA rather than resetting its work away.
     (wt / "stale.txt").write_text("leftover")
     (repo / "README.md").write_text("moved\n")
     _git(repo, "commit", "-am", "branch moves on")
@@ -612,7 +609,7 @@ def test_production_checkout_recreation_rebuilds_read_only_at_the_exact_sha(make
     coord.cycle("claude")                              # re-admission re-runs the production prepare
     assert record_of(coord, ident).attempts == 2
     assert _git(wt, "rev-parse", "HEAD") == reviewed_sha
-    assert not (wt / "stale.txt").exists()             # stale state was discarded, not kept
+    assert (wt / "stale.txt").exists()                 # partial review work survives continuation
 
 
 def test_production_reset_self_heals_an_orphaned_review_checkout_dir(tmp_path):
@@ -689,9 +686,10 @@ def test_production_park_resolves_the_pr_from_the_review_worktree_and_parks_once
     re-observes it and never parks or notifies twice."""
     parked, notified, pr_comments = [], [], []
 
-    def _park(repo, pr, verdict, *, reason):
+    def _park(repo, pr, verdict, *, reason, missing_outcome, context, proof_marker):
         parked.append((repo, pr))
-        pr_comments.append({"body": "> *agentflow: parked for human review.*"})
+        pr_comments.append({
+            "body": f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->"})
 
     monkeypatch.setattr("agentflow.gate.park", _park)
     monkeypatch.setattr("agentflow.github.pr_comments",
@@ -765,12 +763,12 @@ def _completed_review_record(*, profile="reviewed"):
         auto_merge_allowed=True)
 
 
-def test_clean_reviewed_settlement_parks_once_and_returns_durable_proof(monkeypatch):
+def test_clean_reviewed_settlement_posts_one_summary_and_returns_durable_proof(monkeypatch):
     from agentflow.reviewer import Verdict
 
     record = _completed_review_record()
     comments = []
-    parked, notified = [], []
+    summarized = []
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
@@ -781,25 +779,22 @@ def test_clean_reviewed_settlement_parks_once_and_returns_durable_proof(monkeypa
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
 
-    def park(_repo, pr, _verdict, *, reason):
-        parked.append((pr, reason))
-        comments.append({"body": "> *agentflow: parked for human review.*"})
-
-    monkeypatch.setattr("agentflow.gate.park", park)
-    monkeypatch.setattr("agentflow.notify.notify",
-                        lambda *args, **kwargs: notified.append((args, kwargs)) or True)
+    monkeypatch.setattr(
+        "agentflow.gate.post_clean_review_summary",
+        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
+    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
 
     proof = coordinated_build._settle_review(record)
     assert proof == "https://github.com/o/r/pull/42"
-    assert len(parked) == 1 and len(notified) == 1
-    assert coordinated_build._settle_review(record) == proof
-    assert len(parked) == 1 and len(notified) == 1
+    assert summarized == [("o/r", 42)]
 
 
-def test_clean_autonomous_settlement_uses_full_merge_gate(monkeypatch):
+def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeypatch):
     from agentflow.reviewer import Verdict
 
     record = _completed_review_record(profile="autonomous")
+    record.review_tainted = True
+    record.review_taint_cleared = True
     merged, finished, label_edits = [], [], []
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
@@ -824,12 +819,43 @@ def test_clean_autonomous_settlement_uses_full_merge_gate(monkeypatch):
     assert label_edits == [("7", "ready-for-agent")]   # the merged issue's ready label is dropped
 
 
+def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch):
+    """A reviewer may start at sha-a, push sha-b, and merge only after re-reviewing sha-b. The
+    immutable stage target still proves the starting diff; ``final_sha`` is the merge boundary."""
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record(profile="autonomous")
+    verdict = Verdict(
+        clean=True, reviewed_sha="sha-a", final_sha="sha-b", pushed_sha="sha-b",
+        fixes=("Removed the stale helper",))
+    merged = []
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: verdict)
+    monkeypatch.setattr(coordinated_build, "_review_pr_facts",
+                        lambda _r: {"head": "sha-b", "state": "OPEN"})
+    monkeypatch.setattr(coordinated_build, "_review_pr_head", lambda _r: "sha-b")
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.gate.ci_is_green", lambda *args, **kwargs: True)
+    monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
+    monkeypatch.setattr("agentflow.gate.reply_pending", lambda _comments: False)
+    monkeypatch.setattr("agentflow.gate.squash_merge",
+                        lambda _repo, pr: merged.append(pr) or True)
+    monkeypatch.setattr("agentflow.github.remove_label", lambda *_args: True)
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    coordinated_build._REVIEW_CI_OBSERVED[record.identity] = True
+
+    assert coordinated_build._settle_review(record) == "https://github.com/o/r/pull/42"
+    assert merged == [42]
+
+
 def test_review_settlement_releases_claim_through_public_coordinator_seam(make_coord, monkeypatch):
     from agentflow.reviewer import Verdict
 
     fake = FakeSession()
     comments = []
-    parked = []
+    summarized = []
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
@@ -842,11 +868,9 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
                                             for c in comments])
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
 
-    def park(_repo, pr, _verdict, *, reason):
-        parked.append((pr, reason))
-        comments.append({"body": "> *agentflow: parked for human review.*"})
-
-    monkeypatch.setattr("agentflow.gate.park", park)
+    monkeypatch.setattr(
+        "agentflow.gate.post_clean_review_summary",
+        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
     adapter = ReviewStageAdapter(
         verdict_ready=lambda _record, _obs: True, worktree_reset=lambda _record: True,
         observer=fake, settle=coordinated_build._settle_review,
@@ -862,17 +886,17 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
     coord.cycle("claude")
     settled = record_of(coord, ident)
     assert settled.retired is True and settled.claim is False
-    assert len(parked) == 1
+    assert summarized == [("o/r", 42)]
     make_coord(fake, adapter=adapter).cycle("claude")
-    assert len(parked) == 1
+    assert summarized == [("o/r", 42)]
 
 
-def test_same_tool_autonomous_review_settles_to_park_without_waiting_for_ci(
+def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci(
         make_coord, monkeypatch):
     from agentflow.reviewer import Verdict
 
     fake = FakeSession()
-    comments, parked = [], []
+    comments, summarized = [], []
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
@@ -884,15 +908,13 @@ def test_same_tool_autonomous_review_settles_to_park_without_waiting_for_ci(
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
     monkeypatch.setattr("agentflow.gate.ci_is_green",
-                        lambda *args, **kwargs: pytest.fail("same-tool review must park before CI"))
+                        lambda *args, **kwargs: pytest.fail("forced same-tool review skips CI merge"))
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
 
-    def park(_repo, pr, _verdict, *, reason):
-        parked.append((pr, reason))
-        comments.append({"body": "> *agentflow: parked for human review.*"})
-
-    monkeypatch.setattr("agentflow.gate.park", park)
+    monkeypatch.setattr(
+        "agentflow.gate.post_clean_review_summary",
+        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
     adapter = ReviewStageAdapter(
         verdict_ready=lambda _record, _obs: True, worktree_reset=lambda _record: True,
         observer=fake, settle=coordinated_build._settle_review,
@@ -900,7 +922,8 @@ def test_same_tool_autonomous_review_settles_to_park_without_waiting_for_ci(
     coord = make_coord(fake, adapter=adapter)
     ident = coord.submit_stage(_review(
         pool="claude", builder_lineage="claude", target="sha-a",
-        source="/work/.agentflow/worktrees/claude-review/pr-42-fix"))
+        source="/work/.agentflow/worktrees/claude-review/pr-42-fix",
+        review_tainted=True))
     coord.cycle("claude")
     fake.end(ident, success=True, cause=ProviderCause.PROCESS)
     coord.cycle("claude")
@@ -909,7 +932,7 @@ def test_same_tool_autonomous_review_settles_to_park_without_waiting_for_ci(
     settled = record_of(coord, ident)
     assert settled.auto_merge_allowed is False
     assert settled.retired is True and settled.claim is False
-    assert len(parked) == 1
+    assert summarized == [("o/r", 42)]
 
 
 # --- pure Build → Review submission mapping ----------------------------------------------
@@ -923,7 +946,8 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     assert sub.pool == "codex" and sub.builder_lineage == "claude"     # cross-tool reviewer
     assert sub.transfer_from == "o/r|7|build|-"                        # assumes the build's claim
     assert sub.complexity == "deep"                                   # review is the deep net
-    assert "pr-42-fix-thing" in sub.source                            # read-only review worktree
+    assert "pr-42-fix-thing" in sub.source                            # detached review worktree
+    assert "`head-sha-123`" in sub.input_ptr                          # exact starting head contract
     # A build whose worktree is unreadable, or a missing head SHA, yields no submission.
     assert coordinated_build.review_submission(build, "", "codex", 42) is None
     assert coordinated_build.review_submission(
@@ -966,7 +990,7 @@ def test_review_identity_is_idempotent_per_exact_head(make_coord):
 
 
 def _diverged_review(*, target, subject="7", pool="codex", builder_lineage="claude", round=0):
-    """A cold Review holding its claim, at a read-only review worktree whose path encodes PR #26 —
+    """A cold Review holding its claim, at a review worktree whose path encodes PR #26 —
     the shape ``reconcile_and_project`` needs to recover the PR number for its live-head read."""
     return Submission(
         repo="o/r", subject=subject, stage="review", pool=pool, complexity="deep", target=target,
@@ -1013,7 +1037,11 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     stale = coord.submit_stage(_diverged_review(target="stale-sha", round=0))
     monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
-    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda tool: "codex")
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    choices = []
+    monkeypatch.setattr(
+        coordinated_build, "pick_reviewer",
+        lambda tool, **kwargs: choices.append((tool, kwargs)) or "codex")
 
     coordinated_build.reconcile_and_project(coord)
 
@@ -1027,6 +1055,7 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     assert successor.target == "live-sha" and successor.round == 0
     assert successor.builder_lineage == "claude"        # lineage carried forward
     assert successor.handoffs == 0                      # no human park
+    assert choices == [("claude", {"allow_same_tool": False})]
 
     coordinated_build.reconcile_and_project(coord)       # idempotent re-drive
     live = [r.identity for r in _records(coord) if r.stage == "review" and not r.retired]
@@ -1051,13 +1080,35 @@ def test_a_running_moved_head_review_terminates_before_opening_its_successor(mak
                         or submit_stage(submission))
     monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
-    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda tool: "codex")
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda tool, **kwargs: "codex")
 
     coordinated_build.reconcile_and_project(coord)
 
     assert events == [("kill", stale), ("submit", "live-sha")]
     assert record_of(coord, stale).retired is True
     assert record_of(coord, "o/r|7|review|live-sha").claim is True
+
+
+def test_a_running_review_is_not_killed_for_its_own_clean_push(make_coord, monkeypatch):
+    """A live-head move owned by Review's clean detached checkout is its bounded fix, not an
+    external supersession. Let it finish and emit the final-head verdict."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_diverged_review(target="start-sha", round=0))
+    coord.cycle("codex")
+    killed = []
+    monkeypatch.setattr(coordinated_build, "_review_checkout_owns_head",
+                        lambda _record, head: head == "fixed-sha")
+    monkeypatch.setattr(coordinated_build, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "fixed-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    assert killed == []
+    assert record_of(coord, ident).state == "running"
+    assert not [r for r in _records(coord) if r.target == "fixed-sha"]
 
 
 def test_a_moved_head_parks_once_when_the_revise_rounds_are_spent(make_coord, monkeypatch):

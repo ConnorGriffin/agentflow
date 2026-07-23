@@ -191,7 +191,10 @@ forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the bo
 
 Write the PR body for the human who merges it — plain language: what changed, why, and
 what to check, in the app's own domain terms. No jargon: no file/function/test names or
-CSS/API specifics (ADR 0018). If the change touches a user-facing surface (this repo's are:
+CSS/API specifics (ADR 0018). End it with `Review depth: Focused|Targeted|Full — <one short
+reason>`: Focused for exact housekeeping/evidence, Targeted for one contained behavior or
+journey, Full for connected behavior, sensitive information, permissions, safety, or competing
+product decisions. Small safety/permission changes are Full. If the change touches a user-facing surface (this repo's are:
 {surfaces}), you MUST ship before/after screenshots as proof it matches the locked mockup —
 both light and dark themes where the app has them. Capture them with the canonical harness:
 `node scripts/screenshots.mjs <config.json>` — write a small per-issue config (url, theme,
@@ -217,6 +220,15 @@ of guessing.""" + SHELL_CRIB
 
 REVISE_PROMPT = """Address the blocking review findings on PR #{n} in this worktree,
 push to the same branch, and keep the test suite green. Do NOT open a new PR.
+
+Make the implementation judgment yourself when the issue brief, current `main`, surrounding code,
+and tests establish a safe answer. A merge conflict is not by itself missing context: reconcile
+both intended behaviors wherever they are compatible; neither side wins merely because it is newer.
+When the choices encode genuinely incompatible product intent, do not silently preserve either
+side. Stop and post no intermediate PR comment, then
+return one private final line `CONFLICT-UNCERTAINTY: {{"options":["option A","option B"],
+"missing_guidance":"exact missing rule","recommendation":"your grounded recommendation"}}`.
+Agentflow gives that decision one narrow in-flow handoff to the other tool.
 
 Do not degrade the two charter gates while revising (ADR 0018):
 - If the PR touches a user-facing surface (this repo's are: {surfaces}), keep before/after
@@ -256,6 +268,8 @@ continuation after a partial outcome:
 - If the requested branch change is already committed and pushed beyond the baseline, do not
   make or push it again; finish only the still-missing reply.
 - If the reply exists but local work remains, finish and push that work without replying again.
+- Relevant work must be committed and pushed before the reply. Unrelated local scratch files are
+  outside the completion proof; do not delete user files merely to make the worktree globally clean.
 
 Their comment:
 ---
@@ -927,7 +941,23 @@ def _rebase_branch(cfg: RepoConfig, branch: str, wt: Path) -> RebaseResult:
 def _park_conflicted_survivor(cfg: RepoConfig, pr: int, n: int) -> None:
     """A survivor that no longer rebases clean: post one conflict notice (carrying our
     marker) and ping, so a conflicted survivor is never silent."""
-    body = f"> *{_CONFLICT_MARK}.*\n\n{_CONFLICT_REASON}"
+    body = (
+        f"> *{_CONFLICT_MARK}.*\n\n"
+        "## Maintainer decision needed\n\n"
+        "Affected behavior: the PR and current `main` cannot be combined automatically.\n\n"
+        "Options:\n"
+        "- Clarify how the two intended behaviors coexist and resume conflict resolution.\n"
+        "- Close the PR and retain current `main` behavior only.\n\n"
+        "Consequences: resolving may ship both compatible outcomes; closing drops the PR outcome.\n\n"
+        "Recommendation: state the intended behavior at the conflict, then resume this PR.\n\n"
+        "## Agent handoff\n\n"
+        f"Code locations: PR #{pr}'s conflicting diff against current `main`.\n\n"
+        f"Conflicting changes or unresolved facts: {_CONFLICT_REASON}\n\n"
+        "Checks: the rebase was attempted and aborted after Git reported conflicts; no conflicted "
+        "state was pushed.\n\n"
+        f"Retained work: issue #{n}'s existing PR branch remains unchanged.\n\n"
+        "Exact next action: record the intended behavior, then resume conflict resolution on this "
+        "same PR.")
     github.pr_comment(cfg.repo, pr, body)
     ratchet.record(cfg.repo, "parked")
     notify("agentflow needs you",
@@ -940,6 +970,99 @@ def _issue_acceptance(cfg: RepoConfig, number: int) -> str | None:
     return github.issue_body(cfg.repo, number)
 
 
+_SAME_TOOL_REVIEW_WARNING = (
+    "Warning: same-tool review is not independent. This PR will be human-merge-only and marked "
+    "tainted until the other tool reviews the exact open head. Re-run with maintainer_confirmed=True "
+    "only after the maintainer explicitly confirms this trade-off.")
+
+
+def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
+              maintainer_confirmed: bool = False) -> str:
+    """Submit `/agentflow review <pr>` through the durable coordinator.
+
+    A forced same-tool review is never implicit: the first call returns the warning, and only an
+    explicit confirmed call submits the human-merge-only tainted review. Existing running review
+    work is never preempted; a waiting exact-head review may transfer its claim atomically.
+    """
+    from agentflow import coordinated_build
+    from agentflow.coordinator.store import StoreUnavailable
+
+    if force_same_tool and not maintainer_confirmed:
+        return _SAME_TOOL_REVIEW_WARNING
+    data = github.api([
+        "pr", "view", str(pr), "--repo", cfg.repo,
+        "--json", "headRefName,headRefOid,closingIssuesReferences,state",
+    ], parse_json=True)
+    if not isinstance(data, dict) or data.get("state") != "OPEN":
+        return "open PR facts unreadable"
+    branch, head = str(data.get("headRefName") or ""), str(data.get("headRefOid") or "")
+    match = _BRANCH_RE.match(branch)
+    if match is None or not head:
+        return "PR is not on a recognized agentflow issue branch"
+    builder_tool, branch_issue, slug = match.group(1), int(match.group(2)), match.group(3)
+    if builder_tool not in {"claude", "codex"}:
+        return "PR builder tool is unreadable"
+    closing = [
+        int(item["number"]) for item in data.get("closingIssuesReferences") or []
+        if isinstance(item, dict) and isinstance(item.get("number"), int)
+    ]
+    issue = closing[0] if closing else branch_issue
+    acceptance = _issue_acceptance(cfg, issue)
+    if acceptance is None:
+        return "issue acceptance unreadable"
+    try:
+        records = coordinated_build.tracer.load_records()
+    except StoreUnavailable:
+        return "coordinator state unreadable"
+    same_head = [
+        record for record in records
+        if record.stage == "review" and record.repo == cfg.repo
+        and str(record.subject) == str(issue) and record.target == head
+    ]
+    latest = max(
+        same_head,
+        key=lambda record: (
+            record.review_sequence, record.review_passes, record.created_at, record.identity),
+        default=None)
+    # Branch naming is durable builder lineage, not current authorship. A reviewer that pushed a
+    # fix became the author of the exact open head; manual re-review must preserve that provenance.
+    current_author = (
+        latest.change_author_tool if latest and latest.change_author_tool else builder_tool)
+    profile = repo_profile(cfg.workdir)
+    if force_same_tool:
+        reviewer_tool = current_author
+    else:
+        reviewer_tool = pick_reviewer(
+            current_author, allow_same_tool=profile != "autonomous")
+        if reviewer_tool is None:
+            return "no eligible reviewer pool available — deferring"
+    assignment, _changed_files = coordinated_build._review_assignment_facts(
+        cfg.repo, pr, profile=profile)
+    active = next((record for record in same_head if not record.retired), None)
+    if active is not None and active.state == "running":
+        return "exact-head review is already running; it was not preempted"
+    sequence = max((record.review_sequence for record in same_head), default=-1) + 1
+    from agentflow.review_policy import ReviewState
+    review = ReviewState(
+        assignment=assignment, change_author_tool=current_author,
+        reviewed_from_sha=head, sequence=sequence, tainted=force_same_tool)
+    submission = coordinated_build.survivor_review_submission(
+        cfg, issue=issue, slug=slug, builder_tool=builder_tool, head_sha=head,
+        reviewer_tool=reviewer_tool, pr_number=pr, acceptance=acceptance,
+        review=review, transfer_from=active.identity if active else None,
+        supersede=active is not None)
+    if submission is None:
+        return "review submission unavailable"
+    if active is None and not _claim(cfg.repo, issue):
+        return "could not claim PR review"
+    coordinator = coordinated_build.build_coordinator()
+    coordinator.submit_stage(submission)
+    coordinated_build.reconcile_and_project(coordinator)
+    status = "same-tool review submitted; maintainer merge required" if force_same_tool \
+        else "review submitted"
+    return status
+
+
 def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
                                branch_tool: str, branch: str) -> str:
     """Submit the rebased exact head as a fresh durable Review; never launch one directly."""
@@ -948,11 +1071,10 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
     if head.returncode != 0 or not head.stdout.strip():
         return "review head unreadable"
-    # Route the re-review through the same reviewer choice the openers use (ADR 0020): prefer the
-    # cross-tool reviewer, fall back to the builder's own tool when the other pool is out of
-    # budget, and defer when neither pool can launch — never submit into a pool that cannot start
-    # it, which is exactly what froze the reviews this path used to hardcode cross-tool.
-    reviewer_tool = pick_reviewer(branch_tool)
+    # Route the re-review through the same reviewer choice the autonomous openers use: require the
+    # cross-tool reviewer and defer while it cannot launch. Same-tool fallback would create a
+    # result that the autonomous profile is forbidden to merge.
+    reviewer_tool = pick_reviewer(branch_tool, allow_same_tool=False)
     if reviewer_tool is None:
         return "no reviewer pool available — deferring"
     acceptance = _issue_acceptance(cfg, n)
@@ -976,9 +1098,10 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
     """A survivor's re-rebase no longer applies: open a conflict Revise on the builder's own lineage
     to resolve it (ADR 0038) instead of parking. The Revise adopts the retained PR-branch worktree,
     is bound to the conflicting head SHA it must supersede, and is admitted ahead of cold build work.
-    Returns a status string once a conflict Revise is opened (or is already open for this head), or
-    ``None`` when the two-round conflict budget is spent — the caller then falls back to the existing
-    conflict notice and park. Never parks or force-merges here."""
+    Returns a status string once a conflict Revise is opened (or is already open for this head).
+    There is no PR-lifetime conflict cap: each genuinely new conflicting head gets its own bounded
+    stage attempts. ``None`` is reserved for an unreconstructable submission, where the caller uses
+    the human fallback. Never parks or force-merges here."""
     from agentflow import coordinated_build
     from agentflow.coordinator.store import StoreUnavailable
 
@@ -993,8 +1116,6 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
     priors = coordinated_build.conflict_revises_used(records, cfg.repo, n)
     if any(r.target == head_sha for r in priors):
         return f"#{pr}: conflict — revise already open"   # idempotent under re-reconcile
-    if len(priors) >= coordinated_build.MAX_CONFLICT_REVISES:
-        return None                                       # budget spent → caller parks
     conflict_round = len(priors) + 1
     submission = coordinated_build.survivor_conflict_revise_submission(
         cfg, issue=n, slug=sl, builder_tool=tool, head_sha=head_sha, pr_number=pr,
@@ -1011,8 +1132,8 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
 
 def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str:
     """Re-rebase one survivor and route the outcome by the repo's profile. On conflict, open a
-    conflict Revise to resolve it (ADR 0038); once the two-round conflict budget is spent, fall back
-    to the park-and-ping (every profile). On a clean re-rebase: `autonomous` reruns the merge gate
+    conflict Revise to resolve it (ADR 0038); park only when that stage cannot be reconstructed or
+    genuinely fails its bounded attempts. On a clean re-rebase: `autonomous` reruns the merge gate
     and lands one; `reviewed`/`guarded` just leave the PR mergeable again for the human — never a
     merge (ADR 0002)."""
     m = _BRANCH_RE.match(branch)

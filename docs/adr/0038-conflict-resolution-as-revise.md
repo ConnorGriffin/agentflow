@@ -28,8 +28,10 @@ Three prerequisites landed before this decision and make it safe:
 **When the survivor re-rebase pass hits a conflict, open a conflict Revise instead of
 parking.** The Revise runs on the builder's own lineage in the retained PR-branch
 worktree with a single finding: rebase onto current `main`, resolve the conflicts,
-keep the full test suite green. Where a resolution choice is ambiguous, preserve
-`main`'s behavior — `main` has already merged; the PR adapts to it, never the reverse.
+keep the full test suite green. Preserve every compatible behavior from both sides.
+Where the sides encode genuinely competing product intent, the resolver must not choose:
+it records exactly two options, missing guidance, and a recommendation for one private
+other-tool decision pass. If that pass still cannot decide, the PR parks for the maintainer.
 
 Scope and bounds, as decided:
 
@@ -43,10 +45,10 @@ Scope and bounds, as decided:
    autonomous repos, no auto-merge shortcut either. The fresh review's prompt gains
    one explicit lens: *verify the resolution did not silently discard `main`'s
    changes* (the `-X ours` hazard).
-3. **Two conflict Revises per PR lifetime.** Conflict rounds are budgeted separately
-   from finding-driven revise rounds. On the third conflict — or when a conflict
-   Revise exhausts its own attempts — the PR parks with the existing conflict notice.
-   The park is now the fallback, exactly as ADR 0009 intended the human's role.
+3. **Every new conflicting head gets a bounded Revise (amended by ADR 0047).** Conflict rounds
+   remain separate from finding-driven revise rounds, but there is no PR-lifetime count. The
+   coordinator's attempt budget bounds each logical conflict. Exhaustion or genuinely unsafe
+   ambiguity parks with the existing conflict notice; routine repeated `main` movement does not.
 4. **Conflict Revises jump the queue.** A conflict-blocked survivor is one merge from
    done; its Revise is admitted ahead of cold build submissions rather than queueing
    behind new work.
@@ -56,12 +58,12 @@ Scope and bounds, as decided:
 - Multi-PR bursts converge without operator rebasing; the operator sees conflicts
   only when the pipeline has genuinely failed twice.
 - A conflict resolution is agent-authored merge arbitration: the safety relies on
-  the fresh-review floor, not on trusting the resolution. The reviewer lens and the
-  preserve-`main` default are load-bearing; weakening either reopens the silent-drop
-  hazard.
-- The separate two-round budget adds one knob, accepted deliberately: sharing
-  MAX_REVISES would let a busy review cycle starve conflict recovery (and vice
-  versa) — the two failure modes are unrelated.
+  the fresh-review floor, not on trusting the resolution. The reviewer lens, compatible-behavior
+  preservation, and private decision handoff are load-bearing; weakening any of them reopens the
+  silent-drop hazard.
+- Conflict rounds keep distinct identities without adding a lifetime cutoff. Sharing
+  MAX_REVISES would let a busy review cycle starve conflict recovery (and vice versa) — the two
+  failure modes remain unrelated.
 - Queue-jumping trades a little new-build latency for faster drain of nearly-merged
   work, consistent with merge serialization already being the throughput bottleneck.
 

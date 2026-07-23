@@ -5,16 +5,19 @@ The one thing that must never happen: MERGE without independent review + green C
 """
 
 import time
+from pathlib import Path
 
 import pytest
 
 import agentflow.gate as gate
+from agentflow import github
 from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                             has_committed_evidence, has_image_evidence,
                             maintainer_comment, maintainer_comment_id, reply_pending,
                             respond_reply_disclaimer, squash_merge,
                             touches_ui_surface, ui_evidence_gap)
 from agentflow.reviewer import Finding, Verdict
+from agentflow.review_policy import ReviewAction, ReviewFinding
 
 CLEAN = Verdict(clean=True)
 DIRTY = Verdict(clean=False, findings=(Finding("blocking", "bug"),))
@@ -351,14 +354,141 @@ def test_no_verdict_park_carries_the_canonical_marker(monkeypatch):
     assert "agentflow: parked for human review" in body
 
 
-def test_clean_verdict_park_renders_no_blocking_findings(monkeypatch):
+def test_clean_verdict_park_uses_domain_sections_not_legacy_severity(monkeypatch):
     body = _park_body(monkeypatch, Verdict(clean=True))
-    assert "- (no blocking findings)" in body
+    assert "Affected behavior:" in body
+    assert "blocking findings" not in body
 
 
 def test_findings_verdict_park_renders_findings(monkeypatch):
     verdict = Verdict(clean=False, findings=(Finding("blocking", "something bad", "f.py", 10),))
     body = _park_body(monkeypatch, verdict)
     assert "something bad" in body
-    assert "(no blocking findings)" not in body
+    assert "**fix_before_completion**" in body
+    assert "**blocking**" not in body
     assert "No review was completed" not in body
+
+
+def test_reviewed_park_reports_fixes_shipped_and_follow_ups_filed(monkeypatch):
+    verdict = Verdict(
+        clean=True, fixes=("Removed the stale helper",),
+        follow_up_issues=("https://github.com/o/r/issues/12",))
+    body = _park_body(monkeypatch, verdict)
+    assert "Review fixes shipped:" in body and "Removed the stale helper" in body
+    assert "Follow-up issues filed:" in body and "issues/12" in body
+
+
+def test_agentflow_skill_reads_the_current_four_action_park_contract(monkeypatch):
+    verdict = Verdict(clean=False, actions=tuple(
+        ReviewFinding(action, action.value, "grounded")
+        for action in ReviewAction))
+    body = _park_body(monkeypatch, verdict)
+    skill = Path("skills/agentflow/SKILL.md").read_text()
+
+    for action in ReviewAction:
+        assert f"**{action.value}**" in body
+        assert f"`{action.value}`" in skill
+    revise_section = skill.split("### `revise <PR>`", 1)[1].split("## Land it as ready", 1)[0]
+    assert "severity" not in revise_section.lower()
+    assert "blocking" not in revise_section.lower()
+    assert " nit" not in revise_section.lower()
+
+
+def test_current_stage_park_replaces_prior_reason_once_and_notifies_each_new_identity(monkeypatch):
+    from agentflow.handoff import DurableHandoff, Notification, Subject
+
+    subject = Subject("o/r", 9, "pr")
+    comments = [github.Comment(
+        "> *agentflow: parked for human review.*\n\nold reason", "", id="park-1")]
+    edits, posts, notifications = [], [], []
+    monkeypatch.setattr(gate.github, "pr_comments", lambda *_args: list(comments))
+
+    def edit(comment_id, body):
+        edits.append((comment_id, body))
+        comments[0] = github.Comment(body, "", id=comment_id)
+        return True
+
+    monkeypatch.setattr(gate.github, "edit_comment", edit)
+    monkeypatch.setattr(
+        gate.github, "pr_comment",
+        lambda *_args: posts.append(_args) or True)
+    handoff = DurableHandoff(
+        notify=lambda *args: notifications.append(args) or True)
+
+    def run(identity, reason):
+        marker = f"agentflow-park:{identity}:{reason}"
+        return handoff.hand_off(
+            subject, identity=identity, stage="review", marker=marker,
+            action=lambda: gate.park(
+                "o/r", 9, None, reason=reason, proof_marker=marker),
+            notification=Notification("agentflow needs you", reason))
+
+    assert run("review-1", "first reason") == subject.url
+    assert run("review-1", "first reason") == subject.url
+    assert len(edits) == 1 and len(notifications) == 1
+
+    assert run("review-2", "new reason") == subject.url
+    assert len(comments) == 1 and posts == []
+    assert len(edits) == 2 and len(notifications) == 2
+    assert "new reason" in comments[0].body
+    assert "agentflow-park:review-2:new reason" in comments[0].body
+    assert "agentflow-park:review-1:first reason" not in comments[0].body
+
+
+def test_clean_summary_posts_once_with_depth_proof_and_cross_tool_status(monkeypatch):
+    comments = []
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr(
+        gate.github, "pr_comment",
+        lambda _repo, _pr, body: comments.append(github.Comment(body=body, created_at="")) or True)
+    verdict = Verdict(
+        clean=True, reviewer_tool="codex", change_author_tool="claude",
+        depth_reason="one journey", checks=("affected tests passed",))
+
+    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
+    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
+    assert len(comments) == 1
+    assert "Targeted" in comments[0].body and "affected tests passed" in comments[0].body
+    assert "cross-tool review" in comments[0].body
+
+
+def test_clean_summary_states_exact_same_tool_human_merge_status(monkeypatch):
+    comments = []
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr(
+        gate.github, "pr_comment",
+        lambda _repo, _pr, body: comments.append(github.Comment(body=body, created_at="")) or True)
+    verdict = Verdict(
+        clean=True, reviewer_tool="claude", change_author_tool="claude",
+        depth_reason="reviewed fallback", checks=("affected checks passed",))
+
+    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
+    assert "same-tool review; maintainer merge required" in comments[0].body
+
+
+def test_clean_summary_replaces_stale_same_tool_status_without_duplicate_marker(monkeypatch):
+    marker = "<!-- agentflow-clean-review-summary -->"
+    comments = [github.Comment(
+        body=f"> *agentflow: clean review.*\n{marker}\n\n"
+             "Review status: same-tool review; maintainer merge required.",
+        created_at="", id="comment-1")]
+
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr(
+        gate.github, "pr_comment",
+        lambda *_args: pytest.fail("the existing summary must be updated, not duplicated"))
+
+    def edit(comment_id, body):
+        assert comment_id == "comment-1"
+        comments[0] = github.Comment(body=body, created_at="", id=comment_id)
+        return True
+
+    monkeypatch.setattr(gate.github, "edit_comment", edit)
+    verdict = Verdict(
+        clean=True, reviewer_tool="codex", change_author_tool="claude",
+        depth_reason="independent recovery", checks=("exact head checked",))
+
+    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
+    assert comments[0].body.count(marker) == 1
+    assert "Review status: cross-tool review." in comments[0].body
+    assert "same-tool review; maintainer merge required" not in comments[0].body

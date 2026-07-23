@@ -26,8 +26,8 @@ Three named levels. A repo declares exactly one (`profile: <level>`).
 
 | Level | Grounding | Review | Merge |
 |---|---|---|---|
-| **`autonomous`** | agent self-grounds as needed | one cross-tool review, automated | **auto-merge** on green CI + clean review |
-| **`reviewed`** | agent self-grounds as needed | one cross-tool review, findings posted | human glances, then merges |
+| **`autonomous`** | agent self-grounds as needed | cross-tool exact-head review, including any reviewer fixes | **auto-merge** on green CI + clean untainted review |
+| **`reviewed`** | agent self-grounds as needed | cross-tool review when available; same-tool fallback is explicit | human glances, then merges |
 | **`guarded`** | **mandatory** real-data / running-app grounding, frozen at scope time | dual (both tools) or human review | human merges after full review |
 
 - `autonomous` — vibe-code / greenfield / low domain risk. The worst case is a
@@ -58,3 +58,5 @@ promoted, not the whole matrix.
   hermetic-work-order discipline survives — as a per-level requirement, not a
   per-tool cage.
 - Default for a new repo is `reviewed` unless its owner dials it either way.
+- ADR 0047 later made review a depth-aware fix/review chain. The profile still controls who may
+  merge; it no longer implies exactly one report-only review pass.

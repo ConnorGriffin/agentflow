@@ -269,31 +269,31 @@ def choose_pair(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
     return runners[builder.tool], runners[other.tool]
 
 
-def choose_reviewer(builder_tool: str, cs: PoolStatus, xs: PoolStatus) -> str | None:
+def choose_reviewer(builder_tool: str, cs: PoolStatus, xs: PoolStatus, *,
+                    allow_same_tool: bool = True) -> str | None:
     """Pure (ADR 0020): pick the reviewer for a completed builder's PR.
 
     Prefer the cross-tool reviewer (the *other* tool — the independence bar for a hands-off
-    merge, ADR 0003). If only the builder's own pool has headroom, review **same-tool** rather
-    than stalling — the merge gate parks a same-tool review for a human, so it is reviewed and
-    surfaced but never auto-merged. If neither pool has headroom, return None so the caller
-    defers this cycle and retries, rather than opening a review stuck on a dead pool."""
+    merge, ADR 0003). Callers serving a human-merge profile may allow immediate same-tool fallback;
+    autonomous callers pass ``allow_same_tool=False`` and hold for independence. If no eligible
+    pool has headroom, return None so the caller defers this cycle."""
     status = {"claude": cs, "codex": xs}
     opposite = "codex" if builder_tool == "claude" else "claude"
     if status[opposite].clear:
         return opposite
-    if status[builder_tool].clear:
+    if allow_same_tool and status[builder_tool].clear:
         return builder_tool
     return None
 
 
-def pick_reviewer(builder_tool: str) -> str | None:
+def pick_reviewer(builder_tool: str, *, allow_same_tool: bool = True) -> str | None:
     """Live: query both pools under the same unattended pacing `pick_pair` uses, then choose the
     reviewer per ADR 0020. See `choose_reviewer`. Returns None when no pool has headroom to
     review this cycle."""
     now = time.time()
     cs = _claude_dispatch_status(_query_pool("claude"), now)
     xs = _codex_dispatch_status(_query_pool("codex"), now)
-    return choose_reviewer(builder_tool, cs, xs)
+    return choose_reviewer(builder_tool, cs, xs, allow_same_tool=allow_same_tool)
 
 
 def _gate_facts(env: dict, operator: bool) -> tuple[bool, bool, str, str]:

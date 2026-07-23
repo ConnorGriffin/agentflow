@@ -561,7 +561,7 @@ def test_interrupted_revise_continues_on_the_same_retained_worktree(make_coord):
 
 def test_revise_never_migrates_to_the_other_pool(make_coord):
     """A closed pool makes Revise wait, never switch tools — it is code-writing, pinned to its
-    builder lineage (ADR 0028). Only a read-only review may move pools."""
+    builder lineage (ADR 0028). Review is likewise pinned to its selected independence tool."""
     fake = FakeSession()
     coord = make_coord(fake)
     ident = coord.submit_stage(_revise_sub("9", pool="codex"))
@@ -607,9 +607,10 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
     not return no proof and leave the handoff pending with the claim retained (the reported
     behavior)."""
     parked, notified, pr_comments = [], [], []
-    def _park(repo, pr, verdict, *, reason):
-        parked.append((repo, pr))
-        pr_comments.append({"body": "> *agentflow: parked for human review.*"})
+    def _park(repo, pr, verdict, *, reason, missing_outcome, context, proof_marker):
+        parked.append((repo, pr, reason, missing_outcome))
+        pr_comments.append({
+            "body": f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->"})
     monkeypatch.setattr("agentflow.github.api",          # the open PR for the builder branch is #42
                         lambda args, *, parse_json=False: [{"number": 42}])
     monkeypatch.setattr("agentflow.gate.park", _park)
@@ -632,14 +633,15 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
             break
         fake.end(ident, cause=ProviderCause.PROCESS)
     assert outcome is not None and outcome.status == "held" and outcome.handoff == "pr:parked"
-    assert parked == [("o/r", 42)] and len(notified) == 1  # parked and notified exactly once
+    assert len(parked) == 1 and parked[0][:2] == ("o/r", 42) and len(notified) == 1
     rec = record_of(coord, ident)
     assert rec.state == "held" and rec.claim is False and rec.handoffs == 1
     assert rec.source == BUILD_WT                          # the builder worktree is left intact
 
     # Idempotent across a restart: the same durable park proof, no second park or notification.
     assert make_coord(fake, adapter=StageRouter({"revise": revise})).cycle("claude") == []
-    assert parked == [("o/r", 42)] and len(notified) == 1
+    assert len(parked) == 1 and parked[0][:2] == ("o/r", 42)
+    assert "requested revision" in parked[0][2]
 
 
 # --- crash boundaries at both transfer points ---------------------------------------------
@@ -759,6 +761,9 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
     assert sub.complexity == "deep"                                   # the original builder complexity
     assert sub.round == review.round                                  # stays in the review's round
     assert sub.transfer_from == "o/r|7|review|sha-a"                  # assumes the review's claim
+    post_fix = coordinated_build.revise_submission(
+        review, "deep", "- still blocked", target_sha="sha-b-fixed")
+    assert post_fix is not None and post_fix.target == "sha-b-fixed"
     # The retained build worktree is recovered from the review path's slug through the layout owner,
     # so the review (pr-42-fix-thing) and the builder (issue-7-fix-thing) read as the same issue.
     assert sub.source == WorktreeRef.for_build("/home/w", "claude", 7, "fix-thing").path
@@ -836,11 +841,11 @@ def test_completed_conflict_revise_reopens_a_review_with_the_discard_lens(make_c
     assert record_of(coord, conflict).conflict_round == 1
     assert live.run_stage(conflict, head="sha-fixed") == ["revise"]   # pushed → opens the re-review
 
-    review = _ident("7", "review", "sha-fixed")          # round 0: the conflict round is separate
+    review = _ident("7", "review", "sha-fixed") + "|c1"  # conflict lineage stays durable
     r = record_of(coord, review)
     assert r.target == "sha-fixed" and r.round == 0 and r.attempts == 0
     assert r.pool == "codex" and r.builder_lineage == "claude"
-    assert "did not silently discard `main`'s changes" in r.input_ptr
+    assert "preserves both sides wherever their behavior is compatible" in r.input_ptr
     assert record_of(coord, conflict).retired is True
 
 
@@ -856,8 +861,89 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert sub.target == "sha-conf" and sub.conflict_round == 1 and sub.continuation is True
     assert sub.transfer_from is None                      # a survivor owns the claim directly
     assert sub.source == "/w/.agentflow/worktrees/claude/issue-7-fix"
-    assert "resolve the merge conflicts" in sub.input_ptr and "preserve `main`" in sub.input_ptr
+    assert "resolve the merge conflicts" in sub.input_ptr and "Preserve both sides" in sub.input_ptr
     # An unknown tool has no lineage to pin the Revise to.
     assert coordinated_build.survivor_conflict_revise_submission(
         cfg, issue=7, slug="fix", builder_tool="gemini", head_sha="sha-conf", pr_number=42,
         conflict_round=1) is None
+
+
+def test_conflict_uncertainty_is_captured_as_a_durable_stage_outcome():
+    adapter = ReviseStageAdapter(
+        revision_ready=lambda _record, _obs: False,
+        uncertainty=lambda _record, _obs: 'conflict-uncertainty:{"options":["a","b"]}')
+    record = Record(
+        identity="revise", stage="revise", pool="claude", demand=3, conflict_round=1)
+
+    assert adapter.capture(record, SimpleNamespace()) == (
+        'conflict-uncertainty:{"options":["a","b"]}')
+
+
+def test_conflict_uncertainty_opens_one_full_decision_pass_on_the_other_tool():
+    revise = Record(
+        identity="o/r|7|revise|head|c1", stage="revise", pool="claude", demand=3,
+        repo="o/r", subject="7", target="head", conflict_round=1,
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/claude/issue-7-fix",
+        outcome=('conflict-uncertainty:{"options":["keep main","keep PR"],'
+                 '"missing_guidance":"tie owner","recommendation":"keep main"}'))
+
+    sub = coordinated_build.conflict_decision_review_submission(
+        revise, head_sha="head", pr_number=42, acceptance="preserve outcome", surfaces="none")
+
+    assert sub is not None and sub.pool == "codex"
+    assert sub.review.assignment.axis.value == "decision"
+    assert sub.review.assignment.depth.value == "full" and sub.review.uncertainty_handoffs == 1
+    assert "keep main" in sub.input_ptr and sub.transfer_from == revise.identity
+
+
+def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineage():
+    review = Record(
+        identity="o/r|7|review|head|adecision|u1", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", conflict_round=1,
+        builder_lineage="claude", builder_complexity="deep",
+        review_depth="full", review_axis="decision",
+        uncertainty_handoffs=1,
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="head", final_sha="head", decision="keep main: shared rule owns ties")
+
+    sub = coordinated_build.conflict_decision_revise_submission(review, verdict)
+
+    assert sub is not None and sub.pool == "claude" and sub.conflict_round == 1
+    assert sub.review.uncertainty_handoffs == 1 and sub.transfer_from == review.identity
+    assert "shared rule owns ties" in sub.input_ptr
+
+
+def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypatch):
+    """The PR body may propose Focused, but the resolved decision remains Full and must restart
+    the product→standards sequence over the resolved head."""
+    revise = Record(
+        identity="decision-revise", stage="revise", pool="claude", demand=3,
+        repo="o/r", subject="7", target="old", conflict_round=1,
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/claude/issue-7-fix",
+        review_depth="full", depth_reason="competing product behaviors in a conflict",
+        review_axis="product", change_author_tool="claude", uncertainty_handoffs=1)
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [revise])
+    monkeypatch.setattr(
+        coordinated_build, "_source_facts",
+        lambda _record: ("/work", "agentflow/claude/issue-7-fix", "/wt"))
+    monkeypatch.setattr(
+        coordinated_build, "_open_pr_for_branch",
+        lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "resolved"))
+    monkeypatch.setattr(
+        coordinated_build, "_review_context", lambda _record: ("acceptance", "none"))
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "codex")
+    submitted = []
+
+    coordinated_build._open_review_on_completed_revise(
+        SimpleNamespace(submit_stage=submitted.append), revise.identity)
+
+    assert len(submitted) == 1
+    submission = submitted[0]
+    assert submission.target == "resolved"
+    assert submission.review.assignment.depth.value == "full"
+    assert submission.review.assignment.axis.value == "product"
+    assert submission.review.uncertainty_handoffs == 1

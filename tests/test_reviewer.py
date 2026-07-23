@@ -11,6 +11,17 @@ import pytest
 from agentflow.reviewer import REVIEW_PROMPT, parse_verdict, review_worktree
 
 
+def test_reviewer_prompt_exposes_only_the_four_action_vocabulary():
+    prompt = REVIEW_PROMPT.lower()
+
+    assert all(action in prompt for action in (
+        "fix_before_completion", "necessary_follow_up", "ask_maintainer",
+        "discard_preference"))
+    assert "blocking" not in prompt
+    assert "severity" not in prompt
+    assert " nit" not in prompt
+
+
 def test_pass_with_no_findings_is_clean():
     assert parse_verdict('{"verdict": "PASS", "findings": []}').clean is True
 
@@ -109,10 +120,45 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
     # unescaped brace in the rubric would KeyError here and wedge every review — so this
     # both guards the bracing and locks ADR 0018's two always-on gates into the rubric,
     # without which the reviewer structurally can't block on them.
-    body = REVIEW_PROMPT.format(pr=42, acceptance="ships a thing", surfaces="`agentflow/static/`")
+    body = REVIEW_PROMPT.format(
+        pr=42, starting_sha="abc123", acceptance="ships a thing",
+        surfaces="`agentflow/static/`")
     assert "#42" in body and "ships a thing" in body
     # the reviewer must actually fetch the body/files, not just the diff
     assert "headRefOid,files,body" in body
     assert "screenshot" in body.lower()                # UI-change evidence gate
     assert "framed for the human" in body.lower()      # plain-language / no-jargon gate
     assert "agentflow/static/" in body                 # the repo's declared surfaces, not a hardcoded example
+    assert "ship any clear fixes" in body.lower()      # Review owns safe fixes, not report-only nits
+    assert "follow-up issue" in body.lower()           # necessary out-of-scope work is not lost
+
+
+def test_review_fix_ledger_binds_the_final_pushed_head():
+    payload = '''{
+      "verdict": "PASS",
+      "reviewed_sha": "start",
+      "final_sha": "fixed",
+      "pushed_sha": "fixed",
+      "fixes": ["Removed the stale helper"],
+      "follow_up_issues": ["https://github.com/o/r/issues/9"],
+      "findings": []
+    }'''
+    verdict = parse_verdict(payload, expected_sha="start")
+    assert verdict.clean is True
+    assert verdict.final_sha == "fixed" and verdict.pushed_sha == "fixed"
+    assert verdict.fixes == ("Removed the stale helper",)
+    assert verdict.follow_up_issues == ("https://github.com/o/r/issues/9",)
+
+
+def test_review_fix_ledger_rejects_a_push_that_is_not_the_final_reviewed_head():
+    payload = '''{
+      "verdict": "PASS",
+      "reviewed_sha": "start",
+      "final_sha": "reviewed",
+      "pushed_sha": "different",
+      "fixes": ["Changed it"],
+      "follow_up_issues": [],
+      "findings": []
+    }'''
+    verdict = parse_verdict(payload, expected_sha="start")
+    assert verdict.parsed is False and verdict.clean is False

@@ -29,7 +29,7 @@ def _deterministic_reviewer(monkeypatch):
     ADR 0020's same-tool fallback — when the cross-tool pool is exhausted — is exercised directly
     in tests/test_balancer.py via ``choose_reviewer``. A test may still override this."""
     monkeypatch.setattr(coordinated_build, "pick_reviewer",
-                        lambda builder: "codex" if builder == "claude" else "claude")
+                        lambda builder, **_kwargs: "codex" if builder == "claude" else "claude")
 
 
 @dataclass

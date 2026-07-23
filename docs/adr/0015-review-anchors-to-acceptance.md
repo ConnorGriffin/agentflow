@@ -23,9 +23,9 @@ wishlist.** The review prompt carries the issue's acceptance criteria, and:
 - **Blocking** is reserved for a real bug/security hole that **breaks a stated
   acceptance criterion**, or a **charter violation** (shallow module, unmocked UI,
   interface you can't test through).
-- A correctness gap **beyond** the stated acceptance — an unhandled case the issue
-  did not ask for — is a **nit**, not a blocker. It is noted and filed as a
-  follow-up issue, which then flows through the pipeline on its own.
+- A correctness gap **beyond** the stated acceptance is not automatically merge-blocking.
+  ADR 0047 requires the reviewer to distinguish a proven necessary follow-up from unsupported
+  scope growth, validate any filed issue, and discard mere preference.
 
 ## Alternatives considered
 
@@ -41,5 +41,5 @@ wishlist.** The review prompt carries the issue's acceptance criteria, and:
   writing crisp acceptance criteria (and is why `guarded` freezes them at scope time).
 - The reviewer must receive the acceptance criteria — `loop.run_once` passes the
   issue body into `Reviewer.review(..., acceptance=…)`.
-- Genuinely important out-of-scope findings are captured as new issues rather than
-  silently dropped or used to block — the best of both: convergent loop, nothing lost.
+- Genuinely necessary out-of-scope findings are captured as validated issues rather than silently
+  dropped or used to block; ungrounded expansion creates no work.

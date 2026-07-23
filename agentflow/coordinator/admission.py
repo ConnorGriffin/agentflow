@@ -22,6 +22,9 @@ ATTEMPT_BUDGET = 3
 # Stages that own a branch/worktree. Their tool lineage is pinned across continuations
 # and they cannot silently move to the other pool (ADR 0028).
 CODE_WRITING = frozenset({"build", "revise", "mockup", "respond"})
+# Review's bounded fixes make it lineage-pinned after launch without changing the reviewed
+# admission weights above: it stays a short deep stage, not a Build-sized reservation.
+LINEAGE_PINNED = CODE_WRITING | {"review"}
 
 # Stages whose subject is an open PR: getting one over the finish line is the #1
 # priority, so they drain ahead of issue-bound work (build/mockup/intake) at admission

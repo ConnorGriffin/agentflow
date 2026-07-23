@@ -486,9 +486,24 @@ def test_reply_ready_rejects_an_uncommitted_tracked_edit(monkeypatch, tmp_path):
     assert coordinated_build._reply_ready(rec, None) is False
 
 
-def test_reply_ready_rejects_an_untracked_new_file(monkeypatch, tmp_path):
-    # The reply is posted and nothing is ahead of the remote head, but the responder left an
-    # untracked new file — an uncommitted, unpushed change all the same — so the stage stays open.
+def test_reply_ready_ignores_an_unrelated_untracked_scratch_file(monkeypatch, tmp_path):
+    # PR state proves completion. An unrelated local helper does not consume continuations after
+    # the targeted reply and pushed head landed (the ciq-autotune #450 regression).
+    rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="?? run-shot.sh\n")
+    assert coordinated_build._reply_ready(rec, None) is True
+
+
+def test_reply_ready_ignores_nested_temporary_proof_artifacts(monkeypatch, tmp_path):
+    rec = _reply_read(
+        monkeypatch, tmp_path, ahead="0",
+        status="?? tools/run-shot-dark.mjs\n?? test-results/respond/browser.trace\n"
+               "?? tmp/respond.log\n")
+    assert coordinated_build._reply_ready(rec, None) is True
+
+
+def test_reply_ready_rejects_an_untracked_source_file(monkeypatch, tmp_path):
+    # Unknown untracked files may be requested additions. They remain unproved until committed and
+    # pushed; the scratch exception must not silently broaden to all untracked work.
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="?? agentflow/new_helper.py\n")
     assert coordinated_build._reply_ready(rec, None) is False
 
