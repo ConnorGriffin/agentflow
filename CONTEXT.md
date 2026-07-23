@@ -91,11 +91,12 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Autonomy profile** — a per-repo dial governing how much an unwatched agent is
   trusted. It sets grounding rigor, review mode, and merge policy together. One of
   three levels:
-  - **`autonomous`** — agent self-scopes, builds, gets one cross-tool review, and
-    auto-merges on green CI + clean review. (Vibe-code / low domain risk.)
-  - **`reviewed`** — agent builds and gets a cross-tool review; a human glances and
-    merges. The default. (Most repos.)
-  - **`guarded`** — mandatory real-data grounding, dual/human review, human merges.
+  - **`autonomous`** — agent self-scopes, builds, and enters cross-tool review until
+    the other tool makes no changes; it auto-merges only on green CI, a clean exact-head
+    review, and no same-tool taint. (Vibe-code / low domain risk.)
+  - **`reviewed`** — agent builds, gets cross-tool review when available or an explicit same-tool
+    fallback summary, then a human glances and merges. The default. (Most repos.)
+  - **`guarded`** — mandatory real-data grounding, Full dual/human review, human merges.
     (`ciq-autotune` / medical-adjacent.)
 
 - **Domain risk** — the cost of a *plausible-but-wrong merge* in a given repo. The
@@ -124,36 +125,57 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Builder** — the runner that implements an issue and opens the PR. Self-reviews
   and flags uncertainties, but its own sign-off never gates a merge.
 
-- **Reviewer** — the runner that reviews the PR at the deep tier (opus/Sol),
-  independently of builder complexity. Must be a *different model* than the builder
-  (see cross-tool review); its verdict is the one that counts.
+- **Reviewer** — the runner that verifies a PR and may ship clear grounded fixes on its
+  branch. A reviewer never approves its own changed head; another tool must inspect that
+  exact pushed state before completion.
 
-- **Cross-tool review** — a review performed by a different model than the one that
-  built the diff (Codex→Claude or Claude→Codex). Independence from the builder is
-  the point; it targets "green CI but confidently wrong." Degrades to same-tool
-  review only when one tool is unavailable, and that never auto-merges.
+- **Review depth** — the verification scope assigned from a change's complexity and stakes,
+  proposed by its author and only escalated later: **Focused** for exact housekeeping and
+  evidence changes, **Targeted** for one contained behavior or journey, and **Full** for
+  connected behavior, sensitive information, permissions, safety, or competing product
+  decisions. Small is not necessarily low-stakes. Full starts with separate product-outcome
+  and project-standards passes.
 
-- **Blocking finding** — a reviewer finding at or above the correctness/security
-  severity line; the only kind that blocks a merge. Lesser findings post as
-  non-blocking nits.
+- **Review action** — the disposition of a grounded review observation: **fix before
+  completion**, **file a necessary follow-up**, **ask the maintainer**, or **discard as
+  unsupported reviewer preference**. A necessary follow-up is outside the PR's purpose and
+  carries evidence, a desired outcome, and verified duplicate search. “Nit” is retired.
 
-- **Auto-revise round** — the single builder pass that addresses review findings
-  before the pipeline re-reviews. Capped at one, to avoid revise/re-review loops.
+- **Cross-tool review** — a review performed by a different tool than the author of the
+  current change set (Codex→Claude or Claude→Codex). Independence follows every pushed
+  change, not only the original builder: review/fix passes ping-pong until the other tool
+  makes no change. Three consecutive change-making passes park as drift/disagreement.
+  Autonomous work waits without consuming capacity when the other tool is unavailable.
 
-- **Conflict revise** — the builder pass that resolves a finished PR's merge
-  conflict after `main` advanced, preserving `main`'s behavior where ambiguous.
-  Budgeted separately from auto-revise rounds (two per PR, then park), followed by
-  a fresh review of the resolved head under normal merge rules (ADR 0038).
+- **Same-tool taint** — the human-merge-only state created when a maintainer confirms a
+  forced same-tool review. It prevents auto-merge until the other tool returns and cleanly
+  reviews the open PR. Reviewed repositories may use same-tool immediately during an outage,
+  but their final summary says “same-tool review; maintainer merge required.”
+
+- **Review handoff** — private durable state passed to the next reviewer: the current PR,
+  exact changes since the previous review, what changed and why, assigned depth, completed
+  proof/checks, and unresolved concerns. Intermediate agents do not comment on GitHub.
+
+- **Conflict revise** — bounded work that reconciles a finished PR with newly moved `main`.
+  Preserve both intended outcomes when compatible; when they compete, neither side wins because it
+  is newer and the choice enters the private second-opinion path. Every genuinely new conflict gets
+  its own stage budget—there is no PR-lifetime count—and the resulting choice receives Focused,
+  Targeted, or Full review.
+
+- **Conflict decision handoff** — the one private, narrow handoff to the other tool after a
+  resolver records two genuinely ambiguous product options, exact missing guidance, and a
+  recommendation. If the second tool is also unsure, agentflow parks once with the precise
+  maintainer decision needed; there is no intermediate PR comment.
 
 - **PR-bound stage** — a stage whose subject is an open PR (review, revise,
   respond). Admission drains PR-bound work before issue-bound work (build,
   mockup, intake): an open PR is the first thing to get over the finish line
   (ADR 0039). Interactive turns still outrank everything (ADR 0034).
 
-- **Drop-to-reviewed** — the escape valve: an `autonomous` PR that can't clear
-  review after its one revise round is demoted to `reviewed` for that issue
-  (findings posted, human pinged, PR waits). Autonomy parks doubt, never forces a
-  merge — so `autonomous` is never less safe than `reviewed`.
+- **Review park** — the single public handoff when the chain cannot finish safely. It has a
+  **Maintainer decision needed** section in application behavior and an **Agent handoff**
+  section with code locations, conflicting changes, checks, retained work, and the exact
+  next action. Intermediate review agents remain silent.
 
 - **Brief** — at `autonomous`/`reviewed`, the spec a builder starts from: the issue
   itself (acceptance criteria + file pointers). The builder self-scopes from it.
@@ -235,7 +257,7 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   the retained worktree path. Never the prior session's event stream. A continuation with
   no envelope would just re-run the identical prompt (ADR 0043).
 
-- **Targeted repair** — the single continuation a read-only stage (intake, review) earns
+- **Targeted repair** — the single continuation a read-only stage (such as intake) earns
   after a clean exit that produced no outcome. Its envelope names the exact missing proof.
   A read-only stage owns no partial work, so beyond one repair a fresh session would replay
   identically — so it parks for a human instead (ADR 0043).
@@ -251,7 +273,8 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 
 - **Tool lineage** — the runner identity retained across every code-writing attempt on
   one change. A continuation stays in its original Claude or Codex lineage so the other
-  tool remains independent for cross-tool review.
+  tool remains independent for cross-tool review. After a reviewer pushes, a later stage
+  starts from the PR's current pushed state; only the same interrupted task may retain local work.
   *Avoid:* current runner, last runner (both lose the change's authorship history).
 
 - **Bail** — a deliberate runner stop because continuing would require guessing missing
@@ -290,13 +313,13 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   the latest projection and shows its age honestly — it never asks GitHub itself
   (ADR 0026). With the daemon down you see the last snapshot, aged, not an error.
 
-- **Needs-you inbox** — the operator's action list: `guarded` merges awaiting,
-  drop-to-reviewed parks, and intent-gap grillings. The same set ntfy pings.
+- **Needs-you inbox** — the operator's action list: `guarded` merges awaiting, review parks,
+  and intent-gap grillings. The same set ntfy pings.
 
 - **Charter** — the canonical engineering-standards file (`standards/CHARTER.md`)
   every app in the flow must meet: deep-module architecture, UI→`/ui-mockups`,
   test-through-the-interface, maintainability. It applies machine-wide and is
-  enforced at cross-review through blocking findings.
+  enforced at cross-review through grounded fix-before-completion or maintainer-decision actions.
 
 - **Hazard** — an *environmental* obstacle to autonomous work: PHI/real data,
   live credentials, a demo that needs a running app. Historically fenced work off

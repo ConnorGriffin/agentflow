@@ -81,7 +81,7 @@ class Record:
     hold_pending: bool = False           # classified as a hold, awaiting its durable handoff
     hold_reason: str | None = None       # exhaustion, permanent cause, or no-successor boundary
     retired: bool = False
-    builder_lineage: str | None = None   # who built the diff — a same-tool review cannot auto-merge
+    builder_lineage: str | None = None   # original builder; current exact-head author is separate
     builder_complexity: str | None = None  # the original builder complexity, carried so a later
                                            # Revise never re-reads a mutable issue label (ADR 0018)
     round: int = 0                       # completed auto-revise rounds behind this stage; part of
@@ -96,6 +96,23 @@ class Record:
                                          # genuinely fresh bounded execution rather than colliding
                                          # with the terminal `held` record whose identity stays live
     auto_merge_allowed: bool = True
+    review_depth: str = "targeted"       # focused | targeted | full (ADR 0047)
+    depth_reason: str = ""
+    review_axis: str = "combined"        # combined | product | standards | fix
+    change_author_tool: str | None = None # author of the exact change set under review
+    reviewed_from_sha: str | None = None  # start of the range supplied to this pass
+    review_passes: int = 0                # consecutive change-making review passes
+    review_sequence: int = 0              # same-head private handoffs/Full axes identity
+    cross_tool_covered: bool = False      # another tool reviewed the current exact head
+    review_tainted: bool = False          # same-tool override: human merge only
+    review_taint_cleared: bool = False    # later exact-head cross-tool review cleared it
+    review_handoff: str | None = None     # private bounded next-agent context
+    review_findings: str = "[]"           # JSON action ledger across Full read-only axes
+    review_fixes: str = "[]"              # JSON ledger; kept opaque by the coordinator
+    review_follow_ups: str = "[]"         # validated follow-up evidence ledger
+    review_checks: str = "[]"              # JSON proof ledger across serialized passes
+    review_uncertainty: str | None = None # private options/guidance/recommendation JSON
+    uncertainty_handoffs: int = 0         # at most one narrow cross-tool decision handoff
     root: str | None = None              # the root stage this descends from; it shares the root's reservation
     interactive: bool = False            # an operator-present turn (Ask) that outranks background
                                          # pipeline work at admission (ADR 0034); sorts to the head

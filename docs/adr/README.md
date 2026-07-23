@@ -19,8 +19,8 @@ then Context / Decision / Alternatives / Consequences.
 - [0002](0002-three-autonomy-levels.md) — Three autonomy levels: `autonomous`,
   `reviewed`, `guarded`.
 - [0003](0003-cross-tool-review.md) — Cross-tool review is the independence gate.
-- [0004](0004-auto-merge-gate.md) — The auto-merge gate: severity bar, one revise
-  round, drop-to-reviewed.
+- [0004](0004-auto-merge-gate.md) — The auto-merge gate: exact-head independent review, bounded
+  reviewer-fix chain, and no same-tool taint.
 - [0005](0005-spec-rigor-rides-the-dial.md) — Spec rigor rides the dial:
   self-scoped brief vs frozen work order.
 - [0006](0006-two-pool-runner-assignment.md) — Runner assignment: a two-pool
@@ -125,9 +125,9 @@ then Context / Decision / Alternatives / Consequences.
   CONTEXT.md and the ADRs.
 - [0043](0043-recovery-state-before-replay.md) — A retry needs new recovery state: a
   clean read-only exit with no outcome earns one targeted repair then parks; worktree
-  stages continue behind a bounded recovery envelope; identical stateless replays stop.
+  stages continue behind a bounded recovery envelope; Review joins the latter in 0047.
 - [0044](0044-stage-session-profiles-and-ceilings.md) — Every daemon session gets a
-  per-stage tool allowlist (read-only for Intake/Review/Research), an empty MCP set,
+  per-stage tool allowlist (read-only for Intake/Research; Review becomes writable in 0047), an empty MCP set,
   and per-cell wall/turn ceilings replacing the shared two-hour timeout; fail closed
   on withheld capability.
 - [0045](0045-intake-stays-all-deep.md) — Intake stays all-deep: a live pilot showed
@@ -140,3 +140,6 @@ then Context / Decision / Alternatives / Consequences.
   reasoning effort (extra → Extra High, clamped; Max/Ultracode manual-only); intake
   effort coaching is an anchored rubric; recalibration is a monthly by-hand pass
   with manual guardrail rollback.
+- [0047](0047-reviewers-ship-clear-fixes.md) — Depth-aware review uses four grounded actions;
+  reviewer-authored heads ping-pong across tools until unchanged, outages and same-tool taint
+  are explicit, and each new conflict gets bounded resolution plus one narrow decision handoff.

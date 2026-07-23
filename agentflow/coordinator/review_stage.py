@@ -3,10 +3,9 @@ issue #104).
 
 Review has the same three adapter jobs as Build (ADR 0030), but its stage semantics differ:
 
-- ``prepare`` owns a *read-only* checkout of the exact reviewed PR head SHA. Review holds no
-  local edits, so preparation may freely discard and recreate that checkout from durable source
-  state without losing the record's immutable target; a miss consumes neither a permit nor an
-  attempt, exactly as Build's does.
+- ``prepare`` owns a detached, writable checkout of the exact starting PR head SHA. A reviewer may
+  ship bounded fixes, so continuations preserve that checkout and its partial work; a miss consumes
+  neither a permit nor an attempt, exactly as Build's does.
 - ``observe`` reconstructs the provider observation once the reviewer family ends.
 - ``verify`` proves the stage's required outcome: a parsed verdict for the *exact* reviewed head
   SHA. Provider success can never stand in for it — a reviewer that exited badly still completes
@@ -27,9 +26,9 @@ class ReviewStageAdapter:
 
     The collaborators are injected so the stage is exercised without a real worktree, GitHub, or
     reviewer: ``verdict_ready`` answers whether a parsed verdict for the record's exact target SHA
-    is durable, ``worktree_reset`` recreates the read-only checkout at that SHA and returns whether
-    it is ready, and ``observer`` reconstructs the provider observation from the attempt's durable
-    artifacts. Production wires the real verdict parse and a fresh detached checkout.
+    is durable, ``worktree_reset`` prepares the writable detached checkout at that SHA and returns
+    whether it is ready, and ``observer`` reconstructs the provider observation from the attempt's
+    durable artifacts. Production wires the real verdict parse and retained detached checkout.
     """
 
     def __init__(self, *, verdict_ready, worktree_reset=None, observer=None, handoff=None,
@@ -43,10 +42,9 @@ class ReviewStageAdapter:
         self._prepare_settle = prepare_settle
 
     def prepare(self, record) -> bool:
-        """Recreate the read-only checkout at the reviewed head SHA before admission (ADR 0030).
-        Review keeps no local changes, so a stale checkout is discarded and rebuilt from durable
-        source state; the immutable target SHA is part of the record's identity and is never
-        touched. A miss consumes no permit and no attempt — the record simply waits and retries."""
+        """Prepare the writable checkout at the starting head SHA before admission (ADR 0030).
+        A continuation retains local review fixes; a fresh record starts from its immutable target.
+        A miss consumes no permit and no attempt — the record simply waits and retries."""
         return bool(self._worktree_reset(record))
 
     def observe(self, record):
@@ -61,11 +59,10 @@ class ReviewStageAdapter:
         return bool(self._verdict_ready(record, obs))
 
     def recover(self, record, obs):
-        """Review is read-only: it recreates its checkout from durable source and produces no
-        partial work, so a clean exit with no verdict would replay identically. Grant one targeted
-        repair naming the missing verdict, then stop (issue #225)."""
-        from agentflow.coordinator.recovery import targeted_repair
-        return targeted_repair(record, "a recorded review verdict for the exact reviewed head SHA")
+        """Review may own partial fixes in its detached checkout. Preserve and continue them within
+        the bounded attempt budget while naming the missing exact-head verdict."""
+        from agentflow.coordinator.recovery import durable_progress
+        return durable_progress(record, "a recorded review verdict for the exact reviewed head SHA")
 
     def finalize_hold(self, record) -> str | None:
         """Create the Review-native human handoff and return its durable proof. Production parks

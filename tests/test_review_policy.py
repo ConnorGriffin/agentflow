@@ -1,0 +1,646 @@
+"""Review policy through its public decision interface (ADR 0047)."""
+
+import json
+import inspect
+from dataclasses import fields
+from types import SimpleNamespace
+
+from agentflow.review_policy import (
+    FollowUp,
+    ReviewAssignment,
+    ReviewAxis,
+    ReviewDepth,
+    ReviewAction,
+    ReviewFinding,
+    ReviewResult,
+    ReviewState,
+    Uncertainty,
+    assign_depth,
+    decode_findings,
+    encode_findings,
+    parse_review_result,
+    proposed_depth,
+    validate_follow_ups,
+    conflict_uncertainty_from_message,
+)
+
+
+def test_permission_change_escalates_an_authors_focused_proposal_to_full():
+    assignment = assign_depth(
+        "focused", "one wording line", ["agentflow/permissions.py"])
+
+    assert assignment.depth is ReviewDepth.FULL
+    assert "sensitive" in assignment.reason
+
+
+def test_a_changed_final_head_without_push_provenance_is_not_a_review_result():
+    result = parse_review_result(json.dumps({
+        "verdict": "PASS",
+        "depth": "targeted",
+        "depth_reason": "one journey",
+        "axis": "combined",
+        "change_author_tool": "claude",
+        "reviewed_sha": "start",
+        "final_sha": "fixed",
+        "pushed_sha": "",
+        "fixes": ["fixed it"],
+        "follow_ups": [],
+        "checks": ["tests passed"],
+        "findings": [],
+        "uncertainty": None,
+    }), expected_sha="start")
+
+    assert result.parsed is False
+    assert "provenance" in result.detail
+
+
+def test_structured_review_requires_recorded_checks():
+    result = parse_review_result(json.dumps({
+        "verdict": "PASS", "depth": "focused", "depth_reason": "exact link",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": [], "findings": [], "uncertainty": None,
+    }), expected_sha="head")
+
+    assert result.parsed is False and "checks" in result.detail
+
+
+def test_decision_pass_must_choose_or_return_structured_uncertainty():
+    result = parse_review_result(json.dumps({
+        "verdict": "PASS", "depth": "full", "depth_reason": "competing behavior",
+        "axis": "decision", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["compared product rules"], "findings": [], "uncertainty": None,
+        "decision": "",
+    }), expected_sha="head")
+
+    assert result.parsed is False and "decision" in result.detail
+
+
+def test_review_chain_state_round_trips_through_the_coordinator_store(tmp_path, monkeypatch):
+    from agentflow.coordinator import Coordinator, Submission
+
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    coord = Coordinator()
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="review", target="head", pool="codex",
+        review=ReviewState(
+            assignment=ReviewAssignment(
+                ReviewDepth.FULL, "permission decision", ReviewAxis.PRODUCT),
+            change_author_tool="claude", reviewed_from_sha="base", passes=2,
+            cross_tool_covered=True, tainted=True, handoff="verify the permission",
+            findings=(ReviewFinding(ReviewAction.FIX, "fix", "rule"),),
+            fixes=("fixed copy",),
+            follow_ups=(FollowUp("u", "evidence", "outcome", "query"),),
+            uncertainty=Uncertainty(("a", "b"), "missing", "choose a"),
+            uncertainty_handoffs=1)))
+
+    record = coord.stage_record(identity)
+    assert record.review_depth == "full" and record.review_axis == "product"
+    assert record.change_author_tool == "claude" and record.review_passes == 2
+    assert record.review_tainted is True and record.uncertainty_handoffs == 1
+    assert decode_findings(record.review_findings)[0].summary == "fix"
+    restored = ReviewState.from_record(record)
+    assert restored is not None and restored.assignment.axis is ReviewAxis.PRODUCT
+    assert restored.follow_ups[0].desired_outcome == "outcome"
+
+
+def test_submission_and_review_mapping_take_one_cohesive_review_value():
+    from agentflow import coordinated_build
+    from agentflow.coordinator import Submission
+
+    review_fields = [item.name for item in fields(Submission) if item.name.startswith("review")]
+    assert review_fields == ["review"]
+    parameters = inspect.signature(coordinated_build.review_submission).parameters
+    assert "review" in parameters
+    assert not {
+        "review_depth", "review_axis", "review_findings", "review_fixes",
+        "review_follow_ups", "review_checks",
+    }.intersection(parameters)
+
+
+def test_result_cannot_downgrade_or_change_its_durable_assignment():
+    base = {
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["verified"], "findings": [], "uncertainty": None, "decision": "",
+    }
+    downgraded = parse_review_result(
+        json.dumps(base), expected_sha="head", expected_depth="full",
+        expected_axis="combined", expected_author="claude")
+    wrong_axis = parse_review_result(
+        json.dumps({**base, "depth": "full", "axis": "standards"}), expected_sha="head",
+        expected_depth="full", expected_axis="product", expected_author="claude")
+    wrong_author = parse_review_result(
+        json.dumps({**base, "change_author_tool": "codex"}), expected_sha="head",
+        expected_depth="targeted", expected_axis="combined", expected_author="claude")
+
+    assert not downgraded.parsed and "downgraded" in downgraded.detail
+    assert not wrong_axis.parsed and "axis" in wrong_axis.detail
+    assert not wrong_author.parsed and "author" in wrong_author.detail
+
+
+def test_semantic_stakes_and_guarded_profile_enforce_full_without_filename_hints():
+    destructive = assign_depth(
+        "focused", "one line", ["agentflow/widget.py"],
+        context="This changes the destructive delete action.")
+    shared = assign_depth(
+        "targeted", "one journey", ["agentflow/widget.py"],
+        context="This changes a shared policy used across journeys.")
+    guarded = assign_depth(
+        "focused", "copy only", ["README.md"], guarded=True)
+
+    assert destructive.depth is ReviewDepth.FULL
+    assert shared.depth is ReviewDepth.FULL
+    assert guarded.depth is ReviewDepth.FULL
+
+
+def test_guarded_assignment_facts_force_full_product_and_standards_flow(monkeypatch):
+    from agentflow import coordinated_build
+
+    monkeypatch.setattr(coordinated_build.github, "api", lambda *args, **kwargs: {
+        "body": "Review depth: Focused — wording only",
+        "files": [{"path": "README.md"}],
+    })
+
+    assignment, _files = coordinated_build._review_assignment_facts(
+        "o/r", 42, profile="guarded")
+
+    assert assignment.depth is ReviewDepth.FULL and assignment.axis is ReviewAxis.PRODUCT
+    assert assignment.reason == "guarded profile requires Full review"
+
+    monkeypatch.setattr(coordinated_build.github, "api", lambda *args, **kwargs: None)
+    unreadable = coordinated_build._review_assignment_facts(
+        "o/r", 42, profile="guarded")
+    assert unreadable[0] == ReviewAssignment(
+        ReviewDepth.FULL, "guarded profile requires Full review", ReviewAxis.PRODUCT)
+
+
+def test_author_depth_proposal_is_read_from_the_pr_body_with_one_reason():
+    assignment = proposed_depth("Summary\n\nReview depth: Focused — evidence link only")
+
+    assert assignment.depth is ReviewDepth.FOCUSED
+    assert assignment.reason == "evidence link only"
+
+
+def test_reviewer_push_opens_an_exact_head_pass_for_the_other_tool():
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    review = Record(
+        identity="o/r|7|review|start", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="start", change_author_tool="claude",
+        review_depth="targeted", depth_reason="one journey", review_axis="combined",
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="start", final_sha="fixed", pushed_sha="fixed",
+        fixes=("fixed the journey",), change_author_tool="claude")
+
+    successor = coordinated_build.review_successor_submission(review, verdict)
+
+    assert successor is not None and successor.pool == "claude"
+    assert successor.target == "fixed" and successor.review.change_author_tool == "codex"
+    assert successor.review.passes == 1 and successor.transfer_from == review.identity
+
+
+def test_reviewed_reviewer_fix_uses_immediate_same_tool_fallback_without_forced_taint(
+        monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    review = Record(
+        identity="o/r|7|review|start", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="start", change_author_tool="claude",
+        review_depth="targeted", depth_reason="one journey", review_axis="combined",
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="start", final_sha="fixed", pushed_sha="fixed",
+        fixes=("fixed the journey",), change_author_tool="claude")
+    calls = []
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda workdir: "reviewed")
+    monkeypatch.setattr(
+        coordinated_build, "pick_reviewer",
+        lambda author, **kwargs: calls.append((author, kwargs)) or "codex")
+
+    successor = coordinated_build.review_successor_submission(review, verdict)
+
+    assert successor.pool == "codex"
+    assert successor.review.tainted is False
+    assert successor.review.cross_tool_covered is False
+    assert calls == [("codex", {"allow_same_tool": True})]
+
+
+def test_reviewer_fix_waits_for_capacity_but_third_mutating_pass_parks(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    record = Record(
+        identity="review", stage="review", pool="codex", demand=2, repo="o/r",
+        subject="7", target="start", change_author_tool="claude",
+        review_depth="targeted", depth_reason="one journey", review_axis="combined",
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="start", final_sha="fixed", pushed_sha="fixed",
+        fixes=("fixed",), change_author_tool="claude")
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [record])
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _record: verdict)
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *args, **kwargs: None)
+    events = []
+    coord = SimpleNamespace(
+        submit_stage=lambda submission: events.append("submit"),
+        park_completed=lambda identity: events.append("park"))
+
+    coordinated_build._open_revise_on_blocking_review(coord, record.identity)
+    assert events == []
+
+    record.review_passes = 2
+    coordinated_build._open_revise_on_blocking_review(coord, record.identity)
+    assert events == ["park"]
+
+
+def test_full_product_pass_opens_a_separate_read_only_standards_pass():
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    review = Record(
+        identity="o/r|7|review|head|aproduct", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", change_author_tool="claude",
+        review_depth="full", depth_reason="shared permission", review_axis="product",
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="head", final_sha="head", change_author_tool="claude",
+        checks=("product behavior verified",))
+
+    successor = coordinated_build.review_axis_successor_submission(review, verdict)
+
+    assert successor is not None and successor.review.assignment.axis is ReviewAxis.STANDARDS
+    assert successor.target == "head" and successor.pool == "codex"
+    assert "Do not edit during this axis pass" in successor.input_ptr
+
+
+def test_full_standards_pass_durably_unions_product_and_standards_findings_for_fix():
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    product = ReviewFinding(
+        ReviewAction.FIX, "Product journey loses held reason", "Acceptance requires it",
+        "agentflow/view.py", 12)
+    standards = ReviewFinding(
+        ReviewAction.FIX, "Interface exposes storage detail", "Charter deep-module rule",
+        "agentflow/store.py", 8)
+    review = Record(
+        identity="o/r|7|review|head|astandards", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", change_author_tool="claude",
+        review_depth="full", depth_reason="shared behavior", review_axis="standards",
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        review_findings=encode_findings((product,)),
+        review_checks='["product behavior checked"]')
+    verdict = Verdict(
+        clean=False, reviewed_sha="head", final_sha="head", change_author_tool="claude",
+        depth=ReviewDepth.FULL, actions=(standards,), checks=("standards checked",))
+
+    successor = coordinated_build.review_axis_successor_submission(
+        review, verdict, axis="fix")
+    persisted = successor.review.findings
+
+    assert [item.summary for item in persisted] == [
+        "Product journey loses held reason", "Interface exposes storage detail"]
+    assert all(summary in successor.review.handoff for summary in (
+        "Product journey loses held reason", "Interface exposes storage detail"))
+    assert successor.review.checks == ("product behavior checked", "standards checked")
+
+
+def test_reviewer_escalation_to_full_opens_product_axis_before_settlement():
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    review = Record(
+        identity="o/r|7|review|head", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", change_author_tool="claude",
+        review_depth="targeted", depth_reason="one journey", review_axis="combined",
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="head", final_sha="head", change_author_tool="claude",
+        depth=ReviewDepth.FULL, depth_reason="shared decision discovered",
+        checks=("shared consumers traced",))
+
+    successor = coordinated_build.review_axis_successor_submission(
+        review, verdict, axis="product")
+
+    assert successor.review.assignment.depth is ReviewDepth.FULL
+    assert successor.review.assignment.axis is ReviewAxis.PRODUCT
+    assert successor.review.assignment.reason == "shared decision discovered"
+
+
+def test_full_fixer_push_restarts_product_then_standards_over_the_new_head(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    assigned = ReviewFinding(
+        ReviewAction.FIX, "Repair shared behavior", "Product contract", "agentflow/x.py", 4)
+    review = Record(
+        identity="fix", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
+        target="old", review_depth="full", depth_reason="shared decision",
+        review_axis="fix", change_author_tool="claude", builder_lineage="claude",
+        builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        review_findings=encode_findings((assigned,)))
+    fixed = Verdict(
+        clean=True, reviewed_sha="old", final_sha="new", pushed_sha="new",
+        fixes=("repaired shared behavior",), depth=ReviewDepth.FULL,
+        depth_reason="shared decision", change_author_tool="claude",
+        checks=("focused fix check",))
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "claude")
+
+    product = coordinated_build.review_successor_submission(review, fixed)
+
+    assert product is not None and product.target == "new"
+    assert product.review.assignment.depth is ReviewDepth.FULL
+    assert product.review.assignment.axis is ReviewAxis.PRODUCT
+    assert product.review.findings == ()
+
+    product_record = Record(
+        identity="product", stage="review", pool=product.pool, demand=1,
+        repo=product.repo, subject=product.subject, target=product.target,
+        source=product.source, input_ptr=product.input_ptr,
+        builder_lineage=product.builder_lineage, builder_complexity=product.builder_complexity,
+        **product.review.record_fields())
+    checked = Verdict(
+        clean=True, reviewed_sha="new", final_sha="new", depth=ReviewDepth.FULL,
+        depth_reason="shared decision", change_author_tool="codex",
+        checks=("entire product axis checked",))
+    standards = coordinated_build.review_axis_successor_submission(product_record, checked)
+
+    assert standards is not None and standards.review.assignment.axis is ReviewAxis.STANDARDS
+    assert standards.target == "new"
+
+
+def test_fix_axis_cannot_dismiss_assigned_fixes_without_a_pushed_head():
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+
+    assigned = ReviewFinding(
+        ReviewAction.FIX, "Repair shared decision", "Product rule", "agentflow/x.py", 4)
+    record = Record(
+        identity="fix", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
+        target="head", review_depth="full", depth_reason="shared decision",
+        review_axis="fix", change_author_tool="claude",
+        review_findings=encode_findings((assigned,)))
+    payload = json.dumps({
+        "verdict": "PASS", "depth": "full", "depth_reason": "shared decision",
+        "axis": "fix", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["inspected"], "findings": [], "uncertainty": None, "decision": "",
+    })
+
+    assert coordinated_build._verdict_ready(
+        record, SimpleNamespace(final_message=payload)) is False
+
+
+def test_follow_up_must_exist_in_this_repo_and_be_returned_by_its_duplicate_search():
+    from agentflow.review_policy import FollowUp
+
+    follow_up = FollowUp(
+        "https://github.com/o/r/issues/9", "walkthrough is absent",
+        "add routine browser proof", "browser walkthrough in:title")
+    viewed, searched = [], []
+
+    valid = validate_follow_ups(
+        "o/r", (follow_up,),
+        issue_view=lambda number: viewed.append(number) or {
+            "number": number, "url": "https://github.com/o/r/issues/9"},
+        issue_search=lambda query: searched.append(query) or [{"number": 9}])
+
+    assert valid is True
+    assert viewed == [9] and searched == ["browser walkthrough in:title"]
+    assert validate_follow_ups(
+        "other/r", (follow_up,), issue_view=lambda _n: {}, issue_search=lambda _q: []) is False
+
+
+def test_conflict_uncertainty_is_a_private_structured_provider_outcome():
+    value = conflict_uncertainty_from_message(
+        'CONFLICT-UNCERTAINTY: {"options":["keep shared rule","scope PR rule"],'
+        '"missing_guidance":"which behavior owns ties",'
+        '"recommendation":"keep the shared rule"}')
+
+    assert value is not None
+    assert value.options == ("keep shared rule", "scope PR rule")
+    assert value.recommendation == "keep the shared rule"
+    assert conflict_uncertainty_from_message("MISSING-CONTEXT: choose") is None
+
+
+def test_tainted_same_tool_review_reopens_on_the_other_tool_at_the_same_head():
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+
+    prior = Record(
+        identity="o/r|7|review|head", stage="review", pool="claude", demand=1,
+        repo="o/r", subject="7", target="head", change_author_tool="claude",
+        review_tainted=True, review_sequence=0, builder_lineage="claude",
+        source="/work/.agentflow/worktrees/claude-review/pr-42-fix",
+        input_ptr="Review head as claude")
+
+    successor = coordinated_build.tainted_review_submission(prior, "codex")
+
+    assert successor is not None and successor.pool == "codex" and successor.target == "head"
+    assert successor.review.assignment.axis is ReviewAxis.COMBINED
+    assert successor.review.tainted is True and successor.review.taint_cleared is False
+    assert successor.review.sequence == 1
+    assert successor.transfer_from is None
+
+
+def test_full_taint_clears_only_after_clean_product_then_standards(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    prior = Record(
+        identity="forced", stage="review", pool="claude", demand=1,
+        repo="o/r", subject="7", target="head", change_author_tool="claude",
+        review_depth="full", depth_reason="shared behavior", review_axis="product",
+        review_tainted=True, builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/claude-review/pr-42-fix",
+        input_ptr="Review head")
+    product_submission = coordinated_build.tainted_review_submission(prior, "codex")
+    product = Record(
+        identity="product", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", source=product_submission.source,
+        input_ptr=product_submission.input_ptr, builder_lineage="claude",
+        builder_complexity="deep", **product_submission.review.record_fields())
+
+    def payload(axis, *, final="head", pushed="", fixes=()):
+        return json.dumps({
+            "verdict": "PASS", "depth": "full", "depth_reason": "shared behavior",
+            "axis": axis, "change_author_tool": "claude", "reviewed_sha": "head",
+            "final_sha": final, "pushed_sha": pushed, "fixes": list(fixes),
+            "follow_ups": [], "checks": [f"{axis} checked"], "findings": [],
+            "uncertainty": None, "decision": "",
+        })
+
+    assert coordinated_build._verdict_ready(
+        product, SimpleNamespace(final_message=payload("product"))) is True
+    assert product.review_taint_cleared is False
+
+    standards_submission = coordinated_build.review_axis_successor_submission(
+        product, Verdict(
+            clean=True, reviewed_sha="head", final_sha="head", depth=ReviewDepth.FULL,
+            depth_reason="shared behavior", change_author_tool="claude",
+            checks=("product checked",)))
+    standards = Record(
+        identity="standards", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", source=standards_submission.source,
+        input_ptr=standards_submission.input_ptr, builder_lineage="claude",
+        builder_complexity="deep", **standards_submission.review.record_fields())
+
+    assert coordinated_build._verdict_ready(
+        standards, SimpleNamespace(final_message=payload("standards"))) is True
+    assert standards.review_taint_cleared is True
+
+
+def test_full_taint_stays_until_post_push_product_and_standards_complete(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    product = Record(
+        identity="product", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", change_author_tool="claude",
+        review_depth="full", depth_reason="shared behavior", review_axis="product",
+        review_tainted=True, cross_tool_covered=True, builder_lineage="claude",
+        builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        input_ptr="Review head")
+    pushed_payload = json.dumps({
+        "verdict": "PASS", "depth": "full", "depth_reason": "shared behavior",
+        "axis": "product", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "fixed", "pushed_sha": "fixed", "fixes": ["fixed product issue"],
+        "follow_ups": [], "checks": ["product checked"], "findings": [],
+        "uncertainty": None, "decision": "",
+    })
+    assert coordinated_build._verdict_ready(
+        product, SimpleNamespace(final_message=pushed_payload)) is True
+    assert product.review_taint_cleared is False
+
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "claude")
+    successor = coordinated_build.review_successor_submission(
+        product, Verdict(
+            clean=True, reviewed_sha="head", final_sha="fixed", pushed_sha="fixed",
+            fixes=("fixed product issue",), depth=ReviewDepth.FULL,
+            depth_reason="shared behavior", change_author_tool="claude",
+            checks=("product checked",)))
+
+    assert successor.review.assignment.axis is ReviewAxis.PRODUCT
+    assert successor.review.change_author_tool == "codex"
+    assert successor.review.tainted is True
+    assert successor.review.taint_cleared is False
+
+
+def test_successor_prompts_replace_the_private_assignment_instead_of_appending(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict, with_review_assignment
+
+    base_prompt = with_review_assignment(
+        "Acceptance: preserve this exact sentence.",
+        depth=ReviewDepth.FULL, reason="shared behavior", axis=ReviewAxis.FIX,
+        change_author_tool="claude", handoff="obsolete fix handoff")
+    record = Record(
+        identity="fix", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="old", change_author_tool="claude",
+        review_depth="full", depth_reason="shared behavior", review_axis="fix",
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        input_ptr=base_prompt)
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "claude")
+    product = coordinated_build.review_successor_submission(
+        record, Verdict(
+            clean=True, reviewed_sha="old", final_sha="new", pushed_sha="new",
+            fixes=("fixed",), depth=ReviewDepth.FULL, depth_reason="shared behavior",
+            change_author_tool="claude", checks=("fix checked",)))
+
+    def assert_assignment(submission, axis):
+        prompt = submission.input_ptr
+        assert prompt.count("<!-- agentflow-review-assignment:start -->") == 1
+        assert prompt.count("Private review assignment") == 1
+        assert prompt.count("- Prior handoff:") == 1
+        assert f"- Axis: {axis}." in prompt
+        assert "Acceptance: preserve this exact sentence." in prompt
+        assert "obsolete fix handoff" not in prompt
+
+    assert_assignment(product, "product")
+    product_record = Record(
+        identity="product", stage="review", pool="claude", demand=1,
+        repo="o/r", subject="7", target="new", source=product.source,
+        input_ptr=product.input_ptr, builder_lineage="claude", builder_complexity="deep",
+        **product.review.record_fields())
+    standards = coordinated_build.review_axis_successor_submission(
+        product_record, Verdict(
+            clean=True, reviewed_sha="new", final_sha="new", depth=ReviewDepth.FULL,
+            depth_reason="shared behavior", change_author_tool="codex",
+            checks=("product checked",)))
+    assert_assignment(standards, "standards")
+
+    standards_record = Record(
+        identity="standards", stage="review", pool="claude", demand=1,
+        repo="o/r", subject="7", target="new", source=standards.source,
+        input_ptr=standards.input_ptr, builder_lineage="claude", builder_complexity="deep",
+        **standards.review.record_fields())
+    fix = coordinated_build.review_axis_successor_submission(
+        standards_record, Verdict(
+            clean=False, reviewed_sha="new", final_sha="new", depth=ReviewDepth.FULL,
+            depth_reason="shared behavior", change_author_tool="codex",
+            actions=(ReviewFinding(
+                ReviewAction.FIX, "repair", "rule", "agentflow/x.py", 1),),
+            checks=("standards checked",)), axis="fix")
+    assert_assignment(fix, "fix")
+
+
+def test_taint_recovery_chooses_only_latest_forced_autonomous_record(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+
+    def tainted(identity, sequence, created):
+        return Record(
+            identity=identity, stage="review", pool="claude", demand=1, repo="o/r",
+            subject="7", target="head", change_author_tool="claude", review_tainted=True,
+            review_sequence=sequence, created_at=created, retired=True,
+            source="/work/.agentflow/worktrees/claude-review/pr-42-fix")
+
+    old, latest = tainted("old", 0, 1), tainted("latest", 2, 2)
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [old, latest])
+    monkeypatch.setattr(
+        coordinated_build, "_review_source_facts", lambda record: ("/work", 42))
+    monkeypatch.setattr(
+        coordinated_build, "_review_pr_facts",
+        lambda record: {"state": "OPEN", "head": "head"})
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(
+        coordinated_build, "pick_reviewer", lambda author, **kwargs: "codex")
+    chosen = []
+    monkeypatch.setattr(
+        coordinated_build, "tainted_review_submission",
+        lambda record, tool: chosen.append(record.identity) or SimpleNamespace(stage="review"))
+    submitted = []
+
+    coordinated_build._resume_tainted_reviews(
+        SimpleNamespace(submit_stage=submitted.append))
+
+    assert chosen == ["latest"]
+    assert len(submitted) == 1

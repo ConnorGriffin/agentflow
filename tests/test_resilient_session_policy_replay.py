@@ -326,10 +326,9 @@ def test_a_completed_stage_transfers_its_claim_to_the_next_stage(make_coord):
     assert record_of(coord, revise).claim is True               # revise now owns the claim
 
 
-def test_a_read_only_review_routes_cross_pool_and_lineage_governs_auto_merge(make_coord):
-    """A read-only review is unpinned: it runs on either pool. Whether it may auto-merge turns
-    on lineage — a review by the same tool that built the diff cannot, a cross-tool one can
-    (ADR 0028)."""
+def test_a_fresh_review_routes_cross_pool_and_lineage_governs_auto_merge(make_coord):
+    """A fresh review may start on either pool. Whether it may auto-merge turns on lineage — a
+    review by the same tool that built the diff cannot, a cross-tool one can (ADR 0028)."""
     fake = FakeSession()
     coord = make_coord(fake)
     cross = coord.submit_stage(Submission(repo="o/r", subject="X", stage="review",
@@ -339,7 +338,7 @@ def test_a_read_only_review_routes_cross_pool_and_lineage_governs_auto_merge(mak
     assert record_of(coord, cross).auto_merge_allowed is True    # a different tool reviewed it
     assert record_of(coord, same).auto_merge_allowed is False    # a same-tool review cannot merge
 
-    # Both admit on their own pool — the read-only review was free to route cross-pool.
+    # Both admit on their own pool — either may be selected before writable review work begins.
     assert coord.cycle("codex") == [] and permits(coord, "codex") == 2
     assert coord.cycle("claude") == [] and permits(coord, "claude") == 1
     fake.kill(cross)

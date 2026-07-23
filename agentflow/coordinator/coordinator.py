@@ -12,10 +12,9 @@ classification, and reconciliation. SQLite, admission demand, attempt numbers, g
 provider observations are private implementation details.
 
 All six logical stages are production stages behind this coordinator (issues #103–#108),
-including Mockup's durable visual round. Review
-is read-only, so an eligible continuation may move to the other pool when its home pool cannot
-fit it. The interface and crash boundaries remain exercised with injected launcher, gate, and
-observer collaborators.
+including Mockup's durable visual round. Review may ship bounded fixes and its selected tool is an
+independence decision, so it stays pinned like every other code-writing stage. The interface and crash boundaries remain exercised with
+injected launcher, gate, and observer collaborators.
 """
 
 from __future__ import annotations
@@ -27,7 +26,7 @@ from dataclasses import dataclass
 from uuid import uuid4
 
 from agentflow.coordinator.admission import (
-    ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
+    ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import ProviderCause
@@ -36,6 +35,7 @@ from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Reco
 from agentflow.coordinator.recovery import PROGRESS, REPAIR, Recovery
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
+from agentflow.review_policy import ReviewState
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
 # supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
@@ -94,6 +94,7 @@ class Submission:
                                       # background pipeline work (ADR 0034)
     continuation: bool = False        # admit ahead of cold work — a conflict Revise is a
                                       # continuation of nearly-merged work, not new build (ADR 0038)
+    review: ReviewState | None = None
 
 
 @dataclass(frozen=True)
@@ -162,19 +163,24 @@ class Coordinator:
         """Submit one logical stage's facts; returns its stable identity. Idempotent — a
         repeated submission for the same identity never duplicates work."""
         stage = normalize_stage(submission.stage)
+        review = submission.review or ReviewState(
+            change_author_tool=submission.builder_lineage)
         model = MODEL_FOR.get((submission.pool, submission.complexity), "opus")
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
-                             submission.round, submission.conflict_round, submission.resume)
-        # A code-writing stage is pinned to the tool that built its diff (or, first time, its
-        # own pool) and cannot silently cross pools; a read-only stage is unpinned and may run
-        # on either pool. A review by the same tool that built the diff cannot auto-merge
+                             submission.round, submission.conflict_round, submission.resume,
+                             review.assignment.axis.value, review.passes,
+                             review.sequence, review.uncertainty_handoffs)
+        # A code-writing stage is pinned to its writing tool and cannot silently cross pools.
+        # Build-family stages use the builder lineage; Review uses its independent reviewer pool.
+        # A review by the same tool that built the diff cannot auto-merge
         # (ADR 0028 lineage rules).
-        lineage = (submission.builder_lineage or submission.pool
-                   if stage in CODE_WRITING else None)
-        auto_merge = not (submission.builder_lineage is not None
-                          and submission.pool == submission.builder_lineage)
+        lineage = (submission.pool if stage == "review"
+                   else (submission.builder_lineage or submission.pool
+                         if stage in LINEAGE_PINNED else None))
+        current_author = review.change_author_tool or submission.builder_lineage
+        auto_merge = not (current_author is not None and submission.pool == current_author)
         record = Record(
             identity=identity, stage=stage, pool=submission.pool,
             repo=submission.repo, subject=str(submission.subject), target=submission.target,
@@ -186,6 +192,7 @@ class Coordinator:
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
+            **review.record_fields(),
             created_at=int(time.time()))
         with self._lock:
             successor, prior, transferred, root = self._store.submit(
@@ -511,16 +518,13 @@ class Coordinator:
 
     @staticmethod
     def _may_migrate(record: Record) -> bool:
-        """Whether a stage is safe to move off its home pool. A read-only review is unpinned (no
-        code-writing lineage), so it may run on either pool; a same-tool review that lands on the
-        builder's pool may still finish, but the coordinator strips its auto-merge eligibility
-        (ADR 0028). A *never-started* Build (``attempts=0``) has no branch/worktree/PR, so its
+        """Whether a stage is safe to move off its home pool. Review never moves: its selected tool
+        is part of the cross-tool independence policy, not only worktree placement. A *never-started*
+        Build (``attempts=0``) has no branch/worktree/PR, so its
         lineage pin is vacuous and the move is safe (#273): once it launches, the pin is
         re-established on the destination pool. A Build that already made a real attempt, and
         ``revise``/``respond`` continuations bound to an existing PR on a specific lineage, stay
         pinned; only a genuinely fresh Build moves."""
-        if record.stage == "review" and record.lineage is None:
-            return True
         return record.stage == "build" and record.attempts == 0
 
     def _admit_migration(self, record: Record, dest_pool: str, now: int) -> None:
@@ -538,9 +542,9 @@ class Coordinator:
         demand = admission_demand(
             record.stage, dest_pool, record.model, record.complexity, record.effort)
         record.demand = demand if demand is not None else PERMIT_BUDGET
-        record.auto_merge_allowed = not (record.builder_lineage is not None
-                                         and dest_pool == record.builder_lineage)
-        if record.stage in CODE_WRITING:
+        current_author = record.change_author_tool or record.builder_lineage
+        record.auto_merge_allowed = not (current_author is not None and dest_pool == current_author)
+        if record.stage in LINEAGE_PINNED:
             record.lineage = dest_pool
             record.source = _repool_source(record.source, dest_pool)
         if self._admit(record, now) != STARTED:
@@ -554,10 +558,9 @@ class Coordinator:
         ``pool`` right now. Issue-bound new work (build/mockup/intake) defers behind it at the
         reservation ledger so one high-effort build cannot reserve all five permits while a
         review that needs a single permit waits (#293, ADR 0039). Scoped to the same pool only —
-        permits are per-pool, and the review-migration path already re-places a review whose home
-        pool cannot seat it, so coupling pools here would invite a cross-pool deadlock. This
-        cannot deadlock: a genuinely stuck review exhausts its attempts and parks, leaving the
-        waiting set, at which point builds resume — a bounded pause, never a freeze."""
+        permits are per-pool. Coupling pools here would invite a cross-pool deadlock. A gate-blocked
+        autonomous review deliberately stays waiting for its required independent tool without
+        consuming permits; reviewed-profile same-tool fallback is selected before submission."""
         return any(
             r.stage in PR_BOUND and r.pool == pool and r.state == WAITING
             and not r.hold_pending and r.root is None
@@ -570,7 +573,7 @@ class Coordinator:
             return False
         if record.pool not in {"claude", "codex"}:
             return False  # no permit ledger to charge an unknown pool (ADR 0029)
-        if record.stage in CODE_WRITING and record.pool != record.lineage:
+        if record.stage in LINEAGE_PINNED and record.pool != record.lineage:
             return False  # a code-writing stage may not silently leave its pinned lineage
         if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
             return False  # new issue work defers while a PR-bound stage waits to start (#293)
@@ -937,7 +940,9 @@ class Coordinator:
 
 
 def _identity(repo: str, subject: str, stage: str, target: str | None, round: int = 0,
-              conflict_round: int = 0, resume: int = 0) -> str:
+              conflict_round: int = 0, resume: int = 0, review_axis: str = "combined",
+              review_passes: int = 0, review_sequence: int = 0,
+              uncertainty_handoffs: int = 0) -> str:
     # The auto-revise round joins the identity once one exists, so an evidence-only revision —
     # whose re-review binds to the *same* head SHA — still opens a genuinely new stage rather
     # than colliding with the retired prior review's record. A conflict Revise's own round joins
@@ -952,6 +957,14 @@ def _identity(repo: str, subject: str, stage: str, target: str | None, round: in
         parts.append(f"c{conflict_round}")
     if resume:
         parts.append(f"s{resume}")
+    if stage == "review" and review_axis != "combined":
+        parts.append(f"a{review_axis}")
+    if stage == "review" and review_passes:
+        parts.append(f"p{review_passes}")
+    if stage == "review" and review_sequence:
+        parts.append(f"q{review_sequence}")
+    if uncertainty_handoffs:
+        parts.append(f"u{uncertainty_handoffs}")
     return "|".join(parts)
 
 

@@ -34,13 +34,13 @@ repair once, or park:
 - **A genuine capacity / server / timeout interruption always continues** within
   the attempt budget. The limit lifts or the transport recovers, so the next
   session is not an identical replay. This is unchanged.
-- **A worktree-owning stage** (build, revise, respond, mockup, research,
+- **A worktree-owning stage** (build, revise, respond, review, mockup, research,
   converse) **continues** within the budget, because its continuation carries the
   retained worktree forward — genuinely new state. Each continuation now also
   carries a **recovery envelope**: bounded durable facts (the attempt number, the
   missing outcome, and the retained worktree path) appended to the prompt so the
   fresh session resumes from that work rather than restarting.
-- **A read-only stage** (intake, review) **owns no partial work**, so a clean
+- **A read-only stage** (intake) **owns no partial work**, so a clean
   exit with a missing outcome would replay identically. It earns **at most one
   targeted repair** — a continuation whose envelope names the exact missing proof
   — and then **parks for a human** instead of spending a third identical session.
@@ -60,6 +60,10 @@ so the seam is opt-in.
 - Read-only stages that produce nothing durable now park after two attempts
   instead of three, eliminating the identical third replay. Worktree stages keep
   their full budget but resume rather than restart.
+
+Review originally followed the read-only branch above. ADR 0047 supersedes that
+classification: Review now owns writable partial work and continues behind the full
+worktree-stage budget.
 - The recovery envelope is deliberately bounded — a few durable facts, never the
   prior event stream — so a fresh session is grounded without re-ingesting a whole
   transcript.

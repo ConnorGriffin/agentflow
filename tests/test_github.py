@@ -82,10 +82,11 @@ def test_pr_state_reads_and_fails_closed(monkeypatch):
 
 def test_pr_comments_are_typed_rows(monkeypatch):
     _stub_json(monkeypatch, {"comments": [
-        {"body": "please rebase", "createdAt": "2026-07-19T00:00:00Z"}]})
+        {"body": "please rebase", "createdAt": "2026-07-19T00:00:00Z",
+         "id": "IC_kwDO"}]})
     got = github.pr_comments(REPO, 9)
     assert got == [github.Comment(body="please rebase",
-                                  created_at="2026-07-19T00:00:00Z")]
+                                  created_at="2026-07-19T00:00:00Z", id="IC_kwDO")]
 
 
 def test_pr_comments_real_empty_thread_is_a_list(monkeypatch):
@@ -157,6 +158,7 @@ def test_search_failure_is_unknown_not_no_change(monkeypatch):
     lambda: github.edit_body(REPO, 5, "new body"),
     lambda: github.comment(REPO, 5, "hello"),
     lambda: github.pr_comment(REPO, 9, "hello"),
+    lambda: github.edit_comment("IC_kwDO", "updated"),
     lambda: github.close(REPO, 5),
     lambda: github.pr_ready(REPO, 9),
     lambda: github.create_label(REPO, "agentflow:building", "fbca04"),

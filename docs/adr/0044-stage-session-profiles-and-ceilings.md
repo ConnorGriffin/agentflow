@@ -10,9 +10,10 @@
 Every daemon session is launched with a **per-stage profile** instead of today's
 one-size surface and single two-hour timeout:
 
-1. **Tool surface is an allowlist, per stage.** Read-only stages (Intake, Review,
-   Research) get read/search tools only — no edit tools. Code-writing stages
-   (Build, Respond, Revise, Mockup) keep the full edit/test surface. Withheld
+1. **Tool surface is an allowlist, per stage (Review amended by ADR 0047).** Read-only stages
+   (Intake, Research) get read/search tools only — no edit tools. Code-writing stages
+   (Build, Review, Respond, Revise, Mockup) keep the full edit/test surface. Review needs it to
+   ship bounded fixes before recording its exact-final-head verdict. Withheld
    tools are **removed from the loaded surface** (that is where the cache-creation
    savings live), with a settings-level deny as backstop — not deny-only.
 2. **MCP servers are pinned to strict mode** for every stage: only the servers the
@@ -21,7 +22,8 @@ one-size surface and single two-hour timeout:
    operator's *local* dev servers — notably the codebase code-graph tool — are
    re-supplied so daemon sessions keep them ([#244](https://github.com/ConnorGriffin/agentflow/issues/244)),
    and a read-only stage's allowlist includes those local servers so an exploration
-   stage (Intake, Review, Research) keeps the same code-graph access Build has. It is
+   stage (Intake, Research) keeps the same code-graph access Build has. Review keeps the server
+   through its full bounded-fix surface. It is
    the withheld *edit* tools, not the local read-only MCP tools, that a read-only stage
    loses.
 3. **Per-stage wall-clock and turn ceilings replace the shared two-hour timeout**,
@@ -50,5 +52,5 @@ one-size surface and single two-hour timeout:
   savings, earlier kills, and no capability starvation, holding ADR 0040's
   quality guardrails flat. The profile mechanism itself is settled; the numbers
   are calibration.
-- The read-only Intake/Review profile lands once, coordinated with the
-  provider-native structured result surface (#224), not twice.
+- Intake remains read-only. Review's original read-only profile was superseded by ADR 0047 after
+  operational evidence showed that report-only findings created unnecessary follow-on work.

@@ -15,9 +15,10 @@ blind spots will wave that through — the builder already convinced itself.
 
 ## Decision
 
-**The reviewer model must differ from the builder model.** Codex builds → Claude
-reviews; Claude builds → Codex reviews. Independence from the builder is the whole
-point, at every autonomy level.
+**The reviewer model must differ from the current change author's model.** Codex-authored
+changes receive Claude review; Claude-authored changes receive Codex review. ADR 0047 extends
+that rule beyond the original builder: when a reviewer pushes, authorship moves with the changed
+head and the other tool reviews it.
 
 - The **builder** self-reviews and flags what it's unsure of, but its own sign-off
   never gates a merge.
@@ -38,9 +39,9 @@ point, at every autonomy level.
 
 - **Runner assignment and review are linked:** picking the builder picks the
   reviewer. A later ADR covers how the builder is chosen.
-- **Single-tool fallback:** if only one tool is available (the other is rate-limited
-  or down), the pipeline degrades to same-tool fresh-session review and **must not**
-  auto-merge on it — a `guarded`/`reviewed`-style human check applies until the
-  second tool returns. Never silently drop independence.
+- **Single-tool availability (amended by ADR 0047):** autonomous work holds without consuming
+  capacity until the other tool returns. Reviewed work may use a fresh same-tool review but remains
+  human-merge-only and says so explicitly. A maintainer-forced same-tool autonomous review is
+  tainted until the other tool reviews the still-open exact head cleanly.
 - What makes a reviewer's verdict *clean enough to auto-merge* (severity bar,
   not-clean fallback, optional auto-revise round) is the next ADR.

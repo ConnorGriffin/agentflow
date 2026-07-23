@@ -84,6 +84,7 @@ class Comment:
     """One comment on an issue or PR."""
     body: str
     created_at: str
+    id: str = ""
 
 
 @dataclass(frozen=True)
@@ -121,7 +122,8 @@ def _labels_of(node: dict) -> frozenset[str]:
 
 def _comments_of(node: dict) -> list[Comment]:
     return [
-        Comment(body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "")
+        Comment(body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "",
+                id=c.get("id", "") or "")
         for c in node.get("comments", []) if isinstance(c, dict)
     ]
 
@@ -311,6 +313,19 @@ def pr_comment(repo: str, pr: int, body: str) -> bool:
     """Post a comment on the PR. Returns whether the command succeeded."""
     return _gh(["pr", "comment", str(pr), "--repo", repo,
                 "--body", body]).returncode == 0
+
+
+def edit_comment(comment_id: str, body: str) -> bool:
+    """Replace one issue/PR comment by its opaque GraphQL node id."""
+    if not comment_id:
+        return False
+    mutation = (
+        "mutation($id:ID!,$body:String!){updateIssueComment(input:"
+        "{id:$id,body:$body}){issueComment{id}}}")
+    return _gh([
+        "api", "graphql", "-f", f"query={mutation}", "-f", f"id={comment_id}",
+        "-f", f"body={body}",
+    ]).returncode == 0
 
 
 def close(repo: str, issue: int) -> bool:

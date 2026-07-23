@@ -9,8 +9,10 @@ values are taken verbatim from the research table
 (``docs/research/session-profiles-and-ceilings-draft.md`` §3a/§3b); they are calibration and
 are expected to ratchet once per-attempt telemetry (#223) fills the thin cells.
 
-Read-only stages (Intake, Review, Research) get a read/search allowlist and no edit tools;
-every other stage keeps the full edit/test surface (``allowed_tools is None``). The runner
+Read-only stages (Intake, Research) get a read/search allowlist and no edit tools. Review is a
+bounded code-writing stage: it keeps the full edit/test surface so the independent reviewer can
+ship clear fixes before recording its exact-head verdict. Every other stage also keeps the full
+surface (``allowed_tools is None``). The runner
 pins the MCP set to strict mode and re-supplies the operator's local servers (the code-graph
 tool) to every stage, and adds those local servers to a read-only stage's ``--tools`` allowlist
 so an exploration stage keeps the same code-graph access Build has (#244). Revise inherits the
@@ -26,11 +28,9 @@ _MIN = 60
 # Read/search allowlists for the read-only stages (§3a). Every one omits the edit tools; the
 # scheduling/plan-mode surface history showed loaded-in-every-session-and-used-in-none is
 # omitted too. Intake carries ToolSearch + WebFetch per §3a; Research adds both web tools;
-# Review is the plain read/search four (Read/Bash/Grep/Glob) the table names for it — no
-# ToolSearch, no web tools.
+# Review deliberately is not in this map: its review-and-fix contract needs edit tools.
 _READ_ONLY_TOOLS: dict[str, tuple[str, ...]] = {
     "intake": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch"),
-    "review": ("Read", "Bash", "Grep", "Glob"),
     "research": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebSearch", "WebFetch"),
 }
 

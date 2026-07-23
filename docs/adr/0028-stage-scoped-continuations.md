@@ -77,7 +77,7 @@ stage's required outcome independently:
 | --- | --- |
 | Intake | A parsed route is persisted and can be applied idempotently to the issue. |
 | Build | The expected PR exists for the owned branch. |
-| Review | A parsed verdict is persisted for the exact reviewed head SHA. |
+| Review | A parsed verdict names the exact starting head and the exact final head reviewed after any bounded fixes. |
 | Revise | The same PR branch contains the verified pushed revision, or the required non-code evidence/comment is durably attached. |
 | Mockup | The variant artifacts are committed and the single variant-round issue comment exists. |
 | Respond | The marked reply exists and any requested branch change is pushed. |
@@ -179,9 +179,10 @@ required outcome, agentflow creates exactly one durable handoff and one notifica
 - mockup remains `agentflow:needs-mockup`; and
 - review, revise, and respond park the existing PR for human action.
 
-Code-writing worktrees remain exactly as they are. Existing commits may use the normal
+Code-writing worktrees remain exactly as they are. Review joined these writable retained stages in
+ADR 0047; its continuation keeps partial fixes instead of recreating the checkout. Existing commits may use the normal
 draft-PR preservation path, but uncommitted work is neither discarded nor force-committed.
-Read-only worktrees may be recreated. A later human re-entry starts a fresh stage and
+The remaining read-only worktrees may be recreated. A later human re-entry starts a fresh stage and
 adopts the retained code-writing worktree and original lineage unless the human explicitly
 chooses discard or cross-tool rescue; missing or unsafe local state holds again rather
 than silently starting over.

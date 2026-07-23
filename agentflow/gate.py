@@ -1,8 +1,8 @@
-"""The auto-merge gate — decide to merge, revise, or park (ADR 0003, 0004, 0020).
+"""The exact-head merge gate and final public review outcome (ADR 0003, 0004, 0047).
 
 `decide_merge` is pure: auto-merge requires ALL of an independent (cross-tool)
-review, green CI, and a clean verdict. Anything else revises — up to `MAX_REVISES`
-rounds — then parks for a human. So `autonomous` is never less safe than `reviewed`.
+review, green CI, and a clean verdict. Legacy builder-Revise records retain their bounded
+compatibility path; ADR 0047 review actions and reviewer-fix chains settle through the coordinator.
 The gh actions it dispatches (CI check, squash-merge, park) are thin wrappers around
 the pure decision.
 """
@@ -13,6 +13,7 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from enum import Enum
 
 from agentflow import github
@@ -27,7 +28,7 @@ _MERGE_LOCK = threading.Lock()
 class MergeDecision(str, Enum):
     MERGE = "merge"
     REVISE = "revise"
-    PARK = "park"    # drop-to-reviewed: a human merges
+    PARK = "park"    # a concrete two-section human decision handoff
 
 
 # Revise a fixable miss, but bail after this many unproductive rounds rather than
@@ -150,7 +151,7 @@ def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,
 
     `ui_evidence_missing` is the mechanical UI-evidence gate (ADR 0018): it is decided
     from the diff and the PR's attachments, NOT from the review verdict, so a reviewer
-    who waves a screenshot-less UI change through as "not blocking" cannot clear it.
+    who discards a screenshot-less UI change cannot clear it.
     A missing screenshot parks for a human rather than churning revises — the builder
     was already told to attach one."""
     if reply_pending:
@@ -291,22 +292,144 @@ def squash_merge(repo: str, pr_number: int) -> bool:
                            "--squash", "--delete-branch"]) is not None
 
 
+_CLEAN_REVIEW_MARKER = "<!-- agentflow-clean-review-summary -->"
+
+
+@dataclass(frozen=True, slots=True)
+class ParkContext:
+    """Concrete domain and retained-work facts required in every public PR park."""
+
+    behavior: str
+    options: tuple[str, ...]
+    consequences: str
+    recommendation: str
+    locations: tuple[str, ...]
+    conflicts: str
+    checks: tuple[str, ...]
+    retained_work: str
+    next_action: str
+
+
+def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict) -> bool:
+    """Publish and prove exactly one current final summary after a clean review chain."""
+    status = ("cross-tool review"
+              if verdict.reviewer_tool != verdict.change_author_tool
+              else "same-tool review; maintainer merge required")
+    fixes = "\n".join(f"- {item}" for item in verdict.fixes) or "- None."
+    follow_ups = ("\n".join(f"- {item}" for item in verdict.follow_up_issues)
+                  or "- None.")
+    checks = "\n".join(f"- {item}" for item in verdict.checks) or "- No proof recorded."
+    body = (
+        f"> *agentflow: clean review.*\n{_CLEAN_REVIEW_MARKER}\n\n"
+        "Outcome: clean.\n\n"
+        f"Review depth: {verdict.depth.value.title()} — "
+        f"{verdict.depth_reason or 'legacy review assignment'}\n\n"
+        f"Fixes shipped:\n{fixes}\n\n"
+        f"Necessary follow-ups:\n{follow_ups}\n\n"
+        f"Checks and proof:\n{checks}\n\n"
+        f"Review status: {status}.")
+    comments = github.pr_comments(repo, pr_number)
+    if comments is None:
+        return False
+    marked = [comment for comment in comments if _CLEAN_REVIEW_MARKER in comment.body]
+    if marked:
+        canonical, *duplicates = marked
+        if canonical.body != body and not github.edit_comment(canonical.id, body):
+            return False
+        for duplicate in duplicates:
+            replacement = duplicate.body.replace(
+                _CLEAN_REVIEW_MARKER, "<!-- agentflow-superseded-review-summary -->")
+            if not github.edit_comment(duplicate.id, replacement):
+                return False
+    elif not github.pr_comment(repo, pr_number, body):
+        return False
+    proved = github.pr_comments(repo, pr_number)
+    current = ([] if proved is None else [
+        comment for comment in proved if _CLEAN_REVIEW_MARKER in comment.body])
+    return len(current) == 1 and current[0].body == body
+
+
 def park(repo: str, pr_number: int, verdict: Verdict | None,
-         reason: str = "could not be auto-merged after review") -> None:
-    """Post the review findings so a human can pick the PR up (drop-to-reviewed, or
-    the normal hand-off for a `reviewed`/`guarded` repo).
+         reason: str = "could not be auto-merged after review",
+         missing_outcome: str = "No review was completed — do not treat this as a clean review.",
+         context: ParkContext | None = None, proof_marker: str = "") -> None:
+    """Post one concrete two-section human decision handoff.
 
     Pass ``verdict=None`` when no review completed (budget exhaustion): the body
     will say so explicitly rather than listing an empty findings section that
     reads as a clean review.
     """
-    if verdict is None:
-        findings_block = ("**No review was completed — do not treat this as a "
-                          "clean review.**")
-    else:
-        lines = [f"- **{f.severity}** {f.file}:{f.line} — {f.summary}".rstrip(" —:0")
-                 for f in verdict.findings] or ["- (no blocking findings)"]
-        findings_block = "Review findings:\n" + "\n".join(lines)
-    body = ("> *agentflow: parked for human review.*\n\n"
-            f"This PR {reason}. {findings_block}")
+    if context is None:
+        context = ParkContext(
+            behavior=f"The PR cannot safely complete because it {reason}.",
+            options=("Resume the retained agent stage with clarified intent.",
+                     "Close the PR without shipping this behavior."),
+            consequences="Resuming may ship the intended behavior; closing leaves current behavior unchanged.",
+            recommendation="Clarify the unresolved behavior, then resume the retained stage.",
+            locations=tuple(
+                item.file for item in (verdict.actions if verdict else ()) if item.file)
+                or ("PR branch (exact locations were not produced)",),
+            conflicts=(missing_outcome if verdict is None
+                       else "The grounded review actions listed below remain unresolved."),
+            checks=tuple(verdict.checks if verdict else ()) or ("No completed checks were recorded.",),
+            retained_work="The PR branch and retained stage worktree remain available.",
+            next_action="Choose an option above and resume the retained stage on the same PR.")
+    option_lines = "\n".join(f"- {item}" for item in context.options)
+    decision = (
+        f"Affected behavior: {context.behavior}\n\n"
+        f"Options:\n{option_lines}\n\n"
+        f"Consequences: {context.consequences}\n\n"
+        f"Recommendation: {context.recommendation}")
+    location_lines = "\n".join(f"- {item}" for item in context.locations)
+    check_lines = "\n".join(f"- {item}" for item in context.checks)
+    handoff = (
+        f"Code locations:\n{location_lines}\n\n"
+        f"Conflicting changes or unresolved facts: {context.conflicts}\n\n"
+        f"Checks:\n{check_lines}\n\n"
+        f"Retained work: {context.retained_work}\n\n"
+        f"Exact next action: {context.next_action}")
+    if verdict is not None:
+        action_lines = [
+            f"- **{item.action.value}** "
+            f"{item.file + ':' + str(item.line) if item.file else '(cross-cutting)'} — "
+            f"{item.summary}"
+            for item in verdict.actions
+        ]
+        if not action_lines:
+            action_lines = [
+                f"- **{'fix_before_completion' if item.severity == 'blocking' else 'discard_preference'}** "
+                f"{item.file + ':' + str(item.line) if item.file else '(cross-cutting)'} — "
+                f"{item.summary}"
+                for item in verdict.findings
+            ]
+        if action_lines:
+            handoff += "\n\nReview actions:\n" + "\n".join(action_lines)
+        handoff += (f"\n\nReview depth: {verdict.depth.value.title()} — "
+                    f"{verdict.depth_reason or 'legacy review assignment'}")
+        if verdict.fixes:
+            handoff += "\n\nReview fixes shipped:\n" + "\n".join(
+                f"- {summary}" for summary in verdict.fixes)
+        if verdict.follow_up_issues:
+            handoff += "\n\nFollow-up issues filed:\n" + "\n".join(
+                f"- {url}" for url in verdict.follow_up_issues)
+        if verdict.reviewer_tool and verdict.change_author_tool:
+            status = ("cross-tool review"
+                      if verdict.reviewer_tool != verdict.change_author_tool
+                      else "same-tool review; maintainer merge required")
+            handoff += f"\n\nReview status: {status}."
+    marker_line = f"\n<!-- {proof_marker} -->" if proof_marker else ""
+    body = (f"> *agentflow: parked for human review.*{marker_line}\n\n"
+            "## Maintainer decision needed\n\n"
+            f"{decision}\n\n"
+            "## Agent handoff\n\n"
+            f"{handoff}")
+    if proof_marker:
+        comments = github.pr_comments(repo, pr_number)
+        parked = ([] if comments is None else [
+            comment for comment in comments
+            if "> *agentflow: parked for human review.*" in comment.body])
+        if parked:
+            if parked[-1].id:
+                github.edit_comment(parked[-1].id, body)
+            return  # never multiply park comments when the current one cannot be updated
     github.pr_comment(repo, pr_number, body)

@@ -33,8 +33,8 @@ def _flag(cmd: list[str], name: str) -> str:
     return cmd[cmd.index(name) + 1]
 
 
-def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(monkeypatch, tmp_path):
-    """An Intake or Review is launched with a read/search allowlist (edit tools absent from the
+def test_read_only_intake_drops_edits_pins_mcp_and_caps_turns(monkeypatch, tmp_path):
+    """Intake is launched with a read/search allowlist (edit tools absent from the
     loaded surface), an MCP set pinned to strict mode, a turn ceiling, and a deny backstop — none
     of which the old uniform full-surface launch carried."""
     # No operator-local servers → strict mode alone keeps the personal connectors out (#244); the
@@ -42,7 +42,6 @@ def test_read_only_intake_and_review_drop_edits_pin_mcp_and_cap_turns(monkeypatc
     monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
     for stage, expected_tools in (
         ("intake", ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch")),
-        ("review", ("Read", "Bash", "Grep", "Glob")),
     ):
         cmd = provider_command(_record(stage, str(tmp_path)))
         tools = _flag(cmd, "--tools").split(",")
@@ -69,7 +68,7 @@ def test_read_only_stages_keep_the_operators_local_code_graph_server(monkeypatch
     stage keeps the same code-graph access Build has (#244) while still losing the edit tools."""
     monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers",
                         lambda: {"codebase-memory-mcp": {"command": "/x/code-graph"}})
-    cmd = provider_command(_record("review", str(tmp_path)))
+    cmd = provider_command(_record("intake", str(tmp_path)))
 
     tools = _flag(cmd, "--tools").split(",")
     assert "mcp__codebase-memory-mcp" in tools           # code-graph reachable in the read-only surface
@@ -89,6 +88,16 @@ def test_build_keeps_the_full_edit_surface(tmp_path):
     assert "permissions" not in json.loads(_flag(cmd, "--settings"))
     assert "--strict-mcp-config" in cmd               # MCP still pinned empty
     assert _flag(cmd, "--max-turns") == "300"         # Build deep/extra ceiling (§3b)
+
+
+def test_review_keeps_the_full_edit_surface_for_bounded_fixes(tmp_path):
+    """Review is no longer report-only: the independent reviewer can edit, test, commit, and push
+    clear fixes while retaining Review's tighter wall/turn ceiling."""
+    cmd = provider_command(_record("review", str(tmp_path)))
+    assert "--tools" not in cmd
+    assert "permissions" not in json.loads(_flag(cmd, "--settings"))
+    assert "--strict-mcp-config" in cmd
+    assert _flag(cmd, "--max-turns") == "40"
 
 
 def test_revise_inherits_the_original_builders_build_ceiling(tmp_path):

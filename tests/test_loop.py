@@ -1002,7 +1002,7 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
     monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
-    monkeypatch.setattr(loop, "pick_reviewer", lambda tool: "codex")
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
     submission = SimpleNamespace(stage="review", transfer_from=None)
     monkeypatch.setattr(coordinated_build, "survivor_review_submission",
                         lambda *args, **kwargs: submission)
@@ -1021,16 +1021,17 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
     assert submitted == [submission] and reconciled == [coord]
 
 
-def test_survivor_review_uses_the_reviewer_pick_not_a_hardcoded_cross_tool(monkeypatch):
-    """The survivor re-review must go to the tool the balancer picks (ADR 0020), not a hardcoded
-    cross-tool pool: when codex is out of budget, a claude-built survivor is re-reviewed by claude
-    (same-tool, no auto-merge) rather than submitted into a codex pool that cannot launch it."""
+def test_autonomous_survivor_waits_instead_of_falling_back_to_same_tool(monkeypatch):
+    """An autonomous survivor remains open when the independent tool is unavailable."""
     from agentflow import coordinated_build
 
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
     monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
-    monkeypatch.setattr(loop, "pick_reviewer", lambda tool: "claude")   # codex out of budget
+    calls = []
+    monkeypatch.setattr(
+        loop, "pick_reviewer",
+        lambda tool, **kwargs: calls.append((tool, kwargs)) or None)  # codex out of budget
     captured = {}
 
     def fake_submission(cfg, **kwargs):
@@ -1045,8 +1046,100 @@ def test_survivor_review_uses_the_reviewer_pick_not_a_hardcoded_cross_tool(monke
     result = loop._merge_autonomous_survivor(
         RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
 
-    assert result == "review submitted"
+    assert result == "no reviewer pool available — deferring"
+    assert captured == {}
+    assert calls == [("claude", {"allow_same_tool": False})]
+
+
+def test_manual_same_tool_review_requires_warning_then_explicit_confirmation(monkeypatch):
+    from agentflow import coordinated_build
+    from agentflow.review_policy import ReviewAssignment
+
+    warning = loop.review_pr(
+        RepoConfig("o/r", "/work"), 42, force_same_tool=True,
+        maintainer_confirmed=False)
+    assert "Warning: same-tool review is not independent" in warning
+    assert "maintainer_confirmed=True" in warning
+
+    monkeypatch.setattr(loop.github, "api", lambda *args, **kwargs: {
+        "state": "OPEN", "headRefName": "agentflow/claude/issue-7-fix",
+        "headRefOid": "head", "closingIssuesReferences": [{"number": 7}],
+    })
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
+    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(
+        coordinated_build, "_review_assignment_facts",
+        lambda *args, **kwargs: (ReviewAssignment(reason="one journey"), ("agentflow/x.py",)))
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(loop, "_claim", lambda repo, issue: True)
+    captured = {}
+    submission = SimpleNamespace(stage="review")
+    monkeypatch.setattr(
+        coordinated_build, "survivor_review_submission",
+        lambda *args, **kwargs: captured.update(kwargs) or submission)
+    submitted = []
+    monkeypatch.setattr(
+        coordinated_build, "build_coordinator",
+        lambda: SimpleNamespace(submit_stage=submitted.append))
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda coord: [])
+
+    result = loop.review_pr(
+        RepoConfig("o/r", "/work"), 42, force_same_tool=True,
+        maintainer_confirmed=True)
+
+    assert result == "same-tool review submitted; maintainer merge required"
     assert captured["reviewer_tool"] == "claude"
+    assert captured["review"].tainted is True
+    assert submitted == [submission]
+
+
+def test_manual_review_uses_latest_exact_head_author_not_branch_builder(monkeypatch):
+    """Claude built the branch, then Codex pushed a review fix. The durable current author is
+    Codex: default review selects Claude; forced same-tool selects Codex and records taint."""
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+    from agentflow.review_policy import ReviewAssignment
+
+    monkeypatch.setattr(loop.github, "api", lambda *args, **kwargs: {
+        "state": "OPEN", "headRefName": "agentflow/claude/issue-7-fix",
+        "headRefOid": "fixed", "closingIssuesReferences": [{"number": 7}],
+    })
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
+    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(
+        coordinated_build, "_review_assignment_facts",
+        lambda *args, **kwargs: (ReviewAssignment(reason="one journey"), ()))
+    history = Record(
+        identity="review-fixed", stage="review", pool="claude", demand=1,
+        repo="o/r", subject="7", target="fixed", builder_lineage="claude",
+        change_author_tool="codex", review_sequence=2, review_passes=1, retired=True)
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [history])
+    choices = []
+    monkeypatch.setattr(
+        loop, "pick_reviewer",
+        lambda author, **kwargs: choices.append((author, kwargs)) or "claude")
+    monkeypatch.setattr(loop, "_claim", lambda *_args: True)
+    captured = []
+    monkeypatch.setattr(
+        coordinated_build, "survivor_review_submission",
+        lambda *args, **kwargs: captured.append(kwargs) or SimpleNamespace(stage="review"))
+    monkeypatch.setattr(
+        coordinated_build, "build_coordinator",
+        lambda: SimpleNamespace(submit_stage=lambda _submission: None))
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda _coord: None)
+
+    assert loop.review_pr(RepoConfig("o/r", "/work"), 42) == "review submitted"
+    assert choices == [("codex", {"allow_same_tool": False})]
+    assert captured[-1]["reviewer_tool"] == "claude"
+    assert captured[-1]["review"].change_author_tool == "codex"
+    assert captured[-1]["review"].tainted is False
+
+    assert loop.review_pr(
+        RepoConfig("o/r", "/work"), 42, force_same_tool=True,
+        maintainer_confirmed=True) == "same-tool review submitted; maintainer merge required"
+    assert captured[-1]["reviewer_tool"] == "codex"
+    assert captured[-1]["review"].change_author_tool == "codex"
+    assert captured[-1]["review"].tainted is True
 
 
 def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch):
@@ -1055,7 +1148,7 @@ def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch)
     from agentflow import coordinated_build
 
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
-    monkeypatch.setattr(loop, "pick_reviewer", lambda tool: None)
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: None)
     submitted = []
     monkeypatch.setattr(coordinated_build, "survivor_review_submission",
                         lambda *a, **k: submitted.append(True))
@@ -1113,7 +1206,7 @@ def test_survivor_conflict_opens_a_conflict_revise_on_the_builder_lineage(monkey
     assert sub.subject == "4" and sub.target == "sha-conf" and sub.conflict_round == 1
     assert sub.continuation is True                       # admitted ahead of cold build work
     assert "resolve the merge conflicts" in sub.input_ptr
-    assert "preserve `main`" in sub.input_ptr
+    assert "Preserve both sides" in sub.input_ptr
     assert "revise round 1 opened" in out
 
 
@@ -1136,9 +1229,9 @@ def test_second_survivor_conflict_opens_a_distinct_second_round_idempotently(mon
     assert submitted2 == [] and "already open" in out2
 
 
-def test_third_survivor_conflict_parks_once_and_leaves_the_conflict_budget_alone(monkeypatch):
-    """AC4: the third conflict — with both conflict rounds spent — falls back to the existing
-    conflict notice and park, exactly once, and submits no further Revise."""
+def test_third_survivor_conflict_opens_another_bounded_revise(monkeypatch):
+    """A PR-lifetime count never turns a fresh, resolvable conflict into human work. The third
+    distinct conflicting head opens round three; that stage's own attempt budget remains bounded."""
     priors = [_conflict_revise(1, "sha-1"), _conflict_revise(2, "sha-2")]
     submitted, _ = _stub_conflict_env(monkeypatch, priors=priors, head="sha-3")
     parked = []
@@ -1148,8 +1241,9 @@ def test_third_survivor_conflict_parks_once_and_leaves_the_conflict_budget_alone
 
     out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
 
-    assert submitted == [], "the conflict budget is spent — no third conflict Revise"
-    assert parked == [8] and "parked for human" in out
+    assert len(submitted) == 1
+    assert submitted[0].conflict_round == 3 and submitted[0].target == "sha-3"
+    assert parked == [] and "revise round 3 opened" in out
 
 
 def test_conflict_revise_defers_without_parking_when_the_head_is_unreadable(monkeypatch):
