@@ -460,8 +460,9 @@ class ClaudeRunner(_WorktreeRunner):
         """
         from agentflow.coordinator.profiles import WITHHELD_EDIT_TOOLS
 
+        _MODEL_OVERRIDES = {"opus": "claude-opus-5"}
         deny: tuple[str, ...] = ()
-        argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", model,
+        argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", _MODEL_OVERRIDES.get(model, model),
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
                 "--strict-mcp-config"]
