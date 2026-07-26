@@ -50,7 +50,7 @@ def _stub(monkeypatch, *, token="tok", windows="default", now=None):
     if windows == "default":
         windows = {FIVE_HOUR: (12.0, now + 3 * 3600), SEVEN_DAY: (3.0, now + 3 * 24 * 3600)}
     monkeypatch.setattr(quota_poll, "_access_token", lambda: token)
-    monkeypatch.setattr(quota_poll, "_fetch_windows", lambda _t: windows)
+    monkeypatch.setattr(quota_poll, "_fetch_windows", lambda _t, _log=None: windows)
     return windows
 
 
@@ -187,6 +187,43 @@ def test_fetch_fails_closed_on_a_transport_error(monkeypatch):
     """A network failure is a ``None`` reading, never an exception that escapes into the cycle."""
     _serve(monkeypatch, urllib.error.URLError("boom"))
     assert quota_poll._fetch_windows("tok") is None
+
+
+def _http_error(code, headers=None):
+    return urllib.error.HTTPError(
+        quota_poll._USAGE_URL, code, "throttled", headers or {}, None)
+
+
+def test_a_429_fails_closed_but_logs_its_retry_after(monkeypatch, tmp_path):
+    """The wedged-pool incident (#322): the usage endpoint answers HTTP 429 with a ``Retry-After``.
+    The poll still fails closed — it records no fact and leaves any prior fact in place — but the
+    throttle is now observable, logging its bounded wait instead of a silent ``None``."""
+    store = tmp_path / "records.db"
+    now = int(time.time())
+    # A prior five-hour fact on disk, older than the TTL so the poll actually reaches the endpoint.
+    quota.record_quota(store, quota.QuotaFact(
+        pool="claude", used_percent=12.0, resets_at=now + 3 * 3600,
+        observed_at=now - 3600, provenance="oauth:five_hour", window=FIVE_HOUR))
+    monkeypatch.setattr(quota_poll, "_access_token", lambda: "tok")
+    _serve(monkeypatch, _http_error(429, {"Retry-After": "3449"}))   # real _fetch_windows sees 429
+    lines = []
+    result = quota_poll.refresh_claude_quota(store, now=now, ttl=60, log=lines.append)
+    assert result is None
+    assert any("429" in line and "3449" in line for line in lines)
+    assert quota.read_quota(store, "claude", FIVE_HOUR).used_percent == 12.0  # prior fact untouched
+
+
+def test_a_429_retry_after_is_bounded(monkeypatch):
+    """An absent or absurd ``Retry-After`` still logs a finite, actionable wait rather than a
+    missing or hours-long one — the log is diagnostic, not a hard sleep."""
+    lines = []
+    _serve(monkeypatch, _http_error(429, {"Retry-After": "999999"}))
+    assert quota_poll._fetch_windows("tok", lines.append) is None
+    assert f"~{quota_poll._MAX_RETRY_AFTER_SECONDS}s" in lines[0]
+    lines.clear()
+    _serve(monkeypatch, _http_error(429, {}))              # no Retry-After header at all
+    assert quota_poll._fetch_windows("tok", lines.append) is None
+    assert f"~{quota_poll._MAX_RETRY_AFTER_SECONDS}s" in lines[0]
 
 
 # --- credential sourcing (Keychain preferred, on-disk fallback, malformed skipped) --------------

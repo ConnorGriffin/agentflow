@@ -165,29 +165,47 @@ def _weekly_released(elapsed_seconds: float) -> float:
 
 def _weekly_over_pace(window: RateLimitWindow, now: float) -> str | None:
     """The deferral reason when a seven-day window is over its released allowance right now, or
-    ``None`` when it permits unattended dispatch. A window whose fact does not sit inside its own
-    live span is stale and fails closed. Reported usage must be *strictly* below the released
-    allowance — usage equal to it blocks."""
-    starts_at = window.resets_at - window.window_minutes * 60
-    if not starts_at <= now < window.resets_at:
+    ``None`` when it permits unattended dispatch. Reported usage must be *strictly* below the
+    released allowance — usage equal to it blocks.
+
+    Reset-aware roll-forward (#322), mirroring `quota.effective_usage`: once ``now`` reaches the
+    recorded ``resets_at`` the provider window has rolled over, so the reported utilization no
+    longer applies. Rather than failing closed, advance to the current window (start = the latest
+    ``resets_at + k·window`` at or before ``now``) at 0% used and pace from that fresh start, so a
+    throttled pool recovers on the next normal dispatch pass with no operator, poll, or restart.
+    This is decision-time compute only — nothing rolled forward is ever persisted. A window that
+    has not yet opened (``now < starts_at``) is still untrustworthy and fails closed."""
+    window_seconds = window.window_minutes * 60
+    starts_at = window.resets_at - window_seconds
+    if now < starts_at:
         return "weekly limit facts are stale"
+    if now >= window.resets_at:
+        elapsed_windows = int((now - window.resets_at) // window_seconds)
+        starts_at = window.resets_at + elapsed_windows * window_seconds
+        used_percent = 0.0
+    else:
+        used_percent = window.used_percent
     released = _weekly_released(now - starts_at)
-    if window.used_percent >= released:
-        return (f"weekly spend at {window.used_percent:g}% exceeds "
+    if used_percent >= released:
+        return (f"weekly spend at {used_percent:g}% exceeds "
                 f"{released:.1f}% released for unattended work")
     return None
 
 
 def _codex_pacing(windows: tuple[RateLimitWindow, ...], now: float) -> tuple[bool, str]:
     for window in windows:
+        if window.window_minutes == _WEEKLY_WINDOW_MIN:
+            # The seven-day window's staleness/roll-forward is owned entirely by
+            # `_weekly_over_pace` (#322), so an expired-but-reset weekly window rolls forward here
+            # for Codex the same as for Claude. The short-window staleness branch below is #319's
+            # territory and stays untouched.
+            over = _weekly_over_pace(window, now)
+            if over is not None:
+                return False, over
+            continue
         starts_at = window.resets_at - window.window_minutes * 60
         if not starts_at <= now < window.resets_at:
             return False, f"{window.window_minutes}-minute limit facts are stale"
-        if window.window_minutes != _WEEKLY_WINDOW_MIN:
-            continue
-        over = _weekly_over_pace(window, now)
-        if over is not None:
-            return False, over
     return True, ""
 
 
