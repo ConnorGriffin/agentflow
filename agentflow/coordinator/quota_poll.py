@@ -40,6 +40,10 @@ _CREDENTIAL_FILE = "~/.claude/.credentials.json"
 # undocumented endpoint every few seconds. Env-overridable.
 POLL_TTL_SECONDS = int(os.environ.get("AGENTFLOW_QUOTA_POLL_TTL_S", "60"))
 _HTTP_TIMEOUT = 10
+# Upper bound on the throttle wait we report, so a bogus/absent ``Retry-After`` still logs an
+# actionable, finite number rather than an hours-long or missing value. The reset-aware
+# roll-forward (#322), not this poll, is what unwedges the pool — the log is diagnostic only.
+_MAX_RETRY_AFTER_SECONDS = 3600
 
 
 def _access_token() -> str | None:
@@ -96,20 +100,42 @@ def _window_reading(window: dict) -> tuple[float, int] | None:
     return float(used), resets_at
 
 
-def _fetch_windows(token: str) -> dict[str, tuple[float, int]] | None:
+def _retry_after_seconds(value) -> int:
+    """A bounded, actionable throttle wait parsed from a ``Retry-After`` header. The header may be
+    absent or a delta-seconds integer; anything unparseable or out of range collapses to the
+    bounded default so the logged wait is always a finite, sane number of seconds."""
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        return _MAX_RETRY_AFTER_SECONDS
+    if seconds < 0:
+        return _MAX_RETRY_AFTER_SECONDS
+    return min(seconds, _MAX_RETRY_AFTER_SECONDS)
+
+
+def _fetch_windows(token: str, log=None) -> dict[str, tuple[float, int]] | None:
     """GET the OAuth usage endpoint once and return ``{window: (used_percent, resets_at)}`` for
     every window it reports in a trustworthy shape, or ``None`` on a transport/parse failure.
 
     Both the five-hour and the seven-day window come from this single response (#315). A window
     that is missing or malformed is simply absent from the returned mapping — the caller then
     leaves that window's prior fact untouched (a partial response never erases a still-good fact),
-    while ``None`` (the whole request failed) leaves *both* untouched."""
+    while ``None`` (the whole request failed) leaves *both* untouched.
+
+    A throttle (HTTP 429) still fails closed to ``None``, but is surfaced through ``log`` with its
+    bounded ``Retry-After`` (#322) so a wedged pool's recovery is observable in daemon logs instead
+    of a silent ``None``. The reset-aware roll-forward, not this poll, is what unwedges the pool."""
     request = urllib.request.Request(
         _USAGE_URL,
         headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as response:
             payload = json.loads(response.read().decode())
+    except urllib.error.HTTPError as error:
+        if error.code == 429 and log is not None:
+            wait = _retry_after_seconds(error.headers.get("Retry-After"))
+            log(f"claude quota poll throttled (HTTP 429); retry after ~{wait}s")
+        return None
     except (urllib.error.URLError, OSError, ValueError):
         return None
     if not isinstance(payload, dict):
@@ -128,14 +154,17 @@ def _is_fresh(store_path: Path | str, pool: str, window: str, now: float, ttl: i
 
 
 def refresh_claude_quota(store_path: Path | str, *, now: float | None = None,
-                         ttl: int = POLL_TTL_SECONDS):
+                         ttl: int = POLL_TTL_SECONDS, log=None):
     """Ensure the Claude pool has fresh provider facts for both windows, polling the OAuth usage
     endpoint when either persisted window is missing or older than ``ttl``. Records each window
     it reads independently. Returns the recorded five-hour
     :class:`~agentflow.coordinator.quota.QuotaFact` (the dispatch authority the balancer sizes
     headroom from), or ``None`` when no fresh five-hour reading could be obtained (each prior
     fact, if any, is left untouched). Never raises — a poll failure must not break a dispatch
-    pass."""
+    pass.
+
+    ``log`` (if given) receives a diagnostic line when the endpoint throttles the poll (#322), so a
+    429 lands its bounded ``Retry-After`` in daemon logs instead of a silent ``None``."""
     now = time.time() if now is None else now
     if (_is_fresh(store_path, "claude", FIVE_HOUR, now, ttl)
             and _is_fresh(store_path, "claude", SEVEN_DAY, now, ttl)):
@@ -143,7 +172,7 @@ def refresh_claude_quota(store_path: Path | str, *, now: float | None = None,
     token = _access_token()
     if token is None:
         return None
-    windows = _fetch_windows(token)
+    windows = _fetch_windows(token, log)
     if not windows:
         return None
     five_hour_fact = None

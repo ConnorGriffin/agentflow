@@ -163,7 +163,7 @@ def _refresh_claude_quota(_log) -> None:
     ``None``; this outer guard is defense-in-depth for the dispatch-critical path (the poll shells
     out via subprocess/urllib), so no unforeseen error there can ever sink a cycle."""
     try:
-        refresh_claude_quota(default_store_path())
+        refresh_claude_quota(default_store_path(), log=_log)
     except Exception as e:  # noqa: BLE001 — a quota poll must never break dispatch
         _log(f"claude quota poll error: {type(e).__name__}: {e}")
 

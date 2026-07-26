@@ -157,22 +157,77 @@ def test_a_missing_weekly_window_fails_closed(coord_state, monkeypatch):
     assert builder is None and "weekly limit facts unavailable" in block_msg
 
 
-def test_a_stale_weekly_window_fails_closed(coord_state, monkeypatch):
-    """A weekly fact whose window has already rolled over (its reset is in the past) is stale, not
-    fresh capacity — it blocks rather than fabricating a full allowance."""
+def test_a_not_yet_open_weekly_window_fails_closed(coord_state, monkeypatch):
+    """A weekly fact whose window has not yet opened (its start is still in the future) is not
+    trustworthy capacity — it fails closed rather than fabricating an allowance. This is the
+    surviving fail-closed edge after the reset-aware roll-forward (#322): only a *future* window
+    stays stale; an already-reset one rolls forward (see the recovery test below)."""
     tmp_path = coord_state
     _clear_activity_gate(tmp_path, monkeypatch)
     now = 1_000_000
     monkeypatch.setattr(time, "time", lambda: now)
     _seed_five_hour(10.0, now=now)
-    # Observed inside a window that has since reset: resets_at sits 100s in the past.
+    # A valid fact whose window opens 100s from now: observed_at sits inside the fact's own span,
+    # so it passes validation, but the decision clock is still before the window's start.
+    starts_at = now + 100
     quota.record_quota(default_store_path(), quota.QuotaFact(
-        pool="claude", used_percent=5.0, resets_at=now - 100, observed_at=now - 200,
-        provenance="oauth:seven_day", window=quota.SEVEN_DAY))
+        pool="claude", used_percent=5.0, resets_at=starts_at + SEVEN_DAY_SECONDS,
+        observed_at=starts_at, provenance="oauth:seven_day", window=quota.SEVEN_DAY))
 
     builder, _reviewer, block_msg = balancer.pick_pair("CLAUDE", "CODEX")
 
     assert builder is None and "weekly limit facts are stale" in block_msg
+
+
+def test_an_expired_weekly_window_rolls_forward_and_admits_claude(coord_state, monkeypatch):
+    """The #322 recovery: a durable weekly fact recorded 97%-used, whose recorded reset has just
+    passed, must not stay parked as stale. On or after ``resets_at`` the balancer rolls the window
+    forward to a fresh 0%-used window at decision time (never persisting it) and admits queued
+    Claude work — no operator, no quota-store write, no restart. Reproduces the wedged pool from
+    the incident: an expired 97% seven-day fact plus a throttled poll that records nothing."""
+    tmp_path = coord_state
+    _clear_activity_gate(tmp_path, monkeypatch)
+    now = 1_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    _seed_five_hour(10.0, now=now)                          # five-hour clear and independent
+    # A once-valid fact observed near the end of its window at 97% used, whose reset is now 50s
+    # in the past — exactly the incident's expired-but-trustworthy weekly fact.
+    resets_at = now - 50
+    quota.record_quota(default_store_path(), quota.QuotaFact(
+        pool="claude", used_percent=97.0, resets_at=resets_at,
+        observed_at=resets_at - 3600, provenance="oauth:seven_day", window=quota.SEVEN_DAY))
+
+    builder, _reviewer, block_msg = balancer.pick_pair("CLAUDE", "CODEX")
+    assert builder == "CLAUDE" and block_msg == ""
+
+    # Convergence needs no restart and no quota-store write: a plain second dispatch pass, with the
+    # same expired fact still on disk, admits again.
+    before = quota.read_quota(default_store_path(), "claude", quota.SEVEN_DAY)
+    builder2, _reviewer2, _block2 = balancer.pick_pair("CLAUDE", "CODEX")
+    after = quota.read_quota(default_store_path(), "claude", quota.SEVEN_DAY)
+    assert builder2 == "CLAUDE"
+    assert before == after and after.used_percent == 97.0   # nothing rolled forward was persisted
+
+
+def test_a_freshly_reset_weekly_window_still_paces(coord_state, monkeypatch):
+    """The roll-forward yields a real day-0 window, not blanket capacity: right after reset only
+    ~11.4% is released, so a rolled-forward window still defers work that would exceed day-0 pacing
+    once new spend lands. Here the five-hour block stands in for that — the weekly roll-forward
+    clears, but the pool defers on its own five-hour ceiling, proving the roll-forward does not
+    fabricate five-hour headroom."""
+    tmp_path = coord_state
+    _clear_activity_gate(tmp_path, monkeypatch)
+    now = 1_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    _seed_five_hour(95.0, now=now)                          # over the idle ceiling
+    quota.record_quota(default_store_path(), quota.QuotaFact(
+        pool="claude", used_percent=97.0, resets_at=now - 50,
+        observed_at=now - 50 - 3600, provenance="oauth:seven_day", window=quota.SEVEN_DAY))
+
+    builder, _reviewer, block_msg = balancer.pick_pair("CLAUDE", "CODEX")
+
+    assert builder is None
+    assert "utilization at 95%" in block_msg and "weekly" not in block_msg
 
 
 def test_a_queued_claude_build_is_rechecked_and_deferred_at_launch(coord_state, monkeypatch):
