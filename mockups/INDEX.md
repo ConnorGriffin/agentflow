@@ -4,9 +4,15 @@ One line per surface. `locked` = binding visual spec for its implementation;
 `shipped` = now in the app (harvest from the shipping frontend, never from here —
 archived markup is stale by definition).
 
-Grounding for this repo: theme tokens are lifted from `agentflow/static/dashboard.html`
-(`:root` block — GitHub-dark-derived). Real data shape is
-`agentflow.dashboard_data.snapshot()`, captured to `dashboard.capture.json`. The
+Scope (ADR 0048): a `local` mockup round — an addition inside a shipping surface —
+**inherits the live web UI's identity** and varies only the addition; a `surface` round
+is a whole-surface replacement that keeps ADR 0035's explicitly-open visual questions.
+
+Grounding for this repo: the shipping surface — and the incumbent a `local` round
+inherits — is the **v2 console at `agentflow/webui/`** (ADR 0026). Harvest current theme
+tokens from it; the GitHub-dark-derived `:root` values in `DESIGN.md` were originally
+lifted from the retired stdlib `dashboard.html`, which no longer exists. Real data shape
+is `agentflow.dashboard_data.snapshot()`, captured to `dashboard.capture.json`. The
 re-platform (`dashboard-v2`) binds a **proposed v2 snapshot contract** that extends
 `snapshot()` with daemon live-state (running sessions, held, parked, daemon status),
 captured to `dashboard-v2.capture.json`. Both captures are gitignored.

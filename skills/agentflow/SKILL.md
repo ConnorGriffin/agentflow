@@ -56,9 +56,15 @@ For an issue at `agentflow:needs-grilling` or `agentflow:needs-mockup`:
    the app's behavior and their real numbers, never code symbols / ADR numbers / file
    paths. Symptom + concrete options + your recommendation. When the decision tree is
    locked, go to **Land it as ready** below.
-5. **needs-mockup →** run `/ui-mockups` to a *locked* visual spec (charter gate), then
-   land it as ready with the `★ LOCKED visual spec` handoff (mockup file + numbered
-   decisions), and set complexity/effort as usual.
+5. **needs-mockup →** decide the scope first (ADR 0048): `local` (an addition inside a
+   shipping surface — inherit `agentflow/webui/`'s identity, vary only the addition) or
+   `surface` (a whole-surface replacement — the open 3-4 concept tournament). Run
+   `/ui-mockups` to a *locked* visual spec (charter gate); each variant carries a ≤150-word
+   `LOCKED` contract (thesis, user path, first viewport, visual rules, required
+   interactions/states, states to screenshot, out-of-scope). Land it as ready with the
+   `★ LOCKED visual spec` handoff — the chosen variant's committed mockup path AND its
+   `LOCKED` contract copied **verbatim** into the brief so review stays self-contained after
+   archival — and set complexity/effort as usual.
 6. **Release** `agentflow:triaging` once the state label lands — or immediately if you give up.
 
 ### `triage <N>` — force intake on a specific issue now

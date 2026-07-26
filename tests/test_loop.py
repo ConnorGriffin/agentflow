@@ -10,14 +10,16 @@ from agentflow.gate import respond_reply_disclaimer
 from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body
 from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
                             REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
-                            _free_to_dispatch, _issues_in_flight, _native_blockers,
+                            _SCOPE_GUIDANCE, _free_to_dispatch, _issues_in_flight,
+                            _native_blockers,
                             _next_pr_awaiting_reply, _next_ready_issue, _next_resumable_issue,
                             _rebase_survivor, _untriaged, base_advanced, build_issue,
                             complexity_from_labels, conflict_already_flagged, effort_from_labels,
-                            held_build_result, intake_allowlist, issue_of_branch, pr_number,
+                            held_build_result, intake_allowlist, issue_of_branch,
+                            mockup_scope_from_labels, pr_number,
                             recheck_once, repo_profile,
                             slug, ui_surfaces)
-from agentflow.runner import Complexity, Effort
+from agentflow.runner import Complexity, Effort, MockupScope
 
 
 class _FakeRun:
@@ -898,13 +900,43 @@ def test_produce_prompt_drives_ui_mockups_headless_and_one_marked_comment():
     # commit variants to a branch, and post exactly ONE issue comment starting with the marker.
     body = PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
                                  branch="agentflow/claude/mockup-7-a-screen",
-                                 surfaces="`agentflow/static/`", disclaimer=_MOCKUP_DISCLAIMER)
+                                 surfaces="`agentflow/static/`",
+                                 scope_guidance=_SCOPE_GUIDANCE[MockupScope.SURFACE],
+                                 disclaimer=_MOCKUP_DISCLAIMER)
     assert "/ui-mockups" in body
     assert "screenshot" in body.lower()
     assert "agentflow/static/" in body
     assert _MOCKUP_DISCLAIMER in body           # the marker line the comment must start with
     assert "one comment" in body.lower()        # exactly one issue comment
     assert "push" in body.lower()               # variant HTML preserved on a branch, not lost
+    assert "LOCKED" in body                      # every variant must carry a locked contract
+    assert "150" in body                         # the ≤150-word bound on the contract
+
+
+def test_produce_prompt_scope_branches_local_vs_surface():
+    # The two scopes give materially different draw instructions (ADR 0048): surface reopens
+    # the whole visual world; local inherits the shipping surface and varies only the addition.
+    def body(scope):
+        return PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
+                                     branch="b", surfaces="`agentflow/webui/src/`",
+                                     scope_guidance=_SCOPE_GUIDANCE[scope],
+                                     disclaimer=_MOCKUP_DISCLAIMER)
+    surface, local = body(MockupScope.SURFACE), body(MockupScope.LOCAL)
+    assert "wildly-different" in surface.lower() or "genuinely-different" in surface.lower()
+    assert "3-4" in surface
+    assert "inherit" in local.lower()            # local inherits the shipping surface identity
+    assert "addition" in local.lower()
+    assert surface != local                       # materially different instructions
+    # both still demand the locked contract — scope never weakens the charter gate
+    assert "LOCKED" in surface and "LOCKED" in local
+
+
+def test_mockup_scope_from_labels_reads_the_scope_or_defaults_local():
+    assert mockup_scope_from_labels(["agentflow:needs-mockup",
+                                     "agentflow:mockup:surface"]) is MockupScope.SURFACE
+    assert mockup_scope_from_labels(["agentflow:mockup:local"]) is MockupScope.LOCAL
+    # a legacy park with no scope label draws the safer, narrower round
+    assert mockup_scope_from_labels(["agentflow:needs-mockup"]) is MockupScope.LOCAL
 
 
 # --- issue #45: re-rebase survivors after main advances (ADR 0009 merge-time floor) -----
@@ -1382,6 +1414,7 @@ class TestScreenshotHostingInstruction:
         return PRODUCE_PROMPT.format(
             repo="o/r", n=205, title="t", body="b",
             branch="agentflow/claude/issue-205-x", surfaces="agentflow/webui/src/",
+            scope_guidance=_SCOPE_GUIDANCE[MockupScope.SURFACE],
             disclaimer=_MOCKUP_DISCLAIMER)
 
     def test_build_prompt_pins_to_the_commit_and_namespaces_the_round(self):

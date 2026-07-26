@@ -212,6 +212,15 @@ class TestHasCommittedEvidence:
     def test_no_files_no_evidence(self):
         assert not has_committed_evidence([])
 
+    def test_gate_is_existence_only_never_a_contract_matcher(self):
+        # ADR 0048 leaves the mechanical gate existence-only: a committed screenshot satisfies it
+        # regardless of what the image shows or whether it matches the locked visual contract.
+        # Contract fidelity is reviewer judgment, not a new mechanical matcher.
+        assert has_committed_evidence(
+            ["agentflow/webui/src/app.svelte",
+             "docs/screenshots/issue-321/deadbeef/wildly-wrong-but-present.png"])
+        assert has_image_evidence("![anything at all](whatever.png)")
+
 
 class TestUiEvidenceGapAnchorsToUs:
     # issue #205: evidence counts only in the PR body or an agentflow-marked comment.
