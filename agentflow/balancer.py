@@ -192,38 +192,63 @@ def _weekly_over_pace(window: RateLimitWindow, now: float) -> str | None:
     return None
 
 
+def _normalize_short_window(window: RateLimitWindow, now: float) -> float | None:
+    """Normalize a short (300-minute) Codex window's usage to the current moment (#319).
+    Returns the effective usage (0..100), or ``None`` when the window is temporally impossible.
+
+    - Expired (``now >= resets_at``): rolled over; read as 0%.
+    - Future start (``starts_at > now``): impossible window; fail closed.
+    - Live: return the reported usage unchanged."""
+    starts_at = window.resets_at - window.window_minutes * 60
+    if starts_at > now:
+        return None
+    if now >= window.resets_at:
+        return 0.0
+    return window.used_percent
+
+
 def _codex_pacing(windows: tuple[RateLimitWindow, ...], now: float) -> tuple[bool, str]:
     for window in windows:
         if window.window_minutes == _WEEKLY_WINDOW_MIN:
             # The seven-day window's staleness/roll-forward is owned entirely by
             # `_weekly_over_pace` (#322), so an expired-but-reset weekly window rolls forward here
-            # for Codex the same as for Claude. The short-window staleness branch below is #319's
-            # territory and stays untouched.
+            # for Codex the same as for Claude.
             over = _weekly_over_pace(window, now)
             if over is not None:
                 return False, over
             continue
-        starts_at = window.resets_at - window.window_minutes * 60
-        if not starts_at <= now < window.resets_at:
+        # Short window (#319): normalize expired windows to 0% (rolled over) rather than
+        # failing closed as stale; a future-start window is still impossible and fails closed.
+        effective = _normalize_short_window(window, now)
+        if effective is None:
             return False, f"{window.window_minutes}-minute limit facts are stale"
     return True, ""
 
 
-def _codex_spent_pct(windows: tuple[RateLimitWindow, ...]) -> float:
-    short = next((window for window in windows
-                  if window.window_minutes == _SHORT_WINDOW_MIN), None)
-    return short.used_percent if short else windows[0].used_percent
+def _codex_spent_pct(windows: tuple[RateLimitWindow, ...], now: float) -> float:
+    """The effective short-window utilization for headroom and ceiling checks, normalized to
+    ``now`` so an expired 300-minute window does not keep the pool blocked after reset (#319)."""
+    short = next((w for w in windows if w.window_minutes == _SHORT_WINDOW_MIN), None)
+    target = short if short is not None else windows[0]
+    effective = _normalize_short_window(target, now)
+    return effective if effective is not None else 100.0
 
 
 def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
     if status.windows is None:
         return PoolStatus(status.tool, False, 100.0, "limit facts unavailable", None)
     paced, pace_reason = _codex_pacing(status.windows, now)
+    spent_pct = _codex_spent_pct(status.windows, now)
+    # Prefer the pacing reason when it fires; fall back to the existing reason only when
+    # pacing is fine or when it has no reason to offer.
+    reason = (pace_reason if not paced and pace_reason
+              else status.reason if not status.clear
+              else pace_reason)
     return PoolStatus(
         status.tool,
         status.clear and paced,
-        status.spent_pct,
-        status.reason if not status.clear else pace_reason,
+        spent_pct,
+        reason,
         status.windows,
         status.active,
         status.ceiling,
@@ -361,7 +386,7 @@ def _query_pool(tool: str, operator: bool = False, *,
             # unavailable adapter fails closed rather than dispatching blind.
             return PoolStatus(tool, False, 100.0, "limit facts unavailable", None, active, ceiling)
         windows, observed_at = facts
-        pct = _codex_spent_pct(windows)
+        pct = _codex_spent_pct(windows, now)
         under = pct < ceiling
         reason = block_reason if blocked else (yield_reason if active and not under else "")
         return PoolStatus(tool, (not blocked) and under, pct, reason,
