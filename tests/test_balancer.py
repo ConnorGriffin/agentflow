@@ -477,8 +477,10 @@ def test_operator_dispatch_still_honors_spend_ceiling(stub_gate, isolate_state, 
 
 def test_expired_weekly_window_clears_without_transcript_write():
     """Regression for #319: a 10080-minute window at 63% whose resets_at has passed must
-    dispatch-clear without any new transcript write.  This is the exact reproduction from
-    the issue — it failed as 'stale' before the rollover normalization was added."""
+    dispatch-clear at 0% used without any new transcript write. This is the exact
+    reproduction from the issue. The weekly window already rolled its pacing forward (#322),
+    but before this change its reported utilization was still carried forward as the raw 63%;
+    the assertion below fails unless that effective usage is also normalized to 0%."""
     now = 2000.0
     window = RateLimitWindow(used_percent=63.0, window_minutes=10080, resets_at=1900.0)
     status = PoolStatus("codex", True, 63.0, "", (window,))
