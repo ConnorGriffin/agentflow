@@ -1,6 +1,8 @@
 ---
-# Authoritative design tokens (impeccable reads these). Lifted verbatim from
-# agentflow/static/dashboard.html :root — GitHub-dark-derived. Dark-only.
+# Authoritative design tokens (impeccable reads these). GitHub-dark-derived, dark-only.
+# The shipping surface — the v2 console at agentflow/webui/ — is the live source of truth
+# a `local` mockup round inherits (ADR 0026/0048); harvest current tokens from it, not from
+# the retired stdlib dashboard these values were originally lifted from.
 colors:
   bg: "#0d1117"        # app background
   surface: "#161b22"   # panels / rows

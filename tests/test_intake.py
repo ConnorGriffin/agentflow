@@ -16,7 +16,7 @@ from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, apply_inta
                               awaiting_recheck, compose_ready_body, intake_labels,
                               intake_prompt, intake_result_is_durable, parse_intake,
                               replies_since_intake, sweep_legacy_labels)
-from agentflow.runner import Complexity, Effort
+from agentflow.runner import Complexity, Effort, MockupScope
 
 
 def test_ready_with_all_fields_is_build_ready():
@@ -105,7 +105,33 @@ def test_labels_for_ready_carry_both_dials():
 
 def test_labels_for_holds_are_a_single_state():
     assert intake_labels(parse_intake('{"route": "grill", "body": "q"}')) == ["agentflow:needs-grilling"]
-    assert intake_labels(parse_intake('{"route": "mockup", "body": "m"}')) == ["agentflow:needs-mockup"]
+    # a mockup hold carries its scope alongside the state label; missing scope defaults to local
+    assert intake_labels(parse_intake('{"route": "mockup", "body": "m"}')) == [
+        "agentflow:needs-mockup", "agentflow:mockup:local"]
+
+
+def test_mockup_scope_parsed_and_defaults_local():
+    surface = parse_intake('{"route": "mockup", "body": "m", "mockup_scope": "surface"}')
+    assert surface.route is IntakeRoute.MOCKUP and surface.mockup_scope is MockupScope.SURFACE
+    assert intake_labels(surface) == ["agentflow:needs-mockup", "agentflow:mockup:surface"]
+    local = parse_intake('{"route": "mockup", "body": "m", "mockup_scope": "local"}')
+    assert local.mockup_scope is MockupScope.LOCAL
+
+
+@pytest.mark.parametrize("scope_json", [
+    '', ', "mockup_scope": null', ', "mockup_scope": "everything"', ', "mockup_scope": 5'])
+def test_mockup_scope_fails_safe_to_local(scope_json):
+    # An unknown/missing/invalid scope on a mockup route never reopens the whole surface —
+    # it fails safe to the narrower local round (ADR 0048).
+    v = parse_intake('{"route": "mockup", "body": "m"' + scope_json + '}')
+    assert v.route is IntakeRoute.MOCKUP and v.mockup_scope is MockupScope.LOCAL
+
+
+def test_non_mockup_routes_carry_no_scope():
+    ready = parse_intake('{"route": "ready", "title": "t", "body": "b", '
+                         '"complexity": "deep", "effort": "low", "mockup_scope": "surface"}')
+    assert ready.mockup_scope is None            # scope is meaningless off a mockup route
+    assert parse_intake('{"route": "grill", "body": "q"}').mockup_scope is None
 
 
 def _c(body, author=None):
@@ -611,3 +637,23 @@ def test_intake_prompt_carries_the_effort_rubric():
     assert "builder reasoning depth" in prompt, "missing the over-rating-burns-capacity note"
     # the JSON output-field contract for effort must stay untouched
     assert '"effort": "low" | "medium" | "high" | "extra" — for "ready"; null for a hold' in prompt
+
+
+def test_intake_prompt_states_the_mockup_scope_contract():
+    # ADR 0048: intake must be told to classify scope and emit the mockup_scope field, defaulting
+    # to local when unsure.
+    prompt = intake_prompt("owner/repo", {"number": 1, "title": "t", "body": "b"})
+    assert '"mockup_scope": "local" | "surface"' in prompt
+    assert "MOCKUP SCOPE" in prompt
+    assert "default" in prompt.lower() and "local" in prompt
+
+
+def test_pick_resume_copies_the_locked_contract_verbatim_into_the_brief():
+    # The pick/resume path (a maintainer reply after a variant round) must tell intake to copy the
+    # chosen variant's LOCKED contract VERBATIM into the ready brief and record the committed path,
+    # so review stays self-contained after the mockups are archived (ADR 0048).
+    prompt = intake_prompt("owner/repo", {"number": 1, "title": "t", "body": "b"},
+                           extra="B, but tighter")
+    assert "LOCKED" in prompt
+    assert "VERBATIM" in prompt or "verbatim" in prompt
+    assert "committed mockup path" in prompt.lower() or "exact committed mockup path" in prompt.lower()

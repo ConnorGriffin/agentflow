@@ -143,3 +143,7 @@ then Context / Decision / Alternatives / Consequences.
 - [0047](0047-reviewers-ship-clear-fixes.md) — Depth-aware review uses four grounded actions;
   reviewer-authored heads ping-pong across tools until unchanged, outages and same-tool taint
   are explicit, and each new conflict gets bounded resolution plus one narrow decision handoff.
+- [0048](0048-mockup-scope-and-locked-contract.md) — Intake classifies a UI mockup as `local`
+  (inherit the shipping surface, vary only the addition) or `surface` (the open whole-surface
+  tournament); each variant carries a ≤150-word `LOCKED` contract copied verbatim into the ready
+  brief on pick, which the reviewer judges the implementation screenshots against.

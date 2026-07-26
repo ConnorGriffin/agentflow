@@ -306,6 +306,13 @@ Ground every observation in acceptance, security, or the engineering charter. Cl
     block just because an image link doesn't render inline. Backend-only PRs need none.
     (Note: a mechanical gate also parks such a PR independent of your verdict — you
     cannot waive this one.)
+  - a **screenshot that violates the locked visual contract** — if the acceptance brief carries a
+    `LOCKED visual contract`, OPEN the implementation screenshots and compare them to it line by
+    line. A mismatch is `fix_before_completion` ONLY when it breaks a STATED contract line (a
+    named visual rule, a required interaction/state, a state the contract says must be
+    screenshotted but isn't, or an out-of-scope boundary the build crossed). Unstated visual taste
+    the contract never claimed is NOT a violation — that stays `discard_preference`. No contract in
+    the brief means there is nothing here to check.
 A correctness gap beyond the stated acceptance becomes `necessary_follow_up` only when it is a real,
 evidenced improvement outside this PR's purpose. Otherwise discard it as unsupported scope growth.
 

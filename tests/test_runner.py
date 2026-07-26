@@ -223,7 +223,8 @@ def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(t
             disclaimer="> *agentflow reply*")),
         ("mockup", PRODUCE_PROMPT.format(
             repo="o/r", n=7, title="x", body="", branch="mockup-7",
-            surfaces="`frontend/`", disclaimer="> *agentflow mockup*")),
+            surfaces="`frontend/`", scope_guidance="SCOPE: local",
+            disclaimer="> *agentflow mockup*")),
     ]
 
     for index, (stage, prompt) in enumerate(stage_prompts):

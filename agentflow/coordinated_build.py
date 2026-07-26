@@ -132,18 +132,19 @@ def mockup_submission(cfg, issue: dict, tool: str):
     fresh-session continuations. The durable prompt reconstructs the exact same visual-design job.
     """
     from agentflow.coordinator import Submission
-    from agentflow.loop import (PRODUCE_PROMPT, _MOCKUP_DISCLAIMER, _surfaces_phrase,
-                                slug, ui_surfaces)
+    from agentflow.loop import (PRODUCE_PROMPT, _MOCKUP_DISCLAIMER, _SCOPE_GUIDANCE,
+                                _surfaces_phrase, mockup_scope_from_labels, slug, ui_surfaces)
 
     n = int(issue["number"])
     sl = slug(issue.get("title", ""))
     ref = WorktreeRef.for_mockup(cfg.workdir, tool, n, sl)
     branch = ref.branch
     source = ref.path
+    scope = mockup_scope_from_labels([lbl["name"] for lbl in issue.get("labels", [])])
     prompt = PRODUCE_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         branch=branch, surfaces=_surfaces_phrase(ui_surfaces(cfg.workdir)),
-        disclaimer=_MOCKUP_DISCLAIMER)
+        scope_guidance=_SCOPE_GUIDANCE[scope], disclaimer=_MOCKUP_DISCLAIMER)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="mockup", pool=tool, complexity="deep",
         source=source, claim=True, input_ptr=prompt, builder_lineage=tool)

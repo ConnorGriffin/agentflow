@@ -95,6 +95,16 @@ class Effort(str, Enum):
     EXTRA = "extra"
 
 
+class MockupScope(str, Enum):
+    """How wide a mockup round reopens the visual world (ADR 0048). Intake classifies a
+    UI issue as one of these; the produce phase branches its draw instructions on it and
+    the shipping surface's identity is inherited (or replaced) accordingly. Default to
+    `local` when uncertain — a local round is the safer, narrower reopening."""
+
+    LOCAL = "local"      # an addition inside a shipping surface — inherit its identity
+    SURFACE = "surface"  # a whole-surface replacement — the open 3-4 concept tournament
+
+
 @dataclass(frozen=True, slots=True)
 class WorktreeRecovery:
     """What a recovery pass changed and which owned sessions it left for recovery."""
