@@ -23,6 +23,7 @@ from agentflow.intake import (INTAKE_MARK, IntakeResult, IntakeRoute, STATE_LABE
                               replies_since_intake)
 from agentflow.notify import notify
 from agentflow.reviewer import Verdict, review_worktree
+from agentflow.screenshot_crib import SCREENSHOT_HARNESS
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.runner import (Complexity, Effort, MockupScope, _run,
                               _worktree_is_disposable, _worktree_is_registered,
@@ -211,11 +212,9 @@ product decisions. Small safety/permission changes are Full. If the change touch
 both light and dark themes where the app has them. If this brief carries a `## LOCKED visual
 contract`, that contract is the spec you build and screenshot against: satisfy every visual rule
 and interaction it states, and ship a screenshot of EVERY state it names must be screenshotted
-(the reviewer compares your screenshots to those exact contract lines). Capture them with the canonical harness:
-`node scripts/screenshots.mjs <config.json>` — write a small per-issue config (url, theme,
-out per shot) and run the script. Do NOT write your own harness; every session that does
-rediscovers the same sandbox walls. Attach the PNGs the committed way — no browser is
-involved and none may be used: save them under
+(the reviewer compares your screenshots to those exact contract lines). """ + SCREENSHOT_HARNESS + """
+
+Attach the PNGs the committed way — no browser is involved and none may be used: save them under
 `docs/screenshots/issue-{n}/<short-sha>/` (namespace each round by the branch's current short
 commit SHA so a later revision can never overwrite the files an earlier comment points at),
 commit and push them FIRST, then embed each in the PR body as a markdown image hosted from the
@@ -249,9 +248,8 @@ Do not degrade the two charter gates while revising (ADR 0018):
 - If the PR touches a user-facing surface (this repo's are: {surfaces}), keep before/after
   screenshots attached — both light and dark themes where the app has them. A UI change with
   no screenshot cannot auto-merge; a mechanical gate parks it regardless of the review.
-  If screenshots are missing or stale, capture them with the canonical harness
-  (`node scripts/screenshots.mjs <config.json>` — do NOT write your own) and commit the
-  PNGs under `docs/screenshots/issue-{n}/<short-sha>/` — namespace each round by the branch's
+  If screenshots are missing or stale, capture them this way — """ + SCREENSHOT_HARNESS + """
+  Commit the PNGs under `docs/screenshots/issue-{n}/<short-sha>/` — namespace each round by the branch's
   current short commit SHA so this round's files never overwrite the ones an earlier comment
   points at. Push FIRST, then embed them in the PR body as markdown images hosted from the
   immutable commit that added them
@@ -302,8 +300,8 @@ The same comment must contain exactly one durable outcome marker:
 
 - Answer in plain language, in the app's own terms — no code symbols or file paths.
 - If they asked for evidence (e.g. "show me a screenshot"), produce it and ATTACH it to
-  your comment — run `node scripts/screenshots.mjs <config.json>` (the canonical harness,
-  do NOT write your own) against the locked mockup for a UI surface, the same way a build does.
+  your comment, against the locked mockup for a UI surface, the same way a build does.
+  """ + SCREENSHOT_HARNESS + """
 - If they asked for a small change, make it, commit, and push to THIS SAME branch.
 
 Same contract as a revision: never open a new PR, never merge. If you genuinely can't
@@ -822,8 +820,7 @@ The issue as filed / scoped:
 {scope_guidance}
 
 Run the `/ui-mockups` skill for this repo's user-facing surface(s): {surfaces}, following it
-headless. Screenshot each variant using `node scripts/screenshots.mjs <config.json>` (the
-canonical harness — do NOT write your own).
+headless. Screenshot each variant this way — """ + SCREENSHOT_HARNESS + """
 
 Every variant MUST carry a `LOCKED` contract of AT MOST 150 words — the durable spec the build
 and the independent review are judged against after these mockups are archived. State, for that
