@@ -55,6 +55,25 @@ def targeted_repair(record, missing: str) -> Recovery:
     return Recovery(REPAIR, _envelope(record, missing))
 
 
+def contract_repair(record, error: str) -> Recovery:
+    """The attempt finished its actual work and only stated the outcome in a shape the contract
+    rejects. Re-running the work would repeat every external call to reach an answer already
+    reached, so grant exactly one repair turn that names the parser's own error and asks for
+    nothing but a corrected statement of that same outcome (issue #332)."""
+    lines = [
+        "Recovery context for this session (durable facts only, not a transcript):",
+        f"- This is a continuation; {record.attempts} of {ATTEMPT_BUDGET} attempts have run.",
+        "- The prior attempt completed its work but stated the outcome in a rejected shape:",
+        f"  {error}.",
+    ]
+    if record.source:
+        lines.append(f"- That work is retained at {record.source}; it is done — do not redo it.")
+    lines.append(
+        "- Correct only the outcome statement. Do not re-run the review, re-read the diff, or "
+        "make any further GitHub calls — restate the same conclusion in a valid shape.")
+    return Recovery(REPAIR, "\n".join(lines))
+
+
 def durable_progress(record, missing: str) -> Recovery:
     """A worktree-owning stage carries its partial work forward across attempts, so a continuation
     is genuinely new state — not an identical replay — as long as it resumes that work. Continue

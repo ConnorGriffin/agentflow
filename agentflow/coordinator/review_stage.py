@@ -21,6 +21,29 @@ from __future__ import annotations
 from agentflow.coordinator.providers import ProviderObserver
 
 
+def _contract_error(record, obs) -> str:
+    """The parser's own error when the attempt did state a verdict but stated it in a rejected
+    shape, or ``""`` when it produced no verdict at all.
+
+    The distinction is what a fresh session would have to do: a missing verdict means the review
+    itself is unfinished and must continue; a rejected one means the review is finished and only
+    its statement is wrong."""
+    import json
+
+    from agentflow.reviewer import parse_verdict
+    payload = (getattr(obs, "final_message", "") or "").strip()
+    try:
+        stated = json.loads(payload)
+    except ValueError:
+        return ""
+    if not isinstance(stated, dict) or "verdict" not in stated:
+        return ""
+    verdict = parse_verdict(
+        payload, expected_sha=record.target, expected_depth=record.review_depth,
+        expected_axis=record.review_axis, expected_author=record.change_author_tool)
+    return "" if verdict.parsed else (verdict.detail or "")
+
+
 class ReviewStageAdapter:
     """Observes a launched Review family and verifies its verdict outcome.
 
@@ -32,8 +55,9 @@ class ReviewStageAdapter:
     """
 
     def __init__(self, *, verdict_ready, worktree_reset=None, observer=None, handoff=None,
-                 settle=None, prepare_settle=None) -> None:
+                 settle=None, prepare_settle=None, verdict_error=None) -> None:
         self._verdict_ready = verdict_ready
+        self._verdict_error = verdict_error or _contract_error
         self._worktree_reset = worktree_reset or (
             lambda record: bool(record.source and record.target))
         self._observer = observer or ProviderObserver()
@@ -60,8 +84,15 @@ class ReviewStageAdapter:
 
     def recover(self, record, obs):
         """Review may own partial fixes in its detached checkout. Preserve and continue them within
-        the bounded attempt budget while naming the missing exact-head verdict."""
-        from agentflow.coordinator.recovery import durable_progress
+        the bounded attempt budget while naming the missing exact-head verdict.
+
+        A review that did reach a verdict and only stated it in a rejected shape has already done
+        the work; it earns one repair turn naming the parser's exact error instead of spending the
+        continuation budget re-reviewing a head it has already cleared (issue #332)."""
+        from agentflow.coordinator.recovery import contract_repair, durable_progress
+        error = self._verdict_error(record, obs)
+        if error:
+            return contract_repair(record, error)
         return durable_progress(record, "a recorded review verdict for the exact reviewed head SHA")
 
     def finalize_hold(self, record) -> str | None:
