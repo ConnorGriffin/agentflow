@@ -158,7 +158,7 @@ def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
     # The four claim lanes are listed in order (building, triaging, drawing, resolving); only the
     # building lane holds a stale-claimed issue. The proof read back shows the label gone.
-    listings = iter([[{"number": 7, "updatedAt": "2020-01-01T00:00:00Z"}], [], [], []])
+    listings = iter([[{"number": 7, "updated_at": "2020-01-01T00:00:00Z"}], [], [], []])
     monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
     removed = []
     monkeypatch.setattr(github, "remove_label",
@@ -167,6 +167,38 @@ def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch
 
     assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
     assert removed == [(7, "agentflow:building")]
+
+
+def test_claim_reconciliation_reads_labels_off_the_hourly_budget_not_search(monkeypatch):
+    """Reconciliation runs four lanes per repo every cycle. Asking GitHub's search for each one
+    exceeds its ~30/minute ceiling across a fleet and starves the lane permanently, so the listing
+    must be an ordinary REST read. That endpoint also returns pull requests, which share the issue
+    number sequence — one must never be mistaken for a claimed issue."""
+    from agentflow import coordinated_build, github
+
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    asked = []
+
+    def listing(args, *, parse_json=False):
+        asked.append(args)
+        if "building" not in args[-1]:
+            return []
+        return [
+            {"number": 7, "updated_at": "2020-01-01T00:00:00Z"},
+            {"number": 9, "updated_at": "2020-01-01T00:00:00Z",
+             "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/9"}},
+        ]
+
+    monkeypatch.setattr(github, "api", listing)
+    removed = []
+    monkeypatch.setattr(github, "remove_label",
+                        lambda repo, issue, label: removed.append(issue) or True)
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
+
+    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
+    assert removed == [7], "the pull request must not be read as a claimed issue"
+    assert all(call[0] == "api" and call[1].startswith("repos/o/r/issues?") for call in asked)
+    assert not any("issue" == call[0] and "list" == call[1] for call in asked)
 
 
 def test_unreadable_coordinator_state_clears_no_claim(monkeypatch):
@@ -193,8 +225,8 @@ def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
                   repo="o/r", subject="8", state=HELD, claim=False)
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [waiting, held])
     # The building lane lists both issues; #7 is shielded by the live waiting build, #8 is not.
-    listings = iter([[{"number": 7, "updatedAt": "2020-01-01T00:00:00Z"},
-                      {"number": 8, "updatedAt": "2020-01-01T00:00:00Z"}], [], [], []])
+    listings = iter([[{"number": 7, "updated_at": "2020-01-01T00:00:00Z"},
+                      {"number": 8, "updated_at": "2020-01-01T00:00:00Z"}], [], [], []])
     monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
     removed = []
     monkeypatch.setattr(github, "remove_label",
