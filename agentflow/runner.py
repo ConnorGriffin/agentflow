@@ -206,24 +206,46 @@ def _worktree_is_active(wt: Path) -> bool:
         return False
 
 
-def _worktree_is_disposable(workdir: str, wt: Path) -> bool:
+def _worktree_head(workdir: str, wt: Path) -> str:
+    """The commit an idle, owned, clean worktree is parked on — ``""`` when it is any of
+    busy, foreign, dirty, or unreadable. Everything a caller may not disturb answers ``""``,
+    so both reuse and removal fail closed on the same evidence."""
     target = os.path.realpath(wt)
     main = os.path.realpath(workdir)
     if target == main:
-        return False
+        return ""
     if _worktree_is_active(wt):
-        return False
+        return ""
     if not _worktree_is_registered(workdir, wt):
-        return False
+        return ""
     status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
     if status.returncode != 0 or status.stdout.strip():
-        return False
+        return ""
     head = _run(["git", "-C", str(wt), "rev-parse", "HEAD"])
-    if head.returncode != 0 or not head.stdout.strip():
-        return False
-    remote_refs = _run(["git", "-C", workdir, "for-each-ref", "--contains",
-                        head.stdout.strip(), "--format=%(refname)", "refs/remotes/origin/"])
+    return head.stdout.strip() if head.returncode == 0 else ""
+
+
+def _commit_is_on_origin(workdir: str, commit: str) -> bool:
+    remote_refs = _run(["git", "-C", workdir, "for-each-ref", "--contains", commit,
+                        "--format=%(refname)", "refs/remotes/origin/"])
     return remote_refs.returncode == 0 and bool(remote_refs.stdout.strip())
+
+
+def _worktree_is_disposable(workdir: str, wt: Path) -> bool:
+    head = _worktree_head(workdir, wt)
+    return bool(head) and _commit_is_on_origin(workdir, head)
+
+
+def retain_stranded_commit(workdir: str, wt: Path, commit: str) -> bool:
+    """Anchor a commit that exists only in ``wt`` under a durable recovery ref, so moving that
+    checkout can never be the thing that loses it.
+
+    A detached session checkout drifts off the remote whenever its branch is rebased or amended:
+    the commit it is parked on is real work in git's eyes but is already superseded on the PR.
+    Naming it under ``refs/agentflow/stranded/`` keeps it reachable and out of reflog expiry
+    without keeping the checkout hostage to it."""
+    ref = f"refs/agentflow/stranded/{wt.name}/{commit[:12]}"
+    return _run(["git", "-C", workdir, "update-ref", ref, commit]).returncode == 0
 
 
 def discard_orphaned_worktree(workdir: str, wt: Path) -> None:
@@ -326,13 +348,22 @@ class _WorktreeRunner:
         orphaned — its git metadata was lost (e.g. a daemon killed mid-prepare).
         Git holds no state for it and ``worktree add`` would fail on the existing
         dir every cycle, so it is discarded and rebuilt. A *registered* worktree
-        is never force-discarded here: a non-disposable one still fails closed.
+        is never force-discarded here: a busy or dirty one still fails closed.
+
+        A clean checkout parked on a commit that has left the remote — the ordinary
+        aftermath of a rebase or force-push on the branch under review — is moved onto
+        ``ref`` rather than left to stall the stage forever. Its old commit is anchored
+        under a recovery ref first, so no work is destroyed by the move.
         """
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
             if _worktree_is_registered(workdir, wt):
-                if not _worktree_is_disposable(workdir, wt):
+                head = _worktree_head(workdir, wt)
+                if not head:
                     raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
+                if not _commit_is_on_origin(workdir, head) \
+                        and not retain_stranded_commit(workdir, wt, head):
+                    raise subprocess.CalledProcessError(1, ["git", "update-ref"])
                 # Freshen a reused worktree to the (possibly moved) ref — otherwise a
                 # re-review after a revise push would inspect a stale checkout.
                 _run(["git", "-C", str(wt), "reset", "--hard", ref]).check_returncode()
