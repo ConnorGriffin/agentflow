@@ -1340,6 +1340,16 @@ def _review_follow_ups_valid(record, verdict) -> bool:
 _REVIEW_PREPARE_FAILURES: dict[str, int] = {}
 
 
+def _commit_is_gone(workdir: str, sha: str) -> bool:
+    """Whether ``sha`` is absent from the repository — the branch was rebased or amended past it
+    and it survives on no ref. Absence is only claimed on a definite answer, so an unreadable
+    repository reads as present and keeps the more cautious message."""
+    from agentflow.loop import _run
+    if not sha:
+        return False
+    return _run(["git", "-C", workdir, "cat-file", "-e", f"{sha}^{{commit}}"]).returncode != 0
+
+
 def _review_worktree_reset(record, _log=None) -> bool:
     """Prepare Review's detached, writable exact-head checkout (ADR 0030, amended).
 
@@ -1371,8 +1381,16 @@ def _review_worktree_reset(record, _log=None) -> bool:
         # Surface on the 2nd consecutive failure, then re-remind every 10th, so a
         # long-stuck review keeps a periodic breadcrumb instead of a single line.
         if _log is not None and fails >= 2 and (fails - 2) % 10 == 0:
-            _log(f"{record.repo}: review checkout keeps failing at {record.source} — "
-                 "admission is stuck; the PR will not be reviewed until it is cleared")
+            if _commit_is_gone(workdir, record.target):
+                # The reviewed head was rebased or amended away. The record is not stuck on its
+                # checkout and no human can clear it: the diverged-review reconciler supersedes it
+                # with one at the live head as soon as a reviewer pool has headroom. Say that,
+                # rather than sending someone after a checkout that is fine.
+                _log(f"{record.repo}: review target {record.target[:12]} no longer exists — "
+                     "awaiting retarget to the live PR head (needs reviewer headroom)")
+            else:
+                _log(f"{record.repo}: review checkout keeps failing at {record.source} — "
+                     "admission is stuck; the PR will not be reviewed until it is cleared")
         return False
     _REVIEW_PREPARE_FAILURES.pop(record.source, None)
     return True
