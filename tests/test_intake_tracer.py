@@ -472,6 +472,107 @@ def test_exhaustion_hold_is_idempotent_across_a_restart(make_coord, monkeypatch)
     assert applied == [7] and len(notified) == 1
 
 
+def _permanent_hold(coord, fake, identity):
+    """Drive one Intake attempt to a permanent provider condition — the provider refuses the
+    session before the model ever returns a decision — and settle the resulting hold."""
+    coord.cycle("claude")
+    fake.end(identity, cause=ProviderCause.PERMANENT)
+    return [outcome.status for outcome in coord.cycle("claude")]
+
+
+def test_permanent_provider_hold_names_the_failure_not_a_missing_decision(make_coord, monkeypatch):
+    """A provider that refuses the session before the model reads anything is an auth/billing
+    failure, not unresolved product intent (issue #328). The durable handoff names the provider
+    failure and its remediation instead of asking the maintainer to settle a scope question that
+    was never asked — which used to send them to `/agentflow pickup` hunting a decision that
+    never existed. The held state label and the exactly-once envelope are unchanged."""
+    fake = IntakeSession()
+    applied, released, notified, comments = [], [], [], []
+    _hold_seams(monkeypatch, comments, applied=applied, released=released, notified=notified)
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=lambda *args: "proof",
+                                 handoff=coordinated_intake.hold_intake)
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission())
+
+    assert _permanent_hold(coord, fake, identity) == ["held"]
+
+    posted, = comments
+    assert "couldn't ground this into a confident scope" not in posted
+    assert "refused the session" in posted and "Re-authenticate" in posted
+    assert applied == [7] and released == [7] and len(notified) == 1
+
+
+def test_permanent_provider_hold_is_idempotent_across_a_restart(make_coord, monkeypatch):
+    """The provider-failure comment is itself the durable marker, so a restarted daemon replaying
+    the handoff re-detects it and neither posts a second comment nor pings again."""
+    fake = IntakeSession()
+    applied, released, notified, comments = [], [], [], []
+    _hold_seams(monkeypatch, comments, applied=applied, released=released, notified=notified)
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=lambda *args: "proof",
+                                 handoff=coordinated_intake.hold_intake)
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission())
+
+    assert _permanent_hold(coord, fake, identity) == ["held"]
+    assert len(comments) == 1 and len(notified) == 1
+
+    make_coord(fake, adapter=adapter).cycle("claude")
+    assert len(comments) == 1 and len(notified) == 1
+
+
+def test_permanent_provider_hold_keeps_the_claim_when_proof_is_withheld(make_coord, monkeypatch):
+    """Fail closed exactly as every other hold does: a comment thread that could not be read
+    proves no marker, so the provider-failure handoff sends nothing and the triaging claim
+    stays held for a retry."""
+    fake = IntakeSession()
+    applied, released, notified = [], [], []
+    _hold_seams(monkeypatch, None, applied=applied, released=released, notified=notified)
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=lambda *args: "proof",
+                                 handoff=coordinated_intake.hold_intake)
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission())
+
+    assert _permanent_hold(coord, fake, identity) == []
+    assert applied == [] and released == [] and notified == []
+
+
+def test_returned_grill_decision_still_posts_its_own_question(make_coord, monkeypatch):
+    """A grill the model actually returned is a real decision, so it keeps the decision-question
+    handoff and the needs-grilling state label — the provider-failure copy belongs only to the
+    no-outcome permanent hold, and the two bodies stay distinct."""
+    from agentflow.intake import IntakeRoute, intake_labels
+
+    fake = IntakeSession()
+    projected = []
+    monkeypatch.setattr(github, "api", lambda *a, **k: {"title": "old", "labels": []})
+    monkeypatch.setattr(coordinated_intake, "apply_intake",
+                        lambda repo, number, title, labels, result, *rest:
+                        projected.append(result))
+    monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
+    monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args: True)
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=coordinated_intake.apply_route)
+    coord = make_coord(fake, adapter=adapter)
+    submission = Submission(**{**_submission().__dict__, "input_ptr":
+                            '{"snapshot":{"title":"old"},"prompt":"p"}'})
+    identity = coord.submit_stage(submission)
+    coord.cycle("claude")
+    fake.message = '{"route":"grill","body":"Which of the two behaviors did you mean?"}'
+    fake.end(identity, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+    coord.cycle("claude")
+
+    decision, = projected
+    assert decision.route is IntakeRoute.GRILL
+    assert intake_labels(decision) == ["agentflow:needs-grilling"]
+    assert "Which of the two behaviors did you mean?" in decision.body
+    assert "Re-authenticate" not in decision.body
+
+
 def test_exhaustion_holds_nothing_when_the_thread_is_unreadable(make_coord, monkeypatch):
     """Fail closed: a comment read that could not reach GitHub stays unknown, so the hold is
     never proven, no ping is sent, and the triaging claim is retained for a retry — an

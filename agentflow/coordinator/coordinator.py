@@ -51,6 +51,11 @@ RESTART_RESUME_CAP = 5
 # exact missing proof — then no more blind replays.
 REPAIR_BUDGET = 1
 
+# The durable ``hold_reason`` prefix a permanent provider condition stamps. Stage handoffs read it
+# to tell an infrastructure/auth failure apart from a hold the model actually reasoned its way into
+# (issue #328), so it is a shared constant rather than a string repeated at both ends.
+PERMANENT_HOLD_REASON = "permanent provider condition"
+
 # The required-outcome noun each stage proves, for the completion log line (ADR 0028).
 _OUTCOME_LABEL = {
     "intake": "route parsed", "build": "pr opened", "review": "verdict recorded",
@@ -718,7 +723,7 @@ class Coordinator:
         label = obs.classification()
         cause = obs.cause.value
         if label == "permanent":
-            record.hold_reason = f"permanent provider condition ({cause})"
+            record.hold_reason = f"{PERMANENT_HOLD_REASON} ({cause})"
             if not self._hold(record):
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
