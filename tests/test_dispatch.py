@@ -244,7 +244,8 @@ def test_build_submission_enters_the_coordinator_then_claims_runnable_work(monke
              "labels": [{"name": "ready-for-agent"},
                         {"name": "agentflow:complexity:deep"},
                         {"name": "agentflow:effort:high"}]}
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
+    monkeypatch.setattr(loop, "_next_ready_issue",
+                        lambda cfg, reserved=frozenset(), _log=None: issue)
     builder = SimpleNamespace(tool="claude")
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (builder, None, ""))
     events = []
@@ -272,7 +273,9 @@ def test_daemon_does_not_claim_or_launch_when_the_build_stays_held(monkeypatch):
              "labels": [{"name": "ready-for-agent"},
                         {"name": "agentflow:complexity:deep"},
                         {"name": "agentflow:effort:high"}]}
-    monkeypatch.setattr(loop, "_next_ready_issue", lambda cfg, _log=None: issue)
+    monkeypatch.setattr(loop, "_next_ready_issue",
+                        lambda cfg, reserved=frozenset(), _log=None:
+                        None if 7 in reserved else issue)
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("must not claim a held no-op"))
     held = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
@@ -283,6 +286,94 @@ def test_daemon_does_not_claim_or_launch_when_the_build_stays_held(monkeypatch):
 
     result = dispatch._submit_coordinated_build(RepoConfig("o/r", "/tmp"), coord, None)
     assert "held" in result and "submitted" not in result
+
+
+def _ready_queue(monkeypatch, rows, in_flight=frozenset()):
+    """Install a real ready-for-agent queue behind `_next_ready_issue`: the labelled listing, no
+    blockers, and a known in-flight set. `rows` is a list of (number, labels)."""
+    listing = [loop.github.IssueRow(number=n, title=f"issue {n}", body="brief",
+                                    labels=frozenset(labels)) for n, labels in rows]
+    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(listing))
+    monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set(in_flight))
+
+
+_DIALS = ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:high"]
+
+
+def test_build_pass_skips_a_mislabelled_queue_head_and_submits_the_next_issue(
+        monkeypatch, tmp_path):
+    # A ready issue with no complexity dial can never run, so it must not starve the valid work
+    # queued behind it — the same pass reports it and submits the next candidate (#327).
+    from agentflow.coordinator.record import Record, WAITING
+
+    _ready_queue(monkeypatch, [(462, ["ready-for-agent"]), (468, _DIALS)])
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    claimed = []
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    submitted = []
+    coord = SimpleNamespace(
+        submit_stage=lambda s: submitted.append(int(s.subject)) or f"o/r|{s.subject}|build|-",
+        stage_record=lambda identity: Record(identity=identity, stage="build", pool="claude",
+                                             demand=5, state=WAITING))
+
+    result = dispatch._submit_coordinated_build(RepoConfig("o/r", str(tmp_path)), coord, None)
+
+    assert claimed == [468] and submitted == [468]
+    assert "#462" in result and "complexity" in result
+    assert "#468: submitted" in result
+
+
+def test_build_pass_passes_over_an_exhausted_held_head_without_resuming_it(monkeypatch, tmp_path):
+    # An exhausted held Build is terminal until a maintainer resumes it by hand — the pass leaves
+    # it untouched, reports it, and still reaches the valid issue behind it (#327/#245).
+    from agentflow.coordinator.record import HELD, Record, WAITING
+
+    _ready_queue(monkeypatch, [(59, _DIALS), (64, _DIALS)])
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch.coordinated_build, "resume_if_held",
+                        lambda *a: pytest.fail("automatic dispatch must never auto-resume"))
+    claimed = []
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    records = {
+        "o/r|59|build|-": Record(identity="o/r|59|build|-", stage="build", pool="claude",
+                                 demand=5, state=HELD, claim=False),
+        "o/r|64|build|-": Record(identity="o/r|64|build|-", stage="build", pool="claude",
+                                 demand=5, state=WAITING),
+    }
+    coord = SimpleNamespace(submit_stage=lambda s: f"o/r|{s.subject}|build|-",
+                            stage_record=records.get)
+
+    result = dispatch._submit_coordinated_build(RepoConfig("o/r", str(tmp_path)), coord, None)
+
+    assert claimed == [64]
+    assert records["o/r|59|build|-"].state == HELD
+    assert "#59: Build held" in result and "#64: submitted" in result
+
+
+def test_build_pass_stops_when_the_ready_queue_cannot_be_read(monkeypatch, tmp_path):
+    # Unknown shared state is not a per-candidate skip: with the in-flight set unreadable the pass
+    # dispatches nothing rather than scanning on with incomplete duplicate-work protection.
+    _ready_queue(monkeypatch, [(1, _DIALS)])
+    monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
+    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("must not claim while blind"))
+    coord = SimpleNamespace(
+        submit_stage=lambda s: pytest.fail("must not submit while blind"),
+        stage_record=lambda identity: None)
+
+    assert dispatch._submit_coordinated_build(
+        RepoConfig("o/r", str(tmp_path)), coord, None) == "no ready-for-agent issues"
+
+
+def test_build_pass_reports_when_every_ready_candidate_is_undispatchable(monkeypatch, tmp_path):
+    _ready_queue(monkeypatch, [(1, ["ready-for-agent"]), (2, ["ready-for-agent"])])
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("nothing runnable to claim"))
+    coord = SimpleNamespace(submit_stage=lambda s: "id", stage_record=lambda identity: None)
+
+    result = dispatch._submit_coordinated_build(RepoConfig("o/r", str(tmp_path)), coord, None)
+
+    assert "#1" in result and "#2" in result and "no further runnable" in result
 
 
 def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):

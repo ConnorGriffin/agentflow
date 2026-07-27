@@ -408,7 +408,11 @@ def _free_to_dispatch(cfg: RepoConfig, issue: dict, in_flight: set[int], _log=No
     return True
 
 
-def _next_ready_issue(cfg: RepoConfig, _log=None) -> dict | None:
+def _next_ready_issue(cfg: RepoConfig, reserved: set[int] = frozenset(),
+                      _log=None) -> dict | None:
+    """The oldest ready issue free to dispatch. `reserved` skips candidates this pass has
+    already found conclusively undispatchable, so one bad queue head cannot starve later
+    runnable work (#327)."""
     rows = github.list_issues(cfg.repo, label="ready-for-agent", limit=50)
     if rows is None:
         return None
@@ -416,7 +420,8 @@ def _next_ready_issue(cfg: RepoConfig, _log=None) -> dict | None:
     if in_flight is None:
         return None   # can't see what's in flight — fail closed, dispatch next cycle
     issues = sorted((_row_dict(r) for r in rows), key=lambda i: i["number"])
-    return next((i for i in issues if _free_to_dispatch(cfg, i, in_flight, _log)), None)
+    return next((i for i in issues if i["number"] not in reserved
+                 and _free_to_dispatch(cfg, i, in_flight, _log)), None)
 
 
 TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns this issue
