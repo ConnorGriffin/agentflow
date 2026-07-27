@@ -9,6 +9,7 @@ coordinator.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from dataclasses import replace
@@ -1269,3 +1270,34 @@ def test_a_running_diverged_review_terminates_its_family_before_parking(make_coo
 
     assert killed == [ident]
     assert record_of(coord, ident).state == "held"
+
+
+def test_a_rejected_verdict_shape_earns_one_repair_turn_naming_the_exact_error():
+    """A review that reached a conclusion but stated it in a rejected shape must not spend its
+    continuation budget re-reviewing. It gets one repair turn carrying the parser's own error and
+    an instruction to restate only the outcome."""
+    from agentflow.coordinator.recovery import PROGRESS, REPAIR
+
+    record = Record(
+        identity="o/r|9|review|head-x|a1", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="9", target="head-x", change_author_tool="claude",
+        review_depth="targeted", depth_reason="contained journey", review_axis="combined",
+        source="/wt/pr-9-reverify", attempts=2)
+    adapter = ReviewStageAdapter(verdict_ready=lambda r, o: False)
+
+    rejected = json.dumps({
+        "verdict": "PASS", "reviewed_sha": "head-x", "final_sha": "head-x", "pushed_sha": "",
+        "fixes": ["a fix an earlier attempt already pushed"], "checks": ["re-verified"],
+        "follow_ups": [], "findings": [], "depth": "targeted",
+        "depth_reason": "contained journey", "axis": "combined",
+        "change_author_tool": "claude"})
+    repair = adapter.recover(record, SimpleNamespace(final_message=rejected))
+
+    assert repair.kind == REPAIR
+    assert "shipped fixes have no push provenance" in repair.envelope
+    assert "do not redo it" in repair.envelope
+    assert "further GitHub calls" in repair.envelope
+
+    # A review that produced no verdict at all is unfinished work, not a misstatement.
+    unfinished = adapter.recover(record, SimpleNamespace(final_message="ran out of time"))
+    assert unfinished.kind == PROGRESS

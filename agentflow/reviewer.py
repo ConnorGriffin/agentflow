@@ -336,8 +336,12 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
   `ask_maintainer` action remains
 - "reviewed_sha": `{starting_sha}` (proof you inspected the exact starting diff)
 - "final_sha": the exact final head you reviewed after any push (same as reviewed_sha if unchanged)
-- "pushed_sha": the exact pushed head if you changed the branch, otherwise an empty string
-- "fixes": concise human-facing summaries of fixes you shipped during review
+- "pushed_sha": the exact pushed head if THIS session pushed to the branch, otherwise an empty
+  string
+- "fixes": concise human-facing summaries of the fixes THIS session pushed — nothing else.
+  If a previous session already pushed fixes and you only re-verified its head, this is an
+  empty list and "pushed_sha" is an empty string; those earlier fixes are already recorded
+  and restating them here contradicts your own push provenance and voids the verdict.
 - "checks": exact proof/checks you completed
 - "follow_ups": necessary issues as {{"url", "evidence", "desired_outcome", "duplicate_query"}}
 - "findings": unresolved/discarded observations as {{"action", "file", "line", "summary",

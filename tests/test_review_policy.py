@@ -644,3 +644,41 @@ def test_taint_recovery_chooses_only_latest_forced_autonomous_record(monkeypatch
 
     assert chosen == ["latest"]
     assert len(submitted) == 1
+
+
+def test_reverifying_continuation_settles_and_keeps_the_earlier_pushed_fix(monkeypatch):
+    """After an earlier attempt pushed a fix, a continuation that only re-verifies that head
+    reports no fixes and no push of its own — and the earlier fix survives in the ledger."""
+    from agentflow import coordinated_build
+    from agentflow.coordinator.record import Record
+
+    review = Record(
+        identity="o/r|9|review|pushed-head|a2", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="9", target="pushed-head", change_author_tool="claude",
+        review_depth="targeted", depth_reason="contained journey", review_axis="combined",
+        builder_lineage="claude", builder_complexity="deep", attempts=2,
+        source="/work/.agentflow/worktrees/codex-review/pr-9-reverify",
+        review_fixes='["Corrected the held-reason wording"]',
+        review_checks='["suite green at the pushed head"]')
+    restated = json.dumps({
+        "verdict": "PASS", "reviewed_sha": "pushed-head", "final_sha": "pushed-head",
+        "pushed_sha": "", "fixes": ["Corrected the held-reason wording"],
+        "checks": ["re-verified the pushed head"], "follow_ups": [], "findings": [],
+        "depth": "targeted", "depth_reason": "contained journey", "axis": "combined",
+        "change_author_tool": "claude"})
+    assert not parse_review_result(restated, expected_sha="pushed-head").parsed
+
+    clean = json.dumps({
+        "verdict": "PASS", "reviewed_sha": "pushed-head", "final_sha": "pushed-head",
+        "pushed_sha": "", "fixes": [], "checks": ["re-verified the pushed head"],
+        "follow_ups": [], "findings": [], "depth": "targeted",
+        "depth_reason": "contained journey", "axis": "combined",
+        "change_author_tool": "claude"})
+    monkeypatch.setattr(
+        "agentflow.coordinator.providers.ProviderObserver.observe",
+        lambda _self, _record: SimpleNamespace(final_message=clean))
+    verdict = coordinated_build._review_verdict(review)
+
+    assert verdict.parsed and verdict.clean and not verdict.pushed_sha
+    assert verdict.fixes == ("Corrected the held-reason wording",)
+    assert verdict.checks == ("suite green at the pushed head", "re-verified the pushed head")
