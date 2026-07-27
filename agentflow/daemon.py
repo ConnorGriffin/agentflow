@@ -94,6 +94,8 @@ REPOS = [
                os.path.expanduser("~/Code/ConnorGriffin/brewgen")),
     RepoConfig("ConnorGriffin/packing-checklist",  # reviewed: human merges
                os.path.expanduser("~/Code/ConnorGriffin/packing-checklist")),
+    RepoConfig("ConnorGriffin/follow-through",  # reviewed: writes private personal context
+               os.path.expanduser("~/Code/ConnorGriffin/follow-through")),
 ]
 
 
