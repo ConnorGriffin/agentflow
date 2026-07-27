@@ -25,9 +25,10 @@ from agentflow.notify import notify
 from agentflow.reviewer import Verdict, review_worktree
 from agentflow.screenshot_crib import SCREENSHOT_HARNESS
 from agentflow.shell_crib import SHELL_CRIB
-from agentflow.runner import (Complexity, Effort, MockupScope, _run,
+from agentflow.runner import (Complexity, Effort, MockupScope, _commit_is_on_origin, _run,
                               _worktree_is_disposable, _worktree_is_registered,
-                              remove_worktree_if_safe, worktree_session)
+                              remove_worktree_if_safe, resettable_head,
+                              retain_stranded_commit, worktree_session)
 from agentflow.worktree_ref import WorktreeRef
 
 
@@ -759,13 +760,20 @@ def _next_pr_awaiting_reply(cfg: RepoConfig) -> tuple[int, str, str, str, str] |
 def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
     """Put the PR branch in a worktree so a responder can push fixes to it. Reuses the
     builder's worktree when it's still there (freshened to the PR head), else cuts a fresh
-    one tracking `origin/<branch>`. Returns success. Live orchestration, not unit-tested."""
+    one tracking `origin/<branch>`. Returns success. Live orchestration, not unit-tested.
+
+    Reuse is gated on what the freshening actually overwrites: tracked content. A build session
+    routinely leaves untracked files behind (a screenshot config, a draft PR body), and a reset
+    leaves those untouched — so they must not veto the reuse. A commit that never reached the
+    remote is anchored under a recovery ref before the reset, exactly as a review checkout's is."""
     if _run(["git", "-C", cfg.workdir, "fetch", "origin", "--quiet"]).returncode != 0:
         return False
     if wt.exists():
-        if not _worktree_is_registered(cfg.workdir, wt):
+        head = resettable_head(cfg.workdir, wt)
+        if not head:
             return False
-        if not _worktree_is_disposable(cfg.workdir, wt):
+        if not _commit_is_on_origin(cfg.workdir, head) \
+                and not retain_stranded_commit(cfg.workdir, wt, head):
             return False
         return _run(["git", "-C", str(wt), "reset", "--hard", f"origin/{branch}"]).returncode == 0
     wt.parent.mkdir(parents=True, exist_ok=True)

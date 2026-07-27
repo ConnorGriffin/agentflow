@@ -627,3 +627,27 @@ def test_codex_resupplies_a_full_server_spec_as_valid_toml_overrides(monkeypatch
     assert 'mcp_servers.code-graph.command="npx"' in overrides
     assert 'mcp_servers.code-graph.args=["-y", "code-graph-mcp"]' in overrides
     assert 'mcp_servers.code-graph.env.GRAPH_TOKEN="abc123"' in overrides
+
+
+def test_a_sessions_leftover_untracked_files_do_not_block_reuse_but_edits_do(tmp_path):
+    """Re-rebasing a survivor resets its worktree to the PR head. That overwrites tracked content
+    and leaves untracked files alone, so a build session's leftover scratch files must not veto the
+    reuse — vetoing them stalls the re-rebase forever while protecting nothing. Uncommitted edits
+    to tracked files, which the reset would destroy, still do."""
+    from agentflow.runner import resettable_head
+
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-12-litter"
+    _branch_worktree(repo, wt, "agentflow/claude/issue-12-litter")
+    head = _git(wt, "rev-parse", "HEAD")
+
+    (wt / "shots-config.json").write_text("{}")
+    (wt / "pr-body.md").write_text("draft")
+    assert resettable_head(str(repo), wt) == head
+    assert remove_worktree_if_safe(str(repo), wt) is False, "removal must still refuse litter"
+
+    (wt / "result.txt").write_text("uncommitted edit a reset would destroy")
+    assert resettable_head(str(repo), wt) == ""
+
+    with worktree_session(wt):
+        assert resettable_head(str(repo), wt) == ""

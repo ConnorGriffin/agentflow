@@ -225,6 +225,27 @@ def _worktree_head(workdir: str, wt: Path) -> str:
     return head.stdout.strip() if head.returncode == 0 else ""
 
 
+def resettable_head(workdir: str, wt: Path) -> str:
+    """The commit an idle, owned worktree is parked on when a ``reset --hard`` may be run in it —
+    ``""`` when it is busy, foreign, unreadable, or holds edits a reset would destroy.
+
+    Deliberately more permissive than :func:`_worktree_head`, which backs *removal* and so refuses
+    on any untracked file. A reset overwrites tracked content and leaves untracked files exactly
+    where they are, so untracked litter — the leftover config or draft a build session routinely
+    leaves behind — is not a reason to refuse. Treating it as one stalls the caller forever while
+    protecting nothing.
+    """
+    if os.path.realpath(wt) == os.path.realpath(workdir):
+        return ""
+    if _worktree_is_active(wt) or not _worktree_is_registered(workdir, wt):
+        return ""
+    tracked = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=no"])
+    if tracked.returncode != 0 or tracked.stdout.strip():
+        return ""
+    head = _run(["git", "-C", str(wt), "rev-parse", "HEAD"])
+    return head.stdout.strip() if head.returncode == 0 else ""
+
+
 def _commit_is_on_origin(workdir: str, commit: str) -> bool:
     remote_refs = _run(["git", "-C", workdir, "for-each-ref", "--contains", commit,
                         "--format=%(refname)", "refs/remotes/origin/"])
