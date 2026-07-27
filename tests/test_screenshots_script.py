@@ -214,3 +214,66 @@ def test_produce_prompt_references_harness():
         "PRODUCE_PROMPT does not reference 'node scripts/screenshots.mjs' — "
         "mockup sessions will hand-roll their own harness for variant screenshots."
     )
+
+
+def test_review_prompt_references_harness():
+    """REVIEW_PROMPT must too — a reviewer that changes user-facing output refreshes the evidence."""
+    from agentflow.reviewer import REVIEW_PROMPT
+    assert HARNESS_REF in REVIEW_PROMPT, (
+        "REVIEW_PROMPT does not reference 'node scripts/screenshots.mjs' — "
+        "review sessions will hand-roll their own harness when refreshing evidence."
+    )
+
+
+def _prompts_that_demand_screenshots():
+    """Every spawned-session prompt that can require UI evidence, by name."""
+    from agentflow import loop
+    from agentflow.reviewer import REVIEW_PROMPT
+    return {
+        "BUILD_PROMPT": loop.BUILD_PROMPT,
+        "REVISE_PROMPT": loop.REVISE_PROMPT,
+        "RESPOND_PROMPT": loop.RESPOND_PROMPT,
+        "PRODUCE_PROMPT": loop.PRODUCE_PROMPT,
+        "REVIEW_PROMPT": REVIEW_PROMPT,
+    }
+
+
+def test_every_prompt_carries_the_one_owned_clause():
+    """All five must carry the shared clause verbatim, not a hand-copied paraphrase.
+
+    They drifted apart once already — the reviewer's copy had no escape hatch at all — so the
+    clause lives in one module and each prompt splices it in.
+    """
+    from agentflow.screenshot_crib import SCREENSHOT_HARNESS
+    for name, prompt in _prompts_that_demand_screenshots().items():
+        assert SCREENSHOT_HARNESS in prompt, (
+            f"{name} does not carry the shared SCREENSHOT_HARNESS clause — a local paraphrase "
+            f"drifts, and drift is what stranded PR #475."
+        )
+
+
+def test_prompts_tell_a_repo_without_the_harness_what_to_do():
+    """The instruction must not be a dead end in a repo that has no harness yet.
+
+    Three review attempts on one PR hit exactly this: told to run a script the repo did not
+    carry, and forbidden to write one, each spent its whole turn budget improvising Playwright
+    and returned no verdict. Naming the script is not enough — the absent case needs an answer.
+    """
+    from agentflow.screenshot_crib import SCREENSHOT_HARNESS
+    assert "has no `scripts/screenshots.mjs`" in SCREENSHOT_HARNESS, (
+        "the shared clause no longer addresses a repo without the harness — sessions there are "
+        "ordered to run a script that does not exist, with no way out."
+    )
+    assert "port agentflow's" in SCREENSHOT_HARNESS, (
+        "the shared clause no longer tells a session to port the canonical harness in — without "
+        "that, the repo never acquires one and every future session pays the same cost."
+    )
+
+
+def test_shared_clause_has_no_format_braces():
+    """The prompts carrying it are str.format-rendered; a stray brace breaks every render."""
+    from agentflow.screenshot_crib import SCREENSHOT_HARNESS
+    assert "{" not in SCREENSHOT_HARNESS and "}" not in SCREENSHOT_HARNESS, (
+        "SCREENSHOT_HARNESS contains a format brace — every prompt that splices it in will "
+        "raise at render time."
+    )

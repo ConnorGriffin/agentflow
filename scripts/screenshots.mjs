@@ -14,6 +14,9 @@
  *         "url":       string,              // file:///abs/path or http://localhost:PORT/...
  *         "theme":     "light" | "dark",    // sets data-theme on <html> after page load
  *         "out":       string,              // PNG output path (absolute or relative to cwd)
+ *         "viewport":  { "width": N, "height": N },           // optional; defaults to 1280x900
+ *         "settle":    number,              // optional extra ms wait before the shot
+ *         "clicks":    [ "<css-selector>", ... ],             // optional: click each in order after load
  *         "fetchStub": { "<url-substr>": <json-value>, ... }  // optional per-shot stubs
  *       }
  *     ]
@@ -138,10 +141,25 @@ async function captureShots(shots) {
   const page = await context.newPage();
 
   for (let i = 0; i < shots.length; i++) {
-    const { url, theme, out } = shots[i];
+    const { url, theme, out, viewport } = shots[i];
+
+    // Optional per-shot viewport (e.g. a phone width) — defaults to the context
+    // viewport when omitted, so existing single-size configs are unaffected.
+    if (viewport) await page.setViewportSize(viewport);
 
     // Append the shot index so the init script selects the right fetch stub.
     await page.goto(withShotParam(url, i), { waitUntil: 'networkidle' });
+
+    // Optional interaction steps for screens that are only reached by clicking
+    // (e.g. a Generate button, then opening a results card). Each entry is a CSS
+    // selector; Playwright's click auto-waits for the element to be visible and
+    // enabled. Omitted for static screens, so existing configs are unaffected.
+    if (Array.isArray(shots[i].clicks)) {
+      for (const selector of shots[i].clicks) {
+        await page.click(selector);
+        await page.waitForTimeout(200);
+      }
+    }
 
     if (theme) {
       // Set theme AFTER content renders — setting it before boot races the app
@@ -152,6 +170,11 @@ async function captureShots(shots) {
       // Brief settle so any theme-driven re-renders complete before the shot.
       await page.waitForTimeout(200);
     }
+
+    // Optional extra settle for apps whose content arrives after a debounce or
+    // a stubbed fetch (which doesn't register as network activity for
+    // networkidle). Defaults to none, so existing configs are unaffected.
+    if (shots[i].settle) await page.waitForTimeout(shots[i].settle);
 
     const outPath = resolve(out);
     mkdirSync(dirname(outPath), { recursive: true });

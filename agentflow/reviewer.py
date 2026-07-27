@@ -42,6 +42,7 @@ from agentflow.review_policy import (
     Uncertainty,
     parse_review_result,
 )
+from agentflow.screenshot_crib import SCREENSHOT_HARNESS
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.worktree_ref import WorktreeRef
 
@@ -286,9 +287,10 @@ When you change anything, work only in this checkout, run the relevant tests, co
 to this PR's SAME head branch (`gh pr view {pr} --json headRefName`). This checkout is detached, so
 push explicitly with `git push origin HEAD:<headRefName>`. Never force-push, merge, or open another
 PR. A rejected push means the branch moved concurrently: do not overwrite it; leave a
-`fix_before_completion` finding. If your fix changes user-facing output, refresh the required before/after evidence with
-the repo's canonical harness (`node scripts/screenshots.mjs <config.json>`), commit it, and update
-the PR body just as the original builder would. After a successful push, re-read the PR head and
+`fix_before_completion` finding. If your fix changes user-facing output, refresh the required
+before/after evidence, commit it, and update
+the PR body just as the original builder would. """ + SCREENSHOT_HARNESS + """
+After a successful push, re-read the PR head and
 review the complete final diff again.
 
 Ground every observation in acceptance, security, or the engineering charter. Clear
