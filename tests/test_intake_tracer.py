@@ -500,6 +500,9 @@ def test_permanent_provider_hold_names_the_failure_not_a_missing_decision(make_c
     posted, = comments
     assert "couldn't ground this into a confident scope" not in posted
     assert "refused the session" in posted and "Re-authenticate" in posted
+    # The retry path it advertises has to be one that exists: a held issue resumes off its
+    # state label, so the body must never tell the maintainer to strip that label.
+    assert "reply here" in posted and "state label" not in posted
     assert applied == [7] and released == [7] and len(notified) == 1
 
 

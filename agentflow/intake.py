@@ -117,8 +117,8 @@ def _provider_failed(detail: str) -> IntakeResult:
             "refused the session outright (an expired sign-in, a billing or plan limit, or a "
             "permission problem). So there's no question waiting on you here and no product "
             "decision pending.\n\nRe-authenticate the coding agent — or check its billing, "
-            "plan, and permissions — then remove this issue's state label to send it back "
-            "through intake, or run `/agentflow pickup` to drive it live.")
+            "plan, and permissions — then reply here and I'll pick this up again, or run "
+            "`/agentflow pickup` to drive it live.")
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail, infra_failed=True)
 
 
