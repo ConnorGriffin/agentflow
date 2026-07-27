@@ -7,8 +7,8 @@ import time
 import pytest
 
 from agentflow import balancer
-from agentflow.balancer import (PoolStatus, choose_pair, choose_reviewer, parse_pct,
-                                 pick_pair)
+from agentflow.balancer import (PoolStatus, RateLimitWindow, _codex_dispatch_status,
+                                 choose_pair, choose_reviewer, parse_pct, pick_pair)
 from agentflow.coordinator import quota
 from agentflow.coordinator.store import default_store_path
 from agentflow.dashboard_data import pools
@@ -473,6 +473,60 @@ def test_operator_dispatch_still_honors_spend_ceiling(stub_gate, isolate_state, 
     _seed_claude_quota(95)                        # Claude's provider fact over its ceiling
     builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX", operator=True)
     assert builder is None
+
+
+def test_expired_weekly_window_clears_without_transcript_write():
+    """Regression for #319: a 10080-minute window at 63% whose resets_at has passed must
+    dispatch-clear at 0% used without any new transcript write. This is the exact
+    reproduction from the issue. The weekly window already rolled its pacing forward (#322),
+    but before this change its reported utilization was still carried forward as the raw 63%;
+    the assertion below fails unless that effective usage is also normalized to 0%."""
+    now = 2000.0
+    window = RateLimitWindow(used_percent=63.0, window_minutes=10080, resets_at=1900.0)
+    status = PoolStatus("codex", True, 63.0, "", (window,))
+
+    result = _codex_dispatch_status(status, now)
+
+    assert result.clear, f"post-reset Codex should be clear, got: {result.reason!r}"
+    assert result.spent_pct == 0.0
+
+
+def test_expired_short_window_also_normalizes(stub_gate, monkeypatch):
+    """An expired 300-minute window must not keep the pool blocked via the utilization ceiling
+    after reset (trap called out in the issue)."""
+    monkeypatch.setenv("TEST_CLAUDE_BLOCKED", "1")
+    monkeypatch.setenv("TEST_CODEX_CLEAR", "1")
+    resets_at = 1000.0
+    monkeypatch.setattr(time, "time", lambda: 2000.0)
+    monkeypatch.setenv("TEST_LIMITS", json.dumps({"windows": [
+        {"used_percent": 90, "window_minutes": 300, "resets_at": resets_at},
+        {"used_percent": 90, "window_minutes": 10080, "resets_at": resets_at},
+    ]}))
+
+    builder, _, _ = pick_pair("CLAUDE", "CODEX")
+
+    assert builder == "CODEX"
+
+
+def test_live_short_window_and_expired_weekly_window_are_normalized_independently(
+        stub_gate, monkeypatch):
+    """A live 300-minute window retains its reported headroom while an expired 10080-minute
+    window contributes 0% to weekly pacing, and vice versa."""
+    monkeypatch.setenv("TEST_CLAUDE_BLOCKED", "1")
+    monkeypatch.setenv("TEST_CODEX_CLEAR", "1")
+    now = 2000.0
+    monkeypatch.setattr(time, "time", lambda: now)
+    # 300-minute window is live; 10080-minute window has expired
+    monkeypatch.setenv("TEST_LIMITS", json.dumps({"windows": [
+        {"used_percent": 20, "window_minutes": 300, "resets_at": now + 1000},
+        {"used_percent": 90, "window_minutes": 10080, "resets_at": now - 100},
+    ]}))
+
+    builder, _, block_msg = pick_pair("CLAUDE", "CODEX")
+
+    # Codex should dispatch: short window is live at 20% (well under ceiling),
+    # and the weekly window has expired so it reads as 0%.
+    assert builder == "CODEX", f"expected CODEX to dispatch, got block: {block_msg!r}"
 
 
 @pytest.mark.parametrize("stdout,rc,expected", [
