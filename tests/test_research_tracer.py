@@ -300,8 +300,8 @@ def test_a_dead_research_run_releases_the_resolving_claim_a_live_one_retains_it(
 
     # The claim lanes are listed in order (building, triaging, drawing, resolving); only the
     # resolving lane holds the two research-claimed issues. The proof read shows the label gone.
-    listings = iter([[], [], [], [{"number": 5, "updatedAt": "2020-01-01T00:00:00Z"},
-                                   {"number": 6, "updatedAt": "2020-01-01T00:00:00Z"}]])
+    listings = iter([[], [], [], [{"number": 5, "updated_at": "2020-01-01T00:00:00Z"},
+                                   {"number": 6, "updated_at": "2020-01-01T00:00:00Z"}]])
     monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
     monkeypatch.setattr(github, "remove_label",
                         lambda repo, issue, label: edited.append(issue) or True)
