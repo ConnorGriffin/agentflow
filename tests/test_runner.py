@@ -64,6 +64,25 @@ def test_complexity_resolves_to_cost_appropriate_models():
     assert codex.model_for(Complexity.DEEP) == "gpt-5.6-sol"
 
 
+def test_claude_deep_tier_launches_with_pinned_opus_5_model(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-1-owned"
+    _branch_worktree(repo, wt, "agentflow/claude/issue-1-owned")
+    # Internal tier is "opus"; CLI must receive the pinned release identifier.
+    cmd = ClaudeRunner().structured_argv("do deep work", "opus", str(wt))
+    model_arg = cmd[cmd.index("--model") + 1]
+    assert model_arg == "claude-opus-5", f"expected claude-opus-5, got {model_arg!r}"
+
+
+def test_claude_standard_tier_model_passes_through_unchanged(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-2-owned"
+    _branch_worktree(repo, wt, "agentflow/claude/issue-2-owned")
+    cmd = ClaudeRunner().structured_argv("do standard work", "sonnet", str(wt))
+    model_arg = cmd[cmd.index("--model") + 1]
+    assert model_arg == "sonnet"
+
+
 def test_every_complexity_maps_for_every_tool():
     for runner in (ClaudeRunner(), CodexRunner()):
         for complexity in Complexity:
