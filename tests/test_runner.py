@@ -363,22 +363,48 @@ def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
 
     detached = repo / ".agentflow" / "worktrees" / "codex-intake" / "issue-8"
     _detached_worktree(repo, detached)
-    _git(detached, "config", "user.email", "agentflow@example.com")
-    _git(detached, "config", "user.name", "agentflow test")
-    (detached / "recovery.txt").write_text("keep me")
-    _git(detached, "add", "recovery.txt")
-    _git(detached, "commit", "-m", "recoverable intake progress")
     detached_head = _git(detached, "rev-parse", "HEAD")
+    (detached / "in-progress.txt").write_text("still being written")
 
     with pytest.raises(subprocess.CalledProcessError):
         runner.prepare_worktree_detached(str(repo), "origin/main", detached)
-    assert detached.exists() and _git(detached, "rev-parse", "HEAD") == detached_head
+    assert _git(detached, "rev-parse", "HEAD") == detached_head
+    assert (detached / "in-progress.txt").read_text() == "still being written"
 
     _git(wt, "push", "-u", "origin", branch)
     runner._open_pr_for_branch = lambda *_: (False, False)
     with pytest.raises(subprocess.CalledProcessError):
         runner.prepare_worktree(str(repo), branch, wt, "owner/repo")
     assert wt.exists() and _git(wt, "rev-parse", "HEAD") == head
+
+
+def test_review_checkout_recovers_after_its_branch_is_rebased_away(tmp_path):
+    """A rebase strands the commit the review checkout is parked on. The next cycle must move
+    the checkout onto the new head on its own, and must not destroy the stranded commit."""
+    repo = _repo_with_origin(tmp_path)
+    runner = ClaudeRunner()
+    branch = "agentflow/claude/issue-11-rebased"
+    build = repo / ".agentflow" / "worktrees" / "claude" / "issue-11-rebased"
+    _branch_worktree(repo, build, branch)
+
+    review = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-11-rebased"
+    _git(repo, "fetch", "origin", "--quiet")
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    stranded = _git(review, "rev-parse", "HEAD")
+
+    (build / "result.txt").write_text("amended after review started")
+    _git(build, "add", "result.txt")
+    _git(build, "commit", "--amend", "--no-edit")
+    _git(build, "push", "--force", "origin", branch)
+    new_head = _git(build, "rev-parse", "HEAD")
+    assert new_head != stranded
+
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    assert _git(review, "rev-parse", "HEAD") == new_head
+    retained = _git(repo, "for-each-ref", "--contains", stranded,
+                    "--format=%(refname)", "refs/agentflow/stranded/")
+    assert retained, "the superseded commit must stay reachable under a recovery ref"
+    assert _git(repo, "cat-file", "-t", stranded) == "commit"
 
 
 def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_foreign_work(
