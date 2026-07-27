@@ -43,27 +43,48 @@ def _run_and_log(cfg, label: str, fn, _log) -> None:
 
 
 def _submit_coordinated_build(cfg, coordinator, _log) -> str:
-    issue = loop._next_ready_issue(cfg, _log=_log)
-    if not issue:
-        return "no ready-for-agent issues"
-    builder, _reviewer, block_msg = pick_pair()
-    if builder is None:
-        return f"#{issue['number']}: no pool has headroom ({block_msg}) — deferring"
-    submission = coordinated_build.build_submission(cfg, issue, builder.tool)
-    if submission is None:
-        return f"#{issue['number']}: skipped — no agentflow:complexity:* label (ADR 0018 gate)"
+    """Submit the oldest ready issue that can actually run.
+
+    A candidate that is conclusively non-runnable — no complexity dial, or an idempotent
+    resubmission that reused a terminal held record — is reported and passed over so the same
+    pass still reaches later eligible work (#327). Unknown shared state (GitHub listings, pool
+    headroom, a failed claim mutation) still ends the pass, and an exhausted Build is never
+    auto-resumed: it needs an explicit maintainer `build <N>` (#245).
+    """
     from agentflow.coordinator.record import WAITING
-    identity = coordinator.submit_stage(submission)
-    record = coordinator.stage_record(identity)
-    # The daemon never auto-resumes an exhausted Build — that needs an explicit maintainer
-    # `build <N>` (#245). An ordinary resubmission that reused a terminal `held` record produced
-    # nothing to run, so claim nothing and report the held state rather than a false launch.
-    if record is None or record.state != WAITING or record.hold_pending or record.retired:
-        return (f"#{issue['number']}: Build held — awaiting a maintainer resume "
-                f"(`/agentflow pickup {issue['number']}` then `build`)")
-    if not loop._claim(cfg.repo, issue["number"]):
-        return f"#{issue['number']}: could not claim Build — refusing coordinator submission"
-    return f"#{issue['number']}: submitted to coordinator → {builder.tool} (build)"
+
+    reserved: set[int] = set()
+    skipped: list[str] = []
+
+    def _report(tail: str) -> str:
+        return "; ".join([*skipped, tail])
+
+    while True:
+        issue = loop._next_ready_issue(cfg, reserved, _log=_log)
+        if not issue:
+            return _report("no further runnable ready-for-agent issues") if skipped \
+                else "no ready-for-agent issues"
+        number = issue["number"]
+        builder, _reviewer, block_msg = pick_pair()
+        if builder is None:
+            return _report(f"#{number}: no pool has headroom ({block_msg}) — deferring")
+        submission = coordinated_build.build_submission(cfg, issue, builder.tool)
+        if submission is None:
+            skipped.append(f"#{number}: skipped — no agentflow:complexity:* label (ADR 0018 gate)")
+            reserved.add(number)
+            continue
+        identity = coordinator.submit_stage(submission)
+        record = coordinator.stage_record(identity)
+        # The resubmission reused a terminal `held` record and produced nothing to run, so claim
+        # nothing, leave the hold untouched, and move on to the next candidate.
+        if record is None or record.state != WAITING or record.hold_pending or record.retired:
+            skipped.append(f"#{number}: Build held — awaiting a maintainer resume "
+                           f"(`/agentflow pickup {number}` then `build`)")
+            reserved.add(number)
+            continue
+        if not loop._claim(cfg.repo, number):
+            return _report(f"#{number}: could not claim Build — refusing coordinator submission")
+        return _report(f"#{number}: submitted to coordinator → {builder.tool} (build)")
 
 
 def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
