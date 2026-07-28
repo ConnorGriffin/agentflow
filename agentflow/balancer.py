@@ -59,9 +59,10 @@ from agentflow.coordinator import quota
 from agentflow.coordinator.store import default_store_path
 from agentflow.runner import ClaudeRunner, CodexRunner, _WorktreeRunner
 
-_GATE = os.environ.get(
-    "AGENTFLOW_TRIAGE_GATE",
-    os.path.expanduser("~/Code/ConnorGriffin/dotfiles/scripts/triage-gate.sh"))
+_GATE = (
+    os.environ.get("AGENTFLOW_CAPACITY_HELPER")
+    or os.environ.get("AGENTFLOW_TRIAGE_GATE")
+)
 _PCT_RE = re.compile(r"at (\d+(?:\.\d+)?)% of (?:peak|limit)")
 _SHORT_WINDOW_MIN = 300
 _WEEKLY_WINDOW_MIN = 10080
@@ -367,13 +368,21 @@ def _query_pool(tool: str, operator: bool = False, *,
     env = {**os.environ, "TRIAGE_AGENT": tool}
     if operator:
         env["TRIAGE_SKIP_ACTIVITY"] = "1"
-    try:
-        limits = (subprocess.run([_GATE, "limits"], env=env, text=True,
-                                 capture_output=True, timeout=30)
-                  if tool == "codex" else None)
-        blocked, active, block_reason, _ck_stdout = _gate_facts(env, operator)
-    except (OSError, subprocess.TimeoutExpired):
-        return PoolStatus(tool, False, 100.0, "gate unavailable")
+    if _GATE is None:
+        if tool == "codex":
+            return PoolStatus(
+                tool, False, 100.0, "capacity helper not configured", None
+            )
+        limits = None
+        blocked, active, block_reason, _ck_stdout = False, False, "", ""
+    else:
+        try:
+            limits = (subprocess.run([_GATE, "limits"], env=env, text=True,
+                                     capture_output=True, timeout=30)
+                      if tool == "codex" else None)
+            blocked, active, block_reason, _ck_stdout = _gate_facts(env, operator)
+        except (OSError, subprocess.TimeoutExpired):
+            return PoolStatus(tool, False, 100.0, "capacity helper unavailable")
     ceiling = ceiling_for(active)
     yield_reason = f"yielding to operator · ceiling {ceiling:.0f}%"
     # Known legacy spend/check text remains compatible. Structured Codex facts are
@@ -401,6 +410,16 @@ def _query_pool(tool: str, operator: bool = False, *,
     observed_at = fact.observed_at if fact is not None else None
     bootstrapping = False
     if usage is None:
+        if _GATE is None:
+            return PoolStatus(
+                tool,
+                False,
+                100.0,
+                "capacity helper not configured and provider facts unavailable",
+                (),
+                active,
+                ceiling,
+            )
         # No trustworthy provider fact yet — a cold pool before any Claude session has emitted
         # one, or a parked window that never observed its own reset (issue #309). The provider
         # fact has a single producer (a completed Claude session), and the only session allowed

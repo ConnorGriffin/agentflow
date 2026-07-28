@@ -31,14 +31,33 @@ def _wire_global(home: Path, *, apply: bool) -> subprocess.CompletedProcess:
         args.append("--apply")
     return subprocess.run(args, check=True, text=True, capture_output=True,
                           env={**os.environ, "HOME": str(home),
+                               "AGENTFLOW_SHARED_GLOBAL": str(
+                                   home / "shared" / "AGENTS.md"
+                               ),
+                               "AGENTFLOW_RETIRED_CLAUDE_GLOBAL": str(
+                                   home / "retired" / "CLAUDE.md"
+                               ),
                                "PATH": "/usr/bin:/bin"})
 
 
 def _shared_global(home: Path) -> Path:
-    shared = home / "Code" / "ConnorGriffin" / "dotfiles" / "agents" / "AGENTS.md"
+    shared = home / "shared" / "AGENTS.md"
     shared.parent.mkdir(parents=True)
     shared.write_text("# Shared preferences\n")
     return shared
+
+
+def test_global_wiring_requires_an_explicit_shared_instructions_file(tmp_path):
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        text=True,
+        capture_output=True,
+        env={**os.environ, "HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+    )
+
+    assert result.returncode == 1
+    assert "AGENTFLOW_SHARED_GLOBAL" in result.stdout
+    assert "ConnorGriffin" not in result.stdout
 
 
 def test_enrollment_dry_run_does_not_create_gitignore(tmp_path):
@@ -74,12 +93,11 @@ def test_repeated_enrollment_adds_agentflow_rule_exactly_once(tmp_path):
 
 
 def test_global_wiring_makes_both_tools_share_one_file(tmp_path):
-    dotfiles = tmp_path / "Code" / "ConnorGriffin" / "dotfiles"
     shared = _shared_global(tmp_path)
 
     claude_global = tmp_path / ".claude" / "CLAUDE.md"
     claude_global.parent.mkdir()
-    claude_global.symlink_to(dotfiles / "claude" / "CLAUDE.md")
+    claude_global.symlink_to(tmp_path / "retired" / "CLAUDE.md")
 
     codex_global = tmp_path / ".codex" / "AGENTS.md"
     codex_global.parent.mkdir()

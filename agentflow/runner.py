@@ -603,9 +603,12 @@ class CodexRunner(_WorktreeRunner):
         """Read the existing typed Codex limit companion. It establishes capacity only when a
         reported window is exhausted; unavailable or unsupported account diagnoses remain
         ``None`` so provider prose can never be promoted into a cause (ADR 0030)."""
-        gate = os.environ.get(
-            "AGENTFLOW_TRIAGE_GATE",
-            os.path.expanduser("~/Code/ConnorGriffin/dotfiles/scripts/triage-gate.sh"))
+        gate = (
+            os.environ.get("AGENTFLOW_CAPACITY_HELPER")
+            or os.environ.get("AGENTFLOW_TRIAGE_GATE")
+        )
+        if gate is None:
+            return None
         try:
             result = subprocess.run(
                 [gate, "limits"], env={**os.environ, "TRIAGE_AGENT": "codex"},

@@ -265,6 +265,7 @@ def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(t
 
 
 def test_codex_account_fact_uses_typed_limit_windows(monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_CAPACITY_HELPER", "/test/capacity-helper")
     payload = json.dumps({
         "windows": [
             {"used_percent": 100, "window_minutes": 300, "resets_at": 1234},
@@ -280,6 +281,19 @@ def test_codex_account_fact_uses_typed_limit_windows(monkeypatch):
     monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
     assert CodexRunner().account_fact() == {
         "kind": "rate_limited", "reset_at": 1234}
+
+
+def test_codex_account_fact_is_unavailable_without_the_optional_capacity_helper(
+        monkeypatch):
+    monkeypatch.delenv("AGENTFLOW_CAPACITY_HELPER", raising=False)
+    monkeypatch.delenv("AGENTFLOW_TRIAGE_GATE", raising=False)
+    monkeypatch.setattr(
+        runner_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("no personal helper should be invoked"),
+    )
+
+    assert CodexRunner().account_fact() is None
 
 
 def test_effort_has_four_levels():

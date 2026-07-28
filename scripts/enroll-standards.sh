@@ -4,7 +4,7 @@
 # charter into BOTH tools with zero drift. See ADRs 0013 and 0032.
 #
 # Each concern has one canonical file:
-#   - machine global: dotfiles/agents/AGENTS.md is canonical; both tools symlink it
+#   - machine global: $AGENTFLOW_SHARED_GLOBAL is canonical; both tools symlink it
 #   - engineering charter: both tools follow the global's charter reference
 #   - per repo: AGENTS.md is canonical; CLAUDE.md symlinks to it
 #
@@ -13,8 +13,8 @@
 # Idempotent: re-running is a no-op once wired.
 #
 # Usage:
-#   enroll-standards.sh                    # dry-run: show the global-wiring plan
-#   enroll-standards.sh --apply            # do the global wiring
+#   AGENTFLOW_SHARED_GLOBAL=/path/to/AGENTS.md enroll-standards.sh
+#   AGENTFLOW_SHARED_GLOBAL=/path/to/AGENTS.md enroll-standards.sh --apply
 #   enroll-standards.sh <repo-dir>         # dry-run: show a repo's enroll plan
 #   enroll-standards.sh --apply <repo-dir> # enroll a repo (AGENTS.md + CLAUDE.md symlink)
 #
@@ -26,10 +26,10 @@
 set -euo pipefail
 
 CHARTER="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)/standards/CHARTER.md"
-SHARED_GLOBAL="$HOME/Code/ConnorGriffin/dotfiles/agents/AGENTS.md"
+SHARED_GLOBAL="${AGENTFLOW_SHARED_GLOBAL:-}"
 CLAUDE_GLOBAL="$HOME/.claude/CLAUDE.md"
 CODEX_GLOBAL="$HOME/.codex/AGENTS.md"
-RETIRED_CLAUDE_GLOBAL="$HOME/Code/ConnorGriffin/dotfiles/claude/CLAUDE.md"
+RETIRED_CLAUDE_GLOBAL="${AGENTFLOW_RETIRED_CLAUDE_GLOBAL:-}"
 IMPORT_LINE="@$CHARTER"
 
 APPLY=0; REPO=""
@@ -60,7 +60,8 @@ wire_global_link() { # <tool> <target> <retired-link-source>
 
   if [ -L "$target" ] && [ "$(readlink "$target")" = "$SHARED_GLOBAL" ]; then
     note "ok:   $tool global already symlinks the shared global"
-  elif [ -L "$target" ] && [ "$(readlink "$target")" = "$retired_src" ]; then
+  elif [ -n "$retired_src" ] && [ -L "$target" ] \
+      && [ "$(readlink "$target")" = "$retired_src" ]; then
     do_or_show "migrate $tool global -> shared global" ln -sfn "$SHARED_GLOBAL" "$target"
   elif [ -e "$target" ] && [ -s "$target" ]; then
     backup "$target"
@@ -74,6 +75,10 @@ wire_global_link() { # <tool> <target> <retired-link-source>
 }
 
 wire_global() {
+  if [ -z "$SHARED_GLOBAL" ]; then
+    note "ERROR: set AGENTFLOW_SHARED_GLOBAL to your canonical AGENTS.md"
+    return 1
+  fi
   echo "Global instruction wiring — canonical: $SHARED_GLOBAL"
 
   if [ ! -f "$SHARED_GLOBAL" ]; then

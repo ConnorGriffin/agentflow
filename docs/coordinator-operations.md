@@ -4,7 +4,16 @@ All provider work is coordinator-owned. There is no legacy execution mode or byp
 
 ## Activate
 
-Deploy a coordinator-aware revision while paused, start the daemon, then run:
+Validate the repository configuration, start the daemon under the process supervisor,
+then inspect it while still paused:
+
+```bash
+agentflow check
+agentflow daemon
+agentflow status
+```
+
+When the startup log and configured repositories are correct, permit cold submissions:
 
 ```bash
 agentflow resume
@@ -16,7 +25,7 @@ reconciles them before admission.
 
 ## Observe
 
-Use `agentflow status` and the daemon log configured by the LaunchAgent. The useful transient
+Use `agentflow status` and the daemon log captured by the process supervisor. The useful transient
 lines are exact and stage-specific:
 
 - `attempt N/3 → <pool>` — one durable provider start consumed an attempt;
@@ -53,7 +62,8 @@ coordinator-aware binary; reconciliation resumes from durable records.
 2. Let active records drain, or keep the daemon running on the current coordinator-aware binary
    until they reach a durable boundary.
 3. Deploy the new coordinator-aware revision.
-4. `agentflow restart`, inspect the recovery lines, then `agentflow resume`.
+4. Restart `agentflow daemon` through its process supervisor, inspect the recovery lines, then
+   run `agentflow resume`.
 
 Schema compatibility is a release requirement. If the new binary reports unreadable or newer
 coordinator state, leave it paused; it must start nothing and clear no claim.
