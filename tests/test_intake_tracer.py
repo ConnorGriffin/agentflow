@@ -12,7 +12,8 @@ from conftest import FakeSession, permits, record_of, starts_until_held
 from agentflow import coordinated_intake, github, intake as intake_mod, loop
 from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import tracer
-from agentflow.coordinator.providers import ProviderCause, ProviderObservation
+from agentflow.coordinator.providers import (PermanentReason, ProviderCause,
+                                             ProviderObservation)
 
 _READY_MESSAGE = ('{"route":"ready","title":"Scoped","body":"brief",'
                   '"complexity":"deep","effort":"medium"}')
@@ -52,11 +53,14 @@ class IntakeSession(FakeSession):
     def observe(self, record) -> ProviderObservation:
         ending = self._script.get(record.identity)
         cause = ending.obs.cause if ending else ProviderCause.UNKNOWN
-        return ProviderObservation(cause=cause, final_message=self.message)
+        reason = (ending.obs.permanent_reason if ending
+                  else PermanentReason.UNSPECIFIED)
+        return ProviderObservation(cause=cause, permanent_reason=reason,
+                                   final_message=self.message)
 
 
-def _submission(target=None):
-    return Submission(repo="o/r", subject="7", stage="intake", target=target,
+def _submission(target=None, subject="7"):
+    return Submission(repo="o/r", subject=subject, stage="intake", target=target,
                       pool="claude", source="/read-only/issue-7", input_ptr="durable issue")
 
 
@@ -204,10 +208,13 @@ def test_permanent_hold_preserves_its_reason_for_the_stage_handoff(make_coord):
     coord = make_coord(fake, adapter=adapter)
     identity = coord.submit_stage(_submission())
     coord.cycle("claude")
-    fake.end(identity, cause=ProviderCause.PERMANENT)
+    fake.end(identity, cause=ProviderCause.PERMANENT,
+             permanent_reason=PermanentReason.REJECTED_REQUEST)
 
     assert [outcome.status for outcome in coord.cycle("claude")] == ["held"]
-    assert reasons == ["permanent provider condition (permanent)"]
+    # The reason names *which* permanent condition fired, and it is durable on the record
+    # before the handoff runs, so a crash-resumed handoff composes the same copy (issue #342).
+    assert reasons == ["permanent provider condition (rejected-request)"]
 
 
 def test_human_reply_targets_a_fresh_intake_stage(make_coord):
@@ -416,7 +423,7 @@ def test_production_preparation_recreates_read_only_worktree(make_coord, monkeyp
 
 
 def _hold_seams(monkeypatch, comments, *, applied, released, notified,
-                deliver=lambda: True):
+                deliver=lambda: True, results=None):
     """Wire the intake hold's shared-envelope seams: the durable comment thread it reads and
     proves through (ADR 0042), the projection that posts the held-route comment, the claim
     release, and the operator ping — all stated as facts, none as ``gh`` argument vectors."""
@@ -427,6 +434,8 @@ def _hold_seams(monkeypatch, comments, *, applied, released, notified,
 
     def apply(repo, number, title, labels, result):
         applied.append(number)
+        if results is not None:
+            results.append(result)
         comments.append(result.body)  # the held-route comment is the durable handoff marker
 
     monkeypatch.setattr(coordinated_intake, "apply_intake", apply)
@@ -472,12 +481,40 @@ def test_exhaustion_hold_is_idempotent_across_a_restart(make_coord, monkeypatch)
     assert applied == [7] and len(notified) == 1
 
 
-def _permanent_hold(coord, fake, identity):
-    """Drive one Intake attempt to a permanent provider condition — the provider refuses the
-    session before the model ever returns a decision — and settle the resulting hold."""
+def _permanent_hold(coord, fake, identity, reason=PermanentReason.ACCESS):
+    """Drive one Intake attempt to a permanent provider condition — the provider ends the
+    session before the model ever returns a decision — and settle the resulting hold.
+    ``reason`` scripts *which* permanent condition the provider reported."""
     coord.cycle("claude")
-    fake.end(identity, cause=ProviderCause.PERMANENT)
+    fake.end(identity, cause=ProviderCause.PERMANENT, permanent_reason=reason)
     return [outcome.status for outcome in coord.cycle("claude")]
+
+
+def _park_for(make_coord, monkeypatch, reason, subject="7"):
+    """Park one intake attempt on ``reason`` and return the decision it projected. Asserts the
+    guarantees every reason shares: it parks, posts once, releases the claim, pings once, and
+    advertises a retry path that actually works. ``subject`` names the issue, so one test can
+    park two different reasons and compare them."""
+    fake = IntakeSession()
+    applied, released, notified, comments, results = [], [], [], [], []
+    _hold_seams(monkeypatch, comments, applied=applied, released=released,
+                notified=notified, results=results)
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=lambda *args: "proof",
+                                 handoff=coordinated_intake.hold_intake)
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission(subject=subject))
+
+    assert _permanent_hold(coord, fake, identity, reason) == ["held"]
+    assert applied == [int(subject)] and released == [int(subject)] and len(notified) == 1
+    parked, = results
+    assert "reply here" in parked.body and "/agentflow pickup" in parked.body
+    assert "state label" not in parked.body
+    # A restart replays the handoff over the durable comment marker: same reason, same body,
+    # so it neither posts a second comment nor pings again.
+    make_coord(fake, adapter=adapter).cycle("claude")
+    assert len(comments) == 1 and len(notified) == 1
+    return parked
 
 
 def test_permanent_provider_hold_names_the_failure_not_a_missing_decision(make_coord, monkeypatch):
@@ -540,6 +577,56 @@ def test_permanent_provider_hold_keeps_the_claim_when_proof_is_withheld(make_coo
 
     assert _permanent_hold(coord, fake, identity) == []
     assert applied == [] and released == [] and notified == []
+
+
+def test_rejected_request_park_never_sends_the_maintainer_to_re_authenticate(make_coord,
+                                                                            monkeypatch):
+    """A request the provider itself refused — too large, unknown model, malformed — parks on
+    the same path as a refused sign-in, but it is not a credential problem (issue #342). Telling
+    the maintainer to re-authenticate sends them to check a healthy sign-in while the real cause
+    stays invisible, so the two parks must read differently."""
+    rejected = _park_for(make_coord, monkeypatch, PermanentReason.REJECTED_REQUEST)
+    access = _park_for(make_coord, monkeypatch, PermanentReason.ACCESS, subject="8")
+
+    assert "rejected the request itself" in rejected.body
+    for misdiagnosis in ("Re-authenticate", "expired sign-in", "billing", "permission"):
+        assert misdiagnosis not in rejected.body
+    # The access refusal keeps the re-authenticate remediation it earned (issue #328).
+    assert "refused the session" in access.body and "Re-authenticate" in access.body
+    assert rejected.body != access.body
+
+
+def test_spend_ceiling_park_names_the_cap_not_a_credential_problem(make_coord, monkeypatch):
+    """A run stopped by its own configured cost ceiling is a budget decision, not a broken
+    sign-in — the park says so and offers the remedy that actually applies."""
+    parked = _park_for(make_coord, monkeypatch, PermanentReason.SPEND)
+
+    assert "spending cap" in parked.body
+    for misdiagnosis in ("Re-authenticate", "expired sign-in", "billing", "permission"):
+        assert misdiagnosis not in parked.body
+
+
+def test_untyped_permanent_park_stays_neutral_about_the_remedy(make_coord, monkeypatch):
+    """A permanent end nothing typed still parks — but it prescribes no remedy it can't justify,
+    because guessing 're-authenticate' is exactly the misdiagnosis this removes."""
+    parked = _park_for(make_coord, monkeypatch, PermanentReason.UNSPECIFIED)
+
+    assert "ended the session permanently" in parked.body
+    for misdiagnosis in ("Re-authenticate", "expired sign-in", "billing", "permission"):
+        assert misdiagnosis not in parked.body
+
+
+def test_every_permanent_reason_parks_to_the_same_state(make_coord, monkeypatch):
+    """Only the diagnosis differs: whichever permanent condition ended the run, the issue lands
+    in the same parked state with the same route, so nothing downstream reads the reason."""
+    from agentflow.intake import intake_labels
+
+    parked = [_park_for(make_coord, monkeypatch, reason, subject=str(20 + n))
+              for n, reason in enumerate(PermanentReason)]
+
+    assert {p.route for p in parked} == {parked[0].route}
+    assert {tuple(intake_labels(p)) for p in parked} == {tuple(intake_labels(parked[0]))}
+    assert len({p.body for p in parked}) == len(parked)  # every reason reads differently
 
 
 def test_returned_grill_decision_still_posts_its_own_question(make_coord, monkeypatch):

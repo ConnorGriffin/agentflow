@@ -164,17 +164,23 @@ def hold_intake(record) -> str | None:
     The durable hold reason picks the comment: a permanent provider condition stopped the
     session before the model read anything, so that handoff names the provider failure and its
     remediation instead of the generic "I couldn't ground this" ask, which would send the
-    maintainer hunting for a decision that was never made (issue #328). Every other hold reason
-    keeps the grounding-ambiguity copy. Only the body differs — route, state label, and the
-    exactly-once envelope are identical either way."""
-    from agentflow.coordinator.coordinator import PERMANENT_HOLD_REASON
+    maintainer hunting for a decision that was never made (issue #328). The reason also says
+    *which* permanent condition it was, so a rejected request or a spend ceiling gets its own
+    diagnosis instead of re-authenticate advice for a healthy sign-in (issue #342). Every other
+    hold reason keeps the grounding-ambiguity copy. Only the body differs — route, state label,
+    and the exactly-once envelope are identical either way; the reason comes from the persisted
+    record, never a fresh observation, so a restart recomposes the same marker."""
+    from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON,
+                                                   parse_permanent_hold_reason)
     from agentflow.handoff import DurableHandoff, Notification, Subject
     from agentflow.intake import _held, _provider_failed
     from agentflow.loop import _release_triage
     number = int(record.subject)
     reason = record.hold_reason or "continuation budget exhausted"
-    compose = _provider_failed if reason.startswith(PERMANENT_HOLD_REASON) else _held
-    result = compose(reason)
+    if reason.startswith(PERMANENT_HOLD_REASON):
+        result = _provider_failed(reason, parse_permanent_hold_reason(reason).value)
+    else:
+        result = _held(reason)
 
     def project() -> None:
         # Title+labels in one live read via the named escape hatch (ADR 0040); a read that

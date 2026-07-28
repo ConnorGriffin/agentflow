@@ -29,7 +29,7 @@ from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
-from agentflow.coordinator.providers import ProviderCause
+from agentflow.coordinator.providers import PermanentReason, ProviderCause
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
 from agentflow.coordinator.recovery import PROGRESS, REPAIR, Recovery
@@ -55,6 +55,28 @@ REPAIR_BUDGET = 1
 # to tell an infrastructure/auth failure apart from a hold the model actually reasoned its way into
 # (issue #328), so it is a shared constant rather than a string repeated at both ends.
 PERMANENT_HOLD_REASON = "permanent provider condition"
+
+
+def permanent_hold_reason(reason: PermanentReason) -> str:
+    """The durable ``hold_reason`` for a permanent park, naming *which* condition fired.
+
+    The category alone told every parked issue the same story, so a rejected request drew
+    re-authenticate advice for a healthy sign-in (issue #342). The reason is stamped into the
+    record before the handoff runs, so a crash-resumed handoff reads the same reason and
+    composes byte-identical copy. The prefix is unchanged, so the permanent-vs-generic
+    predicate (issue #328) keeps working as the string grows this suffix."""
+    return f"{PERMANENT_HOLD_REASON} ({reason.value})"
+
+
+def parse_permanent_hold_reason(hold_reason: str) -> PermanentReason:
+    """The permanent reason a durable ``hold_reason`` names, or ``UNSPECIFIED``. Fail-safe:
+    a reason written before this suffix existed, or one this build doesn't know, reads as
+    unspecified rather than as a wrong remediation."""
+    inner = (hold_reason or "").partition("(")[2].rpartition(")")[0].strip()
+    try:
+        return PermanentReason(inner)
+    except ValueError:
+        return PermanentReason.UNSPECIFIED
 
 # The required-outcome noun each stage proves, for the completion log line (ADR 0028).
 _OUTCOME_LABEL = {
@@ -723,7 +745,8 @@ class Coordinator:
         label = obs.classification()
         cause = obs.cause.value
         if label == "permanent":
-            record.hold_reason = f"{PERMANENT_HOLD_REASON} ({cause})"
+            reason = getattr(obs, "permanent_reason", PermanentReason.UNSPECIFIED)
+            record.hold_reason = permanent_hold_reason(reason)
             if not self._hold(record):
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
