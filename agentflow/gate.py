@@ -72,15 +72,25 @@ def decision_resume_disclaimer(target: str) -> str:
             f"<!-- {_RESPOND_TARGET_PREFIX}{target} -->")
 
 
-def park_awaiting_decision(comments: list[dict]) -> bool:
-    """Whether agentflow's newest word on this PR is its parked decision handoff. Pure.
+def park_awaiting_decision(comments: list[dict], target: str) -> bool:
+    """Whether this comment follows agentflow's latest parked decision handoff. Pure.
 
-    A maintainer comment after that handoff answers it; one posted after any later agentflow comment
-    is ordinary PR discussion, which never resumes a parked review (#344).
+    A maintainer comment after that handoff answers it; an older pending comment or one posted
+    after any later agentflow comment is ordinary PR discussion, which never resumes a parked
+    review (#344).
     """
-    ours = [comment.get("body", "") for comment in comments
-            if PR_MARK in comment.get("body", "")]
-    return bool(ours) and PARK_MARK in ours[-1]
+    target_index = next(
+        (index for index, comment in enumerate(comments)
+         if str(comment.get("id", "")) == str(target)),
+        None,
+    )
+    ours = [
+        (index, comment.get("body", ""))
+        for index, comment in enumerate(comments)
+        if PR_MARK in comment.get("body", "")
+    ]
+    return (target_index is not None and bool(ours)
+            and ours[-1][0] < target_index and PARK_MARK in ours[-1][1])
 
 
 def respond_change_marker(result: str) -> str:

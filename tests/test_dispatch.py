@@ -510,6 +510,33 @@ def test_ordinary_pr_discussion_after_a_parked_review_still_enters_respond(monke
     assert "(respond)" in result and len(submitted) == 1
 
 
+def test_an_older_unanswered_comment_before_the_park_remains_ordinary_discussion(monkeypatch):
+    """Reply discovery serves the oldest unanswered comment first. A discussion comment that
+    predates the park cannot answer the later decision merely because the park is agentflow's
+    newest comment; it stays on the ordinary Respond path."""
+    parked = _parked_decision_review()
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
+        42, "agentflow/claude/issue-7-fix", "earlier discussion", "IC_old", "sha-a"))
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked])
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [
+        {"id": "IC_old", "body": "earlier discussion"},
+        {"id": "IC_park", "body": "> *agentflow: parked for human review.*\n\nDecide."},
+        {"id": "IC_answer", "body": "keep the conservative behavior"},
+    ])
+    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+                        lambda *a, **k: pytest.fail("older discussion never resumes review"))
+    monkeypatch.setattr(coordinated_build, "respond_submission",
+                        lambda *a, **k: SimpleNamespace(subject="7", pool="claude"))
+    monkeypatch.setattr(coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    submitted = []
+
+    result = dispatch._submit_coordinated_respond(
+        RepoConfig("o/r", "/work"), SimpleNamespace(submit_stage=submitted.append), None)
+
+    assert "(respond)" in result and len(submitted) == 1
+
+
 def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "please adjust", "cid-1", "base"))

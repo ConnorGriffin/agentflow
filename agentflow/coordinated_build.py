@@ -1667,7 +1667,7 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
     comments = _pr_comments(cfg.repo, pr)
     if comments is None:
         return f"PR #{pr}: PR thread unreadable — deferring the parked-review answer"
-    if not bound and not park_awaiting_decision(comments):
+    if not bound and not park_awaiting_decision(comments, target):
         return None                # the reply does not follow the decision handoff
     issue = int(record.subject)
     if not bound:
