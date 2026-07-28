@@ -4,6 +4,10 @@ __pycache__/
 .pytest_cache/
 /dist/
 *.egg-info/
+.agentflow/
+.claude/
+.impeccable/
+agentflow/webui/node_modules/
 
 # ui-mockups captures (illustrative/real payloads — not committed)
 mockups/*.capture.json
