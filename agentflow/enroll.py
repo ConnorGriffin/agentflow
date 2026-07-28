@@ -11,6 +11,10 @@ Usage:
   python -m agentflow.enroll <owner/repo>            # sweep legacy labels
   python -m agentflow.enroll audit                   # fleet declaration census
   python -m agentflow.enroll surfaces <dir> [--apply]  # propose/apply one repo's line
+
+Enrolment seeds `ui-surfaces: none` without looking at the repo, so `surfaces` is also what
+corrects that seed on a repo that turned out to have a UI — and `audit` names any repo still
+claiming to be headless while its own checkout says otherwise.
 """
 
 from __future__ import annotations
@@ -21,7 +25,8 @@ import sys
 from pathlib import Path
 
 from agentflow.intake import sweep_legacy_labels
-from agentflow.loop import UI_SURFACES_NONE, SurfaceDeclaration, surface_declaration
+from agentflow.loop import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
+                            surface_declaration)
 
 # Directory names that hold a user-facing surface when a repo has one. Deliberately narrow:
 # a wrong guess here writes a declaration that either misses real UI or gates a backend path.
@@ -75,24 +80,42 @@ def declaration_line(surfaces: tuple[str, ...]) -> str:
     return f"{_DECLARATION_KEY} {', '.join(surfaces) if surfaces else UI_SURFACES_NONE}"
 
 
+def contradicts_checkout(declaration: SurfaceDeclaration, workdir: str) -> bool:
+    """A repo claiming to be headless when the checkout plainly has a user-facing surface.
+
+    Enrolment seeds `none` without looking at the repo, so this is how a repo that turned out
+    to have a UI stays visible: left alone it would count as answered, keeping the UI-evidence
+    gate switched off there for good — the exact hole the declaration exists to close.
+    """
+    return declaration.headless and bool(propose_surfaces(workdir))
+
+
 def write_declaration(workdir: str, surfaces: tuple[str, ...]) -> str:
     """Add the declaration to the repo's AGENTS.md, keeping everything already in it.
 
-    Idempotent: a repo that already declares anything is left exactly as it is, so re-running
-    the backfill never overwrites a hand-tuned line. Returns a human-readable outcome.
+    Idempotent: a hand-written surface list is never touched, and neither is a `none` the
+    checkout agrees with, so re-running the backfill is a no-op. The one line it rewrites is
+    a `none` the checkout contradicts — the enrolment seed on a repo that has a UI after all.
+    Returns a human-readable outcome.
     """
     target = Path(workdir) / "AGENTS.md"
     if not target.exists():
         return f"SKIP: no AGENTS.md in {workdir} — run enroll-standards.sh --apply first"
-    if surface_declaration(workdir).declared:
+    current = surface_declaration(workdir)
+    if current.surfaces or (current.headless and not surfaces):
         return "ok:   already declared — leaving it alone"
     backup = target.with_name("AGENTS.md.pre-agentflow")
     if not backup.exists():
         shutil.copy2(target, backup)
     existing = target.read_text()
+    line = declaration_line(surfaces)
+    corrected, replaced = _UI_SURFACES_RE.subn(lambda _m: line, existing, count=1)
+    if replaced:
+        target.write_text(corrected)
+        return f"DO:   corrected '{line}' in {target}"
     separator = "" if existing.endswith("\n") or not existing else "\n"
-    target.write_text(f"{existing}{separator}\n{declaration_line(surfaces)}\n")
-    return f"DO:   wrote '{declaration_line(surfaces)}' to {target}"
+    target.write_text(f"{existing}{separator}\n{line}\n")
+    return f"DO:   wrote '{line}' to {target}"
 
 
 def newly_gated_prs(repo: str, surfaces: tuple[str, ...]) -> list[int] | None:
@@ -113,12 +136,19 @@ def newly_gated_prs(repo: str, surfaces: tuple[str, ...]) -> list[int] | None:
 
 
 def audit_lines(repos) -> list[str]:
-    """One line per enrolled repo plus a census tail, naming every undeclared repo."""
+    """One line per enrolled repo plus a census tail, naming every repo the gate cannot fire
+    in: the ones that never answered, and the ones whose headless answer their own checkout
+    contradicts."""
     lines = []
     undeclared = []
+    contradicted = []
     for cfg in repos:
         declaration = surface_declaration(cfg.workdir)
-        lines.append(f"  {cfg.repo}: {_audit_state(declaration)}")
+        state = _audit_state(declaration)
+        if contradicts_checkout(declaration, cfg.workdir):
+            state = f"{UI_SURFACES_NONE} — but this checkout has a user-facing surface"
+            contradicted.append(cfg.repo)
+        lines.append(f"  {cfg.repo}: {state}")
         if not declaration.declared:
             undeclared.append(cfg.repo)
     declared = len(lines) - len(undeclared)
@@ -126,6 +156,9 @@ def audit_lines(repos) -> list[str]:
     if undeclared:
         lines.append("undeclared (the UI-evidence gate cannot fire there): "
                      + ", ".join(undeclared))
+    if contradicted:
+        lines.append("declared headless but the checkout says otherwise (re-run "
+                     "`python -m agentflow.enroll surfaces <dir>`): " + ", ".join(contradicted))
     return lines
 
 
@@ -136,8 +169,18 @@ def _audit_state(declaration: SurfaceDeclaration) -> str:
 
 
 def checkout_repo(workdir: str) -> str:
-    """The `owner/name` this checkout pushes to, or empty when it can't be resolved."""
+    """The `owner/name` this checkout pushes to, or empty when it can't be resolved.
+
+    Only ever the repo rooted at this directory: git answers from the nearest enclosing
+    checkout, so a directory that is not itself one would otherwise borrow its parent's repo
+    and the impact preview would name a different repo's open PRs.
+    """
     from agentflow.runner import _run
+    # `--show-prefix` is empty only at a checkout's root; ask git rather than comparing paths,
+    # which a case-insensitive filesystem gets wrong (a `Brewgen/` checkout rooted at `brewgen/`).
+    prefix = _run(["git", "-C", workdir, "rev-parse", "--show-prefix"])
+    if prefix.returncode != 0 or (prefix.stdout or "").strip():
+        return ""
     r = _run(["git", "-C", workdir, "remote", "get-url", "origin"])
     if r.returncode != 0:
         return ""
@@ -150,9 +193,12 @@ def checkout_repo(workdir: str) -> str:
 def _surfaces_command(workdir: str, apply: bool) -> None:
     print(f"UI surfaces — {workdir}")
     current = surface_declaration(workdir)
-    if current.declared:
+    if current.declared and not contradicts_checkout(current, workdir):
         print(f"  ok:   already declares {_audit_state(current)}")
         return
+    if current.headless:
+        print("  WARN: declares none, but this checkout has a user-facing surface — the "
+              "UI-evidence gate is switched off here")
     proposal = propose_surfaces(workdir)
     print(f"  proposal: {declaration_line(proposal)}")
     repo = checkout_repo(workdir)

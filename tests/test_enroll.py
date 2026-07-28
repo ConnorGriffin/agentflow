@@ -5,8 +5,10 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-from agentflow.enroll import (audit_lines, declaration_line, newly_gated_prs,
-                              propose_surfaces, write_declaration)
+import pytest
+
+from agentflow.enroll import (audit_lines, checkout_repo, declaration_line, main,
+                              newly_gated_prs, propose_surfaces, write_declaration)
 from agentflow.loop import surface_declaration
 
 
@@ -231,3 +233,116 @@ def test_impact_of_an_unreadable_listing_is_unknown_not_empty(monkeypatch):
     monkeypatch.setattr("agentflow.github.list_open_prs", lambda repo: None)
 
     assert newly_gated_prs("o/ciq", ("frontend/",)) is None
+
+
+def test_audit_names_a_repo_whose_headless_answer_its_checkout_contradicts(tmp_path):
+    # Enrolment seeds `none` without looking at the repo, so a repo with a UI can be
+    # "answered" and still have the gate switched off. That must stay visible.
+    seeded = tmp_path / "seeded"
+    (seeded / "frontend").mkdir(parents=True)
+    (seeded / "AGENTS.md").write_text("ui-surfaces: none\n")
+    genuine = tmp_path / "genuine"
+    (genuine / "sandboxlib").mkdir(parents=True)
+    (genuine / "AGENTS.md").write_text("ui-surfaces: none\n")
+    repos = [SimpleNamespace(repo=f"o/{p.name}", workdir=str(p)) for p in (seeded, genuine)]
+
+    report = audit_lines(repos)
+
+    assert report[-1].endswith("o/seeded")
+    assert "o/genuine" not in report[-1]
+
+
+class TestTheImpactPreviewNamesThisCheckoutsOwnRepo:
+    """Which repo's open PRs the preview measures — it must be this checkout's, or none."""
+
+    def _init(self, repo: Path, origin: str) -> None:
+        for cmd in (["init", "-q"], ["remote", "add", "origin", origin]):
+            subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True)
+
+    def test_a_checkout_reached_by_a_differently_cased_path_still_resolves(self, tmp_path):
+        # The fleet's Brewgen checkout is spelled one way on disk and another in the enrolled
+        # list; a case-insensitive filesystem serves both, and the preview must still work.
+        repo = tmp_path / "Brewgen"
+        repo.mkdir()
+        self._init(repo, "git@github.com:o/Brewgen.git")
+        other_case = tmp_path / "brewgen"
+        if not other_case.is_dir():
+            pytest.skip("case-sensitive filesystem — the two spellings are different repos")
+
+        assert checkout_repo(str(other_case)) == "o/Brewgen"
+
+    def test_a_directory_inside_a_checkout_does_not_borrow_the_enclosing_repo(self, tmp_path):
+        repo = tmp_path / "outer"
+        (repo / "inner").mkdir(parents=True)
+        self._init(repo, "git@github.com:o/outer.git")
+
+        assert checkout_repo(str(repo / "inner")) == ""
+
+
+class TestSurfacesCommand:
+    """The operator's command, driven the way an operator runs it."""
+
+    def _stub_github(self, monkeypatch):
+        monkeypatch.setattr("agentflow.enroll.checkout_repo", lambda workdir: "o/ciq")
+        monkeypatch.setattr("agentflow.github.list_open_prs",
+                            lambda repo: [SimpleNamespace(number=476)])
+        monkeypatch.setattr("agentflow.gate.github.api",
+                            lambda args, **kwargs: {"files": [{"path": "frontend/diagnose.js"}],
+                                                    "body": "", "comments": []})
+
+    def _repo_with_a_frontend(self, tmp_path):
+        (tmp_path / "frontend").mkdir()
+        (tmp_path / "frontend" / "index.html").write_text("<html>")
+        (tmp_path / "AGENTS.md").write_text("# repo\n\nprofile: reviewed\n")
+        return tmp_path
+
+    def test_the_default_run_shows_its_plan_and_its_impact_and_writes_nothing(
+            self, tmp_path, monkeypatch, capsys):
+        repo = self._repo_with_a_frontend(tmp_path)
+        before = (repo / "AGENTS.md").read_text()
+        self._stub_github(monkeypatch)
+
+        main(["surfaces", str(repo)])
+
+        out = capsys.readouterr().out
+        assert "ui-surfaces: frontend/" in out
+        assert out.index("#476") < out.index("dry run")   # impact comes before any write
+        assert (repo / "AGENTS.md").read_text() == before
+
+    def test_apply_writes_it_and_re_running_changes_nothing(self, tmp_path, monkeypatch):
+        repo = self._repo_with_a_frontend(tmp_path)
+        self._stub_github(monkeypatch)
+
+        main(["surfaces", str(repo), "--apply"])
+        written = (repo / "AGENTS.md").read_text()
+        main(["surfaces", str(repo), "--apply"])
+
+        assert surface_declaration(str(repo)).surfaces == ("frontend/",)
+        assert (repo / "AGENTS.md").read_text() == written
+
+    def test_a_seeded_headless_answer_is_corrected_when_the_repo_has_a_ui(
+            self, tmp_path, monkeypatch, capsys):
+        # End to end: enrolment seeds `none` on a repo with a frontend, and the command the
+        # enrolment note points at must fix that rather than call the repo already answered.
+        (tmp_path / "frontend").mkdir()
+        (tmp_path / "frontend" / "index.html").write_text("<html>")
+        _enroll(tmp_path, apply=True)
+        self._stub_github(monkeypatch)
+
+        main(["surfaces", str(tmp_path), "--apply"])
+
+        out = capsys.readouterr().out
+        assert "WARN" in out
+        assert surface_declaration(str(tmp_path)).surfaces == ("frontend/",)
+        assert "ui-surfaces: none" not in (tmp_path / "AGENTS.md").read_text()
+
+    def test_a_genuinely_headless_repo_is_left_alone(self, tmp_path, monkeypatch, capsys):
+        (tmp_path / "sandboxlib").mkdir()
+        agents = tmp_path / "AGENTS.md"
+        agents.write_text("# repo\n\nui-surfaces: none\n")
+        self._stub_github(monkeypatch)
+
+        main(["surfaces", str(tmp_path), "--apply"])
+
+        assert agents.read_text() == "# repo\n\nui-surfaces: none\n"
+        assert "already declares none" in capsys.readouterr().out

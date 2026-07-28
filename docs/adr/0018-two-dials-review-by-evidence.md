@@ -70,12 +70,15 @@ amendments:
   it. Failing closed on silence would park every PR in dotfiles, homelab, follow-through
   and agentflow-sandbox for no reason; the fix for silence is to answer it, not to stop
   the fleet.
-- **Enrolment seeds the line, and a backfill command proposes the value.**
+- **Enrolment seeds the line provisionally, and a backfill command settles it.**
   `enroll-standards.sh` seeds `ui-surfaces: none` so a new repo starts declared;
   `python -m agentflow.enroll surfaces <dir> [--apply]` inspects a checkout, proposes the
   right value, and prints which of that repo's open PRs the declaration would newly park
-  before it writes anything. Detection is enrolment-only — the merge path still reads a
-  written declaration and never guesses.
+  before it writes anything. The seed is written without looking at the repo, so a `none`
+  the checkout contradicts is **not** treated as a settled answer: the backfill rewrites
+  that line and the audit names the repo, so a repo with a real UI can never go quiet
+  behind the seed. A hand-written surface list is never rewritten. Detection is
+  enrolment-only — the merge path still reads a written declaration and never guesses.
 
 The retroactive turn-on was **measured before it took effect**: across the fleet's open
 PRs at the time of the audit, exactly one (ciq-autotune #476) would newly have needed
