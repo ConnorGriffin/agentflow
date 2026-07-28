@@ -1775,7 +1775,7 @@ def _prepare_review_settlement(record) -> bool:
     if (verdict.change_author_tool
             and (_review_depth_escalated(record, verdict)
                  or verdict.pushed_sha or verdict.uncertainty is not None
-                 or record.review_axis == "product"
+                 or record.review_axis in {"product", "decision"}
                  or any(item.action.value == "fix_before_completion"
                         for item in verdict.actions))):
         return False  # the private successor opener owns this non-terminal pass
@@ -1841,7 +1841,7 @@ def _settle_review(record) -> str | None:
     if (verdict.change_author_tool
             and (_review_depth_escalated(record, verdict)
                  or verdict.pushed_sha or verdict.uncertainty is not None
-                 or record.review_axis == "product"
+                 or record.review_axis in {"product", "decision"}
                  or any(item.action.value == "fix_before_completion"
                         for item in verdict.actions))):
         return None  # reviewer-authored/axis/decision work must transfer privately first

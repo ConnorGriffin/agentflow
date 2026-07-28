@@ -993,6 +993,80 @@ def test_completed_product_review_keeps_its_verdict_when_provider_artifacts_disa
     assert parked == []
 
 
+def test_completed_conflict_decision_transfers_to_revise_before_settlement(
+        make_coord, monkeypatch):
+    """A grounded private conflict decision must return to the original builder for application.
+    It is not a clean Review settlement: reconciliation transfers the claim to conflict Revise
+    before any summary, park, or merge policy can consume the decision pass."""
+    from agentflow.review_policy import ReviewAssignment, ReviewAxis, ReviewDepth
+
+    payload = json.dumps({
+        "verdict": "PASS", "depth": "full",
+        "depth_reason": "competing product behaviors in a conflict",
+        "axis": "decision", "change_author_tool": "claude", "reviewed_sha": "sha-a",
+        "final_sha": "sha-a", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["competing behaviors traced"],
+        "decision": "keep main: the shared rule owns ties", "findings": [],
+        "uncertainty": None,
+    })
+
+    class CompletedArtifact:
+        def observe(self, _record):
+            return ProviderObservation(
+                final_message=payload, cause=ProviderCause.NONE, has_end_fact=True)
+
+    fake = FakeSession()
+    parked, summarized = [], []
+    adapter = ReviewStageAdapter(
+        verdict_ready=coordinated_build._verdict_ready,
+        worktree_reset=lambda _record: True,
+        observer=CompletedArtifact(),
+        handoff=lambda record: parked.append(record.identity) or f"proof:{record.identity}",
+        settle=coordinated_build._settle_review,
+        prepare_settle=coordinated_build._prepare_review_settlement)
+    coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    ident = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="review", pool="codex", complexity="deep",
+        target="sha-a", builder_lineage="claude", builder_complexity="deep",
+        conflict_round=1,
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        input_ptr="Resolve the private conflict decision for PR #42",
+        review=ReviewState(
+            assignment=ReviewAssignment(
+                ReviewDepth.FULL, "competing product behaviors in a conflict",
+                ReviewAxis.DECISION),
+            change_author_tool="claude", uncertainty_handoffs=1)))
+    coord.cycle("codex")
+    fake.end(ident, success=True, cause=ProviderCause.NONE)
+    assert [outcome.status for outcome in coord.cycle("codex")] == ["completed"]
+
+    monkeypatch.setattr(
+        coordinated_build, "_review_pr_facts",
+        lambda _record: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "agentflow.gate.post_clean_review_summary",
+        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
+
+    coordinated_build.reconcile_and_project(coord)
+
+    completed = record_of(coord, ident)
+    assert completed.retired is True and completed.claim is False
+    successors = [
+        record for record in _records(coord)
+        if record.stage == "revise" and not record.retired
+    ]
+    assert len(successors) == 1
+    assert successors[0].pool == "claude" and successors[0].conflict_round == 1
+    assert successors[0].claim is True
+    assert "shared rule owns ties" in successors[0].input_ptr
+    assert summarized == [] and parked == []
+
+
 def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci(
         make_coord, monkeypatch):
     from agentflow.reviewer import Verdict
