@@ -1036,7 +1036,8 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
 
     A forced same-tool review is never implicit: the first call returns the warning, and only an
     explicit confirmed call submits the human-merge-only tainted review. Existing running review
-    work is never preempted; a waiting exact-head review may transfer its claim atomically.
+    work is never preempted; a waiting exact-head review that still owns the claim transfers it
+    atomically, while a parked one — left unretired but claimless — is recovered on a fresh claim.
     """
     from agentflow import coordinated_build
     from agentflow.coordinator.store import StoreUnavailable
@@ -1092,9 +1093,15 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
             return "no eligible reviewer pool available — deferring"
     assignment, _changed_files = coordinated_build._review_assignment_facts(
         cfg.repo, pr, profile=profile)
-    active = next((record for record in same_head if not record.retired), None)
-    if active is not None and active.state == "running":
+    # A parked review stays unretired, so "the first unretired record" is no longer the live one:
+    # each question is asked of the record that actually answers it. Running work is never
+    # preempted whichever order the store holds, and only a record that still owns the visible
+    # claim has one to hand over — a parked review is left unretired but claimless on purpose, so
+    # recovering it is a fresh claim (#344).
+    unretired = [record for record in same_head if not record.retired]
+    if any(record.state == "running" for record in unretired):
         return "exact-head review is already running; it was not preempted"
+    predecessor = next((record for record in unretired if record.claim), None)
     sequence = max((record.review_sequence for record in same_head), default=-1) + 1
     from agentflow.review_policy import ReviewState
     review = ReviewState(
@@ -1103,11 +1110,11 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
     submission = coordinated_build.survivor_review_submission(
         cfg, issue=issue, slug=slug, builder_tool=builder_tool, head_sha=head,
         reviewer_tool=reviewer_tool, pr_number=pr, acceptance=acceptance,
-        review=review, transfer_from=active.identity if active else None,
-        supersede=active is not None)
+        review=review, transfer_from=predecessor.identity if predecessor else None,
+        supersede=predecessor is not None)
     if submission is None:
         return "review submission unavailable"
-    if active is None and not _claim(cfg.repo, issue):
+    if predecessor is None and not _claim(cfg.repo, issue):
         return "could not claim PR review"
     coordinator = coordinated_build.build_coordinator()
     coordinator.submit_stage(submission)

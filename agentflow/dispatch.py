@@ -92,6 +92,13 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
     if not pending:
         return "no PRs awaiting reply"
     pr, branch, comment, target, baseline = pending
+    # A reply that answers a parked review's recorded decision belongs to that review. It resumes
+    # the parked exact-head review instead of opening a second lifecycle that competes with the
+    # manual recovery for the same claim (#344); ordinary discussion still falls through to Respond.
+    resumed = coordinated_build.resume_answered_review(
+        cfg, coordinator, pr, comment=comment, target=target, baseline=baseline)
+    if resumed is not None:
+        return resumed
     submission = coordinated_build.respond_submission(
         cfg, pr, branch, comment, target, baseline)
     if submission is None:

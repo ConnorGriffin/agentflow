@@ -1332,3 +1332,77 @@ def test_a_rejected_verdict_shape_earns_one_repair_turn_naming_the_exact_error()
     # A review that produced no verdict at all is unfinished work, not a misstatement.
     unfinished = adapter.recover(record, SimpleNamespace(final_message="ran out of time"))
     assert unfinished.kind == PROGRESS
+
+
+# --- recovering a parked review by hand (#344) --------------------------------------------
+
+def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord, monkeypatch):
+    """A parked review is left `held`, deliberately unretired, and claimless, so it owns nothing to
+    hand over. Treating it as an ownership-transfer predecessor is what made the maintainer's own
+    `/agentflow review <PR>` recovery fail outright on the very PR the park asked them to decide.
+
+    Driven end to end over one durable store: park the review through ``cycle``, then run the
+    maintainer's recovery against that same durable state.
+    """
+    from agentflow import loop
+    from agentflow.loop import RepoConfig
+    from agentflow.review_policy import ReviewAssignment
+
+    pr_comments = []
+
+    def _park(repo, pr, verdict, *, reason, missing_outcome, context, proof_marker):
+        pr_comments.append({"body": "> *agentflow: parked for human review.*\n"
+                                    f"<!-- {proof_marker} -->"})
+
+    monkeypatch.setattr("agentflow.gate.park", _park)
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda repo, pr: [github.Comment(body=c["body"], created_at="")
+                                          for c in pr_comments])
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+
+    fake = FakeSession()
+    adapter = ReviewStageAdapter(verdict_ready=lambda r, o: False, worktree_reset=lambda r: True,
+                                 observer=fake, handoff=coordinated_build._park_pr)
+    coord = make_coord(fake, adapter=adapter)
+    parked_id = coord.submit_stage(
+        _review(source="/w/.agentflow/worktrees/codex-review/pr-42-x"))
+    for _ in range(8):
+        if coord.cycle("claude"):
+            break
+        fake.end(parked_id, cause=ProviderCause.PROCESS)
+    parked = record_of(coord, parked_id)
+    assert parked.state == "held" and parked.retired is False and parked.claim is False
+
+    monkeypatch.setattr(loop.github, "api", lambda *args, **kwargs: {
+        "state": "OPEN", "headRefName": "agentflow/codex/issue-7-x", "headRefOid": "sha-a",
+        "closingIssuesReferences": [{"number": 7}]})
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
+    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(coordinated_build, "_review_assignment_facts",
+                        lambda *args, **kwargs: (ReviewAssignment(reason="one journey"), ()))
+    monkeypatch.setattr(loop, "pick_reviewer", lambda author, **kwargs: "claude")
+    claimed = []
+    monkeypatch.setattr(loop, "_claim", lambda repo, issue: claimed.append(issue) or True)
+    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda _coord: None)
+
+    assert loop.review_pr(RepoConfig("o/r", "/w"), 42) == "review submitted"
+
+    assert claimed == [7]                                  # a fresh claim, not an invalid transfer
+    reviews = [r for r in _records(coord) if r.stage == "review"]
+    assert len(reviews) == 2
+    assert record_of(coord, parked_id).claim is False      # the park is not revived or re-owned
+    resumed = next(r for r in reviews if r.identity != parked_id)
+    assert resumed.target == "sha-a" and resumed.claim is True
+    assert resumed.review_sequence == 1 and resumed.builder_lineage == "codex"
+
+    # Run the command a second time while that recovery is live. The park is still unretired and
+    # still sorts first, so asking "is the first unretired record running?" would miss the review
+    # that is — and hand the same issue a second owner.
+    coord.cycle("claude")
+    assert record_of(coord, resumed.identity).state == "running"
+
+    assert loop.review_pr(RepoConfig("o/r", "/w"), 42) == \
+        "exact-head review is already running; it was not preempted"
+    assert claimed == [7]                                  # the issue is never claimed twice
+    assert len([r for r in _records(coord) if r.stage == "review"]) == 2

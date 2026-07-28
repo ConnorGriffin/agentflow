@@ -277,6 +277,54 @@ def _decode_uncertainty(payload: str | None) -> Uncertainty | None:
         raise ValueError("malformed review uncertainty")
 
 
+# One durable park/resume contract owns a PR exact head's whole review chain (#344). A recorded
+# product decision belongs to that chain, not to whichever record happened to stop last: only the
+# maintainer's own answer retires it, and that answer is bound to the comment it came from.
+_DECISION_ANSWER_PREFIX = "Maintainer decision answer for "
+_DECISION_ANSWER_SEPARATOR = " — "
+
+
+def decision_answer_handoff(target: str, answer: str) -> str:
+    """The private next-agent context for a review resumed by the maintainer's own answer.
+
+    It carries the answered PR comment as its durable binding, so the exact-head chain can tell a
+    settled decision from an unanswered one without a second ownership or comment protocol.
+    """
+    return f"{_DECISION_ANSWER_PREFIX}{target}{_DECISION_ANSWER_SEPARATOR}{answer.strip()}"
+
+
+def decision_answer_target(handoff: str | None) -> str:
+    """The maintainer comment a resumed review answers, or ``""`` for any other handoff."""
+    if not handoff or not handoff.startswith(_DECISION_ANSWER_PREFIX):
+        return ""
+    rest = handoff[len(_DECISION_ANSWER_PREFIX):]
+    return rest.split(_DECISION_ANSWER_SEPARATOR)[0].strip()
+
+
+def unresolved_uncertainty(chain: Any) -> Uncertainty | None:
+    """The latest structured product decision in one exact head's review chain that no maintainer
+    has answered yet. Pure over durable records — the test surface (ADR 0020).
+
+    Records are read in durable chain order (creation, then same-head sequence) because a Standards
+    or Fix pass that recorded no decision of its own must not erase the one an earlier Product pass
+    recorded (#344). Malformed durable state contributes nothing rather than inventing a decision.
+    """
+    pending = None
+    for record in sorted(chain, key=lambda item: (
+            int(getattr(item, "created_at", 0) or 0),
+            int(getattr(item, "review_sequence", 0) or 0),
+            str(getattr(item, "identity", "")))):
+        if decision_answer_target(getattr(record, "review_handoff", None)):
+            pending = None
+        try:
+            found = _decode_uncertainty(getattr(record, "review_uncertainty", None))
+        except ValueError:
+            continue
+        if found is not None:
+            pending = found
+    return pending
+
+
 _CONFLICT_UNCERTAINTY_RE = re.compile(r"^CONFLICT-UNCERTAINTY:\s*(\{.*\})\s*$", re.MULTILINE)
 
 
