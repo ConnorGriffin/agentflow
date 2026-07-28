@@ -18,7 +18,7 @@ from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, 
                             held_build_result, intake_allowlist, issue_of_branch,
                             mockup_scope_from_labels, pr_number,
                             recheck_once, repo_profile,
-                            slug, ui_surfaces)
+                            slug, _surfaces_phrase, surface_declaration, ui_surfaces)
 from agentflow.runner import Complexity, Effort, MockupScope
 
 
@@ -474,6 +474,35 @@ def test_ui_surfaces_empty_when_undeclared(tmp_path):
     # No declaration → no surfaces → the UI-evidence gate is inert for a non-UI repo.
     (tmp_path / "AGENTS.md").write_text("profile: reviewed\n")
     assert ui_surfaces(str(tmp_path)) == []
+
+
+@pytest.mark.parametrize("written", ["none", "None", "NONE", "  none  "])
+def test_declared_headless_is_told_apart_from_silence(tmp_path, written):
+    # Issue #337: a repo that says it has no UI reads as declared-with-no-surfaces, so the
+    # gate stays inert while the fleet audit can still see it was answered.
+    (tmp_path / "AGENTS.md").write_text(f"profile: reviewed\nui-surfaces: {written}\n")
+    declaration = surface_declaration(str(tmp_path))
+    assert declaration.surfaces == ()
+    assert declaration.declared
+    assert declaration.headless
+
+
+def test_silence_reports_undeclared(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("profile: reviewed\n")
+    declaration = surface_declaration(str(tmp_path))
+    assert not declaration.declared
+    assert not declaration.headless
+
+
+def test_prompts_do_not_demand_screenshots_of_a_headless_repo():
+    # A declared-headless repo must stop hearing the vague "any user-facing surface" ask;
+    # a real declaration and an unanswered one are unchanged.
+    assert "no screenshot is required" in _surfaces_phrase(
+        loop.SurfaceDeclaration(declared=True))
+    assert _surfaces_phrase(
+        loop.SurfaceDeclaration(surfaces=("frontend/",), declared=True)) == "`frontend/`"
+    assert _surfaces_phrase(loop.SurfaceDeclaration()) == \
+        "any user-facing surface (frontend, UI templates, etc.)"
 
 
 def test_revise_prompt_carries_both_evidence_gates():

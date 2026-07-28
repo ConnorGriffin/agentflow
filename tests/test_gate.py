@@ -260,6 +260,41 @@ class TestUiEvidenceGapAnchorsToUs:
         assert ui_evidence_gap("o/r", 7, self._SURFACES) is True
 
 
+class TestBackfilledSurfacesActuallyGate:
+    # Issue #337: the fleet's other frontends were undeclared, so this gate had never fired
+    # outside agentflow. These are the exact shapes the backfill measured before it landed.
+    _CIQ_FILES = ["frontend/diagnose.js", "frontend/diagnose.test.js",
+                  "ciq_autotune/analyzers/basal.py"]
+
+    def _gap(self, monkeypatch, surfaces, files, *, body=""):
+        monkeypatch.setattr(gate.github, "api", lambda *a, **k: {
+            "files": [{"path": p} for p in files], "body": body, "comments": []})
+        return ui_evidence_gap("o/r", 476, surfaces)
+
+    def test_a_frontend_change_with_no_shots_is_a_gap(self, monkeypatch):
+        assert self._gap(monkeypatch, ["frontend/"], self._CIQ_FILES) is True
+
+    def test_the_same_change_with_committed_shots_clears(self, monkeypatch):
+        assert self._gap(
+            monkeypatch, ["frontend/"],
+            [*self._CIQ_FILES, "docs/screenshots/issue-476/abc1234/after-dark.png"]) is False
+
+    def test_a_frontend_test_change_is_not_a_ui_change(self, monkeypatch):
+        # Brewgen #62: browser tests and backend files sit outside the declared surface,
+        # so declaring surfaces must not park work that never touched the UI itself.
+        assert self._gap(monkeypatch, ["brewgen/frontend/src/"],
+                         ["brewgen/frontend/tests/browser/results-shelf.mjs",
+                          "brewgen/backend/envelope.py", "Dockerfile"]) is False
+
+    def test_declared_headless_never_reads_github(self, monkeypatch):
+        # `ui-surfaces: none` resolves to an empty surface list, which must land on the inert
+        # path — never the fail-closed one that parks a PR when a `gh` read fails.
+        def explode(*a, **k):
+            raise AssertionError("a headless repo must not be read for UI evidence")
+        monkeypatch.setattr(gate.github, "api", explode)
+        assert ui_evidence_gap("o/r", 476, []) is False
+
+
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------
 
 _PARK = {"body": "> *agentflow: parked for human review.*\n\nfindings..."}

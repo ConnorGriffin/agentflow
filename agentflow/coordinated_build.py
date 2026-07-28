@@ -60,7 +60,8 @@ def build_submission(cfg, issue: dict, tool: str):
     attempt."""
     from agentflow.coordinator import Submission
     from agentflow.loop import (BUILD_PROMPT, _builder_worktree, _surfaces_phrase,
-                                complexity_from_labels, effort_from_labels, slug, ui_surfaces)
+                                complexity_from_labels, effort_from_labels, slug,
+                                surface_declaration)
     n = issue["number"]
     labels = [lbl["name"] for lbl in issue.get("labels", [])]
     complexity = complexity_from_labels(labels)
@@ -70,7 +71,7 @@ def build_submission(cfg, issue: dict, tool: str):
     brief = BUILD_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort_from_labels(labels).value,
-        surfaces=_surfaces_phrase(ui_surfaces(cfg.workdir)))
+        surfaces=_surfaces_phrase(surface_declaration(cfg.workdir)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool=tool,
         complexity=complexity.value, effort=effort_from_labels(labels).value,
@@ -134,7 +135,8 @@ def mockup_submission(cfg, issue: dict, tool: str):
     """
     from agentflow.coordinator import Submission
     from agentflow.loop import (PRODUCE_PROMPT, _MOCKUP_DISCLAIMER, _SCOPE_GUIDANCE,
-                                _surfaces_phrase, mockup_scope_from_labels, slug, ui_surfaces)
+                                _surfaces_phrase, mockup_scope_from_labels, slug,
+                                surface_declaration)
 
     n = int(issue["number"])
     sl = slug(issue.get("title", ""))
@@ -144,7 +146,7 @@ def mockup_submission(cfg, issue: dict, tool: str):
     scope = mockup_scope_from_labels([lbl["name"] for lbl in issue.get("labels", [])])
     prompt = PRODUCE_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
-        branch=branch, surfaces=_surfaces_phrase(ui_surfaces(cfg.workdir)),
+        branch=branch, surfaces=_surfaces_phrase(surface_declaration(cfg.workdir)),
         scope_guidance=_SCOPE_GUIDANCE[scope], disclaimer=_MOCKUP_DISCLAIMER)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="mockup", pool=tool, complexity="deep",
@@ -535,7 +537,7 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
     retained branch/worktree naming needed by any later Revise.
     """
     from agentflow.coordinator import Submission
-    from agentflow.loop import _surfaces_phrase, ui_surfaces
+    from agentflow.loop import _surfaces_phrase, surface_declaration
     from agentflow.review_policy import ReviewState
     from agentflow.reviewer import REVIEW_PROMPT, review_worktree, with_review_assignment
 
@@ -543,7 +545,7 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         return None
     prompt = REVIEW_PROMPT.format(
         pr=pr_number, starting_sha=head_sha, acceptance=acceptance or "(none provided)",
-        surfaces=_surfaces_phrase(ui_surfaces(cfg.workdir)))
+        surfaces=_surfaces_phrase(surface_declaration(cfg.workdir)))
     state = review or ReviewState(change_author_tool=builder_tool)
     assignment = state.assignment
     author = state.change_author_tool or builder_tool
@@ -2236,7 +2238,7 @@ def _open_pr_for_branch(repo: str, branch: str) -> github.PrRow | None:
 
 def _review_context(record) -> tuple[str, str] | None:
     """The issue-anchored acceptance brief and declared UI surfaces for a Review."""
-    from agentflow.loop import _surfaces_phrase, ui_surfaces
+    from agentflow.loop import _surfaces_phrase, surface_declaration
 
     parts = _build_source_parts(record)
     if parts is None:
@@ -2247,7 +2249,7 @@ def _review_context(record) -> tuple[str, str] | None:
         acceptance = github.issue_body(record.repo, record.subject)
         if acceptance is None:   # unreadable stays unknown — the opener refuses rather than guesses
             return None
-    return acceptance, _surfaces_phrase(ui_surfaces(workdir))
+    return acceptance, _surfaces_phrase(surface_declaration(workdir))
 
 
 def _review_assignment_facts(repo: str, pr_number: int, *, conflict_resolution: bool = False,

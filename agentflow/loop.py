@@ -94,25 +94,58 @@ def repo_profile(workdir: str) -> str:
     return "reviewed"
 
 
-def ui_surfaces(workdir: str) -> list[str]:
-    """The repo's declared user-facing surfaces from its AGENTS.md/CLAUDE.md
-    `ui-surfaces:` line — a comma-separated list of path prefixes (e.g.
-    `agentflow/static/, frontend/`), or `[]` when none is declared. A change under
-    one of these needs a before/after screenshot: the charter's UI-evidence gate
-    (ADR 0018) reads this per repo instead of a hardcoded example."""
+UI_SURFACES_NONE = "none"
+
+
+@dataclass(frozen=True, slots=True)
+class SurfaceDeclaration:
+    """What a repo says about its user-facing surfaces — and whether it said anything.
+
+    `ui-surfaces: none` is the explicit headless answer: declared, with no surfaces. Silence
+    is a third state, not the same answer written differently — it keeps the UI-evidence gate
+    inert exactly as before (ADR 0018) while staying visible to the enrollment audit.
+    """
+
+    surfaces: tuple[str, ...] = ()
+    declared: bool = False
+
+    @property
+    def headless(self) -> bool:
+        """Declared as having no user-facing surface on purpose."""
+        return self.declared and not self.surfaces
+
+
+def surface_declaration(workdir: str) -> SurfaceDeclaration:
+    """Read the repo's AGENTS.md/CLAUDE.md `ui-surfaces:` line — a comma-separated list of
+    path prefixes (e.g. `agentflow/static/, frontend/`), the literal `none` for a repo that
+    is headless on purpose, or nothing at all. A change under one of the prefixes needs a
+    before/after screenshot: the charter's UI-evidence gate (ADR 0018) reads this per repo
+    instead of a hardcoded example."""
     for name in ("AGENTS.md", "CLAUDE.md"):
         p = Path(workdir) / name
         if p.exists():
             m = _UI_SURFACES_RE.search(p.read_text(errors="replace"))
             if m:
-                return [s.strip() for s in m.group(1).split(",") if s.strip()]
-    return []
+                values = [s.strip() for s in m.group(1).split(",") if s.strip()]
+                if [v.lower() for v in values] == [UI_SURFACES_NONE]:
+                    return SurfaceDeclaration(declared=True)
+                if values:
+                    return SurfaceDeclaration(surfaces=tuple(values), declared=True)
+    return SurfaceDeclaration()
 
 
-def _surfaces_phrase(surfaces: list[str]) -> str:
+def ui_surfaces(workdir: str) -> list[str]:
+    """The repo's effective UI-surface prefixes — empty for a headless or undeclared repo."""
+    return list(surface_declaration(workdir).surfaces)
+
+
+def _surfaces_phrase(declaration: SurfaceDeclaration) -> str:
     """How to name the repo's UI surfaces to a builder/reviewer prompt."""
-    return ", ".join(f"`{s}`" for s in surfaces) if surfaces \
-        else "any user-facing surface (frontend, UI templates, etc.)"
+    if declaration.surfaces:
+        return ", ".join(f"`{s}`" for s in declaration.surfaces)
+    if declaration.headless:
+        return "none — this repo is headless, so no screenshot is required"
+    return "any user-facing surface (frontend, UI templates, etc.)"
 
 
 def intake_allowlist(repo: str, workdir: str) -> set[str]:
