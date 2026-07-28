@@ -16,7 +16,7 @@ one global file without copying the charter into it.
 
 ## Decision
 
-The dotfiles repo owns one machine-global instruction file. Both
+Private tooling owns one machine-global instruction file. Both
 `~/.claude/CLAUDE.md` and `~/.codex/AGENTS.md` symlink to those same canonical
 bytes.
 
@@ -25,9 +25,9 @@ reference directly and Codex follows the referenced guidance. The charter remain
 its own canonical document and cross-review rubric. Codex reference traversal was
 verified with an ephemeral read-only session against the shared global file.
 
-`enroll-standards.sh` verifies the neutral dotfiles source, ensures it references
+`enroll-standards.sh` verifies the neutral private-tooling source, ensures it references
 the charter, and points both tools at it. Only the known retired links—Claude's
-old dotfiles path and Codex's direct charter link—are migrated automatically.
+old private-tooling path and Codex's direct charter link—are migrated automatically.
 
 Per-repository wiring remains unchanged: `AGENTS.md` is canonical and
 `CLAUDE.md` symlinks to it.

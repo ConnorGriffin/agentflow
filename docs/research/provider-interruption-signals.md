@@ -61,8 +61,8 @@ and Anthropic's Agent SDK provides the concrete wire vocabulary:
   control. ([Anthropic error reference](https://platform.claude.com/docs/en/api/errors),
   [Claude Code error reference](https://code.claude.com/docs/en/errors))
 
-The local Claude 2.1.181 transcript for the interrupted `ciq-autotune` build corroborates
-the structured contract: the terminal assistant event had `error: "rate_limit"`,
+An interrupted local Claude transcript corroborates the structured contract: the
+terminal assistant event had `error: "rate_limit"`,
 `isApiErrorMessage: true`, `apiErrorStatus: 429`, and a synthetic message reporting the
 local reset time. `rate_limit_event.resetsAt` is authoritative when emitted. If it is
 absent, match only Claude's documented session/weekly/Opus-limit terminal messages and

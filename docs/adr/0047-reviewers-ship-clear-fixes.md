@@ -10,12 +10,12 @@ clear reviewer-discovered fixes wait for another session, then let the same revi
 own changed head. It also treated all changes alike: wording and evidence cleanup received the same
 review as a permission or product decision, while follow-up issue claims were trusted without proof.
 
-The failure was visible on ciq-autotune#450 and #451. Review found clear held-reason, evidence,
-summary, and helper defects which agents later shipped after maintainer direction. During #450's
+The failure was visible in two guarded-project PRs. Review found clear held-reason,
+evidence, summary, and helper defects which agents later shipped after maintainer direction. During the first PR's
 conflict response, the requested resolution was pushed, the conflict was gone, checks passed, and
 the marked explanation was posted; an unrelated local scratch file nevertheless made Respond look
-incomplete. Two unnecessary continuations then produced a false park. Brewgen#42 supplies the
-different case: the PR was proven, but a reusable browser-walkthrough gap was a necessary follow-up
+incomplete. Two unnecessary continuations then produced a false park. A separate
+reviewed-project PR supplies the different case: the PR was proven, but a reusable browser-walkthrough gap was a necessary follow-up
 outside that PR's purpose.
 
 Conflict recovery also counted conflicts across the PR lifetime. That parked normal work when
@@ -72,10 +72,10 @@ The repository's `AGENTS.md`, engineering charter, project documentation, explic
 direction, and established application behavior are grounding, not personal preference. “Personal
 preference” means only the reviewer's unsupported taste.
 
-Calibration is concrete. ciq-autotune#450's inconsistent held-reason styling, duplicate screenshot,
-and jargon-heavy summary, and #451's broken before-evidence and committed hardcoded helper, are
-fix-before-completion work. Brewgen#42's absent browser walkthrough is a necessary follow-up because
-the current PR was proven and the reusable checking gap was real. A request for different wording
+Calibration is concrete. Inconsistent held-reason styling, duplicate screenshots,
+jargon-heavy summaries, broken before-evidence, and a committed hardcoded helper are
+fix-before-completion work. An absent browser walkthrough is a necessary follow-up
+when the current PR was proven and the reusable checking gap was real. A request for different wording
 when the existing wording is clear, correct, and project-grounded is discarded.
 
 ### Every reviewer-authored head is cross-tool reviewed

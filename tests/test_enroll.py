@@ -155,16 +155,16 @@ class TestSurfaceProposal:
     """The backfill's guess, on the checkout shapes actually in the fleet."""
 
     def test_a_bundled_app_declares_its_authored_source(self, tmp_path):
-        (tmp_path / "brewgen" / "frontend" / "src").mkdir(parents=True)
-        (tmp_path / "brewgen" / "frontend" / "public").mkdir()
-        (tmp_path / "brewgen" / "backend").mkdir()
+        (tmp_path / "sample-app" / "frontend" / "src").mkdir(parents=True)
+        (tmp_path / "sample-app" / "frontend" / "public").mkdir()
+        (tmp_path / "sample-app" / "backend").mkdir()
 
-        assert propose_surfaces(str(tmp_path)) == ("brewgen/frontend/src/",)
+        assert propose_surfaces(str(tmp_path)) == ("sample-app/frontend/src/",)
 
     def test_a_flat_frontend_declares_the_directory(self, tmp_path):
         (tmp_path / "frontend").mkdir()
         (tmp_path / "frontend" / "index.html").write_text("<html>")
-        (tmp_path / "ciq_autotune").mkdir()
+        (tmp_path / "analysis_engine").mkdir()
 
         assert propose_surfaces(str(tmp_path)) == ("frontend/",)
 
@@ -278,16 +278,16 @@ class TestTheImpactPreviewNamesThisCheckoutsOwnRepo:
             subprocess.run(["git", "-C", str(repo), *cmd], check=True, capture_output=True)
 
     def test_a_checkout_reached_by_a_differently_cased_path_still_resolves(self, tmp_path):
-        # The fleet's Brewgen checkout is spelled one way on disk and another in the enrolled
+        # A checkout can be spelled one way on disk and another in the enrolled
         # list; a case-insensitive filesystem serves both, and the preview must still work.
-        repo = tmp_path / "Brewgen"
+        repo = tmp_path / "SampleApp"
         repo.mkdir()
-        self._init(repo, "git@github.com:o/Brewgen.git")
-        other_case = tmp_path / "brewgen"
+        self._init(repo, "git@github.com:o/SampleApp.git")
+        other_case = tmp_path / "sampleapp"
         if not other_case.is_dir():
             pytest.skip("case-sensitive filesystem — the two spellings are different repos")
 
-        assert checkout_repo(str(other_case)) == "o/Brewgen"
+        assert checkout_repo(str(other_case)) == "o/SampleApp"
 
     def test_a_directory_inside_a_checkout_does_not_borrow_the_enclosing_repo(self, tmp_path):
         repo = tmp_path / "outer"

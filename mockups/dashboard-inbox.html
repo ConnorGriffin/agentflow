@@ -219,18 +219,18 @@ const FALLBACK = {
     {tool:'codex',  clear:true, spent_pct:58.0, headroom_pct:42.0}
   ],
   repos: [
-    {repo:'ConnorGriffin/agentflow-sandbox', profile:'autonomous',
+    {repo:'example-org/sandbox', profile:'autonomous',
      in_flight:[{number:7, title:'Add truncate(text, limit) helper', builder:'codex'}],
      recent_merges:[
        {number:5, title:'Add pad(text, width) helper', merged_at:'2026-07-09T23:52:00Z'},
        {number:3, title:'Add slugify(text) helper to sandboxlib', merged_at:'2026-07-09T23:29:42Z'}],
      ratchet:{samples:14, correction_rate:0.07, ready_to_loosen:true}},
-    {repo:'ConnorGriffin/brewgen', profile:'reviewed',
+    {repo:'example-org/recipe-app', profile:'reviewed',
      in_flight:[{number:22, title:'Cache formula lookups across taps', builder:'claude'}],
      recent_merges:[{number:19, title:'Fix cask token parsing for versioned casks', merged_at:'2026-07-09T21:40:00Z'}],
      ratchet:{samples:6, correction_rate:0.17, ready_to_loosen:false}},
-    {repo:'ConnorGriffin/ciq-autotune', profile:'guarded',
-     in_flight:[{number:301, title:'ISF harm-layer arm: dominant-vs-nearest IOB', builder:'claude'}],
+    {repo:'example-org/safety-console', profile:'guarded',
+     in_flight:[{number:301, title:'Validate fail-safe threshold ordering', builder:'claude'}],
      recent_merges:[{number:298, title:'Patterns tab: reject a finding', merged_at:'2026-07-09T18:05:00Z'}],
      ratchet:{samples:0, correction_rate:0.0, ready_to_loosen:false}}
   ]
@@ -245,17 +245,17 @@ const EMPTY = {
     {tool:'codex',  clear:true, spent_pct:44.0, headroom_pct:56.0}
   ],
   repos: [
-    {repo:'ConnorGriffin/agentflow-sandbox', profile:'autonomous',
+    {repo:'example-org/sandbox', profile:'autonomous',
      in_flight:[{number:9, title:'Add chunk(list, size) helper', builder:'codex'}],
      recent_merges:[
        {number:8, title:'Add truncate(text, limit) helper', merged_at:'2026-07-10T00:14:00Z'},
        {number:5, title:'Add pad(text, width) helper', merged_at:'2026-07-09T23:52:00Z'}],
      ratchet:{samples:16, correction_rate:0.06, ready_to_loosen:false}},
-    {repo:'ConnorGriffin/brewgen', profile:'autonomous',
+    {repo:'example-org/recipe-app', profile:'autonomous',
      in_flight:[],
      recent_merges:[{number:23, title:'Cache formula lookups across taps', merged_at:'2026-07-09T23:05:00Z'}],
      ratchet:{samples:22, correction_rate:0.05, ready_to_loosen:false}},
-    {repo:'ConnorGriffin/ciq-autotune', profile:'guarded',
+    {repo:'example-org/safety-console', profile:'guarded',
      in_flight:[],
      recent_merges:[{number:298, title:'Patterns tab: reject a finding', merged_at:'2026-07-09T18:05:00Z'}],
      ratchet:{samples:2, correction_rate:0.0, ready_to_loosen:false}}

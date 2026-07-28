@@ -488,7 +488,7 @@ def test_reply_ready_rejects_an_uncommitted_tracked_edit(monkeypatch, tmp_path):
 
 def test_reply_ready_ignores_an_unrelated_untracked_scratch_file(monkeypatch, tmp_path):
     # PR state proves completion. An unrelated local helper does not consume continuations after
-    # the targeted reply and pushed head landed (the ciq-autotune #450 regression).
+    # the targeted reply and pushed head landed (a guarded-project regression).
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="?? run-shot.sh\n")
     assert coordinated_build._reply_ready(rec, None) is True
 

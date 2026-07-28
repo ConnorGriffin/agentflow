@@ -64,7 +64,11 @@ The transcript scan found two explicit “session limit” events in agentflow w
 
 At launch, three Claude roots began within 1.2 seconds: a standard/medium build, a deep triage, and the deep/extra build that later stopped. Because the proxy is reconstructed from usage events already written to transcripts, it could not reserve any of that newly admitted demand. The calibrated proxy therefore said more than 70% remained at both real provider-limit events.
 
-The proxy is doing what its source defines: sum a rough weighted token formula over the trailing five hours and divide by a historical peak of `38,447,725` ([weighting](https://github.com/ConnorGriffin/dotfiles/blob/9f8b251aac0630e0c33fdee68b23aa3cd566eef3/scripts/triage-gate.sh#L152-L165), [peak calibration](https://github.com/ConnorGriffin/dotfiles/blob/9f8b251aac0630e0c33fdee68b23aa3cd566eef3/scripts/triage-gate.sh#L347-L371), [spend calculation](https://github.com/ConnorGriffin/dotfiles/blob/9f8b251aac0630e0c33fdee68b23aa3cd566eef3/scripts/triage-gate.sh#L407-L417)). It is not a provider-authored quota fact and has no reservation for sessions just admitted. This episode shows it is unsuitable as the correctness boundary for concurrent admission. Keep it as the cumulative-spend signal; use atomic permits for burst control.
+The proxy sums a rough weighted token formula over a trailing window and divides
+by a historical peak calibrated in private tooling. It is not a provider-authored
+quota fact and has no reservation for sessions just admitted. This episode shows
+it is unsuitable as the correctness boundary for concurrent admission. Keep it
+as the cumulative-spend signal; use atomic permits for burst control.
 
 ## Reproducible method
 

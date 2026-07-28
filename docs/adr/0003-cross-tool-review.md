@@ -8,9 +8,9 @@
 [ADR 0002](0002-three-autonomy-levels.md) makes review the load-bearing safety
 control for the `autonomous` and `reviewed` rungs. The question is *who* reviews.
 
-The concrete failure this must catch is the one that bit `ciq-autotune` on PRs
-#310/#311: a green-CI diff that was confidently, subtly **wrong** (misattribution
-edge cases a passing test never exercised). A reviewer that shares the builder's
+The concrete failure this must catch is a green-CI diff that was confidently,
+subtly **wrong** because passing tests missed attribution edge cases. A reviewer
+that shares the builder's
 blind spots will wave that through — the builder already convinced itself.
 
 ## Decision

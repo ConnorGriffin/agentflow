@@ -3,7 +3,7 @@
 The coordinator is the only launch owner. Runners provide model mapping, structured command
 construction, provisioning, and git plumbing; they do not orchestrate a Build lifecycle.
 
-Ported and generalized from the dotfiles `codex-go` wrapper (Codex-only) into a
+Ported and generalized from a private Codex-only wrapper into a
 two-tool abstraction — the "unified runner" the reuse map flagged as net-new.
 
 The interface is command construction, model resolution, and fail-closed worktree plumbing,

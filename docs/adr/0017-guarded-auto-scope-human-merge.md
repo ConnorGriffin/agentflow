@@ -1,4 +1,4 @@
-# ADR 0017 — ciq-autotune: auto-scope, human-merge
+# ADR 0017 — Guarded project: auto-scope, human-merge
 
 - Status: Accepted
 - Date: 2026-07-09
@@ -6,9 +6,9 @@
 ## Context
 
 [ADR 0008](0008-conservatism-knob.md) kept "how conservative" on one coupled dial and
-named the likely first exception verbatim: *ciq-autotune wanting **auto-scope but
-human-merge** — trust the model to route/scope, still hand the medical merge to a
-human*. It said to watch for it and promote exactly that one knob when a real repo
+named the likely first exception: a guarded project wanting **auto-scope but
+human-merge** — trust the model to route/scope, still hand a safety-critical merge
+to a human. It said to watch for it and promote exactly that one knob when a real repo
 needed it. Building intake ([ADR 0016](0016-intake-stage.md)) is that moment.
 
 ciq's own closed-issue history already worked this way: auto-triage grounded against a
@@ -18,8 +18,8 @@ hermetic work orders despite carrying the `guarded` label.
 
 ## Decision
 
-ciq-autotune runs the **auto-scope + human-merge** off-diagonal — the one knob ADR 0008
-reserved for demonstrated need, now promoted for this repo:
+A guarded project runs the **auto-scope + human-merge** off-diagonal — the one
+knob ADR 0008 reserved for demonstrated need:
 
 - **Scope/build trust = `reviewed`:** intake self-scopes with **mandatory** real-data
   grounding (the `ciq-pull-db` snapshot), and the builder self-scopes from the brief.

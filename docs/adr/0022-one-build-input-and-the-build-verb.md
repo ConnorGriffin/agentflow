@@ -7,7 +7,7 @@
 
 Two things named "work order" have coexisted, and the confusion had a cost:
 
-1. **The personal `/go` + `/work-order` skills** (in the maintainer's dotfiles, from
+1. **The personal `/go` + `/work-order` skills** (in private tooling, from
    the pre-agentflow two-tool era). `/work-order` wrote a self-contained copy/paste
    *implement prompt* — repo facts, model/effort assignment, worktree steps, the
    `/implement` (TDD) invocation, routing envelope — and `/go` fetched that comment and
@@ -19,9 +19,9 @@ Two things named "work order" have coexisted, and the confusion had a cost:
 
 2. **Agentflow's guarded work order ([ADR 0005](0005-spec-rigor-rides-the-dial.md))** —
    a genuinely different artifact. Not a copy/paste frame: a *domain-grounding* document
-   for the one medical-risk repo (ciq-autotune), pre-freezing insulin-math literals, test
-   fixtures, a file allow-list, and named invariant tests so an unattended builder never
-   *guesses* a domain fact. Its intent is sound and stays. But ADR 0005 delivered it as a
+   for a safety-critical repo, pre-freezing domain literals, test fixtures, a file
+   allow-list, and named invariant tests so an unattended builder never *guesses*
+   a domain fact. Its intent is sound and stays. But ADR 0005 delivered it as a
    **separate frozen comment** (`loop._work_order`, keyed off an `Open as:` line) — a
    second build-input format alongside the Brief, and the reason `run_once` refuses to
    build a guarded issue that has no such comment.

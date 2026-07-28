@@ -33,6 +33,6 @@ matrix of independent settings.
 
 - Config stays at **one number per repo** (`profile: <level>`).
 - The first repo that genuinely needs an off-diagonal split is the trigger to
-  promote exactly one knob. The likeliest first case: `ciq-autotune` wanting
+  promote exactly one knob. The likeliest first case: a guarded project wanting
   **auto-scope but human-merge** — trust the model to route/scope, still hand the
-  medical merge to a human. Watch for it; don't pre-build it.
+  safety-critical merge to a human. Watch for it; don't pre-build it.

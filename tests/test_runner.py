@@ -346,7 +346,7 @@ def test_public_session_lifecycle_bounds_registrations_across_every_lane(tmp_pat
     foreign_root = tmp_path / "foreign-lifecycle"
     foreign_root.mkdir()
     foreign = _repo_with_origin(foreign_root)
-    foreign_wt = root / "dotfiles" / "open-pr"
+    foreign_wt = root / "foreign-repo" / "open-pr"
     foreign_wt.parent.mkdir(parents=True, exist_ok=True)
     _git(foreign, "worktree", "add", "-b", "codex/open-pr", str(foreign_wt), "origin/main")
 
@@ -457,7 +457,7 @@ def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_fore
     foreign_root = tmp_path / "foreign"
     foreign_root.mkdir()
     foreign = _repo_with_origin(foreign_root)
-    foreign_wt = root / "dotfiles" / "foreign-open-pr"
+    foreign_wt = root / "foreign-repo" / "foreign-open-pr"
     foreign_wt.parent.mkdir(parents=True, exist_ok=True)
     _git(foreign, "worktree", "add", "-b", "codex/foreign-open-pr", str(foreign_wt),
          "origin/main")

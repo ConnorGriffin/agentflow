@@ -20,11 +20,11 @@ from agentflow.runner import Complexity, Effort, MockupScope
 
 
 def test_ready_with_all_fields_is_build_ready():
-    v = parse_intake('{"route": "ready", "title": "ISF: widen the measurement window", '
+    v = parse_intake('{"route": "ready", "title": "Widen the measurement window", '
                      '"complexity": "standard", "effort": "high", "body": "## Agent Brief\\n..."}')
     assert v.route is IntakeRoute.READY and v.parsed
     assert v.complexity is Complexity.STANDARD and v.effort is Effort.HIGH
-    assert v.title == "ISF: widen the measurement window" and v.body.startswith("## Agent Brief")
+    assert v.title == "Widen the measurement window" and v.body.startswith("## Agent Brief")
 
 
 def test_ready_missing_complexity_is_an_invalid_result_not_a_deep_default():
