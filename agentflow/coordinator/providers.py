@@ -39,6 +39,24 @@ class ProviderCause(str, Enum):
     UNKNOWN = "unknown"      # nothing typed established a cause — bounded unknown interruption
 
 
+class PermanentReason(str, Enum):
+    """*Which* permanent condition ended the attempt — a fact, not a policy (ADR 0030).
+
+    ``ProviderCause.PERMANENT`` covers conditions with nothing in common but "a human has to
+    act": a refused sign-in, a request the provider itself rejected, a configured spend ceiling.
+    They need different remediations, so the adapter preserves which one fired and the stage
+    handoff picks its copy from it (issue #342). This is a sibling of ``cause``, never a
+    replacement: ``classification()`` still reads ``cause`` alone, so no trigger changes
+    category. Anything else permanent — including a synthesized non-provider observation —
+    stays ``UNSPECIFIED`` so the handoff never prescribes a wrong remedy.
+    """
+
+    UNSPECIFIED = "unspecified"              # permanent, but nothing typed named which kind
+    ACCESS = "access"                        # sign-in, billing, plan, or permission refusal
+    REJECTED_REQUEST = "rejected-request"    # the provider refused the request itself
+    SPEND = "spend"                          # a configured cost ceiling stopped the run
+
+
 # How each typed cause maps to the coordinator's outcome-first classification label. The
 # coordinator, not the adapter, applies the precedence; this is only the vocabulary bridge.
 _CLASSIFICATION = {
@@ -57,6 +75,8 @@ class ProviderObservation:
     """Everything one attempt preserved. Opaque to policy beyond ``cause``/``reset_at``."""
 
     cause: ProviderCause = ProviderCause.UNKNOWN
+    permanent_reason: PermanentReason = PermanentReason.UNSPECIFIED  # only meaningful on a
+                                                # PERMANENT cause — which kind of condition fired
     reset_at: int | None = None                 # capacity reset → the coordinator's eligible_at
     exit_status: int | None = None
     signal: int | None = None
@@ -103,6 +123,34 @@ _CLAUDE_ERROR_CAUSES = {
     "invalid_request_error": ProviderCause.PERMANENT,
     "request_too_large": ProviderCause.PERMANENT,
 }
+
+# Which kind of permanent condition each permanent trigger is, keyed by the same typed error
+# type / result subtype / Codex account kind the cause tables use. A permanent trigger absent
+# from here stays ``UNSPECIFIED`` — a missing entry never invents a remediation.
+_PERMANENT_REASONS = {
+    # Claude assistant-error types.
+    "authentication_failed": PermanentReason.ACCESS,
+    "authentication_error": PermanentReason.ACCESS,
+    "permission_error": PermanentReason.ACCESS,
+    "billing_error": PermanentReason.ACCESS,
+    "invalid_request": PermanentReason.REJECTED_REQUEST,
+    "invalid_request_error": PermanentReason.REJECTED_REQUEST,
+    "request_too_large": PermanentReason.REJECTED_REQUEST,
+    "not_found_error": PermanentReason.REJECTED_REQUEST,
+    # Claude terminal result subtype.
+    "error_max_budget_usd": PermanentReason.SPEND,
+    # Codex typed account kinds.
+    "unauthenticated": PermanentReason.ACCESS,
+    "billing": PermanentReason.ACCESS,
+    "plan_required": PermanentReason.ACCESS,
+}
+
+
+def _permanent_reason(cause, key) -> PermanentReason:
+    """The permanent reason a typed trigger names, or ``UNSPECIFIED`` for anything else."""
+    if cause is not ProviderCause.PERMANENT:
+        return PermanentReason.UNSPECIFIED
+    return _PERMANENT_REASONS.get(key, PermanentReason.UNSPECIFIED)
 
 # Terminal `result.subtype` failures (SDKResultMessage). `success` is a clean end; the error
 # subtypes are a process-level interruption that no typed provider cause explains, so they map to
@@ -232,6 +280,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
     events = tuple(events)
     observed_at = int(observed_at if observed_at is not None else time.time())
     cause = ProviderCause.NONE
+    permanent_reason = PermanentReason.UNSPECIFIED
     reset_at = None
     final_message = ""
     quota: QuotaFact | None = None
@@ -248,6 +297,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                 if mapped is not None:
                     if cause is ProviderCause.NONE:
                         cause = mapped
+                        permanent_reason = _permanent_reason(mapped, error_type)
                 else:
                     if cause is ProviderCause.NONE:
                         cause = ProviderCause.UNKNOWN
@@ -283,6 +333,11 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                         or (cause is ProviderCause.UNKNOWN
                             and result_cause is not ProviderCause.UNKNOWN)):
                     cause = result_cause
+                    # The only permanent statuses this surface types (401/402/403) are all
+                    # access refusals.
+                    permanent_reason = (PermanentReason.ACCESS
+                                        if result_cause is ProviderCause.PERMANENT
+                                        else PermanentReason.UNSPECIFIED)
                 if result_cause is ProviderCause.UNKNOWN:
                     unrecognized.append(dict(event))
             elif subtype and subtype != "success":
@@ -290,6 +345,7 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                 if mapped is not None:
                     if cause is ProviderCause.NONE:
                         cause = mapped
+                        permanent_reason = _permanent_reason(mapped, subtype)
                 else:
                     if cause is ProviderCause.NONE:
                         cause = ProviderCause.UNKNOWN
@@ -302,7 +358,8 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
         elif signal is not None or (exit_status not in (None, 0)):
             cause = ProviderCause.PROCESS
     return ProviderObservation(
-        cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
+        cause=cause, permanent_reason=permanent_reason,
+        reset_at=reset_at, exit_status=exit_status, signal=signal,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events,
         unrecognized=tuple(unrecognized), family=family, process_alive=process_alive,
@@ -328,11 +385,14 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
     prose is captured as ``final_message`` but never diagnoses. An untyped failure — even a
     non-zero exit — remains a bounded unknown interruption unless the supervisor timed out."""
     cause = ProviderCause.NONE
+    permanent_reason = PermanentReason.UNSPECIFIED
     reset_at = None
     if account_fact is not None:
-        mapped = _CODEX_ACCOUNT_CAUSES.get(account_fact.get("kind"))
+        kind = account_fact.get("kind")
+        mapped = _CODEX_ACCOUNT_CAUSES.get(kind)
         if mapped is not None:
             cause = mapped
+            permanent_reason = _permanent_reason(mapped, kind)
             if mapped is ProviderCause.CAPACITY:
                 reset_at = account_fact.get("reset_at")
     if cause is ProviderCause.NONE:
@@ -347,7 +407,8 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
                 and item.get("type") == "agent_message"):
             final_message = item.get("text", final_message)
     return ProviderObservation(
-        cause=cause, reset_at=reset_at, exit_status=exit_status, signal=signal,
+        cause=cause, permanent_reason=permanent_reason,
+        reset_at=reset_at, exit_status=exit_status, signal=signal,
         timed_out=timed_out, final_message=final_message, partial_output=partial_output,
         events=events, unrecognized=events, family=family, process_alive=process_alive,
         has_end_fact=has_end_fact, usage=codex_usage(events))

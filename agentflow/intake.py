@@ -106,19 +106,46 @@ def _held(detail: str) -> IntakeResult:
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail)
 
 
-def _provider_failed(detail: str) -> IntakeResult:
-    """A *permanent* provider condition — expired sign-in, billing, plan, or permission —
-    stopped the session before the model ever read the issue (issue #328). There is no
-    product decision waiting, so the handoff names the failure and its remediation instead
-    of asking the human to settle a scope question that was never asked. The route stays
-    ``GRILL`` so the held state label and the durable-handoff marker machinery are
-    unchanged; the body is fixed text so a restarted daemon re-detects the same marker."""
-    body = (f"{_DISCLAIMER}\n\nI never got to read this issue — the coding agent's provider "
-            "refused the session outright (an expired sign-in, a billing or plan limit, or a "
-            "permission problem). So there's no question waiting on you here and no product "
-            "decision pending.\n\nRe-authenticate the coding agent — or check its billing, "
-            "plan, and permissions — then reply here and I'll pick this up again, or run "
-            "`/agentflow pickup` to drive it live.")
+_NEVER_READ = "I never got to read this issue — the coding agent's provider "
+_RETRY = ("reply here and I'll pick this up again, or run `/agentflow pickup` to drive it "
+          "live.")
+
+# The diagnosis + remediation for each kind of permanent provider condition (issue #342). One
+# fixed body per reason: an access refusal is the only one a re-authenticate helps, a rejected
+# request means the sign-in is fine, a spend ceiling is a budget the run hit, and anything we
+# couldn't type says only what we know. Keyed by the typed reason the provider observation
+# preserved, so a restart composes the same body and the handoff still posts exactly once.
+_PROVIDER_FAILURE_COPY = {
+    "access": ("refused the session outright (an expired sign-in, a billing or plan limit, or "
+               "a permission problem). So there's no question waiting on you here and no "
+               "product decision pending.\n\nRe-authenticate the coding agent — or check its "
+               f"billing, plan, and permissions — then {_RETRY}"),
+    "rejected-request": ("rejected the request itself — too large for the model, an "
+                         "unrecognized model, or a request it wouldn't accept. The coding "
+                         "agent's credentials are fine, and there's no product decision "
+                         "pending here either.\n\nThis one needs a look at what the coding "
+                         f"agent was asked to send; once that's sorted, {_RETRY}"),
+    "spend": ("stopped the run at its configured spending cap before the model read anything. "
+              "The coding agent's credentials are fine, and there's no product decision "
+              f"pending here.\n\nRaise or reset the cap for this work, then {_RETRY}"),
+    "unspecified": ("ended the session permanently, without telling us which condition it was. "
+                    "So there's no question waiting on you here and no product decision "
+                    "pending.\n\nThis one needs a look at the coding agent's health before it "
+                    f"can run again; once it's back, {_RETRY}"),
+}
+
+
+def _provider_failed(detail: str, reason: str = "unspecified") -> IntakeResult:
+    """A *permanent* provider condition stopped the session before the model ever read the
+    issue (issue #328). There is no product decision waiting, so the handoff names the failure
+    and its remediation instead of asking the human to settle a scope question that was never
+    asked. ``reason`` says *which* condition it was, so a rejected request or a spend ceiling
+    isn't misdiagnosed as an expired sign-in (issue #342); an unknown reason falls back to the
+    neutral body that prescribes no wrong remedy. The route stays ``GRILL`` so the held state
+    label and the durable-handoff marker machinery are unchanged; each body is fixed text for
+    its reason so a restarted daemon re-detects the same marker."""
+    tail = _PROVIDER_FAILURE_COPY.get(reason, _PROVIDER_FAILURE_COPY["unspecified"])
+    body = f"{_DISCLAIMER}\n\n{_NEVER_READ}{tail}"
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail, infra_failed=True)
 
 

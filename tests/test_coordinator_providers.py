@@ -13,7 +13,8 @@ import json
 import pytest
 
 from agentflow.coordinator.providers import (
-    PROVIDER_INPUT_V1, ClaudeProviderAdapter, ProviderCause, classify_claude, classify_codex)
+    PROVIDER_INPUT_V1, ClaudeProviderAdapter, PermanentReason, ProviderCause, classify_claude,
+    classify_codex)
 from agentflow.intake import parse_intake
 from agentflow.reviewer import parse_verdict
 
@@ -53,6 +54,59 @@ def test_claude_assistant_error_values_map_to_their_cause(error_type, cause):
 )
 def test_claude_sdk_assistant_error_strings_map_to_their_cause(error_value, cause):
     assert classify_claude([{"type": "assistant", "error": error_value}]).cause is cause
+
+
+@pytest.mark.parametrize(
+    ("error_type", "reason"),
+    [
+        ("authentication_failed", PermanentReason.ACCESS),
+        ("authentication_error", PermanentReason.ACCESS),
+        ("permission_error", PermanentReason.ACCESS),
+        ("billing_error", PermanentReason.ACCESS),
+        ("invalid_request", PermanentReason.REJECTED_REQUEST),
+        ("invalid_request_error", PermanentReason.REJECTED_REQUEST),
+        ("request_too_large", PermanentReason.REJECTED_REQUEST),
+        ("not_found_error", PermanentReason.REJECTED_REQUEST),
+    ],
+)
+def test_claude_permanent_errors_preserve_which_condition_fired(error_type, reason):
+    """A refused sign-in and a rejected request are both permanent, but they need different
+    remediations, so the adapter preserves which one it was (issue #342). The category itself
+    is untouched — no trigger changes class."""
+    obs = classify_claude([{"type": "assistant", "error": {"type": error_type}}])
+    assert obs.classification() == "permanent" and obs.permanent_reason is reason
+
+
+def test_claude_spend_ceiling_is_permanent_for_its_own_reason():
+    obs = classify_claude([{"type": "result", "subtype": "error_max_budget_usd"}])
+    assert obs.classification() == "permanent"
+    assert obs.permanent_reason is PermanentReason.SPEND
+
+
+@pytest.mark.parametrize("status", [401, 402, 403])
+def test_claude_permanent_result_statuses_are_access_refusals(status):
+    obs = classify_claude([{"type": "result", "is_error": True, "api_error_status": status}])
+    assert obs.classification() == "permanent"
+    assert obs.permanent_reason is PermanentReason.ACCESS
+
+
+@pytest.mark.parametrize("error_type", ["rate_limit_error", "server_error", "max_output_tokens"])
+def test_a_non_permanent_ending_names_no_permanent_reason(error_type):
+    """The reason is a sibling of the cause, never a second classifier: a recoverable or
+    incomplete ending leaves it unspecified so nothing downstream can read a remedy into it."""
+    obs = classify_claude([{"type": "assistant", "error": {"type": error_type}}])
+    assert obs.classification() != "permanent"
+    assert obs.permanent_reason is PermanentReason.UNSPECIFIED
+
+
+def test_an_unmodeled_permanent_ending_leaves_the_reason_unspecified():
+    """Nothing typed named the condition, so the observation says exactly that rather than
+    letting a stage handoff prescribe a remedy it can't justify."""
+    from agentflow.coordinator.providers import ProviderObservation
+
+    obs = ProviderObservation(cause=ProviderCause.PERMANENT)
+    assert obs.classification() == "permanent"
+    assert obs.permanent_reason is PermanentReason.UNSPECIFIED
 
 
 def test_claude_rejected_rate_limit_event_is_capacity_with_reset():
@@ -241,6 +295,10 @@ def test_codex_uses_only_typed_account_facts(kind, cause):
     assert obs.cause is cause
     if cause is ProviderCause.CAPACITY:
         assert obs.reset_at == 1234
+    else:
+        # Every permanent Codex account kind is an access refusal — the one condition a
+        # re-authenticate actually fixes (issue #342).
+        assert obs.permanent_reason is PermanentReason.ACCESS
 
 
 def test_codex_prose_never_establishes_a_cause():
