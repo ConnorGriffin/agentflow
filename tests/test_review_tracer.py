@@ -1395,3 +1395,14 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
     resumed = next(r for r in reviews if r.identity != parked_id)
     assert resumed.target == "sha-a" and resumed.claim is True
     assert resumed.review_sequence == 1 and resumed.builder_lineage == "codex"
+
+    # Run the command a second time while that recovery is live. The park is still unretired and
+    # still sorts first, so asking "is the first unretired record running?" would miss the review
+    # that is — and hand the same issue a second owner.
+    coord.cycle("claude")
+    assert record_of(coord, resumed.identity).state == "running"
+
+    assert loop.review_pr(RepoConfig("o/r", "/w"), 42) == \
+        "exact-head review is already running; it was not preempted"
+    assert claimed == [7]                                  # the issue is never claimed twice
+    assert len([r for r in _records(coord) if r.stage == "review"]) == 2

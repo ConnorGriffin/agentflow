@@ -1093,13 +1093,15 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
             return "no eligible reviewer pool available — deferring"
     assignment, _changed_files = coordinated_build._review_assignment_facts(
         cfg.repo, pr, profile=profile)
-    active = next((record for record in same_head if not record.retired), None)
-    if active is not None and active.state == "running":
+    # A parked review stays unretired, so "the first unretired record" is no longer the live one:
+    # each question is asked of the record that actually answers it. Running work is never
+    # preempted whichever order the store holds, and only a record that still owns the visible
+    # claim has one to hand over — a parked review is left unretired but claimless on purpose, so
+    # recovering it is a fresh claim (#344).
+    unretired = [record for record in same_head if not record.retired]
+    if any(record.state == "running" for record in unretired):
         return "exact-head review is already running; it was not preempted"
-    # Only a record that still owns the visible claim has one to hand over. A parked review is left
-    # unretired but claimless on purpose, so recovering it is a fresh claim — passing it as an
-    # ownership-transfer predecessor is what made a parked review unrecoverable (#344).
-    predecessor = active if active is not None and active.claim else None
+    predecessor = next((record for record in unretired if record.claim), None)
     sequence = max((record.review_sequence for record in same_head), default=-1) + 1
     from agentflow.review_policy import ReviewState
     review = ReviewState(

@@ -41,8 +41,8 @@ MAX_REVISES = 2
 # so we key on the marker, not authorship.
 PR_MARK = "agentflow:"
 # The park handoff's own visible disclaimer. It is the durable dedup key for the current park
-# comment, and — because agentflow's newest word on a PR decides what a maintainer reply answers —
-# the signal that a following reply is that park's decision rather than PR discussion (#344).
+# comment, and — because a maintainer replies underneath the question they are answering — the
+# signal that a following reply is that park's decision rather than PR discussion (#344).
 PARK_MARK = "> *agentflow: parked for human review.*"
 _RESPOND_TARGET_PREFIX = "agentflow-respond-target:"
 _RESPOND_TARGET_RE = re.compile(r"<!--\s*agentflow-respond-target:([^>]+?)\s*-->")
@@ -73,24 +73,23 @@ def decision_resume_disclaimer(target: str) -> str:
 
 
 def park_awaiting_decision(comments: list[dict], target: str) -> bool:
-    """Whether this comment follows agentflow's latest parked decision handoff. Pure.
+    """Whether this comment follows the park handoff that asked for a decision. Pure.
 
-    A maintainer comment after that handoff answers it; an older pending comment or one posted
-    after any later agentflow comment is ordinary PR discussion, which never resumes a parked
-    review (#344).
+    A maintainer comment after the park answers it; one that predates the park is ordinary PR
+    discussion, which never resumes a parked review (#344). Later agentflow comments do not close
+    the park: a repeat park edits the same comment in place, so it keeps its original position long
+    after a resume marker or a build-agent reply followed it, and a second decision round would
+    otherwise be unanswerable. What settles a decision is the maintainer's answer recorded on the
+    durable review chain, not who spoke last on the thread.
     """
     target_index = next(
         (index for index, comment in enumerate(comments)
          if str(comment.get("id", "")) == str(target)),
         None,
     )
-    ours = [
-        (index, comment.get("body", ""))
-        for index, comment in enumerate(comments)
-        if PR_MARK in comment.get("body", "")
-    ]
-    return (target_index is not None and bool(ours)
-            and ours[-1][0] < target_index and PARK_MARK in ours[-1][1])
+    parked = [index for index, comment in enumerate(comments)
+              if PARK_MARK in comment.get("body", "")]
+    return target_index is not None and bool(parked) and parked[-1] < target_index
 
 
 def respond_change_marker(result: str) -> str:

@@ -809,6 +809,11 @@ def test_a_review_that_recorded_no_decision_parks_as_an_execution_failure(monkey
     assert "`/agentflow review 479`" in body
     assert "Close the PR" not in body
     assert "Clarify the affected behavior" not in body
+    # Every line of that comment has to agree with the rest of it: this park names no uncertainty
+    # to resolve and offers no closing option, so it must send the maintainer after neither.
+    assert "named uncertainty" not in body
+    assert "closing preserves" not in body
+    assert "Recommendation: Resume the review — nothing has judged this change yet." in body
 
 
 def test_a_resumed_review_keeps_the_head_lineage_and_ledger_and_settles_the_decision():

@@ -485,12 +485,18 @@ def test_an_answer_waits_while_a_hand_started_review_already_owns_the_issue(monk
 
 
 def test_ordinary_pr_discussion_after_a_parked_review_still_enters_respond(monkeypatch):
-    """Out of scope by design: a reply that does not follow the decision handoff is discussion, not
-    approval to resume. It keeps the ordinary reply path, claim and all."""
+    """Out of scope by design: once the recorded decision has been answered, a further comment is
+    discussion, not approval to resume. It keeps the ordinary reply path, claim and all."""
+    from agentflow.review_policy import decision_answer_handoff
+
     parked = _parked_decision_review()
+    resumed = _parked_decision_review(
+        identity="o/r|7|review|sha-a|s4", state="waiting", claim=True, review_sequence=4,
+        created_at=200, review_uncertainty=None,
+        review_handoff=decision_answer_handoff("IC_1", "keep the conservative behavior"))
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "unrelated question", "IC_2", "sha-a"))
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked])
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked, resumed])
     monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [
         *_answered_park_thread(),
         {"id": "IC_x", "body": "> *agentflow: your decision resumed the parked review.*\n"
@@ -510,10 +516,51 @@ def test_ordinary_pr_discussion_after_a_parked_review_still_enters_respond(monke
     assert "(respond)" in result and len(submitted) == 1
 
 
+def test_a_second_decision_round_is_still_answerable_after_agentflow_replied(monkeypatch):
+    """The resumed review hit a second question and parked again. agentflow has spoken since the
+    first park — the resume marker sits below it and the repeat park updates the original comment
+    in place — so 'is the park our newest comment?' would strand the maintainer's second answer in
+    the generic reply path, claiming the issue for a product decision all over again."""
+    from agentflow.review_policy import decision_answer_handoff
+
+    first = _parked_decision_review()
+    round_two = _parked_decision_review(
+        identity="o/r|7|review|sha-a|s4", review_sequence=4, created_at=200,
+        review_handoff=decision_answer_handoff("IC_1", "keep the conservative behavior"))
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
+        42, "agentflow/claude/issue-7-fix", "prompt every user", "IC_2", "sha-a"))
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [first, round_two])
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [
+        {"id": "IC_0", "body": "> *agentflow: parked for human review.*\n\nDecide again, please."},
+        {"id": "IC_1", "body": "keep the conservative behavior"},
+        {"id": "IC_x", "body": "> *agentflow: your decision resumed the parked review.*\n"
+                               "<!-- agentflow-respond-target:IC_1 -->"},
+        {"id": "IC_2", "body": "prompt every user"}])
+    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(coordinated_build, "respond_submission",
+                        lambda *a, **k: pytest.fail("a decision answer is never a generic Respond"))
+    posted = []
+    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+                        lambda repo, pr, body: posted.append(body) or True)
+    claimed = []
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    submitted = []
+
+    result = dispatch._submit_coordinated_respond(
+        RepoConfig("o/r", "/work"), SimpleNamespace(submit_stage=submitted.append), None)
+
+    assert "resumed the parked review" in result
+    assert claimed == [7] and len(submitted) == 1
+    from agentflow.review_policy import decision_answer_target
+    assert decision_answer_target(submitted[0].review.handoff) == "IC_2"
+    assert submitted[0].review.sequence == 5        # monotone in the same-head chain
+    assert len(posted) == 1 and "agentflow-respond-target:IC_2" in posted[0]
+
+
 def test_an_older_unanswered_comment_before_the_park_remains_ordinary_discussion(monkeypatch):
     """Reply discovery serves the oldest unanswered comment first. A discussion comment that
-    predates the park cannot answer the later decision merely because the park is agentflow's
-    newest comment; it stays on the ordinary Respond path."""
+    predates the park cannot answer the later decision merely because that decision is still
+    outstanding; it stays on the ordinary Respond path."""
     parked = _parked_decision_review()
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "earlier discussion", "IC_old", "sha-a"))

@@ -21,7 +21,7 @@ import os
 import re
 import subprocess
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -1509,20 +1509,32 @@ def _chain_uncertainty(record):
     return unresolved_uncertainty(_exact_head_review_chain(records, record))
 
 
-def _park_context(record, verdict, *, reason: str, missing: str, uncertainty=None,
-                  options=None, next_action=""):
+@dataclass(frozen=True)
+class _ParkCopy:
+    """The maintainer-facing decision wording a park branch owns when no recorded product decision
+    supplies it. Every field is optional; an empty one keeps the shared default (#344)."""
+
+    options: tuple[str, ...] = ()
+    consequences: str = ""
+    recommendation: str = ""
+    next_action: str = ""
+
+
+def _park_context(record, verdict, *, reason: str, missing: str, uncertainty=None, wording=None):
     """Build the concrete two-section park contract from durable stage state.
 
     ``uncertainty`` is the exact-head chain's unanswered decision, supplied by the caller so one
-    park reads the durable chain once. ``options``/``next_action`` let a park with no recorded
-    decision at all describe its own execution failure instead of borrowing product options.
+    park reads the durable chain once. ``wording`` lets a park with no recorded decision at all
+    describe its own execution failure end to end, instead of borrowing options, consequences, and
+    a recommendation that all name a decision nobody recorded.
     """
     from agentflow.gate import ParkContext
     from agentflow.review_policy import ReviewState
 
+    wording = wording or _ParkCopy()
     actions = tuple(verdict.actions) if verdict is not None else ()
     uncertainty = (verdict.uncertainty if verdict is not None else None) or uncertainty
-    options = (tuple(uncertainty.options) if uncertainty is not None else options or (
+    options = (tuple(uncertainty.options) if uncertainty is not None else wording.options or (
         "Clarify the affected behavior and resume this retained stage on the same PR.",
         "Close the PR and leave the currently shipped application behavior unchanged.",
     ))
@@ -1542,15 +1554,16 @@ def _park_context(record, verdict, *, reason: str, missing: str, uncertainty=Non
     return ParkContext(
         behavior=f"The requested PR behavior {reason}.",
         options=options,
-        consequences=(
+        consequences=(wording.consequences or (
             "Resuming can ship the intended change after the named uncertainty is resolved; "
-            "closing preserves the application's current behavior."),
+            "closing preserves the application's current behavior.")),
         recommendation=(uncertainty.recommendation if uncertainty is not None
-                        else "Resolve the named uncertainty, then resume the retained stage."),
+                        else wording.recommendation
+                        or "Resolve the named uncertainty, then resume the retained stage."),
         locations=locations, conflicts=conflicts, checks=checks,
         retained_work=f"`{record.source}` at `{record.target or 'unknown head'}`",
         next_action=(
-            next_action
+            wording.next_action
             or "Record the chosen behavior, then resume this exact retained stage on the same PR."))
 
 
@@ -1575,26 +1588,32 @@ def _park_pr(record) -> str | None:
     if pr is None:
         return None
     uncertainty = _chain_uncertainty(record)
-    options, next_action = None, ""
+    wording = None
     if record.stage == "review" and (uncertainty is not None
                                      or record.review_axis == "decision"):
         reason = "needs the maintainer to choose between competing product behaviors"
-        missing = (
-            "A product decision recorded against this exact head is still unanswered. "
-            f"Missing guidance: {uncertainty.missing_guidance}." if uncertainty is not None
-            else "Both tools remain unsure and the private decision record is unavailable.")
-        next_action = ("Reply on this PR with the behavior you want; agentflow resumes the parked "
-                       "review at this same exact head with your decision.")
+        # A recorded decision prints its own exact wording; this line is what remains when the
+        # axis asked for a decision the durable chain no longer holds.
+        missing = "Both tools remain unsure and the private decision record is unavailable."
+        wording = _ParkCopy(next_action=(
+            "Reply on this PR with the behavior you want; agentflow resumes the parked "
+            "review at this same exact head with your decision."))
         notice = "conflict decision needs your judgment"
     elif record.stage == "review":
         reason = "exhausted its review budget without a durable verdict"
         # No decision was ever recorded for this head, so the honest fact is an execution failure —
-        # inventing a product choice here is what made a parked review unanswerable (#344).
+        # inventing a product choice here is what made a parked review unanswerable (#344). The
+        # consequences and recommendation follow the same rule: nothing may name an uncertainty
+        # this park deliberately does not have, or an option it does not offer.
         missing = ("No review verdict was recorded for this exact head: the review executions "
                    "failed rather than judging the change. Do not treat this as a clean review.")
-        options = (f"Resume the review on this exact head: `/agentflow review {pr}`.",
-                   "Review the retained change by hand and decide this PR yourself.")
-        next_action = f"Run `/agentflow review {pr}` to resume the review at this exact head."
+        wording = _ParkCopy(
+            options=(f"Resume the review on this exact head: `/agentflow review {pr}`.",
+                     "Review the retained change by hand and decide this PR yourself."),
+            consequences=("Resuming runs the review this change never got; judging it by hand "
+                          "leaves this head with no agentflow review at all."),
+            recommendation="Resume the review — nothing has judged this change yet.",
+            next_action=f"Run `/agentflow review {pr}` to resume the review at this exact head.")
         notice = "review parked for your action"
     elif record.conflict_round:
         reason = "could not safely complete and verify the merge-conflict resolution"
@@ -1612,8 +1631,7 @@ def _park_pr(record) -> str | None:
         action=lambda: park(
             record.repo, pr, None, reason=reason, missing_outcome=missing,
             context=_park_context(record, None, reason=reason, missing=missing,
-                                  uncertainty=uncertainty, options=options,
-                                  next_action=next_action),
+                                  uncertainty=uncertainty, wording=wording),
             proof_marker=marker),
         notification=Notification(
             "agentflow needs you", f"{record.repo} PR #{pr}: {notice}"))
@@ -1626,7 +1644,9 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
     Returns a status when this reply is that answer — so no generic Respond ever claims the issue
     for it — and ``None`` when it is ordinary PR discussion, which the Respond path then owns
     unchanged. The answer counts only when a decision recorded against the PR's *current* head is
-    still unanswered and the park handoff asking for it is agentflow's newest word on the PR.
+    still unanswered and the reply follows the park handoff that asked for it. What settles a
+    decision is the maintainer's own answer on the durable chain, so a second decision round after
+    a resume stays just as answerable as the first.
 
     Ordering is the crash contract: the resumed Review record is created before the public
     answered-marker comment, so a crash in between converges — the next pass finds the review
