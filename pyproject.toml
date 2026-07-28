@@ -2,8 +2,17 @@
 name = "agentflow"
 version = "0.0.1"
 description = "Tool-agnostic autonomous issue → PR → review pipeline (runs on Claude or Codex)"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Connor Griffin" }]
 dependencies = ["fastapi>=0.110", "uvicorn>=0.29"]
+
+[project.urls]
+Homepage = "https://github.com/ConnorGriffin/agentflow"
+Issues = "https://github.com/ConnorGriffin/agentflow/issues"
+Documentation = "https://github.com/ConnorGriffin/agentflow#readme"
 
 [project.scripts]
 agentflow = "agentflow.cli:main"
@@ -32,9 +41,15 @@ exclude = [
 [tool.hatch.build.targets.sdist]
 only-include = [
     "agentflow",
+    "COMPATIBILITY.md",
+    "CONTRIBUTING.md",
+    "DCO",
+    "GOVERNANCE.md",
     "LICENSE",
     "NOTICE",
     "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
     "pyproject.toml",
 ]
 

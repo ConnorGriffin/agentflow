@@ -27,10 +27,21 @@ def test_empty_message_becomes_space():
 
 
 def test_notify_reports_delivery_result(monkeypatch):
+    monkeypatch.setattr(notify_module, "NTFY_URL", "https://ntfy/x")
     monkeypatch.setattr(notify_module.subprocess, "run",
                         lambda *args, **kwargs: SimpleNamespace(returncode=0))
     assert notify_module.notify("t", "m") is True
 
     monkeypatch.setattr(notify_module.subprocess, "run",
                         lambda *args, **kwargs: SimpleNamespace(returncode=22))
+    assert notify_module.notify("t", "m") is False
+
+
+def test_notify_is_disabled_without_an_explicit_url(monkeypatch):
+    monkeypatch.setattr(notify_module, "NTFY_URL", "")
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("disabled notifications must not make a network request")
+
+    monkeypatch.setattr(notify_module.subprocess, "run", unexpected_run)
     assert notify_module.notify("t", "m") is False

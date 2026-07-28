@@ -1,0 +1,42 @@
+name: Bug report
+description: Report reproducible AgentFlow behavior that appears incorrect.
+title: "Bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include credentials, private repository content, transcripts, or vulnerability details. Report vulnerabilities through the Security tab.
+  - type: input
+    id: commit
+    attributes:
+      label: AgentFlow commit
+      placeholder: Full commit SHA
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: macOS, Python, GitHub CLI, uv, and agent CLI versions.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal steps using sanitized repository and configuration names.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true

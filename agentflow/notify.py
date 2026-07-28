@@ -1,9 +1,9 @@
-"""Notifications for the needs-you set (ADR 0010) — ntfy, reaching the phone AFK.
+"""Optional notifications for the needs-you set (ADR 0010).
 
-Reuses the self-hosted ntfy path from triage-sweep. Best-effort and non-fatal: a
-failed POST (box down, no network) never aborts the pipeline. Autonomous *merges*
-are silent (audit after, ADR 0004); this fires only for what needs a human — parks
-and build bails. Override the topic with AGENTFLOW_NTFY_URL.
+Set ``AGENTFLOW_NTFY_URL`` to an ntfy topic URL to enable delivery. Notifications
+are disabled by default. A failed POST never aborts the pipeline. Autonomous
+*merges* are silent (audit after, ADR 0004); this fires only for what needs a
+human — parks and build bails.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 
-NTFY_URL = os.environ.get("AGENTFLOW_NTFY_URL", "https://ntfy.home.connorcg.com/agentflow")
+NTFY_URL = os.environ.get("AGENTFLOW_NTFY_URL", "")
 
 
 def _build_args(title: str, message: str, url: str, ntfy_url: str,
@@ -28,6 +28,8 @@ def _build_args(title: str, message: str, url: str, ntfy_url: str,
 def notify(title: str, message: str, url: str = "", sequence_id: str = "") -> bool:
     """Best-effort ntfy push. A stable sequence ID makes a retry replace the same client
     notification. Never raises; reports whether ntfy accepted the request."""
+    if not NTFY_URL:
+        return False
     try:
         completed = subprocess.run(_build_args(title, message, url, NTFY_URL, sequence_id),
                                    capture_output=True, timeout=15)

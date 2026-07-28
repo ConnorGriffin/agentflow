@@ -52,6 +52,17 @@ uv run agentflow check
 AgentFlow keeps runtime state in `~/.agentflow`; `AGENTFLOW_STATE` overrides that
 location.
 
+## Optional notifications
+
+Notifications are disabled by default. Set `AGENTFLOW_NTFY_URL` to an ntfy topic
+URL to receive best-effort alerts when a run needs human attention:
+
+```bash
+export AGENTFLOW_NTFY_URL="https://ntfy.example.com/your-private-topic"
+```
+
+Treat an unprotected topic URL as sensitive configuration. Do not commit it.
+
 ## Calibrate capacity
 
 AgentFlow includes a local capacity helper. It reads provider-authored facts from
@@ -98,3 +109,19 @@ cycle and exits; it bypasses the pause flag.
 
 See [`docs/coordinator-operations.md`](docs/coordinator-operations.md) for pause,
 drain, upgrade, and rollback behavior.
+
+## Project contract
+
+AgentFlow is licensed under [Apache-2.0](LICENSE). Contributions use the same
+inbound and outbound license terms and require
+[Developer Certificate of Origin 1.1](DCO) sign-off; see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+The beta supports only current `main` on macOS and makes no API or response-time
+guarantees. The complete terms are:
+
+- [Compatibility](COMPATIBILITY.md)
+- [Governance](GOVERNANCE.md)
+- [Public beta scope and publication contract](docs/public-beta.md)
+- [Security](SECURITY.md)
+- [Support](SUPPORT.md)

@@ -243,7 +243,7 @@ surface alone does.
    `"name":"<Tool>"` for the grounding-tool mix; tally shell orientation commands from
    the `"command":"…"` fields.
 2. **Index health:** `index_status` / `get_architecture` on project
-   `Users-connor-Code-ConnorGriffin-agentflow` → 2,741 nodes, ready.
+   `<local-project-key>` → 2,741 nodes, ready.
 3. **Probes:** `search_graph` / `search_code` for the structural and domain questions
    above; score whether the top results ground the answer.
 4. **Bundle size:** `wc -c` over `CONTEXT.md`, `docs/adr/*.md`,
