@@ -82,6 +82,15 @@ class ReviewStageAdapter:
         clean exit whose verdict is absent or names another SHA does not."""
         return bool(self._verdict_ready(record, obs))
 
+    def capture(self, record, obs) -> str | None:
+        """Persist the exact verdict that completed Review.
+
+        Provider artifacts establish the outcome once. Later settlement and successor handoffs
+        consume this durable copy instead of reinterpreting a session that may have disappeared.
+        """
+        payload = (getattr(obs, "final_message", "") or "").strip()
+        return payload if payload and self._verdict_ready(record, obs) else None
+
     def recover(self, record, obs):
         """Review may own partial fixes in its detached checkout. Preserve and continue them within
         the bounded attempt budget while naming the missing exact-head verdict.
