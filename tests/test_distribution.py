@@ -63,6 +63,7 @@ def test_release_artifacts_contain_only_the_runtime_and_built_console(tmp_path):
         capture_output=True,
         timeout=30,
     )
+    assert (environment / "bin" / "agentflow-capacity-helper").is_file()
     checkout = tmp_path / "enrolled-repository"
     checkout.mkdir()
     config = tmp_path / "agentflow.toml"

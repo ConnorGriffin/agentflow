@@ -52,25 +52,49 @@ uv run agentflow check
 AgentFlow keeps runtime state in `~/.agentflow`; `AGENTFLOW_STATE` overrides that
 location.
 
-## Run
+## Calibrate capacity
+
+AgentFlow includes a local capacity helper. It reads provider-authored facts from
+the authenticated Claude and Codex session histories already on the machine; it
+does not contact a separate service. Calibrate the Claude five-hour baseline once:
+
+```bash
+uv run agentflow capacity calibrate
+```
+
+Re-run calibration after the Claude plan changes materially. Codex reports typed
+rate-limit windows in its session history and needs no calibration. Missing or
+unreadable facts fail closed instead of permitting unattended work.
+
+`AGENTFLOW_CAPACITY_HELPER` may point to a different compatible executable. The
+bundled helper is the default.
+
+## Run on macOS
 
 The daemon starts paused: it reconciles owned work but submits no cold work until
 explicitly resumed.
 
 ```bash
-uv run agentflow daemon
-uv run agentflow console
+uv run agentflow service install
 uv run agentflow status
 uv run agentflow resume
+uv run agentflow console
 ```
 
-Use `agentflow pause` before maintenance. `agentflow daemon --once` runs one real
-dispatch cycle and exits; it bypasses the pause flag.
+`service install` writes and loads a per-user LaunchAgent at
+`~/Library/LaunchAgents/agentflow.daemon.plist`. It supervises only the persistent
+daemon; the read-only console remains an on-demand operator command. Daemon output
+goes to `~/Library/Logs/agentflow.log`.
 
-The optional `AGENTFLOW_CAPACITY_HELPER` environment variable may point to a local
-capacity-helper executable. Without it, AgentFlow starts safely but Codex capacity
-and operator-activity detection are unavailable; Claude dispatch requires durable
-provider quota facts. The daemon logs this limitation at startup.
+The generated service records absolute `AGENTFLOW_CONFIG`, `AGENTFLOW_STATE`, and
+`AGENTFLOW_CAPACITY_HELPER` paths plus the current `PATH`. Re-run `service install`
+after changing any of them or after upgrading; it replaces and reloads the service
+in place. `uv run agentflow service remove` stops the daemon and removes only the
+generated LaunchAgent, preserving configuration, state, and logs.
+
+Use `agentflow pause` before maintenance. `agentflow daemon` runs the same daemon
+in the foreground for diagnosis. `agentflow daemon --once` runs one real dispatch
+cycle and exits; it bypasses the pause flag.
 
 See [`docs/coordinator-operations.md`](docs/coordinator-operations.md) for pause,
 drain, upgrade, and rollback behavior.

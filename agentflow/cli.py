@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
+import sys
 from pathlib import Path
-
-from agentflow import daemon
-from agentflow.config import ConfigurationError, load_config
 
 
 def _state_dir() -> Path:
@@ -23,7 +22,23 @@ def _daemon_running(state: Path) -> bool:
     return pid > 0
 
 
+def _configure_capacity_helper() -> None:
+    if os.environ.get("AGENTFLOW_CAPACITY_HELPER") or os.environ.get(
+        "AGENTFLOW_TRIAGE_GATE"
+    ):
+        return
+    adjacent = Path(sys.executable).with_name("agentflow-capacity-helper")
+    found = str(adjacent) if adjacent.is_file() else shutil.which(
+        "agentflow-capacity-helper"
+    )
+    if found:
+        os.environ["AGENTFLOW_CAPACITY_HELPER"] = str(Path(found).resolve())
+
+
 def main(argv: list[str] | None = None) -> None:
+    _configure_capacity_helper()
+    from agentflow.config import ConfigurationError, load_config
+
     parser = argparse.ArgumentParser(prog="agentflow")
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="validate runtime configuration")
@@ -39,6 +54,20 @@ def main(argv: list[str] | None = None) -> None:
     commands.add_parser("pause", help="stop new cold submissions")
     commands.add_parser("status", help="show submission and daemon state")
     commands.add_parser("console", help="serve the operator console")
+    service = commands.add_parser("service", help="manage the macOS daemon service")
+    service_commands = service.add_subparsers(dest="service_command", required=True)
+    service_install = service_commands.add_parser(
+        "install", help="install or reload the daemon service"
+    )
+    service_install.add_argument("--config", help="path to config.toml")
+    service_commands.add_parser("remove", help="stop and remove the daemon service")
+    capacity = commands.add_parser("capacity", help="manage local provider facts")
+    capacity_commands = capacity.add_subparsers(
+        dest="capacity_command", required=True
+    )
+    capacity_commands.add_parser(
+        "calibrate", help="calibrate Claude usage from local history"
+    )
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -54,6 +83,8 @@ def main(argv: list[str] | None = None) -> None:
             f"({workspace_count} workspace)"
         )
     elif args.command == "daemon":
+        from agentflow import daemon
+
         try:
             config = load_config(args.config)
         except ConfigurationError as exc:
@@ -78,6 +109,25 @@ def main(argv: list[str] | None = None) -> None:
         from agentflow import webapp
 
         webapp.main()
+    elif args.command == "service" and args.service_command == "install":
+        from agentflow.macos_service import ServiceError, install
+
+        try:
+            config = load_config(args.config)
+            install(config.path)
+        except (ConfigurationError, ServiceError) as exc:
+            parser.error(str(exc))
+        print("daemon service installed and running")
+    elif args.command == "service" and args.service_command == "remove":
+        from agentflow.macos_service import remove
+
+        remove()
+        print("daemon service removed")
+    elif args.command == "capacity" and args.capacity_command == "calibrate":
+        from agentflow.capacity_helper import main as capacity_main
+
+        os.environ["TRIAGE_AGENT"] = "claude"
+        capacity_main(["calibrate"])
 
 
 if __name__ == "__main__":

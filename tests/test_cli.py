@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from unittest import mock
@@ -140,7 +141,7 @@ def test_console_starts_from_the_same_public_command():
     start_console.assert_called_once_with()
 
 
-def test_daemon_reports_the_missing_optional_capacity_helper(tmp_path, monkeypatch):
+def test_public_daemon_selects_the_bundled_capacity_helper(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTFLOW_CAPACITY_HELPER", raising=False)
     monkeypatch.delenv("AGENTFLOW_TRIAGE_GATE", raising=False)
     checkout = tmp_path / "project"
@@ -166,7 +167,114 @@ workdir = "{checkout}"
     ):
         cli.main(["daemon", "--once", "--config", str(config)])
 
-    assert any(
+    helper = Path(os.environ["AGENTFLOW_CAPACITY_HELPER"])
+    assert helper.name == "agentflow-capacity-helper"
+    assert helper.is_file()
+    assert not any(
         "capacity helper not configured" in call.args[0]
         for call in daemon_log.call_args_list
+    )
+
+
+def test_service_install_supervises_the_daemon_with_explicit_runtime_paths(tmp_path):
+    home = tmp_path / "home"
+    checkout = tmp_path / "project"
+    checkout.mkdir()
+    config = tmp_path / "agentflow.toml"
+    config.write_text(
+        f"""
+[[repositories]]
+repo = "owner/project"
+workdir = "{checkout}"
+""".lstrip()
+    )
+    state = tmp_path / "state"
+    helper = tmp_path / "capacity-helper"
+    helper.write_text("#!/bin/sh\n")
+    helper.chmod(0o755)
+    launchctl_log = tmp_path / "launchctl.log"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$*" >> "$AGENTFLOW_LAUNCHCTL_LOG"\n'
+    )
+    launchctl.chmod(0o755)
+    env = os.environ | {
+        "HOME": str(home),
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "AGENTFLOW_STATE": str(state),
+        "AGENTFLOW_CAPACITY_HELPER": str(helper),
+        "AGENTFLOW_LAUNCHCTL_LOG": str(launchctl_log),
+    }
+
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "agentflow",
+            "service",
+            "install",
+            "--config",
+            str(config),
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "daemon service installed and running"
+    plist_path = home / "Library" / "LaunchAgents" / "agentflow.daemon.plist"
+    with plist_path.open("rb") as stream:
+        service = plistlib.load(stream)
+    assert service["Label"] == "agentflow.daemon"
+    assert Path(service["ProgramArguments"][0]).is_absolute()
+    assert service["ProgramArguments"][0].endswith("/agentflow")
+    assert service["ProgramArguments"][1:] == ["daemon"]
+    assert service["KeepAlive"] is True
+    assert "RunAtLoad" not in service
+    environment = service["EnvironmentVariables"]
+    assert {
+        key: environment[key]
+        for key in (
+            "AGENTFLOW_CAPACITY_HELPER",
+            "AGENTFLOW_CONFIG",
+            "AGENTFLOW_STATE",
+        )
+    } == {
+        "AGENTFLOW_CAPACITY_HELPER": str(helper.resolve()),
+        "AGENTFLOW_CONFIG": str(config.resolve()),
+        "AGENTFLOW_STATE": str(state.resolve()),
+    }
+    path_entries = environment["PATH"].split(os.pathsep)
+    assert str(Path(service["ProgramArguments"][0]).parent) in path_entries
+    assert str(fake_bin) in path_entries
+    domain = f"gui/{os.getuid()}"
+    assert launchctl_log.read_text().splitlines() == [
+        f"bootout {domain}/agentflow.daemon",
+        f"bootstrap {domain} {plist_path}",
+    ]
+    state.mkdir()
+    (state / "enabled").touch()
+
+    removed = subprocess.run(
+        ["uv", "run", "agentflow", "service", "remove"],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert removed.returncode == 0, removed.stderr
+    assert removed.stdout.strip() == "daemon service removed"
+    assert not plist_path.exists()
+    assert config.exists()
+    assert (state / "enabled").exists()
+    assert launchctl_log.read_text().splitlines()[-1] == (
+        f"bootout {domain}/agentflow.daemon"
     )

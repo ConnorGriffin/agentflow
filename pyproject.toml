@@ -7,6 +7,7 @@ dependencies = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 agentflow = "agentflow.cli:main"
+agentflow-capacity-helper = "agentflow.capacity_helper:main"
 agentflow-web = "agentflow.webapp:main"
 
 [dependency-groups]

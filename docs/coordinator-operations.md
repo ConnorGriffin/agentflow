@@ -8,16 +8,17 @@ Validate the repository configuration, start the daemon under the process superv
 then inspect it while still paused:
 
 ```bash
-agentflow check
-agentflow daemon
-agentflow status
+uv run agentflow check
+uv run agentflow capacity calibrate
+uv run agentflow service install
+uv run agentflow status
 ```
 
 When the startup log and configured repositories are correct, permit cold submissions:
 
 ```bash
-agentflow resume
-agentflow status
+uv run agentflow resume
+uv run agentflow status
 ```
 
 Activation permits cold submissions. It does not discard existing records; the first full pass
@@ -25,8 +26,8 @@ reconciles them before admission.
 
 ## Observe
 
-Use `agentflow status` and the daemon log captured by the process supervisor. The useful transient
-lines are exact and stage-specific:
+Use `uv run agentflow status` and `~/Library/Logs/agentflow.log`, captured by the
+installed per-user LaunchAgent. The useful transient lines are exact and stage-specific:
 
 - `attempt N/3 → <pool>` — one durable provider start consumed an attempt;
 - `recovered running attempt N/3 pid <pid> — observing until <deadline>; claim retained`;
@@ -43,8 +44,8 @@ deterministic interactive scope operation cannot race the daemon.
 ## Pause and drain
 
 ```bash
-agentflow pause
-agentflow status
+uv run agentflow pause
+uv run agentflow status
 ```
 
 Pause stops new cold submissions. The resident daemon still runs heartbeat passes that observe
@@ -58,12 +59,14 @@ coordinator-aware binary; reconciliation resumes from durable records.
 
 ## Upgrade
 
-1. `agentflow pause`.
+1. `uv run agentflow pause`.
 2. Let active records drain, or keep the daemon running on the current coordinator-aware binary
    until they reach a durable boundary.
-3. Deploy the new coordinator-aware revision.
-4. Restart `agentflow daemon` through its process supervisor, inspect the recovery lines, then
-   run `agentflow resume`.
+3. Update the clone to the new coordinator-aware revision and run `uv sync --group dev`.
+4. Run `uv run agentflow check`, then `uv run agentflow service install`. The install
+   command rewrites the LaunchAgent with the current executable, configuration, state,
+   capacity-helper, and `PATH`, then reloads it in place.
+5. Inspect the recovery lines, then run `uv run agentflow resume`.
 
 Schema compatibility is a release requirement. If the new binary reports unreadable or newer
 coordinator state, leave it paused; it must start nothing and clear no claim.
@@ -74,8 +77,9 @@ Rollback is bounded by durable coordinator ownership:
 
 1. Pause cold submissions.
 2. Drain active records with a coordinator-aware binary.
-3. Deploy only a revision that understands the existing coordinator store schema and preserves
+3. Check out only a revision that understands the existing coordinator store schema and preserves
    coordinator-only launching.
+4. Run `uv sync --group dev` and `uv run agentflow service install` from that revision.
 
 Never run a pre-coordinator or legacy-capable binary against active coordinator-owned work. There
 is no safe conversion of a waiting/running record into a legacy retry. If no compatible rollback
