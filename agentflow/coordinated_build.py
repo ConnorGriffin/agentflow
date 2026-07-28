@@ -1775,10 +1775,10 @@ def _prepare_review_settlement(record) -> bool:
     if (verdict.change_author_tool
             and (_review_depth_escalated(record, verdict)
                  or verdict.pushed_sha or verdict.uncertainty is not None
-                 or record.review_axis == "product"
+                 or record.review_axis in {"product", "decision"}
                  or any(item.action.value == "fix_before_completion"
                         for item in verdict.actions))):
-        return True  # the private successor opener owns this non-terminal pass
+        return False  # the private successor opener owns this non-terminal pass
     if (not verdict.clean or repo_profile(workdir) != "autonomous"
             or not record.auto_merge_allowed):
         return True
@@ -1841,7 +1841,7 @@ def _settle_review(record) -> str | None:
     if (verdict.change_author_tool
             and (_review_depth_escalated(record, verdict)
                  or verdict.pushed_sha or verdict.uncertainty is not None
-                 or record.review_axis == "product"
+                 or record.review_axis in {"product", "decision"}
                  or any(item.action.value == "fix_before_completion"
                         for item in verdict.actions))):
         return None  # reviewer-authored/axis/decision work must transfer privately first
@@ -2326,15 +2326,19 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
 
 
 def _review_verdict(review):
-    """Re-parse the completed Review's durable verdict for its exact reviewed SHA — read from the
-    reviewer's captured final message, never a file in the PR tree (ADR 0018/0028). Live, not
-    unit-tested (ADR 0020); the parse itself is covered in the reviewer tests."""
+    """Re-parse the completed Review's durable verdict for its exact reviewed SHA.
+
+    New records capture that terminal message at completion. The provider artifact fallback drains
+    older records without making a mutable session the source of truth for newly completed work.
+    """
     from agentflow.coordinator.providers import ProviderObserver
     from agentflow.review_policy import ReviewState, merge_findings
     from agentflow.reviewer import Finding, parse_verdict
-    obs = ProviderObserver().observe(review)
+    payload = review.outcome
+    if not payload:
+        payload = ProviderObserver().observe(review).final_message or ""
     verdict = parse_verdict(
-        obs.final_message or "", expected_sha=review.target,
+        payload, expected_sha=review.target,
         expected_depth=review.review_depth, expected_axis=review.review_axis,
         expected_author=review.change_author_tool)
     prior = ReviewState.from_record(review)
