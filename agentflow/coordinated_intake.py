@@ -159,13 +159,22 @@ def hold_intake(record) -> str | None:
     the durable marker, so a repeat after a daemon crash observes the same comment and neither
     re-holds nor pings again. Projecting that comment (and its state label) is the marker-posting
     ``action``; releasing the triaging claim is stage bookkeeping that runs once the handoff
-    confirms the marker landed."""
+    confirms the marker landed.
+
+    The durable hold reason picks the comment: a permanent provider condition stopped the
+    session before the model read anything, so that handoff names the provider failure and its
+    remediation instead of the generic "I couldn't ground this" ask, which would send the
+    maintainer hunting for a decision that was never made (issue #328). Every other hold reason
+    keeps the grounding-ambiguity copy. Only the body differs — route, state label, and the
+    exactly-once envelope are identical either way."""
+    from agentflow.coordinator.coordinator import PERMANENT_HOLD_REASON
     from agentflow.handoff import DurableHandoff, Notification, Subject
-    from agentflow.intake import _held
+    from agentflow.intake import _held, _provider_failed
     from agentflow.loop import _release_triage
     number = int(record.subject)
     reason = record.hold_reason or "continuation budget exhausted"
-    result = _held(reason)
+    compose = _provider_failed if reason.startswith(PERMANENT_HOLD_REASON) else _held
+    result = compose(reason)
 
     def project() -> None:
         # Title+labels in one live read via the named escape hatch (ADR 0040); a read that

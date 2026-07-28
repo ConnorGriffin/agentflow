@@ -106,6 +106,22 @@ def _held(detail: str) -> IntakeResult:
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail)
 
 
+def _provider_failed(detail: str) -> IntakeResult:
+    """A *permanent* provider condition — expired sign-in, billing, plan, or permission —
+    stopped the session before the model ever read the issue (issue #328). There is no
+    product decision waiting, so the handoff names the failure and its remediation instead
+    of asking the human to settle a scope question that was never asked. The route stays
+    ``GRILL`` so the held state label and the durable-handoff marker machinery are
+    unchanged; the body is fixed text so a restarted daemon re-detects the same marker."""
+    body = (f"{_DISCLAIMER}\n\nI never got to read this issue — the coding agent's provider "
+            "refused the session outright (an expired sign-in, a billing or plan limit, or a "
+            "permission problem). So there's no question waiting on you here and no product "
+            "decision pending.\n\nRe-authenticate the coding agent — or check its billing, "
+            "plan, and permissions — then reply here and I'll pick this up again, or run "
+            "`/agentflow pickup` to drive it live.")
+    return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail, infra_failed=True)
+
+
 def _infra_failed(detail: str) -> IntakeResult:
     """An *infrastructure* failure — the worktree, provision, or launch fell over before
     the model ever weighed in. Unlike a model-level hold this is not the issue's fault, so
