@@ -121,8 +121,13 @@ enroll_repo() { # <dir>
     do_or_show "rename CLAUDE.md -> AGENTS.md" mv "$cl" "$ag"
     do_or_show "symlink CLAUDE.md -> AGENTS.md" ln -sfn "AGENTS.md" "$cl"
   elif [ ! -f "$ag" ]; then
+    # The seeded `ui-surfaces:` line starts every repo declared. `none` is the safe seed —
+    # it leaves the UI-evidence gate inert, exactly as an unenrolled repo is today — but a
+    # repo with a frontend must be corrected, or a visual change merges without proof.
     do_or_show "seed AGENTS.md (add repo facts + 'profile:' by hand)" \
-      bash -c 'printf "# %s\n\n<!-- repo facts, hazards, and: profile: reviewed -->\n" "$1" > "$2"' _ "$(basename "$dir")" "$ag"
+      bash -c 'printf "# %s\n\n<!-- repo facts, hazards, and: profile: reviewed -->\n<!-- ui-surfaces: comma-separated path prefixes of this repo'"'"'s user-facing surfaces,\n     or none when it is headless on purpose (ADR 0018) -->\nui-surfaces: none\n" "$1" > "$2"' _ "$(basename "$dir")" "$ag"
+    note "NOTE: seeded 'ui-surfaces: none'. If this repo has a UI, replace that line —"
+    note "      'python -m agentflow.enroll surfaces $dir' proposes the right value."
     do_or_show "symlink CLAUDE.md -> AGENTS.md" ln -sfn "AGENTS.md" "$cl"
   fi
 

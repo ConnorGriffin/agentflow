@@ -53,3 +53,31 @@ The **`review:` dial is dropped.** Its intent is met by two *always-on* rules:
   `agentflow:needs-mockup`) so they never collide with a repo's own triage labels.
   `ready-for-agent` stays bare — it's the established queue label the loop already reads
   across the fleet, so renaming it buys churn without value.
+
+## Amendment — 2026-07-28: declaring UI surfaces fleet-wide (issue #337)
+
+The UI-evidence gate reads a per-repo `ui-surfaces:` declaration in AGENTS.md. Only
+agentflow ever wrote one, so the gate was inert in the other eight enrolled repos —
+including Brewgen and ciq-autotune, which have real frontends. The declaration stays
+per-repo (a repo knows its own surfaces; a central list would drift), with three
+amendments:
+
+- **`ui-surfaces: none` is the explicit headless value.** A repo that means "no user
+  facing surface" now says so. The gate stays inert for it, and builder/reviewer prompts
+  stop asking it for screenshots of a UI it does not have.
+- **Silence is a third state, reported but never fail-closed.** An undeclared repo
+  behaves exactly as it did — gate inert — but `python -m agentflow.enroll audit` names
+  it. Failing closed on silence would park every PR in dotfiles, homelab, follow-through
+  and agentflow-sandbox for no reason; the fix for silence is to answer it, not to stop
+  the fleet.
+- **Enrolment seeds the line, and a backfill command proposes the value.**
+  `enroll-standards.sh` seeds `ui-surfaces: none` so a new repo starts declared;
+  `python -m agentflow.enroll surfaces <dir> [--apply]` inspects a checkout, proposes the
+  right value, and prints which of that repo's open PRs the declaration would newly park
+  before it writes anything. Detection is enrolment-only — the merge path still reads a
+  written declaration and never guesses.
+
+The retroactive turn-on was **measured before it took effect**: across the fleet's open
+PRs at the time of the audit, exactly one (ciq-autotune #476) would newly have needed
+screenshots, in a `reviewed` repo where nothing auto-merges anyway. It has since landed;
+the impact preview is the durable way to re-measure before each backfill.
