@@ -40,6 +40,10 @@ MAX_REVISES = 2
 # same discipline intake uses on issues (INTAKE_MARK). The bot posts as the maintainer,
 # so we key on the marker, not authorship.
 PR_MARK = "agentflow:"
+# The park handoff's own visible disclaimer. It is the durable dedup key for the current park
+# comment, and — because agentflow's newest word on a PR decides what a maintainer reply answers —
+# the signal that a following reply is that park's decision rather than PR discussion (#344).
+PARK_MARK = "> *agentflow: parked for human review.*"
 _RESPOND_TARGET_PREFIX = "agentflow-respond-target:"
 _RESPOND_TARGET_RE = re.compile(r"<!--\s*agentflow-respond-target:([^>]+?)\s*-->")
 _RESPOND_PARK_TARGET_RE = re.compile(r"<!--\s*agentflow-respond-park-target:([^>]+?)\s*-->")
@@ -55,6 +59,28 @@ def respond_reply_disclaimer(target: str) -> str:
     """
     return ("> *agentflow: reply from the build agent.*\n"
             f"<!-- {_RESPOND_TARGET_PREFIX}{target} -->")
+
+
+def decision_resume_disclaimer(target: str) -> str:
+    """Mark the maintainer's decision answered by the review it resumed (#344).
+
+    This reuses the one Respond target protocol — a single hidden marker per answered comment — so
+    the reply queue and the merge gate both see the question closed, without inventing a second
+    comment contract for the same fact.
+    """
+    return ("> *agentflow: your decision resumed the parked review.*\n"
+            f"<!-- {_RESPOND_TARGET_PREFIX}{target} -->")
+
+
+def park_awaiting_decision(comments: list[dict]) -> bool:
+    """Whether agentflow's newest word on this PR is its parked decision handoff. Pure.
+
+    A maintainer comment after that handoff answers it; one posted after any later agentflow comment
+    is ordinary PR discussion, which never resumes a parked review (#344).
+    """
+    ours = [comment.get("body", "") for comment in comments
+            if PR_MARK in comment.get("body", "")]
+    return bool(ours) and PARK_MARK in ours[-1]
 
 
 def respond_change_marker(result: str) -> str:
@@ -418,7 +444,7 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
                       else "same-tool review; maintainer merge required")
             handoff += f"\n\nReview status: {status}."
     marker_line = f"\n<!-- {proof_marker} -->" if proof_marker else ""
-    body = (f"> *agentflow: parked for human review.*{marker_line}\n\n"
+    body = (f"{PARK_MARK}{marker_line}\n\n"
             "## Maintainer decision needed\n\n"
             f"{decision}\n\n"
             "## Agent handoff\n\n"
@@ -426,8 +452,7 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
     if proof_marker:
         comments = github.pr_comments(repo, pr_number)
         parked = ([] if comments is None else [
-            comment for comment in comments
-            if "> *agentflow: parked for human review.*" in comment.body])
+            comment for comment in comments if PARK_MARK in comment.body])
         if parked:
             if parked[-1].id:
                 github.edit_comment(parked[-1].id, body)

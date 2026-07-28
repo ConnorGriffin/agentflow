@@ -477,6 +477,51 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         conflict_round=review_record.conflict_round, review=state)
 
 
+def decision_resume_review_submission(review_record, reviewer_tool: str, *, target: str,
+                                      answer: str, sequence: int):
+    """Reopen one parked exact-head Review with the maintainer's own answer to its decision (#344).
+
+    The resumed pass keeps everything the parked chain established — the immutable reviewed head,
+    builder lineage, the current change author, the retained review checkout naming, and the
+    accumulated fix/check/follow-up ledger — advances the same-head sequence, and records the answer
+    as its private next-agent context so the chain reads that decision as settled and never asks it
+    again. Independence, taint, and human-merge rules are the caller's existing ones. Pure: the
+    mapping is the test surface (ADR 0020). ``None`` when the retained review source, the answered
+    comment, or the durable ledger is unreadable.
+    """
+    from agentflow.coordinator import Submission
+    from agentflow.review_policy import (
+        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, decision_answer_handoff)
+    from agentflow.reviewer import review_worktree, with_review_assignment
+
+    facts = _review_source_facts(review_record)
+    author = review_record.change_author_tool or review_record.builder_lineage
+    if facts is None or not review_record.target or not target or not answer.strip():
+        return None
+    prior = ReviewState.from_record(review_record)
+    if prior is None:
+        return None
+    workdir, pr = facts
+    depth = ReviewDepth(review_record.review_depth)
+    axis = ReviewAxis.PRODUCT if depth is ReviewDepth.FULL else ReviewAxis.COMBINED
+    reason = review_record.depth_reason or "maintainer answered the recorded product decision"
+    handoff = decision_answer_handoff(target, answer)
+    prompt = with_review_assignment(
+        review_record.input_ptr or "",
+        depth=depth, reason=reason, axis=axis, change_author_tool=author or "", handoff=handoff)
+    state = replace(
+        prior, assignment=ReviewAssignment(depth, reason, axis),
+        change_author_tool=author, sequence=sequence,
+        cross_tool_covered=reviewer_tool != author, handoff=handoff, uncertainty=None)
+    return Submission(
+        repo=review_record.repo, subject=review_record.subject, stage="review",
+        target=review_record.target, pool=reviewer_tool, complexity="deep",
+        source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
+        claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        builder_complexity=review_record.builder_complexity, round=review_record.round,
+        conflict_round=review_record.conflict_round, review=state)
+
+
 def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
                                head_sha: str, reviewer_tool: str, pr_number: int,
                                acceptance: str, review=None,
@@ -1436,13 +1481,48 @@ def _park_pr_number(record) -> int | None:
     return prs[0].get("number") if prs else None
 
 
-def _park_context(record, verdict, *, reason: str, missing: str):
-    """Build the concrete two-section park contract from durable stage state."""
+def _exact_head_review_chain(records, record) -> list:
+    """Every Review record for one PR exact head — the Product/Standards/Fix passes that share a
+    ``(repo, subject, target)``. This is the unit the park and the resume both read, so a decision
+    recorded by one axis is never lost to a later axis that recorded none (#344)."""
+    return [item for item in records
+            if item.stage == "review" and item.repo == record.repo
+            and str(item.subject) == str(record.subject) and item.target == record.target]
+
+
+def _chain_uncertainty(record):
+    """The latest unanswered structured decision anywhere in this Review's exact-head chain.
+
+    A park must print the decision agentflow actually recorded, not only whatever the terminal
+    record happened to carry (#344). An unreadable store falls back to this one record rather than
+    inventing a generic product choice. ``None`` for a non-Review record or a chain with no
+    recorded decision.
+    """
+    from agentflow.review_policy import unresolved_uncertainty
+
+    if record.stage != "review" or not record.target:
+        return None
+    try:
+        records = tracer.load_records()
+    except StoreUnavailable:
+        return unresolved_uncertainty([record])
+    return unresolved_uncertainty(_exact_head_review_chain(records, record))
+
+
+def _park_context(record, verdict, *, reason: str, missing: str, uncertainty=None,
+                  options=None, next_action=""):
+    """Build the concrete two-section park contract from durable stage state.
+
+    ``uncertainty`` is the exact-head chain's unanswered decision, supplied by the caller so one
+    park reads the durable chain once. ``options``/``next_action`` let a park with no recorded
+    decision at all describe its own execution failure instead of borrowing product options.
+    """
     from agentflow.gate import ParkContext
+    from agentflow.review_policy import ReviewState
 
     actions = tuple(verdict.actions) if verdict is not None else ()
-    uncertainty = verdict.uncertainty if verdict is not None else None
-    options = (tuple(uncertainty.options) if uncertainty is not None else (
+    uncertainty = (verdict.uncertainty if verdict is not None else None) or uncertainty
+    options = (tuple(uncertainty.options) if uncertainty is not None else options or (
         "Clarify the affected behavior and resume this retained stage on the same PR.",
         "Close the PR and leave the currently shipped application behavior unchanged.",
     ))
@@ -1451,8 +1531,10 @@ def _park_context(record, verdict, *, reason: str, missing: str):
         for item in actions if item.file))
     if not locations:
         locations = (f"PR #{_park_pr_number(record) or '?'} exact head {record.target or 'unknown'}",)
-    checks = tuple(verdict.checks) if verdict is not None and verdict.checks else (
-        "No completed check proof was recorded before the stage stopped.",)
+    ledger = ReviewState.from_record(record)
+    checks = (tuple(verdict.checks) if verdict is not None and verdict.checks
+              else (ledger.checks if ledger is not None and ledger.checks else (
+                  "No completed check proof was recorded before the stage stopped.",)))
     conflicts = (
         f"Missing guidance: {uncertainty.missing_guidance}. "
         f"Agent recommendation: {uncertainty.recommendation}."
@@ -1468,7 +1550,8 @@ def _park_context(record, verdict, *, reason: str, missing: str):
         locations=locations, conflicts=conflicts, checks=checks,
         retained_work=f"`{record.source}` at `{record.target or 'unknown head'}`",
         next_action=(
-            "Record the chosen behavior, then resume this exact retained stage against the same PR."))
+            next_action
+            or "Record the chosen behavior, then resume this exact retained stage on the same PR."))
 
 
 def _park_proof_marker(record, reason: str) -> str:
@@ -1483,21 +1566,35 @@ def _park_pr(record) -> str | None:
     resolved by branch (:func:`_park_pr_number`). The crash-safe post-once → prove → notify-once
     recipe is the shared :class:`DurableHandoff` envelope (ADR 0042): the park comment is the durable
     proof, so a repeat after a daemon crash observes the same comment and neither parks nor pings
-    again. Live orchestration; exercised with faked GitHub reads in ``tests/test_revise_tracer.py``."""
+    again. A Review parks against its whole exact-head chain: any decision that chain recorded and
+    no maintainer answered is the decision this park asks about, whichever axis stopped last (#344).
+    Live orchestration; exercised with faked GitHub reads in ``tests/test_revise_tracer.py``."""
     from agentflow.gate import park
     from agentflow.handoff import DurableHandoff, Notification, Subject
     pr = _park_pr_number(record)
     if pr is None:
         return None
-    if record.stage == "review" and record.review_axis == "decision":
+    uncertainty = _chain_uncertainty(record)
+    options, next_action = None, ""
+    if record.stage == "review" and (uncertainty is not None
+                                     or record.review_axis == "decision"):
         reason = "needs the maintainer to choose between competing product behaviors"
-        missing = "Both tools remain unsure. " + (
-            f"Exact recorded decision: {record.review_uncertainty}"
-            if record.review_uncertainty else "The private decision record is unavailable.")
+        missing = (
+            "A product decision recorded against this exact head is still unanswered. "
+            f"Missing guidance: {uncertainty.missing_guidance}." if uncertainty is not None
+            else "Both tools remain unsure and the private decision record is unavailable.")
+        next_action = ("Reply on this PR with the behavior you want; agentflow resumes the parked "
+                       "review at this same exact head with your decision.")
         notice = "conflict decision needs your judgment"
     elif record.stage == "review":
         reason = "exhausted its review budget without a durable verdict"
-        missing = "No review was completed — do not treat this as a clean review."
+        # No decision was ever recorded for this head, so the honest fact is an execution failure —
+        # inventing a product choice here is what made a parked review unanswerable (#344).
+        missing = ("No review verdict was recorded for this exact head: the review executions "
+                   "failed rather than judging the change. Do not treat this as a clean review.")
+        options = (f"Resume the review on this exact head: `/agentflow review {pr}`.",
+                   "Review the retained change by hand and decide this PR yourself.")
+        next_action = f"Run `/agentflow review {pr}` to resume the review at this exact head."
         notice = "review parked for your action"
     elif record.conflict_round:
         reason = "could not safely complete and verify the merge-conflict resolution"
@@ -1514,10 +1611,98 @@ def _park_pr(record) -> str | None:
         marker=marker,
         action=lambda: park(
             record.repo, pr, None, reason=reason, missing_outcome=missing,
-            context=_park_context(record, None, reason=reason, missing=missing),
+            context=_park_context(record, None, reason=reason, missing=missing,
+                                  uncertainty=uncertainty, options=options,
+                                  next_action=next_action),
             proof_marker=marker),
         notification=Notification(
             "agentflow needs you", f"{record.repo} PR #{pr}: {notice}"))
+
+
+def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: str,
+                           baseline: str) -> str | None:
+    """Resume the parked exact-head Review the maintainer's PR reply answers (#344).
+
+    Returns a status when this reply is that answer — so no generic Respond ever claims the issue
+    for it — and ``None`` when it is ordinary PR discussion, which the Respond path then owns
+    unchanged. The answer counts only when a decision recorded against the PR's *current* head is
+    still unanswered and the park handoff asking for it is agentflow's newest word on the PR.
+
+    Ordering is the crash contract: the resumed Review record is created before the public
+    answered-marker comment, so a crash in between converges — the next pass finds the review
+    already bound to this exact comment and only completes the marker, opening no second lifecycle,
+    claim, or notification. Live orchestration; its mapping is
+    :func:`decision_resume_review_submission`.
+    """
+    from agentflow.coordinator.record import HELD
+    from agentflow.gate import decision_resume_disclaimer, park_awaiting_decision
+    from agentflow.loop import _claim, _pr_comments, repo_profile
+    from agentflow.review_policy import decision_answer_target, unresolved_uncertainty
+
+    if not target or not baseline:
+        return None
+    try:
+        records = tracer.load_records()
+    except StoreUnavailable:
+        return f"PR #{pr}: coordinator state unreadable — deferring the parked-review answer"
+
+    def parked_on_this_pr(record) -> bool:
+        # The review's own retained checkout names the PR, so the head SHA is never the only
+        # binding: this park belongs to *this* PR at *this* exact head.
+        facts = _review_source_facts(record)
+        return (record.stage == "review" and record.repo == cfg.repo
+                and record.target == baseline and record.state == HELD and not record.retired
+                and facts is not None and facts[1] == pr)
+
+    parked = [record for record in records if parked_on_this_pr(record)]
+    if not parked:
+        return None
+    record = max(parked, key=lambda item: (item.created_at, item.review_sequence, item.identity))
+    chain = _exact_head_review_chain(records, record)
+    bound = any(not item.retired
+                and decision_answer_target(item.review_handoff) == str(target)
+                for item in chain)
+    if not bound and unresolved_uncertainty(chain) is None:
+        return None                # nothing was ever asked here — this is ordinary PR discussion
+    comments = _pr_comments(cfg.repo, pr)
+    if comments is None:
+        return f"PR #{pr}: PR thread unreadable — deferring the parked-review answer"
+    if not bound and not park_awaiting_decision(comments):
+        return None                # the reply does not follow the decision handoff
+    issue = int(record.subject)
+    if not bound:
+        if any(not item.retired and item.claim for item in chain):
+            # Another exact-head review already owns this issue — a maintainer recovery that landed
+            # first. Report and wait: it consumes the decision, and meanwhile no Respond claims the
+            # answer either.
+            return (f"#{issue}: an exact-head review already owns this issue — deferring the "
+                    f"answered decision on PR #{pr}")
+        author = record.change_author_tool or record.builder_lineage
+        source_facts = _review_source_facts(record)
+        if not author or source_facts is None:
+            return None            # no lineage to resume — the park stays the human's move
+        reviewer_tool = pick_reviewer(
+            author, allow_same_tool=repo_profile(source_facts[0]) != "autonomous")
+        if reviewer_tool is None:
+            return (f"#{issue}: no eligible reviewer for the answered decision on PR #{pr} — "
+                    "deferring")
+        submission = decision_resume_review_submission(
+            record, reviewer_tool, target=str(target), answer=comment,
+            sequence=max(item.review_sequence for item in chain) + 1)
+        if submission is None:
+            return None
+        if not _claim(cfg.repo, issue):
+            return f"#{issue}: could not claim the resumed review on PR #{pr}"
+        try:
+            coordinator.submit_stage(submission)
+        except StoreUnavailable:
+            return f"#{issue}: coordinator refused the resumed review on PR #{pr} — retrying"
+    body = (f"{decision_resume_disclaimer(target)}\n\n"
+            "Your decision is recorded against this PR's exact reviewed head and the parked review "
+            "has been resumed with it. No separate reply stage will answer this comment.")
+    if not github.pr_comment(cfg.repo, pr, body):
+        return f"#{issue}: resumed review recorded; answer marker still pending on PR #{pr}"
+    return f"#{issue}: maintainer decision resumed the parked review on PR #{pr}"
 
 
 def _review_pr_facts(record) -> dict | None:
@@ -1603,7 +1788,8 @@ def _park_review_settlement(record, verdict, workdir: str, pr: int,
             record.repo, pr, verdict, reason=reason,
             context=_park_context(
                 record, verdict, reason=reason,
-                missing=verdict.detail or "Grounded review actions remain unresolved."),
+                missing=verdict.detail or "Grounded review actions remain unresolved.",
+                uncertainty=_chain_uncertainty(record)),
             proof_marker=marker),
         notification=Notification(
             "agentflow needs you", f"{record.repo} PR #{pr}: reviewed — your action"))

@@ -682,3 +682,151 @@ def test_reverifying_continuation_settles_and_keeps_the_earlier_pushed_fix(monke
     assert verdict.parsed and verdict.clean and not verdict.pushed_sha
     assert verdict.fixes == ("Corrected the held-reason wording",)
     assert verdict.checks == ("suite green at the pushed head", "re-verified the pushed head")
+
+
+# --- one exact head, one park/resume decision contract (#344) ------------------------------
+# A PR head's Product/Standards/Fix passes are one durable chain. The decision that chain recorded
+# belongs to the head, not to whichever pass happened to stop last, and only the maintainer's own
+# answer retires it. The production loss (ciq-autotune#479) was a park that read the terminal
+# record alone, so an unanswered product decision became generic clarify/close boilerplate.
+
+_RESCUE_DECISION = Uncertainty(
+    ("Keep the conservative behavior for anyone who has never used the rescue log.",
+     "Show the rescue-log prompt to every user on their first run."),
+    "what a user who has never used the rescue log should see",
+    "keep the conservative behavior")
+
+
+def _chain_record(identity, *, sequence, created, axis, uncertainty=None, checks=(),
+                  handoff=None, held=False):
+    """One durable Review record in a single PR exact head's chain. A parked pass is `held`,
+    deliberately left unretired, and claimless — exactly what the coordinator's hold writes."""
+    from agentflow.coordinator.record import Record
+
+    review = ReviewState(
+        assignment=ReviewAssignment(ReviewDepth.FULL, "shared behavior", ReviewAxis(axis)),
+        change_author_tool="claude", sequence=sequence, uncertainty=uncertainty,
+        checks=checks, handoff=handoff)
+    return Record(
+        identity=identity, stage="review", pool="codex", demand=2, repo="o/r", subject="479",
+        target="c626f21bae01970c38b14711da5b38117c9f6872", created_at=created,
+        state="held" if held else "completed", retired=not held, claim=False,
+        builder_lineage="claude", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex-review/pr-479-rescue-log",
+        **review.record_fields())
+
+
+def _park_body(monkeypatch, record):
+    """Drive the live Review park through its durable handoff and return the PR comment it posted."""
+    from agentflow import coordinated_build, github
+
+    posted = []
+    monkeypatch.setattr(github, "pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=body, created_at="")
+                                            for body in posted])
+    monkeypatch.setattr(github, "pr_comment",
+                        lambda _repo, _pr, body: bool(posted.append(body)) or True)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *_args, **_kwargs: True)
+    assert coordinated_build._park_pr(record) is not None
+    assert len(posted) == 1
+    return posted[0]
+
+
+def test_the_chain_keeps_an_unanswered_decision_a_later_axis_recorded_none_for():
+    from agentflow.review_policy import unresolved_uncertainty
+
+    chain = [
+        _chain_record("product", sequence=1, created=100, axis="product",
+                      uncertainty=_RESCUE_DECISION),
+        _chain_record("standards", sequence=2, created=200, axis="standards"),
+        _chain_record("fix", sequence=3, created=300, axis="fix", held=True),
+    ]
+
+    assert unresolved_uncertainty(chain) == _RESCUE_DECISION
+    assert unresolved_uncertainty([]) is None
+    assert unresolved_uncertainty(chain[1:]) is None      # nothing recorded, nothing invented
+
+
+def test_a_maintainers_answer_retires_the_chains_decision():
+    """Only the maintainer's own answer settles a recorded decision, and it is bound to the exact
+    comment it came from — so the next park never re-asks a question already answered."""
+    from agentflow.review_policy import decision_answer_handoff, unresolved_uncertainty
+
+    answered = _chain_record(
+        "resumed", sequence=4, created=400, axis="product",
+        handoff=decision_answer_handoff("IC_1", "keep the conservative behavior"))
+    chain = [
+        _chain_record("product", sequence=1, created=100, axis="product",
+                      uncertainty=_RESCUE_DECISION),
+        _chain_record("fix", sequence=3, created=300, axis="fix"),
+        answered,
+    ]
+
+    assert unresolved_uncertainty(chain) is None
+    assert unresolved_uncertainty(chain[:2]) == _RESCUE_DECISION
+
+
+def test_a_parked_review_asks_the_decision_its_chain_recorded(monkeypatch):
+    """The production regression: Product sequence 1 recorded the decision, Standards sequence 2
+    completed, and Fix sequence 3 exhausted carrying none. The park must ask *that* decision — its
+    exact missing guidance, both options, and the recommendation — not generic boilerplate, and it
+    must not claim no review was completed."""
+    from agentflow import coordinated_build
+
+    chain = [
+        _chain_record("product", sequence=1, created=100, axis="product",
+                      uncertainty=_RESCUE_DECISION, checks=("product axis reviewed",)),
+        _chain_record("standards", sequence=2, created=200, axis="standards",
+                      checks=("product axis reviewed", "standards axis reviewed")),
+        _chain_record("fix", sequence=3, created=300, axis="fix", held=True,
+                      checks=("product axis reviewed", "standards axis reviewed")),
+    ]
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: chain)
+
+    body = _park_body(monkeypatch, chain[-1])
+
+    assert _RESCUE_DECISION.missing_guidance in body
+    assert _RESCUE_DECISION.recommendation in body
+    for option in _RESCUE_DECISION.options:
+        assert option in body
+    assert "standards axis reviewed" in body               # what the chain did prove
+    assert "No review was completed" not in body
+    assert "Clarify the affected behavior" not in body
+    assert "Reply on this PR with the behavior you want" in body
+
+
+def test_a_review_that_recorded_no_decision_parks_as_an_execution_failure(monkeypatch):
+    """A genuine no-verdict exhaustion is an execution failure, so the park says so and names the
+    exact resume action. It invents no product choice for a change nobody ever judged."""
+    from agentflow import coordinated_build
+
+    chain = [_chain_record("only", sequence=0, created=100, axis="combined", held=True)]
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: chain)
+
+    body = _park_body(monkeypatch, chain[0])
+
+    assert "the review executions failed rather than judging the change" in body
+    assert "`/agentflow review 479`" in body
+    assert "Close the PR" not in body
+    assert "Clarify the affected behavior" not in body
+
+
+def test_a_resumed_review_keeps_the_head_lineage_and_ledger_and_settles_the_decision():
+    from agentflow import coordinated_build
+    from agentflow.review_policy import decision_answer_target, unresolved_uncertainty
+
+    parked = _chain_record("fix", sequence=3, created=300, axis="fix", held=True,
+                           uncertainty=_RESCUE_DECISION, checks=("standards axis reviewed",))
+    submission = coordinated_build.decision_resume_review_submission(
+        parked, "codex", target="IC_1", answer="keep the conservative behavior", sequence=4)
+
+    assert submission.target == parked.target            # the immutable exact head
+    assert submission.builder_lineage == "claude" and submission.review.change_author_tool == "claude"
+    assert submission.review.sequence == 4               # monotone in the same-head chain
+    assert submission.review.checks == ("standards axis reviewed",)
+    assert submission.review.uncertainty is None
+    assert decision_answer_target(submission.review.handoff) == "IC_1"
+    assert "keep the conservative behavior" in submission.input_ptr
+    assert unresolved_uncertainty([parked, SimpleNamespace(
+        created_at=400, review_sequence=4, identity="resumed",
+        review_uncertainty=None, review_handoff=submission.review.handoff)]) is None

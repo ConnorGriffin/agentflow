@@ -376,6 +376,140 @@ def test_build_pass_reports_when_every_ready_candidate_is_undispatchable(monkeyp
     assert "#1" in result and "#2" in result and "no further runnable" in result
 
 
+# --- a reply to a parked review's decision belongs to that review (#344) ------------------
+
+_DECISION = {"options": ["Keep the conservative behavior.", "Prompt every user on first run."],
+             "missing_guidance": "what a first-time user should see",
+             "recommendation": "keep the conservative behavior"}
+
+
+def _parked_decision_review(**overrides):
+    """A review parked on a recorded product decision: held, unretired, and claimless."""
+    import json
+    from agentflow.coordinator.record import Record
+
+    fields = dict(
+        identity="o/r|7|review|sha-a", stage="review", pool="codex", demand=2, repo="o/r",
+        subject="7", target="sha-a", state="held", retired=False, claim=False,
+        builder_lineage="claude", builder_complexity="deep", change_author_tool="claude",
+        review_sequence=3, created_at=100, review_uncertainty=json.dumps(_DECISION),
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    fields.update(overrides)
+    return Record(**fields)
+
+
+def _answered_park_thread():
+    """The park handoff, then the maintainer's answer to it — agentflow spoke last before them."""
+    return [{"id": "IC_0", "body": "> *agentflow: parked for human review.*\n\nDecide, please."},
+            {"id": "IC_1", "body": "keep the conservative behavior"}]
+
+
+def _stub_answered_park(monkeypatch, records):
+    """Wire one PR whose oldest unanswered comment answers its parked review."""
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
+        42, "agentflow/claude/issue-7-fix", "keep the conservative behavior", "IC_1", "sha-a"))
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: records)
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: _answered_park_thread())
+    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(coordinated_build, "respond_submission",
+                        lambda *a, **k: pytest.fail("a decision answer is never a generic Respond"))
+    posted = []
+    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+                        lambda repo, pr, body: posted.append(body) or True)
+    claimed = []
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    submitted = []
+    return posted, claimed, submitted
+
+
+def test_a_maintainer_answer_resumes_the_parked_review_instead_of_claiming_a_respond(monkeypatch):
+    """The production sequel: the maintainer chose one of the recorded options on the PR. That
+    answer opens exactly one resumed review at the same exact head — never a second, generic reply
+    stage holding a competing claim on the same issue."""
+    parked = _parked_decision_review()
+    posted, claimed, submitted = _stub_answered_park(monkeypatch, [parked])
+    coord = SimpleNamespace(submit_stage=submitted.append)
+
+    result = dispatch._submit_coordinated_respond(RepoConfig("o/r", "/work"), coord, None)
+
+    assert "resumed the parked review" in result
+    assert claimed == [7]
+    assert len(submitted) == 1
+    resumed = submitted[0]
+    assert resumed.stage == "review" and resumed.target == "sha-a"
+    assert resumed.pool == "codex" and resumed.builder_lineage == "claude"
+    assert resumed.review.sequence == 4 and resumed.review.uncertainty is None
+    from agentflow.review_policy import decision_answer_target
+    assert decision_answer_target(resumed.review.handoff) == "IC_1"
+    # One public marker answers that exact comment, so the reply queue and the merge gate both
+    # see the question closed without a second comment protocol.
+    assert len(posted) == 1 and "agentflow-respond-target:IC_1" in posted[0]
+
+
+def test_a_replay_after_the_resumed_review_was_recorded_opens_no_second_lifecycle(monkeypatch):
+    """Crash boundary: the resumed review is durable but its answered-marker comment never landed.
+    The replay completes only the marker — no second review, claim, or notification."""
+    from agentflow.review_policy import decision_answer_handoff
+
+    parked = _parked_decision_review()
+    already = _parked_decision_review(
+        identity="o/r|7|review|sha-a|s4", state="waiting", claim=True, review_sequence=4,
+        created_at=200, review_uncertainty=None,
+        review_handoff=decision_answer_handoff("IC_1", "keep the conservative behavior"))
+    posted, claimed, submitted = _stub_answered_park(monkeypatch, [parked, already])
+    coord = SimpleNamespace(
+        submit_stage=lambda _s: pytest.fail("the resumed review is already durable"))
+
+    result = dispatch._submit_coordinated_respond(RepoConfig("o/r", "/work"), coord, None)
+
+    assert "resumed the parked review" in result
+    assert claimed == [] and submitted == []
+    assert len(posted) == 1 and "agentflow-respond-target:IC_1" in posted[0]
+
+
+def test_an_answer_waits_while_a_hand_started_review_already_owns_the_issue(monkeypatch):
+    """The maintainer ran the recovery command *and* answered on the PR. The running review owns the
+    issue, so the answer waits for it rather than opening a competing second review — and no
+    Respond claims the comment in the meantime."""
+    parked = _parked_decision_review()
+    by_hand = _parked_decision_review(
+        identity="o/r|7|review|sha-a|s4", state="waiting", claim=True, review_sequence=4,
+        created_at=200)
+    posted, claimed, submitted = _stub_answered_park(monkeypatch, [parked, by_hand])
+    coord = SimpleNamespace(submit_stage=lambda _s: pytest.fail("no competing second review"))
+
+    result = dispatch._submit_coordinated_respond(RepoConfig("o/r", "/work"), coord, None)
+
+    assert "already owns this issue" in result
+    assert claimed == [] and posted == []
+
+
+def test_ordinary_pr_discussion_after_a_parked_review_still_enters_respond(monkeypatch):
+    """Out of scope by design: a reply that does not follow the decision handoff is discussion, not
+    approval to resume. It keeps the ordinary reply path, claim and all."""
+    parked = _parked_decision_review()
+    monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
+        42, "agentflow/claude/issue-7-fix", "unrelated question", "IC_2", "sha-a"))
+    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked])
+    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [
+        *_answered_park_thread(),
+        {"id": "IC_x", "body": "> *agentflow: your decision resumed the parked review.*\n"
+                               "<!-- agentflow-respond-target:IC_1 -->"},
+        {"id": "IC_2", "body": "unrelated question"}])
+    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+                        lambda *a, **k: pytest.fail("discussion never resumes a parked review"))
+    monkeypatch.setattr(coordinated_build, "respond_submission",
+                        lambda *a, **k: SimpleNamespace(subject="7", pool="claude"))
+    monkeypatch.setattr(coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    submitted = []
+
+    result = dispatch._submit_coordinated_respond(
+        RepoConfig("o/r", "/work"), SimpleNamespace(submit_stage=submitted.append), None)
+
+    assert "(respond)" in result and len(submitted) == 1
+
+
 def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "please adjust", "cid-1", "base"))
