@@ -710,9 +710,11 @@ def _park_review_settlement(record, verdict, workdir: str, pr: int,
                             *, reason: str, autonomous: bool) -> str | None:
     """Idempotently park, prove, clean up, and notify one completed Review.
 
-    The park-comment-plus-notify-once envelope is the shared :class:`DurableHandoff` recipe (ADR
-    0042); the Review-specific bookkeeping — disposing the finished detached checkout and recording
-    the parked ratchet — stays here and runs after the handoff confirms (returns non-``None``).
+    The park-comment-once-then-notify envelope is the shared :class:`DurableHandoff` recipe (ADR
+    0042) — one comment however often this replays, and a ping that may arrive twice rather than
+    risk not arriving at all; the Review-specific bookkeeping — disposing the finished detached
+    checkout and recording the parked ratchet — stays here and runs after the handoff confirms
+    (returns non-``None``).
     """
     from agentflow.gate import park
     from agentflow.handoff import DurableHandoff, Notification, Subject

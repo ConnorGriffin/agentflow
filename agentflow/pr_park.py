@@ -138,12 +138,13 @@ def park_proof_marker(record, reason: str) -> str:
 
 
 def park_pr(record) -> str | None:
-    """Park the reviewed PR for a human and notify once (ADR 0028's exhaustion table). Serves both
+    """Park the reviewed PR for a human and tell them (ADR 0028's exhaustion table). Serves both
     the Review-native park and the Revise-native park — Revise owns a builder worktree, so the PR is
-    resolved by branch (:func:`park_pr_number`). The crash-safe post-once → prove → notify-once
-    recipe is the shared :class:`DurableHandoff` envelope (ADR 0042): the park comment is the durable
-    proof, so a repeat after a daemon crash observes the same comment and neither parks nor pings
-    again. A Review parks against its whole exact-head chain: any decision that chain recorded and
+    resolved by branch (:func:`park_pr_number`). The crash-safe post-once → prove → notify recipe is
+    the shared :class:`DurableHandoff` envelope (ADR 0042): the park comment is the durable proof, so
+    a repeat after a daemon crash observes the same comment and never parks twice — but it does ping
+    again, because a ping that is only sent when the comment is newly posted is lost outright when a
+    crash falls between the two (ADR 0042 Consequences). A Review parks against its whole exact-head chain: any decision that chain recorded and
     no maintainer answered is the decision this park asks about, whichever axis stopped last (#344).
     Live orchestration; exercised with faked GitHub reads in ``tests/test_revise_tracer.py``."""
     from agentflow.gate import park

@@ -172,10 +172,10 @@ def _park_respond(record) -> str | None:
 
     A generic Review park may already be present on the PR, so this uses its own target-scoped
     marker to prove that this exact maintainer-comment target exhausted its Respond budget. The
-    crash-safe post-once → prove → notify-once recipe is the shared :class:`DurableHandoff` envelope
-    (ADR 0042): it derives the stable ntfy sequence id, so a replay across the window between posting
-    the durable comment and recording completion locally replaces the same notification rather than
-    multiplying it.
+    crash-safe post-once → prove → notify recipe is the shared :class:`DurableHandoff` envelope
+    (ADR 0042): the comment is posted exactly once, while a replay across the window between posting
+    it and recording completion locally sends the ping a second time. The sequence id correlates the
+    two copies; it does not collapse them — ntfy has no such header (ADR 0042 Consequences).
     """
     from agentflow.handoff import DurableHandoff, Notification, Subject
 
