@@ -377,7 +377,8 @@ def test_route_handoff_pings_once_under_one_stable_key_across_a_restart(make_coo
     ping again."""
     fake = IntakeSession()
     notified, comments, releases = [], [], [False]
-    monkeypatch.setattr(github, "api", lambda *a, **k: {"title": "old", "labels": []})
+    monkeypatch.setattr(github, "issue_headline",
+                        lambda repo, number: github.IssueHeadline("old", frozenset()))
     monkeypatch.setattr(github, "issue_comments",
                         lambda repo, number: [github.Comment(body=body, created_at="")
                                               for body in comments])
@@ -438,7 +439,8 @@ def _hold_seams(monkeypatch, comments, *, applied, released, notified,
     """Wire the intake hold's shared-envelope seams: the durable comment thread it reads and
     proves through (ADR 0042), the projection that posts the held-route comment, the claim
     release, and the operator ping — all stated as facts, none as ``gh`` argument vectors."""
-    monkeypatch.setattr(github, "api", lambda *a, **k: {"title": "old", "labels": []})
+    monkeypatch.setattr(github, "issue_headline",
+                        lambda repo, number: github.IssueHeadline("old", frozenset()))
     monkeypatch.setattr(github, "issue_comments",
                         lambda repo, number: None if comments is None
                         else [github.Comment(body=body, created_at="") for body in comments])
@@ -648,7 +650,8 @@ def test_returned_grill_decision_still_posts_its_own_question(make_coord, monkey
 
     fake = IntakeSession()
     projected, comments = [], []
-    monkeypatch.setattr(github, "api", lambda *a, **k: {"title": "old", "labels": []})
+    monkeypatch.setattr(github, "issue_headline",
+                        lambda repo, number: github.IssueHeadline("old", frozenset()))
     monkeypatch.setattr(github, "issue_comments",
                         lambda repo, number: [github.Comment(body=body, created_at="")
                                               for body in comments])

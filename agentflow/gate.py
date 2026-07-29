@@ -286,23 +286,18 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     longer satisfies the gate (issue #205)."""
     if not surfaces:
         return False   # non-UI repo: gate inert
-    # The one read that spans files + body + comments in a single snapshot doesn't fit a
-    # typed helper, so it goes through the module's named escape hatch (ADR 0040). A read
-    # that couldn't reach GitHub comes back as None — fail closed to a gap.
-    data = github.api(["pr", "view", str(pr_number), "--repo", repo,
-                       "--json", "files,body,comments"], parse_json=True)
-    if not isinstance(data, dict):
-        return True
-    files = [f.get("path", "") for f in data.get("files", [])]
+    content = github.pr_content(repo, pr_number)
+    if content is None:
+        return True   # couldn't reach GitHub — fail closed to a gap
+    files = list(content.paths)
     if not touches_ui_surface(files, surfaces):
         return False
     if has_committed_evidence(files):
         return False
-    if has_image_evidence(data.get("body") or ""):
+    if has_image_evidence(content.body):
         return False
-    for comment in data.get("comments", []):
-        body = comment.get("body", "") or ""
-        if PR_MARK in body and has_image_evidence(body):
+    for comment in content.comments:
+        if PR_MARK in comment.body and has_image_evidence(comment.body):
             return False
     return True
 
@@ -323,9 +318,7 @@ def ci_is_green(repo: str, pr_number: int, *,
     iv = interval if interval is not None else int(os.environ.get("AGENTFLOW_CI_INTERVAL", "30"))
     deadline = time.monotonic() + t
     while True:
-        # `gh pr checks` exits non-zero until every required check is green; the escape
-        # hatch surfaces that as None, so a non-None result means all checks passed.
-        if github.api(["pr", "checks", str(pr_number), "--repo", repo]) is not None:
+        if github.pr_checks_passed(repo, pr_number):
             return True
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -338,19 +331,12 @@ def squash_merge(repo: str, pr_number: int) -> bool:
     # survivor re-rebase pass, so merges never overlap (ADR 0009). Held only around the
     # merge itself — never during CI polling — so it can't stall other builds.
     with _MERGE_LOCK:
-        data = github.api(["pr", "view", str(pr_number), "--repo", repo,
-                           "--json", "isDraft"], parse_json=True)
-        if not isinstance(data, dict):
-            return False
-        is_draft = data.get("isDraft")
-        if not isinstance(is_draft, bool):
+        is_draft = github.pr_is_draft(repo, pr_number)
+        if is_draft is None:
             return False
         if is_draft and not github.pr_ready(repo, pr_number):
             return False
-        # No typed merge helper exists (squash + delete-branch is gate-specific), so the
-        # land itself goes through the escape hatch: None means the merge command failed.
-        return github.api(["pr", "merge", str(pr_number), "--repo", repo,
-                           "--squash", "--delete-branch"]) is not None
+        return github.merge_pr(repo, pr_number)
 
 
 _CLEAN_REVIEW_MARKER = "<!-- agentflow-clean-review-summary -->"

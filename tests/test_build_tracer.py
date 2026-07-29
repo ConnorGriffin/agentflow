@@ -804,7 +804,7 @@ def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monke
                     repo="o/r", subject="7", source=str(wt), claim=True, lineage="claude")
     # An unreadable PR listing comes back as None from the module — the Build outcome stays
     # unknown, so it must raise, never be mistaken for an absent PR.
-    monkeypatch.setattr(github, "api", lambda *a, **k: None)
+    monkeypatch.setattr(github, "prs_for_branch", lambda repo, branch, **k: None)
 
     with pytest.raises(RuntimeError, match="cannot verify Build PR outcome"):
         coordinated_build._pr_exists(record)
@@ -836,7 +836,8 @@ def _build_hold_seams(monkeypatch, state, *, notifications, labels_readable=None
                                {"name": "agentflow:building"}]
         return "applied"
 
-    monkeypatch.setattr(github, "api", lambda *a, **k: state)
+    monkeypatch.setattr(github, "issue_headline", lambda repo, number: github.IssueHeadline(
+        title=state["title"], labels=frozenset(entry["name"] for entry in state["labels"])))
     monkeypatch.setattr(github, "issue_comments",
                         lambda repo, number: [github.Comment(body=entry["body"], created_at="")
                                               for entry in state["comments"]])

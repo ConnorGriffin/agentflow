@@ -419,17 +419,23 @@ def test_follow_up_must_exist_in_this_repo_and_be_returned_by_its_duplicate_sear
         "https://github.com/o/r/issues/9", "walkthrough is absent",
         "add routine browser proof", "browser walkthrough in:title")
     viewed, searched = [], []
+    hit = SimpleNamespace(number=9)
 
     valid = validate_follow_ups(
         "o/r", (follow_up,),
-        issue_view=lambda number: viewed.append(number) or {
-            "number": number, "url": "https://github.com/o/r/issues/9"},
-        issue_search=lambda query: searched.append(query) or [{"number": 9}])
+        issue_url=lambda number: viewed.append(number) or "https://github.com/o/r/issues/9",
+        issue_search=lambda query: searched.append(query) or [hit])
 
     assert valid is True
     assert viewed == [9] and searched == ["browser walkthrough in:title"]
     assert validate_follow_ups(
-        "other/r", (follow_up,), issue_view=lambda _n: {}, issue_search=lambda _q: []) is False
+        "other/r", (follow_up,), issue_url=lambda _n: None, issue_search=lambda _q: []) is False
+    # An unreadable tracker is never proof: neither read may pass as "confirmed".
+    assert validate_follow_ups(
+        "o/r", (follow_up,), issue_url=lambda _n: None, issue_search=lambda _q: [hit]) is False
+    assert validate_follow_ups(
+        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
+        issue_search=lambda _q: None) is False
 
 
 def test_conflict_uncertainty_is_a_private_structured_provider_outcome():

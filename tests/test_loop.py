@@ -178,22 +178,23 @@ def test_intake_allowlist_falls_back_to_claude_md(tmp_path):
 def test_issues_in_flight_is_unknown_when_gh_fails(monkeypatch):
     # Unknown is not empty (ADR 0021): a `gh` blip must not read as "nothing in flight",
     # or every in-review issue gets a duplicate dispatch.
-    monkeypatch.setattr(github, "api", lambda *a, **k: None)
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, **k: None)
     assert _issues_in_flight(RepoConfig("o/r", ".")) is None
 
 
 def test_issues_in_flight_recognizes_closing_reference_off_convention_branch(monkeypatch):
     # A hand-driven build opens a PR on an off-convention branch (`codex/40-foo`) that the
     # branch regex can't parse — but its declared closing reference #40 must still dedup.
-    prs = [{"headRefName": "codex/40-foo",
-            "closingIssuesReferences": [{"number": 40}]}]
-    monkeypatch.setattr(github, "api", lambda *a, **k: prs)
+    prs = [github.PrRow(number=1, head_ref_name="codex/40-foo", head_ref_oid="sha",
+                        closing_issues=(40,))]
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, **k: prs)
     assert 40 in _issues_in_flight(RepoConfig("o/r", "."))
 
 
 def test_issues_in_flight_still_recognizes_conventional_branch(monkeypatch):
-    prs = [{"headRefName": "agentflow/codex/issue-7-slug", "closingIssuesReferences": []}]
-    monkeypatch.setattr(github, "api", lambda *a, **k: prs)
+    prs = [github.PrRow(number=1, head_ref_name="agentflow/codex/issue-7-slug",
+                        head_ref_oid="sha")]
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, **k: prs)
     assert 7 in _issues_in_flight(RepoConfig("o/r", "."))
 
 
@@ -494,10 +495,15 @@ def test_work_order_helper_is_gone():
     assert not hasattr(loop, "_work_order")
 
 
+def _canned_issue(*, state="OPEN", title="t", body="b", labels=()):
+    return github.IssueView(title=title, body=body, state=state, url="",
+                            labels=frozenset(labels), comments=[])
+
+
 def _issue_view(monkeypatch, issue):
-    """Serve build_issue's single-issue read (the module's escape hatch) a canned issue row,
-    with no native blocked-by edges (the dispatch gate reads those too)."""
-    monkeypatch.setattr(github, "api", lambda *a, **k: issue)
+    """Serve build_issue's whole-issue read a canned issue, with no native blocked-by edges
+    (the dispatch gate reads those too)."""
+    monkeypatch.setattr(github, "issue_view", lambda repo, n: issue)
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
 
 
@@ -505,8 +511,8 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     from agentflow import coordinated_build
     from agentflow.coordinator.record import Record, WAITING
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -542,8 +548,8 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     from agentflow.coordinator import Submission
     from agentflow.coordinator.record import HELD, WAITING, Record
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     # pick_pair offers codex, but the held Build was built by claude — the resume must pin back.
@@ -586,8 +592,8 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
     from agentflow import coordinated_build
     from agentflow.coordinator.record import Record, WAITING
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -621,8 +627,8 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
     from agentflow import coordinated_build
     from agentflow.coordinator.record import HELD, Record, WAITING
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -658,8 +664,8 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
     from agentflow.coordinator import Submission
 
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -680,9 +686,9 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
 
 
 def test_build_issue_refuses_an_open_blocker(monkeypatch):
-    issue = {"number": 42, "state": "OPEN", "title": "dependent", "body": "Blocked by #41",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
-    monkeypatch.setattr(github, "api", lambda *a, **k: issue)   # the single-issue read
+    issue = _canned_issue(state="OPEN", title="dependent", body="Blocked by #41",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
+    monkeypatch.setattr(github, "issue_view", lambda repo, n: issue)
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
     monkeypatch.setattr(github, "issue_state", lambda repo, n: "OPEN")   # blocker #41 open
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
@@ -692,16 +698,15 @@ def test_build_issue_refuses_an_open_blocker(monkeypatch):
 
 
 def test_build_issue_refuses_a_held_issue_and_points_at_pickup(monkeypatch):
-    issue = {"number": 7, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "agentflow:needs-grilling"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["agentflow:needs-grilling"])
     _issue_view(monkeypatch, issue)
     out = build_issue(RepoConfig("o/r", "/tmp"), 7)
     assert "pickup" in out and "7" in out
 
 
 def test_build_issue_refuses_an_untriaged_issue_and_points_at_triage(monkeypatch):
-    issue = {"number": 8, "state": "OPEN", "title": "t", "body": "b", "labels": [{"name": "bug"}]}
-    _issue_view(monkeypatch, issue)
+    _issue_view(monkeypatch, _canned_issue(labels=["bug"]))
     out = build_issue(RepoConfig("o/r", "/tmp"), 8)
     assert "triage" in out or "scope" in out
 
@@ -776,8 +781,8 @@ def test_next_resumable_issue_returns_none_on_gh_error(monkeypatch):
 
 
 def test_build_issue_refuses_an_in_flight_issue(monkeypatch):
-    issue = {"number": 9, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:deep"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:deep"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: {9})   # an open agentflow PR owns it
     out = build_issue(RepoConfig("o/r", "/tmp"), 9)
@@ -1096,10 +1101,9 @@ def test_manual_same_tool_review_requires_warning_then_explicit_confirmation(mon
     assert "Warning: same-tool review is not independent" in warning
     assert "maintainer_confirmed=True" in warning
 
-    monkeypatch.setattr(github, "api", lambda *args, **kwargs: {
-        "state": "OPEN", "headRefName": "agentflow/claude/issue-7-fix",
-        "headRefOid": "head", "closingIssuesReferences": [{"number": 7}],
-    })
+    monkeypatch.setattr(github, "pr_facts", lambda repo, pr: github.PrFacts(
+        head_ref_name="agentflow/claude/issue-7-fix", head_ref_oid="head",
+        state="OPEN", closing_issues=(7,)))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(
@@ -1135,10 +1139,9 @@ def test_manual_review_uses_latest_exact_head_author_not_branch_builder(monkeypa
     from agentflow.coordinator.record import Record
     from agentflow.review_policy import ReviewAssignment
 
-    monkeypatch.setattr(github, "api", lambda *args, **kwargs: {
-        "state": "OPEN", "headRefName": "agentflow/claude/issue-7-fix",
-        "headRefOid": "fixed", "closingIssuesReferences": [{"number": 7}],
-    })
+    monkeypatch.setattr(github, "pr_facts", lambda repo, pr: github.PrFacts(
+        head_ref_name="agentflow/claude/issue-7-fix", head_ref_oid="fixed",
+        state="OPEN", closing_issues=(7,)))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(

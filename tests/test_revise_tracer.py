@@ -613,8 +613,10 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
         parked.append((repo, pr, reason, missing_outcome))
         pr_comments.append({
             "body": f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->"})
-    monkeypatch.setattr("agentflow.github.api",          # the open PR for the builder branch is #42
-                        lambda args, *, parse_json=False: [{"number": 42}])
+    monkeypatch.setattr(                                 # the PR for the builder branch is #42
+        "agentflow.github.prs_for_branch",
+        lambda repo, branch, **k: [github.BranchPrRow(number=42, state="OPEN",
+                                                      head_ref_name=branch, url="")])
     monkeypatch.setattr("agentflow.gate.park", _park)
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda repo, pr: [github.Comment(body=c["body"], created_at="")

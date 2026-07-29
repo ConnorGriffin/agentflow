@@ -62,24 +62,18 @@ def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:
     Returns None when the listing itself failed — unknown is NOT empty. Treating a `gh`
     blip as "nothing in flight" would re-dispatch every in-review issue; callers fail closed
     (skip, retry next cycle)."""
-    # closingIssuesReferences isn't part of the typed PR row, so this discovery listing goes
-    # through the module's escape hatch rather than `list_open_prs`.
-    data = github.api(["pr", "list", "--repo", cfg.repo, "--state", "open",
-                       "--json", "headRefName,closingIssuesReferences", "--limit", "100"],
-                      parse_json=True)
-    if not isinstance(data, list):
+    prs = github.list_open_prs(cfg.repo, limit=100)
+    if prs is None:
         return None
     in_flight: set[int] = set()
-    for pr in data:
+    for pr in prs:
         # A PR's declared closing-issue reference marks that issue in-flight regardless of
         # how its head branch is named — a hand-driven build on an off-convention branch
-        # (e.g. `codex/40-foo`) still dedups. The field is same-repo scoped, so it can't be
-        # fooled by a `Closes #N` meaning another repo.
-        for ref in pr.get("closingIssuesReferences") or []:
-            if (n := ref.get("number")) is not None:
-                in_flight.add(n)
+        # (e.g. `codex/40-foo`) still dedups. The reference is same-repo scoped, so it can't
+        # be fooled by a `Closes #N` meaning another repo.
+        in_flight.update(pr.closing_issues)
         # Fallback: recognize the conventional branch even if no closing reference is declared.
-        if (n := issue_of_branch(pr.get("headRefName", ""))) is not None:
+        if (n := issue_of_branch(pr.head_ref_name)) is not None:
             in_flight.add(n)
     return in_flight
 
@@ -187,15 +181,16 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     an un-triaged one → `triage`/`scope`), refuses one already claimed or in flight, then
     submits the same durable Build record as the daemon. Provider launch, review, continuation,
     and permits remain behind the coordinator."""
-    # A single-issue read that pulls state alongside the build fields; the row is handed to the
-    # coordinator's build submission, which reads GitHub's own keys, so it goes through the hatch.
-    issue = github.api(["issue", "view", str(n), "--repo", cfg.repo,
-                        "--json", "number,title,body,labels,state"], parse_json=True)
-    if not isinstance(issue, dict):
+    # By-hand, one issue at a time: the whole-issue read is affordable here (the queue pass uses
+    # the lean discovery listing), and it answers the state and the build fields together.
+    view = github.issue_view(cfg.repo, n)
+    if view is None:
         return f"#{n}: not found in {cfg.repo}"
-    if issue.get("state") != "OPEN":
+    if view.state != "OPEN":
         return f"#{n}: closed — nothing to build"
-    labels = {lbl["name"] for lbl in issue.get("labels", [])}
+    issue = _row_dict(github.IssueRow(number=n, title=view.title, body=view.body,
+                                      labels=view.labels))
+    labels = view.labels
     if "ready-for-agent" not in labels:
         held = labels & HELD_LABELS
         if held:
@@ -526,24 +521,17 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
     """
     if force_same_tool and not maintainer_confirmed:
         return _SAME_TOOL_REVIEW_WARNING
-    data = github.api([
-        "pr", "view", str(pr), "--repo", cfg.repo,
-        "--json", "headRefName,headRefOid,closingIssuesReferences,state",
-    ], parse_json=True)
-    if not isinstance(data, dict) or data.get("state") != "OPEN":
+    facts = github.pr_facts(cfg.repo, pr)
+    if facts is None or facts.state != "OPEN":
         return "open PR facts unreadable"
-    branch, head = str(data.get("headRefName") or ""), str(data.get("headRefOid") or "")
+    branch, head = facts.head_ref_name, facts.head_ref_oid
     match = BUILD_BRANCH_RE.match(branch)
     if match is None or not head:
         return "PR is not on a recognized agentflow issue branch"
     builder_tool, branch_issue, slug = match.group(1), int(match.group(2)), match.group(3)
     if builder_tool not in {"claude", "codex"}:
         return "PR builder tool is unreadable"
-    closing = [
-        int(item["number"]) for item in data.get("closingIssuesReferences") or []
-        if isinstance(item, dict) and isinstance(item.get("number"), int)
-    ]
-    issue = closing[0] if closing else branch_issue
+    issue = facts.closing_issues[0] if facts.closing_issues else branch_issue
     acceptance = _issue_acceptance(cfg, issue)
     if acceptance is None:
         return "issue acceptance unreadable"

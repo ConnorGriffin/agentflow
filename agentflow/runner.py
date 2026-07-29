@@ -670,16 +670,13 @@ class CodexRunner(_WorktreeRunner):
 def _pr_state_for_branch(repo: str, branch: str) -> str | None:
     """The current state of the most recent PR for this branch across all states
     (OPEN, MERGED, or CLOSED), or None when no PR has ever been opened for it — or when
-    the lookup could not be made (fail-closed). Branch-scoped, all-state PR lookup has no
-    typed reader on the module, so it goes through the named ``api`` escape hatch."""
+    the lookup could not be made (fail-closed)."""
     from agentflow import github
 
-    rows = github.api(["pr", "list", "--repo", repo, "--head", branch,
-                       "--state", "all", "--json", "state"], parse_json=True)
-    if not isinstance(rows, list) or not rows:
+    rows = github.prs_for_branch(repo, branch)
+    if not rows:
         return None
-    state = rows[0].get("state") if isinstance(rows[0], dict) else None
-    return state if isinstance(state, str) and state else None
+    return rows[0].state or None
 
 
 def _registered_worktrees(workdir: str) -> list[tuple[str, str | None]] | None:

@@ -54,14 +54,20 @@ class _FakeGitHub:
 
     # --- GitHub module seam (ADR 0040) ------------------------------------------------
     def api(self, args, *, parse_json=False):
-        # Routed by leading verb — the GraphQL parent-map read vs. an issue snapshot — never by
-        # matching the read's field vector.
-        if args[0] == "api":                       # GraphQL parent-map read
-            return {"data": {"repository": {"issue": {"parent": {
-                "number": 4, "body": self.map_body,
-                "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
-        return {"state": self.state, "title": self.title, "comments": list(self.comments),
-                "url": f"https://github.com/o/r/issues/{self.number}"}
+        # The one escape-hatch read the finalizer still reaches through: the GraphQL parent-map
+        # lookup, which no typed single-fact method covers.
+        assert args[0] == "api", f"unexpected escape-hatch call: {args}"
+        return {"data": {"repository": {"issue": {"parent": {
+            "number": 4, "body": self.map_body,
+            "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
+
+    def issue_view(self, repo, number):
+        from agentflow import github
+        return github.IssueView(
+            title=self.title, body="", state=self.state,
+            url=f"https://github.com/o/r/issues/{self.number}",
+            labels=frozenset(self.labels),
+            comments=[github.Comment(body=c["body"], created_at="") for c in self.comments])
 
     def comment(self, repo, number, body):
         self.comments.append({"body": body})
@@ -94,6 +100,7 @@ class _FakeGitHub:
     def install(self, monkeypatch):
         from agentflow import github, loop
         monkeypatch.setattr(github, "api", self.api)
+        monkeypatch.setattr(github, "issue_view", self.issue_view)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
         monkeypatch.setattr(github, "edit_body", self.edit_body)

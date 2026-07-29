@@ -36,13 +36,11 @@ def park_pr_number(record) -> int | None:
     if parsed is None:
         return None
     _workdir, branch, _wt = parsed
-    # A Revise's builder branch PR may already be closed/merged, so this spans all states — not the
-    # typed open-only listing — and goes through the module's escape hatch; None stays unresolved.
-    prs = github.api(["pr", "list", "--repo", record.repo, "--head", branch, "--state", "all",
-                      "--json", "number", "--limit", "1"], parse_json=True)
-    if not isinstance(prs, list):
+    # A Revise's builder branch PR may already be closed or merged, so this spans all states.
+    prs = github.prs_for_branch(record.repo, branch, limit=1)
+    if prs is None:
         return None
-    return prs[0].get("number") if prs else None
+    return prs[0].number if prs else None
 
 
 def exact_head_review_chain(records, record) -> list:

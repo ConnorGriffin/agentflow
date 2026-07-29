@@ -142,20 +142,17 @@ def _settle_mockup(record) -> str | None:
     except (TypeError, ValueError):
         return None
     github.remove_label(record.repo, number, DRAWING)
-    # The proof read spans labels+url in one snapshot, which the typed surface does not offer, so
-    # it goes through the module's escape hatch; an unreadable read (None) retries next cycle.
-    state = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "labels,url"], parse_json=True)
-    if not isinstance(state, dict):
+    # An unreadable proof read (None) retries next cycle.
+    settlement = github.issue_settlement(record.repo, number)
+    if settlement is None:
         return None
-    labels = {label.get("name") for label in state.get("labels", [])}
-    if DRAWING in labels or "agentflow:needs-mockup" not in labels:
+    if DRAWING in settlement.labels or "agentflow:needs-mockup" not in settlement.labels:
         return None
     if wt.exists() and not remove_worktree_if_safe(workdir, wt):
         return None
     if wt.exists():
         return None
-    return state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
+    return settlement.url or f"https://github.com/{record.repo}/issues/{number}"
 
 
 def _hold_mockup(record) -> str | None:

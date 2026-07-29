@@ -128,9 +128,40 @@ def test_list_issues_empty_repo_vs_failed_listing(monkeypatch):
 
 def test_list_open_prs_returns_typed_rows(monkeypatch):
     _stub_json(monkeypatch, [
-        {"number": 9, "headRefName": "feature/x", "headRefOid": "abc123"}])
+        {"number": 9, "headRefName": "feature/x", "headRefOid": "abc123",
+         "closingIssuesReferences": [{"number": 40}]}])
     assert github.list_open_prs(REPO) == [
-        github.PrRow(number=9, head_ref_name="feature/x", head_ref_oid="abc123")]
+        github.PrRow(number=9, head_ref_name="feature/x", head_ref_oid="abc123",
+                     closing_issues=(40,))]
+
+
+def test_an_open_pr_declaring_no_closing_issue_reads_as_none_declared(monkeypatch):
+    _stub_json(monkeypatch, [{"number": 9, "headRefName": "feature/x", "headRefOid": "abc"}])
+    assert github.list_open_prs(REPO)[0].closing_issues == ()
+
+
+def test_prs_for_branch_spans_every_state_and_fails_closed(monkeypatch):
+    _stub_json(monkeypatch, [
+        {"number": 9, "state": "MERGED", "headRefName": "feature/x", "url": "u"}])
+    assert github.prs_for_branch(REPO, "feature/x") == [
+        github.BranchPrRow(number=9, state="MERGED", head_ref_name="feature/x", url="u")]
+    _stub_json(monkeypatch, [])
+    assert github.prs_for_branch(REPO, "feature/x") == []   # the branch never had a PR
+    _stub(monkeypatch, returncode=1)
+    assert github.prs_for_branch(REPO, "feature/x") is None  # ...distinct from unreadable
+
+
+def test_claimed_issues_drops_pull_requests_sharing_the_number_sequence(monkeypatch):
+    _stub_json(monkeypatch, [
+        {"number": 7, "updated_at": "2020-01-01T00:00:00Z"},
+        {"number": 9, "updated_at": "2020-01-01T00:00:00Z",
+         "pull_request": {"url": "https://api.github.com/repos/owner/repo/pulls/9"}}])
+    assert github.claimed_issues(REPO, "agentflow:building") == [
+        github.ClaimedIssue(number=7, updated_at="2020-01-01T00:00:00Z")]
+    _stub_json(monkeypatch, [])
+    assert github.claimed_issues(REPO, "agentflow:building") == []   # no claims out there
+    _stub(monkeypatch, returncode=1)
+    assert github.claimed_issues(REPO, "agentflow:building") is None  # ...vs unreadable
 
 
 def test_list_open_prs_failure_is_unknown(monkeypatch):
@@ -149,6 +180,93 @@ def test_search_failure_is_unknown_not_no_change(monkeypatch):
     assert github.search([REPO], "2026-07-18T00:00:00Z") is None
 
 
+# --- the combined reads the stages weigh as one snapshot ------------------------
+
+def test_issue_headline_pairs_title_with_labels_and_fails_closed(monkeypatch):
+    _stub_json(monkeypatch, {"title": "Scoped", "labels": [{"name": "ready-for-agent"}]})
+    assert github.issue_headline(REPO, 5) == github.IssueHeadline(
+        title="Scoped", labels=frozenset({"ready-for-agent"}))
+    _stub(monkeypatch, returncode=1)
+    assert github.issue_headline(REPO, 5) is None
+
+
+def test_issue_settlement_pairs_labels_with_the_url_and_fails_closed(monkeypatch):
+    _stub_json(monkeypatch, {"labels": [], "url": "https://github.com/owner/repo/issues/5"})
+    settled = github.issue_settlement(REPO, 5)
+    assert settled == github.IssueSettlement(
+        labels=frozenset(), url="https://github.com/owner/repo/issues/5")
+    _stub(monkeypatch, returncode=1)
+    assert github.issue_settlement(REPO, 5) is None
+
+
+def test_issue_view_reads_the_whole_issue_and_fails_closed(monkeypatch):
+    _stub_json(monkeypatch, {
+        "title": "t", "body": "b", "state": "CLOSED", "url": "u",
+        "labels": [{"name": "wayfinder:research"}],
+        "comments": [{"body": "findings", "createdAt": "2026-07-19T01:00:00Z"}]})
+    assert github.issue_view(REPO, 5) == github.IssueView(
+        title="t", body="b", state="CLOSED", url="u",
+        labels=frozenset({"wayfinder:research"}),
+        comments=[github.Comment(body="findings", created_at="2026-07-19T01:00:00Z")])
+    _stub(monkeypatch, returncode=1)
+    assert github.issue_view(REPO, 5) is None
+
+
+def test_issue_url_reads_and_fails_closed(monkeypatch):
+    _stub_json(monkeypatch, {"url": "https://github.com/owner/repo/issues/5"})
+    assert github.issue_url(REPO, 5) == "https://github.com/owner/repo/issues/5"
+    _stub(monkeypatch, returncode=1)
+    assert github.issue_url(REPO, 5) is None
+
+
+@pytest.mark.parametrize("payload", [{}, {"isDraft": "true"}])
+def test_a_draft_answer_that_is_not_a_yes_or_no_is_unknown(monkeypatch, payload):
+    # A read missing the field, or carrying a non-boolean, leaves the draft state unknown —
+    # the merge gate must be able to tell that apart from a confirmed "not a draft".
+    _stub_json(monkeypatch, payload)
+    assert github.pr_is_draft(REPO, 9) is None
+
+
+def test_pr_is_draft_reads_both_answers_and_fails_closed(monkeypatch):
+    _stub_json(monkeypatch, {"isDraft": True})
+    assert github.pr_is_draft(REPO, 9) is True
+    _stub_json(monkeypatch, {"isDraft": False})
+    assert github.pr_is_draft(REPO, 9) is False
+    _stub(monkeypatch, returncode=1)
+    assert github.pr_is_draft(REPO, 9) is None
+
+
+def test_pr_facts_reads_head_state_and_declared_closing_issues(monkeypatch):
+    _stub_json(monkeypatch, {
+        "headRefName": "agentflow/claude/issue-7-fix", "headRefOid": "abc123",
+        "state": "OPEN", "closingIssuesReferences": [{"number": 7}, {"number": "bad"}]})
+    assert github.pr_facts(REPO, 9) == github.PrFacts(
+        head_ref_name="agentflow/claude/issue-7-fix", head_ref_oid="abc123",
+        state="OPEN", closing_issues=(7,))
+    _stub(monkeypatch, returncode=1)
+    assert github.pr_facts(REPO, 9) is None
+
+
+def test_pr_content_reads_body_paths_and_thread_and_fails_closed(monkeypatch):
+    _stub_json(monkeypatch, {
+        "body": "what changed", "files": [{"path": "webui/app.svelte"}, {"path": ""}],
+        "comments": [{"body": "a note", "createdAt": "2026-07-19T01:00:00Z"}]})
+    assert github.pr_content(REPO, 9) == github.PrContent(
+        body="what changed", paths=("webui/app.svelte",),
+        comments=[github.Comment(body="a note", created_at="2026-07-19T01:00:00Z")])
+    _stub(monkeypatch, returncode=1)
+    assert github.pr_content(REPO, 9) is None
+
+
+def test_checks_that_could_not_be_confirmed_are_not_passed(monkeypatch):
+    # Unlike the reads, this has no unknown: `gh pr checks` exits non-zero while any check is
+    # pending, failed or unreadable, and the merge gate wants exactly that fail-safe answer.
+    _stub(monkeypatch, returncode=0)
+    assert github.pr_checks_passed(REPO, 9) is True
+    _stub(monkeypatch, returncode=1)
+    assert github.pr_checks_passed(REPO, 9) is False
+
+
 # --- writes report only what the command did ------------------------------------
 
 @pytest.mark.parametrize("call", [
@@ -162,6 +280,8 @@ def test_search_failure_is_unknown_not_no_change(monkeypatch):
     lambda: github.close(REPO, 5),
     lambda: github.pr_ready(REPO, 9),
     lambda: github.create_label(REPO, "agentflow:building", "fbca04"),
+    lambda: github.create_label(REPO, "agentflow:building", "fbca04", "the change claim"),
+    lambda: github.merge_pr(REPO, 9),
 ])
 def test_writes_report_success_and_failure(monkeypatch, call):
     _stub(monkeypatch, returncode=0)

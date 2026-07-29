@@ -6,7 +6,8 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_build, coordinated_mockup, loop, stage_worktree, worktree_ref
+from agentflow import (coordinated_build, coordinated_mockup, github, loop, stage_worktree,
+                       worktree_ref)
 from agentflow.coordinator import MockupStageAdapter, StageRouter
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator import tracer
@@ -340,12 +341,12 @@ def test_completed_mockup_releases_claim_keeps_human_boundary_and_disposes_workt
         labels.discard(label)
         return True
 
-    def api(args, *, parse_json=False):
-        return {"labels": [{"name": label} for label in labels],
-                "url": "https://github.com/o/r/issues/11"}
+    def settlement(repo, number):
+        return github.IssueSettlement(labels=frozenset(labels),
+                                      url="https://github.com/o/r/issues/11")
 
     monkeypatch.setattr("agentflow.github.remove_label", remove_label)
-    monkeypatch.setattr("agentflow.github.api", api)
+    monkeypatch.setattr("agentflow.github.issue_settlement", settlement)
     monkeypatch.setattr("agentflow.coordinated_mockup.remove_worktree_if_safe",
                         lambda workdir, path: (path.rmdir() is None))
     rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,

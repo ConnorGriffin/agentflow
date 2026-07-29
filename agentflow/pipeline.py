@@ -23,7 +23,6 @@ import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
 
 from agentflow import (coordinated_build, coordinated_converse, coordinated_intake,
                        coordinated_mockup, coordinated_research, coordinated_respond,
@@ -70,26 +69,6 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
     }
 
 
-def _issues_labelled(repo: str, label: str) -> list[dict] | None:
-    """Open issues carrying ``label``, with the number and last-touched time reconciliation
-    needs, or ``None`` when the listing could not be read.
-
-    This is a REST read on purpose. The equivalent ``gh issue list --label`` is answered by
-    GitHub's *search*, whose ceiling is about 30 requests a minute — far below what one
-    reconciliation pass costs across a fleet (four lanes per repo, every cycle), so the lane
-    starved permanently once the fleet grew. The REST issues endpoint filters by label from the
-    ordinary hourly budget instead. It also returns pull requests, which carry numbers from the
-    same sequence as issues, so those are dropped — a PR must never be read as an issue's claim.
-    """
-    listed = github.api(
-        ["api", f"repos/{repo}/issues?state=open&labels={quote(label)}&per_page=100"],
-        parse_json=True)
-    if not isinstance(listed, list):
-        return None
-    return [item for item in listed
-            if isinstance(item, dict) and "pull_request" not in item]
-
-
 def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
     """Clear visible claims only after coordinator reconciliation proves them orphaned.
 
@@ -113,17 +92,15 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
                    ("resolving", RESOLVING))
     cleared = 0
     for lane, label in lane_labels:
-        claimed = _issues_labelled(cfg.repo, label)
+        claimed = github.claimed_issues(cfg.repo, label)
         if claimed is None:
             _log(f"{cfg.repo}: {lane} claim reconciliation deferred — GitHub unreadable")
             continue
         for issue in claimed:
-            number = issue.get("number")
-            if not isinstance(number, int):
-                continue
+            number = issue.number
             try:
                 updated = datetime.fromisoformat(
-                    str(issue.get("updated_at", "")).replace("Z", "+00:00")).timestamp()
+                    issue.updated_at.replace("Z", "+00:00")).timestamp()
             except ValueError:
                 continue
             if time.time() - updated < _ORPHAN_CLAIM_GRACE_SECONDS:

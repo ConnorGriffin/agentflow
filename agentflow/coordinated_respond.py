@@ -155,18 +155,16 @@ def _settle_respond(record) -> str | None:
     except (TypeError, ValueError):
         return None
     github.remove_label(record.repo, number, BUILDING)
-    # Labels+url in one snapshot isn't on the typed surface, so this proof read goes through the
-    # module's escape hatch; None means unreadable — retry rather than retire over a live claim.
-    state = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "labels,url"], parse_json=True)
-    if not isinstance(state, dict):
+    # An unreadable proof read means retry rather than retire over a live claim.
+    settlement = github.issue_settlement(record.repo, number)
+    if settlement is None:
         return None
-    if BUILDING in {label.get("name") for label in state.get("labels", [])}:
+    if BUILDING in settlement.labels:
         return None   # the claim label is still present — retry rather than retire over it
     pr = park_pr_number(record)
     if pr is not None:
         return f"https://github.com/{record.repo}/pull/{pr}"
-    return state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
+    return settlement.url or f"https://github.com/{record.repo}/issues/{number}"
 
 
 def _park_respond(record) -> str | None:

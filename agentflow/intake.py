@@ -609,14 +609,12 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult,
     """Verify that the routing decision is visible on GitHub before disposal."""
     if result.route is IntakeRoute.NOTHING_NEW:
         return True
-    # Title+body+labels+comments in one read doesn't fit the typed single-field surface, so
-    # this verification reads through the escape hatch and owns GitHub's shape for this call.
-    issue = github.api(["issue", "view", str(issue_number), "--repo", repo,
-                        "--json", "title,body,labels,comments"], parse_json=True)
-    if not isinstance(issue, dict):
+    # One whole-issue snapshot: a route is only visible if title, labels, comment and body agree
+    # at the same moment, so a proof assembled from separate reads would be no proof.
+    issue = github.issue_view(repo, issue_number)
+    if issue is None:
         return False
-    labels = {label.get("name") for label in issue.get("labels", [])
-              if isinstance(label, dict)}
+    labels = issue.labels
     required = set(intake_labels(result))
     if not required.issubset(labels):
         return False
@@ -626,17 +624,15 @@ def intake_result_is_durable(repo: str, issue_number: int, result: IntakeResult,
            and name not in required for name in labels):
         return False
     expected_title = result.title or source_title
-    if expected_title is not None and issue.get("title") != expected_title:
+    if expected_title is not None and issue.title != expected_title:
         return False
-    comments = [comment.get("body", "") for comment in issue.get("comments", [])
-                if isinstance(comment, dict)]
-    if not any(_comment_matches_result(comment, result) for comment in comments):
+    if not any(_comment_matches_result(comment.body, result) for comment in issue.comments):
         return False
     if result.route is IntakeRoute.READY:
         # Prove the EXACT canonical composed body — the brief over the preserved original —
         # not just that the brief appears somewhere. `compose_ready_body` is idempotent on an
         # already-composed body, so the durable body must equal composing the brief over itself.
-        body = issue.get("body") or ""
+        body = issue.body
         if not _ready_body_is_canonical(body, result.body):
             return False
         if source_body is not None:

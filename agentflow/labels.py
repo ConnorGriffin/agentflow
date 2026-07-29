@@ -99,10 +99,7 @@ def claim(repo: str, n: int, label: str) -> bool:
     establish this guard, and `wayfinder:resolving` is shared, so a human session and the
     daemon never both grab the same ticket."""
     colour, description = _CLAIM_LABELS[label]
-    # The typed `create_label` write carries no description; these claim labels want one, so the
-    # create goes through the module's escape hatch while the add-label is the typed write.
-    if github.api(["label", "create", label, "--repo", repo, "--color", colour,
-                   "--description", description, "--force"]) is None:
+    if not github.create_label(repo, label, colour, description):
         return False
     return github.add_label(repo, n, label)
 

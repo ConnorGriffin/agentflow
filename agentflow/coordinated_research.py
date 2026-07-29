@@ -274,30 +274,27 @@ def resolve(record) -> str | None:
     if findings is None:
         return None  # verify proved findings exist; if the artifact is gone, retry rather than retire
     repo = record.repo
-    # The idempotency read spans state+title+comments+url in one snapshot, which the typed surface
-    # does not offer, so it goes through the module's escape hatch; an unreadable read (None) retries.
-    issue = github.api(["issue", "view", str(number), "--repo", repo,
-                        "--json", "state,title,comments,url"], parse_json=True)
-    if not isinstance(issue, dict):
+    # One whole-issue snapshot carries the idempotency facts together; an unreadable read retries.
+    issue = github.issue_view(repo, number)
+    if issue is None:
         return None
     marker = _findings_marker(number)
-    if not any(marker in c.get("body", "") for c in issue.get("comments", [])):
+    if not any(marker in c.body for c in issue.comments):
         body = f"{_RESEARCH_DISCLAIMER}\n{marker}\n\n{findings}"
         if not github.comment(repo, number, body):
             return None
-    if not _append_map_decision(repo, number, issue.get("title", "")):
+    if not _append_map_decision(repo, number, issue.title):
         return None
-    if issue.get("state") != "CLOSED":
+    if issue.state != "CLOSED":
         if not github.close(repo, number):
             return None
     if not release_claim(repo, number, RESOLVING):
         return None
-    final = github.api(["issue", "view", str(number), "--repo", repo,
-                        "--json", "state,comments,url"], parse_json=True)
-    if not isinstance(final, dict):
+    final = github.issue_view(repo, number)
+    if final is None:
         return None
-    has_comment = any(marker in c.get("body", "") for c in final.get("comments", []))
-    if final.get("state") != "CLOSED" or not has_comment:
+    has_comment = any(marker in c.body for c in final.comments)
+    if final.state != "CLOSED" or not has_comment:
         return None
     # Resolution is durable — remove the isolated worktree so resolved runs don't accumulate.
     ref = WorktreeRef.parse(record.source)
@@ -305,7 +302,7 @@ def resolve(record) -> str | None:
         wt = Path(ref.path)
         if wt.exists():
             _run(["git", "-C", ref.workdir, "worktree", "remove", "--force", str(wt)])
-    return final.get("url") or f"https://github.com/{repo}/issues/{number}"
+    return final.url or f"https://github.com/{repo}/issues/{number}"
 
 
 def release(record) -> str | None:
@@ -321,8 +318,5 @@ def release(record) -> str | None:
         return None
     if not release_claim(record.repo, number, RESOLVING):
         return None
-    viewed = github.api(["issue", "view", str(number), "--repo", record.repo, "--json", "url"],
-                        parse_json=True)
-    if isinstance(viewed, dict) and viewed.get("url"):
-        return viewed["url"]
-    return f"https://github.com/{record.repo}/issues/{number}"
+    return (github.issue_url(record.repo, number)
+            or f"https://github.com/{record.repo}/issues/{number}")

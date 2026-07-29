@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -159,8 +160,8 @@ def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     # The four claim lanes are listed in order (building, triaging, drawing, resolving); only the
     # building lane holds a stale-claimed issue. The proof read back shows the label gone.
-    listings = iter([[{"number": 7, "updated_at": "2020-01-01T00:00:00Z"}], [], [], []])
-    monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
+    listings = iter([[github.ClaimedIssue(7, "2020-01-01T00:00:00Z")], [], [], []])
+    monkeypatch.setattr(github, "claimed_issues", lambda repo, label: next(listings))
     removed = []
     monkeypatch.setattr(github, "remove_label",
                         lambda repo, issue, label: removed.append((issue, label)) or True)
@@ -173,33 +174,31 @@ def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch
 def test_claim_reconciliation_reads_labels_off_the_hourly_budget_not_search(monkeypatch):
     """Reconciliation runs four lanes per repo every cycle. Asking GitHub's search for each one
     exceeds its ~30/minute ceiling across a fleet and starves the lane permanently, so the listing
-    must be an ordinary REST read. That endpoint also returns pull requests, which share the issue
-    number sequence — one must never be mistaken for a claimed issue."""
+    must be the module's off-search claim read — whose own contract (`github.claimed_issues`)
+    keeps it on REST and drops the pull requests that share the issue number sequence."""
     from agentflow import coordinated_build, github
 
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     asked = []
 
-    def listing(args, *, parse_json=False):
-        asked.append(args)
-        if "building" not in args[-1]:
+    def listing(repo, label):
+        asked.append((repo, label))
+        if label != "agentflow:building":
             return []
-        return [
-            {"number": 7, "updated_at": "2020-01-01T00:00:00Z"},
-            {"number": 9, "updated_at": "2020-01-01T00:00:00Z",
-             "pull_request": {"url": "https://api.github.com/repos/o/r/pulls/9"}},
-        ]
+        return [github.ClaimedIssue(7, "2020-01-01T00:00:00Z")]
 
-    monkeypatch.setattr(github, "api", listing)
+    monkeypatch.setattr(github, "claimed_issues", listing)
+    monkeypatch.setattr(github, "api",
+                        lambda *a, **k: pytest.fail("no lane may reach for the escape hatch"))
     removed = []
     monkeypatch.setattr(github, "remove_label",
                         lambda repo, issue, label: removed.append(issue) or True)
     monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
     assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
-    assert removed == [7], "the pull request must not be read as a claimed issue"
-    assert all(call[0] == "api" and call[1].startswith("repos/o/r/issues?") for call in asked)
-    assert not any("issue" == call[0] and "list" == call[1] for call in asked)
+    assert removed == [7]
+    assert asked == [("o/r", "agentflow:building"), ("o/r", "agentflow:triaging"),
+                     ("o/r", "agentflow:drawing-mockup"), ("o/r", "wayfinder:resolving")]
 
 
 def test_unreadable_coordinator_state_clears_no_claim(monkeypatch):
@@ -208,7 +207,7 @@ def test_unreadable_coordinator_state_clears_no_claim(monkeypatch):
 
     monkeypatch.setattr(pipeline.tracer, "load_records",
                         lambda: (_ for _ in ()).throw(StoreUnavailable("locked")))
-    monkeypatch.setattr(github, "api",
+    monkeypatch.setattr(github, "claimed_issues",
                         lambda *a, **k: pytest.fail("must not inspect or clear claims"))
     monkeypatch.setattr(github, "remove_label",
                         lambda *a, **k: pytest.fail("must not clear claims"))
@@ -226,9 +225,9 @@ def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
                   repo="o/r", subject="8", state=HELD, claim=False)
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [waiting, held])
     # The building lane lists both issues; #7 is shielded by the live waiting build, #8 is not.
-    listings = iter([[{"number": 7, "updated_at": "2020-01-01T00:00:00Z"},
-                      {"number": 8, "updated_at": "2020-01-01T00:00:00Z"}], [], [], []])
-    monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
+    listings = iter([[github.ClaimedIssue(7, "2020-01-01T00:00:00Z"),
+                      github.ClaimedIssue(8, "2020-01-01T00:00:00Z")], [], [], []])
+    monkeypatch.setattr(github, "claimed_issues", lambda repo, label: next(listings))
     removed = []
     monkeypatch.setattr(github, "remove_label",
                         lambda repo, issue, label: removed.append(issue) or True)
@@ -804,6 +803,60 @@ def test_no_module_outside_the_github_module_shells_out_to_gh():
             if isinstance(first, ast.Constant) and first.value == "gh":
                 assert path == root / "github.py", (
                     f"GitHub access outside the github module: {path}:{node.lineno}")
+
+
+# GitHub's own wire field names. Each is now read exclusively inside `github.py` and handed
+# back as a typed row field, so a reappearance anywhere else is a stage re-learning GitHub's
+# schema. `createdAt` is deliberately absent: three sites still read raw comment rows for the
+# `author` the typed comment does not carry, and weakening this rule to accommodate them would
+# be worse than naming the gap.
+_GITHUB_WIRE_FIELDS = {
+    "headRefOid", "headRefName", "isDraft", "reviewDecision", "statusCheckRollup",
+    "closingIssuesReferences", "mergedAt", "mergeCommit", "updatedAt",
+}
+
+# Instruction text telling a review agent which `gh` command to run is not GitHub access:
+# these two modules are prompts handed to a session, not callers reading a PR.
+_PROMPT_MODULES = {"reviewer.py", "prompts.py"}
+
+
+def _docstrings(tree: ast.AST) -> set[int]:
+    """Every module/class/function docstring in ``tree``. Prose that names a field is
+    describing the seam, not crossing it."""
+    ids = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                 ast.AsyncFunctionDef)):
+            continue
+        first = node.body[0] if node.body else None
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str)):
+            ids.add(id(first.value))
+    return ids
+
+
+def test_github_wire_field_names_never_leave_the_github_module():
+    """ADR 0040's other half — the *schema* seam. `gh` argument vectors already cannot be built
+    outside `github.py`; neither may GitHub's own field names be spoken outside it.
+
+    A stage that writes `headRefOid` is re-deriving GitHub's schema at a site with no business
+    owning it — and, worse, re-deriving with it the fail-closed rule for a read that failed.
+    This repo decides merges: that rule gets one owner, or it gets silently wrong somewhere."""
+    root = Path(__file__).parents[1] / "agentflow"
+    for path in root.rglob("*.py"):
+        if path == root / "github.py" or path.name in _PROMPT_MODULES:
+            continue
+        tree = ast.parse(path.read_text())
+        exempt = _docstrings(tree)
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                continue
+            if id(node) in exempt:
+                continue
+            leaked = _GITHUB_WIRE_FIELDS.intersection(re.split(r"[^A-Za-z]+", node.value))
+            assert not leaked, (
+                f"GitHub wire field {sorted(leaked)} outside the github module: "
+                f"{path}:{node.lineno}")
 
 
 def _loop_imports(tree: ast.AST):

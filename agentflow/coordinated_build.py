@@ -108,15 +108,12 @@ def _pr_exists(record) -> bool:
     if parsed is None:
         return False
     _workdir, branch, _wt = parsed
-    # A PR opened for this branch in *any* state (open/closed/merged) is the Build outcome, which
-    # the typed open-only listing cannot express, so this goes through the module's escape hatch. An
+    # A PR opened for this branch in *any* state (open/closed/merged) is the Build outcome. An
     # unreadable read stays unknown — raise rather than mistake it for an absent PR (ADR 0040).
-    data = github.api(["pr", "list", "--repo", record.repo, "--head", branch,
-                       "--state", "all", "--json", "headRefName,url", "--limit", "1"],
-                      parse_json=True)
-    if not isinstance(data, list):
+    prs = github.prs_for_branch(record.repo, branch, limit=1)
+    if prs is None:
         raise RuntimeError(f"cannot verify Build PR outcome for {record.repo}:{branch}")
-    return any(pr.get("headRefName") == branch for pr in data)
+    return any(pr.head_ref_name == branch for pr in prs)
 
 
 _COLLISION_MARK = "INTEGRATION-COLLISION"
@@ -196,15 +193,12 @@ def _hold_build(record) -> str | None:
     result = held_build_result(status, f"the retained worktree `{record.source}`")
 
     def project() -> None:
-        # Title+labels in one live read through the named escape hatch (ADR 0040); a read that
-        # couldn't reach GitHub leaves the hold unprojected, so the envelope proves no marker
-        # and retries next cycle rather than holding over an empty read.
-        issue = github.api(["issue", "view", str(number), "--repo", record.repo,
-                            "--json", "title,labels"], parse_json=True)
-        if not isinstance(issue, dict):
+        # A read that couldn't reach GitHub leaves the hold unprojected, so the envelope proves
+        # no marker and retries next cycle rather than holding over an empty read.
+        live = github.issue_headline(record.repo, number)
+        if live is None:
             return
-        apply_intake(record.repo, number, issue.get("title", ""),
-                     [label.get("name", "") for label in issue.get("labels", [])], result)
+        apply_intake(record.repo, number, live.title, sorted(live.labels), result)
 
     headline = ("Build hit an integration collision" if record.hold_reason == "integration collision"
                 else "Build continuation budget exhausted")

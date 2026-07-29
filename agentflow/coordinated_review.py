@@ -475,17 +475,10 @@ def _review_follow_ups_valid(record, verdict) -> bool:
     if not verdict.follow_ups:
         return True
 
-    def view(number):
-        return github.api(["issue", "view", str(number), "--repo", record.repo,
-                           "--json", "number,url"], parse_json=True)
-
-    def search(query):
-        return github.api(["issue", "list", "--repo", record.repo, "--state", "all",
-                           "--search", query, "--json", "number", "--limit", "100"],
-                          parse_json=True)
-
     return validate_follow_ups(
-        record.repo, verdict.follow_ups, issue_view=view, issue_search=search)
+        record.repo, verdict.follow_ups,
+        issue_url=lambda number: github.issue_url(record.repo, number),
+        issue_search=lambda query: github.find_issues(record.repo, query, limit=100))
 
 # Consecutive review-prepare failures per source path, so a genuinely stuck
 # review (one that never checks out) is surfaced periodically instead of silently
@@ -660,16 +653,12 @@ def _review_pr_facts(record) -> dict | None:
     if facts is None:
         return None
     _workdir, pr = facts
-    # Head SHA + state in one snapshot doesn't fit the typed surface, so this read goes through the
-    # module's escape hatch; None means GitHub was unreadable (ADR 0040).
-    data = github.api(["pr", "view", str(pr), "--repo", record.repo,
-                       "--json", "headRefOid,state"], parse_json=True)
-    if not isinstance(data, dict):
+    live = github.pr_facts(record.repo, pr)
+    if live is None:
         return None
-    head, state = data.get("headRefOid"), data.get("state")
-    if not isinstance(head, str) or not head or state not in {"OPEN", "CLOSED", "MERGED"}:
+    if not live.head_ref_oid or live.state not in {"OPEN", "CLOSED", "MERGED"}:
         return None
-    return {"head": head, "state": state}
+    return {"head": live.head_ref_oid, "state": live.state}
 
 
 def _review_pr_head(record) -> str | None:
@@ -904,9 +893,8 @@ def _review_assignment_facts(repo: str, pr_number: int, *, conflict_resolution: 
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, assign_depth, proposed_depth)
 
-    data = github.api(["pr", "view", str(pr_number), "--repo", repo,
-                       "--json", "body,files"], parse_json=True)
-    if not isinstance(data, dict):
+    content = github.pr_content(repo, pr_number)
+    if content is None:
         if profile == "guarded":
             return ReviewAssignment(
                 ReviewDepth.FULL, "guarded profile requires Full review",
@@ -914,11 +902,9 @@ def _review_assignment_facts(repo: str, pr_number: int, *, conflict_resolution: 
         return ReviewAssignment(
             ReviewDepth.TARGETED, "PR depth proposal was unreadable",
             ReviewAxis.COMBINED), ()
-    body = str(data.get("body") or "")
+    body = content.body
     proposal = proposed_depth(body)
-    paths = tuple(
-        str(item.get("path")) for item in data.get("files", [])
-        if isinstance(item, dict) and item.get("path"))
+    paths = content.paths
     assignment = assign_depth(
         proposal.depth.value, proposal.reason, paths, context=body,
         guarded=profile == "guarded")

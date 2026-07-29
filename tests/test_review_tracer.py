@@ -1252,11 +1252,14 @@ def _diverged_review(*, target, subject="7", pool="codex", builder_lineage="clau
 
 
 def _gh_pr(state, head):
-    """A faked GitHub edge: the PR's live head and state come back through the module's escape
-    hatch (ADR 0040), the way the diverged-review reconciler reads them — never a gh shellout."""
-    def api(args, *, parse_json=False):
-        return {"headRefOid": head, "state": state}
-    return api
+    """A faked GitHub edge: the PR's live head and state come back as the module's typed PR
+    facts, the way the diverged-review reconciler reads them — never a gh shellout."""
+    from agentflow import github
+
+    def pr_facts(repo, pr):
+        return github.PrFacts(head_ref_name="", head_ref_oid=head, state=state,
+                              closing_issues=())
+    return pr_facts
 
 
 def test_a_merged_pr_retires_the_stranded_review_silently(make_coord, monkeypatch):
@@ -1267,7 +1270,7 @@ def test_a_merged_pr_retires_the_stranded_review_silently(make_coord, monkeypatc
     fake.gate_open = False  # isolate the divergence pass from admission
     coord = make_coord(fake)
     ident = coord.submit_stage(_diverged_review(target="stale-sha"))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("MERGED", "merged-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1288,7 +1291,7 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     fake.gate_open = False
     coord = make_coord(fake)
     stale = coord.submit_stage(_diverged_review(target="stale-sha", round=0))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
     choices = []
@@ -1331,7 +1334,7 @@ def test_a_running_moved_head_review_terminates_before_opening_its_successor(mak
     monkeypatch.setattr(coord, "submit_stage",
                         lambda submission: events.append(("submit", submission.target))
                         or submit_stage(submission))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
     monkeypatch.setattr(coordinated_review, "pick_reviewer", lambda tool, **kwargs: "codex")
 
@@ -1354,7 +1357,7 @@ def test_a_running_review_is_not_killed_for_its_own_clean_push(make_coord, monke
                         lambda _record, head: head == "fixed-sha")
     monkeypatch.setattr(coordinated_review, "_kill_running_family",
                         lambda rec: killed.append(rec.identity))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "fixed-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("OPEN", "fixed-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1371,7 +1374,7 @@ def test_a_moved_head_parks_once_when_the_revise_rounds_are_spent(make_coord, mo
     fake.gate_open = False
     coord = make_coord(fake)
     ident = coord.submit_stage(_diverged_review(target="stale-sha", round=MAX_REVISES))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1392,7 +1395,7 @@ def test_an_unmoved_head_is_left_to_the_normal_review_flow(make_coord, monkeypat
     fake.gate_open = False
     coord = make_coord(fake)
     ident = coord.submit_stage(_diverged_review(target="live-sha", round=0))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1424,7 +1427,7 @@ def test_a_running_diverged_review_terminates_its_family_before_retiring(make_co
     killed = []
     monkeypatch.setattr(coordinated_review, "_kill_running_family",
                         lambda rec: killed.append(rec.identity))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("MERGED", "merged-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1451,7 +1454,7 @@ def test_kill_failure_does_not_block_the_retire(make_coord, monkeypatch):
             raise OSError("no such process")
 
     monkeypatch.setattr(coordinated_review.os, "kill", raise_on_sigterm)
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("MERGED", "merged-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1472,7 +1475,7 @@ def test_a_waiting_diverged_review_does_not_attempt_a_kill(make_coord, monkeypat
     killed = []
     monkeypatch.setattr(coordinated_review, "_kill_running_family",
                         lambda rec: killed.append(rec.identity))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("MERGED", "merged-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1496,7 +1499,7 @@ def test_a_completed_diverged_review_does_not_attempt_a_kill(make_coord, monkeyp
     monkeypatch.setattr(coordinated_review, "_kill_running_family",
                         lambda rec: killed.append(rec.identity))
     monkeypatch.setattr(coordinated_review, "_review_verdict", lambda _rec: Verdict(clean=True))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("MERGED", "merged-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("MERGED", "merged-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1515,7 +1518,7 @@ def test_a_running_diverged_review_terminates_its_family_before_parking(make_coo
     killed = []
     monkeypatch.setattr(coordinated_review, "_kill_running_family",
                         lambda rec: killed.append(rec.identity))
-    monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
 
     pipeline.reconcile_and_project(coord)
@@ -1594,9 +1597,9 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
     parked = record_of(coord, parked_id)
     assert parked.state == "held" and parked.retired is False and parked.claim is False
 
-    monkeypatch.setattr(loop.github, "api", lambda *args, **kwargs: {
-        "state": "OPEN", "headRefName": "agentflow/codex/issue-7-x", "headRefOid": "sha-a",
-        "closingIssuesReferences": [{"number": 7}]})
+    monkeypatch.setattr(loop.github, "pr_facts", lambda repo, pr: loop.github.PrFacts(
+        head_ref_name="agentflow/codex/issue-7-x", head_ref_oid="sha-a",
+        state="OPEN", closing_issues=(7,)))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(coordinated_review, "_review_assignment_facts",

@@ -574,12 +574,12 @@ def test_settle_respond_releases_the_building_claim_and_proves_it(monkeypatch):
         labels.clear()
         return True
 
-    def api(args, *, parse_json=False):
-        return {"labels": [{"name": n} for n in labels],
-                "url": "https://github.com/o/r/issues/7"}
+    def settlement(repo, number):
+        return github.IssueSettlement(labels=frozenset(labels),
+                                      url="https://github.com/o/r/issues/7")
 
     monkeypatch.setattr("agentflow.github.remove_label", remove_label)
-    monkeypatch.setattr("agentflow.github.api", api)
+    monkeypatch.setattr("agentflow.github.issue_settlement", settlement)
     monkeypatch.setattr(coordinated_respond, "park_pr_number", lambda record: 42)
     assert coordinated_respond._settle_respond(rec) == "https://github.com/o/r/pull/42"
     assert removed == ["agentflow:building"]                       # the change claim is dropped

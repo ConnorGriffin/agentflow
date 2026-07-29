@@ -37,8 +37,8 @@ def _R(returncode=0, stdout=""):
 class FakeGitHub:
     """A stateful stand-in for the ticket, its parent Decision Map, and the shared claim. The
     finalizer's GitHub reads/writes are stated through the GitHub module's helpers (ADR 0040) —
-    the typed ``comment``/``close``/``edit_body`` writes and the ``api`` escape hatch — never by
-    matching a ``gh`` argument vector. ``run`` stands in for ``coordinated_research._run`` for the git worktree
+    the typed ``issue_view`` read, the typed ``comment``/``close``/``edit_body`` writes and the
+    ``api`` escape hatch — never by matching a ``gh`` argument vector. ``run`` stands in for ``coordinated_research._run`` for the git worktree
     cleanup that remains loop-owned."""
 
     def __init__(self, *, state="OPEN", title="Audit the widget path",
@@ -53,14 +53,20 @@ class FakeGitHub:
 
     # --- GitHub module seam (ADR 0040) ------------------------------------------------
     def api(self, args, *, parse_json=False):
-        # The two escape-hatch reads the finalizer still reaches through — routed by their leading
-        # verb (a GraphQL parent-map lookup vs. an issue snapshot), never by matching a field vector.
-        if args[0] == "api":                       # GraphQL parent-map read
-            return {"data": {"repository": {"issue": {"parent": {
-                "number": self.map_number, "body": self.map_body,
-                "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
-        return {"state": self.state, "title": self.title, "comments": list(self.comments),
-                "url": f"https://github.com/{REPO}/issues/{args[2]}"}
+        # The one escape-hatch read the finalizer still reaches through: the GraphQL parent-map
+        # lookup, which no typed single-fact method covers.
+        assert args[0] == "api", f"unexpected escape-hatch call: {args}"
+        return {"data": {"repository": {"issue": {"parent": {
+            "number": self.map_number, "body": self.map_body,
+            "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
+
+    def issue_view(self, repo, number):
+        from agentflow import github
+        return github.IssueView(
+            title=self.title, body="", state=self.state,
+            url=f"https://github.com/{REPO}/issues/{number}",
+            labels=frozenset(self.labels),
+            comments=[github.Comment(body=c["body"], created_at="") for c in self.comments])
 
     def comment(self, repo, number, body):
         self.comments.append({"body": body})
@@ -86,6 +92,7 @@ class FakeGitHub:
     def install(self, monkeypatch):
         from agentflow import github
         monkeypatch.setattr(github, "api", self.api)
+        monkeypatch.setattr(github, "issue_view", self.issue_view)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
         monkeypatch.setattr(github, "edit_body", self.edit_body)
@@ -300,9 +307,9 @@ def test_a_dead_research_run_releases_the_resolving_claim_a_live_one_retains_it(
 
     # The claim lanes are listed in order (building, triaging, drawing, resolving); only the
     # resolving lane holds the two research-claimed issues. The proof read shows the label gone.
-    listings = iter([[], [], [], [{"number": 5, "updated_at": "2020-01-01T00:00:00Z"},
-                                   {"number": 6, "updated_at": "2020-01-01T00:00:00Z"}]])
-    monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
+    listings = iter([[], [], [], [github.ClaimedIssue(5, "2020-01-01T00:00:00Z"),
+                                  github.ClaimedIssue(6, "2020-01-01T00:00:00Z")]])
+    monkeypatch.setattr(github, "claimed_issues", lambda repo, label: next(listings))
     monkeypatch.setattr(github, "remove_label",
                         lambda repo, issue, label: edited.append(issue) or True)
     monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())

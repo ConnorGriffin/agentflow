@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentflow import github
 from agentflow.enroll import (audit_lines, checkout_repo, declaration_line, main,
                               newly_gated_prs, propose_surfaces, write_declaration)
 from agentflow.repo_facts import surface_declaration
@@ -240,9 +241,8 @@ def test_impact_names_the_open_prs_that_would_newly_need_screenshots(monkeypatch
     files = {476: ["frontend/diagnose.js"],
              475: ["frontend/plan.js", "docs/screenshots/issue-462/f7cf507/plan.png"]}
     monkeypatch.setattr(
-        "agentflow.gate.github.api",
-        lambda args, **kwargs: {"files": [{"path": p} for p in files[int(args[2])]],
-                                "body": "", "comments": []})
+        "agentflow.gate.github.pr_content",
+        lambda repo, pr: github.PrContent(body="", paths=tuple(files[pr]), comments=[]))
 
     assert newly_gated_prs("o/ciq", ("frontend/",)) == [476]
 

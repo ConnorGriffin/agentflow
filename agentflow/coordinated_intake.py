@@ -135,16 +135,13 @@ def apply_route(record, result: IntakeResult) -> str | None:
     source_body = snapshot.get("body", "")
 
     def project() -> None:
-        # The live title + labels read in one snapshot doesn't fit a typed helper, so it goes
-        # through the module's named escape hatch (ADR 0040); None means GitHub couldn't be
-        # reached and the route is not projected.
-        issue = github.api(["issue", "view", str(number), "--repo", record.repo,
-                            "--json", "title,labels"], parse_json=True)
-        if not isinstance(issue, dict):
+        # An unreadable live headline means GitHub couldn't be reached and the route is not
+        # projected at all.
+        live = github.issue_headline(record.repo, number)
+        if live is None:
             return
-        apply_intake(record.repo, number, issue.get("title", source_title),
-                     [label.get("name", "") for label in issue.get("labels", [])], result,
-                     source_title, source_body)
+        apply_intake(record.repo, number, live.title or source_title,
+                     sorted(live.labels), result, source_title, source_body)
 
     route = result.route.value
     hands_off = route in ("grill", "mockup")
@@ -198,15 +195,12 @@ def hold_intake(record) -> str | None:
         result = _held(reason)
 
     def project() -> None:
-        # Title+labels in one live read via the named escape hatch (ADR 0040); a read that
-        # couldn't reach GitHub leaves the hold unprojected, so the envelope proves no marker
-        # and retries next cycle — it never holds over an empty read.
-        issue = github.api(["issue", "view", str(number), "--repo", record.repo,
-                            "--json", "title,labels"], parse_json=True)
-        if not isinstance(issue, dict):
+        # A read that couldn't reach GitHub leaves the hold unprojected, so the envelope proves
+        # no marker and retries next cycle — it never holds over an empty read.
+        live = github.issue_headline(record.repo, number)
+        if live is None:
             return
-        apply_intake(record.repo, number, issue.get("title", ""),
-                     [x.get("name", "") for x in issue.get("labels", [])], result)
+        apply_intake(record.repo, number, live.title, sorted(live.labels), result)
 
     url = DurableHandoff().hand_off(
         Subject(repo=record.repo, number=number, kind="issue"),

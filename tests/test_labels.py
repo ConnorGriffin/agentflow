@@ -41,14 +41,14 @@ def test_claim_triage_description_is_ownership_not_live_session(monkeypatch):
     # execution even when the record is waiting with 0 attempts and no provider process.
     # The new description must be true whether the record is queued or running.
     captured = []
-    monkeypatch.setattr(github, "api", lambda args, **k: captured.append(args) or "ok")
+    monkeypatch.setattr(github, "create_label",
+                        lambda repo, name, color, description="":
+                        captured.append(description) or True)
     monkeypatch.setattr(github, "add_label", lambda repo, n, label: True)
     result = labels.claim("o/r", 7, TRIAGING)
 
     assert result is True
-    label_create = next(args for args in captured if "label" in args and "create" in args)
-    desc_idx = label_create.index("--description") + 1
-    description = label_create[desc_idx]
+    description = captured[0]
     # Must not assert a live/active/running session (the AC: no "is triaging" phrasing)
     assert "is triaging" not in description
     assert "A grounding session" not in description
