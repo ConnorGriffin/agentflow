@@ -858,3 +858,21 @@ def test_high_effort_build_still_takes_the_whole_pool_when_no_review_waits(make_
     coord.cycle("claude")
     assert record_of(coord, build).state == "running"      # no PR-bound stage waiting to defer it
     assert permits(coord, "claude") == 5                    # full pool reserved
+
+
+def test_unprepared_review_does_not_freeze_issue_work_behind_it(make_coord):
+    """A review whose checkout cannot be prepared reserves no capacity, so it must not keep
+    otherwise-runnable issue work idle while it waits for its next preparation attempt."""
+    fake = FakeSession()
+    fake.prepare = lambda record: record.stage != "review"
+    coord = make_coord(fake)
+    review = coord.submit_stage(Submission(repo="o/r", subject="1", stage="review",
+                                           pool="claude"))
+    build = coord.submit_stage(Submission(repo="o/r", subject="2", stage="build",
+                                          pool="claude", complexity="deep"))
+
+    coord.cycle("claude", now=10)
+
+    assert record_of(coord, review).state == "waiting"
+    assert record_of(coord, build).state == "running"
+    assert permits(coord, "claude") == 5

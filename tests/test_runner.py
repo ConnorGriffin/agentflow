@@ -478,6 +478,25 @@ def test_review_checkout_recovers_after_its_branch_is_rebased_away(tmp_path):
     assert _git(repo, "cat-file", "-t", stranded) == "commit"
 
 
+def test_freshening_review_checkout_keeps_its_ready_environment(tmp_path):
+    """Repeated review preparation must not delete a ready environment and rebuild it before
+    every admission attempt."""
+    repo = _repo_with_origin(tmp_path)
+    runner = ClaudeRunner()
+    review = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-12-ready"
+    _detached_worktree(repo, review)
+    excludes = tmp_path / "review-excludes"
+    excludes.write_text(".venv/\n")
+    _git(review, "config", "core.excludesFile", str(excludes))
+    python = review / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("ready")
+
+    runner.prepare_worktree_detached(str(repo), "origin/main", review)
+
+    assert python.read_text() == "ready"
+
+
 def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_foreign_work(
         tmp_path, monkeypatch):
     repo = _repo_with_origin(tmp_path)
