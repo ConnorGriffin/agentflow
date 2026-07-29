@@ -37,7 +37,8 @@ def _write_findings(record):
     findings.write_text(
         "## Findings\n\nThe answer is 42.\n\n"
         "## Disposition\n\n```json\n"
-        '{"disposition":"no_build","summary":"The answer requires no implementation change."}'
+        '{"disposition":"no_build","summary":'
+        '"The existing widget router already covers the investigated path."}'
         "\n```\n"
     )
 
@@ -48,7 +49,8 @@ def _write_handoff_findings(record):
     findings.write_text(
         "## Findings\n\nThe audit found one independently shippable change.\n\n"
         "## Disposition\n\n```json\n"
-        '{"disposition":"handoff_required","summary":"The finding needs operator disposition.",'
+        '{"disposition":"handoff_required",'
+        '"summary":"The audit exposes one widget-routing build for operator review.",'
         '"candidates":[{"title":"Route widgets through the shared router",'
         '"build":"Replace the widget-only path with the shared router."}]}'
         "\n```\n"
@@ -178,7 +180,8 @@ def test_resolve_tolerates_already_missing_worktree(tmp_path, monkeypatch):
     findings_text = (
         "## Findings\n\nThe answer is 42.\n\n"
         "## Disposition\n\n```json\n"
-        '{"disposition":"no_build","summary":"The answer requires no implementation change."}'
+        '{"disposition":"no_build","summary":'
+        '"The existing widget router already covers the investigated path."}'
         "\n```\n"
     )
     shutil.rmtree(wt)

@@ -258,6 +258,29 @@ def test_next_research_ticket_fails_closed_on_an_unreadable_blocker_graph(monkey
         "\n```\n"
     ),
     "## Disposition\n\n```json\n{not valid json}\n```\n",
+    (
+        "## Disposition\n\n```json\n"
+        '{"disposition":"handoff_required","disposition":"no_build",'
+        '"summary":"Conflicting rulings must not collapse into the last JSON key."}'
+        "\n```\n"
+    ),
+    _artifact("no_build", "No implementation work is needed."),
+    _artifact("no_build", "The answer requires no implementation change."),
+    _artifact("no_build", "No build is needed for the overall project direction."),
+    _artifact(
+        "handoff_required",
+        "The widget audit exposes a candidate that needs operator judgment.",
+        candidates=[{
+            "title": "A build is required",
+            "build": "Some implementation work is needed",
+        }],
+    ),
+    _artifact(
+        "deferred",
+        "The widget route may become useful after upstream work.",
+        trigger="A meaningful future event occurs.",
+        verification="Confirm that the meaningful event occurred.",
+    ),
     _artifact(
         "deferred",
         "The widget route may become useful after upstream work.",
@@ -563,6 +586,32 @@ def test_pending_replay_converges_after_each_durable_write(boundary, tmp_path, m
     assert gh.map_body.count("(#5)") == 1
     assert "wayfinder:awaiting-disposition" in gh.labels
     assert "wayfinder:resolving" not in gh.labels
+
+
+def test_pending_resolution_replaces_a_stale_untitled_map_entry(tmp_path, monkeypatch):
+    gh = FakeGitHub(map_body=(
+        "# Map\n\n## Awaiting disposition\n\n"
+        "- awaiting operator disposition (#5).\n"
+        "- **Audit the widget path** — awaiting operator disposition (#5).\n"
+    ))
+    gh.install(monkeypatch)
+    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    _write_findings(record, _artifact(
+        "handoff_required",
+        "The widget path exposes one independently shippable build.",
+        candidates=[{
+            "title": "Route widgets through the shared router",
+            "build": "Replace the widget-only dispatch path with the shared router.",
+        }],
+    ))
+
+    assert coordinated_research.resolve(record) is not None
+
+    assert gh.map_body.count("(#5)") == 1
+    assert (
+        "- **Audit the widget path** — awaiting operator disposition (#5)."
+        in gh.map_body
+    )
 
 
 def test_exhaustion_releases_the_claim_so_the_ticket_is_eligible_again(make_coord, coord_state,
