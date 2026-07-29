@@ -34,7 +34,9 @@ The 119 initial findings resolve as follows:
 | **Total** | **119** |
 
 CodeQL default setup remains enabled for Actions, JavaScript/TypeScript, and
-Python.
+Python. After the required integration rebase, the later default-setup run at
+`f9bb4e75d6d010f4a3321c5bc546735b37c5ae23` also completed all three analyses
+successfully.
 
 ## Command findings
 
@@ -104,6 +106,13 @@ left by the previous release is migrated and remains drainable.
 | [#1](https://github.com/ConnorGriffin/agentflow/security/code-scanning/1) | The screenshot harness reads the config path passed by the operator as its sole positional CLI argument. Reading that selected file is the command's interface; repository, issue, and page content do not select it. | Dismiss: false positive. |
 | [#2–#16](https://github.com/ConnorGriffin/agentflow/security/code-scanning/2) | Every result is in `mockups/dashboard-v2-combined.js`. This committed locked mockup is design evidence, not a shipping asset: the web server serves `agentflow/webui/dist`, and the Svelte source/build neither imports nor serves the mockup script. Its fixture data is code-authored. | Dismiss each alert with its exact sink location as non-shipping mockup evidence. |
 | [#119](https://github.com/ConnorGriffin/agentflow/security/code-scanning/119) | The substring checks only recognize image-looking links in issue Markdown. Credential attachment is a separate decision: URLs are parsed, must use HTTPS, and must have the exact `github.com` or `user-images.githubusercontent.com` hostname. Redirect targets are fetched with no authorization header. | Dismiss: false positive. The reported substring never authorizes a request. |
+
+Related current flows were checked even where the initial run had no alert.
+Attachment bodies and URLs never name a staged path: intake writes a fixed
+`attachment-<index>` name with an extension selected from recognized magic
+bytes beneath the coordinator-owned intake worktree. Worktree references
+sanitize issue titles and repository identities before joining them beneath an
+operator-selected enrolled checkout.
 
 ## GitHub dispositions
 
