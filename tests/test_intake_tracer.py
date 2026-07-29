@@ -369,12 +369,14 @@ def test_production_projection_applies_once_then_releases_claim(make_coord, monk
     assert released == [7] and len(notified) == 1
 
 
-def test_route_handoff_pings_once_under_one_stable_key_across_a_restart(make_coord, monkeypatch):
+def test_route_handoff_states_itself_once_under_one_stable_key_across_a_restart(
+        make_coord, monkeypatch):
     """A grill or mockup route asks a human for something, so it is a handoff: the route's own
-    comment is the durable marker and the operator is pinged exactly once, under the key the
-    shared envelope derives (ADR 0042). A daemon that died between posting that comment and
-    releasing the triaging claim re-runs the route on restart and must neither restate it nor
-    ping again."""
+    comment is the durable marker and the operator is pinged under the key the shared envelope
+    derives (ADR 0042). A daemon that died between posting that comment and releasing the
+    triaging claim re-runs the route on restart and must not restate it. It does ping again — the
+    envelope cannot tell a restart that already pinged from one that died before it could, and
+    only one of those two mistakes leaves a maintainer waiting on a question nobody asked."""
     fake = IntakeSession()
     notified, comments, releases = [], [], [False]
     monkeypatch.setattr(github, "issue_headline",
@@ -406,10 +408,10 @@ def test_route_handoff_pings_once_under_one_stable_key_across_a_restart(make_coo
     assert len(comments) == 1 and len(notified) == 1
 
     releases[0] = True
-    coord.cycle("claude")  # the restart finds its own comment: no restatement, no second ping
+    coord.cycle("claude")  # the restart finds its own comment: no restatement, one more ping
     assert record_of(coord, identity).retired is True
-    assert len(comments) == 1 and len(notified) == 1
-    assert notified[0][3] and len(notified[0][3]) == 24
+    assert len(comments) == 1 and len(notified) == 2
+    assert notified[0][3] == notified[1][3] and len(notified[0][3]) == 24
 
 
 def test_production_preparation_recreates_read_only_worktree(make_coord, monkeypatch, tmp_path):
@@ -458,6 +460,27 @@ def _hold_seams(monkeypatch, comments, *, applied, released, notified,
                         lambda *args: notified.append(args) or deliver())
 
 
+def test_two_intake_holds_of_one_issue_do_not_swallow_each_other(monkeypatch):
+    # The grounding-ambiguity hold composes the *same words* whatever stopped the intake, so
+    # matching on the comment's text made a second hold on the same issue invisible: nothing was
+    # posted, nobody was pinged, and the record reported itself handed off. The marker is derived
+    # per record and reason, so a resumed intake that holds for a different reason still speaks.
+    from agentflow.coordinator.record import Record
+
+    applied, released, notified, comments = [], [], [], []
+    _hold_seams(monkeypatch, comments, applied=applied, released=released, notified=notified)
+
+    def held(identity, reason):
+        return Record(identity=identity, stage="intake", pool="claude", demand=5,
+                      repo="o/r", subject="7", hold_reason=reason)
+
+    assert coordinated_intake.hold_intake(held("o/r|7|intake|-", "continuation budget exhausted"))
+    assert coordinated_intake.hold_intake(
+        held("o/r|7|intake|-|s1", "intake decision carried no valid route"))
+
+    assert len(comments) == 2 and len(notified) == 2
+
+
 def test_production_exhaustion_holds_and_notifies_once(make_coord, monkeypatch):
     fake = IntakeSession()
     applied, released, notified, comments = [], [], [], []
@@ -471,7 +494,7 @@ def test_production_exhaustion_holds_and_notifies_once(make_coord, monkeypatch):
     assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 2
     coord.cycle("claude")
 
-    # The hold is posted once, the claim released, and the operator pinged exactly once.
+    # The hold is posted once, the claim released, and the operator told.
     assert applied == [7] and released == [7] and len(notified) == 1
 
 
@@ -535,7 +558,7 @@ def test_permanent_provider_hold_names_the_failure_not_a_missing_decision(make_c
     failure, not unresolved product intent (issue #328). The durable handoff names the provider
     failure and its remediation instead of asking the maintainer to settle a scope question that
     was never asked — which used to send them to `/agentflow pickup` hunting a decision that
-    never existed. The held state label and the exactly-once envelope are unchanged."""
+    never existed. The held state label and the shared envelope are unchanged."""
     fake = IntakeSession()
     applied, released, notified, comments = [], [], [], []
     _hold_seams(monkeypatch, comments, applied=applied, released=released, notified=notified)

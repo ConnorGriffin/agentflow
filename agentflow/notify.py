@@ -26,8 +26,13 @@ def _build_args(title: str, message: str, url: str, ntfy_url: str,
 
 
 def notify(title: str, message: str, url: str = "", sequence_id: str = "") -> bool:
-    """Best-effort ntfy push. A stable sequence ID makes a retry replace the same client
-    notification. Never raises; reports whether ntfy accepted the request."""
+    """Best-effort ntfy push. Never raises; reports whether ntfy accepted the request.
+
+    ``sequence_id`` is a stable per-handoff key sent as a header so a repeat is recognizable in
+    the request log. It does **not** deduplicate or replace anything at the client: ntfy has no
+    header for that — its own sequence ids are a URL path segment and only update a *scheduled*
+    message before delivery, never one that has already arrived. Nothing in the pipeline may
+    lean on a repeat being collapsed for the reader (ADR 0042)."""
     if not NTFY_URL:
         return False
     try:

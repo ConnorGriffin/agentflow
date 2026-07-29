@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from types import SimpleNamespace
 
+import pytest
 from conftest import FakeSession, permits, record_of
 
 from agentflow import (coordinated_build, coordinated_mockup, github, loop, stage_worktree,
@@ -357,20 +359,27 @@ def test_completed_mockup_releases_claim_keeps_human_boundary_and_disposes_workt
     assert coordinated_mockup._settle_mockup(rec) == "https://github.com/o/r/issues/11"
 
 
-def _mockup_hold_seams(monkeypatch, comments, labels, *, notified, labels_readable=None):
+def _mockup_hold_seams(monkeypatch, comments, labels, *, notified, labels_readable=None,
+                       die_after_comment=False, edits_fail=False):
     """Wire the mockup hold's shared-envelope seams (ADR 0042): the durable comment thread it
     reads and proves the handoff through, the one marked comment it posts or edits, the label
     edit that hands the round back to the maintainer's choice, and the operator ping. Everything
     is stated as a fact about the issue, never as a ``gh`` argument vector. ``labels_readable``
-    is a one-element list a test flips to stand a label read that couldn't reach GitHub.
+    is a one-element list a test flips to stand a label read that couldn't reach GitHub,
+    ``die_after_comment`` a daemon that dies the instant its comment is durable, and
+    ``edits_fail`` a comment GitHub refuses to rewrite.
     """
     from agentflow import github
 
     def post(repo, number, body):
         comments.append(github.Comment(body=body, created_at="", id=f"IC_{len(comments)}"))
+        if die_after_comment:
+            raise RuntimeError("daemon died after the handoff comment landed")
         return True
 
     def edit(comment_id, body):
+        if edits_fail:
+            return False
         for index, existing in enumerate(comments):
             if existing.id == comment_id:
                 comments[index] = github.Comment(body=body, created_at="", id=comment_id)
@@ -417,34 +426,35 @@ def test_exhausted_mockup_posts_one_stable_handoff_and_retains_worktree(monkeypa
     assert first == second == "https://github.com/o/r/issues/11"
     assert len(comments) == 1 and "agentflow-mockup-hold" in comments[0].body
     assert labels == {"agentflow:needs-mockup"} and wt.exists()
-    # The second pass observes the same marker, so it neither restates the hold nor pings again.
-    assert len(notified) == 1
+    # The second pass observes the same marker and restates nothing. It does ping again — a
+    # duplicate ping is the accepted cost of never dropping one (ADR 0042).
+    assert len(notified) == 2
 
 
-def test_mockup_hold_interrupted_after_its_comment_does_not_ping_the_operator_twice(
+def test_mockup_hold_interrupted_after_its_comment_still_reaches_the_operator(
         monkeypatch, tmp_path):
-    # The crash window the envelope exists to close: the handoff comment lands, then the daemon
-    # dies before the round is finished (stood here as a label read that can't reach GitHub).
-    # The restart must finish the hold without a second comment and without a second ping.
+    # The crash window that matters: the handoff comment reaches GitHub and the daemon dies
+    # before the push goes out. Gating the ping on having posted the comment lost it for good —
+    # the round sat held, and the maintainer whose choice it waits on was never told.
     wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
     wt.mkdir(parents=True)
     labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
-    comments, notified, readable = [], [], [False]
-    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified,
-                       labels_readable=readable)
+    comments, notified = [], []
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified, die_after_comment=True)
     rec = _mockup_record(wt, hold_reason="continuation budget exhausted")
 
-    assert coordinated_mockup._hold_mockup(rec) is None
-    assert len(comments) == 1 and len(notified) == 1
+    with pytest.raises(RuntimeError):
+        coordinated_mockup._hold_mockup(rec)
+    assert len(comments) == 1 and notified == []
 
-    readable[0] = True
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified)   # restarted daemon
     assert coordinated_mockup._hold_mockup(rec) == "https://github.com/o/r/issues/11"
     assert len(comments) == 1 and len(notified) == 1
 
 
 def test_mockup_hold_ping_carries_a_stable_sequence_id(monkeypatch, tmp_path):
-    # Keyed delivery is what makes a redelivered ping replace the operator's notification
-    # instead of multiplying it, so the same held round must always derive the same key.
+    # The same held round always derives the same delivery key, so a repeat is recognizable as
+    # the same handoff rather than as new work.
     wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
     wt.mkdir(parents=True)
     keys = []
@@ -458,10 +468,31 @@ def test_mockup_hold_ping_carries_a_stable_sequence_id(monkeypatch, tmp_path):
     assert keys[0] and keys[0] == keys[1]
 
 
-def test_missing_context_comment_is_the_handoff_and_never_gets_a_second_comment(
+def test_missing_context_comment_is_the_handoff_and_is_left_exactly_as_it_is(
         monkeypatch, tmp_path):
-    # MISSING-CONTEXT already says why the round stopped, so the round keeps its one comment —
-    # it gains only the per-round marker that makes the hold provable and the ping exactly-once.
+    # MISSING-CONTEXT already says why the round stopped and is itself the durable handoff, so
+    # the hold writes nothing at all: no second comment, and no rewrite of the one that is there.
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+    notified = []
+    body = ("> *agentflow intake: mockup variants — generated by AI.*\n\n"
+            "MISSING-CONTEXT: no runnable surface")
+    comments = [SimpleNamespace(id="IC_missing", body=body)]
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified)
+    _refuse_a_second_comment(monkeypatch, "MISSING-CONTEXT already is the durable handoff")
+    rec = _mockup_record(wt)
+
+    assert coordinated_mockup._hold_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert len(comments) == 1 and comments[0].body == body and wt.exists()
+    assert len(notified) == 1 and "missing context" in notified[0][1]
+
+
+def test_a_missing_context_hold_is_not_wedged_by_a_comment_github_will_not_rewrite(
+        monkeypatch, tmp_path):
+    # Requiring an edit to land before the hold counts as proven made an unwritable comment
+    # permanent: no ping, no release of the drawing claim, and a round that could never finish.
+    # Nothing needs writing here, so a refused edit cannot hold the stage hostage.
     wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
     wt.mkdir(parents=True)
     labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
@@ -469,15 +500,54 @@ def test_missing_context_comment_is_the_handoff_and_never_gets_a_second_comment(
     comments = [SimpleNamespace(id="IC_missing", body=(
         "> *agentflow intake: mockup variants — generated by AI.*\n\n"
         "MISSING-CONTEXT: no runnable surface"))]
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified, edits_fail=True)
+
+    assert coordinated_mockup._hold_mockup(_mockup_record(wt)) == \
+        "https://github.com/o/r/issues/11"
+    assert labels == {"agentflow:needs-mockup"} and len(notified) == 1
+
+
+def test_an_exhausted_round_whose_comment_cannot_be_rewritten_still_says_so(
+        monkeypatch, tmp_path):
+    # The other half of the same wedge: an unfinished round's explanation belongs on the comment
+    # it already has, but if GitHub refuses that rewrite the explanation is posted on its own
+    # rather than leaving the round stuck forever with nothing said and nobody told.
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+    notified = []
+    comments = [SimpleNamespace(id="IC_partial", body=(
+        "> *agentflow intake: mockup variants — generated by AI.*\n\n"
+        "Only variant A was finished."))]
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified, edits_fail=True)
+
+    assert coordinated_mockup._hold_mockup(_mockup_record(wt)) == \
+        "https://github.com/o/r/issues/11"
+    assert len(comments) == 2 and "continuation budget" in comments[1].body
+    assert len(notified) == 1
+
+
+def test_an_exhausted_round_does_not_report_an_earlier_rounds_missing_context(
+        monkeypatch, tmp_path):
+    # Round one ended at MISSING-CONTEXT; the maintainer answered and asked for another round,
+    # which then ran out of budget with no missing context of its own. Reading the whole thread,
+    # the hold found round one's comment, decided nothing needed saying, and told the maintainer
+    # the round was missing context — the wrong reason, and no explanation on the issue at all.
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+    notified = []
+    comments = [github.Comment(id="IC_round1", created_at="2026-07-01T00:00:00Z", body=(
+        "> *agentflow intake: mockup variants — generated by AI.*\n\n"
+        "MISSING-CONTEXT: no runnable surface"))]
     _mockup_hold_seams(monkeypatch, comments, labels, notified=notified)
-    _refuse_a_second_comment(monkeypatch, "MISSING-CONTEXT already is the durable handoff")
-    rec = _mockup_record(wt)
+    # The second round's record was opened after round one's comment was posted.
+    rec = _mockup_record(wt, created_at=int(
+        datetime.fromisoformat("2026-07-02T00:00:00+00:00").timestamp()))
 
     assert coordinated_mockup._hold_mockup(rec) == "https://github.com/o/r/issues/11"
-    assert len(comments) == 1 and wt.exists()
-    assert "agentflow-mockup-hold" in comments[0].body
-    assert "continuation budget" not in comments[0].body   # it never restates the round's reason
-    assert len(notified) == 1 and "missing context" in notified[0][1]
+    assert len(comments) == 2 and "continuation budget" in comments[1].body
+    assert "continuation budget exhausted" in notified[0][1]
 
 
 def test_partial_marked_comment_is_edited_into_the_exhaustion_handoff(monkeypatch, tmp_path):

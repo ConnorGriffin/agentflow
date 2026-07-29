@@ -474,11 +474,13 @@ def test_current_stage_park_replaces_prior_reason_once_and_notifies_each_new_ide
 
     assert run("review-1", "first reason") == subject.url
     assert run("review-1", "first reason") == subject.url
-    assert len(edits) == 1 and len(notifications) == 1
+    # The park comment is written once; the ping is at-least-once by design, so a repeat pass
+    # re-tells the operator rather than risking never having told them (ADR 0042).
+    assert len(edits) == 1 and len(notifications) == 2
 
     assert run("review-2", "new reason") == subject.url
     assert len(comments) == 1 and posts == []
-    assert len(edits) == 2 and len(notifications) == 2
+    assert len(edits) == 2 and len(notifications) == 3
     assert "new reason" in comments[0].body
     assert "agentflow-park:review-2:new reason" in comments[0].body
     assert "agentflow-park:review-1:first reason" not in comments[0].body

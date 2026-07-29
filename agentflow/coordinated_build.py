@@ -19,6 +19,7 @@ adapter seam (ADR 0020).
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from agentflow import github, worktree_ref
@@ -66,7 +67,6 @@ def resume_if_held(submission, records):
     worktree ``source``. Otherwise the submission is returned unchanged, so an ordinary duplicate
     stays idempotent and a repeated resume — whose successor is already live — never opens a second
     concurrent Build. Pure: the resume decision is the test surface."""
-    from dataclasses import replace
     from agentflow.coordinator.record import HELD
 
     builds = [r for r in records
@@ -171,16 +171,21 @@ def _collision_comment(comment: github.Comment, admitted_at: int) -> bool:
 def _hold_build(record) -> str | None:
     """Create and prove Build's exhaustion handoff without touching its worktree.
 
-    The held-route comment is the durable marker, so the crash-safe post-once → prove →
-    notify-once recipe is the shared :class:`~agentflow.handoff.DurableHandoff` envelope
-    (ADR 0042): a daemon that dies between posting that comment and pinging the operator
-    observes the same comment on restart and does not ping again — this handoff previously
-    had no notification key at all and could double-ping. Releasing the visible building claim
-    and proving the resulting held state are stage bookkeeping that run once the handoff
-    confirms; an interrupted projection is finished on the way out so a partial write is never
-    stranded.
+    The crash-safe post-once → prove → notify recipe is the shared
+    :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042). The marker is a hidden tag
+    derived from this record and why it stopped, carried at the end of the held-build comment:
+    the comment's own text names only which of two fixed stoppages happened, so a resumed build
+    reusing the same retained worktree would compose the identical words and read as already
+    handed off.
+
+    Releasing the visible building claim and proving the resulting held state are stage
+    bookkeeping that run once the handoff confirms. A projection interrupted after its comment
+    landed is finished here — **once** — and the hold then ends either way: the alternative is a
+    maintainer who reads the hold and re-queues the issue having their labels re-stamped on every
+    later cycle, which is not a repair but a revert.
     """
-    from agentflow.handoff import DurableHandoff, Notification, Subject
+    from agentflow.handoff import (DurableHandoff, Notification, Subject, marked_body,
+                                   proof_marker)
     from agentflow.intake import apply_intake
 
     try:
@@ -191,31 +196,42 @@ def _hold_build(record) -> str | None:
               "without resolving it" if record.hold_reason == "integration collision"
               else "continuation budget exhausted")
     result = held_build_result(status, f"the retained worktree `{record.source}`")
+    # A hold posted before this record carried its own marker is still proof of itself, so an
+    # issue already held when the daemon deploys is never commented on twice. The marker goes
+    # *between* the disclaimer and the ask rather than at the end, so that a marked comment does
+    # not itself contain the old whole-body text and re-answer for a different record's hold.
+    legacy_marker = result.body.strip()
+    marker = proof_marker(record.identity, status, tag="build-hold")
+    result = replace(result, body=marked_body(result.body, marker))
 
-    def project() -> None:
+    def project() -> bool:
         # A read that couldn't reach GitHub leaves the hold unprojected, so the envelope proves
         # no marker and retries next cycle rather than holding over an empty read.
         live = github.issue_headline(record.repo, number)
         if live is None:
-            return
+            return False
         apply_intake(record.repo, number, live.title, sorted(live.labels), result)
+        return True
 
     headline = ("Build hit an integration collision" if record.hold_reason == "integration collision"
                 else "Build continuation budget exhausted")
     url = DurableHandoff().hand_off(
         Subject(repo=record.repo, number=number, kind="issue"),
         identity=record.identity, stage="build-hold",
-        marker=result.body.strip(),
+        marker=marker,
         action=project,
         notification=Notification(
-            "agentflow needs you", f"{record.repo} #{number}: {headline}"))
+            "agentflow needs you", f"{record.repo} #{number}: {headline}"),
+        also_proven_by=legacy_marker)
     if url is None:
         return None
-    github.remove_label(record.repo, number, BUILDING)
     labels = github.issue_labels(record.repo, number)
     if labels is None:
         return None
-    if BUILDING in labels or "agentflow:needs-grilling" not in labels:
-        project()   # the projection was interrupted after its comment landed — finish it
-        return None
+    if "agentflow:needs-grilling" not in labels and not project():
+        return None   # GitHub was unreachable, so nothing was written — retry instead
+    github.remove_label(record.repo, number, BUILDING)
+    labels = github.issue_labels(record.repo, number)
+    if labels is None or BUILDING in labels:
+        return None   # the claim is still visible — retry the release, and only the release
     return url

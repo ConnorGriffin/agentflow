@@ -20,6 +20,7 @@ adapter seam (ADR 0020).
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 
 from agentflow import github, worktree_ref
 from agentflow.labels import DRAWING, MOCKUP_MARK, mockup_scope_from_labels
@@ -155,19 +156,46 @@ def _settle_mockup(record) -> str | None:
     return settlement.url or f"https://github.com/{record.repo}/issues/{number}"
 
 
+def _this_round(comment, opened_at: int) -> bool:
+    """Whether one marked comment belongs to *this* round rather than an earlier one on the same
+    issue. A mockup issue can be drawn more than once, and every round's comment carries the same
+    mark, so a round that reads the whole thread would answer for its predecessor's work. Anchored
+    to when the record was opened; a record from before creation times were stamped keeps the old
+    whole-thread behavior."""
+    if not opened_at:
+        return True
+    try:
+        created = datetime.fromisoformat(
+            (comment.created_at or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return False
+    return created >= opened_at
+
+
 def _hold_mockup(record) -> str | None:
     """Create Mockup's one issue-native handoff while preserving unfinished local work.
 
-    The per-record proof marker is what makes the hold durable, so the crash-safe post-once →
-    prove → notify-once recipe is the shared :class:`~agentflow.handoff.DurableHandoff` envelope
-    (ADR 0042) keyed on that marker: a repeat after a daemon crash observes it and neither
-    re-posts nor pings again. The round only ever gets *one* marked comment — MISSING-CONTEXT
-    already is the durable stage-native handoff and is never restated, so it gains the marker in
-    place; an unfinished round gains the marker and the exhaustion explanation. Handing the issue
-    back to the maintainer's choice (``needs-mockup`` kept, the drawing claim released) is stage
-    bookkeeping that runs once the handoff confirms; the worktree is retained either way.
+    The round only ever gets *one* marked comment, and which one it is decides the whole handoff,
+    so it is selected from this round alone (:func:`_this_round`) — an earlier round's comment
+    must not stand in for this one, or an exhausted round would silently report itself as missing
+    context and never post its explanation.
+
+    From there the two boundaries differ:
+
+    - **Missing context** is already the durable stage-native handoff. It is never restated and
+      never edited: its own MISSING-CONTEXT text is what proves the hold, and the envelope
+      (:class:`~agentflow.handoff.DurableHandoff`, ADR 0042) writes nothing at all. An edit that
+      could keep failing — an unwritable comment, a body over GitHub's size limit — would
+      otherwise wedge the round with no ping and no release, forever.
+    - **An unfinished round** gains the exhaustion explanation plus a per-record marker derived
+      from this record and its reason. If the comment it belongs on cannot be edited, the
+      explanation is posted on its own rather than leaving the stage stuck.
+
+    Handing the issue back to the maintainer's choice (``needs-mockup`` kept, the drawing claim
+    released) is stage bookkeeping that runs once the handoff confirms; the worktree is retained
+    either way.
     """
-    from agentflow.handoff import DurableHandoff, Notification, Subject
+    from agentflow.handoff import DurableHandoff, Notification, Subject, proof_marker
 
     try:
         number = int(record.subject)
@@ -176,32 +204,37 @@ def _hold_mockup(record) -> str | None:
     comments = github.issue_comments(record.repo, number)
     if comments is None:
         return None
-    marked = next((comment for comment in comments if MOCKUP_MARK in comment.body), None)
-    missing = next((comment for comment in comments if MOCKUP_MARK in comment.body
-                    and "MISSING-CONTEXT:" in comment.body), None)
-    proof = "<!-- agentflow-mockup-hold:" + hashlib.sha256(
-        record.identity.encode()).hexdigest()[:24] + " -->"
+    marked = next((comment for comment in reversed(comments)
+                   if MOCKUP_MARK in comment.body and _this_round(comment, record.created_at)),
+                  None)
+    missing = marked is not None and "MISSING-CONTEXT:" in marked.body
     explanation = ("Mockup exhausted its continuation budget before completing the visual round. "
                    "The branch and local worktree are retained for a human to continue.")
+    reason = "missing context" if missing else "continuation budget exhausted"
+    proof = proof_marker(record.identity, reason, tag="mockup-hold")
+    # The marker a hold posted before it was scoped to the reason, still proof of itself on an
+    # issue held when the daemon deploys.
+    legacy = "<!-- agentflow-mockup-hold:" + hashlib.sha256(
+        record.identity.encode()).hexdigest()[:24] + " -->"
 
     def post() -> None:
-        if marked is None:
+        # The explanation belongs on the round's own comment; a comment GitHub will not rewrite
+        # gets it as a comment of its own rather than wedging the round with nothing said.
+        if marked is None or not github.edit_comment(
+                marked.id, f"{marked.body.rstrip()}\n\n{proof}\n\n{explanation}"):
             github.comment(record.repo, number,
                            f"{MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}")
-            return
-        # The round already has its one marked comment: a MISSING-CONTEXT handoff says why on its
-        # own and gains only the marker; an unfinished one also gains the exhaustion explanation.
-        tail = proof if missing is not None else f"{proof}\n\n{explanation}"
-        github.edit_comment(marked.id, f"{marked.body.rstrip()}\n\n{tail}")
 
-    reason = "missing context" if missing is not None else "continuation budget exhausted"
     url = DurableHandoff().hand_off(
         Subject(repo=record.repo, number=number, kind="issue"),
         identity=record.identity, stage="mockup-hold",
-        marker=proof,
+        # A missing-context round is already handed off: its own boundary is the proof, and the
+        # action below is never reached.
+        marker="MISSING-CONTEXT:" if missing else proof,
         action=post,
         notification=Notification(
-            "agentflow needs you", f"{record.repo} #{number}: Mockup held — {reason}"))
+            "agentflow needs you", f"{record.repo} #{number}: Mockup held — {reason}"),
+        also_proven_by="" if missing else legacy)
     if url is None:
         return None
     # A single edit that both adds and removes a label is not on the typed surface, so the write

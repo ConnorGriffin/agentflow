@@ -117,13 +117,15 @@ def apply_route(record, result: IntakeResult) -> str | None:
 
     A ``grill`` or ``mockup`` route is a handoff — it asks a human for something — so it goes
     through the shared :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042): the
-    route's own comment is the durable marker, and the operator is pinged exactly once, when
-    that comment is newly posted, under the key the envelope derives. Every other route hands
-    the issue on to the pipeline and is projected without a ping, exactly as before.
+    route's own comment is the durable marker, and the operator is pinged once the envelope can
+    prove that comment exists, under the key it derives. Every other route hands the issue on to
+    the pipeline and is projected without a ping, exactly as before.
 
     Either way projection is idempotent across partial writes: a projection interrupted after
     its comment landed is finished on the way out, so the remaining title/body/label mutations
-    are never stranded behind the envelope's post-once gate.
+    are never stranded behind the envelope's post-once gate. That repair happens **once** and
+    the route then ends either way — an issue a maintainer has since retitled or re-labelled is
+    theirs, and re-deciding this every cycle would keep overwriting their edit.
     """
     from agentflow.handoff import DurableHandoff, Notification, Subject
     try:
@@ -134,14 +136,15 @@ def apply_route(record, result: IntakeResult) -> str | None:
     source_title = snapshot.get("title", "")
     source_body = snapshot.get("body", "")
 
-    def project() -> None:
+    def project() -> bool:
         # An unreadable live headline means GitHub couldn't be reached and the route is not
-        # projected at all.
+        # projected at all; the caller retries rather than treating nothing-written as done.
         live = github.issue_headline(record.repo, number)
         if live is None:
-            return
+            return False
         apply_intake(record.repo, number, live.title or source_title,
                      sorted(live.labels), result, source_title, source_body)
+        return True
 
     route = result.route.value
     hands_off = route in ("grill", "mockup")
@@ -156,9 +159,13 @@ def apply_route(record, result: IntakeResult) -> str | None:
                 "agentflow needs you", f"{record.repo} #{number}: {route}")) is None:
         return None
     if not intake_result_is_durable(record.repo, number, result, source_title, source_body):
-        if hands_off:
-            project()   # the post-once gate skipped an interrupted projection — finish it
-        return None
+        if not hands_off:
+            return None
+        # The route's comment is durable, so the post-once gate skipped a projection that never
+        # finished — or the issue has been edited since. Those look identical from here, so
+        # finish the projection once and let the route end on whatever that leaves.
+        if not project():
+            return None   # GitHub was unreachable, so nothing was written — retry instead
     if not release(record.repo, number, TRIAGING):
         return None
     return f"https://github.com/{record.repo}/issues/{number}"
@@ -167,10 +174,13 @@ def apply_route(record, result: IntakeResult) -> str | None:
 def hold_intake(record) -> str | None:
     """Create Intake's single exhaustion handoff and notification.
 
-    The crash-safe post-once → prove → notify-once recipe is the shared
-    :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042): the held-route comment is
-    the durable marker, so a repeat after a daemon crash observes the same comment and neither
-    re-holds nor pings again. Projecting that comment (and its state label) is the marker-posting
+    The crash-safe post-once → prove → notify recipe is the shared
+    :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042). The marker is a hidden tag
+    derived from this record and its hold reason, carried at the end of the held-route comment,
+    so a repeat after a daemon crash observes it and does not re-hold. It cannot be the comment's
+    own text: the grounding-ambiguity copy is the *same words* for every hold reason, so a
+    resumed intake holding for a completely different reason would read as already handed off and
+    post nothing at all. Projecting the comment (and its state label) is the marker-posting
     ``action``; releasing the triaging claim is stage bookkeeping that runs once the handoff
     confirms the marker landed.
 
@@ -181,11 +191,14 @@ def hold_intake(record) -> str | None:
     *which* permanent condition it was, so a rejected request or a spend ceiling gets its own
     diagnosis instead of re-authenticate advice for a healthy sign-in (issue #342). Every other
     hold reason keeps the grounding-ambiguity copy. Only the body differs — route, state label,
-    and the exactly-once envelope are identical either way; the reason comes from the persisted
-    record, never a fresh observation, so a restart recomposes the same marker."""
+    and the envelope are identical either way; the reason comes from the persisted record, never
+    a fresh observation, so a restart recomposes the same marker."""
+    from dataclasses import replace as replace_result
+
     from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON,
                                                    parse_permanent_hold_reason)
-    from agentflow.handoff import DurableHandoff, Notification, Subject
+    from agentflow.handoff import (DurableHandoff, Notification, Subject, marked_body,
+                                   proof_marker)
     from agentflow.intake import _held, _provider_failed
     number = int(record.subject)
     reason = record.hold_reason or "continuation budget exhausted"
@@ -193,6 +206,11 @@ def hold_intake(record) -> str | None:
         result = _provider_failed(reason, parse_permanent_hold_reason(reason).value)
     else:
         result = _held(reason)
+    # A hold posted before this record carried its own marker is still proof of itself, so an
+    # issue already held when the daemon deploys is never commented on twice.
+    legacy_marker = result.body
+    marker = proof_marker(record.identity, reason, tag="intake-hold")
+    result = replace_result(result, body=marked_body(result.body, marker))
 
     def project() -> None:
         # A read that couldn't reach GitHub leaves the hold unprojected, so the envelope proves
@@ -205,10 +223,11 @@ def hold_intake(record) -> str | None:
     url = DurableHandoff().hand_off(
         Subject(repo=record.repo, number=number, kind="issue"),
         identity=record.identity, stage="intake-hold",
-        marker=result.body,
+        marker=marker,
         action=project,
         notification=Notification(
-            "agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}"))
+            "agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}"),
+        also_proven_by=legacy_marker)
     if url is None:
         return None
     if not release(record.repo, number, TRIAGING):

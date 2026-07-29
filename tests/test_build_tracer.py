@@ -811,14 +811,14 @@ def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monke
 
 
 def _build_hold_seams(monkeypatch, state, *, notifications, labels_readable=None,
-                      label_failures=None):
+                      label_failures=None, die_after_comment=False):
     """Wire the build hold's shared-envelope seams (ADR 0042): the durable comment thread it reads
     and proves the handoff through, the projection that posts the held-route comment and state
     label, the release of the visible building claim, and the operator ping. Everything is stated
     as a fact about the issue, never as a ``gh`` argument vector. ``labels_readable`` is a
-    one-element list a test flips to stand a label read that couldn't reach GitHub, and
+    one-element list a test flips to stand a label read that couldn't reach GitHub,
     ``label_failures`` a countdown of projections whose comment lands but whose label write is
-    interrupted.
+    interrupted, and ``die_after_comment`` a daemon that dies the instant its comment is durable.
     """
     from agentflow import github, intake, notify as notify_module
 
@@ -829,6 +829,8 @@ def _build_hold_seams(monkeypatch, state, *, notifications, labels_readable=None
     def fake_apply(repo, number, title, labels, result):
         if not any(comment["body"] == result.body for comment in state["comments"]):
             state["comments"].append({"body": result.body})
+        if die_after_comment:
+            raise RuntimeError("daemon died after the hold comment landed")
         if label_failures and label_failures[0]:
             label_failures[0] -= 1
         else:
@@ -870,42 +872,82 @@ def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(mo
     assert coordinated_build._hold_build(record) == state["url"]
     assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
     assert len(state["comments"]) == 1
-    assert len(notifications) == 1
+    # The issue is written once; the second pass re-tells the operator rather than risking a
+    # hold nobody was ever told about (ADR 0042's at-least-once notification).
+    assert len(notifications) == 2
 
 
-def test_build_hold_interrupted_after_its_comment_does_not_ping_the_operator_twice(monkeypatch):
-    # The crash window the shared envelope exists to close: the hold comment lands and the
-    # operator is pinged, then the daemon dies before the held state is proven (stood here as a
-    # label read that couldn't reach GitHub). This hold used to ping with no delivery key at all,
-    # so the restart's ping arrived as a second notification; now the comment gates it.
+def test_build_hold_interrupted_after_its_comment_lands_still_reaches_the_operator(monkeypatch):
+    # The crash window that matters: the hold comment reaches GitHub and the daemon dies before
+    # the ping goes out. The projection is stood as one that raises *after* its comment is
+    # durable, so the next cycle is a genuinely fresh call over a thread that already carries the
+    # marker. Gating the ping on having posted the comment lost it here permanently — the issue
+    # sat held, asking a maintainer a question nobody was ever told about.
     state = _held_build_issue()
-    notifications, readable = [], [False]
-    _build_hold_seams(monkeypatch, state, notifications=notifications, labels_readable=readable)
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications, die_after_comment=True)
     record = _held_build_record()
 
-    assert coordinated_build._hold_build(record) is None
-    assert len(state["comments"]) == 1 and len(notifications) == 1
+    with pytest.raises(RuntimeError):
+        coordinated_build._hold_build(record)
+    assert len(state["comments"]) == 1 and notifications == []
 
-    readable[0] = True
+    _build_hold_seams(monkeypatch, state, notifications=notifications)   # the restarted daemon
     assert coordinated_build._hold_build(record) == state["url"]
-    assert len(state["comments"]) == 1 and len(notifications) == 1
+    assert len(state["comments"]) == 1        # the marker is there, so nothing is written twice
+    assert len(notifications) == 1            # and the maintainer is finally told
     assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
-    assert notifications[0][3]   # the ping carries a delivery key it previously had none of
 
 
 def test_a_hold_projection_interrupted_before_its_state_label_is_still_finished(monkeypatch):
     # Projecting the hold is idempotent across partial writes, so the envelope's post-once gate
     # must not strand one: a hold whose comment landed but whose state label did not still
-    # reaches the held state, on a later pass, without a second comment or a second ping.
+    # reaches the held state, without a second comment.
     state = _held_build_issue()
     notifications = []
     _build_hold_seams(monkeypatch, state, notifications=notifications, label_failures=[1])
     record = _held_build_record()
 
-    assert coordinated_build._hold_build(record) is None   # the label write was interrupted
     assert coordinated_build._hold_build(record) == state["url"]
     assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
     assert len(state["comments"]) == 1 and len(notifications) == 1
+
+
+def test_a_maintainer_who_re_queues_the_held_issue_is_not_fought_over_it(monkeypatch):
+    # A maintainer reads the hold, decides the issue is buildable after all, and re-queues it.
+    # On the issue that is indistinguishable from a projection interrupted before its labels
+    # landed — both leave `ready-for-agent` and no `needs-grilling` — so the hold cannot refuse to
+    # finish. What it must never do is keep re-deciding: the old code answered "not held yet" and
+    # re-projected on every later cycle, reverting the maintainer for as long as they kept
+    # editing. Now the hold reports itself done and stops looking.
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+    record = _held_build_record()
+
+    assert coordinated_build._hold_build(record) == state["url"]
+    state["labels"] = [{"name": "ready-for-agent"}]   # the maintainer takes the issue back
+
+    # Reporting the hold done is what ends it: the coordinator records the proof and never asks
+    # again, so the maintainer's next edit is the last word on this issue.
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert len(state["comments"]) == 1
+
+
+def test_two_builds_of_one_issue_do_not_swallow_each_others_hold(monkeypatch):
+    # A resumed build that stops the same way composes the same words as the first — same status,
+    # same retained worktree. Matching on that text made the resume's hold invisible: no comment,
+    # no ping, and the resume reported itself handed off. The marker is per-record, so both land.
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+
+    assert coordinated_build._hold_build(_held_build_record()) == state["url"]
+    resumed = _held_build_record(resume=1)
+    resumed.identity = "o/r|7|build|-|s1"
+    assert coordinated_build._hold_build(resumed) == state["url"]
+
+    assert len(state["comments"]) == 2 and len(notifications) == 2
 
 
 def test_live_collision_handoff_names_the_collision_and_leaves_a_resumable_issue(monkeypatch):
