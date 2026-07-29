@@ -949,7 +949,7 @@ function wireEvents(){
     [...e.currentTarget.children].forEach(c => c.classList.toggle('on', c === b));
     STATE.selected = {inbox:-1, live:-1, fleet:-1, history:-1};
     STATE.fleet.expanded.clear();
-    if (STATE.mode === 'typical') STATE.fleet.expanded.add('ConnorGriffin/ciq-autotune');
+    if (STATE.mode === 'typical') STATE.fleet.expanded.add('example-org/safety-console');
     STATE.fleet.needsOnly = (STATE.mode === 'dense');
     render();
   });
@@ -1030,7 +1030,7 @@ async function boot(){
   try { STATE.capture = await (await fetch(CAPTURE_URL, {cache:'no-store'})).json(); }
   catch(e){ STATE.capture = FALLBACK; }   // MOCK-ONLY: file:// fetch of sibling JSON is CORS-blocked
   STATE.daemonEnabled = !!(STATE.capture.daemon && STATE.capture.daemon.enabled);
-  STATE.fleet.expanded.add('ConnorGriffin/ciq-autotune');   // typical: one row drilled-in
+  STATE.fleet.expanded.add('example-org/safety-console');   // typical: one row drilled-in
   wireEvents();
   render();
   setInterval(tick, 1000);   // advance live elapsed between (real-app) polls
@@ -1050,49 +1050,49 @@ const FALLBACK = {
   running:[
     {repo:'ConnorGriffin/agentflow', number:63, title:'Re-platform the operator dashboard as a Svelte control plane',
      stage:'building', tool:'claude', model:'opus', branch:'agentflow/claude/issue-63-re-platform-dashboard',
-     worktree:'~/Code/ConnorGriffin/worktrees/agentflow-63', pid:48213, started_at:'2026-07-13T13:47:02Z'},
-    {repo:'ConnorGriffin/homelab', number:43, title:'Pin Grafana to 11.1 and add a readiness probe',
-     stage:'building', tool:'codex', model:'sol', branch:'agentflow/codex/issue-43-grafana-pin',
-     worktree:'~/Code/ConnorGriffin/worktrees/homelab-43', pid:48301, started_at:'2026-07-13T13:57:40Z'},
-    {repo:'ConnorGriffin/dotfiles', number:24, title:'Add a git-worktree cleanup script to scripts/',
+     worktree:'~/worktrees/agentflow-63', pid:48213, started_at:'2026-07-13T13:47:02Z'},
+    {repo:'example-org/infrastructure', number:43, title:'Pin the dashboard image and add a readiness probe',
+     stage:'building', tool:'codex', model:'sol', branch:'agentflow/codex/issue-43-dashboard-pin',
+     worktree:'~/worktrees/infrastructure-43', pid:48301, started_at:'2026-07-13T13:57:40Z'},
+    {repo:'example-org/tooling', number:24, title:'Add a worktree cleanup script',
      stage:'building', tool:'claude', model:'sonnet', branch:'agentflow/claude/issue-24-worktree-cleanup',
-     worktree:'~/Code/ConnorGriffin/worktrees/dotfiles-24', pid:48355, started_at:'2026-07-13T13:59:11Z'},
-    {repo:'ConnorGriffin/agentflow-sandbox', number:12, title:'Add wrap(text, width) helper to sandboxlib',
+     worktree:'~/worktrees/tooling-24', pid:48355, started_at:'2026-07-13T13:59:11Z'},
+    {repo:'example-org/sandbox', number:12, title:'Add wrap(text, width) helper to sandboxlib',
      stage:'reviewing', tool:'codex', model:'sol', branch:'agentflow/claude/issue-12-wrap-helper',
-     worktree:'~/Code/ConnorGriffin/worktrees/agentflow-sandbox-12', pid:48377, started_at:'2026-07-13T14:01:40Z'},
-    {repo:'ConnorGriffin/home-depot-location-probe', number:8, title:'Retry store-locator on 429 with backoff',
+     worktree:'~/worktrees/sandbox-12', pid:48377, started_at:'2026-07-13T14:01:40Z'},
+    {repo:'example-org/store-locator', number:8, title:'Retry store lookup on 429 with backoff',
      stage:'reviewing', tool:'claude', model:'sonnet', branch:'agentflow/codex/issue-8-locator-retry',
-     worktree:'~/Code/ConnorGriffin/worktrees/home-depot-location-probe-8', pid:48390, started_at:'2026-07-13T14:00:05Z'},
-    {repo:'ConnorGriffin/ciq-autotune', number:314, title:'Grounding pull for basal harm-layer thresholds',
+     worktree:'~/worktrees/store-locator-8', pid:48390, started_at:'2026-07-13T14:00:05Z'},
+    {repo:'example-org/safety-console', number:314, title:'Grounding pull for safety thresholds',
      stage:'triaging', tool:'codex', model:'sol', branch:null,
-     worktree:'~/Code/ConnorGriffin/worktrees/ciq-autotune-314', pid:48410, started_at:'2026-07-13T14:03:20Z'},
+     worktree:'~/worktrees/safety-console-314', pid:48410, started_at:'2026-07-13T14:03:20Z'},
     {repo:'ConnorGriffin/agentflow', number:66, title:'Daemon: write live-session state file for the dashboard',
      stage:'triaging', tool:'claude', model:'opus', branch:null,
-     worktree:'~/Code/ConnorGriffin/worktrees/agentflow-66', pid:48441, started_at:'2026-07-13T14:02:52Z'}
+     worktree:'~/worktrees/agentflow-66', pid:48441, started_at:'2026-07-13T14:02:52Z'}
   ],
   repos:[
-    {repo:'ConnorGriffin/agentflow-sandbox', profile:'autonomous',
+    {repo:'example-org/sandbox', profile:'autonomous',
      ready:[{number:15, title:'Add center(text, width) helper', complexity:'standard', effort:'low'}],
      held:[], in_flight:[{number:12, title:'Add wrap(text, width) helper to sandboxlib', builder:'claude', reviewer:'codex', stage:'reviewing', checks:'passing'}],
      parked:[],
      recent_merges:[
        {number:11, title:'Add pad(text, width) helper', builder:'codex', merged_at:'2026-07-13T12:40:00Z'},
        {number:9,  title:'Add slugify(text) helper', builder:'claude', merged_at:'2026-07-12T23:29:42Z'}],
-     ratchet:{repo:'ConnorGriffin/agentflow-sandbox', samples:18, correction_rate:0.06, ready_to_loosen:true}},
-    {repo:'ConnorGriffin/home-depot-location-probe', profile:'autonomous',
+     ratchet:{repo:'example-org/sandbox', samples:18, correction_rate:0.06, ready_to_loosen:true}},
+    {repo:'example-org/store-locator', profile:'autonomous',
      ready:[],
      held:[{number:6, title:'Show nearest-store distance in miles or km?', state:'needs-grilling', reason:'unit convention undecidable from repo — intent gap', since:'2026-07-12T18:10:00Z'}],
      in_flight:[{number:8, title:'Retry store-locator on 429 with backoff', builder:'codex', reviewer:'claude', stage:'reviewing', checks:'passing'}],
      parked:[],
      recent_merges:[{number:5, title:'Cache geocode lookups for 24h', builder:'codex', merged_at:'2026-07-13T09:12:00Z'}],
-     ratchet:{repo:'ConnorGriffin/home-depot-location-probe', samples:9, correction_rate:0.11, ready_to_loosen:false}},
-    {repo:'ConnorGriffin/ciq-autotune', profile:'guarded',
+     ratchet:{repo:'example-org/store-locator', samples:9, correction_rate:0.11, ready_to_loosen:false}},
+    {repo:'example-org/safety-console', profile:'guarded',
      ready:[],
      held:[{number:309, title:'Patterns tab: confidence badge on rejected findings', state:'needs-mockup', reason:'user-facing surface — needs a locked mockup', since:'2026-07-11T16:44:00Z'}],
-     in_flight:[{number:305, title:'ISF harm-layer arm: dominant-vs-nearest IOB', builder:'claude', reviewer:'codex', stage:'awaiting-merge', checks:'passing'}],
-     parked:[{number:302, title:'Basal fold: clamp negative deltas at zero', reason:'open-question', builder:'claude', reviewer:'codex', since:'2026-07-13T08:22:00Z'}],
+     in_flight:[{number:305, title:'Validate fail-safe threshold ordering', builder:'claude', reviewer:'codex', stage:'awaiting-merge', checks:'passing'}],
+     parked:[{number:302, title:'Clamp negative deltas at zero', reason:'open-question', builder:'claude', reviewer:'codex', since:'2026-07-13T08:22:00Z'}],
      recent_merges:[{number:298, title:'Patterns tab: reject a finding', builder:'claude', merged_at:'2026-07-12T18:05:00Z'}],
-     ratchet:{repo:'ConnorGriffin/ciq-autotune', samples:0, correction_rate:0.0, ready_to_loosen:false}},
+     ratchet:{repo:'example-org/safety-console', samples:0, correction_rate:0.0, ready_to_loosen:false}},
     {repo:'ConnorGriffin/agentflow', profile:'reviewed',
      ready:[{number:67, title:'Cache gh queries in server with a 15s TTL', complexity:'standard', effort:'medium'}],
      held:[],
@@ -1102,20 +1102,20 @@ const FALLBACK = {
        {number:60, title:'Post mockup screenshots with URLs that load on private repos', builder:'codex', merged_at:'2026-07-13T10:58:00Z'},
        {number:59, title:'Cover child session PID marker', builder:'claude', merged_at:'2026-07-13T09:41:00Z'}],
      ratchet:{repo:'ConnorGriffin/agentflow', samples:11, correction_rate:0.18, ready_to_loosen:false}},
-    {repo:'ConnorGriffin/homelab', profile:'reviewed',
+    {repo:'example-org/infrastructure', profile:'reviewed',
      ready:[], held:[],
      in_flight:[
        {number:41, title:'Pin Traefik to 3.1 and add health check', builder:'codex', reviewer:'claude', stage:'awaiting-merge', checks:'passing'},
        {number:43, title:'Pin Grafana to 11.1 and add a readiness probe', builder:'codex', reviewer:'claude', stage:'building', checks:'pending'}],
      parked:[{number:39, title:'Move Pi-hole to a dedicated tailnet subnet', reason:'drop-to-reviewed', builder:'claude', reviewer:'codex', since:'2026-07-13T07:30:00Z'}],
      recent_merges:[{number:37, title:'Rotate the Grafana admin secret via sops', builder:'codex', merged_at:'2026-07-12T20:15:00Z'}],
-     ratchet:{repo:'ConnorGriffin/homelab', samples:7, correction_rate:0.14, ready_to_loosen:false}},
-    {repo:'ConnorGriffin/dotfiles', profile:'reviewed',
+     ratchet:{repo:'example-org/infrastructure', samples:7, correction_rate:0.14, ready_to_loosen:false}},
+    {repo:'example-org/tooling', profile:'reviewed',
      ready:[], held:[],
      in_flight:[{number:24, title:'Add a git-worktree cleanup script to scripts/', builder:'claude', reviewer:'codex', stage:'building', checks:'pending'}],
      parked:[],
      recent_merges:[{number:22, title:'install.sh: skip-and-warn on existing symlinks', builder:'claude', merged_at:'2026-07-12T14:03:00Z'}],
-     ratchet:{repo:'ConnorGriffin/dotfiles', samples:4, correction_rate:0.0, ready_to_loosen:false}}
+     ratchet:{repo:'example-org/tooling', samples:4, correction_rate:0.0, ready_to_loosen:false}}
   ]
 };
 

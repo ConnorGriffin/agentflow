@@ -12,9 +12,9 @@ the repo, couldn't ground against real data, couldn't stand up the app, so every
 fact it needed had to be baked in.
 
 Both tools can now explore and ground. So the frozen work order is no longer
-*forced* by tool weakness. But the domain reason it existed at `ciq-autotune` has
-not gone away: in a medical domain, a plausible-but-wrong guess about insulin math
-or attribution is the expensive failure mode — and a smarter model that guesses
+*forced* by tool weakness. But the domain reason it existed has not gone away:
+in a safety-critical domain, a plausible-but-wrong guess about domain math or
+attribution is the expensive failure mode — and a smarter model that guesses
 confidently is not safer, it's more convincing.
 
 ## Decision

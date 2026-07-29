@@ -145,11 +145,10 @@ launch token, the rest by worktree-path inference. Reproduction method below.
   that were retried or superseded. This is the floor of what
   [#225](https://github.com/ConnorGriffin/agentflow/issues/225) (stop identical
   fresh-session retries) can reclaim.
-- **Merged-issue denominator:** 62 agentflow-branch PRs merged across the four
-  enrolled repos in the window (38 agentflow, 17 ciq-autotune, 6
-  home-depot-location-probe, 1 dotfiles) → roughly **$6.24 Claude-normalized per
-  merged PR** fleet-wide, before Codex normalization. Per-issue attribution:
-  median $2.60, P75 $6.62, max $48.12 across 64 issues with joined Claude spend.
+- **Merged-issue denominator:** count merged agentflow-branch PRs across enrolled
+  repos in the measurement window, then divide normalized provider spend by that
+  count. Keep per-issue attribution and percentile calculations, but do not
+  publish private fleet identities or live spend totals.
 - Quality floor to hold: 18/78 review verdicts BLOCK (23%); 15 held records at
   snapshot (10 parked PRs, 4 needs-grilling issues, 1 other).
 

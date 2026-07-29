@@ -11,11 +11,11 @@ file (Claude: `~/.claude/CLAUDE.md` global + repo `CLAUDE.md`; Codex:
 `~/.codex/AGENTS.md` global + repo `AGENTS.md`), but the setup is fragmented and
 already drifting:
 
-- Claude's global is versioned (`dotfiles/claude/CLAUDE.md`) but **Claude-only**.
+- Claude's global is versioned in private tooling but **Claude-only**.
 - Codex's global (`~/.codex/AGENTS.md`) is **empty** — Codex builds inherit *no*
   standards.
-- Per-repo copies are **hand-duplicated** (`ciq-autotune` has twin `CLAUDE.md` /
-  `AGENTS.md` that will drift) or **missing** (`retirement-planner` is Codex-blind).
+- Per-repo copies are **hand-duplicated** across instruction files that will
+  drift, or **missing** in some projects.
 
 So today, whether an app is well-architected depends on which tool happened to build
 it and whether two files stayed in sync. For a flow that builds on either tool, that

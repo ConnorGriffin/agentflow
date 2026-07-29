@@ -687,7 +687,7 @@ def test_reverifying_continuation_settles_and_keeps_the_earlier_pushed_fix(monke
 # --- one exact head, one park/resume decision contract (#344) ------------------------------
 # A PR head's Product/Standards/Fix passes are one durable chain. The decision that chain recorded
 # belongs to the head, not to whichever pass happened to stop last, and only the maintainer's own
-# answer retires it. The production loss (ciq-autotune#479) was a park that read the terminal
+# answer retires it. The production loss was a park that read the terminal
 # record alone, so an unanswered product decision became generic clarify/close boilerplate.
 
 _RESCUE_DECISION = Uncertainty(

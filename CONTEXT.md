@@ -97,11 +97,11 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   - **`reviewed`** — agent builds, gets cross-tool review when available or an explicit same-tool
     fallback summary, then a human glances and merges. The default. (Most repos.)
   - **`guarded`** — mandatory real-data grounding, Full dual/human review, human merges.
-    (`ciq-autotune` / medical-adjacent.)
+    (Safety-critical projects.)
 
 - **Domain risk** — the cost of a *plausible-but-wrong merge* in a given repo. The
   durable constraint that a smarter model does not erase; it, not tool identity,
-  sets a repo's position on the autonomy dial. High in `ciq-autotune` (medical),
+  sets a repo's position on the autonomy dial. High in safety-critical projects,
   low in a vibe-code project.
 
 - **Complexity** — the per-issue builder model size intake stamps as a hard gate:

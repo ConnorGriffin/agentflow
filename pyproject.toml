@@ -2,15 +2,63 @@
 name = "agentflow"
 version = "0.0.1"
 description = "Tool-agnostic autonomous issue → PR → review pipeline (runs on Claude or Codex)"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{ name = "Connor Griffin" }]
 dependencies = ["fastapi>=0.110", "uvicorn>=0.29"]
 
+[project.urls]
+Homepage = "https://github.com/ConnorGriffin/agentflow"
+Issues = "https://github.com/ConnorGriffin/agentflow/issues"
+Documentation = "https://github.com/ConnorGriffin/agentflow#readme"
+
 [project.scripts]
+agentflow = "agentflow.cli:main"
+agentflow-capacity-helper = "agentflow.capacity_helper:main"
 agentflow-web = "agentflow.webapp:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = ["pytest>=8", "httpx>=0.27", "hatchling>=1.27"]
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build]
+skip-excluded-dirs = true
+exclude = [
+    "/.agentflow",
+    "/.claude",
+    "/.impeccable",
+    "/.pytest_cache",
+    "/.venv",
+    "/agentflow/webui/node_modules",
+    "/dist",
+]
+
+[tool.hatch.build.targets.sdist]
+only-include = [
+    "agentflow",
+    "COMPATIBILITY.md",
+    "CONTRIBUTING.md",
+    "DCO",
+    "GOVERNANCE.md",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "pyproject.toml",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentflow"]
+exclude = [
+    "/agentflow/webui/index.html",
+    "/agentflow/webui/node_modules",
+    "/agentflow/webui/src",
+    "/agentflow/webui/svelte.config.js",
+    "/agentflow/webui/vite.config.js",
+]

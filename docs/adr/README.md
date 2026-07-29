@@ -1,15 +1,15 @@
 # Architecture Decision Records — agentflow
 
 Decisions about the tool-agnostic, autonomous **issue → PR → review** pipeline
-that `agentflow` defines. Consuming repos (`ciq-autotune`, `work-kit`, vibe-code
-projects) carry only their own per-repo config (profile + hazards); the design
+that `agentflow` defines. Consuming repos carry only their own per-repo config
+(profile + hazards); the design
 lives here.
 
-Supersedes the tooling ADRs in `dotfiles/docs/adr/0001–0005` (the "two-tool
+Supersedes earlier private-tooling ADRs 0001–0005 (the "two-tool
 split / Opus-ends, Codex-middle" era), which were written the day before GPT-5.6
 Sol shipped and are kept only for history.
 
-Format follows the ciq-autotune convention: `# ADR NNNN — Title`, Status + Date,
+Format follows the project convention: `# ADR NNNN — Title`, Status + Date,
 then Context / Decision / Alternatives / Consequences.
 
 ## Index
@@ -46,7 +46,7 @@ then Context / Decision / Alternatives / Consequences.
   acceptance criteria (beyond-scope correctness is a follow-up, not a blocker).
 - [0016](0016-intake-stage.md) — Intake: the autonomous front of the pipe (ground →
   rewrite → route; native, drops the `/triage` skill).
-- [0017](0017-ciq-auto-scope-human-merge.md) — ciq-autotune: auto-scope, human-merge
+- [0017](0017-guarded-auto-scope-human-merge.md) — Guarded project: auto-scope, human-merge
   (promotes ADR 0008's reserved off-diagonal knob).
 - [0018](0018-two-dials-review-by-evidence.md) — Two dials (complexity + effort);
   review by evidence not demo; `tier:` retired.

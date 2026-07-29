@@ -542,7 +542,7 @@ def test_pr_bound_review_admits_and_the_build_stays_waiting(make_coord):
 def _gate_blocking(*pools):
     """An admission gate that refuses launches on the named pools (e.g. one whose codex weekly
     budget is spent) while its permit ledger is untouched — the launch-gate block that froze the
-    ciq-autotune #391/#396/#397 builds at zero attempts."""
+    multiple enrolled-project builds at zero attempts."""
     blocked = set(pools)
     return lambda record: record.pool not in blocked
 
@@ -555,7 +555,8 @@ _SRC = "/work/o-r/.agentflow/worktrees/codex/issue-7-fix"
 def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlocking(make_coord):
     """A waiting, zero-attempt build pinned to codex whose codex launch gate is blocked (weekly
     pacing) while claude has headroom migrates to claude within a single cycle and starts, rather
-    than freezing forever behind its own live claim. Reproduces ciq-autotune #391/#396/#397: before
+    than freezing forever behind its own live claim. Reproduces a guarded-project
+    incident: before
     the fix the build could neither launch on codex nor fall back to claude, and its live claim
     shielded the building label from reclaim."""
     fake = FakeSession()

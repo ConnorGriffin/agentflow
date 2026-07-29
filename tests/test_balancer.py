@@ -123,6 +123,19 @@ def test_neither_clear_is_no_capacity():
     assert choose_pair(claude, codex, RUNNERS) == (None, None)
 
 
+def test_missing_optional_capacity_helper_keeps_codex_closed_but_uses_claude_facts(
+        isolate_state, monkeypatch):
+    monkeypatch.setattr(balancer, "_GATE", None)
+    _seed_claude_quota(19)
+
+    builder, reviewer, block_msg = pick_pair("CLAUDE", "CODEX")
+
+    assert (builder, reviewer, block_msg) == ("CLAUDE", None, "")
+    codex = balancer._query_pool("codex")
+    assert codex.clear is False
+    assert codex.reason == "capacity helper not configured"
+
+
 # --- choose_reviewer: ADR 0020 review under partial availability -----------------
 _CS = PoolStatus("claude", True, 20.0)
 _XS = PoolStatus("codex", True, 60.0)

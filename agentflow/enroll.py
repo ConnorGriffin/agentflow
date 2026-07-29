@@ -177,7 +177,7 @@ def checkout_repo(workdir: str) -> str:
     """
     from agentflow.runner import _run
     # `--show-prefix` is empty only at a checkout's root; ask git rather than comparing paths,
-    # which a case-insensitive filesystem gets wrong (a `Brewgen/` checkout rooted at `brewgen/`).
+    # which a case-insensitive filesystem gets wrong (a `SampleApp/` checkout rooted at `sampleapp/`).
     prefix = _run(["git", "-C", workdir, "rev-parse", "--show-prefix"])
     if prefix.returncode != 0 or (prefix.stdout or "").strip():
         return ""

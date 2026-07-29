@@ -263,8 +263,8 @@ class TestUiEvidenceGapAnchorsToUs:
 class TestBackfilledSurfacesActuallyGate:
     # Issue #337: the fleet's other frontends were undeclared, so this gate had never fired
     # outside agentflow. These are the exact shapes the backfill measured before it landed.
-    _CIQ_FILES = ["frontend/diagnose.js", "frontend/diagnose.test.js",
-                  "ciq_autotune/analyzers/basal.py"]
+    _UI_FILES = ["frontend/diagnose.js", "frontend/diagnose.test.js",
+                 "analysis_engine/analyzers/threshold.py"]
 
     def _gap(self, monkeypatch, surfaces, files, *, body=""):
         monkeypatch.setattr(gate.github, "api", lambda *a, **k: {
@@ -272,19 +272,19 @@ class TestBackfilledSurfacesActuallyGate:
         return ui_evidence_gap("o/r", 476, surfaces)
 
     def test_a_frontend_change_with_no_shots_is_a_gap(self, monkeypatch):
-        assert self._gap(monkeypatch, ["frontend/"], self._CIQ_FILES) is True
+        assert self._gap(monkeypatch, ["frontend/"], self._UI_FILES) is True
 
     def test_the_same_change_with_committed_shots_clears(self, monkeypatch):
         assert self._gap(
             monkeypatch, ["frontend/"],
-            [*self._CIQ_FILES, "docs/screenshots/issue-476/abc1234/after-dark.png"]) is False
+            [*self._UI_FILES, "docs/screenshots/issue-476/abc1234/after-dark.png"]) is False
 
     def test_a_frontend_test_change_is_not_a_ui_change(self, monkeypatch):
-        # Brewgen #62: browser tests and backend files sit outside the declared surface,
+        # Browser tests and backend files sit outside the declared surface,
         # so declaring surfaces must not park work that never touched the UI itself.
-        assert self._gap(monkeypatch, ["brewgen/frontend/src/"],
-                         ["brewgen/frontend/tests/browser/results-shelf.mjs",
-                          "brewgen/backend/envelope.py", "Dockerfile"]) is False
+        assert self._gap(monkeypatch, ["sample-app/frontend/src/"],
+                         ["sample-app/frontend/tests/browser/results-shelf.mjs",
+                          "sample-app/backend/envelope.py", "Dockerfile"]) is False
 
     def test_declared_headless_never_reads_github(self, monkeypatch):
         # `ui-surfaces: none` resolves to an empty surface list, which must land on the inert

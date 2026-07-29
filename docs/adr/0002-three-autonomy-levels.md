@@ -34,8 +34,8 @@ Three named levels. A repo declares exactly one (`profile: <level>`).
   revert. The machine closes the loop.
 - `reviewed` — the sensible default for most repos. The machine does everything up
   to a reviewed, mergeable PR; the human's only act is a glance and a merge click.
-- `guarded` — `ciq-autotune` and anything medical-adjacent. A plausible-wrong
-  merge is expensive, so grounding is mandatory and a human always merges.
+- `guarded` — safety-critical projects. A plausible-wrong merge is expensive,
+  so grounding is mandatory and a human always merges.
 
 **Single coupled dial.** Grounding/review/merge are not independently settable.
 Off-diagonal combinations (e.g. auto-merge but mandatory grounding) are deferred

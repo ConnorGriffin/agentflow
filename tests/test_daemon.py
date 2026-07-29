@@ -12,7 +12,8 @@ from unittest import mock
 import pytest
 
 from agentflow import daemon, live
-from agentflow.daemon import PollLoop, _acquire_lock, _release_lock, cycle, main
+from agentflow.config import RuntimeConfig
+from agentflow.daemon import PollLoop, _acquire_lock, _release_lock, cycle
 from agentflow.loop import RepoConfig
 
 A = RepoConfig("owner/a", "/tmp/a")
@@ -44,13 +45,15 @@ def _wait_for_lock(lock, owner_pid: int, timeout: float = 2) -> None:
 def _start_daemon(state_dir):
     env = os.environ | {"AGENTFLOW_STATE": str(state_dir)}
     script = """
-from agentflow import daemon
+from pathlib import Path
 
-daemon.REPOS = []
+from agentflow import daemon
+from agentflow.config import RuntimeConfig
+
 daemon.FAST_TICK_SECONDS = 0.05
 daemon.FULL_PASS_SECONDS = 0.05
 daemon.publish_snapshot = lambda repos: None  # hermetic: no pool-gate subprocesses
-daemon.main()
+daemon.run(RuntimeConfig((), (), Path("/tmp/test-agentflow-config.toml")))
 """
     return subprocess.Popen(
         [sys.executable, "-c", script],
@@ -117,7 +120,6 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
     with (
         mock.patch("agentflow.daemon.STATE_DIR", tmp_path),
         mock.patch("agentflow.daemon.LOCK", tmp_path / "daemon.lock"),
-        mock.patch("agentflow.daemon.REPOS", [A, B]),
         mock.patch("agentflow.daemon.recover_worktrees",
                    side_effect=lambda repos: events.append(("recover", list(repos)))),
         mock.patch("agentflow.daemon.dispatch_cycle",
@@ -125,9 +127,8 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
         mock.patch("agentflow.daemon.publish_snapshot",
                    side_effect=lambda repos: events.append(("publish", list(repos)))),
         mock.patch("agentflow.daemon.log"),
-        mock.patch.object(sys, "argv", ["daemon", "--once"]),
     ):
-        main()
+        daemon.run(RuntimeConfig((A, B), (), tmp_path / "config.toml"), once=True)
 
     assert events == [("recover", [A, B]), ("cycle", [A, B]), ("publish", [A, B])]
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit

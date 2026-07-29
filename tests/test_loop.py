@@ -437,7 +437,7 @@ def test_build_prompt_formats_and_tells_the_builder_the_pr_gates():
 
 
 def test_build_prompt_prescribes_the_browserless_screenshot_path():
-    # PR #402 in ciq-autotune parked because the builder tried GitHub's drag-drop upload,
+    # A guarded-project PR parked because the builder tried GitHub's drag-drop upload,
     # which needs a signed-in browser this host doesn't have. The prompt names the committed
     # path (docs/screenshots/ on the branch), pins the image host to the immutable commit
     # (issue #205), and forbids the browser route.

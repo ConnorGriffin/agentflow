@@ -6,16 +6,16 @@
 ## Context
 
 We run an autonomous **issue → PR → review** pipeline across several repos with
-wildly different risk. `ciq-autotune` is medical-adjacent — a plausible-but-wrong
-merge can alter an insulin recommendation. A greenfield "vibe-code" project is
-low-stakes: the worst case is a revert. Same owner, same machinery, opposite
-tolerance for an unwatched agent.
+wildly different risk. A safety-critical project can cause real harm when a
+plausible-but-wrong change lands. A greenfield "vibe-code" project is low-stakes:
+the worst case is a revert. Same owner, same machinery, opposite tolerance for
+an unwatched agent.
 
 As of 2026-07 both coding agents in play — Claude (Opus) and Codex (GPT-5.6 Sol)
 — are full-loop autonomous agents: either can scope, ground, build, and review a
 whole issue end to end. Tool identity no longer bounds what can be automated.
 
-The prior design (`dotfiles/docs/adr/0001–0005`, dated 2026-07-08, **superseded
+The prior design (private tooling ADRs 0001–0005, dated 2026-07-08, **superseded
 by this repo**) routed by *tool*: a `tool:codex` label confined Codex to a frozen
 "hermetic middle" while Opus owned both pipe-ends. That conflated two different
 things — *which tool runs the work* and *how hazardous the work is*. When both
@@ -43,8 +43,9 @@ runners (see a later ADR); either can occupy any stage at any profile level.
 
 - **Route by tool (the superseded design).** Rejected: conflates capability with
   hazard; obsoleted the moment both tools reached full-loop autonomy.
-- **One uniform policy for every repo.** Rejected: medical caution would throttle
-  vibe-code to a crawl, and vibe-code autonomy would be reckless in `ciq-autotune`.
+- **One uniform policy for every repo.** Rejected: safety-critical caution would
+  throttle vibe-code to a crawl, and vibe-code autonomy would be reckless in a
+  guarded project.
 - **Route by change size (mechanical → auto, big → human).** Rejected for the same
   reason the superseded design failed: a one-line change in a medical domain can
   be catastrophically wrong. Size is not risk.

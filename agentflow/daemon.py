@@ -50,6 +50,7 @@ import time
 from pathlib import Path
 
 from agentflow import dispatch, live
+from agentflow.config import ConfigurationError, RuntimeConfig, load_config
 from agentflow.dashboard_data import snapshot
 from agentflow.loop import RepoConfig, recheck_once
 from agentflow.probe import ChangeProbe
@@ -75,30 +76,6 @@ FULL_PASS_SECONDS = int(os.environ.get(
 HEARTBEAT_SECONDS = 60
 STALE_SECONDS = 3 * 3600
 
-# One repo per entry; extend as repos are enrolled (each needs an AGENTS.md
-# `profile:` line, ready-for-agent + tier:* labels, and PR CI).
-REPOS = [
-    RepoConfig("ConnorGriffin/agentflow-sandbox",
-               os.path.expanduser("~/Code/ConnorGriffin/agentflow-sandbox")),
-    RepoConfig("ConnorGriffin/home-depot-location-probe",
-               os.path.expanduser("~/Code/ConnorGriffin/home-depot-location-probe")),
-    RepoConfig("ConnorGriffin/ciq-autotune",  # guarded: medical/PHI, human merges
-               os.path.expanduser("~/Code/ConnorGriffin/ciq-autotune")),
-    RepoConfig("ConnorGriffin/agentflow",  # dogfood: the engine in its own fleet
-               os.path.expanduser("~/Code/ConnorGriffin/agentflow")),
-    RepoConfig("ConnorGriffin/homelab",  # reviewed: manual deploy, live DNS/tailnet
-               os.path.expanduser("~/Code/ConnorGriffin/homelab")),
-    RepoConfig("ConnorGriffin/dotfiles",  # reviewed: install.sh mutates the live machine
-               os.path.expanduser("~/Code/ConnorGriffin/dotfiles")),
-    RepoConfig("ConnorGriffin/Brewgen",  # reviewed: human merges
-               os.path.expanduser("~/Code/ConnorGriffin/brewgen")),
-    RepoConfig("ConnorGriffin/packing-checklist",  # reviewed: human merges
-               os.path.expanduser("~/Code/ConnorGriffin/packing-checklist")),
-    RepoConfig("ConnorGriffin/follow-through",  # reviewed: writes private personal context
-               os.path.expanduser("~/Code/ConnorGriffin/follow-through")),
-]
-
-
 def log(msg: str) -> None:
     print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} agentflow: {msg}", flush=True)
 
@@ -123,11 +100,6 @@ def dispatch_cycle(repos: list[RepoConfig], _log=log, *, submit_new: bool = True
     dispatch.run_cycle(repos, submit_new=submit_new, _log=_log)
     if submit_new:
         cycle(repos, run=_recheck, _log=_log)
-
-
-# The repositories enrolled as Project workspaces. Only agentflow's own repo is enrolled for the
-# first workspace slice (ADR 0033/0034); the fleet-home switcher is a stub.
-WORKSPACE_REPOS = [c for c in REPOS if c.repo == "ConnorGriffin/agentflow"]
 
 
 def workspace_cycle(repos: list[RepoConfig], _log=log) -> None:
@@ -223,10 +195,11 @@ class PollLoop:
     heartbeat it runs a drain pass with cold submission disabled, so active durable records keep
     reconciling and the operator sees a fresh snapshot."""
 
-    def __init__(self, repos, *, probe=None, dispatch_pass=None, publish=None,
+    def __init__(self, repos, *, workspace_repos=(), probe=None, dispatch_pass=None, publish=None,
                  enabled=None, local_complete=None, clock=time.monotonic, spawn=None,
                  _log=log) -> None:
         self._repos = repos
+        self._workspace_repos = workspace_repos
         self._probe = probe if probe is not None else ChangeProbe(repos)
         self._dispatch = dispatch_pass or dispatch_cycle
         self._publish = publish or publish_snapshot
@@ -252,7 +225,7 @@ class PollLoop:
         def work():
             try:
                 self._dispatch(self._repos, submit_new=submit_new)
-                workspace_cycle(WORKSPACE_REPOS)
+                workspace_cycle(self._workspace_repos)
                 self._publish(self._repos)
             finally:
                 self._running.release()
@@ -381,15 +354,9 @@ def _heartbeat(stop: threading.Event) -> None:
             return
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="agentflow daemon")
-    parser.add_argument(
-        "--once",
-        action="store_true",
-        help="run one cycle and exit (bypasses the enable flag; still respects the lock)",
-    )
-    args = parser.parse_args()
-
+def run(config: RuntimeConfig, *, once: bool = False) -> None:
+    repos = list(config.repositories)
+    workspace_repos = list(config.workspace_repositories)
     stop = threading.Event()
     beat = threading.Thread(target=_heartbeat, args=(stop,), daemon=True)
     previous_handlers = {}
@@ -421,19 +388,27 @@ def main() -> None:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
             signals_blocked = False
         beat.start()
-        recover_worktrees(REPOS)
-        if args.once:
-            log(f"--once: running one cycle over repos={[c.repo for c in REPOS]}")
-            dispatch_cycle(REPOS)
-            workspace_cycle(WORKSPACE_REPOS)
+        if not (
+            os.environ.get("AGENTFLOW_CAPACITY_HELPER")
+            or os.environ.get("AGENTFLOW_TRIAGE_GATE")
+        ):
+            log(
+                "capacity helper not configured — Codex capacity and "
+                "operator-activity detection are unavailable"
+            )
+        recover_worktrees(repos)
+        if once:
+            log(f"--once: running one cycle over repos={[c.repo for c in repos]}")
+            dispatch_cycle(repos)
+            workspace_cycle(workspace_repos)
             live.mark_cycle(FAST_TICK_SECONDS)
-            publish_snapshot(REPOS)
+            publish_snapshot(repos)
             return
         log(
             f"daemon up — enable={ENABLE_FLAG}, fast={FAST_TICK_SECONDS}s, "
-            f"heartbeat={FULL_PASS_SECONDS}s, repos={[c.repo for c in REPOS]}"
+            f"heartbeat={FULL_PASS_SECONDS}s, repos={[c.repo for c in repos]}"
         )
-        PollLoop(REPOS).run()
+        PollLoop(repos, workspace_repos=workspace_repos).run()
     finally:
         shutdown_requested = True
         stop.set()
@@ -443,6 +418,22 @@ def main() -> None:
             signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="agentflow daemon")
+    parser.add_argument("--config", help="path to config.toml")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="run one cycle and exit (bypasses the enable flag; still respects the lock)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        config = load_config(args.config)
+    except ConfigurationError as exc:
+        parser.error(str(exc))
+    run(config, once=args.once)
 
 
 if __name__ == "__main__":

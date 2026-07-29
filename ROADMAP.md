@@ -28,7 +28,7 @@ intake → build (tool A, worktree) → cross-review (tool B) → auto-merge on 
 clean. Proves session-spawn, the cross-tool handoff, and the merge gate on real
 GitHub. May hardcode a single pool.
 
-**Proven live** on `agentflow-sandbox` #1: Claude built `slugify`; Codex cross-reviewed
+**Proven live** on a sandbox project: Claude built `slugify`; Codex cross-reviewed
 and caught a real spec ambiguity (ASCII vs Unicode); one revise round made it
 Unicode-aware; Codex re-reviewed clean; the gate auto-squash-merged PR #3. Findings
 folded in along the way: verdict-capture (not a model-written file), park-not-revise
@@ -107,6 +107,6 @@ blocker merges:
 ## Rollout coupling (signed off)
 
 The build sequence *is* the repo rollout: **M0–M3 harden on a new vibe-code repo
-(`autonomous`)** → add a `reviewed` repo → **port `ciq-autotune` last at `guarded`
-(M4)**. The existing dotfiles `*-sweep` automation keeps running untouched until
-agentflow's `guarded` path is proven, then retires per-repo.
+(`autonomous`)** → add a `reviewed` repo → **port a safety-critical repo last at
+`guarded` (M4)**. Existing private-tooling automation keeps running untouched
+until agentflow's `guarded` path is proven, then retires per-repo.

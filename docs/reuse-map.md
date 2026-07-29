@@ -1,6 +1,6 @@
 # agentflow reuse map (build reference)
 
-Point-in-time inventory (2026-07-09) of which `dotfiles` logic ports into agentflow.
+Point-in-time inventory (2026-07-09) of which private-tooling logic ports into agentflow.
 Not a decision (see ADRs) — a build aid. **The organizing flip:** everything today
 routes by `tool:codex`; agentflow routes by a domain-risk `profile` — so most assets
 need their tool-routing swapped for a `profile`/`pool` stamp.
@@ -12,7 +12,7 @@ need their tool-routing swapped for a `profile`/`pool` stamp.
 | Orchestrator daemon [0011] | BUILD-NEW (loop reusable) | 3 stateless cron sweeps today. Reuse the sweep skeleton: `mkdir` lock + stale-reclaim, `next_candidate()` poll, `attempts.json` dedup, `run_one()`. Always-on supervisor holding both pools is new. |
 | Two-pool balancer [0006] | **REUSE** (gate→comparator) | `scripts/triage-gate.sh` already reads both pools (Claude calibrated 5h spend; Codex reported window usage, duration, and reset facts). New: turn the per-agent binary gate into a *comparator* (more-headroom → builder). tty + transcript-mtime interactive detection + reserve port directly. |
 | Session spawner / worktree [0011] | **REUSE** (de-Codex it) | `scripts/codex-go` ≈ 80%: precheck → slug → worktree off FRESH `origin/main` → `uv sync` → launch → exit-code classify (0/2/3/4). Generalize launch line (`codex exec` vs `claude -p`) + namespace. `skills/spin-worktree/scripts/spin-worktree.py` = clean worktree primitive. |
-| Intake [0007] | **REUSE** (reframe labels) | `skills/triage` auto mode IS the decide-then-review headless state machine. New: stamp `profile:`/`pool:` not `tool:codex`. work-order's hermeticity/insulin-math/exclusion gate = the "what makes it `guarded`" logic. |
+| Intake [0007] | **REUSE** (reframe labels) | `skills/triage` auto mode IS the decide-then-review headless state machine. New: stamp `profile:`/`pool:` not `tool:codex`. Work-order hermeticity, domain invariants, and exclusion gates define what makes a project `guarded`. |
 | Build stage [0005] | **REUSE** | Spawner + `skills/work-order/orchestrator-prompt.md` (self-scoped brief) + `skills/go` builder entry + model/effort table. |
 | Cross-tool review [0003] | **BUILD-NEW** (top gap) | **No runner exists** — the old `review-sweep` was never built; review is a manual `/close` rule. Must build: "other tool" dispatch, blocking-vs-nit severity contract [0004], reviewer sibling-PR check [0009], single-tool fallback. Riskiest must-build. |
 | Auto-merge gate [0004] | BUILD-NEW (merge action reusable) | `skills/close` has the merge mechanics (`gh pr merge --squash --delete-branch`, conflict→stop, `pull --ff-only`) but is deliberately human-only. The green∧clean→merge / else revise-once / else drop-to-reviewed decision is net-new. |

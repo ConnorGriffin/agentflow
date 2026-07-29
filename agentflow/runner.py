@@ -3,7 +3,7 @@
 The coordinator is the only launch owner. Runners provide model mapping, structured command
 construction, provisioning, and git plumbing; they do not orchestrate a Build lifecycle.
 
-Ported and generalized from the dotfiles `codex-go` wrapper (Codex-only) into a
+Ported and generalized from a private Codex-only wrapper into a
 two-tool abstraction — the "unified runner" the reuse map flagged as net-new.
 
 The interface is command construction, model resolution, and fail-closed worktree plumbing,
@@ -603,9 +603,12 @@ class CodexRunner(_WorktreeRunner):
         """Read the existing typed Codex limit companion. It establishes capacity only when a
         reported window is exhausted; unavailable or unsupported account diagnoses remain
         ``None`` so provider prose can never be promoted into a cause (ADR 0030)."""
-        gate = os.environ.get(
-            "AGENTFLOW_TRIAGE_GATE",
-            os.path.expanduser("~/Code/ConnorGriffin/dotfiles/scripts/triage-gate.sh"))
+        gate = (
+            os.environ.get("AGENTFLOW_CAPACITY_HELPER")
+            or os.environ.get("AGENTFLOW_TRIAGE_GATE")
+        )
+        if gate is None:
+            return None
         try:
             result = subprocess.run(
                 [gate, "limits"], env={**os.environ, "TRIAGE_AGENT": "codex"},

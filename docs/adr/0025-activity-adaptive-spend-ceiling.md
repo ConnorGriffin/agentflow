@@ -51,11 +51,11 @@ Consequences that fall out for free:
   becomes unnecessary for its original purpose but stays harmless.
 
 **Facts move to the gate, policy moves to the balancer.** Today the gate script
-(in dotfiles) *decides* clear-vs-busy and agentflow obeys. Under this ADR the
+(in private tooling) *decides* clear-vs-busy and agentflow obeys. Under this ADR the
 gate reports **facts** — trailing-5h spend and active-or-idle — and **agentflow's
 balancer applies the ceiling** (thresholds as named config: `IDLE_CEILING_PCT=85`,
 `ACTIVE_CEILING_PCT=50`, `ACTIVE_PACE=1/cycle`). That makes the policy testable
-in-repo, tunable without touching dotfiles, and surfaceable: the dashboard's pool
+in-repo, tunable without touching private tooling, and surfaceable: the dashboard's pool
 strip ([ADR 0023](0023-dashboard-replatform-control-plane.md)) can honestly show
 *"claude · yielding to operator · ceiling 50%"* instead of a mute "busy".
 
@@ -87,7 +87,7 @@ The gate's existing exclusion of agentflow's own sessions from the activity chec
 - The operator's worst case is bounded and known: at most `ACTIVE_CEILING_PCT`
   of a window spent by the daemon while they're active (plus sessions already
   in flight when the burst began).
-- `triage-gate.sh` (dotfiles, itself fleet-enrolled) needs a small change: expose
+- `triage-gate.sh` (private tooling, itself fleet-enrolled) needs a small change: expose
   activity as a reported fact (e.g. `activity` mode or a field alongside
   `spend:`), while `check` semantics remain for compatibility until agentflow
   switches over. Cross-repo, one seam.
