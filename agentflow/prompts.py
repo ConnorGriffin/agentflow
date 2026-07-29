@@ -231,5 +231,3 @@ CONFLICT_REASON = (
 
 # A survivor that re-rebased clean but still can't auto-merge (review not clean, CI red, or
 # an unanswered question) hands off to a human rather than churning a revise here.
-SURVIVOR_PARK_REASON = ("was re-rebased after `main` advanced but still can't auto-merge — "
-                        "a human takes it from here")

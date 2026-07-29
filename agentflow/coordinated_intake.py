@@ -78,8 +78,8 @@ def dispose_worktree(record) -> bool:
     """Remove Intake's read-only checkout once its route is durable, *before* the record retires
     (issue #106). A completed-but-not-retired record's source is still in the coordinator's
     owned-sources set, so it is protected; the instant it retires that protection drops, and any
-    checkout still on disk would then read as ambiguous legacy activation evidence
-    (:func:`agentflow.coordinated_build.activation_evidence`). Disposing here closes that window.
+    checkout still on disk would then read as ambiguous legacy activation evidence.
+    Disposing here closes that window.
     Idempotent: an already-removed worktree is a no-op success. Returns whether the worktree is
     gone — a stubborn checkout that could not be removed returns ``False`` so settlement retries
     rather than retiring over ambiguous evidence."""
