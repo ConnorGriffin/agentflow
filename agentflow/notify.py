@@ -14,6 +14,8 @@ import subprocess
 import time
 from pathlib import Path
 
+from agentflow.state import OutsideStateDirectory, state_path
+
 NTFY_URL = os.environ.get("AGENTFLOW_NTFY_URL", "")
 
 # How long one handoff's ping counts as already sent. A handoff pings on every cycle that can
@@ -34,8 +36,10 @@ _SEQUENCE_ID = re.compile(r"^[0-9a-f]{1,64}$")
 def _sent_marker(sequence_id: str) -> Path | None:
     if not _SEQUENCE_ID.match(sequence_id):
         return None   # not a key this module minted — never let it name a file
-    root = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
-    return root / "notifications" / f"{sequence_id}.sent"
+    try:
+        return state_path("notifications", f"{sequence_id}.sent")
+    except OutsideStateDirectory:
+        return None
 
 
 def _sent_within_window(sequence_id: str, now: float) -> bool:
