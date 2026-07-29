@@ -419,7 +419,9 @@ class _WorktreeRunner:
                 # Freshen a reused worktree to the (possibly moved) ref — otherwise a
                 # re-review after a revise push would inspect a stale checkout.
                 _run(["git", "-C", str(wt), "reset", "--hard", ref]).check_returncode()
-                _run(["git", "-C", str(wt), "clean", "-fdx"])
+                # The environment is derived from the lockfile and expensive to recreate.
+                # Keep it while removing every other ignored or untracked artifact.
+                _run(["git", "-C", str(wt), "clean", "-fdx", "-e", ".venv/"]).check_returncode()
                 return
             discard_orphaned_worktree(workdir, wt)
         wt.parent.mkdir(parents=True, exist_ok=True)

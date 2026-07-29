@@ -503,6 +503,12 @@ class Coordinator:
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
         if not self._adapter.prepare(record):
+            # Do not let an unpreparable PR-bound record keep the pool's issue work behind the
+            # PR-priority barrier. It owns no permit and gets another preparation attempt next
+            # cycle; until then, other useful work may use the idle pool.
+            if record.stage in PR_BOUND:
+                record.eligible_at = max(record.eligible_at, now + 1)
+                self._persist(record)
             return "unprepared"
         if not self._begin_start(record, now):
             # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
