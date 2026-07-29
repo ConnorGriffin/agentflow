@@ -320,7 +320,6 @@ def create_issue(repo: str, title: str, body: str) -> IssueCreation:
     return IssueCreation(url=(r.stdout or "").strip().splitlines()[-1].strip() if r.stdout else "")
 
 
-
 def add_label(repo: str, issue: int, label: str) -> bool:
     """Add ``label`` to the issue. Returns whether the command succeeded."""
     return _gh(["issue", "edit", str(issue), "--repo", repo,
