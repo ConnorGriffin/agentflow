@@ -41,6 +41,15 @@ ownership, attempts, permits, claims, or recovery; use the coordinator records a
 An orphaned visible claim is held for a one-hour safety grace before removal so a short,
 deterministic interactive scope operation cannot race the daemon.
 
+### Wayfinder research awaiting disposition
+
+Closed Wayfinder research always has a durable disposition; no hidden issues-to-file list
+exists outside GitHub. A research ticket carrying `wayfinder:awaiting-disposition` has
+finished its unattended investigation but still needs human judgment. Leave it open, do
+not restore `wayfinder:resolving`, and disposition every candidate through Wayfinder:
+each selected build is filed and indexed, while each unselected candidate is explicitly
+recorded as no-build or deferred with a concrete trigger and verification condition.
+
 ## Pause and drain
 
 ```bash

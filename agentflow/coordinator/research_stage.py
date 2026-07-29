@@ -12,11 +12,12 @@ stage). Its required outcome is the findings the session recorded in its worktre
 can never stand in for it — a clean exit that recorded nothing is incomplete and continues within
 budget (ADR 0037's outcome-first rule), which is the anti-duplication guarantee.
 
-``finalize_completed`` is the **single place the daemon resolves** the ticket — it posts the findings
-comment, closes the ticket, appends one titled line to the parent map's "Decisions so far", and
-releases the shared ``wayfinder:resolving`` claim. The dispatched session never writes GitHub, the
-map, or coordinator state itself (ADR 0037); only this finalizer resolves. On budget exhaustion the
-shared ``finalize_hold`` releases the claim alone, leaving the ticket eligible again next cycle.
+``finalize_completed`` is the **single place the daemon records** the result. It closes explicit
+no-build and concrete deferred outcomes; a handoff-required result instead leaves the ticket open,
+indexes it under "Awaiting disposition", marks the pending state, releases the active claim, and
+returns durable proof so the completed run can retire. The dispatched session never writes GitHub,
+the map, or coordinator state itself (ADR 0037). On budget exhaustion ``finalize_hold`` releases the
+claim alone, leaving the ticket eligible again next cycle.
 """
 
 from __future__ import annotations
@@ -27,11 +28,13 @@ from agentflow.coordinator.stage_adapter import StageAdapter
 class ResearchStageAdapter(StageAdapter):
     """Observes a launched research session and verifies its findings outcome.
 
-    Beyond the shared collaborators, ``findings_ready`` answers whether the session's durable
-    findings for this ticket exist, ``resolve`` posts the findings, closes the ticket, appends the
-    map breadcrumb, and releases the shared claim (the single resolution point), and ``release``
-    drops the claim alone on a hold. Production wires these to the real worktree findings artifact
-    and GitHub.
+    Collaborators are injected so the stage is exercised without a real worktree or provider:
+    ``findings_ready`` answers whether the session's durable findings for this ticket exist,
+    ``resolve`` posts the findings and durably routes their disposition (the single result-writing
+    point), ``release`` drops the claim alone on a hold,
+    ``worktree_ready`` proves the run's isolated worktree is present, and ``observer`` reconstructs
+    the provider observation. Production wires these to the real worktree findings artifact and
+    GitHub.
     """
 
     required_outcome = "recorded findings for the ticket"
@@ -43,11 +46,12 @@ class ResearchStageAdapter(StageAdapter):
         self._resolve = resolve
 
     def finalize_completed(self, record) -> str | None:
-        """Resolve the ticket: post the findings comment, close the ticket, append the map
-        breadcrumb, and release the shared claim, retiring the record with no successor. This is the
-        *only* writer of the outcome — the session never wrote GitHub itself. Withholding the proof
-        (``None``) leaves the record completed-and-claimed so resolution retries next cycle rather
-        than retiring over a ticket it never durably resolved."""
+        """Durably route the findings, then retire the run with no successor.
+
+        The proof may represent a closed no-build/deferred ticket or an intentionally open
+        handoff-required ticket whose pending map entry, state label, and released claim all agree.
+        Withholding it leaves the record completed-and-claimed so replay finishes the durable route.
+        """
         if self._resolve is not None:
             return self._resolve(record)
         return f"proof:{record.identity}:resolved"

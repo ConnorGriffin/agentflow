@@ -24,8 +24,9 @@ from agentflow.gate import (conflict_revises_used, maintainer_comment, maintaine
                             park, reply_pending)
 from agentflow.intake import (INTAKE_MARK, _strip_quoted_lines, awaiting_recheck,
                               replies_since_intake)
-from agentflow.labels import (BUILDING, DRAWING, HELD_LABELS, RESEARCH_TICKET, RESOLVING,
-                              TRIAGE_SKIP, TRIAGING, WAYFINDER_NON_RESEARCH, claim)
+from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS,
+                              RESEARCH_TICKET, RESOLVING, TRIAGE_SKIP, TRIAGING,
+                              WAYFINDER_NON_RESEARCH, claim)
 from agentflow.notify import notify
 from agentflow.prompts import CONFLICT_REASON
 from agentflow.repo_facts import intake_allowlist, repo_profile
@@ -241,14 +242,13 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
 # nothing else. The shared `wayfinder:resolving` label is the claim — set before the session, so a
 # human session and the daemon never both grab the same ticket.
 
-
 def _research_eligible(issue: dict) -> bool:
     """Pure (test surface). A ticket is dispatchable research only if it carries the
     `wayfinder:research` type label, is not already claimed by `wayfinder:resolving`, and carries no
     other `wayfinder:*` type label the daemon must never run (ADR 0037). Its blocker state is
     verified separately against the live dependency graph."""
     labels = {lbl["name"] for lbl in issue.get("labels", [])}
-    if RESEARCH_TICKET not in labels or RESOLVING in labels:
+    if RESEARCH_TICKET not in labels or RESOLVING in labels or AWAITING_DISPOSITION in labels:
         return False
     return not (labels & WAYFINDER_NON_RESEARCH)
 

@@ -34,7 +34,25 @@ def _write_findings(record):
     """Plant the findings artifact the session would have written."""
     findings = Path(coordinated_research.findings_path(record))
     findings.parent.mkdir(parents=True, exist_ok=True)
-    findings.write_text("The answer is 42.")
+    findings.write_text(
+        "## Findings\n\nThe answer is 42.\n\n"
+        "## Disposition\n\n```json\n"
+        '{"disposition":"no_build","summary":"The answer requires no implementation change."}'
+        "\n```\n"
+    )
+
+
+def _write_handoff_findings(record):
+    findings = Path(coordinated_research.findings_path(record))
+    findings.parent.mkdir(parents=True, exist_ok=True)
+    findings.write_text(
+        "## Findings\n\nThe audit found one independently shippable change.\n\n"
+        "## Disposition\n\n```json\n"
+        '{"disposition":"handoff_required","summary":"The finding needs operator disposition.",'
+        '"candidates":[{"title":"Route widgets through the shared router",'
+        '"build":"Replace the widget-only path with the shared router."}]}'
+        "\n```\n"
+    )
 
 
 class _FakeGitHub:
@@ -84,6 +102,17 @@ class _FakeGitHub:
         self.map_body = body
         return True
 
+    def add_label(self, repo, number, label):
+        if label not in self.labels:
+            self.labels.append(label)
+        return True
+
+    def create_label(self, repo, label, color, description=""):
+        return True
+
+    def issue_labels(self, repo, number):
+        return frozenset(self.labels)
+
     def release(self, repo, number, _label):       # stands in for coordinated_research.release_claim
         if "wayfinder:resolving" in self.labels:
             self.labels.remove("wayfinder:resolving")
@@ -110,6 +139,9 @@ class _FakeGitHub:
         monkeypatch.setattr(github, "edit_body", self.edit_body)
         monkeypatch.setattr(coordinated_research, "release_claim", self.release)
         monkeypatch.setattr(coordinated_research, "_run", self.run)
+        monkeypatch.setattr(github, "create_label", self.create_label)
+        monkeypatch.setattr(github, "add_label", self.add_label)
+        monkeypatch.setattr(github, "issue_labels", self.issue_labels)
 
 
 # --- worktree cleanup on durable resolution -------------------------------------
@@ -143,7 +175,12 @@ def test_resolve_tolerates_already_missing_worktree(tmp_path, monkeypatch):
     wt = Path(record.source)
 
     # Read the findings content before removing the directory, then stub read_findings.
-    findings_text = "The answer is 42."
+    findings_text = (
+        "## Findings\n\nThe answer is 42.\n\n"
+        "## Disposition\n\n```json\n"
+        '{"disposition":"no_build","summary":"The answer requires no implementation change."}'
+        "\n```\n"
+    )
     shutil.rmtree(wt)
     assert not wt.exists()
 
@@ -156,6 +193,22 @@ def test_resolve_tolerates_already_missing_worktree(tmp_path, monkeypatch):
 
     assert proof is not None, "resolve() must succeed even if worktree is already gone"
     assert not gh.worktree_removals, "git worktree remove must be skipped when directory is absent"
+
+
+def test_pending_disposition_also_removes_the_finished_research_worktree(tmp_path, monkeypatch):
+    record = _make_record(tmp_path)
+    _write_handoff_findings(record)
+    wt = Path(record.source)
+    gh = _FakeGitHub()
+    gh.install(monkeypatch)
+
+    proof = coordinated_research.resolve(record)
+
+    assert proof is not None
+    assert gh.state == "OPEN"
+    assert "wayfinder:awaiting-disposition" in gh.labels
+    assert not wt.exists()
+    assert gh.worktree_removals
 
 
 def test_release_does_not_remove_the_worktree(tmp_path, monkeypatch):
