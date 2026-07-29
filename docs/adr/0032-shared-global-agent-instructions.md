@@ -32,6 +32,16 @@ old private-tooling path and Codex's direct charter link—are migrated automati
 Per-repository wiring remains unchanged: `AGENTS.md` is canonical and
 `CLAUDE.md` symlinks to it.
 
+Automated provider stages are the deliberate exception to global-file delivery.
+Their launchers suppress user configuration to keep private instructions and
+connectors out of unattended sessions, then inject the exact contents of
+agentflow's canonical `standards/CHARTER.md` through the shared prompt seam.
+Source clones keep that file as the sole canonical source; release builds embed
+the same bytes as an `agentflow` package resource for installed runners.
+The launch fails closed when that file is missing or empty. Interactive Claude
+and Codex sessions continue to receive the shared machine-global file described
+above.
+
 ## Alternatives
 
 - **Keep separate native global files.** Rejected: personal instructions can
@@ -45,6 +55,8 @@ Per-repository wiring remains unchanged: `AGENTS.md` is canonical and
 
 - A personal instruction edit reaches Claude and Codex immediately.
 - Charter edits remain single-source and reach both tools through the shared file.
+- Automated stages receive the same canonical charter without receiving personal
+  machine-global instructions.
 - No generated files or manual synchronization step exists.
 - The global source uses tool-neutral wording; tool-specific preferences must be
   labeled explicitly.

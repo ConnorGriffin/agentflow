@@ -41,6 +41,7 @@ exclude = [
 [tool.hatch.build.targets.sdist]
 only-include = [
     "agentflow",
+    "standards",
     "COMPATIBILITY.md",
     "CONTRIBUTING.md",
     "DCO",
@@ -62,3 +63,6 @@ exclude = [
     "/agentflow/webui/svelte.config.js",
     "/agentflow/webui/vite.config.js",
 ]
+
+[tool.hatch.build.targets.wheel.force-include]
+"standards/CHARTER.md" = "agentflow/_data/CHARTER.md"

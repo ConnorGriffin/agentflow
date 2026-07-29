@@ -18,14 +18,13 @@ one-size surface and single two-hour timeout:
    savings live), with a settings-level deny as backstop — not deny-only.
 2. **MCP servers are pinned to strict mode** for every stage: only the servers the
    launcher hands the session attach, so the operator's personal claude.ai connectors
-   never leak in ([#240](https://github.com/ConnorGriffin/agentflow/issues/240)). The
-   operator's *local* dev servers — notably the codebase code-graph tool — are
-   re-supplied so daemon sessions keep them ([#244](https://github.com/ConnorGriffin/agentflow/issues/244)),
-   and a read-only stage's allowlist includes those local servers so an exploration
-   stage (Intake, Research) keeps the same code-graph access Build has. Review keeps the server
-   through its full bounded-fix surface. It is
-   the withheld *edit* tools, not the local read-only MCP tools, that a read-only stage
-   loses.
+   never leak in ([#240](https://github.com/ConnorGriffin/agentflow/issues/240)).
+   Codebase Memory is the sole operator-local server re-supplied so daemon sessions
+   keep the code graph ([#244](https://github.com/ConnorGriffin/agentflow/issues/244)).
+   Its command and arguments cross the launch seam; its environment does not. Every
+   other MCP definition is discarded. A read-only stage's allowlist includes Codebase
+   Memory so Intake and Research keep the same graph access Build and Review have. It
+   is the withheld *edit* tools, not this read-only graph, that a read-only stage loses.
 3. **Per-stage wall-clock and turn ceilings replace the shared two-hour timeout**,
    sized ~1.5–2× the observed maximum per (stage, complexity, effort) cell — the
    table in the research doc is the source of truth. Thin-sample stages (Respond,

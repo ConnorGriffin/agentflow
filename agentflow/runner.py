@@ -21,11 +21,15 @@ import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
+from importlib import resources
 from pathlib import Path
 
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 _ACTIVE_WORKTREES: dict[str, int] = {}
+_SOURCE_ROOT = Path(__file__).resolve().parents[1]
+_CHARTER_SOURCE_PATH = _SOURCE_ROOT / "standards" / "CHARTER.md"
+_SOURCE_CHECKOUT_MARKER = _SOURCE_ROOT / ".git"
 
 _CLAUDE_SANDBOX_SETTINGS = {
     "sandbox": {
@@ -141,6 +145,29 @@ def _canonical_graph_project(cwd: str) -> str | None:
     return main_checkout.strip("/").replace("/", "-") or None
 
 
+def _canonical_charter() -> str:
+    """The standards every unattended stage receives from AgentFlow's canonical bytes.
+
+    A source clone reads its sole canonical ``standards/CHARTER.md``. Built distributions carry
+    those bytes as an ``agentflow`` package resource, so an installed runner never reaches
+    sideways into ``site-packages/standards``. Missing or empty bytes block launch rather than
+    silently running a stage without its review standard.
+    """
+    try:
+        if _SOURCE_CHECKOUT_MARKER.exists():
+            charter = _CHARTER_SOURCE_PATH.read_text()
+            source = str(_CHARTER_SOURCE_PATH)
+        else:
+            resource = resources.files("agentflow").joinpath("_data", "CHARTER.md")
+            charter = resource.read_text()
+            source = "agentflow/_data/CHARTER.md"
+    except OSError as exc:
+        raise RuntimeError("canonical engineering charter unavailable") from exc
+    if not charter.strip():
+        raise RuntimeError(f"canonical engineering charter is empty: {source}")
+    return charter
+
+
 def _bounded_prompt(prompt: str, cwd: str) -> str:
     """Tell the provider which checkout it owns and how to ground structural questions.
 
@@ -153,6 +180,7 @@ def _bounded_prompt(prompt: str, cwd: str) -> str:
     branch = current.stdout.strip() if current.returncode == 0 else ""
     branch = branch or "detached HEAD"
     project = _canonical_graph_project(worktree)
+    charter = _canonical_charter()
     discovery = "" if project is None else f"""
 Discovery protocol (ground structural questions in the code graph first):
 - The maintained code graph for this repository is the codebase-memory project `{project}`. Pass
@@ -172,6 +200,9 @@ Discovery protocol (ground structural questions in the code graph first):
 - Work only in that worktree and do not switch or create branches.
 - Never use another checkout, even if an index, hook, or search result names one.
 {discovery}
+Canonical engineering charter (applies to this entire stage):
+{charter}
+
 {prompt}"""
 
 
@@ -429,22 +460,28 @@ def _write_output_schema(schema: dict) -> str:
     return path
 
 
-def _operator_local_mcp_servers() -> dict:
-    """The operator's user-scoped local MCP servers, read from ``~/.claude.json``.
+def _codebase_memory_mcp_servers() -> dict:
+    """The public-safe Codebase Memory server from the operator's Claude configuration.
 
-    These are the deliberate local tools the operator configured — notably the codebase
-    code-graph server that Build and Review sessions lean on. The personal claude.ai
-    connectors (Gmail, Google Drive, Google Calendar) that #240 removes are *account*
-    connectors: they are attached by the signed-in claude.ai account, never stored here.
-    Re-supplying just this map under ``--strict-mcp-config`` therefore keeps the code-graph
-    tool while the personal connectors stay dropped (#244).
+    Automated sessions deliberately ignore user configuration. Codebase Memory is the one
+    operator-local server the pipeline needs to restore, so every other server and every
+    environment value stays private. Only its executable shape crosses the launch seam.
     """
     try:
         data = json.loads((Path.home() / ".claude.json").read_text())
     except (OSError, ValueError):
         return {}
     servers = data.get("mcpServers")
-    return servers if isinstance(servers, dict) else {}
+    if not isinstance(servers, dict):
+        return {}
+    server = servers.get("codebase-memory-mcp")
+    if not isinstance(server, dict) or not isinstance(server.get("command"), str):
+        return {}
+    public = {"command": server["command"]}
+    args = server.get("args")
+    if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+        public["args"] = list(args)
+    return {"codebase-memory-mcp": public}
 
 
 def _codex_local_mcp_config(servers: dict) -> list[str]:
@@ -455,12 +492,12 @@ def _codex_local_mcp_config(servers: dict) -> list[str]:
     ``mcp_servers.<name>`` config table, so re-supply the *same* map here as dotted ``-c``
     overrides — applied on top of the ignored user config — giving both providers the code-graph
     tool from one source while the account connectors stay excluded. Each ``-c`` *value* is parsed
-    as TOML: ``json.dumps`` renders strings and lists as valid TOML scalars/arrays, and env vars go
-    in one key at a time so no inline table has to be hand-built. The server name is used verbatim
-    as a dotted-key segment, which is correct for the fleet's bare-word (dash-separated) server
-    names; a name containing a ``.`` would nest as sub-tables — not a shape any operator config
-    uses, so it is left unescaped rather than guarded speculatively. A server without a ``command``
-    is skipped; an empty map yields no overrides (nothing to attach)."""
+    as TOML: ``json.dumps`` renders strings and lists as valid TOML scalars/arrays. Environment
+    values are never rendered into provider arguments. The server name is used verbatim as a
+    dotted-key segment, which is correct for the fleet's bare-word (dash-separated) server names;
+    a name containing a ``.`` would nest as sub-tables — not a shape any operator config uses, so
+    it is left unescaped rather than guarded speculatively. A server without a ``command`` is
+    skipped; an empty map yields no overrides (nothing to attach)."""
     argv: list[str] = []
     for name, spec in servers.items():
         if not isinstance(spec, dict):
@@ -472,10 +509,6 @@ def _codex_local_mcp_config(servers: dict) -> list[str]:
         args = spec.get("args")
         if isinstance(args, list) and args:
             argv += ["-c", f"mcp_servers.{name}.args={json.dumps(args)}"]
-        env = spec.get("env")
-        if isinstance(env, dict):
-            for key, value in env.items():
-                argv += ["-c", f"mcp_servers.{name}.env.{key}={json.dumps(str(value))}"]
     return argv
 
 
@@ -495,15 +528,15 @@ class ClaudeRunner(_WorktreeRunner):
 
         ``--strict-mcp-config`` pins the session to only the MCP servers we hand it, so the
         operator's personal claude.ai connectors can never attach (#240). We then re-supply
-        the operator's local dev servers — the codebase code-graph tool — so daemon sessions
-        keep it (#244). With no local servers configured the MCP set is simply empty.
+        only Codebase Memory's executable configuration, without its environment, so daemon
+        sessions keep the code graph (#244). Without that server the MCP set is simply empty.
 
         A ``profile`` (ADR 0044) narrows the session to its stage: a read-only stage's
         allowlist is handed to ``--tools`` so the withheld edit tools are absent from the
         loaded surface (with a ``permissions.deny`` backstop in the settings), and the turn
         ceiling is handed to ``--max-turns``. The read-only allowlist is the research §3a
-        read/search set plus the operator's re-supplied local servers (the code-graph tool):
-        an exploration stage keeps the same code-graph access Build has — it is the withheld
+        read/search set plus the re-supplied Codebase Memory server: an exploration stage keeps
+        the same code-graph access Build has — it is the withheld
         *edit* tools, not the local read-only MCP tools, that a read-only stage loses.
 
         A build/revise profile also carries a reasoning-effort rung (ADR 0046), handed to Claude's
@@ -518,7 +551,7 @@ class ClaudeRunner(_WorktreeRunner):
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
                 "--strict-mcp-config"]
-        servers = _operator_local_mcp_servers()
+        servers = _codebase_memory_mcp_servers()
         if servers:
             argv += ["--mcp-config",
                      json.dumps({"mcpServers": servers}, separators=(",", ":"))]
@@ -560,10 +593,11 @@ class CodexRunner(_WorktreeRunner):
         sandbox so it cannot edit the checkout — Codex's own shape of the read-only stage
         surface (there is no Claude-style per-tool allowlist flag). Codex runs
         ``--ignore-user-config`` so no personal MCP leaks in, which also drops the code-graph
-        server; we re-supply *only* that operator-local map as ``mcp_servers`` ``-c`` overrides,
-        so both providers get the code graph from one source while the account connectors stay
-        excluded, on every stage including read-only ones. The wall ceiling is applied per-record
-        by the launcher, the same as for Claude.
+        server; we re-supply *only* Codebase Memory's executable configuration as
+        ``mcp_servers`` ``-c`` overrides, so both providers get the code graph from one source
+        while account connectors and environment values stay excluded, on every stage including
+        read-only ones. The wall ceiling is applied per-record by the launcher, the same as for
+        Claude.
 
         A build/revise profile also carries a reasoning-effort rung (ADR 0046). Codex has no
         ``--effort`` flag — reasoning effort is a config override — so it is appended as another
@@ -590,7 +624,7 @@ class CodexRunner(_WorktreeRunner):
                 "-c", "sandbox_workspace_write.network_access=true",
                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
                 "--skip-git-repo-check"]
-        argv += _codex_local_mcp_config(_operator_local_mcp_servers())
+        argv += _codex_local_mcp_config(_codebase_memory_mcp_servers())
         if profile is not None and profile.reasoning_effort is not None:
             level = _clamp_reasoning(profile.reasoning_effort, self._REASONING_LADDER)
             argv += ["-c", f"model_reasoning_effort={level}"]

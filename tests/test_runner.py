@@ -9,6 +9,8 @@ from unittest.mock import patch
 import pytest
 
 from agentflow import runner as runner_mod
+from agentflow.coordinator.providers import provider_command
+from agentflow.coordinator.record import Record
 from agentflow.runner import (ClaudeRunner, CodexRunner, Complexity,
                               Effort, _run, recover_stale_worktrees,
                               remove_worktree_if_safe,
@@ -54,6 +56,19 @@ def _branch_worktree(repo: Path, path: Path, branch: str, *, push: bool = True,
 def _detached_worktree(repo: Path, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _git(repo, "worktree", "add", "--detach", str(path), "origin/main")
+
+
+def _provider_record(pool: str, source: Path) -> Record:
+    model = "opus" if pool == "claude" else "gpt-5.6-sol"
+    return Record(
+        f"{pool}-build", "build", pool, 1,
+        model=model, source=str(source), input_ptr="do the stage",
+        complexity="deep", effort="high",
+    )
+
+
+def _provider_prompt(pool: str, command: list[str]) -> str:
+    return command[command.index("-p") + 1] if pool == "claude" else command[-1]
 
 
 def test_complexity_resolves_to_cost_appropriate_models():
@@ -109,22 +124,64 @@ def test_claude_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert "--output-format" in cmd
 
 
-def test_claude_keeps_only_the_operator_local_mcp_servers(monkeypatch, tmp_path):
-    repo = _repo_with_origin(tmp_path)
-    wt = repo / ".agentflow" / "worktrees" / "claude" / "issue-10-mcp"
-    _branch_worktree(repo, wt, "agentflow/claude/issue-10-mcp")
-    from agentflow.intake import INTAKE_RESULT_SCHEMA
+def test_both_provider_commands_receive_the_same_canonical_charter(tmp_path):
+    charter = (Path(__file__).parents[1] / "standards" / "CHARTER.md").read_text()
 
-    # The operator's local code-graph server is re-supplied under strict mode; the personal
-    # claude.ai connectors (never in this map) are excluded. Holds with schema (intake/review)
-    # and without (build).
-    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers",
-                        lambda: {"codebase-memory-mcp": {"command": "/x/code-graph"}})
-    for schema in (INTAKE_RESULT_SCHEMA, None):
-        cmd = ClaudeRunner().structured_argv("do work", "sonnet", str(wt), schema=schema)
-        assert "--strict-mcp-config" in cmd
-        mcp = json.loads(cmd[cmd.index("--mcp-config") + 1])
-        assert list(mcp["mcpServers"]) == ["codebase-memory-mcp"]
+    prompts = []
+    for pool in ("claude", "codex"):
+        prompts.append(_provider_prompt(
+            pool, provider_command(_provider_record(pool, tmp_path))
+        ))
+
+    assert charter in prompts[0]
+    assert charter in prompts[1]
+    assert prompts[0].count(charter) == prompts[1].count(charter) == 1
+
+
+def test_provider_command_refuses_missing_canonical_charter(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_mod, "_CHARTER_SOURCE_PATH", tmp_path / "missing-charter.md")
+
+    for pool in ("claude", "codex"):
+        with pytest.raises(RuntimeError, match="canonical engineering charter unavailable"):
+            provider_command(_provider_record(pool, tmp_path))
+
+
+def test_provider_command_refuses_empty_canonical_charter(monkeypatch, tmp_path):
+    charter = tmp_path / "empty-charter.md"
+    charter.write_text(" \n\t")
+    monkeypatch.setattr(runner_mod, "_CHARTER_SOURCE_PATH", charter)
+
+    for pool in ("claude", "codex"):
+        with pytest.raises(RuntimeError, match="canonical engineering charter is empty"):
+            provider_command(_provider_record(pool, tmp_path))
+
+
+def test_claude_keeps_only_codebase_memory_without_private_environment(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {
+        "codebase-memory-mcp": {
+            "command": "/x/code-graph",
+            "args": ["serve"],
+            "env": {"PRIVATE_TOKEN": "must-not-cross"},
+        },
+        "gmail": {
+            "command": "/x/mail",
+            "env": {"GMAIL_TOKEN": "also-private"},
+        },
+    }}))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+    cmd = provider_command(_provider_record("claude", tmp_path))
+    assert "--strict-mcp-config" in cmd
+    mcp = json.loads(cmd[cmd.index("--mcp-config") + 1])
+    assert mcp == {"mcpServers": {
+        "codebase-memory-mcp": {"command": "/x/code-graph", "args": ["serve"]},
+    }}
+    assert "gmail" not in " ".join(cmd)
+    assert "must-not-cross" not in " ".join(cmd)
+    assert "also-private" not in " ".join(cmd)
 
 
 def test_claude_pins_mcp_empty_when_operator_has_no_local_servers(monkeypatch, tmp_path):
@@ -133,7 +190,7 @@ def test_claude_pins_mcp_empty_when_operator_has_no_local_servers(monkeypatch, t
     _branch_worktree(repo, wt, "agentflow/claude/issue-10-nomcp")
 
     # No local servers → nothing to re-supply; strict mode alone keeps the set empty.
-    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
+    monkeypatch.setattr(runner_mod, "_codebase_memory_mcp_servers", lambda: {})
     cmd = ClaudeRunner().structured_argv("do work", "sonnet", str(wt))
     assert "--strict-mcp-config" in cmd
     assert "--mcp-config" not in cmd
@@ -606,7 +663,7 @@ def test_codex_resupplies_the_operator_code_graph_server_on_every_stage(monkeypa
     repo = _repo_with_origin(tmp_path)
     wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-11-graph"
     _branch_worktree(repo, wt, "agentflow/codex/issue-11-graph")
-    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers",
+    monkeypatch.setattr(runner_mod, "_codebase_memory_mcp_servers",
                         lambda: {"codebase-memory-mcp": {"command": "/x/code-graph"}})
 
     read_only = StageProfile(("Read", "Bash", "Grep", "Glob"), 900, 40)
@@ -618,29 +675,51 @@ def test_codex_resupplies_the_operator_code_graph_server_on_every_stage(monkeypa
         assert cmd[cmd.index("--sandbox") + 1] == sandbox  # read-only stage keeps its boundary
 
     # No operator-local servers → nothing is re-supplied (the personal connectors were the risk).
-    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
+    monkeypatch.setattr(runner_mod, "_codebase_memory_mcp_servers", lambda: {})
     cmd = CodexRunner().structured_argv("do work", "sol", str(wt))
     assert not any(str(arg).startswith("mcp_servers.") for arg in cmd)
 
 
-def test_codex_resupplies_a_full_server_spec_as_valid_toml_overrides(monkeypatch, tmp_path):
-    """A launched server may carry ``args`` and ``env`` (the common ``npx``-style shape), not just a
-    bare ``command`` — Claude honors them because it hands the whole map to ``--mcp-config``, so
-    Codex must carry the same map across. Each is rendered as a Codex ``-c`` override whose value is
-    valid TOML: a string command, a TOML array of args, and one env key per entry (no hand-built
-    inline table). This guards the parity that keeps both providers on one server definition."""
-    repo = _repo_with_origin(tmp_path)
-    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-12-fullspec"
-    _branch_worktree(repo, wt, "agentflow/codex/issue-12-fullspec")
-    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {
-        "code-graph": {"command": "npx", "args": ["-y", "code-graph-mcp"],
-                       "env": {"GRAPH_TOKEN": "abc123"}}})
+def test_codex_keeps_only_codebase_memory_without_private_environment(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": {
+        "codebase-memory-mcp": {
+            "command": "npx",
+            "args": ["-y", "codebase-memory-mcp"],
+            "env": {"GRAPH_TOKEN": "must-not-cross"},
+        },
+        "google-drive": {
+            "command": "/x/drive",
+            "env": {"DRIVE_TOKEN": "also-private"},
+        },
+    }}))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: home)
 
-    cmd = CodexRunner().structured_argv("do work", "sol", str(wt))
+    cmd = provider_command(_provider_record("codex", tmp_path))
     overrides = [cmd[i + 1] for i, arg in enumerate(cmd) if arg == "-c"]
-    assert 'mcp_servers.code-graph.command="npx"' in overrides
-    assert 'mcp_servers.code-graph.args=["-y", "code-graph-mcp"]' in overrides
-    assert 'mcp_servers.code-graph.env.GRAPH_TOKEN="abc123"' in overrides
+    assert 'mcp_servers.codebase-memory-mcp.command="npx"' in overrides
+    assert (
+        'mcp_servers.codebase-memory-mcp.args=["-y", "codebase-memory-mcp"]'
+        in overrides
+    )
+    assert not any("google-drive" in override or ".env." in override for override in overrides)
+    assert "must-not-cross" not in " ".join(cmd)
+    assert "also-private" not in " ".join(cmd)
+
+
+def test_codex_renderer_never_accepts_mcp_environment_values(monkeypatch, tmp_path):
+    monkeypatch.setattr(runner_mod, "_codebase_memory_mcp_servers", lambda: {
+        "codebase-memory-mcp": {
+            "command": "/x/code-graph",
+            "env": {"PRIVATE_TOKEN": "must-not-cross"},
+        },
+    })
+
+    cmd = provider_command(_provider_record("codex", tmp_path))
+    assert ".env." not in " ".join(cmd)
+    assert "must-not-cross" not in " ".join(cmd)
 
 
 def test_a_sessions_leftover_untracked_files_do_not_block_reuse_but_edits_do(tmp_path):
