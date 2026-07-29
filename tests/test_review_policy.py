@@ -222,7 +222,7 @@ def test_reviewed_reviewer_fix_uses_immediate_same_tool_fallback_without_forced_
         clean=True, reviewed_sha="start", final_sha="fixed", pushed_sha="fixed",
         fixes=("fixed the journey",), change_author_tool="claude")
     calls = []
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda workdir: "reviewed")
     monkeypatch.setattr(
         coordinated_build, "pick_reviewer",
         lambda author, **kwargs: calls.append((author, kwargs)) or "codex")
@@ -364,7 +364,7 @@ def test_full_fixer_push_restarts_product_then_standards_over_the_new_head(monke
         fixes=("repaired shared behavior",), depth=ReviewDepth.FULL,
         depth_reason="shared decision", change_author_tool="claude",
         checks=("focused fix check",))
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "claude")
 
     product = coordinated_build.review_successor_submission(review, fixed)
@@ -536,7 +536,7 @@ def test_full_taint_stays_until_post_push_product_and_standards_complete(monkeyp
         product, SimpleNamespace(final_message=pushed_payload)) is True
     assert product.review_taint_cleared is False
 
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "autonomous")
     monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "claude")
     successor = coordinated_build.review_successor_submission(
         product, Verdict(
@@ -567,7 +567,7 @@ def test_successor_prompts_replace_the_private_assignment_instead_of_appending(m
         builder_lineage="claude", builder_complexity="deep",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
         input_ptr=base_prompt)
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "claude")
     product = coordinated_build.review_successor_submission(
         record, Verdict(
@@ -630,7 +630,7 @@ def test_taint_recovery_chooses_only_latest_forced_autonomous_record(monkeypatch
     monkeypatch.setattr(
         coordinated_build, "_review_pr_facts",
         lambda record: {"state": "OPEN", "head": "head"})
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(
         coordinated_build, "pick_reviewer", lambda author, **kwargs: "codex")
     chosen = []

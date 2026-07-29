@@ -782,7 +782,7 @@ def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
                         lambda self, path: provisioned.append(path))
     expected = "agentflow/claude/issue-7-owned"
     monkeypatch.setattr(
-        loop, "_run",
+        coordinated_build, "_run",
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, expected, ""),
     )
 
@@ -790,7 +790,7 @@ def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
     assert provisioned == [wt]
 
     monkeypatch.setattr(
-        loop, "_run",
+        coordinated_build, "_run",
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, "wrong", ""),
     )
     assert coordinated_build._worktree_ready(record) is False

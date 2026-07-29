@@ -145,6 +145,18 @@ def _comments_of(node: dict) -> list[Comment]:
     ]
 
 
+# --- URL forms (pure) ----------------------------------------------------------
+
+def pr_url(repo: str, pr: int) -> str:
+    """Where a human goes to look at this PR."""
+    return f"https://github.com/{repo}/pull/{pr}"
+
+
+def pr_number(url: str) -> int:
+    """The PR number a pull-request URL names — :func:`pr_url` read back."""
+    return int(url.rstrip("/").rsplit("/", 1)[-1])
+
+
 # --- reads (fail closed on None) -----------------------------------------------
 
 def issue_labels(repo: str, issue: int) -> frozenset[str] | None:
@@ -200,6 +212,30 @@ def pr_comments(repo: str, pr: int) -> list[Comment] | None:
     if not isinstance(data, dict):
         return None
     return _comments_of(data)
+
+
+def issue_comment_rows(repo: str, issue: int) -> list[dict] | None:
+    """The issue's comments as GitHub's own rows, or ``None`` if they can't be read.
+
+    The typed :func:`issue_comments` above is the shape callers should want. These rows exist
+    for the gate/intake predicates that still read GitHub's own `author` key, which the typed
+    comment does not carry — so the raw shape stays available here rather than every such
+    caller reaching for the escape hatch. Same fail-closed contract: a real empty thread
+    returns an empty list."""
+    data = _read_json(["issue", "view", str(issue), "--repo", repo, "--json", "comments"])
+    if not isinstance(data, dict):
+        return None
+    return data.get("comments", [])
+
+
+def pr_comment_rows(repo: str, pr: int) -> list[dict] | None:
+    """The PR's comments as GitHub's own rows, or ``None`` if they can't be read — the raw
+    counterpart to :func:`pr_comments`, for the predicates that read `author` as well as
+    `body`. A real empty thread returns an empty list."""
+    data = _read_json(["pr", "view", str(pr), "--repo", repo, "--json", "comments"])
+    if not isinstance(data, dict):
+        return None
+    return data.get("comments", [])
 
 
 def list_issues(repo: str, *, label: str | None = None,

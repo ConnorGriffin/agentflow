@@ -307,11 +307,11 @@ def test_revise_completes_on_durable_non_code_evidence_with_no_pushed_head(make_
     verifier (:func:`coordinated_build._revision_ready`) must accept an evidence-only revision whose
     head never moved, not consume its continuations and park (the reported behavior)."""
     comments = [[]]                                       # the PR carries no evidence yet
-    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+    monkeypatch.setattr("agentflow.coordinated_build._run",           # only git reads remain on _run
                         lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: comments[0])
 
     fake = FakeSession()
     revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
@@ -344,11 +344,11 @@ def test_evidence_predating_the_revise_round_cannot_complete_it(make_coord, monk
                      "![old shot](https://user-images.githubusercontent.com/1/old.png)",
              "createdAt": BEFORE_ROUND}
     comments = [[stale]]                                  # the stale proof already sits on the PR
-    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+    monkeypatch.setattr("agentflow.coordinated_build._run",           # only git reads remain on _run
                         lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: comments[0])
 
     fake = FakeSession()
     revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
@@ -379,11 +379,11 @@ def test_restart_between_evidence_and_completion_still_completes_exactly_once(ma
     comments = [[{"body": "> *agentflow: reply from the build agent.*\n\n"
                           "![before/after](https://user-images.githubusercontent.com/1/x.png)",
                   "createdAt": AFTER_ROUND}]]
-    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+    monkeypatch.setattr("agentflow.coordinated_build._run",           # only git reads remain on _run
                         lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: comments[0])
 
     fake = FakeSession()
     revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
@@ -451,10 +451,10 @@ def test_revision_ready_rejects_a_head_that_does_not_descend_from_the_reviewed_s
         if "merge-base" in cmd:
             return SimpleNamespace(returncode=ancestor[0], stdout="")
         return SimpleNamespace(returncode=0, stdout="")
-    monkeypatch.setattr("agentflow.loop._run", _git)
+    monkeypatch.setattr("agentflow.coordinated_build._run", _git)
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR exposes a DIFFERENT head
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-rewound")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [])
 
     assert coordinated_build._revision_ready(record, None) is False  # rewound head, no evidence
     ancestor[0] = 0                                       # the head descends from the reviewed SHA
@@ -489,9 +489,9 @@ def _revise_head_read(tmp_path, monkeypatch, *, head, target="sha-a",
     def list_open_prs(repo, *, head=None, limit=100):
         return [github.PrRow(42, head or "", head_sha)]
 
-    monkeypatch.setattr("agentflow.loop._run", _git)
+    monkeypatch.setattr("agentflow.coordinated_build._run", _git)
     monkeypatch.setattr("agentflow.github.list_open_prs", list_open_prs)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(comments))
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: list(comments))
     return record
 
 
@@ -934,7 +934,7 @@ def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypa
         lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "resolved"))
     monkeypatch.setattr(
         coordinated_build, "_review_context", lambda _record: ("acceptance", "none"))
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "codex")
     submitted = []
 

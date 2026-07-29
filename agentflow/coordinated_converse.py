@@ -31,6 +31,7 @@ from pathlib import Path
 
 from agentflow import live
 from agentflow.coordinator import Submission
+from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.workspace import channel, publish
 from agentflow.workspace.projection import workspace_projection
@@ -182,7 +183,6 @@ def _ask_worktree_ready(record) -> bool:
     the review stage's freshening ``prepare_worktree_detached``). An Ask owns no branch and pushes
     nothing, so the checkout is detached. Any git failure returns False, so admission is skipped
     with no permit and no attempt consumed — the turn simply retries next cycle."""
-    from agentflow.loop import _run
     from agentflow.runner import _worktree_is_registered
     src = record.source or ""
     ref = WorktreeRef.parse(src)

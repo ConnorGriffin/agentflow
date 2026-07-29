@@ -286,7 +286,7 @@ def test_provider_adapters_supply_the_stage_schema_for_intake_and_review(tmp_pat
 def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(tmp_path):
     from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
     from agentflow.coordinator.record import Record
-    from agentflow.loop import BUILD_PROMPT, PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT
+    from agentflow.prompts import BUILD_PROMPT, PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT
 
     repo = _repo_with_origin(tmp_path)
     stage_prompts = [

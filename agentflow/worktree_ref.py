@@ -182,3 +182,25 @@ def _lane_tool(lane: str, suffix: str) -> str | None:
             return None
         lane = lane[: -len(suffix)]
     return lane or None
+
+
+# --- the branch form, read apart ---------------------------------------------------------
+# A branch names the same ``{lane}/{name}`` convention the paths above render, minus the
+# workdir a path carries — so it reads apart here rather than through :class:`WorktreeRef`,
+# which cannot be built without one.
+
+_BRANCH_ISSUE_RE = re.compile(r"^agentflow/[^/]+/issue-(\d+)-")
+BUILD_BRANCH_RE = re.compile(r"^agentflow/([^/]+)/issue-(\d+)-(.+)$")
+
+
+def issue_of_branch(branch: str) -> int | None:
+    """The issue number an agentflow PR branch is working, or None. Pure — the signal
+    that an agent already owns an issue (dispatch dedup, beyond ADR 0009's merge floor)."""
+    m = _BRANCH_ISSUE_RE.match(branch or "")
+    return int(m.group(1)) if m else None
+
+
+def slug(title: str) -> str:
+    """The trailing descriptor an issue's title contributes to its branch and worktree name."""
+    s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    return s[:40].strip("-") or "issue"

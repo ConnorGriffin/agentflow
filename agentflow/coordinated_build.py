@@ -27,7 +27,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
 
-from agentflow import github
+from agentflow import github, worktree_ref
 from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coordinator,
                                    IntakeStageAdapter, MockupStageAdapter, ResearchStageAdapter,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
@@ -35,7 +35,17 @@ from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coor
 from agentflow.balancer import pick_reviewer
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES
-from agentflow.worktree_ref import WorktreeKind, WorktreeRef
+from agentflow.intake import held_build_result
+from agentflow.labels import (BUILDING, DRAWING, MOCKUP_MARK, RESOLVING, TRIAGING, claim,
+                              complexity_from_labels, effort_from_labels,
+                              mockup_scope_from_labels)
+from agentflow.prompts import (BUILD_PROMPT, MOCKUP_DISCLAIMER, PRODUCE_PROMPT, RESPOND_PROMPT,
+                               REVISE_PROMPT, SCOPE_GUIDANCE, UI_GAP_REASON)
+from agentflow.repo_facts import (repo_profile, surface_declaration, surfaces_phrase,
+                                  ui_surfaces)
+from agentflow.reviewer import review_worktree
+from agentflow.runner import _run, remove_worktree_if_safe
+from agentflow.worktree_ref import BUILD_BRANCH_RE, WorktreeKind, WorktreeRef
 
 BUILD_POOLS = ("claude", "codex")
 _ORPHAN_CLAIM_GRACE_SECONDS = 60 * 60
@@ -59,23 +69,20 @@ def build_submission(cfg, issue: dict, tool: str):
     complexity gate a build requires (ADR 0018), so a mis-labelled issue never becomes an
     attempt."""
     from agentflow.coordinator import Submission
-    from agentflow.loop import (BUILD_PROMPT, _builder_worktree, _surfaces_phrase,
-                                complexity_from_labels, effort_from_labels, slug,
-                                surface_declaration)
     n = issue["number"]
     labels = [lbl["name"] for lbl in issue.get("labels", [])]
     complexity = complexity_from_labels(labels)
     if complexity is None:
         return None
-    sl = slug(issue["title"])
+    sl = worktree_ref.slug(issue["title"])
     brief = BUILD_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort_from_labels(labels).value,
-        surfaces=_surfaces_phrase(surface_declaration(cfg.workdir)))
+        surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool=tool,
         complexity=complexity.value, effort=effort_from_labels(labels).value,
-        source=_builder_worktree(cfg, tool, n, sl), claim=True, input_ptr=brief)
+        source=WorktreeRef.for_build(cfg.workdir, tool, n, sl).path, claim=True, input_ptr=brief)
 
 
 def resume_if_held(submission, records):
@@ -134,20 +141,17 @@ def mockup_submission(cfg, issue: dict, tool: str):
     fresh-session continuations. The durable prompt reconstructs the exact same visual-design job.
     """
     from agentflow.coordinator import Submission
-    from agentflow.loop import (PRODUCE_PROMPT, _MOCKUP_DISCLAIMER, _SCOPE_GUIDANCE,
-                                _surfaces_phrase, mockup_scope_from_labels, slug,
-                                surface_declaration)
 
     n = int(issue["number"])
-    sl = slug(issue.get("title", ""))
+    sl = worktree_ref.slug(issue.get("title", ""))
     ref = WorktreeRef.for_mockup(cfg.workdir, tool, n, sl)
     branch = ref.branch
     source = ref.path
     scope = mockup_scope_from_labels([lbl["name"] for lbl in issue.get("labels", [])])
     prompt = PRODUCE_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
-        branch=branch, surfaces=_surfaces_phrase(surface_declaration(cfg.workdir)),
-        scope_guidance=_SCOPE_GUIDANCE[scope], disclaimer=_MOCKUP_DISCLAIMER)
+        branch=branch, surfaces=surfaces_phrase(surface_declaration(cfg.workdir)),
+        scope_guidance=SCOPE_GUIDANCE[scope], disclaimer=MOCKUP_DISCLAIMER)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="mockup", pool=tool, complexity="deep",
         source=source, claim=True, input_ptr=prompt, builder_lineage=tool)
@@ -183,7 +187,7 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
     or head SHA is unreadable."""
     from agentflow.coordinator import Submission
     from agentflow.review_policy import ReviewState
-    from agentflow.reviewer import REVIEW_PROMPT, review_worktree, with_review_assignment
+    from agentflow.reviewer import REVIEW_PROMPT, with_review_assignment
     parts = _build_source_parts(build_record)
     if parts is None or not head_sha:
         return None
@@ -263,7 +267,6 @@ def conflict_decision_review_submission(revise_record, *, head_sha: str, pr_numb
 def conflict_decision_revise_submission(review_record, verdict):
     """Resume the same retained conflict after the other tool supplies a grounded decision."""
     from agentflow.coordinator import Submission
-    from agentflow.loop import REVISE_PROMPT
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
 
@@ -306,10 +309,9 @@ def review_successor_submission(review_record, verdict):
     never reused. Three consecutive mutating passes have no successor; the caller parks once.
     """
     from agentflow.coordinator import Submission
-    from agentflow.loop import repo_profile
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
-    from agentflow.reviewer import review_worktree, with_review_assignment
+    from agentflow.reviewer import with_review_assignment
 
     facts = _review_source_facts(review_record)
     if (facts is None or not verdict.pushed_sha or verdict.pushed_sha != verdict.final_sha
@@ -375,7 +377,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_findings, other_tool)
-    from agentflow.reviewer import review_worktree, with_review_assignment
+    from agentflow.reviewer import with_review_assignment
 
     facts = _review_source_facts(review_record)
     if facts is None or verdict.pushed_sha:
@@ -443,7 +445,7 @@ def tainted_review_submission(review_record, reviewer_tool: str):
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
-    from agentflow.reviewer import review_worktree, with_review_assignment
+    from agentflow.reviewer import with_review_assignment
 
     facts = _review_source_facts(review_record)
     author = review_record.change_author_tool or review_record.builder_lineage
@@ -494,7 +496,7 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, decision_answer_handoff)
-    from agentflow.reviewer import review_worktree, with_review_assignment
+    from agentflow.reviewer import with_review_assignment
 
     facts = _review_source_facts(review_record)
     author = review_record.change_author_tool or review_record.builder_lineage
@@ -537,15 +539,14 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
     retained branch/worktree naming needed by any later Revise.
     """
     from agentflow.coordinator import Submission
-    from agentflow.loop import _surfaces_phrase, surface_declaration
     from agentflow.review_policy import ReviewState
-    from agentflow.reviewer import REVIEW_PROMPT, review_worktree, with_review_assignment
+    from agentflow.reviewer import REVIEW_PROMPT, with_review_assignment
 
     if not head_sha or builder_tool not in BUILD_POOLS or reviewer_tool not in BUILD_POOLS:
         return None
     prompt = REVIEW_PROMPT.format(
         pr=pr_number, starting_sha=head_sha, acceptance=acceptance or "(none provided)",
-        surfaces=_surfaces_phrase(surface_declaration(cfg.workdir)))
+        surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
     state = review or ReviewState(change_author_tool=builder_tool)
     assignment = state.assignment
     author = state.change_author_tool or builder_tool
@@ -586,7 +587,6 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
     cold build work. Returns ``None`` when the tool is unknown or the head SHA is missing.
     """
     from agentflow.coordinator import Submission
-    from agentflow.loop import REVISE_PROMPT, _builder_worktree
     if not head_sha or builder_tool not in BUILD_POOLS:
         return None
     brief = REVISE_PROMPT.format(
@@ -595,7 +595,7 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
         pool=builder_tool, complexity="deep", conflict_round=conflict_round,
-        source=_builder_worktree(cfg, builder_tool, issue, slug), claim=True, input_ptr=brief,
+        source=WorktreeRef.for_build(cfg.workdir, builder_tool, issue, slug).path, claim=True, input_ptr=brief,
         builder_lineage=builder_tool, builder_complexity="deep", continuation=True)
 
 
@@ -622,7 +622,6 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     test surface (ADR 0020). Returns ``None`` if the builder worktree cannot be reconstructed or
     the reviewed SHA is missing."""
     from agentflow.coordinator import Submission
-    from agentflow.loop import REVISE_PROMPT
     facts = _revise_builder_source(review_record)
     reviewed_head = target_sha or review_record.target
     if facts is None or not reviewed_head:
@@ -652,8 +651,7 @@ def respond_submission(cfg, pr_number, branch, comment, target, baseline):
     not an agentflow PR branch or either immutable target is missing."""
     from agentflow.coordinator import Submission
     from agentflow.gate import respond_reply_disclaimer
-    from agentflow.loop import _BRANCH_RE, RESPOND_PROMPT, _builder_worktree
-    m = _BRANCH_RE.match(branch or "")
+    m = BUILD_BRANCH_RE.match(branch or "")
     if m is None or not target or not baseline:
         return None
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
@@ -662,7 +660,7 @@ def respond_submission(cfg, pr_number, branch, comment, target, baseline):
         disclaimer=respond_reply_disclaimer(str(target)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="respond", target=str(target),
-        pool=tool, complexity="deep", source=_builder_worktree(cfg, tool, n, sl),
+        pool=tool, complexity="deep", source=WorktreeRef.for_build(cfg.workdir, tool, n, sl).path,
         claim=True, input_ptr=brief, builder_lineage=tool)
 
 
@@ -746,7 +744,6 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
     operations. GitHub listing or verification failures likewise clear nothing.
     """
     from agentflow.coordinator.record import RUNNING
-    from agentflow.loop import BUILDING, DRAWING, RESOLVING, TRIAGING
 
     _log = _log or (lambda _line: None)
     try:
@@ -975,7 +972,6 @@ def _main_head(record) -> str | None:
     """The current `origin/main` head SHA in the record's checkout, or None if unreadable. The
     coordinator compares it to the head a collision was recorded against to tell an identical
     retry (defer) from a main that has moved (one retry is warranted — issue #209)."""
-    from agentflow.loop import _run
     parsed = _source_facts(record)
     if parsed is None:
         return None
@@ -1039,7 +1035,6 @@ def _worktree_ready(record) -> bool:
     rebuilt. An absent Build worktree may start a new branch from ``origin/main``; a continuation
     stage may only recover the existing branch from its local or remote PR ref. Any git failure
     returns False, so admission is skipped with no permit and no attempt consumed."""
-    from agentflow.loop import _run
     from agentflow.runner import ClaudeRunner, CodexRunner, _worktree_is_registered
     parsed = _source_facts(record)
     if parsed is None:
@@ -1091,7 +1086,6 @@ def _mockup_outcome_ready(record, obs) -> bool:
     and exactly one durable issue comment that embeds every committed screenshot. A
     MISSING-CONTEXT comment is a human hold, not a completed visual round.
     """
-    from agentflow.loop import MOCKUP_MARK, _issue_comments, _run
 
     parsed = _source_facts(record)
     if parsed is None:
@@ -1103,7 +1097,7 @@ def _mockup_outcome_ready(record, obs) -> bool:
         number = int(record.subject)
     except (TypeError, ValueError):
         return False
-    marked = [comment for comment in _issue_comments(record.repo, number)
+    marked = [comment for comment in (github.issue_comment_rows(record.repo, number) or [])
               if MOCKUP_MARK in comment.get("body", "")]
     if len(marked) != 1 or "MISSING-CONTEXT:" in marked[0].get("body", ""):
         return False
@@ -1132,7 +1126,6 @@ def _mockup_outcome_ready(record, obs) -> bool:
 
 def _mockup_missing_context(record) -> bool:
     """Whether this issue carries Mockup's deliberate durable MISSING-CONTEXT boundary."""
-    from agentflow.loop import MOCKUP_MARK, _issue_comments
 
     try:
         number = int(record.subject)
@@ -1140,12 +1133,11 @@ def _mockup_missing_context(record) -> bool:
         return False
     return any(MOCKUP_MARK in comment.get("body", "")
                and "MISSING-CONTEXT:" in comment.get("body", "")
-               for comment in _issue_comments(record.repo, number))
+               for comment in (github.issue_comment_rows(record.repo, number) or []))
 
 
 def _mockup_claim_ready(record) -> bool:
     """Prove Mockup's visible drawing claim immediately before admission."""
-    from agentflow.loop import DRAWING
 
     try:
         number = int(record.subject)
@@ -1165,8 +1157,6 @@ def _settle_mockup(record) -> str | None:
     choice, and disposes the clean pushed worktree before coordinator ownership disappears.
     Every step is idempotent; an unreadable label or stubborn worktree retries next cycle.
     """
-    from agentflow.loop import DRAWING
-    from agentflow.runner import remove_worktree_if_safe
 
     parsed = _source_facts(record)
     if parsed is None:
@@ -1206,7 +1196,6 @@ def _hold_mockup(record) -> str | None:
     bookkeeping that runs once the handoff confirms; the worktree is retained either way.
     """
     from agentflow.handoff import DurableHandoff, Notification, Subject
-    from agentflow.loop import DRAWING, MOCKUP_MARK, _MOCKUP_DISCLAIMER
 
     try:
         number = int(record.subject)
@@ -1226,7 +1215,7 @@ def _hold_mockup(record) -> str | None:
     def post() -> None:
         if marked is None:
             github.comment(record.repo, number,
-                           f"{_MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}")
+                           f"{MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}")
             return
         # The round already has its one marked comment: a MISSING-CONTEXT handoff says why on its
         # own and gains only the marker; an unfinished one also gains the exhaustion explanation.
@@ -1267,7 +1256,6 @@ def _hold_build(record) -> str | None:
     """
     from agentflow.handoff import DurableHandoff, Notification, Subject
     from agentflow.intake import apply_intake
-    from agentflow.loop import BUILDING, held_build_result
 
     try:
         number = int(record.subject)
@@ -1382,7 +1370,6 @@ def _commit_is_gone(workdir: str, sha: str) -> bool:
     """Whether ``sha`` is absent from the repository — the branch was rebased or amended past it
     and it survives on no ref. Absence is only claimed on a definite answer, so an unreadable
     repository reads as present and keeps the more cautious message."""
-    from agentflow.loop import _run
     if not sha:
         return False
     return _run(["git", "-C", workdir, "cat-file", "-e", f"{sha}^{{commit}}"]).returncode != 0
@@ -1396,7 +1383,6 @@ def _review_worktree_reset(record, _log=None) -> bool:
     cleaned. A fresh logical review may reuse a clean prior checkout and reset it to its own
     target. Any git failure skips admission without consuming a permit or attempt.
     """
-    from agentflow.loop import _run
     from agentflow.runner import ClaudeRunner, CodexRunner
     facts = _review_source_facts(record)
     if facts is None or not record.target:
@@ -1450,6 +1436,18 @@ def _review_slug(record) -> str:
     source is not a well-formed review path."""
     ref = WorktreeRef.parse(record.source)
     return ref.slug if ref is not None else ""
+
+
+def _finish_review(cfg, reviewer_tool: str, pr: int, sl: str, merged: bool = False) -> None:
+    """Dispose the reviewer's checkout once the review's outcome is durable on GitHub — merged,
+    or carrying our park handoff. Anything less leaves the worktree in place so the next pass can
+    finish from it rather than starting cold."""
+    comments = github.pr_comment_rows(cfg.repo, pr)
+    durable = merged or (comments is not None and any(
+        "agentflow: parked for human review" in c.get("body", "") for c in comments))
+    if durable:
+        remove_worktree_if_safe(
+            cfg.workdir, review_worktree(cfg.workdir, reviewer_tool, pr, sl))
 
 
 def _park_pr_number(record) -> int | None:
@@ -1649,7 +1647,6 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
     """
     from agentflow.coordinator.record import HELD
     from agentflow.gate import decision_resume_disclaimer, park_awaiting_decision
-    from agentflow.loop import _claim, _pr_comments, repo_profile
     from agentflow.review_policy import decision_answer_target, unresolved_uncertainty
 
     if not target or not baseline:
@@ -1677,7 +1674,7 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
                 for item in chain)
     if not bound and unresolved_uncertainty(chain) is None:
         return None                # nothing was ever asked here — this is ordinary PR discussion
-    comments = _pr_comments(cfg.repo, pr)
+    comments = github.pr_comment_rows(cfg.repo, pr)
     if comments is None:
         return f"PR #{pr}: PR thread unreadable — deferring the parked-review answer"
     if not bound and not park_awaiting_decision(comments, target):
@@ -1704,7 +1701,7 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
             sequence=max(item.review_sequence for item in chain) + 1)
         if submission is None:
             return None
-        if not _claim(cfg.repo, issue):
+        if not claim(cfg.repo, issue, BUILDING):
             return f"#{issue}: could not claim the resumed review on PR #{pr}"
         try:
             coordinator.submit_stage(submission)
@@ -1756,7 +1753,6 @@ def _prepare_review_settlement(record) -> bool:
     finalization. Settlement rechecks both head and CI immediately before the merge.
     """
     from agentflow.gate import ci_is_green
-    from agentflow.loop import repo_profile
 
     facts = _review_source_facts(record)
     if facts is None:
@@ -1789,7 +1785,6 @@ def _park_review_settlement(record, verdict, workdir: str, pr: int,
     """
     from agentflow.gate import park
     from agentflow.handoff import DurableHandoff, Notification, Subject
-    from agentflow.loop import _finish_review
     from agentflow import ratchet
 
     marker = _park_proof_marker(record, reason)
@@ -1821,8 +1816,6 @@ def _settle_review(record) -> str | None:
     from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                                 post_clean_review_summary, reply_pending, squash_merge,
                                 ui_evidence_gap)
-    from agentflow.loop import (_UI_GAP_REASON, _finish_review, _pr_comments,
-                                repo_profile, ui_surfaces)
 
     facts = _review_source_facts(record)
     if facts is None:
@@ -1838,7 +1831,7 @@ def _settle_review(record) -> str | None:
         return None  # reviewer-authored/axis/decision work must transfer privately first
     if verdict.blocking:
         return None  # durable opener transfers this claim to Revise
-    comments = _pr_comments(record.repo, pr)
+    comments = github.pr_comment_rows(record.repo, pr)
     if comments is None:
         return None
     profile = repo_profile(workdir)
@@ -1877,7 +1870,7 @@ def _settle_review(record) -> str | None:
             _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
                            record.pool, pr, slug)
             return f"https://github.com/{record.repo}/pull/{pr}"
-        reason = (_UI_GAP_REASON if ui_gap
+        reason = (UI_GAP_REASON if ui_gap
                   else f"has unresolved review actions in a `{profile}` repository")
         return _park_review_settlement(
             record, verdict, workdir, pr, reason=reason, autonomous=False)
@@ -1889,7 +1882,7 @@ def _settle_review(record) -> str | None:
             _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
                            record.pool, pr, slug)
             return f"https://github.com/{record.repo}/pull/{pr}"
-        reason = _UI_GAP_REASON if ui_gap else "forced same-tool review remains unresolved"
+        reason = UI_GAP_REASON if ui_gap else "forced same-tool review remains unresolved"
         return _park_review_settlement(
             record, verdict, workdir, pr, reason=reason, autonomous=True)
     if not verdict.clean:
@@ -1897,7 +1890,7 @@ def _settle_review(record) -> str | None:
             record, verdict, workdir, pr,
             reason="review did not produce an actionable clean verdict", autonomous=True)
     if not record.auto_merge_allowed:
-        reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
+        reason = UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
         return _park_review_settlement(
             record, verdict, workdir, pr, reason=reason, autonomous=True)
 
@@ -1916,7 +1909,7 @@ def _settle_review(record) -> str | None:
         revises_used=record.round,
         ui_evidence_missing=ui_gap, reply_pending=reply_pending(comments))
     if decision is not MergeDecision.MERGE:
-        reason = (_UI_GAP_REASON if ui_gap
+        reason = (UI_GAP_REASON if ui_gap
                   else "CI did not complete successfully within the review settlement window"
                   if not ci_green else "could not be auto-merged after review")
         return _park_review_settlement(
@@ -2013,7 +2006,6 @@ def _worktree_owns_head(wt, head: str) -> bool:
     untracked new file). Read after fetching the branch, this proves the reviser's own local state
     and the pushed branch agree — a stale or third-party push cannot satisfy it. Any failed read
     fails closed."""
-    from agentflow.loop import _run
     local = _run(["git", "-C", str(wt), "rev-parse", "HEAD"])
     if local.returncode != 0 or local.stdout.strip() != head:
         return False
@@ -2040,7 +2032,6 @@ def _revision_ready(record, obs) -> bool:
     A branch whose head still equals the reviewed SHA and carries no such evidence comment pushed
     and proved nothing, so it stays incomplete and continues. Live orchestration; exercised with
     faked GitHub reads in ``tests/test_revise_tracer.py``."""
-    from agentflow.loop import _pr_comments, _run
     parsed = _source_facts(record)
     if parsed is None or not record.target:
         return False
@@ -2070,7 +2061,7 @@ def _revision_ready(record, obs) -> bool:
     # No new code, but an evidence-only revision still completes on its durable non-code proof: an
     # agentflow-authored PR comment (our marker, never the maintainer's) that attaches evidence
     # and postdates this revise round.
-    comments = _pr_comments(record.repo, prs[0].number)
+    comments = github.pr_comment_rows(record.repo, prs[0].number)
     if comments is None:
         return False
     return any(_round_evidence(c, record.created_at) for c in comments)
@@ -2144,7 +2135,6 @@ def _reply_ready(record, obs) -> bool:
     A record without that exact targeted reply stays incomplete. Live orchestration; exercised
     through the Coordinator/Respond adapter seam in ``tests/test_respond_tracer.py``."""
     from agentflow.gate import respond_reply_change, respond_reply_posted
-    from agentflow.loop import _pr_comments, _run
     parsed = _source_facts(record)
     if parsed is None:
         return False
@@ -2152,7 +2142,7 @@ def _reply_ready(record, obs) -> bool:
     pr = _open_pr_for_branch(record.repo, branch)
     if pr is None:
         return False
-    comments = _pr_comments(record.repo, pr.number)
+    comments = github.pr_comment_rows(record.repo, pr.number)
     if comments is None or not respond_reply_posted(comments, record.target or ""):
         return False   # no durable reply bound to this record's maintainer-comment target
     change = respond_reply_change(comments, record.target or "")
@@ -2196,7 +2186,6 @@ def _settle_respond(record) -> str | None:
     no-op, so a repeat re-proves the same release. Returns ``None`` when the issue is unreadable or
     the label is still present, so settlement retries next cycle rather than retiring over a claim it
     never released. Live orchestration, not unit-tested (ADR 0020)."""
-    from agentflow.loop import BUILDING
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
@@ -2229,7 +2218,6 @@ def _open_pr_for_branch(repo: str, branch: str) -> github.PrRow | None:
 
 def _review_context(record) -> tuple[str, str] | None:
     """The issue-anchored acceptance brief and declared UI surfaces for a Review."""
-    from agentflow.loop import _surfaces_phrase, surface_declaration
 
     parts = _build_source_parts(record)
     if parts is None:
@@ -2240,7 +2228,7 @@ def _review_context(record) -> tuple[str, str] | None:
         acceptance = github.issue_body(record.repo, record.subject)
         if acceptance is None:   # unreadable stays unknown — the opener refuses rather than guesses
             return None
-    return acceptance, _surfaces_phrase(surface_declaration(workdir))
+    return acceptance, surfaces_phrase(surface_declaration(workdir))
 
 
 def _review_assignment_facts(repo: str, pr_number: int, *, conflict_resolution: bool = False,
@@ -2298,7 +2286,6 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
     if context is None:
         return
     acceptance, surfaces = context
-    from agentflow.loop import repo_profile
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
     assignment, _changed_files = _review_assignment_facts(
@@ -2487,7 +2474,6 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
             coord.submit_stage(submission)
         return
     conflict_resolution = bool(revise.conflict_round)
-    from agentflow.loop import repo_profile
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
     inherited = ReviewState.from_record(revise)
@@ -2527,13 +2513,11 @@ def _moved_head_review_submission(record, head_sha: str):
     later pass retries."""
     from agentflow.coordinator import Submission
     from agentflow.review_policy import ReviewState
-    from agentflow.reviewer import review_worktree
     facts = _review_source_facts(record)
     if facts is None or not head_sha or not record.builder_lineage:
         return None
     workdir, pr = facts
     slug = _review_slug(record)
-    from agentflow.loop import repo_profile
     reviewer_tool = pick_reviewer(
         record.builder_lineage, allow_same_tool=repo_profile(workdir) != "autonomous")
     if reviewer_tool is None:
@@ -2575,7 +2559,6 @@ def _review_checkout_owns_head(record, head: str) -> bool:
     verdict) from a concurrent maintainer push (terminate the stale review and retarget it).
     Unknown or dirty local state fails closed as not-owned.
     """
-    from agentflow.loop import _run
     wt = Path(record.source)
     if not wt.exists() or not head:
         return False
@@ -2652,7 +2635,6 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
 
 def _resume_tainted_reviews(coord: Coordinator) -> None:
     """Reopen only maintainer-forced autonomous taint when independence returns."""
-    from agentflow.loop import repo_profile
 
     records = list(tracer.load_records())
     candidates = [record for record in records

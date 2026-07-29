@@ -10,12 +10,13 @@ from agentflow import github
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import PROVIDER_INPUT_V1
 from agentflow.intake import IntakeResult, apply_intake, intake_prompt, intake_result_is_durable
+from agentflow.labels import TRIAGING, release
+from agentflow.runner import _run
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 
 def intake_submission(cfg, issue: dict, extra: str, tool: str) -> Submission | None:
     """Map a durable issue snapshot to one idempotent Intake stage submission."""
-    from agentflow.loop import _run
     n = issue["number"]
     target = issue.get("_intake_target") if extra else None
     source_path = WorktreeRef.for_intake(cfg.workdir, tool, n).path
@@ -38,7 +39,6 @@ def intake_submission(cfg, issue: dict, extra: str, tool: str) -> Submission | N
 
 def reset_worktree(record) -> bool:
     """Discard and rebuild Intake's read-only checkout from its durable source pointer."""
-    from agentflow.loop import _run
     from agentflow.runner import ClaudeRunner, CodexRunner
     if not record.source or not record.input_ptr:
         return False
@@ -83,7 +83,6 @@ def dispose_worktree(record) -> bool:
     Idempotent: an already-removed worktree is a no-op success. Returns whether the worktree is
     gone — a stubborn checkout that could not be removed returns ``False`` so settlement retries
     rather than retiring over ambiguous evidence."""
-    from agentflow.loop import _run
     ref = _intake_ref(record)
     if ref is None:
         return False
@@ -107,7 +106,6 @@ def _intake_ref(record) -> WorktreeRef | None:
 
 def intake_claim_ready(record) -> bool:
     """Prove the durable Intake record still owns GitHub's triaging claim before admission."""
-    from agentflow.loop import TRIAGING
     labels = github.issue_labels(record.repo, int(record.subject))
     if labels is None:   # fail closed: a read that couldn't reach GitHub stays unknown
         return False
@@ -128,7 +126,6 @@ def apply_route(record, result: IntakeResult) -> str | None:
     are never stranded behind the envelope's post-once gate.
     """
     from agentflow.handoff import DurableHandoff, Notification, Subject
-    from agentflow.loop import _release_triage
     try:
         snapshot = json.loads(record.input_ptr or "")["snapshot"]
         number = int(record.subject)
@@ -165,7 +162,7 @@ def apply_route(record, result: IntakeResult) -> str | None:
         if hands_off:
             project()   # the post-once gate skipped an interrupted projection — finish it
         return None
-    if not _release_triage(record.repo, number):
+    if not release(record.repo, number, TRIAGING):
         return None
     return f"https://github.com/{record.repo}/issues/{number}"
 
@@ -193,7 +190,6 @@ def hold_intake(record) -> str | None:
                                                    parse_permanent_hold_reason)
     from agentflow.handoff import DurableHandoff, Notification, Subject
     from agentflow.intake import _held, _provider_failed
-    from agentflow.loop import _release_triage
     number = int(record.subject)
     reason = record.hold_reason or "continuation budget exhausted"
     if reason.startswith(PERMANENT_HOLD_REASON):
@@ -221,6 +217,6 @@ def hold_intake(record) -> str | None:
             "agentflow needs you", f"{record.repo} #{number}: Intake held — {reason}"))
     if url is None:
         return None
-    if not _release_triage(record.repo, number):
+    if not release(record.repo, number, TRIAGING):
         return None
     return url

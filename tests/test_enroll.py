@@ -9,7 +9,7 @@ import pytest
 
 from agentflow.enroll import (audit_lines, checkout_repo, declaration_line, main,
                               newly_gated_prs, propose_surfaces, write_declaration)
-from agentflow.loop import surface_declaration
+from agentflow.repo_facts import surface_declaration
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "enroll-standards.sh"

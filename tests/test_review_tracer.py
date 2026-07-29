@@ -804,9 +804,9 @@ def test_clean_reviewed_settlement_posts_one_summary_and_returns_durable_proof(m
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: list(comments))
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
@@ -814,7 +814,7 @@ def test_clean_reviewed_settlement_posts_one_summary_and_returns_durable_proof(m
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
         lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
-    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.coordinated_build._finish_review", lambda *args, **kwargs: None)
 
     proof = coordinated_build._settle_review(record)
     assert proof == "https://github.com/o/r/pull/42"
@@ -831,15 +831,15 @@ def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeyp
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
     monkeypatch.setattr("agentflow.gate.ci_is_green", lambda _repo, _pr, **_kwargs: True)
     monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
     monkeypatch.setattr("agentflow.gate.reply_pending", lambda _comments: False)
     monkeypatch.setattr("agentflow.gate.squash_merge",
                         lambda _repo, pr: merged.append(pr) or True)
-    monkeypatch.setattr("agentflow.loop._finish_review",
+    monkeypatch.setattr("agentflow.coordinated_build._finish_review",
                         lambda *args, **kwargs: finished.append((args, kwargs)))
     monkeypatch.setattr("agentflow.github.remove_label",
                         lambda repo, issue, label: label_edits.append((issue, label)) or True)
@@ -865,10 +865,10 @@ def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-b", "state": "OPEN"})
     monkeypatch.setattr(coordinated_build, "_review_pr_head", lambda _r: "sha-b")
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: [])
-    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.coordinated_build._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.gate.ci_is_green", lambda *args, **kwargs: True)
     monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
     monkeypatch.setattr("agentflow.gate.reply_pending", lambda _comments: False)
@@ -907,9 +907,9 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments)
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: list(surfaces))
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: list(surfaces))
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: list(comments))
     monkeypatch.setattr("agentflow.github.api", lambda *_args, **_kwargs: dict(pr_view))
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=body, created_at="")
@@ -918,7 +918,7 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments)
     monkeypatch.setattr("agentflow.gate.park", _park)
     monkeypatch.setattr("agentflow.gate.squash_merge",
                         lambda *_args, **_kwargs: pytest.fail("a blocked PR must never merge"))
-    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.coordinated_build._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
     coordinated_build._REVIEW_CI_OBSERVED[record.identity] = True
@@ -932,7 +932,7 @@ def test_screenshotless_ui_change_is_blocked_by_the_gate_it_is_reported_to(monke
     """A clean autonomous PR that touches a declared user-facing surface with no before/after
     screenshot must not merge — and the merge gate must be the thing that says so, so the fact
     reaches it instead of being ruled on before the question is asked (ADR 0018)."""
-    from agentflow.loop import _UI_GAP_REASON
+    from agentflow.prompts import UI_GAP_REASON
 
     settled = _settle_autonomous_clean_review(
         monkeypatch,
@@ -942,7 +942,7 @@ def test_screenshotless_ui_change_is_blocked_by_the_gate_it_is_reported_to(monke
         comments=[])
 
     assert settled.asked and settled.asked[0]["ui_evidence_missing"] is True
-    assert settled.parked == [_UI_GAP_REASON]
+    assert settled.parked == [UI_GAP_REASON]
     assert settled.proof == "https://github.com/o/r/pull/42"
 
 
@@ -968,10 +968,10 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
-    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.coordinated_build._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: list(comments))
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
@@ -1054,7 +1054,7 @@ def test_completed_product_review_keeps_its_verdict_when_provider_artifacts_disa
         coordinated_build, "_review_pr_facts",
         lambda _record: {"head": "sha-a", "state": "OPEN"})
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "reviewed")
 
     coordinated_build.reconcile_and_project(coord)
 
@@ -1121,10 +1121,10 @@ def test_completed_conflict_decision_transfers_to_revise_before_settlement(
         coordinated_build, "_review_pr_facts",
         lambda _record: {"head": "sha-a", "state": "OPEN"})
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: [])
-    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.coordinated_build._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
         lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
@@ -1153,10 +1153,10 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
     monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
     monkeypatch.setattr(coordinated_build, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
-    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.coordinated_build._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: list(comments))
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
@@ -1209,7 +1209,7 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
 
 
 def test_survivor_review_has_no_synthetic_predecessor(monkeypatch):
-    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.coordinated_build.ui_surfaces", lambda _workdir: [])
     cfg = SimpleNamespace(repo="o/r", workdir="/work")
 
     sub = coordinated_build.survivor_review_submission(
@@ -1290,7 +1290,7 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     stale = coord.submit_stage(_diverged_review(target="stale-sha", round=0))
     monkeypatch.setattr("agentflow.github.api", _gh_pr("OPEN", "live-sha"))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_build.repo_profile", lambda _workdir: "autonomous")
     choices = []
     monkeypatch.setattr(
         coordinated_build, "pick_reviewer",
@@ -1603,7 +1603,7 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
                         lambda *args, **kwargs: (ReviewAssignment(reason="one journey"), ()))
     monkeypatch.setattr(loop, "pick_reviewer", lambda author, **kwargs: "claude")
     claimed = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, issue: claimed.append(issue) or True)
+    monkeypatch.setattr(loop, "claim", lambda repo, issue, _label: claimed.append(issue) or True)
     monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coord)
     monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda _coord: None)
 

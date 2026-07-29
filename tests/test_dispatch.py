@@ -11,7 +11,7 @@ import pytest
 
 from conftest import FakeSession, record_of
 
-from agentflow import coordinated_build, dispatch, live, loop
+from agentflow import coordinated_build, dispatch, github, live, loop
 from agentflow.coordinator import MockupStageAdapter
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.loop import RepoConfig
@@ -249,7 +249,7 @@ def test_build_submission_enters_the_coordinator_then_claims_runnable_work(monke
     builder = SimpleNamespace(tool="claude")
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (builder, None, ""))
     events = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: events.append("claim") or True)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: events.append("claim") or True)
     waiting = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
                      state=WAITING)
     coord = SimpleNamespace(
@@ -277,7 +277,7 @@ def test_daemon_does_not_claim_or_launch_when_the_build_stays_held(monkeypatch):
                         lambda cfg, reserved=frozenset(), _log=None:
                         None if 7 in reserved else issue)
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
-    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("must not claim a held no-op"))
+    monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("must not claim a held no-op"))
     held = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
                   state=HELD, claim=False)
     coord = SimpleNamespace(
@@ -310,7 +310,7 @@ def test_build_pass_skips_a_mislabelled_queue_head_and_submits_the_next_issue(
     _ready_queue(monkeypatch, [(462, ["ready-for-agent"]), (468, _DIALS)])
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     claimed = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: claimed.append(number) or True)
     submitted = []
     coord = SimpleNamespace(
         submit_stage=lambda s: submitted.append(int(s.subject)) or f"o/r|{s.subject}|build|-",
@@ -334,7 +334,7 @@ def test_build_pass_passes_over_an_exhausted_held_head_without_resuming_it(monke
     monkeypatch.setattr(dispatch.coordinated_build, "resume_if_held",
                         lambda *a: pytest.fail("automatic dispatch must never auto-resume"))
     claimed = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: claimed.append(number) or True)
     records = {
         "o/r|59|build|-": Record(identity="o/r|59|build|-", stage="build", pool="claude",
                                  demand=5, state=HELD, claim=False),
@@ -356,7 +356,7 @@ def test_build_pass_stops_when_the_ready_queue_cannot_be_read(monkeypatch, tmp_p
     # dispatches nothing rather than scanning on with incomplete duplicate-work protection.
     _ready_queue(monkeypatch, [(1, _DIALS)])
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
-    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("must not claim while blind"))
+    monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("must not claim while blind"))
     coord = SimpleNamespace(
         submit_stage=lambda s: pytest.fail("must not submit while blind"),
         stage_record=lambda identity: None)
@@ -368,7 +368,7 @@ def test_build_pass_stops_when_the_ready_queue_cannot_be_read(monkeypatch, tmp_p
 def test_build_pass_reports_when_every_ready_candidate_is_undispatchable(monkeypatch, tmp_path):
     _ready_queue(monkeypatch, [(1, ["ready-for-agent"]), (2, ["ready-for-agent"])])
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
-    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("nothing runnable to claim"))
+    monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("nothing runnable to claim"))
     coord = SimpleNamespace(submit_stage=lambda s: "id", stage_record=lambda identity: None)
 
     result = dispatch._submit_coordinated_build(RepoConfig("o/r", str(tmp_path)), coord, None)
@@ -409,7 +409,7 @@ def _stub_answered_park(monkeypatch, records):
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "keep the conservative behavior", "IC_1", "sha-a"))
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: records)
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: _answered_park_thread())
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: _answered_park_thread())
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(coordinated_build, "respond_submission",
                         lambda *a, **k: pytest.fail("a decision answer is never a generic Respond"))
@@ -417,7 +417,9 @@ def _stub_answered_park(monkeypatch, records):
     monkeypatch.setattr(coordinated_build.github, "pr_comment",
                         lambda repo, pr, body: posted.append(body) or True)
     claimed = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    stamp = lambda repo, number, _label: claimed.append(number) or True   # noqa: E731
+    monkeypatch.setattr(dispatch, "claim", stamp)
+    monkeypatch.setattr(coordinated_build, "claim", stamp)
     submitted = []
     return posted, claimed, submitted
 
@@ -497,7 +499,7 @@ def test_ordinary_pr_discussion_after_a_parked_review_still_enters_respond(monke
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "unrelated question", "IC_2", "sha-a"))
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked, resumed])
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [
         *_answered_park_thread(),
         {"id": "IC_x", "body": "> *agentflow: your decision resumed the parked review.*\n"
                                "<!-- agentflow-respond-target:IC_1 -->"},
@@ -507,7 +509,7 @@ def test_ordinary_pr_discussion_after_a_parked_review_still_enters_respond(monke
     monkeypatch.setattr(coordinated_build, "respond_submission",
                         lambda *a, **k: SimpleNamespace(subject="7", pool="claude"))
     monkeypatch.setattr(coordinated_build, "owned_issues", lambda cfg, lane=None: set())
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: True)
     submitted = []
 
     result = dispatch._submit_coordinated_respond(
@@ -530,7 +532,7 @@ def test_a_second_decision_round_is_still_answerable_after_agentflow_replied(mon
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "prompt every user", "IC_2", "sha-a"))
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [first, round_two])
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [
         {"id": "IC_0", "body": "> *agentflow: parked for human review.*\n\nDecide again, please."},
         {"id": "IC_1", "body": "keep the conservative behavior"},
         {"id": "IC_x", "body": "> *agentflow: your decision resumed the parked review.*\n"
@@ -543,7 +545,9 @@ def test_a_second_decision_round_is_still_answerable_after_agentflow_replied(mon
     monkeypatch.setattr(coordinated_build.github, "pr_comment",
                         lambda repo, pr, body: posted.append(body) or True)
     claimed = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    stamp = lambda repo, number, _label: claimed.append(number) or True   # noqa: E731
+    monkeypatch.setattr(dispatch, "claim", stamp)
+    monkeypatch.setattr(coordinated_build, "claim", stamp)
     submitted = []
 
     result = dispatch._submit_coordinated_respond(
@@ -565,7 +569,7 @@ def test_an_older_unanswered_comment_before_the_park_remains_ordinary_discussion
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "earlier discussion", "IC_old", "sha-a"))
     monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked])
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [
         {"id": "IC_old", "body": "earlier discussion"},
         {"id": "IC_park", "body": "> *agentflow: parked for human review.*\n\nDecide."},
         {"id": "IC_answer", "body": "keep the conservative behavior"},
@@ -575,7 +579,7 @@ def test_an_older_unanswered_comment_before_the_park_remains_ordinary_discussion
     monkeypatch.setattr(coordinated_build, "respond_submission",
                         lambda *a, **k: SimpleNamespace(subject="7", pool="claude"))
     monkeypatch.setattr(coordinated_build, "owned_issues", lambda cfg, lane=None: set())
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: True)
     submitted = []
 
     result = dispatch._submit_coordinated_respond(
@@ -589,7 +593,7 @@ def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):
         42, "agentflow/claude/issue-7-fix", "please adjust", "cid-1", "base"))
     monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
                         lambda cfg, lane=None: {7})
-    monkeypatch.setattr(loop, "_claim", lambda *a: pytest.fail("must not double-claim"))
+    monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("must not double-claim"))
 
     result = dispatch._submit_coordinated_respond(
         RepoConfig("o/r", "/tmp"), SimpleNamespace(), None)
@@ -610,7 +614,7 @@ def test_intake_skips_an_issue_a_live_pipeline_stage_already_owns(monkeypatch):
                         lambda cfg, lane=None: {42})
     monkeypatch.setattr(dispatch, "pick_pair",
                         lambda: pytest.fail("must not pick a pool for an owned issue"))
-    monkeypatch.setattr(loop, "_claim_triage", lambda *a: pytest.fail("must not re-claim"))
+    monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("must not re-claim"))
     monkeypatch.setattr(coordinated_intake, "intake_submission",
                         lambda *a, **k: pytest.fail("must not submit an owned issue"))
 
@@ -631,7 +635,7 @@ def test_intake_still_claims_a_genuinely_new_issue(monkeypatch):
     monkeypatch.setattr(coordinated_intake, "intake_submission",
                         lambda *a, **k: SimpleNamespace(pool="claude"))
     claimed = []
-    monkeypatch.setattr(loop, "_claim_triage", lambda repo, n: claimed.append(n) or True)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, n, _label: claimed.append(n) or True)
     waiting = Record(identity="o/r|42|intake|-", stage="triage", pool="claude", demand=5,
                      state=WAITING)
     coord = SimpleNamespace(
@@ -663,7 +667,7 @@ def test_intake_does_not_claim_a_dedup_hit_on_a_completed_record(monkeypatch):
                             lambda: (SimpleNamespace(tool="claude"), None, ""))
         monkeypatch.setattr(coordinated_intake, "intake_submission",
                             lambda *a, **k: SimpleNamespace(pool="claude"))
-        monkeypatch.setattr(loop, "_claim_triage",
+        monkeypatch.setattr(dispatch, "claim",
                             lambda *a: pytest.fail("must not claim a terminal dedup no-op"))
         completed = Record(identity=f"o/r|393|intake|{target}", stage="triage", pool="claude",
                            demand=5, state=COMPLETED)
@@ -690,7 +694,7 @@ def test_intake_withdraws_the_submission_when_the_claim_fails(monkeypatch):
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_intake, "intake_submission",
                         lambda *a, **k: SimpleNamespace(pool="claude"))
-    monkeypatch.setattr(loop, "_claim_triage", lambda *a: False)
+    monkeypatch.setattr(dispatch, "claim", lambda *a: False)
     waiting = Record(identity="o/r|42|intake|-", stage="triage", pool="claude", demand=5,
                      state=WAITING)
     withdrawn = []
@@ -799,3 +803,38 @@ def test_no_module_outside_the_github_module_shells_out_to_gh():
             if isinstance(first, ast.Constant) and first.value == "gh":
                 assert path == root / "github.py", (
                     f"GitHub access outside the github module: {path}:{node.lineno}")
+
+
+def _loop_imports(tree: ast.AST):
+    """Every statement in ``tree`` that pulls a name out of ``agentflow.loop``."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "agentflow.loop":
+            yield node
+        if isinstance(node, ast.Import):
+            if any(alias.name == "agentflow.loop" for alias in node.names):
+                yield node
+
+
+def test_dispatch_policy_never_imports_the_dispatch_loop():
+    """Stage policy stays readable on its own: the coordinated stages own what a stage decides,
+    the loop owns which one runs next, and only that second direction may know the first.
+
+    The two modules used to import each other, and the cycle stayed invisible because every one
+    of those imports sat inside a function body — deferred until call time, so Python never
+    complained. A function-local import of the loop is therefore not merely a style question: it
+    is exactly how a re-formed cycle would hide again. Anything genuinely shared belongs in a
+    module both sides can import outright.
+    """
+    root = Path(__file__).parents[1] / "agentflow"
+
+    stage_policy = ast.parse((root / "coordinated_build.py").read_text())
+    assert not list(_loop_imports(stage_policy)), (
+        "coordinated_build.py imports agentflow.loop — move the shared vocabulary into a module "
+        "both sides can import instead of reaching back into dispatch")
+
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        module_level = {id(node) for node in tree.body}
+        for node in _loop_imports(tree):
+            assert id(node) in module_level, (
+                f"function-local import of agentflow.loop: {path}:{node.lineno}")

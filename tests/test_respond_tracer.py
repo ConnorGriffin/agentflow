@@ -95,7 +95,7 @@ def test_public_respond_prepare_recreates_only_from_the_owned_remote_pr_branch(
             return SimpleNamespace(returncode=0, stdout="")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.coordinated_build._run", git)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
     adapter = RespondStageAdapter(
         reply_ready=lambda record, obs: False,
@@ -122,7 +122,7 @@ def test_public_respond_prepare_waits_when_the_remote_pr_branch_is_missing(
         calls.append(argv)
         return SimpleNamespace(returncode=1 if "show-ref" in argv else 0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.coordinated_build._run", git)
     adapter = RespondStageAdapter(
         reply_ready=lambda record, obs: False,
         worktree_ready=coordinated_build._worktree_ready,
@@ -219,10 +219,10 @@ def test_public_respond_seam_requires_targeted_reply_and_clean_pushed_worktree(
             return SimpleNamespace(returncode=0, stdout="")
         return real_run(argv)
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.coordinated_build._run", git)
     monkeypatch.setattr("agentflow.github.list_open_prs",
                         lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-1") + "\n" +
                   respond_change_marker("none") + "\n\nDone.")},
@@ -253,7 +253,7 @@ def test_public_respond_seam_fails_closed_when_owned_worktree_is_missing(
     missing = tmp_path / ".agentflow/worktrees/claude/issue-7-missing"
     monkeypatch.setattr("agentflow.github.list_open_prs",
                         lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-1") + "\n" +
                   respond_change_marker("none") + "\n\nDone.")},
@@ -284,10 +284,10 @@ def test_public_respond_seam_rejects_a_reply_for_a_different_comment_target(
             return SimpleNamespace(returncode=0, stdout="0\n")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.coordinated_build._run", git)
     monkeypatch.setattr("agentflow.github.list_open_prs",
                         lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "first question", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-2") + "\n" +
                   respond_change_marker("none") + "\n\nAnswered another question.")},
@@ -431,7 +431,7 @@ def test_reply_ready_rejects_a_generic_reply_that_is_not_bound_to_its_target(
         monkeypatch, tmp_path):
     from agentflow.gate import PR_MARK
     rec = _reply_read(monkeypatch, tmp_path)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please tweak the copy", "id": "cid"},
         {"body": f"{PR_MARK} reply from the build agent: done"},
     ])
@@ -467,9 +467,9 @@ def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
     def list_open_prs(repo, *, head=None, limit=100):
         return [github.PrRow(42, head or "", head_sha)]
 
-    monkeypatch.setattr("agentflow.loop._run", _run)
+    monkeypatch.setattr("agentflow.coordinated_build._run", _run)
     monkeypatch.setattr("agentflow.github.list_open_prs", list_open_prs)
-    monkeypatch.setattr("agentflow.loop._pr_comments",
+    monkeypatch.setattr("agentflow.github.pr_comment_rows",
                         lambda repo, pr: [
                             {"body": "please tweak the copy", "id": "cid"},
                             {"body": (respond_reply_disclaimer("cid") + "\n" +
@@ -555,7 +555,7 @@ def test_reply_ready_rejects_multiple_ambiguous_outcome_markers(monkeypatch, tmp
 
     rec = _reply_read(monkeypatch, tmp_path, change="none", head="new-head",
                       baseline="old-head")
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please change it", "id": "cid"},
         {"body": (respond_reply_disclaimer("cid") + "\n" +
                   respond_change_marker("none") + "\n" +

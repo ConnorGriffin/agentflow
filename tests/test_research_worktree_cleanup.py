@@ -75,13 +75,13 @@ class _FakeGitHub:
         self.map_body = body
         return True
 
-    def release(self, repo, number):               # stands in for loop._release_resolving
+    def release(self, repo, number, _label):       # stands in for coordinated_research.release_claim
         if "wayfinder:resolving" in self.labels:
             self.labels.remove("wayfinder:resolving")
         return True
 
-    def run(self, argv):                           # loop._run: only the git worktree cleanup remains
-        assert argv and argv[0] == "git", f"unexpected non-git loop._run call: {argv}"
+    def run(self, argv):                           # coordinated_research._run: only the git worktree cleanup remains
+        assert argv and argv[0] == "git", f"unexpected non-git coordinated_research._run call: {argv}"
         self.git_calls.append(list(argv))
         if "worktree" in argv and "remove" in argv:
             shutil.rmtree(argv[-1], ignore_errors=True)
@@ -97,8 +97,8 @@ class _FakeGitHub:
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
         monkeypatch.setattr(github, "edit_body", self.edit_body)
-        monkeypatch.setattr(loop, "_release_resolving", self.release)
-        monkeypatch.setattr(loop, "_run", self.run)
+        monkeypatch.setattr(coordinated_research, "release_claim", self.release)
+        monkeypatch.setattr(coordinated_research, "_run", self.run)
 
 
 # --- worktree cleanup on durable resolution -------------------------------------

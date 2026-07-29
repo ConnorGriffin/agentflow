@@ -13,7 +13,7 @@ from collections import defaultdict
 from agentflow.coordinated_converse import ASK_PROMPT, BUILD_ISSUE_PROMPT
 from agentflow.coordinated_research import RESEARCH_PROMPT
 from agentflow.intake import INTAKE_PROMPT
-from agentflow.loop import BUILD_PROMPT, PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT
+from agentflow.prompts import BUILD_PROMPT, PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT
 from agentflow.reviewer import REVIEW_PROMPT
 from agentflow.shell_crib import SHELL_CRIB
 

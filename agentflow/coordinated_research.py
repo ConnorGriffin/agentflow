@@ -26,6 +26,8 @@ from pathlib import Path
 
 from agentflow import github
 from agentflow.coordinator import Submission
+from agentflow.labels import RESOLVING, release as release_claim
+from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
@@ -127,7 +129,6 @@ def _research_worktree_ready(record) -> bool:
     already wrote — so it is never reset or cleaned. A research run owns no branch and pushes nothing,
     so the checkout is detached. Any git failure returns False, so admission is skipped with no permit
     and no attempt consumed — the run simply retries next cycle."""
-    from agentflow.loop import _run
     from agentflow.runner import _worktree_is_registered
     ref = WorktreeRef.parse(record.source)
     if ref is None or ref.kind is not WorktreeKind.RESEARCH or ref.tool != record.pool:
@@ -265,7 +266,6 @@ def resolve(record) -> str | None:
 
     On durable resolution the run's isolated worktree is removed so resolved runs do not accumulate
     on disk. Cleanup is best-effort and never blocks returning the proof."""
-    from agentflow.loop import _release_resolving, _run
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
@@ -290,7 +290,7 @@ def resolve(record) -> str | None:
     if issue.get("state") != "CLOSED":
         if not github.close(repo, number):
             return None
-    if not _release_resolving(repo, number):
+    if not release_claim(repo, number, RESOLVING):
         return None
     final = github.api(["issue", "view", str(number), "--repo", repo,
                         "--json", "state,comments,url"], parse_json=True)
@@ -315,12 +315,11 @@ def release(record) -> str | None:
 
     The run's isolated worktree is intentionally kept on disk — a resumed attempt reuses it to pick up
     partial findings rather than starting from scratch."""
-    from agentflow.loop import _release_resolving
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    if not _release_resolving(record.repo, number):
+    if not release_claim(record.repo, number, RESOLVING):
         return None
     viewed = github.api(["issue", "view", str(number), "--repo", record.repo, "--json", "url"],
                         parse_json=True)

@@ -38,7 +38,7 @@ class FakeGitHub:
     """A stateful stand-in for the ticket, its parent Decision Map, and the shared claim. The
     finalizer's GitHub reads/writes are stated through the GitHub module's helpers (ADR 0040) —
     the typed ``comment``/``close``/``edit_body`` writes and the ``api`` escape hatch — never by
-    matching a ``gh`` argument vector. ``run`` stands in for ``loop._run`` for the git worktree
+    matching a ``gh`` argument vector. ``run`` stands in for ``coordinated_research._run`` for the git worktree
     cleanup that remains loop-owned."""
 
     def __init__(self, *, state="OPEN", title="Audit the widget path",
@@ -74,13 +74,13 @@ class FakeGitHub:
         self.map_body = body
         return True
 
-    def release(self, repo, number):               # stands in for loop._release_resolving
+    def release(self, repo, number, _label):       # stands in for coordinated_research.release_claim
         if "wayfinder:resolving" in self.labels:
             self.labels.remove("wayfinder:resolving")
         return True
 
-    def run(self, argv):                           # loop._run: only the git worktree cleanup remains
-        assert argv and argv[0] == "git", f"unexpected non-git loop._run call: {argv}"
+    def run(self, argv):                           # coordinated_research._run: only the git worktree cleanup remains
+        assert argv and argv[0] == "git", f"unexpected non-git coordinated_research._run call: {argv}"
         return _R(0)
 
     def install(self, monkeypatch):
@@ -89,8 +89,8 @@ class FakeGitHub:
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
         monkeypatch.setattr(github, "edit_body", self.edit_body)
-        monkeypatch.setattr(loop, "_release_resolving", self.release)
-        monkeypatch.setattr(loop, "_run", self.run)
+        monkeypatch.setattr(coordinated_research, "release_claim", self.release)
+        monkeypatch.setattr(coordinated_research, "_run", self.run)
 
 
 def _adapter(fake):
@@ -155,7 +155,7 @@ def test_next_research_ticket_picks_the_oldest_eligible_unblocked_ticket(monkeyp
             return _R(0, "[]")
         raise AssertionError(argv)
 
-    monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr(coordinated_research, "_run", run)
     monkeypatch.setattr("agentflow.github._run", run)
     picked = loop._next_research_ticket(RepoConfig(REPO, "/tmp"))
     assert picked["number"] == 5
@@ -172,7 +172,7 @@ def test_next_research_ticket_skips_a_ticket_with_an_open_native_blocker(monkeyp
             return _R(0, '{"state":"OPEN"}')
         raise AssertionError(argv)
 
-    monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr(coordinated_research, "_run", run)
     monkeypatch.setattr("agentflow.github._run", run)
     assert loop._next_research_ticket(RepoConfig(REPO, "/tmp")) is None
 
@@ -186,7 +186,7 @@ def test_next_research_ticket_fails_closed_on_an_unreadable_blocker_graph(monkey
             return _R(1, "")
         raise AssertionError(argv)
 
-    monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr(coordinated_research, "_run", run)
     monkeypatch.setattr("agentflow.github._run", run)
     assert loop._next_research_ticket(RepoConfig(REPO, "/tmp")) is None  # unreadable ≠ unblocked
 
@@ -341,8 +341,8 @@ def test_research_dispatch_claims_then_enters_the_coordinator(monkeypatch):
     monkeypatch.setattr("agentflow.coordinated_research.research_map_context",
                         lambda repo, n: "")
     events = []
-    monkeypatch.setattr(loop, "_claim_resolving",
-                        lambda repo, n: events.append("claim") or True)
+    monkeypatch.setattr(dispatch, "claim",
+                        lambda repo, n, _label: events.append("claim") or True)
     coord = SimpleNamespace(submit_stage=lambda s: events.append(s.stage))
 
     assert "submitted" in dispatch._submit_coordinated_research(
@@ -400,7 +400,7 @@ def test_research_dispatch_refuses_submission_when_the_claim_cannot_be_set(monke
                         lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr("agentflow.coordinated_research.research_map_context",
                         lambda repo, n: "")
-    monkeypatch.setattr(loop, "_claim_resolving", lambda repo, n: False)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, n, _label: False)
     coord = SimpleNamespace(submit_stage=lambda s: (_ for _ in ()).throw(
         AssertionError("must not submit without the claim")))
 

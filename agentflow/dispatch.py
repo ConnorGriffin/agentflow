@@ -12,6 +12,7 @@ import threading
 
 from agentflow import coordinated_build, loop
 from agentflow.balancer import pick_pair
+from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
 from agentflow.coordinator.quota_poll import refresh_claude_quota
 from agentflow.coordinator.store import default_store_path
 
@@ -82,7 +83,7 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
                            f"(`/agentflow pickup {number}` then `build`)")
             reserved.add(number)
             continue
-        if not loop._claim(cfg.repo, number):
+        if not claim(cfg.repo, number, BUILDING):
             return _report(f"#{number}: could not claim Build — refusing coordinator submission")
         return _report(f"#{number}: submitted to coordinator → {builder.tool} (build)")
 
@@ -107,7 +108,7 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
     if number in coordinated_build.owned_issues(cfg, lane="building"):
         return (f"#{number}: prior change stage still owns the building claim — "
                 "deferring Respond")
-    if not loop._claim(cfg.repo, number):
+    if not claim(cfg.repo, number, BUILDING):
         return f"#{number}: could not claim Respond — refusing coordinator submission"
     coordinator.submit_stage(submission)
     return f"#{number}: submitted PR #{pr} to coordinator → {submission.pool} (respond)"
@@ -146,7 +147,7 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
         if record is None or record.state != WAITING or record.hold_pending or record.retired:
             reserved.add(issue["number"])
             continue
-        if not loop._claim_triage(cfg.repo, issue["number"]):
+        if not claim(cfg.repo, issue["number"], TRIAGING):
             # Runnable submission but the claim mutation failed: withdraw the never-started
             # WAITING record so no unowned Intake work survives, mirroring build_issue.
             coordinator.withdraw_stage(identity)
@@ -168,7 +169,7 @@ def _submit_coordinated_research(cfg, coordinator, _log) -> str:
     map_context = coordinated_research.research_map_context(cfg.repo, ticket["number"])
     submission = coordinated_research.research_submission(
         cfg, ticket, builder.tool, map_context=map_context)
-    if not loop._claim_resolving(cfg.repo, ticket["number"]):
+    if not claim(cfg.repo, ticket["number"], RESOLVING):
         return f"#{ticket['number']}: could not claim wayfinder:resolving — refusing submission"
     coordinator.submit_stage(submission)
     return f"#{ticket['number']}: submitted to coordinator → {builder.tool} (research)"

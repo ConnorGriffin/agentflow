@@ -4,7 +4,7 @@ from agentflow.github import IssueRow, PipelinePrRow, SnapshotPrRow
 import agentflow.dashboard_data as dd
 from agentflow.dashboard_data import (
     _CONFLICT_MARK,
-    _UI_GAP_REASON,
+    UI_GAP_REASON,
     _complexity_of,
     _effort_of,
     park_reason,
@@ -41,7 +41,7 @@ def _park(reason: str) -> dict:
 
 def test_park_reason_classifies_all_four_markers():
     assert park_reason([_park("is a `reviewed` repo — a human merges")]) == "drop-to-reviewed"
-    assert park_reason([_park(_UI_GAP_REASON)]) == "ui-evidence"
+    assert park_reason([_park(UI_GAP_REASON)]) == "ui-evidence"
     assert park_reason([_park("could not be squash-merged (branch protection)")]) == "failed-merge"
     assert park_reason([{"body": f"> *{_CONFLICT_MARK}.*\n\nmain moved"}]) == "failed-merge"
     # An unanswered maintainer question is the freshest word, even over an earlier park.
@@ -80,7 +80,7 @@ _COMMENTS = {
     21: [_park("could not be squash-merged (branch protection)") | {"createdAt": "2026-07-13T08:00:00Z"}],
     22: [_park("is a `reviewed` repo — a human merges") | {"createdAt": "2026-07-13T07:00:00Z"},
          {"body": "one more question?", "createdAt": "2026-07-13T07:30:00Z"}],
-    23: [_park(_UI_GAP_REASON) | {"createdAt": "2026-07-13T06:00:00Z"}],
+    23: [_park(UI_GAP_REASON) | {"createdAt": "2026-07-13T06:00:00Z"}],
     24: [{"body": "> *agentflow: reviewing…*\n\nno block yet", "createdAt": "2026-07-13T05:00:00Z"}],
 }
 
@@ -102,7 +102,7 @@ def _patch(monkeypatch, held=None):
 
     monkeypatch.setattr(github, "list_issues", fake_list_issues)
     monkeypatch.setattr(github, "list_prs", fake_list_prs)
-    monkeypatch.setattr(dd, "_pr_comments", lambda repo, n: _COMMENTS.get(n, []))
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, n: _COMMENTS.get(n, []))
     monkeypatch.setattr(dd, "repo_profile", lambda workdir: "reviewed")
     monkeypatch.setattr(dd.ratchet, "status",
                         lambda repo: {"samples": 0, "correction_rate": 0, "ready_to_loosen": False})

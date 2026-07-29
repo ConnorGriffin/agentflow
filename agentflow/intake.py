@@ -106,6 +106,19 @@ def _held(detail: str) -> IntakeResult:
     return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail)
 
 
+def held_build_result(status: str, where: str) -> IntakeResult:
+    """The hold a stuck build hands back — routes the issue to `needs-grilling` instead of
+    leaving it `ready-for-agent`, where the loop would re-pick it every cycle: a fresh build
+    session, a duplicate bail comment, and a duplicate ping per cycle, with the rest of the
+    queue stalled behind it (ADR 0021's claim only covers a *live* build). The body carries
+    the intake marker, so a maintainer reply resumes it through the normal re-intake path
+    (ADR 0019). Pure (test surface)."""
+    body = (f"{_DISCLAIMER}\n\nThe build stopped before opening a PR ({status}) — details in "
+            f"{where}. I've held this rather than retrying blind. Reply here with what's "
+            "missing (or run `/agentflow pickup` to drive it live) and I'll re-scope and retry.")
+    return IntakeResult(IntakeRoute.GRILL, body)
+
+
 _NEVER_READ = "I never got to read this issue — the coding agent's provider "
 _RETRY = ("reply here and I'll pick this up again, or run `/agentflow pickup` to drive it "
           "live.")
