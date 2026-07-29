@@ -54,3 +54,22 @@ def test_claim_triage_description_is_ownership_not_live_session(monkeypatch):
     assert "A grounding session" not in description
     # Must convey ownership/admission purpose
     assert any(word in description.lower() for word in ("claim", "ownership", "dispatch"))
+
+
+def test_a_double_stamped_complexity_takes_the_more_cautious_size():
+    # Intake stamps one, but a human can add a second by hand. Whichever order the labels arrive
+    # in, the answer must be the same one — and the same one must be the careful one.
+    from agentflow.labels import complexity_from_labels
+    from agentflow.runner import Complexity
+    both = ["agentflow:complexity:standard", "agentflow:complexity:deep"]
+    assert complexity_from_labels(both) is Complexity.DEEP
+    assert complexity_from_labels(list(reversed(both))) is Complexity.DEEP
+
+
+def test_a_double_stamped_effort_takes_the_larger():
+    from agentflow.labels import effort_from_labels
+    from agentflow.runner import Effort
+    both = ["agentflow:effort:low", "agentflow:effort:medium"]
+    assert effort_from_labels(both) is Effort.MEDIUM
+    assert effort_from_labels(list(reversed(both))) is Effort.MEDIUM
+    assert effort_from_labels(["agentflow:effort:extra", "agentflow:effort:low"]) is Effort.EXTRA

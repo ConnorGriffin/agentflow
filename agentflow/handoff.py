@@ -72,10 +72,16 @@ def marked_body(body: str, marker: str) -> str:
     Not appended at the end, deliberately: a comment ending in the marker still contains the
     *unmarked* text verbatim, and that unmarked text is what an older deploy matched on. A second
     record's hold would then read the first record's comment as proof of its own and go silent —
-    the collision this marker exists to prevent.
+    the collision this marker exists to prevent. So the marker goes after the first paragraph, or
+    failing that after the first line. A body that is a single line has nowhere to hide it and
+    falls back to appending; nothing composes one today, and the legacy matching this protects is
+    itself transitional.
     """
     head, separator, tail = body.partition("\n\n")
-    return f"{head}\n\n{marker}\n\n{tail}" if separator else f"{body}\n\n{marker}"
+    if separator:
+        return f"{head}\n\n{marker}\n\n{tail}"
+    head, separator, tail = body.partition("\n")
+    return f"{head}\n{marker}\n{tail}" if separator else f"{body}\n\n{marker}"
 
 
 @dataclass(frozen=True)

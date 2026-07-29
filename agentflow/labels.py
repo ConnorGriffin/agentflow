@@ -24,24 +24,26 @@ _EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")
 _MOCKUP_SCOPE_LABEL = re.compile(r"^agentflow:mockup:(local|surface)$")
 
 
+# Intake stamps one label per dial, but a human can add a second by hand. Taking whichever came
+# first makes the answer depend on the order a label listing happened to arrive in, so a duplicate
+# is settled by rank instead: the most cautious stamp on the issue wins, whatever the order.
+_COMPLEXITY_RANK = (Complexity.STANDARD, Complexity.DEEP)
+_EFFORT_RANK = (Effort.LOW, Effort.MEDIUM, Effort.HIGH, Effort.EXTRA)
+
+
 def complexity_from_labels(labels: list[str]) -> Complexity | None:
     """The issue's model-size dial from its `agentflow:complexity:*` label. Hard gate
-    — no build without one (ADR 0018)."""
-    for name in labels:
-        m = _COMPLEXITY_LABEL.match(name)
-        if m:
-            return Complexity(m.group(1))
-    return None
+    — no build without one (ADR 0018). Two stamps resolve to `deep`."""
+    found = [Complexity(m.group(1)) for m in map(_COMPLEXITY_LABEL.match, labels) if m]
+    return max(found, key=_COMPLEXITY_RANK.index) if found else None
 
 
 def effort_from_labels(labels: list[str]) -> Effort:
     """The issue's effort dial from its `agentflow:effort:*` label; defaults to
-    `medium` when absent (guidance, not a hard gate — ADR 0018)."""
-    for name in labels:
-        m = _EFFORT_LABEL.match(name)
-        if m:
-            return Effort(m.group(1))
-    return Effort.MEDIUM
+    `medium` when absent (guidance, not a hard gate — ADR 0018). Two stamps resolve to
+    the larger."""
+    found = [Effort(m.group(1)) for m in map(_EFFORT_LABEL.match, labels) if m]
+    return max(found, key=_EFFORT_RANK.index) if found else Effort.MEDIUM
 
 
 def mockup_scope_from_labels(labels: list[str]) -> MockupScope:

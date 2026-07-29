@@ -50,10 +50,9 @@ def _row_dict(row: github.IssueRow) -> dict:
     bridge to the not-yet-migrated consumers, so the wire shape is reassembled once here rather
     than at every call site."""
     return {"number": row.number, "title": row.title, "body": row.body,
-            # Sorted, because a typed row holds its labels as a set: the dial decoders take the
-            # first match, so an issue hand-stamped with two `complexity:`/`effort:` labels would
-            # otherwise resolve to a different model size from one process to the next. Sorting
-            # settles such a tie on `deep` over `standard`, the more cautious of the two.
+            # Sorted only so the shape a caller sees is stable from run to run — a typed row holds
+            # its labels as a set. Nothing may depend on the order: a duplicate dial is settled by
+            # rank in the decoders themselves (:mod:`agentflow.labels`), not by who comes first.
             "labels": [{"name": name} for name in sorted(row.labels)]}
 
 

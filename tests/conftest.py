@@ -41,6 +41,11 @@ def _is_gh(cmd) -> bool:
     return bool(head) and os.path.basename(head[0]) == "gh"
 
 
+class _RealGhProcess(BaseException):
+    """A test let a real `gh` run. Not an ``Exception``, so the pipeline's bare
+    ``except Exception`` handlers cannot swallow it into a log line."""
+
+
 @pytest.fixture(autouse=True)
 def _no_real_gh(request, monkeypatch):
     """Fail any test that lets a real `gh` process execute.
@@ -63,7 +68,11 @@ def _no_real_gh(request, monkeypatch):
     def guarded(cmd, *args, **kwargs):
         if _is_gh(cmd):
             argv = " ".join(os.fsdecode(a) for a in cmd) if not isinstance(cmd, str) else cmd
-            raise AssertionError(
+            # Deliberately not an ``AssertionError``: several pipeline paths wrap their work in a
+            # bare ``except Exception`` and log it (``dispatch._run_and_log`` and friends), which
+            # would turn this into a log line and let the test pass green — the exact silence the
+            # guard exists to end. Only a BaseException gets past them.
+            raise _RealGhProcess(
                 f"{request.node.nodeid} let a real `gh` process run: {argv}\n"
                 "Some GitHub seam the code under test is unstubbed — stub the typed "
                 "agentflow.github method it actually calls, not the generic github.api escape "
