@@ -382,16 +382,14 @@ def _is_awaiting_entry(line: str, number: int) -> bool:
     return match is not None and int(match.group("number")) == number
 
 
-def awaiting_disposition_present(
-    map_body: str, number: int, expected: str | None = None,
-) -> bool:
+def awaiting_disposition_present(map_body: str, number: int, expected: str) -> bool:
+    """Whether the map carries exactly this ticket's one expected pending entry — a stale or
+    duplicate pending line for the same ticket means *not* present, so the finalizer reconciles
+    it rather than leaving the map with two answers for one child."""
     section = _awaiting_section(map_body)
     if section is None:
         return False
-    entries = [line for line in section[2] if _is_awaiting_entry(line, number)]
-    if expected is not None:
-        return entries == [expected]
-    return bool(entries)
+    return [line for line in section[2] if _is_awaiting_entry(line, number)] == [expected]
 
 
 def with_awaiting_disposition(map_body: str, line: str, number: int) -> str:
