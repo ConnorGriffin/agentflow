@@ -62,6 +62,7 @@ TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns 
 DRAWING = "agentflow:drawing-mockup"   # dispatch claim — a session is drawing this issue's variants
 RESEARCH_TICKET = "wayfinder:research"   # the one AFK-able planning ticket type the daemon may run
 RESOLVING = "wayfinder:resolving"        # shared claim — a session (human or daemon) owns this ticket
+AWAITING_DISPOSITION = "wayfinder:awaiting-disposition"  # completed research needs operator judgment
 
 HELD_LABELS = {"agentflow:needs-grilling", "agentflow:needs-mockup"}
 

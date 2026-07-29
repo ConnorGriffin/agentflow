@@ -7,33 +7,35 @@ is the daemon-side glue, mirroring :mod:`agentflow.coordinated_converse`:
 
 - **submission mapping** — one eligible ticket → one ``research`` :class:`Submission` with identity
   ``(repository, ticket number, research)``, so re-discovery of the same ticket is idempotent.
-- **stage collaborators** — the findings-artifact ``verify``, the isolated-worktree ``prepare``, the
-  single-writer ``resolve`` (post findings, close the ticket, append one map breadcrumb, release the
-  shared claim), and the exhaustion ``release`` (drop the claim so the ticket is eligible again).
+- **stage collaborators** — the disposition-aware findings ``verify``, isolated-worktree ``prepare``,
+  single-writer ``resolve`` (close an explicit decision or park a handoff for operator judgment),
+  and exhaustion ``release`` (drop the claim so an incomplete ticket is eligible again).
   These are the production wiring the daemon injects into :class:`ResearchStageAdapter`.
 
 The dispatched session writes only into its isolated worktree — a findings artifact. It never writes
-the ticket, the map, GitHub, or coordinator state; only the daemon-side finalizer resolves the ticket
-(ADR 0037). Resolution is idempotent on the closed-ticket state: a crash-replay never posts a second
-findings comment or appends a second map line.
+the ticket, the map, GitHub, or coordinator state; only the daemon-side finalizer records the result
+(ADR 0037). Finalization is idempotent across both closed and intentionally pending outcomes: a
+crash-replay never posts a second findings comment or appends a second map line.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from agentflow import github
 from agentflow.coordinator import Submission
-from agentflow.labels import RESOLVING, release as release_claim
+from agentflow.labels import AWAITING_DISPOSITION, RESOLVING, release as release_claim
 from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 # The findings comment marker (per-ticket, stable across attempts and restarts) and the visible
 # disclaimer that fronts it, so a replay recognizes its own prior comment and never posts a second.
-_RESEARCH_DISCLAIMER = "> *agentflow research — resolved by an unattended session (AI).*"
+_RESEARCH_DISCLAIMER = "> *agentflow research — completed by an unattended session (AI).*"
 
 
 def _findings_marker(number: int) -> str:
@@ -52,7 +54,8 @@ and history as needed.
 
 Do NOT open a pull request, push a branch, edit any GitHub issue or label, edit the decision map,
 or change any durable project state — this is research, not a build. The daemon records your outcome
-for you: it posts your findings as a comment, closes the ticket, and leaves one line on the map.
+for you. It closes a ticket only for a durable no-build ruling or concrete defer; a handoff result
+stays open for an operator to disposition.
 
 The ticket:
 ---
@@ -64,10 +67,23 @@ creating parent directories as needed:
     {findings_path}
 
 Writing that file is the sole durable outcome of this run. Keep it self-contained: state what you
-investigated, what you found, and the concrete decision or recommendation it supports, in plain
-prose the map's owner can read without re-deriving it. It becomes the ticket comment verbatim, so
-write it as the answer, not as a note to yourself. If you exit without writing it, the run is
-incomplete and will run again — never write it twice.
+investigated and what you found in plain prose the map's owner can read without re-deriving it. End
+with exactly one top-level ``## Disposition`` section containing only one fenced ``json`` object in
+one of these exact shapes:
+
+    {{"disposition":"no_build","summary":"Why no implementation should be filed."}}
+    {{"disposition":"deferred","summary":"What is deferred and why.",
+     "trigger":"The named observable event that reopens the decision.",
+     "verification":"How the operator will verify that the event occurred."}}
+    {{"disposition":"handoff_required","summary":"Why operator disposition is required.",
+     "candidates":[{{"title":"One independently shippable build",
+                    "build":"The concrete behavior that build would deliver."}}]}}
+
+For ``handoff_required``, list every independently shippable candidate separately; never combine
+several builds into an umbrella candidate. For ``deferred``, name an observable trigger and a
+distinct verification condition — “maybe later”, “when ready”, and similar placeholders are
+invalid. The file becomes the ticket comment verbatim. Missing, malformed, multiple, or vague
+dispositions are incomplete and continue within this run's recovery budget.
 """ + SHELL_CRIB
 
 
@@ -91,6 +107,99 @@ def read_findings(record) -> str | None:
     except OSError:
         return None
     return text or None
+
+
+@dataclass(frozen=True)
+class ResearchDisposition:
+    """The one machine-checkable ruling carried by a completed findings artifact."""
+
+    kind: str
+    summary: str
+    trigger: str | None = None
+    verification: str | None = None
+    candidates: tuple[tuple[str, str], ...] = ()
+
+
+_DISPOSITION_HEADING = re.compile(r"^##\s+Disposition\s*$", re.IGNORECASE | re.MULTILINE)
+_DISPOSITION_JSON = re.compile(r"^```json\s*\n(?P<body>.+)\n```\s*$",
+                               re.IGNORECASE | re.DOTALL)
+_VAGUE = re.compile(
+    r"^(?:maybe(?:\s+later)?|later|someday|tbd|unknown|when\s+(?:ready|needed|appropriate))"
+    r"[.!]?$",
+    re.IGNORECASE,
+)
+_NON_OBSERVABLE_CONDITION = re.compile(
+    r"\b(?:maybe|later|someday|tbd|unknown|somehow|when\s+(?:ready|needed|appropriate)|"
+    r"if\s+needed|priorities?\s+allow|time\s+permits|team\s+(?:decides|wants|feels)|"
+    r"ask\s+the\s+team)\b",
+    re.IGNORECASE,
+)
+
+
+def _specific_text(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if len(text) < 12 or _VAGUE.fullmatch(text):
+        return None
+    return text
+
+
+def _observable_condition(value) -> str | None:
+    text = _specific_text(value)
+    if text is None or _NON_OBSERVABLE_CONDITION.search(text):
+        return None
+    return text
+
+
+def parse_disposition(findings: str) -> ResearchDisposition | None:
+    """Parse the artifact's single final structured disposition, failing closed on any drift."""
+    headings = list(_DISPOSITION_HEADING.finditer(findings or ""))
+    if len(headings) != 1:
+        return None
+    fenced = _DISPOSITION_JSON.fullmatch(findings[headings[0].end():].strip())
+    if fenced is None:
+        return None
+    try:
+        payload = json.loads(fenced.group("body"))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    kind = payload.get("disposition")
+    summary = _specific_text(payload.get("summary"))
+    if summary is None:
+        return None
+    if kind == "no_build":
+        if set(payload) != {"disposition", "summary"}:
+            return None
+        return ResearchDisposition(kind=kind, summary=summary)
+    if kind == "deferred":
+        if set(payload) != {"disposition", "summary", "trigger", "verification"}:
+            return None
+        trigger = _observable_condition(payload.get("trigger"))
+        verification = _observable_condition(payload.get("verification"))
+        if trigger is None or verification is None or trigger.casefold() == verification.casefold():
+            return None
+        return ResearchDisposition(kind=kind, summary=summary, trigger=trigger,
+                                   verification=verification)
+    if kind != "handoff_required" or set(payload) != {
+        "disposition", "summary", "candidates",
+    }:
+        return None
+    raw_candidates = payload.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        return None
+    candidates = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, dict) or set(candidate) != {"title", "build"}:
+            return None
+        title = _specific_text(candidate.get("title"))
+        build = _specific_text(candidate.get("build"))
+        if title is None or build is None:
+            return None
+        candidates.append((title, build))
+    return ResearchDisposition(kind=kind, summary=summary, candidates=tuple(candidates))
 
 
 # --- submission mapping (pure over the ticket + supplied map context) --------------------
@@ -118,7 +227,8 @@ def _findings_ready(record, obs) -> bool:
     """The Research outcome is a durable findings artifact for this ticket (ADR 0037 outcome-first),
     independent of provider exit: a bad exit that recorded findings completes; a clean exit that
     recorded nothing does not, and the run continues within budget."""
-    return read_findings(record) is not None
+    findings = read_findings(record)
+    return findings is not None and parse_disposition(findings) is not None
 
 
 def _research_worktree_ready(record) -> bool:
@@ -147,23 +257,22 @@ def _research_worktree_ready(record) -> bool:
 # --- parent map + 'Decisions so far' breadcrumb (pure helpers + one GitHub read) ---------
 
 _DECISIONS_HEADING = re.compile(r"^#{1,6}\s+Decisions so far\s*$", re.IGNORECASE)
+_AWAITING_HEADING = re.compile(r"^#{1,6}\s+Awaiting disposition\s*$", re.IGNORECASE)
 _ANY_HEADING = re.compile(r"^#{1,6}\s+")
 
 
-def decision_line(title: str, number: int) -> str:
-    """One titled breadcrumb line for the map's 'Decisions so far' — the ticket's own title and a
-    back-reference to the resolved ticket (GitHub auto-links ``#N`` in an issue body). The `#N`
-    reference is the idempotency key, so a human can later curate the prose without risking a
-    duplicate append."""
+def decision_line(title: str, number: int, disposition: ResearchDisposition) -> str:
+    """One titled, explicit no-build or deferred ruling for the settled map ledger."""
     clean = " ".join((title or "").split()) or f"research ticket #{number}"
-    return f"- **{clean}** — resolved by unattended research (#{number})."
+    if disposition.kind == "no_build":
+        return f"- **{clean}** — no build: {disposition.summary} (#{number})."
+    return (f"- **{clean}** — deferred: {disposition.summary} Trigger: {disposition.trigger} "
+            f"Verification: {disposition.verification} (#{number}).")
 
 
-def _decisions_section(map_body: str) -> tuple[int, int, list[str]] | None:
-    """The ('Decisions so far' heading index, section-end index, section lines) of a map body, or
-    ``None`` when the section is absent. Section-end is the next heading or end of body."""
+def _map_section(map_body: str, heading: re.Pattern) -> tuple[int, int, list[str]] | None:
     lines = (map_body or "").splitlines()
-    idx = next((i for i, ln in enumerate(lines) if _DECISIONS_HEADING.match(ln)), None)
+    idx = next((i for i, ln in enumerate(lines) if heading.match(ln)), None)
     if idx is None:
         return None
     end = len(lines)
@@ -174,31 +283,66 @@ def _decisions_section(map_body: str) -> tuple[int, int, list[str]] | None:
     return idx, end, lines[idx + 1:end]
 
 
-def decision_present(map_body: str, number: int) -> bool:
+def _decisions_section(map_body: str) -> tuple[int, int, list[str]] | None:
+    """The map's 'Decisions so far' section, if present."""
+    return _map_section(map_body, _DECISIONS_HEADING)
+
+
+def _awaiting_section(map_body: str) -> tuple[int, int, list[str]] | None:
+    """The map's 'Awaiting disposition' section, if present."""
+    return _map_section(map_body, _AWAITING_HEADING)
+
+
+def decision_present(map_body: str, number: int, expected: str | None = None) -> bool:
     """Whether the map's 'Decisions so far' already contains this ticket's own breadcrumb entry —
     the exact shape decision_line() writes — not any incidental #N cross-reference elsewhere in
     the section. The idempotency guard that keeps a crash-replay from appending a second line."""
     section = _decisions_section(map_body)
     if section is None:
         return False
-    return any(re.search(rf"resolved by unattended research \(#{number}\)\.", ln)
-               for ln in section[2])
+    if expected is not None:
+        return expected in section[2]
+    return any(
+        re.search(rf"— (?:no build:|deferred:).+\(#{number}\)\.$", ln)
+        for ln in section[2]
+    )
 
 
-def with_decision(map_body: str, line: str) -> str:
-    """Append ``line`` under the map's 'Decisions so far' — after the last existing entry, before any
-    following heading. Creates the section at the end of the body when it is absent. Pure."""
+def _with_map_entry(map_body: str, heading: str, section, line: str) -> str:
     body = map_body or ""
     lines = body.splitlines()
-    section = _decisions_section(body)
     if section is None:
         prefix = [*lines, ""] if lines else []
-        return "\n".join([*prefix, "## Decisions so far", "", line]) + "\n"
+        return "\n".join([*prefix, f"## {heading}", "", line]) + "\n"
     idx, end, _ = section
     insert_at = end
     while insert_at > idx + 1 and not lines[insert_at - 1].strip():
         insert_at -= 1  # keep the new entry inside the section, above trailing blank lines
     return "\n".join([*lines[:insert_at], line, *lines[insert_at:]]) + "\n"
+
+
+def with_decision(map_body: str, line: str) -> str:
+    """Append ``line`` under the map's 'Decisions so far' idempotency section. Pure."""
+    return _with_map_entry(map_body, "Decisions so far", _decisions_section(map_body), line)
+
+
+def awaiting_disposition_line(title: str, number: int) -> str:
+    clean = " ".join((title or "").split()) or f"research ticket #{number}"
+    return f"- **{clean}** — awaiting operator disposition (#{number})."
+
+
+def awaiting_disposition_present(map_body: str, number: int) -> bool:
+    section = _awaiting_section(map_body)
+    if section is None:
+        return False
+    return any(re.search(rf"awaiting operator disposition \(#{number}\)\.", line)
+               for line in section[2])
+
+
+def with_awaiting_disposition(map_body: str, line: str) -> str:
+    """Append one pending research entry outside the settled decisions ledger. Pure."""
+    return _with_map_entry(
+        map_body, "Awaiting disposition", _awaiting_section(map_body), line)
 
 
 def _parent_map(repo: str, number: int) -> tuple[int, str] | None:
@@ -236,7 +380,8 @@ def research_map_context(repo: str, number: int, *, limit: int = 4000) -> str:
     return body[:limit] if body else ""
 
 
-def _append_map_decision(repo: str, number: int, title: str) -> bool:
+def _append_map_decision(repo: str, number: int, title: str,
+                         disposition: ResearchDisposition) -> bool:
     """Append this ticket's one titled line to the parent map's 'Decisions so far' idempotently.
     Returns whether the breadcrumb is durably present. A missing/unreadable parent map fails closed
     (retry), so resolution never retires without the breadcrumb the map's owner reconciles from."""
@@ -244,28 +389,71 @@ def _append_map_decision(repo: str, number: int, title: str) -> bool:
     if found is None:
         return False
     map_number, map_body = found
+    line = decision_line(title, number, disposition)
     if decision_present(map_body, number):
-        return True  # already recorded — idempotent
-    new_body = with_decision(map_body, decision_line(title, number))
+        return decision_present(map_body, number, line)
+    new_body = with_decision(map_body, line)
     if not github.edit_body(repo, map_number, new_body):
         return False
     reread = _parent_map(repo, number)
-    return reread is not None and decision_present(reread[1], number)
+    return reread is not None and decision_present(reread[1], number, line)
+
+
+def _append_map_awaiting(repo: str, number: int, title: str) -> bool:
+    """Record one visibly pending entry without making the map claim a settled decision."""
+    found = _parent_map(repo, number)
+    if found is None:
+        return False
+    map_number, map_body = found
+    if awaiting_disposition_present(map_body, number):
+        return True
+    new_body = with_awaiting_disposition(
+        map_body, awaiting_disposition_line(title, number))
+    if not github.edit_body(repo, map_number, new_body):
+        return False
+    reread = _parent_map(repo, number)
+    return reread is not None and awaiting_disposition_present(reread[1], number)
+
+
+def _cleanup_worktree(record) -> None:
+    ref = WorktreeRef.parse(record.source)
+    if ref is not None:
+        wt = Path(ref.path)
+        if wt.exists():
+            _run(["git", "-C", ref.workdir, "worktree", "remove", "--force", str(wt)])
+
+
+def _findings_comment_present(comments, marker: str, findings: str) -> bool:
+    return any(marker in comment.body and findings in comment.body for comment in comments)
+
+
+def _await_disposition(repo: str, number: int) -> bool:
+    """Durably mark completed research as waiting for operator judgment."""
+    if not github.create_label(
+        repo, AWAITING_DISPOSITION, "d4c5f9",
+        "Completed research awaiting operator disposition",
+    ):
+        return False
+    labels = github.issue_labels(repo, number)
+    if labels is None:
+        return False
+    if AWAITING_DISPOSITION not in labels:
+        if not github.add_label(repo, number, AWAITING_DISPOSITION):
+            return False
+    proved = github.issue_labels(repo, number)
+    return proved is not None and AWAITING_DISPOSITION in proved
 
 
 # --- resolution (the single daemon-side writer, ADR 0037) -------------------------------
 
 def resolve(record) -> str | None:
-    """Resolve the ticket in the stage finalizer — the *only* writer of the outcome (ADR 0037): post
-    the findings comment, append the map breadcrumb, close the ticket, and release the shared claim.
-    Every step is idempotent and ordered so a crash-replay never double-writes: the per-ticket comment
-    marker gates the comment, the `#N` reference gates the map line, and a closed ticket / removed
-    label are no-ops. Returns a durable proof (the ticket URL) once the ticket is closed with its
-    findings comment, or ``None`` to retry next cycle rather than retiring over an incomplete
-    resolution.
+    """Record one disposition as the stage's only GitHub writer (ADR 0037).
 
-    On durable resolution the run's isolated worktree is removed so resolved runs do not accumulate
-    on disk. Cleanup is best-effort and never blocks returning the proof."""
+    Explicit no-build and deferred rulings close; handoff-required findings become an open pending
+    ticket whose map entry, state label, released claim, and findings comment are all re-proved.
+    Every write is idempotent. ``None`` withholds retirement until the durable route converges.
+    Finished-run worktree cleanup is best-effort and never blocks proof.
+    """
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
@@ -273,17 +461,41 @@ def resolve(record) -> str | None:
     findings = read_findings(record)
     if findings is None:
         return None  # verify proved findings exist; if the artifact is gone, retry rather than retire
+    disposition = parse_disposition(findings)
+    if disposition is None:
+        return None
     repo = record.repo
     # One whole-issue snapshot carries the idempotency facts together; an unreadable read retries.
     issue = github.issue_view(repo, number)
     if issue is None:
         return None
     marker = _findings_marker(number)
-    if not any(marker in c.body for c in issue.comments):
+    marker_present = any(marker in comment.body for comment in issue.comments)
+    if not marker_present:
         body = f"{_RESEARCH_DISCLAIMER}\n{marker}\n\n{findings}"
         if not github.comment(repo, number, body):
             return None
-    if not _append_map_decision(repo, number, issue.title):
+    elif not _findings_comment_present(issue.comments, marker, findings):
+        return None
+    if disposition.kind == "handoff_required":
+        if not _append_map_awaiting(repo, number, issue.title):
+            return None
+        if not _await_disposition(repo, number):
+            return None
+        if not release_claim(repo, number, RESOLVING):
+            return None
+        final = github.issue_view(repo, number)
+        if final is None:
+            return None
+        has_comment = _findings_comment_present(final.comments, marker, findings)
+        found = _parent_map(repo, number)
+        has_pending = found is not None and awaiting_disposition_present(found[1], number)
+        if (final.state != "OPEN" or not has_comment or not has_pending
+                or AWAITING_DISPOSITION not in final.labels or RESOLVING in final.labels):
+            return None
+        _cleanup_worktree(record)
+        return final.url or f"https://github.com/{repo}/issues/{number}"
+    if not _append_map_decision(repo, number, issue.title, disposition):
         return None
     if issue.state != "CLOSED":
         if not github.close(repo, number):
@@ -293,15 +505,11 @@ def resolve(record) -> str | None:
     final = github.issue_view(repo, number)
     if final is None:
         return None
-    has_comment = any(marker in c.body for c in final.comments)
+    has_comment = _findings_comment_present(final.comments, marker, findings)
     if final.state != "CLOSED" or not has_comment:
         return None
     # Resolution is durable — remove the isolated worktree so resolved runs don't accumulate.
-    ref = WorktreeRef.parse(record.source)
-    if ref is not None:
-        wt = Path(ref.path)
-        if wt.exists():
-            _run(["git", "-C", ref.workdir, "worktree", "remove", "--force", str(wt)])
+    _cleanup_worktree(record)
     return final.url or f"https://github.com/{repo}/issues/{number}"
 
 

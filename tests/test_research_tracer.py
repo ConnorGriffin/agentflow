@@ -19,6 +19,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from conftest import FakeSession, permits, record_of
 
 from agentflow import coordinated_research, dispatch, loop, pipeline
@@ -43,13 +45,23 @@ class FakeGitHub:
 
     def __init__(self, *, state="OPEN", title="Audit the widget path",
                  labels=("wayfinder:research", "wayfinder:resolving"),
-                 map_number=4, map_body="# Map\n\n## Decisions so far\n\n- earlier (#3).\n"):
+                 map_number=4, map_body="# Map\n\n## Decisions so far\n\n- earlier (#3).\n",
+                 fail_once_at=None):
         self.state = state
         self.title = title
         self.labels = list(labels)
         self.map_number = map_number
         self.map_body = map_body
         self.comments: list[dict] = []
+        self.fail_once_at = fail_once_at
+        self.failed = False
+        self.mutations: list[str] = []
+
+    def _response(self, boundary):
+        if self.fail_once_at == boundary and not self.failed:
+            self.failed = True
+            return False
+        return True
 
     # --- GitHub module seam (ADR 0040) ------------------------------------------------
     def api(self, args, *, parse_json=False):
@@ -73,20 +85,38 @@ class FakeGitHub:
 
     def comment(self, repo, number, body):
         self.comments.append({"body": body})
-        return True
+        self.mutations.append("comment")
+        return self._response("comment")
 
     def close(self, repo, number):
-        self.state = "CLOSED"
-        return True
+        if self.state != "CLOSED":
+            self.state = "CLOSED"
+            self.mutations.append("close")
+        return self._response("close")
 
     def edit_body(self, repo, number, body):       # the parent map's breadcrumb edit
-        self.map_body = body
-        return True
+        if self.map_body != body:
+            self.map_body = body
+            self.mutations.append("map")
+        return self._response("map")
+
+    def add_label(self, repo, number, label):
+        if label not in self.labels:
+            self.labels.append(label)
+            self.mutations.append("label")
+        return self._response("label")
+
+    def create_label(self, repo, label, color, description=""):
+        return self._response("label")
+
+    def issue_labels(self, repo, number):
+        return frozenset(self.labels)
 
     def release(self, repo, number, _label):       # stands in for coordinated_research.release_claim
         if "wayfinder:resolving" in self.labels:
             self.labels.remove("wayfinder:resolving")
-        return True
+            self.mutations.append("release")
+        return self._response("release")
 
     def run(self, argv):                           # coordinated_research._run: only the git worktree cleanup remains
         assert argv and argv[0] == "git", f"unexpected non-git coordinated_research._run call: {argv}"
@@ -102,6 +132,9 @@ class FakeGitHub:
         monkeypatch.setattr(github, "edit_body", self.edit_body)
         monkeypatch.setattr(coordinated_research, "release_claim", self.release)
         monkeypatch.setattr(coordinated_research, "_run", self.run)
+        monkeypatch.setattr(github, "create_label", self.create_label)
+        monkeypatch.setattr(github, "add_label", self.add_label)
+        monkeypatch.setattr(github, "issue_labels", self.issue_labels)
 
 
 def _adapter(fake):
@@ -128,6 +161,14 @@ def _write_findings(record, text):
     path.write_text(text)
 
 
+def _artifact(kind, summary, **details):
+    payload = {"disposition": kind, "summary": summary, **details}
+    return (
+        f"## Findings\n\nInvestigated the widget path.\n\n"
+        f"## Disposition\n\n```json\n{json.dumps(payload)}\n```\n"
+    )
+
+
 # --- selection: only AFK-able research tickets, wall stays up ---------------------------
 
 def test_research_eligible_refuses_every_non_research_type_and_a_claimed_ticket():
@@ -141,6 +182,9 @@ def test_research_eligible_refuses_every_non_research_type_and_a_claimed_ticket(
             {"labels": [{"name": "wayfinder:research"}, {"name": other}]})
     assert not loop._research_eligible(
         {"labels": [{"name": "wayfinder:research"}, {"name": "wayfinder:resolving"}]})
+    assert not loop._research_eligible(
+        {"labels": [{"name": "wayfinder:research"},
+                    {"name": "wayfinder:awaiting-disposition"}]})
 
 
 def test_the_intake_wall_still_excludes_every_wayfinder_ticket():
@@ -204,6 +248,217 @@ def test_next_research_ticket_fails_closed_on_an_unreadable_blocker_graph(monkey
 
 # --- resolution: the finalizer is the single writer, and it is idempotent ---------------
 
+@pytest.mark.parametrize("artifact", [
+    "Findings without a disposition.",
+    (
+        "## Disposition\n\n```json\n"
+        '{"disposition":"no_build","summary":"No implementation is warranted for this path."}'
+        "\n```\n\n## Disposition\n\n```json\n"
+        '{"disposition":"no_build","summary":"A second ruling must make the artifact invalid."}'
+        "\n```\n"
+    ),
+    "## Disposition\n\n```json\n{not valid json}\n```\n",
+    _artifact(
+        "deferred",
+        "The widget route may become useful after upstream work.",
+        trigger="maybe later",
+        verification="Check whether the upstream route exists in the published schema.",
+    ),
+    _artifact(
+        "deferred",
+        "The widget route may become useful after upstream work.",
+        trigger="When the team decides it is time.",
+        verification="Check whether the upstream route exists in the published schema.",
+    ),
+    _artifact(
+        "deferred",
+        "The widget route may become useful after upstream work.",
+        trigger="The upstream schema publishes the shared widget route.",
+        verification="Ask the team what they think about it later.",
+    ),
+])
+def test_an_invalid_disposition_stays_within_the_research_recovery_budget(
+        artifact, make_coord, coord_state, tmp_path, monkeypatch):
+    gh = FakeGitHub()
+    gh.install(monkeypatch)
+    fake = FakeSession()
+    coord = _coord(make_coord, fake)
+    cfg = RepoConfig(REPO, str(tmp_path / "wd"))
+    ident = coord.submit_stage(coordinated_research.research_submission(cfg, _ticket(), "claude"))
+    coord.cycle("claude")
+    record = record_of(coord, ident)
+    original_map = gh.map_body
+    _write_findings(record, artifact)
+
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert coord.cycle("claude") == []
+
+    current = record_of(coord, ident)
+    assert current.retired is False
+    assert current.state != "completed"
+    assert gh.state == "OPEN"
+    assert gh.comments == []
+    assert gh.map_body == original_map
+
+
+def test_no_build_fails_closed_when_its_existing_comment_does_not_carry_the_ruling(
+        tmp_path, monkeypatch):
+    gh = FakeGitHub()
+    gh.comments.append({
+        "body": coordinated_research._findings_marker(5) + "\n\nOlder findings without the ruling.",
+    })
+    gh.install(monkeypatch)
+    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    _write_findings(record, _artifact(
+        "no_build",
+        "The existing router already covers the widget path, so no implementation is warranted.",
+    ))
+
+    assert coordinated_research.resolve(record) is None
+    assert gh.state == "OPEN"
+    assert not coordinated_research.decision_present(gh.map_body, 5)
+
+
+def test_no_build_fails_closed_when_the_map_contains_a_different_ruling(
+        tmp_path, monkeypatch):
+    gh = FakeGitHub(map_body=(
+        "# Map\n\n## Decisions so far\n\n"
+        "- **Audit the widget path** — no build: An older, different ruling. (#5).\n"
+    ))
+    gh.install(monkeypatch)
+    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    _write_findings(record, _artifact(
+        "no_build",
+        "The existing router already covers the widget path, so no implementation is warranted.",
+    ))
+
+    assert coordinated_research.resolve(record) is None
+    assert gh.state == "OPEN"
+    assert gh.map_body.count("(#5)") == 1
+    assert "wayfinder:resolving" in gh.labels
+
+
+def test_a_handoff_result_retires_the_run_but_parks_the_ticket_open(make_coord, coord_state,
+                                                                    tmp_path, monkeypatch):
+    gh = FakeGitHub()
+    gh.install(monkeypatch)
+    fake = FakeSession()
+    coord = _coord(make_coord, fake)
+    cfg = RepoConfig(REPO, str(tmp_path / "wd"))
+    ident = coord.submit_stage(coordinated_research.research_submission(cfg, _ticket(), "claude"))
+    coord.cycle("claude")
+    record = record_of(coord, ident)
+    _write_findings(record, _artifact(
+        "handoff_required",
+        "The widget path exposes one independently shippable build.",
+        candidates=[{
+            "title": "Route widgets through the shared router",
+            "build": "Replace the widget-only dispatch path with the shared router.",
+        }, {
+            "title": "Remove the retired widget dispatcher",
+            "build": "Delete the independently removable widget-only dispatch path.",
+        }],
+    ))
+
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+    coord.cycle("claude")
+
+    assert record_of(coord, ident).retired is True
+    assert gh.state == "OPEN"
+    assert "wayfinder:awaiting-disposition" in gh.labels
+    assert "wayfinder:resolving" not in gh.labels
+    assert "## Awaiting disposition" in gh.map_body
+    assert "Audit the widget path" in gh.map_body
+    assert gh.map_body.count("(#5)") == 1
+    assert not coordinated_research.decision_present(gh.map_body, 5)
+    assert "Remove the retired widget dispatcher" in gh.comments[0]["body"]
+
+
+def test_a_concrete_defer_closes_with_its_trigger_and_verification_on_the_map(
+        make_coord, coord_state, tmp_path, monkeypatch):
+    gh = FakeGitHub()
+    gh.install(monkeypatch)
+    fake = FakeSession()
+    coord = _coord(make_coord, fake)
+    cfg = RepoConfig(REPO, str(tmp_path / "wd"))
+    ident = coord.submit_stage(coordinated_research.research_submission(cfg, _ticket(), "claude"))
+    coord.cycle("claude")
+    record = record_of(coord, ident)
+    _write_findings(record, _artifact(
+        "deferred",
+        "The widget route depends on an upstream schema capability that does not exist yet.",
+        trigger="The published upstream schema adds a versioned widget route.",
+        verification="Confirm the route in the upstream schema and its generated client.",
+    ))
+
+    fake.end(ident, cause=ProviderCause.PROCESS)
+    assert [o.status for o in coord.cycle("claude")] == ["completed"]
+    coord.cycle("claude")
+
+    assert record_of(coord, ident).retired is True
+    assert gh.state == "CLOSED"
+    assert "deferred: The widget route depends on an upstream schema capability" in gh.map_body
+    assert "Trigger: The published upstream schema adds a versioned widget route." in gh.map_body
+    assert "Verification: Confirm the route in the upstream schema" in gh.map_body
+    assert "resolved by unattended research" not in gh.map_body
+
+
+def test_ciq_autotune_469_through_472_keep_build_findings_open_and_close_the_evidence_gate(
+        tmp_path, monkeypatch):
+    fixtures = [
+        (469, _artifact(
+            "handoff_required",
+            "The audit exposes one independently shippable cache build.",
+            candidates=[{"title": "Index the cache result",
+                         "build": "Persist the cache result in the ordinary result index."}],
+        )),
+        (470, _artifact(
+            "handoff_required",
+            "The audit exposes one independently shippable matching build.",
+            candidates=[{"title": "Match the initial pump result",
+                         "build": "Make initial pump matching use the settled ranking rule."}],
+        )),
+        (471, _artifact(
+            "deferred",
+            "No current build is justified until the direction-only evidence gate opens.",
+            trigger="A completed trial records direction-only evidence for the affected profile.",
+            verification="Confirm the evidence in the durable trial result and profile history.",
+        )),
+        (472, _artifact(
+            "handoff_required",
+            "The audit exposes two independently shippable builds.",
+            candidates=[
+                {"title": "Surface the first independent recommendation",
+                 "build": "Deliver the first recommendation without depending on the second."},
+                {"title": "Surface the second independent recommendation",
+                 "build": "Deliver the second recommendation without depending on the first."},
+            ],
+        )),
+    ]
+    states = []
+    maps = []
+
+    for number, artifact in fixtures:
+        gh = FakeGitHub(title=f"ciq-autotune research {number}")
+        gh.install(monkeypatch)
+        record = SimpleNamespace(
+            repo=REPO, subject=str(number), source=str(tmp_path / f"wt-{number}"))
+        _write_findings(record, artifact)
+
+        assert coordinated_research.resolve(record) is not None
+        states.append(gh.state)
+        maps.append(gh.map_body)
+        if number == 472:
+            assert "first independent recommendation" in gh.comments[0]["body"]
+            assert "second independent recommendation" in gh.comments[0]["body"]
+
+    assert states == ["OPEN", "OPEN", "CLOSED", "OPEN"]
+    assert all("## Awaiting disposition" in maps[index] for index in (0, 1, 3))
+    assert "deferred: No current build is justified" in maps[2]
+    assert all("resolved by unattended research" not in body for body in maps)
+
+
 def test_a_dispatched_ticket_ends_closed_with_findings_and_one_map_line(make_coord, coord_state,
                                                                         tmp_path, monkeypatch):
     gh = FakeGitHub()
@@ -216,7 +471,10 @@ def test_a_dispatched_ticket_ends_closed_with_findings_and_one_map_line(make_coo
     record = record_of(coord, ident)
     assert permits(coord, "claude") == 2                               # research (deep) reserves two
 
-    _write_findings(record, "Investigated the widget path; decision: fold it into the router.")
+    _write_findings(record, _artifact(
+        "no_build",
+        "The existing router already covers the widget path, so no implementation is warranted.",
+    ))
     fake.end(ident, cause=ProviderCause.PROCESS)
     assert [o.status for o in coord.cycle("claude")] == ["completed"]
     coord.cycle("claude")                                              # settle → finalize resolves
@@ -225,10 +483,12 @@ def test_a_dispatched_ticket_ends_closed_with_findings_and_one_map_line(make_coo
     assert gh.state == "CLOSED"
     findings = [c for c in gh.comments if "agentflow-research-findings" in c["body"]]
     assert len(findings) == 1
-    assert "fold it into the router" in findings[0]["body"]
+    assert "no implementation is warranted" in findings[0]["body"]
     assert "wayfinder:resolving" not in gh.labels                      # shared claim released
     assert coordinated_research.decision_present(gh.map_body, 5)       # one titled breadcrumb
     assert gh.map_body.count("(#5)") == 1
+    assert "no build: The existing router already covers the widget path" in gh.map_body
+    assert "resolved by unattended research" not in gh.map_body
 
     # A restart re-observes the retired record and never resolves a second time.
     _coord(make_coord, fake).cycle("claude")
@@ -242,7 +502,10 @@ def test_resolution_replays_without_a_duplicate_comment_or_map_line(tmp_path, mo
     gh = FakeGitHub()
     gh.install(monkeypatch)
     record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
-    _write_findings(record, "the finding and its decision")
+    _write_findings(record, _artifact(
+        "no_build",
+        "The existing router already covers the widget path, so no implementation is warranted.",
+    ))
 
     assert coordinated_research.resolve(record) is not None
     assert coordinated_research.resolve(record) is not None            # replay
@@ -251,6 +514,54 @@ def test_resolution_replays_without_a_duplicate_comment_or_map_line(tmp_path, mo
     assert gh.state == "CLOSED"
     assert len([c for c in gh.comments if "research-findings" in c["body"]]) == 1
     assert gh.map_body.count("(#5)") == 1
+    assert "wayfinder:resolving" not in gh.labels
+
+
+@pytest.mark.parametrize("boundary", ["comment", "map", "close", "release"])
+def test_no_build_replay_converges_after_each_durable_write(boundary, tmp_path, monkeypatch):
+    gh = FakeGitHub(fail_once_at=boundary)
+    gh.install(monkeypatch)
+    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    _write_findings(record, _artifact(
+        "no_build",
+        "The existing router already covers the widget path, so no implementation is warranted.",
+    ))
+
+    assert coordinated_research.resolve(record) is None
+    assert coordinated_research.resolve(record) is not None
+
+    assert gh.state == "CLOSED"
+    assert gh.mutations.count("comment") == 1
+    assert gh.mutations.count("map") == 1
+    assert gh.mutations.count("close") == 1
+    assert gh.mutations.count("release") == 1
+    assert gh.map_body.count("(#5)") == 1
+
+
+@pytest.mark.parametrize("boundary", ["comment", "map", "label", "release"])
+def test_pending_replay_converges_after_each_durable_write(boundary, tmp_path, monkeypatch):
+    gh = FakeGitHub(fail_once_at=boundary)
+    gh.install(monkeypatch)
+    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    _write_findings(record, _artifact(
+        "handoff_required",
+        "The widget path exposes one independently shippable build.",
+        candidates=[{
+            "title": "Route widgets through the shared router",
+            "build": "Replace the widget-only dispatch path with the shared router.",
+        }],
+    ))
+
+    assert coordinated_research.resolve(record) is None
+    assert coordinated_research.resolve(record) is not None
+
+    assert gh.state == "OPEN"
+    assert gh.mutations.count("comment") == 1
+    assert gh.mutations.count("map") == 1
+    assert gh.mutations.count("label") == 1
+    assert gh.mutations.count("release") == 1
+    assert gh.map_body.count("(#5)") == 1
+    assert "wayfinder:awaiting-disposition" in gh.labels
     assert "wayfinder:resolving" not in gh.labels
 
 
@@ -328,7 +639,14 @@ def test_map_decision_append_is_idempotent_and_stays_in_section():
     body = ("# Map\n\n## Decisions so far\n\n- earlier (#3).\n\n"
             "## Open questions\n\n- something\n")
     assert not coordinated_research.decision_present(body, 5)
-    line = coordinated_research.decision_line("Audit the widget path", 5)
+    line = coordinated_research.decision_line(
+        "Audit the widget path",
+        5,
+        coordinated_research.ResearchDisposition(
+            kind="no_build",
+            summary="The existing router already covers the widget path.",
+        ),
+    )
     updated = coordinated_research.with_decision(body, line)
     assert coordinated_research.decision_present(updated, 5)
     assert updated.count("(#5)") == 1

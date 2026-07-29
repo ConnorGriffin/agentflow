@@ -74,12 +74,46 @@ strand happens at charting time or three days later.
 
 ### Unattended resolution is narrow
 
-A daemon-dispatched session answers the bounded question and records it: findings
-and the decision they support as a ticket comment, close the ticket, one titled
-line appended to the map's "Decisions so far." It does **not** create newly
-exposed tickets, graduate fog, judge handoff readiness, or write ADRs — the map's
-graph is reconciled by the next human wayfinder session, which sees the closed
-ticket. The daemon resolves questions; it never makes planning judgments.
+A daemon-dispatched session answers the bounded question and records its findings
+with exactly one structured disposition:
+
+- `no_build`, with an explicit ruling;
+- `deferred`, with a named observable trigger and a distinct verification condition; or
+- `handoff_required`, with each independently shippable candidate listed separately.
+
+The session supplies the investigated facts and its bounded conclusion; the daemon only
+validates and records that explicit result. A no-build ruling or concrete defer terminates
+the question already delegated to research, so it requires no new planning choice.
+Selecting among newly exposed build candidates does require judgment and therefore parks
+for a human Wayfinder session.
+
+Missing, multiple, malformed, or vague dispositions are incomplete outcomes and stay
+within the research stage's recovery budget. A durable no-build ruling or concrete
+defer is posted to the ticket, indexed explicitly under the map's "Decisions so far,"
+and only then may the ticket close.
+
+A handoff-required result does **not** grant the daemon planning authority. The daemon
+posts the findings once, adds one titled entry under the map's "Awaiting disposition,"
+adds `wayfinder:awaiting-disposition` alongside the ticket's one type label, releases
+`wayfinder:resolving`, retires the completed research run, and leaves the ticket open.
+The pending state is not a claim or a second ticket type, and the daemon never
+redispatches it.
+
+The next human Wayfinder session selects zero or more candidates. Every selected
+independently shippable candidate becomes its own ordinary Build Issue. Every
+unselected candidate is explicitly ruled no-build or deferred with a concrete trigger
+and verification condition. Under [ADR 0036](0036-bounded-repository-map-projection.md),
+a selected handoff is durable only when all three facts agree: the map's `Handoffs`
+entry, the exact `Wayfinder handoff: #<map>` body marker, and a native `blockedBy`
+edge to the terminal research child. A map link alone never counts. The pending
+ticket closes only after every candidate has a durable disposition; replay must
+discover existing handoffs from that three-fact identity before filing anything.
+
+The maintainer rule is therefore singular: **closed research always has a durable
+disposition, and no hidden issues-to-file list exists outside GitHub.** The daemon
+still does not create newly exposed tickets, graduate fog, judge handoff readiness,
+or write ADRs. The source Wayfinder skill's matching human procedure is tracked in
+[ConnorGriffin/dotfiles#49](https://github.com/ConnorGriffin/dotfiles/issues/49).
 
 ### Nothing new is owned by the daemon
 
@@ -123,3 +157,6 @@ or unattended*; its retirement of the web planning surface is untouched.
   operator choice.
 - The daemon grows a research stage (dispatch, claim, narrow resolution); that
   implementation lands through the normal pipeline as ordinary build issues.
+- Completed research that needs judgment remains an open map child until a human
+  durably dispositions every candidate; native child progress therefore cannot
+  report completion while build work exists only in a findings comment.
