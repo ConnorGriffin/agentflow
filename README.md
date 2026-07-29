@@ -5,8 +5,8 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](docs/public-beta.md)
 [![Sponsor](https://img.shields.io/badge/sponsor-ConnorGriffin-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/ConnorGriffin)
 
-AgentFlow turns GitHub issues into agent-built, cross-reviewed pull requests
-using Claude Code and Codex. Each repository chooses how far automation may go.
+AgentFlow turns GitHub issues into agent-built, reviewed pull requests using
+Claude Code, Codex, or both. Each repository chooses how far automation may go.
 
 > **macOS beta:** AgentFlow launches authenticated local coding agents, GitHub
 > CLI, Git, and uv. Run it only on a machine where unattended coding sessions
@@ -45,7 +45,12 @@ New repositories default to `reviewed`. A repository declares its profile with
 - macOS
 - Python 3.11 or newer and [uv](https://docs.astral.sh/uv/)
 - Git and an authenticated [GitHub CLI](https://cli.github.com/)
-- An authenticated Claude Code or Codex installation
+- At least one authenticated Claude Code or Codex installation
+
+Both providers are required for automatic cross-tool review in the
+`autonomous` profile. With one provider, AgentFlow can still build work;
+`reviewed` repositories may use a fresh same-tool review and still require a
+human merge.
 
 ### Install
 
@@ -55,31 +60,40 @@ cd agentflow
 uv sync --group dev
 ```
 
-The built console is tracked and included in the package. Node is needed only
-when changing the console itself.
+The built console is tracked in the clone. Headless repositories need no Node.
+Enrolling a UI repository installs pinned Playwright and Chromium tooling and
+recommends Node 20 or newer. Console development also requires Node.
 
-### Configure
+### Enroll a repository
 
-Create `~/.config/agentflow/config.toml`:
-
-```toml
-[[repositories]]
-repo = "owner/repository"
-workdir = "/absolute/path/to/repository"
-
-# Optional: expose this repository in the Project workspace.
-workspace = true
-```
-
-Add one table per repository, then validate the configuration:
+Start with a clean checkout of the repository you want AgentFlow to manage.
+Inspect its current readiness:
 
 ```bash
+uv run agentflow doctor --repo /absolute/path/to/repository
+```
+
+The first check may report missing setup. Preview the files and capabilities
+AgentFlow would add, then apply them:
+
+```bash
+uv run agentflow enroll /absolute/path/to/repository --profile reviewed
+uv run agentflow enroll /absolute/path/to/repository --profile reviewed --apply
+```
+
+Review and commit the generated files in the target repository. Then verify the
+repository and AgentFlow configuration:
+
+```bash
+uv run agentflow doctor --repo /absolute/path/to/repository
 uv run agentflow check
 ```
 
-Relative `workdir` values resolve from the configuration file.
-`AGENTFLOW_CONFIG` overrides the configuration path. Runtime state lives in
-`~/.agentflow`; `AGENTFLOW_STATE` overrides it.
+Enrollment does not create GitHub queue labels or harden public-pull-request CI.
+Complete the printed GitHub verification step before starting the daemon.
+
+See [repository capabilities](docs/capabilities.md) for the generated contract,
+skill manifest, UI tooling, and optional integrations.
 
 ### Calibrate provider capacity
 
@@ -87,7 +101,7 @@ AgentFlow reads provider-authored capacity facts from the authenticated Claude
 and Codex session histories already on the machine. It does not contact a
 separate service.
 
-Calibrate the Claude five-hour baseline once:
+If you use Claude, calibrate its five-hour baseline once:
 
 ```bash
 uv run agentflow capacity calibrate
@@ -113,6 +127,51 @@ Use `agentflow pause` before maintenance.
 Daemon output goes to `~/Library/Logs/agentflow.log`. Re-run the install command
 after changing paths, environment, or the AgentFlow checkout.
 
+## Skills and repository capabilities
+
+AgentFlow is not a bundle or wrapper for Matt Pocock's skills. Its issue-to-PR
+engine is Python. It shares the broader method of turning repeatable agent work
+into explicit, reviewable skills.
+
+Enrollment installs AgentFlow's bundled operating skill inside each repository.
+For UI repositories, it also installs pinned `ui-mockups` and
+`drive-local-webapp` skills, a screenshot harness, and the required browser
+runtime.
+
+The UI skills are also available independently from
+[Connor Griffin's public skills repository](https://github.com/ConnorGriffin/skills):
+
+```bash
+npx skills add ConnorGriffin/skills \
+  --skill ui-mockups \
+  --skill drive-local-webapp
+```
+
+[Codebase Memory onboarding](https://github.com/ConnorGriffin/skills/tree/main/skills/cbm-onboard)
+and [Matt Pocock's upstream skills](https://github.com/mattpocock/skills) are
+optional. AgentFlow does not require either.
+
+Unattended stages receive AgentFlow's canonical charter, but not personal
+global instructions or connectors. An optional local Codebase Memory server is
+the only MCP configuration re-supplied, and its configured environment is not
+forwarded.
+
+## Recover on a new machine
+
+AgentFlow's required setup is reproducible from public repositories and
+checked-in project files:
+
+1. Install Git, GitHub CLI, uv, and at least one supported coding agent; then
+   authenticate them.
+2. Clone AgentFlow and run `uv sync --group dev`.
+3. Clone the project into a clean checkout.
+4. Run enrollment as a preview, apply it, commit its generated files, then run
+   `doctor` and `check`.
+5. Install the AgentFlow service and resume it.
+
+The capability manifest pins required skill and runtime versions. Recovery does
+not depend on remembered dotfiles or user-global skills.
+
 ## Optional notifications
 
 Notifications are disabled by default. Set `AGENTFLOW_NTFY_URL` to an ntfy topic
@@ -128,6 +187,8 @@ Treat an unprotected topic URL as sensitive configuration. Do not commit it.
 
 - [Coordinator operations](docs/coordinator-operations.md) covers pause, drain,
   upgrade, diagnosis, and rollback.
+- [Repository capabilities](docs/capabilities.md) explains enrollment,
+  generated skills, and optional integrations.
 - [Contributing](CONTRIBUTING.md) covers development setup, console builds,
   tests, pull requests, and DCO sign-off.
 - `uv run pytest -q` is the Python test gate.
