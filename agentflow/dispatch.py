@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 import threading
 
-from agentflow import coordinated_build, loop
+from agentflow import coordinated_build, coordinated_respond, coordinated_review, loop, pipeline
 from agentflow.balancer import pick_pair
 from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
 from agentflow.coordinator.quota_poll import refresh_claude_quota
@@ -96,16 +96,16 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
     # A reply that answers a parked review's recorded decision belongs to that review. It resumes
     # the parked exact-head review instead of opening a second lifecycle that competes with the
     # manual recovery for the same claim (#344); ordinary discussion still falls through to Respond.
-    resumed = coordinated_build.resume_answered_review(
+    resumed = coordinated_review.resume_answered_review(
         cfg, coordinator, pr, comment=comment, target=target, baseline=baseline)
     if resumed is not None:
         return resumed
-    submission = coordinated_build.respond_submission(
+    submission = coordinated_respond.respond_submission(
         cfg, pr, branch, comment, target, baseline)
     if submission is None:
         return f"PR #{pr}: not a resolvable agentflow respond target — skipping"
     number = int(submission.subject)
-    if number in coordinated_build.owned_issues(cfg, lane="building"):
+    if number in pipeline.owned_issues(cfg, lane="building"):
         return (f"#{number}: prior change stage still owns the building claim — "
                 "deferring Respond")
     if not claim(cfg.repo, number, BUILDING):
@@ -125,7 +125,7 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
         if picked is None:
             break
         issue, extra = picked
-        if issue["number"] in coordinated_build.owned_issues(cfg, lane=None):
+        if issue["number"] in pipeline.owned_issues(cfg, lane=None):
             # A non-retired coordinator record in some downstream lane already owns this
             # issue — it is mid-pipeline, not a fresh intake candidate. Reserve it so the
             # picker doesn't return it again this cycle, then skip (#201).
@@ -206,13 +206,13 @@ def run_cycle(repos, *, submit_new: bool = True, coordinator=None, _log=None) ->
     """
     _log = _log or (lambda _m: None)
     _refresh_claude_quota(_log)
-    coord = coordinator if coordinator is not None else coordinated_build.build_coordinator(_log)
+    coord = coordinator if coordinator is not None else pipeline.build_coordinator(_log)
     if submit_new:
         threads = [_spawn(lambda cfg=cfg: _submit_repo(cfg, coord, _log)) for cfg in repos]
         for thread in threads:
             thread.join()
     else:
         _log("dispatch paused — reconciling coordinator-owned work only")
-    coordinated_build.reconcile_and_project(coord, _log=_log)
+    pipeline.reconcile_and_project(coord, _log=_log)
     for cfg in repos:
-        coordinated_build.reconcile_orphaned_claims(cfg, _log=_log)
+        pipeline.reconcile_orphaned_claims(cfg, _log=_log)

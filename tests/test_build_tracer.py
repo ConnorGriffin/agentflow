@@ -15,7 +15,7 @@ import pytest
 
 from conftest import FakeSession, permits, record_of, starts_until_held
 
-from agentflow import coordinated_build
+from agentflow import coordinated_build, pipeline, stage_worktree, worktree_ref
 from agentflow.coordinator import BuildStageAdapter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause
@@ -35,8 +35,8 @@ def _weekly_clear():
 def test_operator_pacing_is_charged_only_after_a_confirmed_start(make_coord, monkeypatch):
     from agentflow.balancer import PoolStatus
     from agentflow.coordinator.launcher import NOT_STARTED, StartResult
-    gate = coordinated_build._production_gate()
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    gate = pipeline._production_gate()
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, active=True,
                                                      windows=(_weekly_clear(),)))
@@ -74,8 +74,8 @@ def test_interactive_turn_admits_under_a_not_clear_pool(make_coord, monkeypatch)
     # work on the same pool stays deferred by the not-clear pool. Fails against pre-#161 code,
     # where the interactive turn was gated exactly like background and sat waiting.
     from agentflow.balancer import PoolStatus
-    gate = coordinated_build._production_gate()
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    gate = pipeline._production_gate()
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(
         "agentflow.balancer._query_pool",
         lambda tool, **_: PoolStatus(tool, False, 47.0, reason="a session was active in the last 10m"))
@@ -95,8 +95,8 @@ def test_interactive_turn_defers_only_when_no_permit_fits(make_coord, monkeypatc
     # may still defer an interactive turn (issue #161). A background build claims all five of the
     # pool's permits; the Ask turn then cannot reserve its demand and stays waiting.
     from agentflow.balancer import PoolStatus
-    gate = coordinated_build._production_gate()
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    gate = pipeline._production_gate()
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(_weekly_clear(),)))
     fake = FakeSession()
@@ -117,7 +117,7 @@ def test_interactive_start_leaves_the_background_pace_slot_intact(monkeypatch):
     # background start — which then spends it, deferring the next background record.
     from agentflow.balancer import PoolStatus
     from agentflow.coordinator.record import Record
-    gate = coordinated_build._production_gate()
+    gate = pipeline._production_gate()
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, active=True,
                                                      windows=(_weekly_clear(),)))
@@ -140,7 +140,7 @@ def test_interactive_flag_never_admits_a_disabled_stage(monkeypatch):
     # gate, before the interactive carve-out is ever consulted (issue #161). _query_pool would
     # raise if reached, proving the refusal short-circuits on stage enablement.
     from agentflow.coordinator.record import Record
-    gate = coordinated_build._production_gate()
+    gate = pipeline._production_gate()
 
     def _boom(tool, **_):
         raise AssertionError("stage gate must refuse before the pool is queried")
@@ -159,10 +159,10 @@ def test_codex_launch_honors_weekly_unattended_budget(monkeypatch):
     # build fires on codex despite intake having deferred new work for lack of weekly headroom.
     from agentflow.balancer import PoolStatus, RateLimitWindow
     from agentflow.coordinator.record import Record
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
 
     now = 1_000_000.0
-    monkeypatch.setattr(coordinated_build.time, "time", lambda: now)
+    monkeypatch.setattr(pipeline.time, "time", lambda: now)
     short = RateLimitWindow(used_percent=10.0, window_minutes=300, resets_at=now + 3600)
     # One hour into the week: only 11.4% of the 80% weekly cap is released for unattended day 0.
     weekly_at = lambda used: RateLimitWindow(used_percent=used, window_minutes=10080,
@@ -173,12 +173,12 @@ def test_codex_launch_honors_weekly_unattended_budget(monkeypatch):
     # Short window clear, but weekly at 29% is over the 11.4% released — launch defers.
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(29.0))))
-    assert coordinated_build._production_gate()(codex) is False
+    assert pipeline._production_gate()(codex) is False
 
     # Weekly under the released budget — the same queued build launches.
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(5.0))))
-    assert coordinated_build._production_gate()(codex) is True
+    assert pipeline._production_gate()(codex) is True
 
 
 def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
@@ -574,7 +574,7 @@ def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlock
     assert moved.pool == "claude" and moved.state == "running"
     assert moved.lineage == "claude"                   # lineage re-pinned to the destination
     assert moved.source == "/work/o-r/.agentflow/worktrees/claude/issue-7-fix"
-    assert coordinated_build._source_facts(moved) is not None  # the real parser accepts the move
+    assert worktree_ref.source_facts(moved) is not None  # the real parser accepts the move
     assert permits(coord, "claude") == moved.demand
 
 
@@ -619,7 +619,7 @@ def test_a_never_started_build_stays_home_when_both_pools_are_throttled(make_coo
     coord.cycle("codex", now=0)                        # launches at home from the intact source
     launched = record_of(coord, ident)
     assert launched.pool == "codex" and launched.state == "running"
-    assert coordinated_build._source_facts(launched) is not None
+    assert worktree_ref.source_facts(launched) is not None
 
 
 # --- live projection & claim ownership ---------------------------------------------------
@@ -782,18 +782,18 @@ def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
                         lambda self, path: provisioned.append(path))
     expected = "agentflow/claude/issue-7-owned"
     monkeypatch.setattr(
-        coordinated_build, "_run",
+        stage_worktree, "_run",
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, expected, ""),
     )
 
-    assert coordinated_build._worktree_ready(record) is True
+    assert stage_worktree.worktree_ready(record) is True
     assert provisioned == [wt]
 
     monkeypatch.setattr(
-        coordinated_build, "_run",
+        stage_worktree, "_run",
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, "wrong", ""),
     )
-    assert coordinated_build._worktree_ready(record) is False
+    assert stage_worktree.worktree_ready(record) is False
 
 
 def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monkeypatch):

@@ -15,11 +15,13 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from agentflow import coordinated_build, github, ratchet
+from agentflow import (coordinated_build, coordinated_review, coordinated_revise, github,
+                       pipeline, ratchet)
 from agentflow.balancer import pick_pair, pick_reviewer
 from agentflow.coordinator.record import WAITING
 from agentflow.coordinator.store import StoreUnavailable
-from agentflow.gate import (maintainer_comment, maintainer_comment_id, park, reply_pending)
+from agentflow.gate import (conflict_revises_used, maintainer_comment, maintainer_comment_id,
+                            park, reply_pending)
 from agentflow.intake import (INTAKE_MARK, _strip_quoted_lines, awaiting_recheck,
                               replies_since_intake)
 from agentflow.labels import (BUILDING, DRAWING, HELD_LABELS, RESEARCH_TICKET, RESOLVING,
@@ -213,9 +215,9 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
     # A `build <N>` on an issue whose latest Build exhausted its budget and `held` is the explicit,
     # durable maintainer resume (#245): open a fresh bounded execution at the next resume identity
     # instead of silently reusing the terminal held record.
-    records = coordinated_build.tracer.load_records()
+    records = pipeline.tracer.load_records()
     resumed = coordinated_build.resume_if_held(submission, records)
-    coordinator = coordinated_build.build_coordinator()
+    coordinator = pipeline.build_coordinator()
     identity = coordinator.submit_stage(resumed)
     record = coordinator.stage_record(identity)
     # Claim the issue and report a launch only when admission actually produced runnable work. An
@@ -230,7 +232,7 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
         # orphaned WAITING build is left for a later cycle to launch unguarded (#245).
         coordinator.withdraw_stage(identity)
         return f"#{n}: could not claim Build — withdrew the coordinator submission"
-    coordinated_build.reconcile_and_project(coordinator)
+    pipeline.reconcile_and_project(coordinator)
     verb = "resumed" if resumed.resume else "submitted"
     return f"#{n}: {verb} to coordinator → {resumed.pool} (build)"
 
@@ -546,7 +548,7 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
     if acceptance is None:
         return "issue acceptance unreadable"
     try:
-        records = coordinated_build.tracer.load_records()
+        records = pipeline.tracer.load_records()
     except StoreUnavailable:
         return "coordinator state unreadable"
     same_head = [
@@ -571,7 +573,7 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
             current_author, allow_same_tool=profile != "autonomous")
         if reviewer_tool is None:
             return "no eligible reviewer pool available — deferring"
-    assignment, _changed_files = coordinated_build._review_assignment_facts(
+    assignment, _changed_files = coordinated_review._review_assignment_facts(
         cfg.repo, pr, profile=profile)
     # A parked review stays unretired, so "the first unretired record" is no longer the live one:
     # each question is asked of the record that actually answers it. Running work is never
@@ -586,7 +588,7 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
     review = ReviewState(
         assignment=assignment, change_author_tool=current_author,
         reviewed_from_sha=head, sequence=sequence, tainted=force_same_tool)
-    submission = coordinated_build.survivor_review_submission(
+    submission = coordinated_review.survivor_review_submission(
         cfg, issue=issue, slug=slug, builder_tool=builder_tool, head_sha=head,
         reviewer_tool=reviewer_tool, pr_number=pr, acceptance=acceptance,
         review=review, transfer_from=predecessor.identity if predecessor else None,
@@ -595,9 +597,9 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
         return "review submission unavailable"
     if predecessor is None and not claim(cfg.repo, issue, BUILDING):
         return "could not claim PR review"
-    coordinator = coordinated_build.build_coordinator()
+    coordinator = pipeline.build_coordinator()
     coordinator.submit_stage(submission)
-    coordinated_build.reconcile_and_project(coordinator)
+    pipeline.reconcile_and_project(coordinator)
     status = "same-tool review submitted; maintainer merge required" if force_same_tool \
         else "review submitted"
     return status
@@ -618,16 +620,16 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     acceptance = _issue_acceptance(cfg, n)
     if acceptance is None:
         return "issue acceptance unreadable"
-    submission = coordinated_build.survivor_review_submission(
+    submission = coordinated_review.survivor_review_submission(
         cfg, issue=n, slug=sl, builder_tool=branch_tool, head_sha=head.stdout.strip(),
         reviewer_tool=reviewer_tool, pr_number=pr, acceptance=acceptance)
     if submission is None:
         return "review submission unavailable"
     if not claim(cfg.repo, n, BUILDING):
         return "could not claim survivor Review"
-    coordinator = coordinated_build.build_coordinator()
+    coordinator = pipeline.build_coordinator()
     coordinator.submit_stage(submission)
-    coordinated_build.reconcile_and_project(coordinator)
+    pipeline.reconcile_and_project(coordinator)
     return "review submitted"
 
 
@@ -645,23 +647,23 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
         return f"#{pr}: conflict — head unreadable, retry next cycle"
     head_sha = head.stdout.strip()
     try:
-        records = coordinated_build.tracer.load_records()
+        records = pipeline.tracer.load_records()
     except StoreUnavailable:
         return f"#{pr}: conflict — coordinator state unreadable, retry next cycle"
-    priors = coordinated_build.conflict_revises_used(records, cfg.repo, n)
+    priors = conflict_revises_used(records, cfg.repo, n)
     if any(r.target == head_sha for r in priors):
         return f"#{pr}: conflict — revise already open"   # idempotent under re-reconcile
     conflict_round = len(priors) + 1
-    submission = coordinated_build.survivor_conflict_revise_submission(
+    submission = coordinated_revise.survivor_conflict_revise_submission(
         cfg, issue=n, slug=sl, builder_tool=tool, head_sha=head_sha, pr_number=pr,
         conflict_round=conflict_round)
     if submission is None:
         return None                                       # unreconstructable → caller parks
     if not claim(cfg.repo, n, BUILDING):
         return f"#{pr}: conflict — could not claim conflict revise"
-    coordinator = coordinated_build.build_coordinator()
+    coordinator = pipeline.build_coordinator()
     coordinator.submit_stage(submission)
-    coordinated_build.reconcile_and_project(coordinator)
+    pipeline.reconcile_and_project(coordinator)
     return f"#{pr}: conflict — revise round {conflict_round} opened"
 
 

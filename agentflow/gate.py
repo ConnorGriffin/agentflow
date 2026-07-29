@@ -35,6 +35,32 @@ class MergeDecision(str, Enum):
 # looping forever (ADR 0020; was a single round under ADR 0004).
 MAX_REVISES = 2
 
+
+def revise_round_budget_remains(records, repo, subject) -> bool:
+    """Whether the auto-revise product cap (ADR 0004's revise round, relaxed to ``MAX_REVISES``
+    rounds by ADR 0020's convergence bail) still has room for this issue — fewer than
+    ``MAX_REVISES`` *logical* Revise records exist for it, regardless of how many continuation
+    attempts each one used. This keeps the per-stage continuation budget separate from the product
+    loop: continuation attempts never reset or expand the round cap. Conflict Revises (ADR 0038) are
+    counted apart and never spend this one; each conflicting head gets its own bounded stage. Pure —
+    the test surface (ADR 0020)."""
+    rounds = sum(1 for r in records
+                 if r.stage == "revise" and not r.conflict_round
+                 and r.repo == repo and str(r.subject) == str(subject))
+    return rounds < MAX_REVISES
+
+
+def conflict_revises_used(records, repo, subject) -> list:
+    """The conflict Revise records already opened for this PR in its lifetime (ADR 0038), oldest
+    first. They determine the next stable conflict-round identity but do not impose a lifetime cap:
+    every genuinely new conflicting head gets another bounded Revise attempt. Includes retired
+    records and stays separate from the finding-driven revise rounds. Pure."""
+    conflicts = [r for r in records
+                 if r.stage == "revise" and r.conflict_round
+                 and r.repo == repo and str(r.subject) == str(subject)]
+    return sorted(conflicts, key=lambda r: r.conflict_round)
+
+
 # Every agentflow comment on a PR (the park notice, a build-agent reply) carries this
 # marker in its disclaimer, so we can tell our own comments from the maintainer's — the
 # same discipline intake uses on issues (INTAKE_MARK). The bot posts as the maintainer,

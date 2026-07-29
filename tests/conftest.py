@@ -16,7 +16,7 @@ from itertools import count
 
 import pytest
 
-from agentflow import coordinated_build
+from agentflow import coordinated_review, pipeline
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.providers import (PermanentReason, ProviderCause,
@@ -29,8 +29,9 @@ def _deterministic_reviewer(monkeypatch):
     consult the live rate-limit gate (which is timing-sensitive and would make the suite flaky).
     ADR 0020's same-tool fallback — when the cross-tool pool is exhausted — is exercised directly
     in tests/test_balancer.py via ``choose_reviewer``. A test may still override this."""
-    monkeypatch.setattr(coordinated_build, "pick_reviewer",
-                        lambda builder, **_kwargs: "codex" if builder == "claude" else "claude")
+    for module in (coordinated_review, pipeline):
+        monkeypatch.setattr(module, "pick_reviewer",
+                            lambda builder, **_kwargs: "codex" if builder == "claude" else "claude")
 
 
 @dataclass

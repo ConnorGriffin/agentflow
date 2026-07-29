@@ -327,6 +327,11 @@ def unresolved_uncertainty(chain: Any) -> Uncertainty | None:
 
 _CONFLICT_UNCERTAINTY_RE = re.compile(r"^CONFLICT-UNCERTAINTY:\s*(\{.*\})\s*$", re.MULTILINE)
 
+# How a Revise stage records that private ambiguity as its own durable outcome, so the decision
+# review it opens recognizes it. Written by Revise and read by Review, so it belongs with the
+# uncertainty vocabulary rather than in either stage's module.
+CONFLICT_UNCERTAINTY_PREFIX = "conflict-uncertainty:"
+
 
 def conflict_uncertainty_from_message(message: str) -> Uncertainty | None:
     """Parse a resolver's private durable uncertainty marker; PR comments do not count."""

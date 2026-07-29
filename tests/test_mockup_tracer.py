@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_build, loop
+from agentflow import coordinated_build, coordinated_mockup, loop, stage_worktree, worktree_ref
 from agentflow.coordinator import MockupStageAdapter, StageRouter
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator import tracer
@@ -18,8 +18,8 @@ def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage()
     cfg = SimpleNamespace(repo="o/r", workdir="/home/w")
     issue = {"number": 11, "title": "Compare navigation concepts", "body": "Draw variants"}
 
-    first = coordinated_build.mockup_submission(cfg, issue, "claude")
-    again = coordinated_build.mockup_submission(cfg, issue, "claude")
+    first = coordinated_mockup.mockup_submission(cfg, issue, "claude")
+    again = coordinated_mockup.mockup_submission(cfg, issue, "claude")
 
     assert first == again
     assert first.stage == "mockup" and first.subject == "11" and first.target is None
@@ -40,10 +40,10 @@ def test_mockup_source_reads_back_to_its_own_branch_through_the_layout_owner():
     cfg = SimpleNamespace(repo="o/r", workdir="/home/w")
     issue = {"number": 11, "title": "A screen", "body": "Draw it"}
 
-    sub = coordinated_build.mockup_submission(cfg, issue, "claude")
+    sub = coordinated_mockup.mockup_submission(cfg, issue, "claude")
     record = SimpleNamespace(source=sub.source, pool="claude", lineage="claude",
                              stage="mockup", subject="11")
-    workdir, branch, path = coordinated_build._source_facts(record)
+    workdir, branch, path = worktree_ref.source_facts(record)
 
     expected = WorktreeRef.for_mockup("/home/w", "claude", 11, "a-screen")
     assert (workdir, branch, str(path)) == (expected.workdir, expected.branch, expected.path)
@@ -59,8 +59,8 @@ def test_resubmission_cannot_switch_the_original_mockup_lineage(make_coord):
     coord = make_coord(fake, adapter=adapter)
     cfg = SimpleNamespace(repo="o/r", workdir="/w")
     issue = {"number": 11, "title": "A screen", "body": "Draw it"}
-    ident = coord.submit_stage(coordinated_build.mockup_submission(cfg, issue, "claude"))
-    assert coord.submit_stage(coordinated_build.mockup_submission(cfg, issue, "codex")) == ident
+    ident = coord.submit_stage(coordinated_mockup.mockup_submission(cfg, issue, "claude"))
+    assert coord.submit_stage(coordinated_mockup.mockup_submission(cfg, issue, "codex")) == ident
 
     rec = record_of(coord, ident)
     assert rec.pool == rec.lineage == "claude"
@@ -76,7 +76,7 @@ def test_mockup_waiting_and_preparation_miss_retain_claim_lineage_and_local_work
         observer=fake,
     )
     coord = make_coord(fake, adapter=adapter)
-    sub = coordinated_build.mockup_submission(
+    sub = coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
     ident = coord.submit_stage(sub)
@@ -100,7 +100,7 @@ def test_interrupted_mockup_continues_on_the_same_branch_and_pinned_pool(make_co
         observer=fake,
     )
     coord = make_coord(fake, adapter=adapter)
-    sub = coordinated_build.mockup_submission(
+    sub = coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
     ident = coord.submit_stage(sub)
@@ -122,7 +122,7 @@ def test_live_admission_gate_enables_mockup_at_its_reviewed_five_permit_demand(m
         observer=fake,
     )})
     coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
-    sub = coordinated_build.mockup_submission(
+    sub = coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
     ident = coord.submit_stage(sub)
@@ -156,16 +156,16 @@ def test_public_mockup_seam_completes_only_on_pushed_variants_screenshots_and_on
             return SimpleNamespace(returncode=0, stdout="\n".join(files) + "\n")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.coordinated_build._run", external_read)
+    monkeypatch.setattr("agentflow.coordinated_mockup._run", external_read)
     settled = []
     adapter = MockupStageAdapter(
-        outcome_ready=coordinated_build._mockup_outcome_ready,
+        outcome_ready=coordinated_mockup._mockup_outcome_ready,
         worktree_ready=lambda record: True,
         observer=fake,
         settle=lambda record: settled.append(record.identity) or "issue-url",
     )
     coord = make_coord(fake, adapter=adapter)
-    sub = coordinated_build.mockup_submission(
+    sub = coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir=str(tmp_path)),
         {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
     ident = coord.submit_stage(sub)
@@ -186,13 +186,13 @@ def test_duplicate_marked_comments_cannot_complete_mockup(monkeypatch, tmp_path)
     comment = {"body": "> *agentflow intake: mockup variants — generated by AI.*"}
     monkeypatch.setattr("agentflow.github.issue_comment_rows",
                         lambda repo, number: [comment, comment])
-    monkeypatch.setattr("agentflow.coordinated_build._run",
+    monkeypatch.setattr("agentflow.coordinated_mockup._run",
                         lambda argv: (_ for _ in ()).throw(AssertionError(
                             "duplicate comments must fail before git verification")))
     rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
                  repo="o/r", subject="11", lineage="claude", source=str(wt))
 
-    assert coordinated_build._mockup_outcome_ready(rec, SimpleNamespace()) is False
+    assert coordinated_mockup._mockup_outcome_ready(rec, SimpleNamespace()) is False
 
 
 def test_deleted_mockup_artifacts_do_not_count_as_committed_outcome(monkeypatch, tmp_path):
@@ -211,11 +211,11 @@ def test_deleted_mockup_artifacts_do_not_count_as_committed_outcome(monkeypatch,
             return SimpleNamespace(returncode=0, stdout="")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.coordinated_build._run", git)
+    monkeypatch.setattr("agentflow.coordinated_mockup._run", git)
     rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
                  repo="o/r", subject="11", lineage="claude", source=str(wt))
 
-    assert coordinated_build._mockup_outcome_ready(rec, SimpleNamespace()) is False
+    assert coordinated_mockup._mockup_outcome_ready(rec, SimpleNamespace()) is False
 
 
 def test_missing_context_is_an_immediate_single_human_boundary_that_preserves_work(
@@ -229,12 +229,12 @@ def test_missing_context_is_an_immediate_single_human_boundary_that_preserves_wo
     adapter = MockupStageAdapter(
         outcome_ready=lambda record, obs: False,
         worktree_ready=lambda record: True,
-        missing_context=coordinated_build._mockup_missing_context,
+        missing_context=coordinated_mockup._mockup_missing_context,
         observer=fake,
         handoff=lambda record: handoffs.append(record.identity) or "issue-proof",
     )
     coord = make_coord(fake, adapter=adapter)
-    sub = coordinated_build.mockup_submission(
+    sub = coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
     ident = coord.submit_stage(sub)
@@ -260,7 +260,7 @@ def test_exhaustion_creates_one_mockup_handoff_and_preserves_unfinished_work(mak
         handoff=lambda record: handoffs.append(record.identity) or "issue-proof",
     )
     coord = make_coord(fake, adapter=adapter)
-    sub = coordinated_build.mockup_submission(
+    sub = coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
     ident = coord.submit_stage(sub)
@@ -297,18 +297,18 @@ def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktr
         return (frozenset({"agentflow:needs-mockup", "agentflow:drawing-mockup"}) if claimed[0]
                 else frozenset({"agentflow:needs-mockup"}))
 
-    monkeypatch.setattr("agentflow.coordinated_build._run", git)
+    monkeypatch.setattr("agentflow.stage_worktree._run", git)
     monkeypatch.setattr("agentflow.github.issue_labels", issue_labels)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
     adapter = MockupStageAdapter(
         outcome_ready=lambda record, obs: False,
         worktree_ready=lambda record: (
-            coordinated_build._mockup_claim_ready(record)
-            and coordinated_build._worktree_ready(record)),
+            coordinated_mockup._mockup_claim_ready(record)
+            and stage_worktree.worktree_ready(record)),
         observer=fake,
     )
     coord = make_coord(fake, adapter=adapter)
-    sub = coordinated_build.mockup_submission(
+    sub = coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir=str(tmp_path)),
         {"number": 11, "title": "A screen", "body": "Draw it"}, "claude")
     ident = coord.submit_stage(sub)
@@ -346,14 +346,14 @@ def test_completed_mockup_releases_claim_keeps_human_boundary_and_disposes_workt
 
     monkeypatch.setattr("agentflow.github.remove_label", remove_label)
     monkeypatch.setattr("agentflow.github.api", api)
-    monkeypatch.setattr("agentflow.coordinated_build.remove_worktree_if_safe",
+    monkeypatch.setattr("agentflow.coordinated_mockup.remove_worktree_if_safe",
                         lambda workdir, path: (path.rmdir() is None))
     rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
                  repo="o/r", subject="11", lineage="claude", source=str(wt))
 
-    assert coordinated_build._settle_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert coordinated_mockup._settle_mockup(rec) == "https://github.com/o/r/issues/11"
     assert not wt.exists() and labels == {"agentflow:needs-mockup"}
-    assert coordinated_build._settle_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert coordinated_mockup._settle_mockup(rec) == "https://github.com/o/r/issues/11"
 
 
 def _mockup_hold_seams(monkeypatch, comments, labels, *, notified, labels_readable=None):
@@ -411,8 +411,8 @@ def test_exhausted_mockup_posts_one_stable_handoff_and_retains_worktree(monkeypa
     _mockup_hold_seams(monkeypatch, comments, labels, notified=notified)
     rec = _mockup_record(wt, hold_reason="continuation budget exhausted")
 
-    first = coordinated_build._hold_mockup(rec)
-    second = coordinated_build._hold_mockup(rec)
+    first = coordinated_mockup._hold_mockup(rec)
+    second = coordinated_mockup._hold_mockup(rec)
     assert first == second == "https://github.com/o/r/issues/11"
     assert len(comments) == 1 and "agentflow-mockup-hold" in comments[0].body
     assert labels == {"agentflow:needs-mockup"} and wt.exists()
@@ -433,11 +433,11 @@ def test_mockup_hold_interrupted_after_its_comment_does_not_ping_the_operator_tw
                        labels_readable=readable)
     rec = _mockup_record(wt, hold_reason="continuation budget exhausted")
 
-    assert coordinated_build._hold_mockup(rec) is None
+    assert coordinated_mockup._hold_mockup(rec) is None
     assert len(comments) == 1 and len(notified) == 1
 
     readable[0] = True
-    assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert coordinated_mockup._hold_mockup(rec) == "https://github.com/o/r/issues/11"
     assert len(comments) == 1 and len(notified) == 1
 
 
@@ -452,7 +452,7 @@ def test_mockup_hold_ping_carries_a_stable_sequence_id(monkeypatch, tmp_path):
         _mockup_hold_seams(monkeypatch, comments,
                            {"agentflow:needs-mockup", "agentflow:drawing-mockup"},
                            notified=notified)
-        coordinated_build._hold_mockup(_mockup_record(wt, hold_reason="budget exhausted"))
+        coordinated_mockup._hold_mockup(_mockup_record(wt, hold_reason="budget exhausted"))
         keys.append(notified[0][3])
     assert keys[0] and keys[0] == keys[1]
 
@@ -472,7 +472,7 @@ def test_missing_context_comment_is_the_handoff_and_never_gets_a_second_comment(
     _refuse_a_second_comment(monkeypatch, "MISSING-CONTEXT already is the durable handoff")
     rec = _mockup_record(wt)
 
-    assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert coordinated_mockup._hold_mockup(rec) == "https://github.com/o/r/issues/11"
     assert len(comments) == 1 and wt.exists()
     assert "agentflow-mockup-hold" in comments[0].body
     assert "continuation budget" not in comments[0].body   # it never restates the round's reason
@@ -491,7 +491,7 @@ def test_partial_marked_comment_is_edited_into_the_exhaustion_handoff(monkeypatc
     _refuse_a_second_comment(monkeypatch, "the one existing variant-round comment must be edited")
     rec = _mockup_record(wt)
 
-    assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert coordinated_mockup._hold_mockup(rec) == "https://github.com/o/r/issues/11"
     assert len(comments) == 1
     assert "agentflow-mockup-hold" in comments[0].body
     assert "continuation budget" in comments[0].body and wt.exists()

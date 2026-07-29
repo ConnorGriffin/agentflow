@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_research, dispatch, loop
+from agentflow import coordinated_research, dispatch, loop, pipeline
 from agentflow.coordinator import ResearchStageAdapter, StageRouter, tracer
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import HELD, RUNNING, Record
@@ -268,7 +268,7 @@ def test_exhaustion_releases_the_claim_so_the_ticket_is_eligible_again(make_coor
 # --- capacity: research reserves its own lane/cap and shows in the live board -----------
 
 def test_research_reserves_its_own_stage_lane_and_cap():
-    from agentflow.coordinated_build import _ProductionGate
+    from agentflow.pipeline import _ProductionGate
     limits = _ProductionGate.reservation_limits(
         Record(identity="i", stage="research", pool="claude", demand=2, repo=REPO, subject="5"))
     assert limits.stage_lane == "research"                             # distinct lane, not build/triage
@@ -294,7 +294,7 @@ def test_a_dead_research_run_releases_the_resolving_claim_a_live_one_retains_it(
                   subject="5", state=HELD, claim=False)
     live = Record(identity="live", stage="research", pool="claude", demand=2, repo=REPO,
                   subject="6", state=RUNNING, claim=True)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [dead, live])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [dead, live])
     edited = []
     from agentflow import github
 
@@ -307,7 +307,7 @@ def test_a_dead_research_run_releases_the_resolving_claim_a_live_one_retains_it(
                         lambda repo, issue, label: edited.append(issue) or True)
     monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
-    assert coordinated_build.reconcile_orphaned_claims(RepoConfig(REPO, "/tmp")) == 1
+    assert pipeline.reconcile_orphaned_claims(RepoConfig(REPO, "/tmp")) == 1
     assert edited == [5]                                               # dead run released; live retained
 
 

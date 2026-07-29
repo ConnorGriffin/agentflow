@@ -14,10 +14,9 @@ where ``lane`` is ``{tool}``, ``{tool}-review``, or ``{tool}-intake``, ``name`` 
 directions cannot drift — a round-trip (``parse(ref.path) == ref``) pins the whole layout
 in one place. Parse owns only the *shape* rule: a malformed or unrecognized path reads as
 ``None`` (the fail-closed convention every current site uses), never a raise. Whether a
-path's tool or lane agrees with a particular record's expectations is the caller's
-judgment — the type never takes a record.
-
-This module is purely additive (ADR 0041): it migrates no existing caller.
+path's tool or lane agrees with a particular record's expectations is a second judgment —
+the *type* never takes a record; the record-shaped derivations at the foot of this module
+do, and they are the one place that judgment lives.
 """
 
 from __future__ import annotations
@@ -204,3 +203,34 @@ def slug(title: str) -> str:
     """The trailing descriptor an issue's title contributes to its branch and worktree name."""
     s = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
     return s[:40].strip("-") or "issue"
+
+
+# --- a stage record's own checkout --------------------------------------------------------
+# The layout above says how a path reads apart; these two say whether the path a *record*
+# carries is the checkout that record is entitled to. Build, Revise, Respond, Mockup, Review
+# and the park handoff all ask one of these questions, so the answer lives with the layout
+# rather than in whichever stage module happened to hold it.
+
+def source_facts(record):
+    """The ``(workdir, branch, path)`` of the branch-owning checkout a Build, Revise, Respond
+    or Mockup record owns, or ``None`` when the source is not that record's own checkout —
+    a foreign tool, a lineage the pool no longer matches, or the wrong kind of path."""
+    ref = WorktreeRef.parse(record.source)
+    if ref is None or ref.tool != record.pool or record.lineage != record.pool:
+        return None
+    if record.stage == "mockup":
+        if ref.kind is not WorktreeKind.MOCKUP or str(ref.number) != str(record.subject):
+            return None
+    elif ref.kind is not WorktreeKind.BUILD:
+        return None
+    return ref.workdir, ref.branch, Path(record.source)
+
+
+def review_source_facts(record):
+    """The ``(workdir, pr_number)`` a review worktree encodes, or ``None``. The review source is
+    ``.../<tool>-review/pr-<pr>-<slug>``, so the PR number is recoverable for the park handoff
+    without a second durable field."""
+    ref = WorktreeRef.parse(record.source)
+    if ref is None or ref.kind is not WorktreeKind.REVIEW:
+        return None
+    return ref.workdir, ref.number

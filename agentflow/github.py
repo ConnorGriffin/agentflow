@@ -276,6 +276,17 @@ def list_open_prs(repo: str, *, head: str | None = None,
     ]
 
 
+def open_pr_for_branch(repo: str, branch: str) -> PrRow | None:
+    """The one open PR for the owned branch — its number and head SHA — or ``None`` when there is
+    none or the read fails. The shared lookup behind every claim-transfer opener; a ``None`` leaves
+    the completed record still claimed, so the next reconcile pass retries the transfer rather than
+    stranding it."""
+    prs = list_open_prs(repo, head=branch)
+    if not prs:
+        return None
+    return prs[0]
+
+
 def list_prs(repo: str, state: str, *, limit: int = 30) -> list[SnapshotPrRow] | None:
     """PRs in ``repo`` with the given ``state`` as snapshot rows (number, title, branch,
     merge timestamp), or ``None`` if the listing failed. No PRs returns an empty list."""

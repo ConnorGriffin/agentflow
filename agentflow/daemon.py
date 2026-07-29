@@ -108,12 +108,12 @@ def workspace_cycle(repos: list[RepoConfig], _log=log) -> None:
     bounded workspace projection (ADR 0033/0034). Isolated from the pipeline dispatch pass — it
     shares the coordinator's durable store, so interactive Ask turns and background pipeline work
     contend on the same permit ledger with the operator's turn ranked first."""
-    from agentflow import coordinated_build, coordinated_converse, dashboard_data
+    from agentflow import coordinated_converse, dashboard_data, pipeline
     from agentflow.workspace import publish
     if not repos:
         return
     try:
-        coord = coordinated_build.build_coordinator(_log=_log)
+        coord = pipeline.build_coordinator(_log=_log)
         workdir_for = {c.repo: c.workdir for c in repos}
         coordinated_converse.drain_commands(coord, workdir_for, _log=_log)
         for pool in ("claude", "codex"):
@@ -147,10 +147,10 @@ def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _l
     Durable coordinator records protect every owned source. The live board is not consulted; it
     is regenerated from running records on the next reconciliation pass.
     """
-    from agentflow import coordinated_build
+    from agentflow import pipeline
     for cfg in repos:
         try:
-            protected = coordinated_build.owned_worktrees(cfg)
+            protected = pipeline.owned_worktrees(cfg)
             report = sweep(cfg.repo, cfg.workdir, protected)
             if report.removed or report.retained:
                 _log(f"{cfg.repo}: startup worktree recovery removed {len(report.removed)}, "

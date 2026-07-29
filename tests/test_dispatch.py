@@ -11,7 +11,8 @@ import pytest
 
 from conftest import FakeSession, record_of
 
-from agentflow import coordinated_build, dispatch, github, live, loop
+from agentflow import (coordinated_build, coordinated_mockup, coordinated_respond,
+                       coordinated_review, dispatch, github, live, loop, pipeline)
 from agentflow.coordinator import MockupStageAdapter
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.loop import RepoConfig
@@ -27,10 +28,10 @@ def test_paused_cycle_submits_nothing_but_still_reconciles(monkeypatch):
     monkeypatch.setattr(dispatch, "_submit_repo", lambda *a: pytest.fail(
         "pause may not submit cold work"))
     reconciled = []
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project",
+    monkeypatch.setattr(dispatch.pipeline, "reconcile_and_project",
                         lambda coord, _log=None: reconciled.append(coord))
     claims = []
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_orphaned_claims",
+    monkeypatch.setattr(dispatch.pipeline, "reconcile_orphaned_claims",
                         lambda cfg, _log=None: claims.append(cfg.repo))
     coord = object()
 
@@ -46,10 +47,10 @@ def test_active_cycle_submits_each_repo_then_reconciles_once(monkeypatch):
     monkeypatch.setattr(dispatch, "_submit_repo",
                         lambda cfg, coord, log: submitted.append((cfg.repo, coord)))
     reconciled = []
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_and_project",
+    monkeypatch.setattr(dispatch.pipeline, "reconcile_and_project",
                         lambda coord, _log=None: reconciled.append(coord))
     claims = []
-    monkeypatch.setattr(dispatch.coordinated_build, "reconcile_orphaned_claims",
+    monkeypatch.setattr(dispatch.pipeline, "reconcile_orphaned_claims",
                         lambda cfg, _log=None: claims.append(cfg.repo))
     coord = object()
 
@@ -70,18 +71,18 @@ def test_cycle_withdraws_cold_mockup_but_recovers_started_continuation(
         observer=fake,
     )
     old = make_coord(fake, adapter=adapter)
-    running = old.submit_stage(coordinated_build.mockup_submission(
+    running = old.submit_stage(coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 11, "title": "Started", "body": "Draw it"}, "claude"))
     old.cycle("claude")
     fake.end(running, cause=ProviderCause.PROCESS)
-    cold = old.submit_stage(coordinated_build.mockup_submission(
+    cold = old.submit_stage(coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 12, "title": "Still held", "body": "Draw it"}, "claude"))
     coord = make_coord(fake, adapter=adapter,
                        disabled_cold_stages=frozenset({"mockup"}))
     monkeypatch.setattr(live, "replace_projection", lambda records: None)
-    monkeypatch.setattr(coordinated_build, "reconcile_orphaned_claims", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline, "reconcile_orphaned_claims", lambda *a, **k: 0)
 
     dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
                        coordinator=coord, _log=lambda _line: None)
@@ -100,7 +101,7 @@ def test_cycle_withdraws_a_mockup_reservation_that_never_started(
         observer=fake,
     )
     old = make_coord(fake, adapter=adapter)
-    identity = old.submit_stage(coordinated_build.mockup_submission(
+    identity = old.submit_stage(coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 13, "title": "Reserved", "body": "Draw it"}, "claude"))
     fake.crash_start = True
@@ -110,7 +111,7 @@ def test_cycle_withdraws_a_mockup_reservation_that_never_started(
     coord = make_coord(fake, adapter=adapter,
                        disabled_cold_stages=frozenset({"mockup"}))
     monkeypatch.setattr(live, "replace_projection", lambda records: None)
-    monkeypatch.setattr(coordinated_build, "reconcile_orphaned_claims", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline, "reconcile_orphaned_claims", lambda *a, **k: 0)
 
     dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
                        coordinator=coord, _log=lambda _line: None)
@@ -127,7 +128,7 @@ def test_cycle_keeps_a_capacity_blocked_mockup_restart_resume(
         observer=fake,
     )
     old = make_coord(fake, adapter=adapter, daemon_generation="old")
-    identity = old.submit_stage(coordinated_build.mockup_submission(
+    identity = old.submit_stage(coordinated_mockup.mockup_submission(
         SimpleNamespace(repo="o/r", workdir="/w"),
         {"number": 14, "title": "Restart", "body": "Draw it"}, "claude"))
     old.cycle("claude")
@@ -136,7 +137,7 @@ def test_cycle_keeps_a_capacity_blocked_mockup_restart_resume(
     restarted = make_coord(fake, adapter=adapter, daemon_generation="new",
                            disabled_cold_stages=frozenset({"mockup"}))
     monkeypatch.setattr(live, "replace_projection", lambda records: None)
-    monkeypatch.setattr(coordinated_build, "reconcile_orphaned_claims", lambda *a, **k: 0)
+    monkeypatch.setattr(pipeline, "reconcile_orphaned_claims", lambda *a, **k: 0)
 
     dispatch.run_cycle([RepoConfig("o/r", "/w")], submit_new=False,
                        coordinator=restarted, _log=lambda _line: None)
@@ -155,7 +156,7 @@ def test_cycle_keeps_a_capacity_blocked_mockup_restart_resume(
 def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch):
     from agentflow import coordinated_build, github
 
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     # The four claim lanes are listed in order (building, triaging, drawing, resolving); only the
     # building lane holds a stale-claimed issue. The proof read back shows the label gone.
     listings = iter([[{"number": 7, "updated_at": "2020-01-01T00:00:00Z"}], [], [], []])
@@ -165,7 +166,7 @@ def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch
                         lambda repo, issue, label: removed.append((issue, label)) or True)
     monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
-    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
     assert removed == [(7, "agentflow:building")]
 
 
@@ -176,7 +177,7 @@ def test_claim_reconciliation_reads_labels_off_the_hourly_budget_not_search(monk
     number sequence — one must never be mistaken for a claimed issue."""
     from agentflow import coordinated_build, github
 
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     asked = []
 
     def listing(args, *, parse_json=False):
@@ -195,7 +196,7 @@ def test_claim_reconciliation_reads_labels_off_the_hourly_budget_not_search(monk
                         lambda repo, issue, label: removed.append(issue) or True)
     monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
-    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
     assert removed == [7], "the pull request must not be read as a claimed issue"
     assert all(call[0] == "api" and call[1].startswith("repos/o/r/issues?") for call in asked)
     assert not any("issue" == call[0] and "list" == call[1] for call in asked)
@@ -205,14 +206,14 @@ def test_unreadable_coordinator_state_clears_no_claim(monkeypatch):
     from agentflow import coordinated_build, github
     from agentflow.coordinator.store import StoreUnavailable
 
-    monkeypatch.setattr(coordinated_build.tracer, "load_records",
+    monkeypatch.setattr(pipeline.tracer, "load_records",
                         lambda: (_ for _ in ()).throw(StoreUnavailable("locked")))
     monkeypatch.setattr(github, "api",
                         lambda *a, **k: pytest.fail("must not inspect or clear claims"))
     monkeypatch.setattr(github, "remove_label",
                         lambda *a, **k: pytest.fail("must not clear claims"))
 
-    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
 
 
 def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
@@ -223,7 +224,7 @@ def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
                      repo="o/r", subject="7", state=WAITING, claim=True)
     held = Record(identity="held", stage="review", pool="codex", demand=2,
                   repo="o/r", subject="8", state=HELD, claim=False)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [waiting, held])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [waiting, held])
     # The building lane lists both issues; #7 is shielded by the live waiting build, #8 is not.
     listings = iter([[{"number": 7, "updated_at": "2020-01-01T00:00:00Z"},
                       {"number": 8, "updated_at": "2020-01-01T00:00:00Z"}], [], [], []])
@@ -233,7 +234,7 @@ def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
                         lambda repo, issue, label: removed.append(issue) or True)
     monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
-    assert coordinated_build.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
     assert removed == [8]
 
 
@@ -408,18 +409,18 @@ def _stub_answered_park(monkeypatch, records):
     """Wire one PR whose oldest unanswered comment answers its parked review."""
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "keep the conservative behavior", "IC_1", "sha-a"))
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: records)
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: records)
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: _answered_park_thread())
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
-    monkeypatch.setattr(coordinated_build, "respond_submission",
+    monkeypatch.setattr(coordinated_respond, "respond_submission",
                         lambda *a, **k: pytest.fail("a decision answer is never a generic Respond"))
     posted = []
-    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+    monkeypatch.setattr(pipeline.github, "pr_comment",
                         lambda repo, pr, body: posted.append(body) or True)
     claimed = []
     stamp = lambda repo, number, _label: claimed.append(number) or True   # noqa: E731
     monkeypatch.setattr(dispatch, "claim", stamp)
-    monkeypatch.setattr(coordinated_build, "claim", stamp)
+    monkeypatch.setattr(coordinated_review, "claim", stamp)
     submitted = []
     return posted, claimed, submitted
 
@@ -498,17 +499,17 @@ def test_ordinary_pr_discussion_after_a_parked_review_still_enters_respond(monke
         review_handoff=decision_answer_handoff("IC_1", "keep the conservative behavior"))
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "unrelated question", "IC_2", "sha-a"))
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked, resumed])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [parked, resumed])
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [
         *_answered_park_thread(),
         {"id": "IC_x", "body": "> *agentflow: your decision resumed the parked review.*\n"
                                "<!-- agentflow-respond-target:IC_1 -->"},
         {"id": "IC_2", "body": "unrelated question"}])
-    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+    monkeypatch.setattr(pipeline.github, "pr_comment",
                         lambda *a, **k: pytest.fail("discussion never resumes a parked review"))
-    monkeypatch.setattr(coordinated_build, "respond_submission",
+    monkeypatch.setattr(coordinated_respond, "respond_submission",
                         lambda *a, **k: SimpleNamespace(subject="7", pool="claude"))
-    monkeypatch.setattr(coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(pipeline, "owned_issues", lambda cfg, lane=None: set())
     monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: True)
     submitted = []
 
@@ -531,7 +532,7 @@ def test_a_second_decision_round_is_still_answerable_after_agentflow_replied(mon
         review_handoff=decision_answer_handoff("IC_1", "keep the conservative behavior"))
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "prompt every user", "IC_2", "sha-a"))
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [first, round_two])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [first, round_two])
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [
         {"id": "IC_0", "body": "> *agentflow: parked for human review.*\n\nDecide again, please."},
         {"id": "IC_1", "body": "keep the conservative behavior"},
@@ -539,15 +540,15 @@ def test_a_second_decision_round_is_still_answerable_after_agentflow_replied(mon
                                "<!-- agentflow-respond-target:IC_1 -->"},
         {"id": "IC_2", "body": "prompt every user"}])
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
-    monkeypatch.setattr(coordinated_build, "respond_submission",
+    monkeypatch.setattr(coordinated_respond, "respond_submission",
                         lambda *a, **k: pytest.fail("a decision answer is never a generic Respond"))
     posted = []
-    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+    monkeypatch.setattr(pipeline.github, "pr_comment",
                         lambda repo, pr, body: posted.append(body) or True)
     claimed = []
     stamp = lambda repo, number, _label: claimed.append(number) or True   # noqa: E731
     monkeypatch.setattr(dispatch, "claim", stamp)
-    monkeypatch.setattr(coordinated_build, "claim", stamp)
+    monkeypatch.setattr(coordinated_review, "claim", stamp)
     submitted = []
 
     result = dispatch._submit_coordinated_respond(
@@ -568,17 +569,17 @@ def test_an_older_unanswered_comment_before_the_park_remains_ordinary_discussion
     parked = _parked_decision_review()
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "earlier discussion", "IC_old", "sha-a"))
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [parked])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [parked])
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [
         {"id": "IC_old", "body": "earlier discussion"},
         {"id": "IC_park", "body": "> *agentflow: parked for human review.*\n\nDecide."},
         {"id": "IC_answer", "body": "keep the conservative behavior"},
     ])
-    monkeypatch.setattr(coordinated_build.github, "pr_comment",
+    monkeypatch.setattr(pipeline.github, "pr_comment",
                         lambda *a, **k: pytest.fail("older discussion never resumes review"))
-    monkeypatch.setattr(coordinated_build, "respond_submission",
+    monkeypatch.setattr(coordinated_respond, "respond_submission",
                         lambda *a, **k: SimpleNamespace(subject="7", pool="claude"))
-    monkeypatch.setattr(coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(pipeline, "owned_issues", lambda cfg, lane=None: set())
     monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: True)
     submitted = []
 
@@ -591,7 +592,7 @@ def test_an_older_unanswered_comment_before_the_park_remains_ordinary_discussion
 def test_respond_waits_while_a_prior_change_record_owns_the_claim(monkeypatch):
     monkeypatch.setattr(loop, "_next_pr_awaiting_reply", lambda cfg: (
         42, "agentflow/claude/issue-7-fix", "please adjust", "cid-1", "base"))
-    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
+    monkeypatch.setattr(dispatch.pipeline, "owned_issues",
                         lambda cfg, lane=None: {7})
     monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("must not double-claim"))
 
@@ -610,7 +611,7 @@ def test_intake_skips_an_issue_a_live_pipeline_stage_already_owns(monkeypatch):
         return None if 42 in reserved else ({"number": 42, "labels": []}, "")
 
     monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
-    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
+    monkeypatch.setattr(dispatch.pipeline, "owned_issues",
                         lambda cfg, lane=None: {42})
     monkeypatch.setattr(dispatch, "pick_pair",
                         lambda: pytest.fail("must not pick a pool for an owned issue"))
@@ -630,7 +631,7 @@ def test_intake_still_claims_a_genuinely_new_issue(monkeypatch):
         return None if 42 in reserved else ({"number": 42, "labels": []}, "")
 
     monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
-    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(dispatch.pipeline, "owned_issues", lambda cfg, lane=None: set())
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_intake, "intake_submission",
                         lambda *a, **k: SimpleNamespace(pool="claude"))
@@ -661,7 +662,7 @@ def test_intake_does_not_claim_a_dedup_hit_on_a_completed_record(monkeypatch):
             return None if 393 in reserved else ({"number": 393, "labels": []}, extra)
 
         monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
-        monkeypatch.setattr(dispatch.coordinated_build, "owned_issues",
+        monkeypatch.setattr(dispatch.pipeline, "owned_issues",
                             lambda cfg, lane=None: set())
         monkeypatch.setattr(dispatch, "pick_pair",
                             lambda: (SimpleNamespace(tool="claude"), None, ""))
@@ -690,7 +691,7 @@ def test_intake_withdraws_the_submission_when_the_claim_fails(monkeypatch):
         return None if 42 in reserved else ({"number": 42, "labels": []}, "")
 
     monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
-    monkeypatch.setattr(dispatch.coordinated_build, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(dispatch.pipeline, "owned_issues", lambda cfg, lane=None: set())
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_intake, "intake_submission",
                         lambda *a, **k: SimpleNamespace(pool="claude"))
@@ -775,7 +776,7 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
                 if counter_name in {"Semaphore", "BoundedSemaphore"}:
                     raise AssertionError(f"second capacity ledger primitive: {path}:{node.lineno}")
                 if counter_name == "Counter":
-                    assert path in {root / "coordinated_build.py", root / "dashboard_data.py"}, (
+                    assert path in {root / "pipeline.py", root / "dashboard_data.py"}, (
                         f"counter outside pacing/projection owners: {path}:{node.lineno}")
             if "coordinator" not in path.parts and isinstance(
                     node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):

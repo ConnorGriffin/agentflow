@@ -17,7 +17,7 @@ import time
 
 from conftest import FakeSession, permits
 
-from agentflow import balancer, coordinated_build
+from agentflow import balancer, coordinated_build, pipeline
 from agentflow.coordinator import Submission, quota
 from agentflow.coordinator.store import default_store_path
 
@@ -76,7 +76,7 @@ def test_a_stale_below_ceiling_reading_cannot_be_reused_to_overshoot_the_ceiling
     _seed_claude_quota(30.0, now=now, resets_at=now + 4 * 3600, observed_at=now)
 
     fake = FakeSession()
-    coord = make_coord(fake, gate=coordinated_build._production_gate())
+    coord = make_coord(fake, gate=pipeline._production_gate())
     for subject in ("1", "2", "3"):
         coord.submit_stage(Submission(repo="o/r", subject=subject, stage="intake",
                                       pool="claude", source="/ro"))
@@ -98,7 +98,7 @@ def test_without_the_reservation_the_same_three_all_overshoot(
     _seed_claude_quota(30.0, now=now, resets_at=now + 4 * 3600, observed_at=now)
 
     fake = FakeSession()
-    coord = make_coord(fake, gate=coordinated_build._production_gate())
+    coord = make_coord(fake, gate=pipeline._production_gate())
     for subject in ("1", "2", "3"):
         coord.submit_stage(Submission(repo="o/r", subject=subject, stage="intake",
                                       pool="claude", source="/ro"))
