@@ -61,6 +61,38 @@ def test_operator_pacing_is_charged_only_after_a_confirmed_start(make_coord, mon
     assert launcher.calls == 2  # miss is free, one confirmed start spends active pacing
 
 
+def test_launch_gate_queries_each_pool_once_per_cycle(make_coord, monkeypatch):
+    """A slow capacity helper must cost one bounded probe, not one probe per waiting record.
+
+    The production coordinator evaluates the gate for every cold record. Before this regression,
+    thirteen waiting records could serialize thirteen 30-second helper timeouts and hold the whole
+    fleet pass for minutes even though every probe returned the same pool fact.
+    """
+    from agentflow.balancer import PoolStatus
+    calls = []
+
+    def query(tool, **_):
+        calls.append(tool)
+        return PoolStatus(tool, True, 10.0, active=True, windows=(_weekly_clear(),))
+
+    monkeypatch.setattr("agentflow.balancer._query_pool", query)
+    fake = FakeSession()
+    coord = make_coord(fake, gate=pipeline._production_gate())
+    first = coord.submit_stage(
+        Submission(repo="o/r", subject="1", stage="intake", pool="claude", source="/one"))
+    second = coord.submit_stage(
+        Submission(repo="o/r", subject="2", stage="intake", pool="claude", source="/two"))
+
+    coord.cycle("claude")
+    assert calls == ["claude"]
+    assert sorted((record_of(coord, first).state, record_of(coord, second).state)) == [
+        "running", "waiting"]
+
+    coord.cycle("claude")
+    assert calls == ["claude", "claude"]
+    assert record_of(coord, first).state == record_of(coord, second).state == "running"
+
+
 def _converse(subject="c1", *, pool="claude", source="/wt/ask"):
     """An operator-present Ask turn — interactive, so admission is real-time (issue #161)."""
     return Submission(repo="o/r", subject=subject, stage="converse", target="1", pool=pool,
