@@ -32,6 +32,7 @@ from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coor
                                    IntakeStageAdapter, MockupStageAdapter, ResearchStageAdapter,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
                                    StageRouter, tracer)
+from agentflow.coordinator.admission import MACHINE_CEILING, STAGE_CAPS
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
 from agentflow.labels import BUILDING, DRAWING, RESOLVING, TRIAGING
@@ -237,13 +238,12 @@ class _ProductionGate:
     @staticmethod
     def reservation_limits(record) -> ReservationLimits:
         """The global limits the store enforces with the running-row reservation."""
-        from agentflow import dispatch
         lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build",
                 "respond": "respond", "mockup": "mockup", "research": "research"}
         stage_lane = lane.get(record.stage, record.stage)
         return ReservationLimits(
-            machine_ceiling=dispatch.MACHINE_CEILING,
-            stage_cap=dispatch.STAGE_CAPS.get(stage_lane, 1),
+            machine_ceiling=MACHINE_CEILING,
+            stage_cap=STAGE_CAPS.get(stage_lane, 1),
             stage_lane=stage_lane,
             lane_by_stage=lane,
         )

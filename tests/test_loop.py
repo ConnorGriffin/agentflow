@@ -52,6 +52,17 @@ def test_complexity_from_labels_reads_the_label():
 def test_complexity_from_labels_is_none_without_one():
     # Hard gate (ADR 0018): no complexity label => the loop must skip, not guess.
     assert complexity_from_labels(["ready-for-agent", "bug"]) is None
+
+
+def test_a_double_stamped_dial_resolves_the_same_way_every_run():
+    # A typed row carries its labels as a set, and the dial decoders take the first match, so an
+    # issue a human stamped with both sizes must not pick a different builder model per process.
+    row = github.IssueRow(number=7, title="t", body="",
+                          labels=frozenset({"agentflow:complexity:standard",
+                                            "agentflow:complexity:deep", "ready-for-agent"}))
+    names = [label["name"] for label in loop._row_dict(row)["labels"]]
+    assert names == sorted(names)
+    assert complexity_from_labels(names) is Complexity.DEEP
     assert complexity_from_labels([]) is None
 
 

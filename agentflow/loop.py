@@ -50,7 +50,11 @@ def _row_dict(row: github.IssueRow) -> dict:
     bridge to the not-yet-migrated consumers, so the wire shape is reassembled once here rather
     than at every call site."""
     return {"number": row.number, "title": row.title, "body": row.body,
-            "labels": [{"name": name} for name in row.labels]}
+            # Sorted, because a typed row holds its labels as a set: the dial decoders take the
+            # first match, so an issue hand-stamped with two `complexity:`/`effort:` labels would
+            # otherwise resolve to a different model size from one process to the next. Sorting
+            # settles such a tie on `deep` over `standard`, the more cautious of the two.
+            "labels": [{"name": name} for name in sorted(row.labels)]}
 
 
 def _issues_in_flight(cfg: RepoConfig) -> set[int] | None:

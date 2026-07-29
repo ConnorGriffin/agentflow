@@ -16,19 +16,6 @@ from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
 from agentflow.coordinator.quota_poll import refresh_claude_quota
 from agentflow.coordinator.store import default_store_path
 
-# Production limits are named here for the coordinator's one composed admission gate. They are
-# not counters: durable running rows are the only concurrency/permit ledger.
-MACHINE_CEILING = int(os.environ.get("AGENTFLOW_MAX_SESSIONS", "4"))
-TRIAGE_CONCURRENCY = int(os.environ.get("AGENTFLOW_TRIAGE_CONCURRENCY", "3"))
-BUILD_CONCURRENCY = int(os.environ.get("AGENTFLOW_BUILD_CONCURRENCY", "2"))
-STAGE_CAPS = {
-    "triage": TRIAGE_CONCURRENCY,
-    "build": BUILD_CONCURRENCY,
-    "mockup": 1,
-    "respond": 1,
-    "research": 1,
-}
-
 
 def _spawn(fn) -> threading.Thread:
     thread = threading.Thread(target=fn, daemon=True)

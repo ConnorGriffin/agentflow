@@ -834,13 +834,18 @@ def _settle_review(record) -> str | None:
     # gate's own blockers, decided there rather than a second time here. A clean verdict can only
     # come back non-MERGE as a blocker or on red CI, and settlement parks either — it never churns
     # a revise round over a red build.
+    pending_reply = reply_pending(comments)
     decision = decide_merge(
         verdict=verdict, ci_green=ci_green, reviewer_tool=record.pool,
         builder_tool=record.change_author_tool or record.builder_lineage or "",
         revises_used=record.round,
-        ui_evidence_missing=ui_gap, reply_pending=reply_pending(comments))
+        ui_evidence_missing=ui_gap, reply_pending=pending_reply)
     if decision is not MergeDecision.MERGE:
+        # A maintainer's own unanswered question outranks red CI in the park notice: telling them
+        # the build failed when the pipeline is really waiting on their answer sends them to the
+        # wrong place. Same precedence the pre-gate settlement used.
         reason = (UI_GAP_REASON if ui_gap
+                  else "could not be auto-merged after review" if pending_reply
                   else "CI did not complete successfully within the review settlement window"
                   if not ci_green else "could not be auto-merged after review")
         return _park_review_settlement(

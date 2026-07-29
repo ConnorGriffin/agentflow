@@ -882,7 +882,7 @@ def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch
     assert merged == [42]
 
 
-def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments):
+def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments, ci_green=True):
     """Settle one clean, exact-head, autonomous PR and report what the merge gate was asked.
 
     Everything the settlement reads is fixed except the two facts under test — what the PR's diff
@@ -921,7 +921,7 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments)
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
-    coordinated_review._REVIEW_CI_OBSERVED[record.identity] = True
+    coordinated_review._REVIEW_CI_OBSERVED[record.identity] = ci_green
 
     proof = coordinated_review._settle_review(record)
     coordinated_review._REVIEW_CI_OBSERVED.pop(record.identity, None)
@@ -956,6 +956,19 @@ def test_unanswered_maintainer_question_is_blocked_by_the_gate_it_is_reported_to
         comments=[{"id": "9001", "body": "Why did this drop the retry?"}])
 
     assert settled.asked and settled.asked[0]["reply_pending"] is True
+    assert settled.parked == ["could not be auto-merged after review"]
+
+
+def test_an_unanswered_question_outranks_red_ci_in_the_park_notice(monkeypatch):
+    """A maintainer whose question is still hanging must not be told the build failed. Both are
+    true, but only one of them is theirs to act on, and the park comment is where they read it."""
+    settled = _settle_autonomous_clean_review(
+        monkeypatch,
+        surfaces=[],
+        pr_view={"files": [], "body": "", "comments": []},
+        comments=[{"id": "9002", "body": "Should this keep the old default?"}],
+        ci_green=False)
+
     assert settled.parked == ["could not be auto-merged after review"]
 
 

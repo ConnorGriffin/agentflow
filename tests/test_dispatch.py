@@ -15,14 +15,15 @@ from conftest import FakeSession, record_of
 from agentflow import (coordinated_build, coordinated_mockup, coordinated_respond,
                        coordinated_review, dispatch, github, live, loop, pipeline)
 from agentflow.coordinator import MockupStageAdapter
+from agentflow.coordinator import admission
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.loop import RepoConfig
 
 
 def test_stage_caps_remain_named_inputs_to_the_coordinator_gate():
-    assert dispatch.STAGE_CAPS == {"triage": 3, "build": 2, "mockup": 1, "respond": 1,
-                                   "research": 1}
-    assert dispatch.MACHINE_CEILING > 0
+    assert dict(admission.STAGE_CAPS) == {"triage": 3, "build": 2, "mockup": 1, "respond": 1,
+                                          "research": 1}
+    assert admission.MACHINE_CEILING > 0
 
 
 def test_paused_cycle_submits_nothing_but_still_reconciles(monkeypatch):
