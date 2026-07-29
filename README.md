@@ -5,26 +5,77 @@
 [![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](docs/public-beta.md)
 [![Sponsor](https://img.shields.io/badge/sponsor-ConnorGriffin-ea4aaa?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/ConnorGriffin)
 
-AgentFlow turns GitHub issues into agent-built, reviewed pull requests using
-Claude Code, Codex, or both. Each repository chooses how far automation may go.
+AgentFlow is an unattended GitHub issue → pull request engine. It grounds work,
+builds it with Claude Code or Codex, reviews the exact pushed commit, and applies
+the repository's merge policy.
 
 > **macOS beta:** AgentFlow launches authenticated local coding agents, GitHub
 > CLI, Git, and uv. Run it only on a machine where unattended coding sessions
 > are acceptable.
 
-![AgentFlow console showing a Codex build in progress and provider capacity](mockups/evidence/issue-70-live-session.png)
+## The mental model
 
-## How it works
+AgentFlow does not decide what deserves to become work. It executes work that a
+human has already approved as an ordinary GitHub issue.
 
-1. **Intake** turns an issue into a grounded Agent Brief.
-2. **Build** gives Claude or Codex an isolated worktree and the brief.
-3. **Review** sends the exact pull-request head to the other tool when required.
-4. **Gate** merges the result or leaves a clear human action, based on the
-   repository's autonomy profile.
+For large or uncertain efforts, [Wayfinder](docs/adr/0027-wayfinder-planning-boundary.md)
+is the upstream planning layer:
 
-The daemon coordinates the work. The read-only console shows provider capacity,
-work in flight, repositories awaiting attention, recent merges, and trust-ratchet
-state.
+```text
+foggy destination
+      ↓
+Wayfinder Decision Map
+      ↓
+research · prototypes · grilling · operator decisions
+      ↓
+clear, independently shippable subtree
+      ↓
+ordinary standalone Build Issue
+      ↓
+AgentFlow intake → build → review → gate
+```
+
+Wayfinder makes uncertainty explicit and earns the right to file work.
+AgentFlow turns approved work into a safe, reviewed change.
+
+GitHub and the repository remain the durable authority. The console is a
+read-only projection; it is not another planner, tracker, or mutation surface.
+
+## Issue intake and routing
+
+The daemon selects an open issue only when it has no AgentFlow state or claim
+and no `wayfinder:*` label. Planning artifacts cannot accidentally become
+builds.
+
+Intake reads the issue and repository, rewrites the request as a grounded Agent
+Brief, and returns one structured route:
+
+| Route | Meaning | Result |
+| --- | --- | --- |
+| `ready` | The outcome and constraints are clear | Add complexity and effort dials, then enter the build queue |
+| `mockup` | A visual decision is missing | Hold for the human-selected `/ui-mockups` flow |
+| `grill` | Missing intent would change the outcome | Hold until a maintainer resolves the fork |
+| `nothing-new` | A resumed issue has no new actionable reply | Make no duplicate projection |
+
+Malformed output, missing dials, and unreadable routes fail closed to a
+human-visible hold. They never become accidental builds.
+
+## How the engine works an issue
+
+1. **Intake** grounds the issue and writes the Agent Brief.
+2. **Dispatch** selects a provider with headroom and reserves durable capacity.
+3. **Build** works in an isolated worktree, tests, pushes, and opens a PR.
+4. **Review** sends the exact pushed head to an independent tool when required.
+5. **Revise** addresses findings, feedback, and conflicts with bounded retries.
+6. **Gate** checks CI, review proof, taint, collision safety, and repo policy.
+7. **Recover** resumes from durable facts without duplicating work or claims.
+
+PR-bound work drains before new issues. Live operator activity reduces
+unattended dispatch without killing sessions already running.
+
+Reviewers may ship clear fixes. When they do, the other tool must inspect the
+new exact head. Repeated cross-tool disagreement parks for a human instead of
+looping forever.
 
 ## Autonomy profiles
 
@@ -37,6 +88,69 @@ state.
 New repositories default to `reviewed`. A repository declares its profile with
 `profile: autonomous`, `profile: reviewed`, or `profile: guarded` in its
 `AGENTS.md` or `CLAUDE.md`.
+
+There is one engine, not a different pipeline per profile. The profile controls
+trust and merge authority. Declared capabilities control available tools and
+required proof.
+
+## Wayfinder and AgentFlow
+
+Wayfinder owns destination-setting, dependency-ordered decisions, and the human
+judgment required to turn a clear subtree into a Build Issue.
+
+Decision tickets have one type:
+
+- `wayfinder:research`: a bounded question that may run unattended.
+- `wayfinder:prototype`: human-selected UI exploration.
+- `wayfinder:grilling`: a human-in-the-loop domain decision.
+- `wayfinder:task`: an operator prerequisite that unblocks a decision.
+
+AgentFlow excludes every `wayfinder:*` ticket from normal intake. The one narrow
+exception is open, unblocked, unclaimed `wayfinder:research`.
+
+That exception executes research, not planning judgment. A human still decides
+whether a recommendation becomes a Build Issue.
+
+## How skills are invoked
+
+“Installed” does not mean “automatically dispatched.” Skills enter the system in
+three ways:
+
+1. **Chat triggers.** A conversational agent selects a skill when the user names
+   it or the request matches its `SKILL.md` description.
+2. **Skill composition.** Wayfinder invokes tools such as `/grilling`,
+   `/domain-modeling`, `/research`, and `/ui-mockups` at defined boundaries.
+3. **Engine prompts.** AgentFlow supplies stage-specific contracts and only the
+   checked capabilities enrolled in that repository.
+
+The Python engine does not scan or dispatch every globally installed personal
+skill. User-global skills and connectors are intentionally absent from
+unattended sessions.
+
+## Where the project is today
+
+The issue-to-PR engine, structured intake, dual-provider dispatch, isolated
+builds, exact-head review, bounded recovery, autonomy profiles, and read-only
+console exist on `main`.
+
+The main open boundary bug is research disposition. Today, non-empty findings
+can close a research ticket even when they recommend new implementation work.
+
+The target contract is:
+
+- Every result becomes `handoff_required`, `no_build`, or concretely `deferred`.
+- Handoff candidates remain visible until a human disposes every one.
+- Selected candidates become standalone Build Issues with durable provenance.
+- Research closes only after reconciliation.
+- Crash replay creates no duplicate comments, labels, map lines, or issues.
+
+The broader destination is one read-only fleet → repository → map console. It
+should show frontiers, blockers, pipeline state, evidence, provider headroom,
+required actions, and honest freshness.
+
+That console remains behind its whole-surface prototype and implementation
+slicing decisions: [#183](https://github.com/ConnorGriffin/agentflow/issues/183)
+and [#184](https://github.com/ConnorGriffin/agentflow/issues/184).
 
 ## Quick start
 
@@ -129,16 +243,11 @@ Use `agentflow pause` before maintenance.
 Daemon output goes to `~/Library/Logs/agentflow.log`. Re-run the install command
 after changing paths, environment, or the AgentFlow checkout.
 
-## Skills and repository capabilities
+## Repository capabilities
 
-AgentFlow is not a bundle or wrapper for Matt Pocock's skills. Its issue-to-PR
-engine is Python. It shares the broader method of turning repeatable agent work
-into explicit, reviewable skills.
-
-Enrollment installs AgentFlow's bundled operating skill inside each repository.
-For UI repositories, it also installs pinned `ui-mockups` and
-`drive-local-webapp` skills, a screenshot harness, and the required browser
-runtime.
+Enrollment installs AgentFlow's operating skill inside each repository. UI
+repositories also get pinned `ui-mockups` and `drive-local-webapp` skills, a
+screenshot harness, and the required browser runtime.
 
 The UI skills are also available independently from
 [Connor Griffin's public skills repository](https://github.com/ConnorGriffin/skills):
@@ -151,7 +260,7 @@ npx skills add ConnorGriffin/skills \
 
 [Codebase Memory onboarding](https://github.com/ConnorGriffin/skills/tree/main/skills/cbm-onboard)
 and [Matt Pocock's upstream skills](https://github.com/mattpocock/skills) are
-optional. AgentFlow does not require either.
+optional.
 
 Unattended stages receive AgentFlow's canonical charter, but not personal
 global instructions or connectors. An optional local Codebase Memory server is
@@ -172,7 +281,7 @@ checked-in project files:
 5. Install the AgentFlow service and resume it.
 
 The capability manifest pins required skill and runtime versions. Recovery does
-not depend on remembered dotfiles or user-global skills.
+not depend on remembered user-global configuration.
 
 ## Foreground notifications
 
