@@ -75,6 +75,19 @@ pause until a stuck review parks, never a permanent freeze. A build held back th
 way yields the pool without reserving anything, so it does not block the pool
 head-of-line — the very review it yields to is reached in the same cycle.
 
+## Amendment (2026-07-29) — preparation failure cannot hold the fleet
+
+The bounded-stall argument above omitted preparation failures. Preparing a review
+checkout happens before admission and deliberately consumes no permit or attempt,
+so a review that cannot prepare never exhausts its attempt budget and never parks.
+Keeping that record eligible at the reservation gate can therefore freeze its pool
+forever while every provider permit remains idle.
+
+After an unprepared PR-bound stage, the coordinator moves its next eligibility to
+the following cycle. It remains waiting and keeps its full attempt budget, but it
+does not block issue-bound work during that short interval. A review that can
+prepare still drains first exactly as before.
+
 ## Alternatives considered
 
 - **Status quo (identity-ordered cold queue).** Rejected: arbitrary interleaving
