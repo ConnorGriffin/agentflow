@@ -780,3 +780,22 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
                          if isinstance(item, ast.Name)]
                 assert not any("permit" in name.lower() for name in names), (
                     f"second permit ledger outside coordinator: {path}:{node.lineno}")
+
+
+def test_no_module_outside_the_github_module_shells_out_to_gh():
+    """ADR 0040: all GitHub access flows through one typed, fail-closed module. Any `gh` argument
+    vector built anywhere else is a bypass of the seam — however it is later run."""
+    root = Path(__file__).parents[1] / "agentflow"
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        # An argv that is only *described* in a raised error is never executed, so it isn't
+        # GitHub access. Nothing else is exempt.
+        described = {id(item) for node in ast.walk(tree) if isinstance(node, ast.Raise)
+                     for item in ast.walk(node) if isinstance(item, ast.List)}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.List) or id(node) in described:
+                continue
+            first = node.elts[0] if node.elts else None
+            if isinstance(first, ast.Constant) and first.value == "gh":
+                assert path == root / "github.py", (
+                    f"GitHub access outside the github module: {path}:{node.lineno}")

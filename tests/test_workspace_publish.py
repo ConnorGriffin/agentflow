@@ -13,6 +13,7 @@ import subprocess
 
 import pytest
 
+from agentflow import github
 from agentflow.workspace import publish
 from agentflow.workspace.store import FAILED, PUBLISHED, WorkspaceStore
 
@@ -66,6 +67,15 @@ def _fail(stderr="boom"):
 
 
 @pytest.fixture
+def gh(monkeypatch):
+    """Stand in for GitHub itself. Publishing reaches GitHub only through the one access module
+    (ADR 0040), so faking that module's `gh` runner fakes every call publishing can make."""
+    fake = FakeGitHub()
+    monkeypatch.setattr(github, "_run", fake)
+    return fake
+
+
+@pytest.fixture
 def store(tmp_path):
     s = WorkspaceStore("ConnorGriffin/agentflow", path=tmp_path / "agentflow.db")
     yield s
@@ -84,10 +94,9 @@ def _approved(store, cid="conv-1", hash_="sha256:v1", title="Add a Publish butto
 REPO = "ConnorGriffin/agentflow"
 
 
-def test_approving_publishes_one_issue_stamped_with_provenance_and_no_wayfinder_label(store):
+def test_approving_publishes_one_issue_stamped_with_provenance_and_no_wayfinder_label(store, gh):
     cid = _approved(store)
-    gh = FakeGitHub()
-    issue = publish.publish_approved(REPO, cid, store=store, gh=gh, now=10)
+    issue = publish.publish_approved(REPO, cid, store=store, now=10)
     assert gh.created == 1 and issue["number"] == 100
     body = gh.issues[0]["body"]
     assert publish.provenance_line("sha256:v1") in body       # the hash is the provenance key
@@ -96,13 +105,12 @@ def test_approving_publishes_one_issue_stamped_with_provenance_and_no_wayfinder_
     assert prop.state == PUBLISHED and prop.published_issue == 100
 
 
-def test_a_replay_between_create_and_receipt_never_files_a_duplicate(store):
+def test_a_replay_between_create_and_receipt_never_files_a_duplicate(store, gh):
     """The crash-recovery proof (AC #3): the daemon created the issue but crashed before recording
     the receipt, so the Proposal is still APPROVED. The next reconcile MUST search the provenance
     key before creating — it finds the existing issue and records the receipt only. Exactly one
     issue for the hash. Would fail if the pre-create search regressed to create-first."""
     cid = _approved(store)
-    gh = FakeGitHub()
 
     # First attempt: create the issue, then crash before recording the receipt.
     def crash_after_create(*a, **k):
@@ -111,30 +119,29 @@ def test_a_replay_between_create_and_receipt_never_files_a_duplicate(store):
     original = store.record_publication
     store.record_publication = crash_after_create
     with pytest.raises(RuntimeError):
-        publish.publish_approved(REPO, cid, store=store, gh=gh, now=10)
+        publish.publish_approved(REPO, cid, store=store, now=10)
     assert gh.created == 1                                     # the issue exists on GitHub...
     assert store.proposal(cid).state == "approved"            # ...but no receipt was recorded
 
     # Recovery: the reconcile runs again. It searches first, finds the just-created issue, and
     # records the receipt without creating a second one.
     store.record_publication = original
-    issue = publish.publish_approved(REPO, cid, store=store, gh=gh, now=11)
+    issue = publish.publish_approved(REPO, cid, store=store, now=11)
     assert gh.created == 1                                     # STILL exactly one issue for the hash
     assert issue["number"] == 100
     assert store.proposal(cid).state == PUBLISHED
 
 
-def test_a_hard_create_failure_parks_failed_with_a_plain_reason_and_stops_auto_retry(store):
+def test_a_hard_create_failure_parks_failed_with_a_plain_reason_and_stops_auto_retry(store, gh):
     """AC #3/regression: a hard ``gh issue create`` failure records a durable FAILED disposition
     with a plain human reason and ``failed_at``, keeps the approval bound to its hash, and is NOT
     silently re-attempted. Fails on the old code, which stayed APPROVED and republished every cycle.
     """
     cid = _approved(store)
-    gh = FakeGitHub()
     gh.fail_create = True
     gh.create_stderr = "HTTP 401: Bad credentials (https://api.github.com/repos/...)"
 
-    assert publish.publish_approved(REPO, cid, store=store, gh=gh, now=10) is None
+    assert publish.publish_approved(REPO, cid, store=store, now=10) is None
     prop = store.proposal(cid)
     assert prop.state == FAILED                               # durable failed disposition, not approved
     assert prop.fail_reason == "GitHub rejected the request — bad credentials."  # plain, not stderr
@@ -144,19 +151,18 @@ def test_a_hard_create_failure_parks_failed_with_a_plain_reason_and_stops_auto_r
     # No silent re-attempt: a parked failure is not APPROVED, so a following publish pass is a
     # no-op that files nothing and leaves it failed until an operator Retry re-authorizes it.
     gh.fail_create = False
-    assert publish.publish_approved(REPO, cid, store=store, gh=gh, now=20) is None
+    assert publish.publish_approved(REPO, cid, store=store, now=20) is None
     assert gh.created == 0 and store.proposal(cid).state == FAILED
 
 
-def test_retry_after_a_failure_republishes_the_same_version_without_a_duplicate(store):
+def test_retry_after_a_failure_republishes_the_same_version_without_a_duplicate(store, gh):
     """AC #5/#7: Retry = the operator re-issuing ``approve_proposal`` for the same hash. It clears
     the failure and re-authorizes; the search-before-create idempotency still holds, so even if an
     issue for that hash already exists it records the receipt without a second ``create_issue``.
     """
     cid = _approved(store)
-    gh = FakeGitHub()
     gh.fail_create = True
-    assert publish.publish_approved(REPO, cid, store=store, gh=gh, now=10) is None
+    assert publish.publish_approved(REPO, cid, store=store, now=10) is None
     assert store.proposal(cid).state == FAILED
 
     # An issue for this exact hash already exists on GitHub (e.g. a prior attempt that raced).
@@ -168,27 +174,26 @@ def test_retry_after_a_failure_republishes_the_same_version_without_a_duplicate(
     assert store.proposal(cid).state == "approved"           # failure cleared; re-authorized
     assert store.proposal(cid).fail_reason is None
 
-    issue = publish.publish_approved(REPO, cid, store=store, gh=gh, now=12)
+    issue = publish.publish_approved(REPO, cid, store=store, now=12)
     assert gh.created == 0                                    # search-before-create found it — no dup
     assert issue["number"] == existing
     assert store.proposal(cid).state == PUBLISHED
 
 
-def test_retry_after_a_failure_creates_exactly_one_issue_when_none_exists(store):
+def test_retry_after_a_failure_creates_exactly_one_issue_when_none_exists(store, gh):
     """The common Retry path: the first attempt created nothing, so Retry files exactly one issue."""
     cid = _approved(store)
-    gh = FakeGitHub()
     gh.fail_create = True
-    publish.publish_approved(REPO, cid, store=store, gh=gh, now=10)
+    publish.publish_approved(REPO, cid, store=store, now=10)
     assert store.proposal(cid).state == FAILED
 
     gh.fail_create = False
     store.approve_proposal(cid, "sha256:v1", idempotency_key="retry-1", now=11)
-    publish.publish_approved(REPO, cid, store=store, gh=gh, now=12)
+    publish.publish_approved(REPO, cid, store=store, now=12)
     assert gh.created == 1 and store.proposal(cid).state == PUBLISHED
 
 
-def test_reconcile_publishes_every_approved_proposal_and_skips_the_rest(tmp_path):
+def test_reconcile_publishes_every_approved_proposal_and_skips_the_rest(tmp_path, gh):
     path = tmp_path / "agentflow.db"
     seed = WorkspaceStore(REPO, path=path)
     approved = _approved(seed, cid="conv-approved", hash_="sha256:aaa")
@@ -200,8 +205,7 @@ def test_reconcile_publishes_every_approved_proposal_and_skips_the_rest(tmp_path
 
     cfg = type("Cfg", (), {"repo": REPO})()
     factory = lambda repo: WorkspaceStore(repo, path=path)  # noqa: E731
-    gh = FakeGitHub()
-    receipts = publish.reconcile_publications([cfg], store_factory=factory, gh=gh, now=10)
+    receipts = publish.reconcile_publications([cfg], store_factory=factory, now=10)
     assert gh.created == 1                                     # only the approved one published
     assert [r["conversation_id"] for r in receipts] == [approved]
     after = factory(REPO)
@@ -212,7 +216,7 @@ def test_reconcile_publishes_every_approved_proposal_and_skips_the_rest(tmp_path
         after.close()
 
 
-def test_reconcile_is_idempotent_across_cycles(tmp_path):
+def test_reconcile_is_idempotent_across_cycles(tmp_path, gh):
     """Once published, a later reconcile is a no-op that never files a second issue (the daemon
     runs this every cycle)."""
     path = tmp_path / "agentflow.db"
@@ -221,7 +225,6 @@ def test_reconcile_is_idempotent_across_cycles(tmp_path):
     seed.close()
     cfg = type("Cfg", (), {"repo": REPO})()
     factory = lambda repo: WorkspaceStore(repo, path=path)  # noqa: E731
-    gh = FakeGitHub()
-    publish.reconcile_publications([cfg], store_factory=factory, gh=gh, now=10)
-    publish.reconcile_publications([cfg], store_factory=factory, gh=gh, now=20)
+    publish.reconcile_publications([cfg], store_factory=factory, now=10)
+    publish.reconcile_publications([cfg], store_factory=factory, now=20)
     assert gh.created == 1

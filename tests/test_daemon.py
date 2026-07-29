@@ -11,7 +11,7 @@ from unittest import mock
 
 import pytest
 
-from agentflow import daemon, live
+from agentflow import daemon, github, live
 from agentflow.config import RuntimeConfig
 from agentflow.daemon import PollLoop, _acquire_lock, _release_lock, cycle
 from agentflow.loop import RepoConfig
@@ -209,7 +209,7 @@ def test_newly_ready_issue_dispatches_within_a_fast_tick(monkeypatch):
     from agentflow.probe import ChangeProbe
 
     # A fleet that was quiet, then a new ready-for-agent issue appears (its update is newer).
-    feed = iter([[], [{"number": 42, "updatedAt": "2026-07-14T10:00:00Z"}]])
+    feed = iter([[], [github.SearchHit(number=42, updated_at="2026-07-14T10:00:00Z")]])
     probe = ChangeProbe([A], search=lambda repos, since: next(feed),
                         now=lambda: "2026-07-14T09:59:00Z")
     passes = []
@@ -379,7 +379,7 @@ def test_change_probe_costs_one_call_per_tick_for_the_whole_fleet():
 
     def fake_search(repos, since):
         calls.append((tuple(repos), since))
-        return [{"number": 5, "updatedAt": "2999-01-01T00:00:00Z"}]
+        return [github.SearchHit(number=5, updated_at="2999-01-01T00:00:00Z")]
 
     probe = ChangeProbe([A, B], search=fake_search, now=lambda: "2000-01-01T00:00:00Z")
     assert probe.changed() is True
@@ -394,9 +394,9 @@ def test_change_probe_reports_change_only_when_something_moved():
 
     feed = iter([
         [],                                                  # nothing new
-        [{"number": 5, "updatedAt": "2026-07-14T10:00:00Z"}],  # a new update → change
-        [{"number": 5, "updatedAt": "2026-07-14T10:00:00Z"}],  # same update seen again → no change
-        [{"number": 6, "updatedAt": "2026-07-14T10:05:00Z"}],  # a newer update → change
+        [github.SearchHit(5, "2026-07-14T10:00:00Z")],   # a new update → change
+        [github.SearchHit(5, "2026-07-14T10:00:00Z")],   # same update seen again → no change
+        [github.SearchHit(6, "2026-07-14T10:05:00Z")],   # a newer update → change
     ])
     probe = ChangeProbe([A], search=lambda repos, since: next(feed),
                         now=lambda: "2026-07-14T09:00:00Z")

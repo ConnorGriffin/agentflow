@@ -94,6 +94,23 @@ class SearchHit:
     updated_at: str
 
 
+@dataclass(frozen=True)
+class IssueMatch:
+    """One issue matched by a free-text search within a repo, body included so the caller can
+    confirm the hit really carries what it searched for."""
+    number: int
+    url: str
+    body: str
+
+
+@dataclass(frozen=True)
+class IssueCreation:
+    """The outcome of creating an issue: the new issue's ``url``, or a ``url`` of ``None`` when
+    the create failed, with ``error`` carrying `gh`'s own failure text for the caller to word."""
+    url: str | None = None
+    error: str = ""
+
+
 # --- internals -----------------------------------------------------------------
 
 def _gh(args: list[str]) -> subprocess.CompletedProcess:
@@ -277,7 +294,32 @@ def search(repos: list[str], since: str, *, limit: int = 100) -> list[SearchHit]
     ]
 
 
+def find_issues(repo: str, term: str, *, limit: int = 50) -> list[IssueMatch] | None:
+    """Issues in ``repo`` in any state whose free-text search matches ``term``, as typed rows,
+    or ``None`` if the search failed. No matches returns an empty list."""
+    data = _read_json(["issue", "list", "--repo", repo, "--state", "all", "--search", term,
+                       "--json", "number,url,body", "--limit", str(limit)])
+    if not isinstance(data, list):
+        return None
+    return [
+        IssueMatch(number=row["number"], url=row.get("url", "") or "",
+                   body=row.get("body", "") or "")
+        for row in data if isinstance(row, dict) and isinstance(row.get("number"), int)
+    ]
+
+
 # --- writes (report the command's result, not durable proof) -------------------
+
+def create_issue(repo: str, title: str, body: str) -> IssueCreation:
+    """Create an issue and report what the command did: the new issue's URL, or `gh`'s failure
+    text. Like every write here it reports the command's result — it never re-reads to prove the
+    issue landed."""
+    r = _gh(["issue", "create", "--repo", repo, "--title", title, "--body", body])
+    if r.returncode != 0:
+        return IssueCreation(error=getattr(r, "stderr", "") or "")
+    return IssueCreation(url=(r.stdout or "").strip().splitlines()[-1].strip() if r.stdout else "")
+
+
 
 def add_label(repo: str, issue: int, label: str) -> bool:
     """Add ``label`` to the issue. Returns whether the command succeeded."""
