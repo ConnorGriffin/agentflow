@@ -46,6 +46,8 @@ New repositories default to `reviewed`. A repository declares its profile with
 - Python 3.11 or newer and [uv](https://docs.astral.sh/uv/)
 - Git and an authenticated [GitHub CLI](https://cli.github.com/)
 - At least one authenticated Claude Code or Codex installation
+- For UI repository enrollment: Node.js 18 or newer, npm, and npx (Node.js 20
+  or newer is recommended)
 
 Both providers are required for automatic cross-tool review in the
 `autonomous` profile. With one provider, AgentFlow can still build work;
@@ -60,9 +62,9 @@ cd agentflow
 uv sync --group dev
 ```
 
-The built console is tracked in the clone. Headless repositories need no Node.
-Enrolling a UI repository installs pinned Playwright and Chromium tooling and
-recommends Node 20 or newer. Console development also requires Node.
+The built console is tracked in the clone. Headless repository enrollment needs
+no Node.js, npm, or npx. UI enrollment requires them and installs pinned
+Playwright and Chromium tooling. Console development also requires Node.js.
 
 ### Enroll a repository
 
@@ -172,14 +174,20 @@ checked-in project files:
 The capability manifest pins required skill and runtime versions. Recovery does
 not depend on remembered dotfiles or user-global skills.
 
-## Optional notifications
+## Foreground notifications
 
-Notifications are disabled by default. Set `AGENTFLOW_NTFY_URL` to an ntfy topic
-URL for best-effort alerts when a run needs human attention:
+Notifications are disabled by default. `AGENTFLOW_NTFY_URL` applies only to a
+foreground daemon launched from the same shell:
 
 ```bash
 export AGENTFLOW_NTFY_URL="https://ntfy.example.com/your-private-topic"
+uv run agentflow daemon
 ```
+
+The installed LaunchAgent does not inherit `AGENTFLOW_NTFY_URL` from your shell.
+`service install` writes selected runtime values to its plist, but does not copy
+the topic URL. Notifications therefore remain disabled for the service. Do not
+add the topic URL to the plist.
 
 Treat an unprotected topic URL as sensitive configuration. Do not commit it.
 
