@@ -107,6 +107,17 @@ MODEL_FOR = MappingProxyType({
 })
 
 
+def native_handoff_proof(record) -> str | None:
+    """The durable proof of a stage-native handoff nobody wrote a richer one for.
+
+    The kind comes from the table above, so a stage adapter with no handoff collaborator, the
+    coordinator's own fallback, and the ``handoff_kind`` stamped on the record can never name
+    different handoffs for the same stage. An unrecognized stage has no handoff to prove, so it
+    withholds the proof and the hold is retried rather than recorded as done."""
+    kind = STAGE_NATIVE_HANDOFF.get(record.stage)
+    return f"proof:{record.identity}:{kind}" if kind else None
+
+
 def normalize_stage(stage: str) -> str:
     """Map a legacy orchestration label to its logical stage. Idempotent for the six
     logical stages, so callers that already know their stage pass it straight through."""
