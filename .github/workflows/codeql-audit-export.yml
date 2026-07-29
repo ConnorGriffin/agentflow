@@ -47,18 +47,19 @@ jobs:
 
           repository = os.environ["REPOSITORY"]
           alerts = []
-          page = 1
-          while True:
-              query = urllib.parse.urlencode(
-                  {"per_page": 100, "page": page, "state": "open"}
-              )
-              batch = get_json(
-                  f"{API}/repos/{repository}/code-scanning/alerts?{query}"
-              )
-              alerts.extend(batch)
-              if len(batch) < 100:
-                  break
-              page += 1
+          for state in ("open", "closed"):
+              page = 1
+              while True:
+                  query = urllib.parse.urlencode(
+                      {"per_page": 100, "page": page, "state": state}
+                  )
+                  batch = get_json(
+                      f"{API}/repos/{repository}/code-scanning/alerts?{query}"
+                  )
+                  alerts.extend(batch)
+                  if len(batch) < 100:
+                      break
+                  page += 1
 
           analyses_query = urllib.parse.urlencode(
               {"per_page": 100, "ref": "refs/heads/main"}
