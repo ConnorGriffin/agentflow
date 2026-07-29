@@ -411,7 +411,7 @@ def _stub_answered_park(monkeypatch, records):
         42, "agentflow/claude/issue-7-fix", "keep the conservative behavior", "IC_1", "sha-a"))
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: records)
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: _answered_park_thread())
-    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(coordinated_review, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(coordinated_respond, "respond_submission",
                         lambda *a, **k: pytest.fail("a decision answer is never a generic Respond"))
     posted = []
@@ -539,7 +539,7 @@ def test_a_second_decision_round_is_still_answerable_after_agentflow_replied(mon
         {"id": "IC_x", "body": "> *agentflow: your decision resumed the parked review.*\n"
                                "<!-- agentflow-respond-target:IC_1 -->"},
         {"id": "IC_2", "body": "prompt every user"}])
-    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(coordinated_review, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(coordinated_respond, "respond_submission",
                         lambda *a, **k: pytest.fail("a decision answer is never a generic Respond"))
     posted = []

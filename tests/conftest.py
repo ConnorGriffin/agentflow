@@ -7,10 +7,16 @@ observation — so a test scripts *what the world did* (a provider started, stay
 ended a certain way) and then cycles. The fake is the persistent world: reusing it across a
 fresh :class:`Coordinator` replays a daemon crash, because the durable store already carries
 what the launcher wrote and the fake still answers liveness the same way.
+
+It also carries the suite-wide `gh` guard: no test anywhere may reach the real GitHub CLI, so a
+stub pointed at a seam the code no longer uses fails loudly instead of passing for the wrong
+reason.
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
 from dataclasses import dataclass
 from itertools import count
 
@@ -21,6 +27,51 @@ from agentflow.coordinator import Coordinator
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.providers import (PermanentReason, ProviderCause,
                                              ProviderObservation)
+
+
+# --- the `gh` guard -------------------------------------------------------------
+
+def _is_gh(cmd) -> bool:
+    """Is this argv a `gh` invocation? Everything else — git plumbing, launchd, the rate-limit
+    gate, the agent children — passes straight through the guard."""
+    if isinstance(cmd, (str, bytes, os.PathLike)):
+        head = os.fsdecode(cmd).split()[:1]
+    else:
+        head = [os.fsdecode(a) for a in list(cmd)[:1]]
+    return bool(head) and os.path.basename(head[0]) == "gh"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gh(request, monkeypatch):
+    """Fail any test that lets a real `gh` process execute.
+
+    A test that stubs the wrong GitHub seam — the generic ``github.api`` escape hatch when the
+    code under test reads a typed method like ``github.pr_content`` — used to shell out to the
+    real `gh` for a repo that does not exist, get a failure back, and then quietly assert
+    against the fail-closed "GitHub unreadable" branch. It looks green while proving something
+    else entirely, and it makes the suite depend on the machine having an authenticated `gh`.
+    This turns that silence into a named failure.
+
+    The guard sits on ``subprocess.run`` rather than on ``runner._run`` because a dozen modules
+    bind ``_run`` into their own namespace at import time, so patching it in one place would
+    miss most of them; every `gh` invocation in the pipeline reaches ``subprocess.run`` in the
+    end. Only `gh` is blocked — tests that shell out to git plumbing or to the enrollment
+    script are untouched.
+    """
+    real_run = subprocess.run
+
+    def guarded(cmd, *args, **kwargs):
+        if _is_gh(cmd):
+            argv = " ".join(os.fsdecode(a) for a in cmd) if not isinstance(cmd, str) else cmd
+            raise AssertionError(
+                f"{request.node.nodeid} let a real `gh` process run: {argv}\n"
+                "Some GitHub seam the code under test is unstubbed — stub the typed "
+                "agentflow.github method it actually calls, not the generic github.api escape "
+                "hatch."
+            )
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", guarded)
 
 
 @pytest.fixture(autouse=True)

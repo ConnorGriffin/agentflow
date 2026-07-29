@@ -304,9 +304,9 @@ class TestSurfacesCommand:
         monkeypatch.setattr("agentflow.enroll.checkout_repo", lambda workdir: "o/ciq")
         monkeypatch.setattr("agentflow.github.list_open_prs",
                             lambda repo: [SimpleNamespace(number=476)])
-        monkeypatch.setattr("agentflow.gate.github.api",
-                            lambda args, **kwargs: {"files": [{"path": "frontend/diagnose.js"}],
-                                                    "body": "", "comments": []})
+        monkeypatch.setattr("agentflow.gate.github.pr_content",
+                            lambda _repo, _pr: github.PrContent(
+                                body="", paths=("frontend/diagnose.js",), comments=[]))
 
     def _repo_with_a_frontend(self, tmp_path):
         (tmp_path / "frontend").mkdir()

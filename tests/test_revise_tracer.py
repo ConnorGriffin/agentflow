@@ -98,11 +98,13 @@ class _Live:
         self.fail_gh = False            # flip to make every gh read fail (a transient outage)
         self.projections = []
         # The transitions state PR/issue facts through the github module now, never by shelling
-        # out: the open PR for a branch, the issue's acceptance body, and (kept unreadable so the
-        # diverged-review reconciler stays inert here) the PR head/state escape-hatch read.
+        # out: the open PR for a branch, the issue's acceptance body, the PR's own content that a
+        # reopened review's depth is assigned from, and the PR identity — the last kept unreadable
+        # so the diverged-review reconciler stays inert here.
         monkeypatch.setattr("agentflow.github.list_open_prs", self._list_open_prs)
         monkeypatch.setattr("agentflow.github.issue_body", self._issue_body)
-        monkeypatch.setattr("agentflow.github.api", lambda *a, **k: None)
+        monkeypatch.setattr("agentflow.github.pr_content", self._pr_content)
+        monkeypatch.setattr("agentflow.github.pr_facts", lambda *a, **k: None)
         monkeypatch.setattr(coordinated_review, "_review_verdict", lambda review: self.verdict)
         monkeypatch.setattr("agentflow.live.replace_projection",
                             lambda entries, **kw: self.projections.append(entries))
@@ -114,6 +116,14 @@ class _Live:
 
     def _issue_body(self, repo, issue):
         return None if self.fail_gh else "Issue acceptance"
+
+    def _pr_content(self, repo, pr):
+        """An ordinary PR: it proposes no review depth of its own and touches nothing sensitive,
+        so the depth a reopened review gets is the policy's, not this fixture's."""
+        if self.fail_gh:
+            return None
+        return github.PrContent(body="Fixed the thing.",
+                                paths=("agentflow/widget.py",), comments=[])
 
     def step(self):
         return pipeline.reconcile_and_project(self.coord)

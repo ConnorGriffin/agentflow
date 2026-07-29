@@ -983,8 +983,12 @@ def test_conflict_already_flagged_pings_once_not_every_cycle():
 def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed", conflict_revise=None):
     """Drive _rebase_survivor with a canned rebase result; record park / merge side effects. By
     default a conflict falls through to the park (``conflict_revise=None``), so these tests exercise
-    the ADR 0038 fallback; pass a status to model a conflict Revise that was opened instead."""
+    the ADR 0038 fallback; pass a status to model a conflict Revise that was opened instead.
+
+    Nothing has been said on the PR — the park notice itself is stubbed out here — so the
+    survivor's worktree is left where it is."""
     events = {"parked": [], "merged": []}
+    monkeypatch.setattr(github, "pr_comment_rows", lambda _repo, _pr: [])
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: rebase)
     monkeypatch.setattr(loop, "_conflict_revise_survivor",
                         lambda cfg, pr, n, sl, tool, branch: conflict_revise)

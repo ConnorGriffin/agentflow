@@ -497,8 +497,17 @@ def test_production_reconciliation_recovers_completed_build_handoff_after_restar
         return [github.PrRow(42, head or "", "head-a")]
 
     monkeypatch.setattr("agentflow.github.list_open_prs", list_open_prs)
-    # The in-flight review's live head stays unreadable, so the diverged-review reconciler is inert.
-    monkeypatch.setattr("agentflow.github.api", lambda *a, **k: None)
+    # The PR the opener resolves is an ordinary one: no depth proposal of its own, nothing
+    # sensitive in its surface, so the review it opens gets the policy's default depth.
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(
+                            body="Fixed the thing.", paths=("agentflow/widget.py",), comments=[]))
+    # The in-flight review's live head still sits on the SHA it was opened against, so the
+    # diverged-review reconciler finds nothing to resettle and leaves the record alone.
+    monkeypatch.setattr("agentflow.github.pr_facts",
+                        lambda _repo, _pr: github.PrFacts(
+                            head_ref_name="agentflow/claude/issue-7-recover-handoff",
+                            head_ref_oid="head-a", state="OPEN", closing_issues=(7,)))
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
     # An unreadable PR fails closed: Build still owns the change and a later pass retries.
     pipeline.reconcile_and_project(restarted)
@@ -882,18 +891,24 @@ def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch
     assert merged == [42]
 
 
-def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments, ci_green=True):
+def _settle_autonomous_clean_review(monkeypatch, *, surfaces, content, comments, ci_green=True,
+                                    merges=False):
     """Settle one clean, exact-head, autonomous PR and report what the merge gate was asked.
 
     Everything the settlement reads is fixed except the two facts under test — what the PR's diff
     and attachments say about screenshots, and whether a maintainer question is outstanding — so a
     park here is the merge gate's own answer, not a second copy of the rule in the caller.
+
+    ``content`` is the PR's reviewable content as the gate reads it (:class:`github.PrContent`):
+    the paths it changes, what its body says, and the comments already on it. Pass ``merges`` for
+    the case where nothing should block — the merge is then let through and reported, rather than
+    failing the test the way an unexpected merge must.
     """
     from agentflow import gate
     from agentflow.reviewer import Verdict
 
     record = _completed_review_record(profile="autonomous")
-    asked, parked, posted = [], [], []
+    asked, parked, posted, merged = [], [], [], []
     decide = gate.decide_merge
 
     def _spy(**kwargs):
@@ -910,14 +925,18 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments,
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
     monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: list(surfaces))
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: list(comments))
-    monkeypatch.setattr("agentflow.github.api", lambda *_args, **_kwargs: dict(pr_view))
+    monkeypatch.setattr("agentflow.github.pr_content", lambda _repo, _pr: content)
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=body, created_at="")
                                             for body in posted])
     monkeypatch.setattr("agentflow.gate.decide_merge", _spy)
     monkeypatch.setattr("agentflow.gate.park", _park)
     monkeypatch.setattr("agentflow.gate.squash_merge",
-                        lambda *_args, **_kwargs: pytest.fail("a blocked PR must never merge"))
+                        (lambda _repo, pr: merged.append(pr) or True) if merges else
+                        (lambda *_args, **_kwargs: pytest.fail("a blocked PR must never merge")))
+    if merges:
+        monkeypatch.setattr("agentflow.gate.ci_is_green", lambda *args, **kwargs: True)
+        monkeypatch.setattr("agentflow.github.remove_label", lambda *_args: True)
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
@@ -925,7 +944,7 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments,
 
     proof = coordinated_review._settle_review(record)
     coordinated_review._REVIEW_CI_OBSERVED.pop(record.identity, None)
-    return SimpleNamespace(proof=proof, asked=asked, parked=parked)
+    return SimpleNamespace(proof=proof, asked=asked, parked=parked, merged=merged)
 
 
 def test_screenshotless_ui_change_is_blocked_by_the_gate_it_is_reported_to(monkeypatch):
@@ -937,13 +956,29 @@ def test_screenshotless_ui_change_is_blocked_by_the_gate_it_is_reported_to(monke
     settled = _settle_autonomous_clean_review(
         monkeypatch,
         surfaces=["agentflow/webui/src/"],
-        pr_view={"files": [{"path": "agentflow/webui/src/App.svelte"}],
-                 "body": "Renamed the queue column.", "comments": []},
+        content=github.PrContent(body="Renamed the queue column.",
+                                 paths=("agentflow/webui/src/App.svelte",), comments=[]),
         comments=[])
 
     assert settled.asked and settled.asked[0]["ui_evidence_missing"] is True
     assert settled.parked == [UI_GAP_REASON]
     assert settled.proof == "https://github.com/o/r/pull/42"
+
+
+def test_a_ui_change_that_carries_its_screenshot_is_not_reported_as_a_gap(monkeypatch):
+    """The other half of the same rule: the identical PR, with the before/after screenshot
+    committed alongside the change, reaches the merge gate with no gap to report. Without this
+    the screenshot case and the screenshotless one are indistinguishable."""
+    settled = _settle_autonomous_clean_review(
+        monkeypatch,
+        surfaces=["agentflow/webui/src/"],
+        content=github.PrContent(body="Renamed the queue column.",
+                                 paths=("agentflow/webui/src/App.svelte",
+                                        "docs/screenshots/queue-column-after.png"), comments=[]),
+        comments=[], merges=True)
+
+    assert settled.asked and settled.asked[0]["ui_evidence_missing"] is False
+    assert settled.parked == [] and settled.merged == [42]
 
 
 def test_unanswered_maintainer_question_is_blocked_by_the_gate_it_is_reported_to(monkeypatch):
@@ -952,7 +987,7 @@ def test_unanswered_maintainer_question_is_blocked_by_the_gate_it_is_reported_to
     settled = _settle_autonomous_clean_review(
         monkeypatch,
         surfaces=[],
-        pr_view={"files": [], "body": "", "comments": []},
+        content=github.PrContent(body="", paths=(), comments=[]),
         comments=[{"id": "9001", "body": "Why did this drop the retry?"}])
 
     assert settled.asked and settled.asked[0]["reply_pending"] is True
@@ -965,7 +1000,7 @@ def test_an_unanswered_question_outranks_red_ci_in_the_park_notice(monkeypatch):
     settled = _settle_autonomous_clean_review(
         monkeypatch,
         surfaces=[],
-        pr_view={"files": [], "body": "", "comments": []},
+        content=github.PrContent(body="", paths=(), comments=[]),
         comments=[{"id": "9002", "body": "Should this keep the old default?"}],
         ci_green=False)
 

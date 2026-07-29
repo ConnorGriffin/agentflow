@@ -69,6 +69,9 @@ class _FakeGitHub:
             labels=frozenset(self.labels),
             comments=[github.Comment(body=c["body"], created_at="") for c in self.comments])
 
+    def issue_url(self, repo, number):             # the release's durable proof-of-release
+        return f"https://github.com/o/r/issues/{number}"
+
     def comment(self, repo, number, body):
         self.comments.append({"body": body})
         return True
@@ -101,6 +104,7 @@ class _FakeGitHub:
         from agentflow import github, loop
         monkeypatch.setattr(github, "api", self.api)
         monkeypatch.setattr(github, "issue_view", self.issue_view)
+        monkeypatch.setattr(github, "issue_url", self.issue_url)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
         monkeypatch.setattr(github, "edit_body", self.edit_body)

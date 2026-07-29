@@ -164,6 +164,33 @@ def test_claimed_issues_drops_pull_requests_sharing_the_number_sequence(monkeypa
     assert github.claimed_issues(REPO, "agentflow:building") is None  # ...vs unreadable
 
 
+def test_claimed_issues_asks_the_rest_endpoint_and_never_the_search_api(monkeypatch):
+    """The one read in this file whose *argv* is the point, against the module's usual rule.
+
+    Which endpoint answers the claim listing is not an implementation detail. The obvious
+    spelling — `gh issue list --label` — is answered by GitHub's search, whose ceiling is about
+    thirty requests a minute; a fleet-wide reconciliation pass (four lanes per repo, every cycle)
+    goes through that in seconds, and when it did, the lane starved for every repo at once. The
+    REST issues endpoint filters by label out of the ordinary hourly budget instead.
+    """
+    asked = []
+
+    def recording_run(cmd, cwd=None, timeout=None):
+        asked.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(github, "_run", recording_run)
+
+    assert github.claimed_issues(REPO, "agentflow:building") == []
+
+    assert len(asked) == 1
+    assert asked[0][:2] == ["gh", "api"]
+    assert asked[0][2].startswith(f"repos/{REPO}/issues?")
+    assert "labels=agentflow%3Abuilding" in asked[0][2]
+    assert asked[0][1:3] != ["issue", "list"]   # never the search-backed listing
+    assert "search" not in asked[0]
+
+
 def test_list_open_prs_failure_is_unknown(monkeypatch):
     _stub(monkeypatch, returncode=1)
     assert github.list_open_prs(REPO, head="feature/x") is None

@@ -157,24 +157,28 @@ def test_semantic_stakes_and_guarded_profile_enforce_full_without_filename_hints
 
 
 def test_guarded_assignment_facts_force_full_product_and_standards_flow(monkeypatch):
-    from agentflow import coordinated_review, pipeline, pr_park
+    """A guarded repo overrides whatever the author proposed. The PR here reads perfectly well —
+    the author asked for a Focused pass over nothing but README wording, which on any other repo
+    would be granted — and the guarded profile still lifts it to a Full product review. The second
+    half is the separate unreadable-PR path, which lands on the same answer for a different
+    reason."""
+    from agentflow import coordinated_review, pipeline
 
-    monkeypatch.setattr(pipeline.github, "api", lambda *args, **kwargs: {
-        "body": "Review depth: Focused — wording only",
-        "files": [{"path": "README.md"}],
-    })
+    monkeypatch.setattr(pipeline.github, "pr_content", lambda _repo, _pr: pipeline.github.PrContent(
+        body="Review depth: Focused — wording only", paths=("README.md",), comments=[]))
 
-    assignment, _files = coordinated_review._review_assignment_facts(
+    assignment, files = coordinated_review._review_assignment_facts(
         "o/r", 42, profile="guarded")
 
     assert assignment.depth is ReviewDepth.FULL and assignment.axis is ReviewAxis.PRODUCT
     assert assignment.reason == "guarded profile requires Full review"
+    assert files == ("README.md",)   # the read PR's own surface, not the unreadable fallback
 
-    monkeypatch.setattr(pipeline.github, "api", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline.github, "pr_content", lambda _repo, _pr: None)
     unreadable = coordinated_review._review_assignment_facts(
         "o/r", 42, profile="guarded")
-    assert unreadable[0] == ReviewAssignment(
-        ReviewDepth.FULL, "guarded profile requires Full review", ReviewAxis.PRODUCT)
+    assert unreadable == (ReviewAssignment(
+        ReviewDepth.FULL, "guarded profile requires Full review", ReviewAxis.PRODUCT), ())
 
 
 def test_author_depth_proposal_is_read_from_the_pr_body_with_one_reason():
