@@ -787,16 +787,32 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
                     f"second permit ledger outside coordinator: {path}:{node.lineno}")
 
 
+def _described_argv(tree: ast.AST) -> set[int]:
+    """Argv lists that a raised error only *names* — `raise CalledProcessError(1, [...])`. The
+    list has to be a direct argument of the exception being raised: once it sits inside a further
+    call, that call runs before the exception is ever built, so the argv is executed after all."""
+    ids = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
+            continue
+        for arg in [*node.exc.args, *(kw.value for kw in node.exc.keywords)]:
+            if isinstance(arg, ast.List):
+                ids.add(id(arg))
+    return ids
+
+
 def test_no_module_outside_the_github_module_shells_out_to_gh():
     """ADR 0040: all GitHub access flows through one typed, fail-closed module. Any `gh` argument
-    vector built anywhere else is a bypass of the seam — however it is later run."""
+    vector built anywhere else is a bypass of the seam — however it is later run.
+
+    It catches an argv written as a literal list, in any of the shapes real code uses. It does not
+    chase an argv deliberately disguised — `["g" + "h", ...]`, a `"gh"` hidden behind a module
+    constant, a tuple instead of a list. Those take intent to write, and a rule that hunts them
+    starts firing on innocent code."""
     root = Path(__file__).parents[1] / "agentflow"
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
-        # An argv that is only *described* in a raised error is never executed, so it isn't
-        # GitHub access. Nothing else is exempt.
-        described = {id(item) for node in ast.walk(tree) if isinstance(node, ast.Raise)
-                     for item in ast.walk(node) if isinstance(item, ast.List)}
+        described = _described_argv(tree)
         for node in ast.walk(tree):
             if not isinstance(node, ast.List) or id(node) in described:
                 continue
@@ -808,17 +824,44 @@ def test_no_module_outside_the_github_module_shells_out_to_gh():
 
 # GitHub's own wire field names. Each is now read exclusively inside `github.py` and handed
 # back as a typed row field, so a reappearance anywhere else is a stage re-learning GitHub's
-# schema. `createdAt` is deliberately absent: three sites still read raw comment rows for the
-# `author` the typed comment does not carry, and weakening this rule to accommodate them would
-# be worse than naming the gap.
+# schema.
 _GITHUB_WIRE_FIELDS = {
-    "headRefOid", "headRefName", "isDraft", "reviewDecision", "statusCheckRollup",
-    "closingIssuesReferences", "mergedAt", "mergeCommit", "updatedAt",
+    "headRefOid", "headRefName", "baseRefName", "isDraft", "reviewDecision",
+    "mergeStateStatus", "statusCheckRollup", "closingIssuesReferences", "mergedAt",
+    "mergeCommit", "updatedAt", "createdAt",
 }
 
-# Instruction text telling a review agent which `gh` command to run is not GitHub access:
-# these two modules are prompts handed to a session, not callers reading a PR.
-_PROMPT_MODULES = {"reviewer.py", "prompts.py"}
+# `author` and `login` are wire fields too, but unlike the camel-cased names above they are also
+# ordinary English words — matched anywhere inside a string they fire on prose like "the author
+# supplied no review-depth proposal". Code reads them as dict keys and nothing else, so they are
+# matched only when the whole string *is* the key.
+_GITHUB_WIRE_KEYS = {"author", "login"}
+
+# The raw comment rows still read outside `github.py`, named site by site rather than dropped
+# from the rule above. Six reads, two reasons:
+#
+#   author / login — the typed comment carries no author at all, so the three predicates that
+#     filter comments down to the maintainer's own have nothing else to read:
+#     `intake.awaiting_recheck`, `intake.replies_since_intake`, and the qualifying-comment scan
+#     in `loop._next_recheck_candidate`.
+#   createdAt — the typed comment *does* carry this (as `created_at`), but these three are handed
+#     the raw rows by their callers: `dashboard_data._park_since`, `coordinated_revise.
+#     _round_evidence`, and the intake-target stamp in `loop._next_recheck_candidate`.
+#
+# Both are real gaps in the seam, not exceptions to it. Granularity is per file and field, not
+# per line — line numbers rot on the next edit — so a *second* `createdAt` read in one of these
+# files goes unseen; a new one in any other file does not.
+_RAW_COMMENT_ROW_READS = {
+    ("intake.py", "author"), ("intake.py", "login"),
+    ("loop.py", "author"), ("loop.py", "login"), ("loop.py", "createdAt"),
+    ("dashboard_data.py", "createdAt"), ("coordinated_revise.py", "createdAt"),
+}
+
+# Instruction text telling a review agent which `gh` command to run is not GitHub access — it is
+# prose handed to a session, not a caller reading a PR. Exempt the prompt constant, never the
+# module: `reviewer.py` is 400 lines of verdict parsing around this one string, and executable
+# code there re-derives GitHub's schema exactly like anywhere else.
+_PROMPT_TEXT = {("reviewer.py", "REVIEW_PROMPT")}
 
 
 def _docstrings(tree: ast.AST) -> set[int]:
@@ -836,60 +879,161 @@ def _docstrings(tree: ast.AST) -> set[int]:
     return ids
 
 
+def _prompt_text(path: Path, tree: ast.AST) -> set[int]:
+    """Every string inside this module's declared prompt constants — and only those. A prompt is
+    a module-level constant of instruction prose; anything in a function body is code."""
+    ids = set()
+    for node in tree.body:
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = {item.id for target in targets for item in ast.walk(target)
+                 if isinstance(item, ast.Name)}
+        if any((path.name, name) in _PROMPT_TEXT for name in names):
+            ids |= {id(item) for item in ast.walk(node) if isinstance(item, ast.Constant)}
+    return ids
+
+
 def test_github_wire_field_names_never_leave_the_github_module():
     """ADR 0040's other half — the *schema* seam. `gh` argument vectors already cannot be built
     outside `github.py`; neither may GitHub's own field names be spoken outside it.
 
     A stage that writes `headRefOid` is re-deriving GitHub's schema at a site with no business
     owning it — and, worse, re-deriving with it the fail-closed rule for a read that failed.
-    This repo decides merges: that rule gets one owner, or it gets silently wrong somewhere."""
+    This repo decides merges: that rule gets one owner, or it gets silently wrong somewhere.
+
+    Two things are exempt and both are named above, not waved through by file: the prompt prose
+    that tells a review agent which `gh` command to run, and the six raw-comment-row reads the
+    typed comment cannot yet serve. Prose describing the seam — docstrings — is not crossing it."""
     root = Path(__file__).parents[1] / "agentflow"
     for path in root.rglob("*.py"):
-        if path == root / "github.py" or path.name in _PROMPT_MODULES:
+        if path == root / "github.py":
             continue
         tree = ast.parse(path.read_text())
-        exempt = _docstrings(tree)
+        exempt = _docstrings(tree) | _prompt_text(path, tree)
         for node in ast.walk(tree):
             if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
                 continue
             if id(node) in exempt:
                 continue
-            leaked = _GITHUB_WIRE_FIELDS.intersection(re.split(r"[^A-Za-z]+", node.value))
+            spoken = _GITHUB_WIRE_FIELDS.intersection(re.split(r"[^A-Za-z]+", node.value))
+            spoken |= _GITHUB_WIRE_KEYS.intersection({node.value})
+            leaked = {field for field in spoken
+                      if (path.name, field) not in _RAW_COMMENT_ROW_READS}
             assert not leaked, (
                 f"GitHub wire field {sorted(leaked)} outside the github module: "
                 f"{path}:{node.lineno}")
 
 
-def _loop_imports(tree: ast.AST):
-    """Every statement in ``tree`` that pulls a name out of ``agentflow.loop``."""
+# The stage-policy layer — what a stage decides, and the pacing that admits one. Not
+# `coordinated_build.py` alone: that file is a 200-line husk now, and the two thousand lines of
+# policy that used to live beside it sit in its siblings and in `pipeline`.
+_STAGE_POLICY_GLOBS = ("coordinated_*.py", "pipeline.py")
+
+# The one import ring this repo tolerates. `github.py` reaches the `gh` binary through
+# `runner._run` at module level, and `runner` gets away with calling back into `github` by
+# deferring those imports into function bodies. Named here rather than quietly skipped:
+# untangling it means moving process execution out of `runner`, which is its own change. Every
+# other ring the graph grows is the defect this test exists to catch.
+_TOLERATED_IMPORT_CYCLE = frozenset({"agentflow.github", "agentflow.runner"})
+
+
+def _module_name(root: Path, path: Path) -> str:
+    """The dotted name ``path`` is imported by."""
+    parts = list(path.relative_to(root).with_suffix("").parts)
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(["agentflow", *parts])
+
+
+def _imported_modules(root: Path, path: Path, tree: ast.AST):
+    """Every ``agentflow`` module ``path`` reaches for, in whichever way it spells the import:
+    absolute or relative, whole-module or name-from-module, at module level or deferred inside a
+    function body, or named as a string handed to ``importlib``. Yields ``(module, node)``."""
+    package = _module_name(root, path)
+    if path.name != "__init__.py":
+        package = package.rpartition(".")[0]
     for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom) and node.module == "agentflow.loop":
-            yield node
         if isinstance(node, ast.Import):
-            if any(alias.name == "agentflow.loop" for alias in node.names):
-                yield node
+            for alias in node.names:
+                if alias.name.split(".")[0] == "agentflow":
+                    yield alias.name, node
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = package.split(".")
+                base = ".".join(base[:len(base) - node.level + 1])
+            elif node.module and node.module.split(".")[0] == "agentflow":
+                base = None
+            else:
+                continue
+            module = node.module if base is None else (
+                f"{base}.{node.module}" if node.module else base)
+            yield module, node
+            # `from agentflow import loop` names a module in the alias, not in `module`.
+            for alias in node.names:
+                yield f"{module}.{alias.name}", node
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr == "import_module" and node.args):
+            named = node.args[0]
+            if isinstance(named, ast.Constant) and isinstance(named.value, str):
+                yield named.value, node
+
+
+def _import_cycles(edges: dict[str, set[str]]) -> list[tuple[str, ...]]:
+    """Every ring in the import graph, each as the modules that close it."""
+    rings: list[tuple[str, ...]] = []
+    state: dict[str, int] = {}
+    stack: list[str] = []
+
+    def visit(module: str) -> None:
+        state[module] = 1
+        stack.append(module)
+        for other in sorted(edges.get(module, ())):
+            if state.get(other) == 1:
+                rings.append(tuple(stack[stack.index(other):]))
+            elif not state.get(other):
+                visit(other)
+        stack.pop()
+        state[module] = 2
+
+    for module in sorted(edges):
+        if not state.get(module):
+            visit(module)
+    return rings
 
 
 def test_dispatch_policy_never_imports_the_dispatch_loop():
     """Stage policy stays readable on its own: the coordinated stages own what a stage decides,
     the loop owns which one runs next, and only that second direction may know the first.
 
-    The two modules used to import each other, and the cycle stayed invisible because every one
-    of those imports sat inside a function body — deferred until call time, so Python never
-    complained. A function-local import of the loop is therefore not merely a style question: it
-    is exactly how a re-formed cycle would hide again. Anything genuinely shared belongs in a
-    module both sides can import outright.
+    The two used to import each other, and the cycle stayed invisible because every one of those
+    imports sat inside a function body — deferred until call time, so Python never complained.
+    So this checks the invariant twice over. Stage policy may not name the loop at all, however
+    the import is spelled. And no module in the package may take part in an import ring, because
+    a function-local import is precisely how the *next* cycle would hide, under some other pair
+    of names — the only way to see one coming is to look at the whole graph. Anything genuinely
+    shared belongs in a module both sides can import outright.
     """
     root = Path(__file__).parents[1] / "agentflow"
+    modules = {_module_name(root, path): path for path in root.rglob("*.py")}
 
-    stage_policy = ast.parse((root / "coordinated_build.py").read_text())
-    assert not list(_loop_imports(stage_policy)), (
-        "coordinated_build.py imports agentflow.loop — move the shared vocabulary into a module "
-        "both sides can import instead of reaching back into dispatch")
+    stage_policy = sorted({path for glob in _STAGE_POLICY_GLOBS for path in root.glob(glob)})
+    assert {root / "coordinated_review.py", root / "pipeline.py"} <= set(stage_policy), (
+        "the stage-policy globs no longer match the real surface")
+    for path in stage_policy:
+        for module, node in _imported_modules(root, path, ast.parse(path.read_text())):
+            assert module != "agentflow.loop", (
+                f"{path.name} imports agentflow.loop at line {node.lineno} — move the shared "
+                "vocabulary into a module both sides can import instead of reaching back into "
+                "dispatch")
 
-    for path in root.rglob("*.py"):
-        tree = ast.parse(path.read_text())
-        module_level = {id(node) for node in tree.body}
-        for node in _loop_imports(tree):
-            assert id(node) in module_level, (
-                f"function-local import of agentflow.loop: {path}:{node.lineno}")
+    edges: dict[str, set[str]] = {}
+    for name, path in modules.items():
+        for module, _ in _imported_modules(root, path, ast.parse(path.read_text())):
+            if module in modules and module != name:
+                edges.setdefault(name, set()).add(module)
+
+    for ring in _import_cycles(edges):
+        assert frozenset(ring) == _TOLERATED_IMPORT_CYCLE, (
+            "import cycle — a deferred import is standing in for a module that should not be "
+            f"reached at all: {' -> '.join([*ring, ring[0]])}")
