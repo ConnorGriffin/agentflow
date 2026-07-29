@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_research, dispatch, loop
+from agentflow import coordinated_research, dispatch, loop, pipeline
 from agentflow.coordinator import ResearchStageAdapter, StageRouter, tracer
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import HELD, RUNNING, Record
@@ -37,8 +37,8 @@ def _R(returncode=0, stdout=""):
 class FakeGitHub:
     """A stateful stand-in for the ticket, its parent Decision Map, and the shared claim. The
     finalizer's GitHub reads/writes are stated through the GitHub module's helpers (ADR 0040) —
-    the typed ``comment``/``close``/``edit_body`` writes and the ``api`` escape hatch — never by
-    matching a ``gh`` argument vector. ``run`` stands in for ``loop._run`` for the git worktree
+    the typed ``issue_view`` read, the typed ``comment``/``close``/``edit_body`` writes and the
+    ``api`` escape hatch — never by matching a ``gh`` argument vector. ``run`` stands in for ``coordinated_research._run`` for the git worktree
     cleanup that remains loop-owned."""
 
     def __init__(self, *, state="OPEN", title="Audit the widget path",
@@ -53,14 +53,23 @@ class FakeGitHub:
 
     # --- GitHub module seam (ADR 0040) ------------------------------------------------
     def api(self, args, *, parse_json=False):
-        # The two escape-hatch reads the finalizer still reaches through — routed by their leading
-        # verb (a GraphQL parent-map lookup vs. an issue snapshot), never by matching a field vector.
-        if args[0] == "api":                       # GraphQL parent-map read
-            return {"data": {"repository": {"issue": {"parent": {
-                "number": self.map_number, "body": self.map_body,
-                "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
-        return {"state": self.state, "title": self.title, "comments": list(self.comments),
-                "url": f"https://github.com/{REPO}/issues/{args[2]}"}
+        # The one escape-hatch read the finalizer still reaches through: the GraphQL parent-map
+        # lookup, which no typed single-fact method covers.
+        assert args[0] == "api", f"unexpected escape-hatch call: {args}"
+        return {"data": {"repository": {"issue": {"parent": {
+            "number": self.map_number, "body": self.map_body,
+            "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
+
+    def issue_view(self, repo, number):
+        from agentflow import github
+        return github.IssueView(
+            title=self.title, body="", state=self.state,
+            url=f"https://github.com/{REPO}/issues/{number}",
+            labels=frozenset(self.labels),
+            comments=[github.Comment(body=c["body"], created_at="") for c in self.comments])
+
+    def issue_url(self, repo, number):             # the release's durable proof-of-release
+        return f"https://github.com/{REPO}/issues/{number}"
 
     def comment(self, repo, number, body):
         self.comments.append({"body": body})
@@ -74,23 +83,25 @@ class FakeGitHub:
         self.map_body = body
         return True
 
-    def release(self, repo, number):               # stands in for loop._release_resolving
+    def release(self, repo, number, _label):       # stands in for coordinated_research.release_claim
         if "wayfinder:resolving" in self.labels:
             self.labels.remove("wayfinder:resolving")
         return True
 
-    def run(self, argv):                           # loop._run: only the git worktree cleanup remains
-        assert argv and argv[0] == "git", f"unexpected non-git loop._run call: {argv}"
+    def run(self, argv):                           # coordinated_research._run: only the git worktree cleanup remains
+        assert argv and argv[0] == "git", f"unexpected non-git coordinated_research._run call: {argv}"
         return _R(0)
 
     def install(self, monkeypatch):
         from agentflow import github
         monkeypatch.setattr(github, "api", self.api)
+        monkeypatch.setattr(github, "issue_view", self.issue_view)
+        monkeypatch.setattr(github, "issue_url", self.issue_url)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
         monkeypatch.setattr(github, "edit_body", self.edit_body)
-        monkeypatch.setattr(loop, "_release_resolving", self.release)
-        monkeypatch.setattr(loop, "_run", self.run)
+        monkeypatch.setattr(coordinated_research, "release_claim", self.release)
+        monkeypatch.setattr(coordinated_research, "_run", self.run)
 
 
 def _adapter(fake):
@@ -155,7 +166,7 @@ def test_next_research_ticket_picks_the_oldest_eligible_unblocked_ticket(monkeyp
             return _R(0, "[]")
         raise AssertionError(argv)
 
-    monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr(coordinated_research, "_run", run)
     monkeypatch.setattr("agentflow.github._run", run)
     picked = loop._next_research_ticket(RepoConfig(REPO, "/tmp"))
     assert picked["number"] == 5
@@ -172,7 +183,7 @@ def test_next_research_ticket_skips_a_ticket_with_an_open_native_blocker(monkeyp
             return _R(0, '{"state":"OPEN"}')
         raise AssertionError(argv)
 
-    monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr(coordinated_research, "_run", run)
     monkeypatch.setattr("agentflow.github._run", run)
     assert loop._next_research_ticket(RepoConfig(REPO, "/tmp")) is None
 
@@ -186,7 +197,7 @@ def test_next_research_ticket_fails_closed_on_an_unreadable_blocker_graph(monkey
             return _R(1, "")
         raise AssertionError(argv)
 
-    monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr(coordinated_research, "_run", run)
     monkeypatch.setattr("agentflow.github._run", run)
     assert loop._next_research_ticket(RepoConfig(REPO, "/tmp")) is None  # unreadable ≠ unblocked
 
@@ -268,7 +279,7 @@ def test_exhaustion_releases_the_claim_so_the_ticket_is_eligible_again(make_coor
 # --- capacity: research reserves its own lane/cap and shows in the live board -----------
 
 def test_research_reserves_its_own_stage_lane_and_cap():
-    from agentflow.coordinated_build import _ProductionGate
+    from agentflow.pipeline import _ProductionGate
     limits = _ProductionGate.reservation_limits(
         Record(identity="i", stage="research", pool="claude", demand=2, repo=REPO, subject="5"))
     assert limits.stage_lane == "research"                             # distinct lane, not build/triage
@@ -294,20 +305,20 @@ def test_a_dead_research_run_releases_the_resolving_claim_a_live_one_retains_it(
                   subject="5", state=HELD, claim=False)
     live = Record(identity="live", stage="research", pool="claude", demand=2, repo=REPO,
                   subject="6", state=RUNNING, claim=True)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [dead, live])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [dead, live])
     edited = []
     from agentflow import github
 
     # The claim lanes are listed in order (building, triaging, drawing, resolving); only the
     # resolving lane holds the two research-claimed issues. The proof read shows the label gone.
-    listings = iter([[], [], [], [{"number": 5, "updated_at": "2020-01-01T00:00:00Z"},
-                                   {"number": 6, "updated_at": "2020-01-01T00:00:00Z"}]])
-    monkeypatch.setattr(github, "api", lambda args, *, parse_json=False: next(listings))
+    listings = iter([[], [], [], [github.ClaimedIssue(5, "2020-01-01T00:00:00Z"),
+                                  github.ClaimedIssue(6, "2020-01-01T00:00:00Z")]])
+    monkeypatch.setattr(github, "claimed_issues", lambda repo, label: next(listings))
     monkeypatch.setattr(github, "remove_label",
                         lambda repo, issue, label: edited.append(issue) or True)
     monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset())
 
-    assert coordinated_build.reconcile_orphaned_claims(RepoConfig(REPO, "/tmp")) == 1
+    assert pipeline.reconcile_orphaned_claims(RepoConfig(REPO, "/tmp")) == 1
     assert edited == [5]                                               # dead run released; live retained
 
 
@@ -341,8 +352,8 @@ def test_research_dispatch_claims_then_enters_the_coordinator(monkeypatch):
     monkeypatch.setattr("agentflow.coordinated_research.research_map_context",
                         lambda repo, n: "")
     events = []
-    monkeypatch.setattr(loop, "_claim_resolving",
-                        lambda repo, n: events.append("claim") or True)
+    monkeypatch.setattr(dispatch, "claim",
+                        lambda repo, n, _label: events.append("claim") or True)
     coord = SimpleNamespace(submit_stage=lambda s: events.append(s.stage))
 
     assert "submitted" in dispatch._submit_coordinated_research(
@@ -400,7 +411,7 @@ def test_research_dispatch_refuses_submission_when_the_claim_cannot_be_set(monke
                         lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr("agentflow.coordinated_research.research_map_context",
                         lambda repo, n: "")
-    monkeypatch.setattr(loop, "_claim_resolving", lambda repo, n: False)
+    monkeypatch.setattr(dispatch, "claim", lambda repo, n, _label: False)
     coord = SimpleNamespace(submit_stage=lambda s: (_ for _ in ()).throw(
         AssertionError("must not submit without the claim")))
 

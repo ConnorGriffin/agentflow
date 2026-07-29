@@ -327,6 +327,11 @@ def unresolved_uncertainty(chain: Any) -> Uncertainty | None:
 
 _CONFLICT_UNCERTAINTY_RE = re.compile(r"^CONFLICT-UNCERTAINTY:\s*(\{.*\})\s*$", re.MULTILINE)
 
+# How a Revise stage records that private ambiguity as its own durable outcome, so the decision
+# review it opens recognizes it. Written by Revise and read by Review, so it belongs with the
+# uncertainty vocabulary rather than in either stage's module.
+CONFLICT_UNCERTAINTY_PREFIX = "conflict-uncertainty:"
+
 
 def conflict_uncertainty_from_message(message: str) -> Uncertainty | None:
     """Parse a resolver's private durable uncertainty marker; PR comments do not count."""
@@ -382,9 +387,13 @@ def other_tool(tool: str) -> str | None:
     return {"claude": "codex", "codex": "claude"}.get(tool)
 
 
-def validate_follow_ups(repo: str, follow_ups: tuple[FollowUp, ...], *, issue_view,
+def validate_follow_ups(repo: str, follow_ups: tuple[FollowUp, ...], *, issue_url,
                         issue_search) -> bool:
-    """Prove each recorded follow-up exists here and its duplicate query finds it."""
+    """Prove each recorded follow-up exists here and its duplicate query finds it.
+
+    ``issue_url`` answers one issue's canonical URL and ``issue_search`` the issues a free-text
+    query matches; both answer ``None`` when the tracker could not be read, so a follow-up
+    agentflow was unable to confirm is never accepted."""
     pattern = re.compile(
         rf"^https://github\.com/{re.escape(repo)}/issues/([1-9][0-9]*)/?$")
     for follow_up in follow_ups:
@@ -392,14 +401,10 @@ def validate_follow_ups(repo: str, follow_ups: tuple[FollowUp, ...], *, issue_vi
         if match is None:
             return False
         number = int(match.group(1))
-        issue = issue_view(number)
-        if (not isinstance(issue, dict) or issue.get("number") != number
-                or issue.get("url") != follow_up.url.rstrip("/")):
+        if issue_url(number) != follow_up.url.rstrip("/"):
             return False
         matches = issue_search(follow_up.duplicate_query)
-        if (not isinstance(matches, list)
-                or not any(isinstance(item, dict) and item.get("number") == number
-                           for item in matches)):
+        if matches is None or not any(item.number == number for item in matches):
             return False
     return True
 

@@ -32,7 +32,8 @@ from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import PermanentReason, ProviderCause
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
-from agentflow.coordinator.recovery import PROGRESS, REPAIR, Recovery
+from agentflow.coordinator.recovery import PROGRESS, REPAIR
+from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.review_policy import ReviewState
@@ -161,7 +162,9 @@ class Coordinator:
         self._store = Store(default_store_path())
         self._launcher = launcher or LocalLauncher()
         self._gate = gate or _admit_everything
-        self._adapter = adapter or _DefaultAdapter()
+        # Every adapter hook is optional; StageCalls owns the default for each one, so the
+        # coordinator never carries a second copy of them (ADR 0030).
+        self._adapter = StageCalls(adapter or _DefaultAdapter())
         # This process's daemon-lifecycle identity, stamped on every attempt it admits. A restart
         # is a new process with a new pid, so an attempt found dead under a *different* generation
         # — and leaving no supervisor end fact — was taken down with the daemon, not by the
@@ -171,10 +174,6 @@ class Coordinator:
         # already started. The coordinator owns the distinction: only truly cold, never-started
         # records are discarded; continuations and restart-resumes remain eligible.
         self._disabled_cold_stages = disabled_cold_stages
-        # A stage adapter that owns branch/worktree recovery may reject admission before it
-        # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
-        # An adapter with no prepare (the read-only default) is always ready.
-        self._prepare = getattr(self._adapter, "prepare", None) or (lambda _record: True)
         self._log = log or (lambda _line: None)
         self._lock = threading.RLock()
         self._records: dict[str, Record] = self._store.load()
@@ -501,7 +500,9 @@ class Coordinator:
         a waiting PR-bound stage — no permit, non-blocking, #293), ``blocked`` (admission/permits
         refused), ``started`` (a provider family exists and an attempt was consumed), or
         ``not_started`` (admitted but no provider came into existence — no attempt consumed)."""
-        if not self._prepare(record):
+        # A stage adapter that owns branch/worktree recovery may reject admission before it
+        # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
+        if not self._adapter.prepare(record):
             return "unprepared"
         if not self._begin_start(record, now):
             # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
@@ -686,15 +687,13 @@ class Coordinator:
 
     def _settle_completed(self, record: Record) -> bool:
         """Project a completed stage at its durable boundary behind the ``cycle`` seam."""
-        prepare = getattr(self._adapter, "prepare_completed", None)
-        if prepare is not None and not prepare(record):
+        if not self._adapter.prepare_completed(record):
             return False
 
         def settle(current: Record) -> bool:
             if current.state != COMPLETED or current.retired:
                 return False
-            finalize = getattr(self._adapter, "finalize_completed", None)
-            proof = finalize(current) if finalize is not None else None
+            proof = self._adapter.finalize_completed(current)
             if proof is None:
                 return False
             current.handoff_proof = proof
@@ -720,8 +719,7 @@ class Coordinator:
         Returns the terminal outcome, if any."""
         obs = self._adapter.observe(record)
         self._release(record)
-        capture = getattr(self._adapter, "capture", None)
-        outcome = capture(record, obs) if capture is not None else None
+        outcome = self._adapter.capture(record, obs)
         verified = outcome is not None or self._adapter.verify(record, obs)
         # Every ended family — completed, superseded, or held — records its spend exactly once,
         # keyed by this attempt's launch token (ADR 0040 per-attempt telemetry).
@@ -739,7 +737,7 @@ class Coordinator:
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} completed — "
                               f"{_OUTCOME_LABEL.get(record.stage, record.stage)}; claim retained")
             return StageOutcome(record.identity, record.stage, "completed")
-        collision = self._integration_collision(record)
+        collision = self._adapter.integration_collision(record)
         if collision is not None:
             return self._settle_collision(record, collision)
         label = obs.classification()
@@ -762,7 +760,7 @@ class Coordinator:
         # clean exit that only left its required outcome missing earns one targeted repair naming
         # that exact proof; nothing new stops the replay instead of burning a session on an
         # identical prompt.
-        recovery = self._recover(record, obs)
+        recovery = self._adapter.recover(record, obs)
         if obs.cause is ProviderCause.CAPACITY:
             # A provider-declared five-hour capacity interruption is an automatic reset wait, not a
             # spent attempt or a durable human hold (#305). It refunds the attempt and requeues
@@ -830,22 +828,6 @@ class Coordinator:
                           f"automatic reset wait eligible {when}; attempt refunded; claim retained")
         return None
 
-    def _recover(self, record: Record, obs) -> Recovery:
-        """The stage adapter's classification of what a fresh attempt would have new to act on. A
-        stage adapter with no ``recover`` hook keeps the historical behavior — every non-permanent
-        ending continues within the attempt budget — so only a stage that opts in stops an
-        identical replay (issue #225)."""
-        fn = getattr(self._adapter, "recover", None)
-        result = fn(record, obs) if fn is not None else None
-        return result if isinstance(result, Recovery) else Recovery(PROGRESS)
-
-    def _integration_collision(self, record: Record) -> str | None:
-        """The `origin/main` head a Build reported an integration collision against this attempt,
-        or None. The stage adapter reads the durable outcome (the builder's own marked comment)
-        and the current main head; a stage with no such adapter never collides (issue #209)."""
-        fn = getattr(self._adapter, "integration_collision", None)
-        return fn(record) if fn is not None else None
-
     def _settle_collision(self, record: Record, main_sha: str) -> StageOutcome | None:
         """A reported integration collision is a durable outcome, not a retryable failure (issue
         #209). The first collision against an unchanged main records that main head and defers the
@@ -884,9 +866,7 @@ class Coordinator:
             if not current.hold_pending or current.state not in {WAITING, COMPLETED}:
                 return False
             if current.handoff_proof is None:
-                finalize = getattr(self._adapter, "finalize_hold", None)
-                proof = finalize(current) if finalize is not None else (
-                    f"proof:{current.identity}:{STAGE_NATIVE_HANDOFF[current.stage]}")
+                proof = self._adapter.finalize_hold(current)
                 if proof is None:
                     return False
                 current.handoffs = 1

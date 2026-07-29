@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 
-from agentflow.coordinator.providers import ProviderObserver
+from agentflow.coordinator.recovery import targeted_repair
+from agentflow.coordinator.stage_adapter import StageAdapter
 from agentflow.intake import IntakeResult, IntakeRoute, parse_intake
 from agentflow.runner import Complexity, Effort
 
@@ -28,16 +29,14 @@ def decode_result(payload: str) -> IntakeResult:
     )
 
 
-class IntakeStageAdapter:
+class IntakeStageAdapter(StageAdapter):
     """Rebuild Intake's read-only source, capture its parsed route, and apply it once durable."""
 
     def __init__(self, *, worktree_reset, apply_route, claim_ready=None,
                  observer=None, handoff=None, worktree_dispose=None) -> None:
-        self._worktree_reset = worktree_reset
+        super().__init__(worktree_ready=worktree_reset, observer=observer, handoff=handoff)
         self._apply_route = apply_route
         self._claim_ready = claim_ready or (lambda _record: True)
-        self._observer = observer or ProviderObserver()
-        self._handoff = handoff
         # A completed Intake disposes its read-only checkout before retiring so it cannot linger
         # as ambiguous legacy activation evidence (issue #106). The default no-op keeps a bare
         # adapter's read-only stage side-effect-free; production wires the real disposer.
@@ -46,23 +45,20 @@ class IntakeStageAdapter:
     def prepare(self, record) -> bool:
         # Rebuild first, then prove the GitHub claim immediately before admission. A removed or
         # unreadable claim fails closed without consuming a permit or attempt.
-        return bool(self._worktree_reset(record) and self._claim_ready(record))
-
-    def observe(self, record):
-        return self._observer.observe(record)
+        return bool(super().prepare(record) and self._claim_ready(record))
 
     def capture(self, record, obs) -> str | None:
         result = parse_intake(obs.final_message or "")
         return encode_result(result) if result.parsed else None
 
     def verify(self, record, obs) -> bool:
+        # Intake's outcome is the route it captured, so the durable record is the whole check.
         return record.outcome is not None
 
     def recover(self, record, obs):
         """Intake is read-only: it owns no durable partial work, so a clean exit that parsed no
         route would replay identically. Grant one targeted repair naming the missing route, then
         stop (issue #225)."""
-        from agentflow.coordinator.recovery import targeted_repair
         return targeted_repair(record, "a parsed intake route (e.g. ready / grill / close)")
 
     def finalize_completed(self, record) -> str | None:
@@ -77,8 +73,3 @@ class IntakeStageAdapter:
         if not self._worktree_dispose(record):
             return None
         return url
-
-    def finalize_hold(self, record) -> str | None:
-        if self._handoff is not None:
-            return self._handoff(record)
-        return f"proof:{record.identity}:issue:needs-grilling"

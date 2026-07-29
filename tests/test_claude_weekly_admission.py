@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 
-from agentflow import balancer, coordinated_build
+from agentflow import balancer, coordinated_build, pipeline
 from agentflow.coordinator import quota
 from agentflow.coordinator.quota import SEVEN_DAY_SECONDS
 from agentflow.coordinator.record import Record
@@ -237,16 +237,16 @@ def test_a_queued_claude_build_is_rechecked_and_deferred_at_launch(coord_state, 
     the recheck between assignment and launch."""
     tmp_path = coord_state
     _clear_activity_gate(tmp_path, monkeypatch)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     now = 1_000_000
     monkeypatch.setattr(time, "time", lambda: now)
-    monkeypatch.setattr(coordinated_build.time, "time", lambda: now)
+    monkeypatch.setattr(pipeline.time, "time", lambda: now)
     _seed_five_hour(10.0, now=now)
     record = Record(identity="315", stage="build", pool="claude", lineage="claude",
                     demand=5, repo="o/r", subject="315")
 
     _seed_weekly(5.0, now=now)                             # weekly headroom at assignment
-    assert coordinated_build._production_gate()(record) is True
+    assert pipeline._production_gate()(record) is True
 
     _seed_weekly(40.0, now=now)                            # weekly consumed before launch
-    assert coordinated_build._production_gate()(record) is False
+    assert pipeline._production_gate()(record) is False

@@ -286,7 +286,7 @@ def test_provider_adapters_supply_the_stage_schema_for_intake_and_review(tmp_pat
 def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(tmp_path):
     from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
     from agentflow.coordinator.record import Record
-    from agentflow.loop import BUILD_PROMPT, PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT
+    from agentflow.prompts import BUILD_PROMPT, PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT
 
     repo = _repo_with_origin(tmp_path)
     stage_prompts = [
@@ -583,14 +583,15 @@ def test_open_pr_lookup_reports_presence_and_fails_closed(monkeypatch):
     assert runner._open_pr_for_branch("o/r", "b") == (True, True)
 
 
-def test_pr_state_for_branch_reads_through_the_api_hatch_and_fails_closed(monkeypatch):
+def test_pr_state_for_branch_reads_the_all_state_listing_and_fails_closed(monkeypatch):
     from agentflow import github
 
-    monkeypatch.setattr(github, "api", lambda args, parse_json=False: None)
+    monkeypatch.setattr(github, "prs_for_branch", lambda repo, branch, **k: None)
     assert runner_mod._pr_state_for_branch("o/r", "b") is None  # lookup failed → unknown
-    monkeypatch.setattr(github, "api", lambda args, parse_json=False: [])
+    monkeypatch.setattr(github, "prs_for_branch", lambda repo, branch, **k: [])
     assert runner_mod._pr_state_for_branch("o/r", "b") is None  # no PR ever opened
-    monkeypatch.setattr(github, "api", lambda args, parse_json=False: [{"state": "MERGED"}])
+    monkeypatch.setattr(github, "prs_for_branch", lambda repo, branch, **k: [
+        github.BranchPrRow(number=1, state="MERGED", head_ref_name=branch, url="")])
     assert runner_mod._pr_state_for_branch("o/r", "b") == "MERGED"
 
 

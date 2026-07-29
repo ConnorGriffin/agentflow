@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from agentflow.runner import _run
+from agentflow import github
 
 # The worktree directory intake stages fetched screenshots into. The intake prompt points
 # the model here; `stage_attachments` writes here. Untracked scratch — the worktree is a
@@ -82,11 +82,8 @@ def extract_image_urls(body: str) -> list[str]:
 
 
 def _gh_token() -> str | None:
-    r = _run(["gh", "auth", "token"])
-    if r.returncode != 0:
-        return None
-    token = (r.stdout or "").strip()
-    return token or None
+    # The auth token is one of the exotic calls ADR 0040 routes through the escape hatch.
+    return github.api(["auth", "token"]) or None
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):

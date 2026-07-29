@@ -34,8 +34,8 @@ from importlib.resources import files
 from pathlib import Path
 
 from agentflow.intake import sweep_legacy_labels
-from agentflow.loop import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
-                            surface_declaration)
+from agentflow.repo_facts import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
+                                  surface_declaration)
 
 # Directory names that hold a user-facing surface when a repo has one. Deliberately narrow:
 # a wrong guess here writes a declaration that either misses real UI or gates a backend path.

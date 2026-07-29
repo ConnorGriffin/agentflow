@@ -79,9 +79,28 @@ implements [ADR 0028](0028-stage-scoped-continuations.md)'s exhaustion-handoff c
 
 ## Consequences
 
-- The crash-safe notify-once ordering is fixed once and cannot be reassembled wrong; one
-  exhaustive crash-window test replaces the partial re-verification scattered across four
-  tracer test files.
+- The crash-safe ordering is fixed once and cannot be reassembled wrong; one exhaustive
+  crash-window test replaces the partial re-verification scattered across four tracer test files.
 - Notification keying becomes uniform across every handoff.
+- **The notification is at-least-once, not exactly once.** The Decision above asks for
+  exactly-once, and the envelope cannot deliver it. Pinging only on the cycle that *posts* the
+  marker means a daemon that dies after the comment reaches GitHub and before the push goes out
+  never pings at all — the next cycle sees the marker, reads itself as a repeat, and the human
+  the pipeline is waiting on is never told. The window is seconds wide, because the posting
+  action goes on to edit the title and shuffle labels before it returns. Exactly-once would
+  require durable notification state, which this module deliberately does not keep, so the
+  envelope pings on every cycle that can *prove* the marker. The accepted cost: a crash between
+  the call returning and the stage retiring its record, or bookkeeping the stage retries
+  afterwards, sends the operator a second copy of the same ping. For "the pipeline needs a
+  human", a duplicate ping is plainly better than a silent drop.
+- **Nothing may lean on the client collapsing that duplicate.** The sequence id is sent to ntfy
+  as a header, and ntfy has no header that deduplicates or replaces a notification: its own
+  sequence ids are a URL path segment and only update a *scheduled* message before it is
+  delivered. The id remains a stable per-handoff key; the reader really does see two pings.
+- **The marker is derived, never the comment's own text.** Two genuinely different holds that
+  compose the same words would otherwise read as one, and the second would post nothing and ping
+  no one. The envelope derives markers from the record identity plus the reason for the handoff —
+  the shape the PR park already used — and accepts a second "also proves this" string so a hold
+  posted under an older marker format is not commented on twice after a deploy.
 - Ordered after the `github` module; additive keystone. Its migrations (holds, parks, settles,
   intake holds) serialize with the other candidates on shared files.

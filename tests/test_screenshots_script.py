@@ -182,7 +182,7 @@ def test_self_check_produces_png_through_interface(tmp_path):
 
 def test_build_prompt_references_harness():
     """BUILD_PROMPT must point sessions at the canonical script, not just 'headless Playwright'."""
-    from agentflow.loop import BUILD_PROMPT
+    from agentflow.prompts import BUILD_PROMPT
     assert HARNESS_REF in BUILD_PROMPT, (
         "BUILD_PROMPT does not reference 'node scripts/screenshots.mjs' — "
         "build sessions will hand-roll their own harness and rediscover the sandbox walls."
@@ -191,7 +191,7 @@ def test_build_prompt_references_harness():
 
 def test_revise_prompt_references_harness():
     """REVISE_PROMPT must point revise sessions at the canonical script."""
-    from agentflow.loop import REVISE_PROMPT
+    from agentflow.prompts import REVISE_PROMPT
     assert HARNESS_REF in REVISE_PROMPT, (
         "REVISE_PROMPT does not reference 'node scripts/screenshots.mjs' — "
         "revise sessions may write a new harness when refreshing stale screenshots."
@@ -200,7 +200,7 @@ def test_revise_prompt_references_harness():
 
 def test_respond_prompt_references_harness():
     """RESPOND_PROMPT must point respond sessions at the canonical script."""
-    from agentflow.loop import RESPOND_PROMPT
+    from agentflow.prompts import RESPOND_PROMPT
     assert HARNESS_REF in RESPOND_PROMPT, (
         "RESPOND_PROMPT does not reference 'node scripts/screenshots.mjs' — "
         "respond sessions may write a new harness when evidence is requested."
@@ -209,7 +209,7 @@ def test_respond_prompt_references_harness():
 
 def test_produce_prompt_references_harness():
     """PRODUCE_PROMPT must point mockup sessions at the canonical script."""
-    from agentflow.loop import PRODUCE_PROMPT
+    from agentflow.prompts import PRODUCE_PROMPT
     assert HARNESS_REF in PRODUCE_PROMPT, (
         "PRODUCE_PROMPT does not reference 'node scripts/screenshots.mjs' — "
         "mockup sessions will hand-roll their own harness for variant screenshots."
@@ -227,13 +227,13 @@ def test_review_prompt_references_harness():
 
 def _prompts_that_demand_screenshots():
     """Every spawned-session prompt that can require UI evidence, by name."""
-    from agentflow import loop
+    from agentflow import prompts
     from agentflow.reviewer import REVIEW_PROMPT
     return {
-        "BUILD_PROMPT": loop.BUILD_PROMPT,
-        "REVISE_PROMPT": loop.REVISE_PROMPT,
-        "RESPOND_PROMPT": loop.RESPOND_PROMPT,
-        "PRODUCE_PROMPT": loop.PRODUCE_PROMPT,
+        "BUILD_PROMPT": prompts.BUILD_PROMPT,
+        "REVISE_PROMPT": prompts.REVISE_PROMPT,
+        "RESPOND_PROMPT": prompts.RESPOND_PROMPT,
+        "PRODUCE_PROMPT": prompts.PRODUCE_PROMPT,
         "REVIEW_PROMPT": REVIEW_PROMPT,
     }
 

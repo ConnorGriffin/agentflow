@@ -15,7 +15,7 @@ import pytest
 
 from conftest import FakeSession, permits, record_of, starts_until_held
 
-from agentflow import coordinated_build
+from agentflow import coordinated_build, pipeline, stage_worktree, worktree_ref
 from agentflow.coordinator import BuildStageAdapter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause
@@ -35,8 +35,8 @@ def _weekly_clear():
 def test_operator_pacing_is_charged_only_after_a_confirmed_start(make_coord, monkeypatch):
     from agentflow.balancer import PoolStatus
     from agentflow.coordinator.launcher import NOT_STARTED, StartResult
-    gate = coordinated_build._production_gate()
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    gate = pipeline._production_gate()
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, active=True,
                                                      windows=(_weekly_clear(),)))
@@ -74,8 +74,8 @@ def test_interactive_turn_admits_under_a_not_clear_pool(make_coord, monkeypatch)
     # work on the same pool stays deferred by the not-clear pool. Fails against pre-#161 code,
     # where the interactive turn was gated exactly like background and sat waiting.
     from agentflow.balancer import PoolStatus
-    gate = coordinated_build._production_gate()
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    gate = pipeline._production_gate()
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(
         "agentflow.balancer._query_pool",
         lambda tool, **_: PoolStatus(tool, False, 47.0, reason="a session was active in the last 10m"))
@@ -95,8 +95,8 @@ def test_interactive_turn_defers_only_when_no_permit_fits(make_coord, monkeypatc
     # may still defer an interactive turn (issue #161). A background build claims all five of the
     # pool's permits; the Ask turn then cannot reserve its demand and stays waiting.
     from agentflow.balancer import PoolStatus
-    gate = coordinated_build._production_gate()
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    gate = pipeline._production_gate()
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(_weekly_clear(),)))
     fake = FakeSession()
@@ -117,7 +117,7 @@ def test_interactive_start_leaves_the_background_pace_slot_intact(monkeypatch):
     # background start — which then spends it, deferring the next background record.
     from agentflow.balancer import PoolStatus
     from agentflow.coordinator.record import Record
-    gate = coordinated_build._production_gate()
+    gate = pipeline._production_gate()
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, active=True,
                                                      windows=(_weekly_clear(),)))
@@ -140,7 +140,7 @@ def test_interactive_flag_never_admits_a_disabled_stage(monkeypatch):
     # gate, before the interactive carve-out is ever consulted (issue #161). _query_pool would
     # raise if reached, proving the refusal short-circuits on stage enablement.
     from agentflow.coordinator.record import Record
-    gate = coordinated_build._production_gate()
+    gate = pipeline._production_gate()
 
     def _boom(tool, **_):
         raise AssertionError("stage gate must refuse before the pool is queried")
@@ -159,10 +159,10 @@ def test_codex_launch_honors_weekly_unattended_budget(monkeypatch):
     # build fires on codex despite intake having deferred new work for lack of weekly headroom.
     from agentflow.balancer import PoolStatus, RateLimitWindow
     from agentflow.coordinator.record import Record
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
 
     now = 1_000_000.0
-    monkeypatch.setattr(coordinated_build.time, "time", lambda: now)
+    monkeypatch.setattr(pipeline.time, "time", lambda: now)
     short = RateLimitWindow(used_percent=10.0, window_minutes=300, resets_at=now + 3600)
     # One hour into the week: only 11.4% of the 80% weekly cap is released for unattended day 0.
     weekly_at = lambda used: RateLimitWindow(used_percent=used, window_minutes=10080,
@@ -173,12 +173,12 @@ def test_codex_launch_honors_weekly_unattended_budget(monkeypatch):
     # Short window clear, but weekly at 29% is over the 11.4% released — launch defers.
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(29.0))))
-    assert coordinated_build._production_gate()(codex) is False
+    assert pipeline._production_gate()(codex) is False
 
     # Weekly under the released budget — the same queued build launches.
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(short, weekly_at(5.0))))
-    assert coordinated_build._production_gate()(codex) is True
+    assert pipeline._production_gate()(codex) is True
 
 
 def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
@@ -574,7 +574,7 @@ def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlock
     assert moved.pool == "claude" and moved.state == "running"
     assert moved.lineage == "claude"                   # lineage re-pinned to the destination
     assert moved.source == "/work/o-r/.agentflow/worktrees/claude/issue-7-fix"
-    assert coordinated_build._source_facts(moved) is not None  # the real parser accepts the move
+    assert worktree_ref.source_facts(moved) is not None  # the real parser accepts the move
     assert permits(coord, "claude") == moved.demand
 
 
@@ -619,7 +619,7 @@ def test_a_never_started_build_stays_home_when_both_pools_are_throttled(make_coo
     coord.cycle("codex", now=0)                        # launches at home from the intact source
     launched = record_of(coord, ident)
     assert launched.pool == "codex" and launched.state == "running"
-    assert coordinated_build._source_facts(launched) is not None
+    assert worktree_ref.source_facts(launched) is not None
 
 
 # --- live projection & claim ownership ---------------------------------------------------
@@ -782,18 +782,18 @@ def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
                         lambda self, path: provisioned.append(path))
     expected = "agentflow/claude/issue-7-owned"
     monkeypatch.setattr(
-        loop, "_run",
+        stage_worktree, "_run",
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, expected, ""),
     )
 
-    assert coordinated_build._worktree_ready(record) is True
+    assert stage_worktree.worktree_ready(record) is True
     assert provisioned == [wt]
 
     monkeypatch.setattr(
-        loop, "_run",
+        stage_worktree, "_run",
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, "wrong", ""),
     )
-    assert coordinated_build._worktree_ready(record) is False
+    assert stage_worktree.worktree_ready(record) is False
 
 
 def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monkeypatch):
@@ -804,82 +804,160 @@ def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monke
                     repo="o/r", subject="7", source=str(wt), claim=True, lineage="claude")
     # An unreadable PR listing comes back as None from the module — the Build outcome stays
     # unknown, so it must raise, never be mistaken for an absent PR.
-    monkeypatch.setattr(github, "api", lambda *a, **k: None)
+    monkeypatch.setattr(github, "prs_for_branch", lambda repo, branch, **k: None)
 
     with pytest.raises(RuntimeError, match="cannot verify Build PR outcome"):
         coordinated_build._pr_exists(record)
 
 
-def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(monkeypatch):
+def _build_hold_seams(monkeypatch, state, *, notifications, labels_readable=None,
+                      label_failures=None, die_after_comment=False):
+    """Wire the build hold's shared-envelope seams (ADR 0042): the durable comment thread it reads
+    and proves the handoff through, the projection that posts the held-route comment and state
+    label, the release of the visible building claim, and the operator ping. Everything is stated
+    as a fact about the issue, never as a ``gh`` argument vector. ``labels_readable`` is a
+    one-element list a test flips to stand a label read that couldn't reach GitHub,
+    ``label_failures`` a countdown of projections whose comment lands but whose label write is
+    interrupted, and ``die_after_comment`` a daemon that dies the instant its comment is durable.
+    """
     from agentflow import github, intake, notify as notify_module
-
-    state = {
-        "title": "Build it",
-        "url": "https://github.com/o/r/issues/7",
-        "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
-        "comments": [],
-    }
 
     def drop_building(repo, number, label):
         state["labels"] = [entry for entry in state["labels"] if entry["name"] != label]
         return True
 
     def fake_apply(repo, number, title, labels, result):
-        state["labels"] = [{"name": "agentflow:needs-grilling"},
-                           {"name": "agentflow:building"}]
         if not any(comment["body"] == result.body for comment in state["comments"]):
             state["comments"].append({"body": result.body})
+        if die_after_comment:
+            raise RuntimeError("daemon died after the hold comment landed")
+        if label_failures and label_failures[0]:
+            label_failures[0] -= 1
+        else:
+            state["labels"] = [{"name": "agentflow:needs-grilling"},
+                               {"name": "agentflow:building"}]
         return "applied"
 
-    notifications = []
-    # The handoff states the issue's title/labels/comments through the module and drops the
-    # building claim through it — never by matching gh argument vectors.
-    monkeypatch.setattr(github, "api", lambda *a, **k: state)
+    monkeypatch.setattr(github, "issue_headline", lambda repo, number: github.IssueHeadline(
+        title=state["title"], labels=frozenset(entry["name"] for entry in state["labels"])))
+    monkeypatch.setattr(github, "issue_comments",
+                        lambda repo, number: [github.Comment(body=entry["body"], created_at="")
+                                              for entry in state["comments"]])
+    monkeypatch.setattr(github, "issue_labels",
+                        lambda repo, number: None if labels_readable == [False]
+                        else frozenset(entry["name"] for entry in state["labels"]))
     monkeypatch.setattr(github, "remove_label", drop_building)
     monkeypatch.setattr(intake, "apply_intake", fake_apply)
     monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
-    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-                    repo="o/r", subject="7", source="/retained/wt", claim=True)
+
+
+def _held_build_issue():
+    return {"title": "Build it", "url": "https://github.com/o/r/issues/7",
+            "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
+            "comments": []}
+
+
+def _held_build_record(**extra):
+    return Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                  repo="o/r", subject="7", source="/retained/wt", claim=True, **extra)
+
+
+def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(monkeypatch):
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+    record = _held_build_record()
 
     assert coordinated_build._hold_build(record) == state["url"]
     assert coordinated_build._hold_build(record) == state["url"]
     assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
     assert len(state["comments"]) == 1
-    assert len(notifications) == 1
+    # The issue is written once; the second pass re-tells the operator rather than risking a
+    # hold nobody was ever told about (ADR 0042's at-least-once notification).
+    assert len(notifications) == 2
+
+
+def test_build_hold_interrupted_after_its_comment_lands_still_reaches_the_operator(monkeypatch):
+    # The crash window that matters: the hold comment reaches GitHub and the daemon dies before
+    # the ping goes out. The projection is stood as one that raises *after* its comment is
+    # durable, so the next cycle is a genuinely fresh call over a thread that already carries the
+    # marker. Gating the ping on having posted the comment lost it here permanently — the issue
+    # sat held, asking a maintainer a question nobody was ever told about.
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications, die_after_comment=True)
+    record = _held_build_record()
+
+    with pytest.raises(RuntimeError):
+        coordinated_build._hold_build(record)
+    assert len(state["comments"]) == 1 and notifications == []
+
+    _build_hold_seams(monkeypatch, state, notifications=notifications)   # the restarted daemon
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert len(state["comments"]) == 1        # the marker is there, so nothing is written twice
+    assert len(notifications) == 1            # and the maintainer is finally told
+    assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
+
+
+def test_a_hold_projection_interrupted_before_its_state_label_is_still_finished(monkeypatch):
+    # Projecting the hold is idempotent across partial writes, so the envelope's post-once gate
+    # must not strand one: a hold whose comment landed but whose state label did not still
+    # reaches the held state, without a second comment.
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications, label_failures=[1])
+    record = _held_build_record()
+
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
+    assert len(state["comments"]) == 1 and len(notifications) == 1
+
+
+def test_a_maintainer_who_re_queues_the_held_issue_is_not_fought_over_it(monkeypatch):
+    # A maintainer reads the hold, decides the issue is buildable after all, and re-queues it.
+    # On the issue that is indistinguishable from a projection interrupted before its labels
+    # landed — both leave `ready-for-agent` and no `needs-grilling` — so the hold cannot refuse to
+    # finish. What it must never do is keep re-deciding: the old code answered "not held yet" and
+    # re-projected on every later cycle, reverting the maintainer for as long as they kept
+    # editing. Now the hold reports itself done and stops looking.
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+    record = _held_build_record()
+
+    assert coordinated_build._hold_build(record) == state["url"]
+    state["labels"] = [{"name": "ready-for-agent"}]   # the maintainer takes the issue back
+
+    # Reporting the hold done is what ends it: the coordinator records the proof and never asks
+    # again, so the maintainer's next edit is the last word on this issue.
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert len(state["comments"]) == 1
+
+
+def test_two_builds_of_one_issue_do_not_swallow_each_others_hold(monkeypatch):
+    # A resumed build that stops the same way composes the same words as the first — same status,
+    # same retained worktree. Matching on that text made the resume's hold invisible: no comment,
+    # no ping, and the resume reported itself handed off. The marker is per-record, so both land.
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+
+    assert coordinated_build._hold_build(_held_build_record()) == state["url"]
+    resumed = _held_build_record(resume=1)
+    resumed.identity = "o/r|7|build|-|s1"
+    assert coordinated_build._hold_build(resumed) == state["url"]
+
+    assert len(state["comments"]) == 2 and len(notifications) == 2
 
 
 def test_live_collision_handoff_names_the_collision_and_leaves_a_resumable_issue(monkeypatch):
     # A collision handoff routes through the same visible stuck-build handoff, but its comment and
     # notification name the collision — and it leaves the issue in the resume-ready state ADR 0019
     # intake picks up on a maintainer reply (needs-grilling, no building/ready-for-agent claim).
-    from agentflow import github, intake, notify as notify_module
-
-    state = {
-        "title": "Build it",
-        "url": "https://github.com/o/r/issues/7",
-        "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
-        "comments": [],
-    }
-
-    def drop_building(repo, number, label):
-        state["labels"] = [entry for entry in state["labels"] if entry["name"] != label]
-        return True
-
-    def fake_apply(repo, number, title, labels, result):
-        state["labels"] = [{"name": "agentflow:needs-grilling"},
-                           {"name": "agentflow:building"}]
-        if not any(comment["body"] == result.body for comment in state["comments"]):
-            state["comments"].append({"body": result.body})
-        return "applied"
-
+    state = _held_build_issue()
     notifications = []
-    monkeypatch.setattr(github, "api", lambda *a, **k: state)
-    monkeypatch.setattr(github, "remove_label", drop_building)
-    monkeypatch.setattr(intake, "apply_intake", fake_apply)
-    monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
-    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-                    repo="o/r", subject="7", source="/retained/wt", claim=True,
-                    hold_reason="integration collision")
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+    record = _held_build_record(hold_reason="integration collision")
 
     assert coordinated_build._hold_build(record) == state["url"]
     # Resume-ready for a maintainer reply: needs-grilling only, no build claim, no ready-for-agent.

@@ -18,6 +18,7 @@ import hashlib
 import json
 import re
 
+from agentflow import github
 from agentflow.workspace.store import APPROVED, WorkspaceStore
 
 # The provenance line stamped into every published issue body. It carries the approved content
@@ -56,31 +57,20 @@ def render_issue_body(version, content_hash_value: str) -> str:
     return "\n\n".join(p for p in parts if p)
 
 
-def _default_gh(cmd: list[str]):
-    from agentflow.runner import _run
-    return _run(cmd)
-
-
-def find_published(repo: str, content_hash_value: str, *, gh=_default_gh) -> dict | None:
+def find_published(repo: str, content_hash_value: str) -> dict | None:
     """The already-published issue carrying this provenance key, or ``None``. Searches GitHub for
     the hash and confirms the provenance line is really in the body — a fuzzy search hit that does
     not carry the marker is not our issue. This runs before every create, so a replay finds a
     just-created issue instead of filing a second one (ADR 0033)."""
     # Search by the bare hex digest: GitHub free-text search reads ``sha256:`` as a ``key:value``
     # qualifier, so the colon-free digest is what actually matches the marker in the body.
-    term = content_hash_value.split(":", 1)[-1]
-    r = gh(["gh", "issue", "list", "--repo", repo, "--state", "all", "--search",
-            term, "--json", "number,url,body", "--limit", "50"])
-    if r.returncode != 0:
-        return None
-    try:
-        issues = json.loads(r.stdout or "[]")
-    except json.JSONDecodeError:
+    matches = github.find_issues(repo, content_hash_value.split(":", 1)[-1])
+    if matches is None:
         return None
     marker = provenance_line(content_hash_value)
-    for issue in issues:
-        if marker in (issue.get("body") or ""):
-            return {"number": issue.get("number"), "url": issue.get("url")}
+    for issue in matches:
+        if marker in issue.body:
+            return {"number": issue.number, "url": issue.url}
     return None
 
 
@@ -102,22 +92,21 @@ def publish_failure_reason(stderr: str) -> str:
     return "GitHub rejected the request."
 
 
-def create_issue(repo: str, title: str, body: str, *, gh=_default_gh) -> dict:
+def create_issue(repo: str, title: str, body: str) -> dict:
     """Create the real GitHub build issue. Returns ``{"issue": {number, url}}`` on success, or
     ``{"error": <plain reason>}`` when creation failed hard (the daemon parks it FAILED for an
     operator Retry). No label is passed — no ``wayfinder:*`` marking, so intake grounds it normally
     (ADR 0027)."""
-    r = gh(["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body])
-    if r.returncode != 0:
-        return {"error": publish_failure_reason(getattr(r, "stderr", ""))}
-    url = (r.stdout or "").strip().splitlines()[-1].strip() if r.stdout else ""
-    m = re.search(r"/issues/(\d+)", url)
+    created = github.create_issue(repo, title, body)
+    if created.url is None:
+        return {"error": publish_failure_reason(created.error)}
+    m = re.search(r"/issues/(\d+)", created.url)
     if not m:
         return {"error": "GitHub accepted the request but returned no issue link."}
-    return {"issue": {"number": int(m.group(1)), "url": url}}
+    return {"issue": {"number": int(m.group(1)), "url": created.url}}
 
 
-def publish_approved(repo: str, conversation_id: str, *, store: WorkspaceStore, gh=_default_gh,
+def publish_approved(repo: str, conversation_id: str, *, store: WorkspaceStore,
                      now: int = 0) -> dict | None:
     """Publish one approved Proposal idempotently on its approved-hash provenance key.
 
@@ -135,9 +124,9 @@ def publish_approved(repo: str, conversation_id: str, *, store: WorkspaceStore, 
     if version is None:
         return None
     key = prop.approved_hash
-    issue = find_published(repo, key, gh=gh)              # ALWAYS search first (idempotency)
+    issue = find_published(repo, key)                    # ALWAYS search first (idempotency)
     if issue is None:
-        created = create_issue(repo, version.title, render_issue_body(version, key), gh=gh)
+        created = create_issue(repo, version.title, render_issue_body(version, key))
         if "error" in created:
             # Park the failure durably instead of re-attempting forever; the approval stays bound.
             store.fail_publication(conversation_id, key, reason=created["error"], now=now)
@@ -148,7 +137,7 @@ def publish_approved(repo: str, conversation_id: str, *, store: WorkspaceStore, 
     return issue
 
 
-def reconcile_publications(repos: list, *, store_factory=WorkspaceStore, gh=_default_gh, now=0,
+def reconcile_publications(repos: list, *, store_factory=WorkspaceStore, now=0,
                            _log=None) -> list[dict]:
     """Publish every approved-but-unpublished Proposal across the enrolled repos. Called each
     workspace cycle after commands drain, so an approval taken this cycle publishes this cycle, and
@@ -161,8 +150,7 @@ def reconcile_publications(repos: list, *, store_factory=WorkspaceStore, gh=_def
                 if prop.state != APPROVED:
                     continue
                 try:
-                    issue = publish_approved(cfg.repo, prop.conversation_id, store=store, gh=gh,
-                                             now=now)
+                    issue = publish_approved(cfg.repo, prop.conversation_id, store=store, now=now)
                 except Exception as e:  # noqa: BLE001 — one bad publish must not stall the rest
                     if _log:
                         _log(f"publish error {cfg.repo}#{prop.conversation_id}: "

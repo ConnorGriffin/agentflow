@@ -14,14 +14,10 @@ from datetime import datetime, timezone
 from agentflow import github, live, ratchet
 from agentflow.balancer import _query_pool
 from agentflow.gate import reply_pending
-from agentflow.loop import (
-    _CONFLICT_MARK,
-    _UI_GAP_REASON,
-    HELD_LABELS,
-    RepoConfig,
-    _pr_comments,
-    repo_profile,
-)
+from agentflow.labels import HELD_LABELS
+from agentflow.loop import _CONFLICT_MARK, RepoConfig
+from agentflow.prompts import UI_GAP_REASON
+from agentflow.repo_facts import repo_profile
 
 
 def pools() -> list[dict]:
@@ -209,7 +205,7 @@ def park_reason(comments: list[dict]) -> str | None:
         if _CONFLICT_MARK in body:
             return "failed-merge"
         if _PARK_MARK in body:
-            if _UI_GAP_REASON in body:
+            if UI_GAP_REASON in body:
                 return "ui-evidence"
             if _SQUASH_FAIL in body:
                 return "failed-merge"
@@ -246,7 +242,7 @@ def _parked_prs(repo: str) -> list[dict]:
     already posted, then classified into one reason (never by re-running the pipeline)."""
     out = []
     for p in _prs(repo, "open"):
-        comments = _pr_comments(repo, p.number)
+        comments = github.pr_comment_rows(repo, p.number)
         if comments is None:  # a `gh` blip reads as 'unknown', not 'not parked'
             continue
         reason = park_reason(comments)

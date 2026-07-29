@@ -7,7 +7,7 @@ discarding that work, and a completed Revise opens one new Review bound to the c
 a fresh budget.
 
 The Build → Review → Revise → Review path is exercised end to end through
-:func:`coordinated_build.reconcile_and_project` — the production interface that actually opens each
+:func:`pipeline.reconcile_and_project` — the production interface that actually opens each
 transition — with only its external reads faked (the PR head a completed Build/Revise exposes, the
 issue complexity label a revise trigger reads, and the parsed review verdict). This proves the real
 transition wiring, not a hand-submitted stand-in for it. The crash boundaries are exercised through
@@ -20,7 +20,8 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_build, github
+from agentflow import (coordinated_build, coordinated_review, coordinated_revise, gate,
+                       github, pipeline, pr_park)
 from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
                                     StageRouter, Submission, tracer)
 from agentflow.coordinator.providers import ProviderCause
@@ -80,7 +81,7 @@ _BLOCKING = Verdict(clean=False, findings=(Finding("blocking", "fix the thing"),
 
 class _Live:
     """Drives the real Build → Review → Revise → Review transitions through
-    :func:`coordinated_build.reconcile_and_project`, faking only its external reads. ``head`` is the
+    :func:`pipeline.reconcile_and_project`, faking only its external reads. ``head`` is the
     PR head SHA a completed Build/Revise exposes (mutable, so a pushed revision advances it),
     ``verdict`` is the parsed review verdict a blocking Review acts on, and ``labels`` are the issue
     complexity labels a revise trigger reads. Each :meth:`step` is one full reconcile of both build
@@ -97,12 +98,14 @@ class _Live:
         self.fail_gh = False            # flip to make every gh read fail (a transient outage)
         self.projections = []
         # The transitions state PR/issue facts through the github module now, never by shelling
-        # out: the open PR for a branch, the issue's acceptance body, and (kept unreadable so the
-        # diverged-review reconciler stays inert here) the PR head/state escape-hatch read.
+        # out: the open PR for a branch, the issue's acceptance body, the PR's own content that a
+        # reopened review's depth is assigned from, and the PR identity — the last kept unreadable
+        # so the diverged-review reconciler stays inert here.
         monkeypatch.setattr("agentflow.github.list_open_prs", self._list_open_prs)
         monkeypatch.setattr("agentflow.github.issue_body", self._issue_body)
-        monkeypatch.setattr("agentflow.github.api", lambda *a, **k: None)
-        monkeypatch.setattr(coordinated_build, "_review_verdict", lambda review: self.verdict)
+        monkeypatch.setattr("agentflow.github.pr_content", self._pr_content)
+        monkeypatch.setattr("agentflow.github.pr_facts", lambda *a, **k: None)
+        monkeypatch.setattr(coordinated_review, "_review_verdict", lambda review: self.verdict)
         monkeypatch.setattr("agentflow.live.replace_projection",
                             lambda entries, **kw: self.projections.append(entries))
 
@@ -114,8 +117,16 @@ class _Live:
     def _issue_body(self, repo, issue):
         return None if self.fail_gh else "Issue acceptance"
 
+    def _pr_content(self, repo, pr):
+        """An ordinary PR: it proposes no review depth of its own and touches nothing sensitive,
+        so the depth a reopened review gets is the policy's, not this fixture's."""
+        if self.fail_gh:
+            return None
+        return github.PrContent(body="Fixed the thing.",
+                                paths=("agentflow/widget.py",), comments=[])
+
     def step(self):
-        return coordinated_build.reconcile_and_project(self.coord)
+        return pipeline.reconcile_and_project(self.coord)
 
     def run_stage(self, identity, *, head=None):
         """Admit and start the one waiting stage, then end its provider and reconcile so its
@@ -304,17 +315,17 @@ def test_revise_completes_only_on_a_pushed_revision_even_after_a_bad_exit(make_c
 def test_revise_completes_on_durable_non_code_evidence_with_no_pushed_head(make_coord, monkeypatch):
     """Issue #105: a revision completes on a pushed head SHA OR the required durable non-code proof
     — an agentflow-marked PR comment that attaches evidence (e.g. a screenshot). The PRODUCTION
-    verifier (:func:`coordinated_build._revision_ready`) must accept an evidence-only revision whose
+    verifier (:func:`coordinated_revise._revision_ready`) must accept an evidence-only revision whose
     head never moved, not consume its continuations and park (the reported behavior)."""
     comments = [[]]                                       # the PR carries no evidence yet
-    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+    monkeypatch.setattr("agentflow.coordinated_revise._run",           # only git reads remain on _run
                         lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: comments[0])
 
     fake = FakeSession()
-    revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
+    revise = ReviseStageAdapter(revision_ready=coordinated_revise._revision_ready,
                                 worktree_ready=lambda r: True, observer=fake)
     coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
     ident = coord.submit_stage(_revise_sub(source=BUILD_WT, target="sha-a"))
@@ -344,14 +355,14 @@ def test_evidence_predating_the_revise_round_cannot_complete_it(make_coord, monk
                      "![old shot](https://user-images.githubusercontent.com/1/old.png)",
              "createdAt": BEFORE_ROUND}
     comments = [[stale]]                                  # the stale proof already sits on the PR
-    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+    monkeypatch.setattr("agentflow.coordinated_revise._run",           # only git reads remain on _run
                         lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: comments[0])
 
     fake = FakeSession()
-    revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
+    revise = ReviseStageAdapter(revision_ready=coordinated_revise._revision_ready,
                                 worktree_ready=lambda r: True, observer=fake)
     coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
     ident = coord.submit_stage(_revise_sub(source=BUILD_WT, target="sha-a"))
@@ -379,14 +390,14 @@ def test_restart_between_evidence_and_completion_still_completes_exactly_once(ma
     comments = [[{"body": "> *agentflow: reply from the build agent.*\n\n"
                           "![before/after](https://user-images.githubusercontent.com/1/x.png)",
                   "createdAt": AFTER_ROUND}]]
-    monkeypatch.setattr("agentflow.loop._run",           # only git reads remain on _run
+    monkeypatch.setattr("agentflow.coordinated_revise._run",           # only git reads remain on _run
                         lambda cmd, *a, **k: SimpleNamespace(returncode=0, stdout=""))
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR head is unchanged (== target)
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-a")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: comments[0])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: comments[0])
 
     fake = FakeSession()
-    revise = ReviseStageAdapter(revision_ready=coordinated_build._revision_ready,
+    revise = ReviseStageAdapter(revision_ready=coordinated_revise._revision_ready,
                                 worktree_ready=lambda r: True, observer=fake)
     coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
     ident = coord.submit_stage(_revise_sub(source=BUILD_WT, target="sha-a"))
@@ -451,14 +462,14 @@ def test_revision_ready_rejects_a_head_that_does_not_descend_from_the_reviewed_s
         if "merge-base" in cmd:
             return SimpleNamespace(returncode=ancestor[0], stdout="")
         return SimpleNamespace(returncode=0, stdout="")
-    monkeypatch.setattr("agentflow.loop._run", _git)
+    monkeypatch.setattr("agentflow.coordinated_revise._run", _git)
     monkeypatch.setattr("agentflow.github.list_open_prs",  # the PR exposes a DIFFERENT head
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-rewound")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [])
 
-    assert coordinated_build._revision_ready(record, None) is False  # rewound head, no evidence
+    assert coordinated_revise._revision_ready(record, None) is False  # rewound head, no evidence
     ancestor[0] = 0                                       # the head descends from the reviewed SHA
-    assert coordinated_build._revision_ready(record, None) is True
+    assert coordinated_revise._revision_ready(record, None) is True
 
 
 def _revise_head_read(tmp_path, monkeypatch, *, head, target="sha-a",
@@ -489,9 +500,10 @@ def _revise_head_read(tmp_path, monkeypatch, *, head, target="sha-a",
     def list_open_prs(repo, *, head=None, limit=100):
         return [github.PrRow(42, head or "", head_sha)]
 
-    monkeypatch.setattr("agentflow.loop._run", _git)
+    monkeypatch.setattr("agentflow.coordinated_revise._run", _git)
+    monkeypatch.setattr("agentflow.stage_worktree._run", _git)   # the shared owns-head probe
     monkeypatch.setattr("agentflow.github.list_open_prs", list_open_prs)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: list(comments))
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: list(comments))
     return record
 
 
@@ -502,7 +514,7 @@ def test_revision_ready_completes_on_a_rebased_head_the_worktree_owns(tmp_path, 
     history and burn the continuation budget."""
     record = _revise_head_read(tmp_path, monkeypatch, head="rebased-head",
                                descends=False, rewound=False)
-    assert coordinated_build._revision_ready(record, None) is True
+    assert coordinated_revise._revision_ready(record, None) is True
 
 
 def test_revision_ready_rejects_a_rewound_head_even_with_a_clean_worktree(tmp_path, monkeypatch):
@@ -511,7 +523,7 @@ def test_revision_ready_rejects_a_rewound_head_even_with_a_clean_worktree(tmp_pa
     comment to fall back on either."""
     record = _revise_head_read(tmp_path, monkeypatch, head="older-head",
                                descends=False, rewound=True)
-    assert coordinated_build._revision_ready(record, None) is False
+    assert coordinated_revise._revision_ready(record, None) is False
 
 
 def test_revision_ready_rejects_a_rewritten_head_the_worktree_does_not_own(tmp_path, monkeypatch):
@@ -519,10 +531,10 @@ def test_revision_ready_rejects_a_rewritten_head_the_worktree_does_not_own(tmp_p
     dirty — is not proven the reviser's own pushed work, so it stays incomplete."""
     elsewhere = _revise_head_read(tmp_path / "a", monkeypatch, head="rebased-head",
                                   local_head="some-other-head")
-    assert coordinated_build._revision_ready(elsewhere, None) is False
+    assert coordinated_revise._revision_ready(elsewhere, None) is False
     dirty = _revise_head_read(tmp_path / "b", monkeypatch, head="rebased-head",
                               status=" M changed.py\n")
-    assert coordinated_build._revision_ready(dirty, None) is False
+    assert coordinated_revise._revision_ready(dirty, None) is False
 
 
 # --- retained worktree reuse: a miss costs nothing; an interrupt keeps local work ---------
@@ -603,7 +615,7 @@ def test_exhaustion_parks_the_pr_once_and_does_not_discard_local_work(make_coord
 def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_coord, monkeypatch):
     """A Revise owns the *builder* worktree (``.../<tool>/issue-<n>-<slug>``), not a review worktree,
     so its exhaustion handoff must resolve the PR by branch. The PRODUCTION park
-    (:func:`coordinated_build._park_pr`) must post the durable park proof and release the claim —
+    (:func:`pr_park.park_pr`) must post the durable park proof and release the claim —
     not return no proof and leave the handoff pending with the claim retained (the reported
     behavior)."""
     parked, notified, pr_comments = [], [], []
@@ -611,8 +623,10 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
         parked.append((repo, pr, reason, missing_outcome))
         pr_comments.append({
             "body": f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->"})
-    monkeypatch.setattr("agentflow.github.api",          # the open PR for the builder branch is #42
-                        lambda args, *, parse_json=False: [{"number": 42}])
+    monkeypatch.setattr(                                 # the PR for the builder branch is #42
+        "agentflow.github.prs_for_branch",
+        lambda repo, branch, **k: [github.BranchPrRow(number=42, state="OPEN",
+                                                      head_ref_name=branch, url="")])
     monkeypatch.setattr("agentflow.gate.park", _park)
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda repo, pr: [github.Comment(body=c["body"], created_at="")
@@ -621,7 +635,7 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
 
     fake = FakeSession()
     revise = ReviseStageAdapter(revision_ready=lambda r, o: False, worktree_ready=lambda r: True,
-                                observer=fake, handoff=coordinated_build._park_pr)
+                                observer=fake, handoff=pr_park.park_pr)
     coord = make_coord(fake, adapter=StageRouter({"revise": revise}))
     ident = coord.submit_stage(_revise_sub(source=BUILD_WT))
 
@@ -754,24 +768,24 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
     review = Record(identity="o/r|7|review|sha-a", stage="review", pool="codex", demand=2,
                     repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
                     source="/home/w/.agentflow/worktrees/codex-review/pr-42-fix-thing")
-    sub = coordinated_build.revise_submission(review, "deep", "- fix the thing")
+    sub = coordinated_revise.revise_submission(review, "deep", "- fix the thing")
     assert sub is not None
     assert sub.stage == "revise" and sub.target == "sha-a"            # revises away from reviewed SHA
     assert sub.pool == "claude" and sub.builder_lineage == "claude"   # the builder's tool lineage
     assert sub.complexity == "deep"                                   # the original builder complexity
     assert sub.round == review.round                                  # stays in the review's round
     assert sub.transfer_from == "o/r|7|review|sha-a"                  # assumes the review's claim
-    post_fix = coordinated_build.revise_submission(
+    post_fix = coordinated_revise.revise_submission(
         review, "deep", "- still blocked", target_sha="sha-b-fixed")
     assert post_fix is not None and post_fix.target == "sha-b-fixed"
     # The retained build worktree is recovered from the review path's slug through the layout owner,
     # so the review (pr-42-fix-thing) and the builder (issue-7-fix-thing) read as the same issue.
     assert sub.source == WorktreeRef.for_build("/home/w", "claude", 7, "fix-thing").path
     # A review with no builder lineage, an unreadable source, or a missing SHA yields no submission.
-    assert coordinated_build.revise_submission(
+    assert coordinated_revise.revise_submission(
         Record(identity="x", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
                target="sha-a", source="/nope"), "deep") is None
-    assert coordinated_build.revise_submission(
+    assert coordinated_revise.revise_submission(
         Record(identity="x", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
                builder_lineage="claude",
                source="/home/w/.agentflow/worktrees/codex-review/pr-42-fix-thing"), "deep") is None
@@ -781,7 +795,7 @@ def test_review_submission_from_a_completed_revise_binds_the_new_head_and_keeps_
     revise = Record(identity="o/r|7|revise|sha-a", stage="revise", pool="claude", demand=3,
                     repo="o/r", subject="7", builder_lineage="claude", lineage="claude",
                     source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing")
-    sub = coordinated_build.review_submission(revise, "sha-b-new", "codex", 42)
+    sub = coordinated_review.review_submission(revise, "sha-b-new", "codex", 42)
     assert sub is not None
     assert sub.stage == "review" and sub.target == "sha-b-new"       # bound to the changed head SHA
     assert sub.pool == "codex" and sub.builder_lineage == "claude"   # original builder still recorded
@@ -796,11 +810,11 @@ def test_continuation_attempts_do_not_expand_the_auto_revise_round_policy():
     attempts it burned."""
     revises = [Record(identity=f"o/r|7|revise|sha-{i}", stage="revise", pool="claude", demand=3,
                       repo="o/r", subject="7", attempts=3) for i in range(MAX_REVISES)]
-    assert coordinated_build.revise_round_budget_remains([], "o/r", "7") is True
-    assert coordinated_build.revise_round_budget_remains(revises, "o/r", "7") is False
-    assert coordinated_build.revise_round_budget_remains(revises[:-1], "o/r", "7") is (MAX_REVISES > 1)
+    assert gate.revise_round_budget_remains([], "o/r", "7") is True
+    assert gate.revise_round_budget_remains(revises, "o/r", "7") is False
+    assert gate.revise_round_budget_remains(revises[:-1], "o/r", "7") is (MAX_REVISES > 1)
     # A revise for another issue never counts against this one.
-    assert coordinated_build.revise_round_budget_remains(revises, "o/r", "8") is True
+    assert gate.revise_round_budget_remains(revises, "o/r", "8") is True
 
 
 # --- issue #212: a survivor conflict Revise, budgeted and re-reviewed apart (ADR 0038) --------
@@ -820,11 +834,11 @@ def test_conflict_revise_round_is_budgeted_apart_from_the_finding_driven_rounds(
     conflicts = [Record(identity=f"o/r|7|revise|sha-c{i}|c{i}", stage="revise", pool="claude",
                         demand=3, repo="o/r", subject="7", conflict_round=i) for i in (1, 2)]
     # Spent finding-driven rounds leave the conflict budget fully open, and vice versa.
-    assert coordinated_build.revise_round_budget_remains(findings + conflicts, "o/r", "7") is False
-    assert coordinated_build.revise_round_budget_remains(conflicts, "o/r", "7") is True
-    used = coordinated_build.conflict_revises_used(findings + conflicts, "o/r", "7")
+    assert gate.revise_round_budget_remains(findings + conflicts, "o/r", "7") is False
+    assert gate.revise_round_budget_remains(conflicts, "o/r", "7") is True
+    used = gate.conflict_revises_used(findings + conflicts, "o/r", "7")
     assert [r.conflict_round for r in used] == [1, 2]         # only the conflict rounds, in order
-    assert coordinated_build.conflict_revises_used(findings, "o/r", "7") == []
+    assert gate.conflict_revises_used(findings, "o/r", "7") == []
 
 
 def test_completed_conflict_revise_reopens_a_review_with_the_discard_lens(make_coord, monkeypatch):
@@ -853,7 +867,7 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     """The pure survivor conflict-Revise mapping: pinned to the builder's tool and retained
     worktree, bound to the conflicting head, marked a continuation, carrying the ADR's finding."""
     cfg = SimpleNamespace(repo="o/r", workdir="/w")
-    sub = coordinated_build.survivor_conflict_revise_submission(
+    sub = coordinated_revise.survivor_conflict_revise_submission(
         cfg, issue=7, slug="fix", builder_tool="claude", head_sha="sha-conf", pr_number=42,
         conflict_round=1)
     assert sub is not None
@@ -863,7 +877,7 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert sub.source == "/w/.agentflow/worktrees/claude/issue-7-fix"
     assert "resolve the merge conflicts" in sub.input_ptr and "Preserve both sides" in sub.input_ptr
     # An unknown tool has no lineage to pin the Revise to.
-    assert coordinated_build.survivor_conflict_revise_submission(
+    assert coordinated_revise.survivor_conflict_revise_submission(
         cfg, issue=7, slug="fix", builder_tool="gemini", head_sha="sha-conf", pr_number=42,
         conflict_round=1) is None
 
@@ -888,7 +902,7 @@ def test_conflict_uncertainty_opens_one_full_decision_pass_on_the_other_tool():
         outcome=('conflict-uncertainty:{"options":["keep main","keep PR"],'
                  '"missing_guidance":"tie owner","recommendation":"keep main"}'))
 
-    sub = coordinated_build.conflict_decision_review_submission(
+    sub = coordinated_review.conflict_decision_review_submission(
         revise, head_sha="head", pr_number=42, acceptance="preserve outcome", surfaces="none")
 
     assert sub is not None and sub.pool == "codex"
@@ -908,7 +922,7 @@ def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineag
     verdict = Verdict(
         clean=True, reviewed_sha="head", final_sha="head", decision="keep main: shared rule owns ties")
 
-    sub = coordinated_build.conflict_decision_revise_submission(review, verdict)
+    sub = coordinated_revise.conflict_decision_revise_submission(review, verdict)
 
     assert sub is not None and sub.pool == "claude" and sub.conflict_round == 1
     assert sub.review.uncertainty_handoffs == 1 and sub.transfer_from == review.identity
@@ -925,20 +939,20 @@ def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypa
         source="/work/.agentflow/worktrees/claude/issue-7-fix",
         review_depth="full", depth_reason="competing product behaviors in a conflict",
         review_axis="product", change_author_tool="claude", uncertainty_handoffs=1)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [revise])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [revise])
     monkeypatch.setattr(
-        coordinated_build, "_source_facts",
+        pipeline, "source_facts",
         lambda _record: ("/work", "agentflow/claude/issue-7-fix", "/wt"))
     monkeypatch.setattr(
-        coordinated_build, "_open_pr_for_branch",
+        github, "open_pr_for_branch",
         lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "resolved"))
     monkeypatch.setattr(
-        coordinated_build, "_review_context", lambda _record: ("acceptance", "none"))
-    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "reviewed")
-    monkeypatch.setattr(coordinated_build, "pick_reviewer", lambda *_args, **_kwargs: "codex")
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+    monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr(pipeline, "pick_reviewer", lambda *_args, **_kwargs: "codex")
     submitted = []
 
-    coordinated_build._open_review_on_completed_revise(
+    pipeline._open_review_on_completed_revise(
         SimpleNamespace(submit_stage=submitted.append), revise.identity)
 
     assert len(submitted) == 1

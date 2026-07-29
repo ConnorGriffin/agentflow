@@ -5,21 +5,24 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentflow import loop
+from agentflow import coordinated_review, github, labels as label_vocab, loop, pipeline
 from agentflow.gate import respond_reply_disclaimer
-from agentflow.intake import INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body
-from agentflow.loop import (BUILD_PROMPT, DRAWING, MOCKUP_MARK, PRODUCE_PROMPT, RESPOND_PROMPT,
-                            REVISE_PROMPT, RebaseResult, RepoConfig, _MOCKUP_DISCLAIMER,
-                            _SCOPE_GUIDANCE, _free_to_dispatch, _issues_in_flight,
+from agentflow.github import pr_number
+from agentflow.intake import (INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body,
+                              held_build_result)
+from agentflow.labels import (DRAWING, MOCKUP_MARK, complexity_from_labels, effort_from_labels,
+                              mockup_scope_from_labels)
+from agentflow.loop import (RebaseResult, RepoConfig, _free_to_dispatch, _issues_in_flight,
                             _native_blockers,
                             _next_pr_awaiting_reply, _next_ready_issue, _next_resumable_issue,
                             _rebase_survivor, _untriaged, base_advanced, build_issue,
-                            complexity_from_labels, conflict_already_flagged, effort_from_labels,
-                            held_build_result, intake_allowlist, issue_of_branch,
-                            mockup_scope_from_labels, pr_number,
-                            recheck_once, repo_profile,
-                            slug, _surfaces_phrase, surface_declaration, ui_surfaces)
+                            conflict_already_flagged, recheck_once)
+from agentflow.prompts import (BUILD_PROMPT, MOCKUP_DISCLAIMER, PRODUCE_PROMPT, RESPOND_PROMPT,
+                               REVISE_PROMPT, SCOPE_GUIDANCE)
+from agentflow.repo_facts import (SurfaceDeclaration, intake_allowlist, repo_profile,
+                                  surface_declaration, surfaces_phrase, ui_surfaces)
 from agentflow.runner import Complexity, Effort, MockupScope
+from agentflow.worktree_ref import issue_of_branch, slug
 
 
 class _FakeRun:
@@ -31,13 +34,13 @@ class _FakeRun:
 
 def _issue_row(number, labels=(), title="t", body="b"):
     """A typed issue row as the shared GitHub module's discovery listing returns."""
-    return loop.github.IssueRow(number=number, title=title, body=body,
+    return github.IssueRow(number=number, title=title, body=body,
                                labels=frozenset(labels))
 
 
 def _pr_row(number, head_ref_name, head_ref_oid=""):
     """A typed open-PR row as the shared GitHub module's discovery listing returns."""
-    return loop.github.PrRow(number=number, head_ref_name=head_ref_name,
+    return github.PrRow(number=number, head_ref_name=head_ref_name,
                             head_ref_oid=head_ref_oid)
 
 
@@ -49,6 +52,17 @@ def test_complexity_from_labels_reads_the_label():
 def test_complexity_from_labels_is_none_without_one():
     # Hard gate (ADR 0018): no complexity label => the loop must skip, not guess.
     assert complexity_from_labels(["ready-for-agent", "bug"]) is None
+
+
+def test_a_double_stamped_dial_resolves_the_same_way_every_run():
+    # A typed row carries its labels as a set, and the dial decoders take the first match, so an
+    # issue a human stamped with both sizes must not pick a different builder model per process.
+    row = github.IssueRow(number=7, title="t", body="",
+                          labels=frozenset({"agentflow:complexity:standard",
+                                            "agentflow:complexity:deep", "ready-for-agent"}))
+    names = [label["name"] for label in loop._row_dict(row)["labels"]]
+    assert names == sorted(names)
+    assert complexity_from_labels(names) is Complexity.DEEP
     assert complexity_from_labels([]) is None
 
 
@@ -108,7 +122,7 @@ def test_free_to_dispatch_ignores_blocked_by_in_incidental_prose(monkeypatch):
     # No native edges, and the prose isn't a real `Blocked by #N` declaration — so no blocker
     # state is ever read (a read here would mean the incidental prose was treated as a blocker).
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
-    monkeypatch.setattr(loop.github, "issue_state",
+    monkeypatch.setattr(github, "issue_state",
                         lambda repo, n: pytest.fail("prose is not a declaration"))
 
     assert _free_to_dispatch(RepoConfig("o/r", "."), issue, set()) is True
@@ -175,28 +189,29 @@ def test_intake_allowlist_falls_back_to_claude_md(tmp_path):
 def test_issues_in_flight_is_unknown_when_gh_fails(monkeypatch):
     # Unknown is not empty (ADR 0021): a `gh` blip must not read as "nothing in flight",
     # or every in-review issue gets a duplicate dispatch.
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, **k: None)
     assert _issues_in_flight(RepoConfig("o/r", ".")) is None
 
 
 def test_issues_in_flight_recognizes_closing_reference_off_convention_branch(monkeypatch):
     # A hand-driven build opens a PR on an off-convention branch (`codex/40-foo`) that the
     # branch regex can't parse — but its declared closing reference #40 must still dedup.
-    prs = [{"headRefName": "codex/40-foo",
-            "closingIssuesReferences": [{"number": 40}]}]
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: prs)
+    prs = [github.PrRow(number=1, head_ref_name="codex/40-foo", head_ref_oid="sha",
+                        closing_issues=(40,))]
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, **k: prs)
     assert 40 in _issues_in_flight(RepoConfig("o/r", "."))
 
 
 def test_issues_in_flight_still_recognizes_conventional_branch(monkeypatch):
-    prs = [{"headRefName": "agentflow/codex/issue-7-slug", "closingIssuesReferences": []}]
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: prs)
+    prs = [github.PrRow(number=1, head_ref_name="agentflow/codex/issue-7-slug",
+                        head_ref_oid="sha")]
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, **k: prs)
     assert 7 in _issues_in_flight(RepoConfig("o/r", "."))
 
 
 def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
     ready = [_issue_row(5, ["ready-for-agent"], body="")]
-    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())   # no blockers
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
@@ -214,9 +229,9 @@ def _ready_dispatch(monkeypatch, ready, blocker_states, native=None):
     rows = [_issue_row(d["number"], [lbl["name"] for lbl in d.get("labels", [])],
                        title=d.get("title", "t"), body=d.get("body", ""))
             for d in ready]
-    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(rows))
+    monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(rows))
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set(native.get(n, set())))
-    monkeypatch.setattr(loop.github, "issue_state", lambda repo, n: blocker_states.get(n))
+    monkeypatch.setattr(github, "issue_state", lambda repo, n: blocker_states.get(n))
 
 
 def _native_edge(number, state, repo="o/r"):
@@ -304,7 +319,7 @@ def test_native_blockers_unions_same_repo_edges_and_ignores_cross_repo(monkeypat
     # The native blocked-by read, exercised through the shared GitHub module: the endpoint's
     # edges come back via `github.api`, and only same-repo edges join the gate.
     edges = [_native_edge(41, "OPEN"), _native_edge(7, "CLOSED", "other/repo")]
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: edges)
+    monkeypatch.setattr(github, "api", lambda *a, **k: edges)
 
     blockers = _native_blockers(RepoConfig("o/r", "."), 42)
 
@@ -313,7 +328,7 @@ def test_native_blockers_unions_same_repo_edges_and_ignores_cross_repo(monkeypat
 
 def test_native_blockers_is_unknown_when_the_read_fails(monkeypatch):
     # Unreadable edges are None (unknown), never an empty set — the caller then fails closed.
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)
+    monkeypatch.setattr(github, "api", lambda *a, **k: None)
     assert _native_blockers(RepoConfig("o/r", "."), 42) is None
 
 
@@ -357,8 +372,8 @@ def test_next_ready_issue_unions_prose_and_native_blockers(monkeypatch):
 def test_next_ready_issue_fails_closed_when_native_read_fails(monkeypatch):
     ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
     logs = []
-    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)   # native fetch failed — unknown
+    monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(github, "api", lambda *a, **k: None)   # native fetch failed — unknown
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", "."), _log=logs.append) is None
@@ -368,8 +383,8 @@ def test_next_ready_issue_fails_closed_when_native_read_fails(monkeypatch):
 def test_next_ready_issue_fails_closed_on_malformed_native_response(monkeypatch):
     ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
     # A malformed native response reads back as None through the module — never "no blockers".
-    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: None)
+    monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(github, "api", lambda *a, **k: None)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", ".")) is None
@@ -379,40 +394,11 @@ def test_next_ready_issue_ignores_cross_repo_native_blocker(monkeypatch):
     # A native edge pointing at another repo does not by itself hold the issue.
     ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
     edges = [_native_edge(41, "OPEN", repo="other/repo")]
-    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: list(ready))
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: edges)   # real filtering drops it
+    monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
+    monkeypatch.setattr(github, "api", lambda *a, **k: edges)   # real filtering drops it
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
     assert _next_ready_issue(RepoConfig("o/r", "."))["number"] == 42
-
-
-def test_release_triage_proves_the_claim_is_absent(monkeypatch):
-    # The claim is present, the removal succeeds, and a re-read confirms it's gone.
-    reads = iter((frozenset({"agentflow:triaging"}), frozenset()))
-    monkeypatch.setattr(loop.github, "issue_labels", lambda repo, n: next(reads))
-    monkeypatch.setattr(loop.github, "remove_label", lambda repo, n, label: True)
-
-    assert loop._release_triage("o/r", 69) is True
-
-
-def test_release_triage_fails_closed_when_github_still_reports_the_claim(monkeypatch):
-    # The re-read still shows the claim — the release cannot be proven, so it fails closed.
-    reads = iter((frozenset({"agentflow:triaging"}), frozenset({"agentflow:triaging"})))
-    monkeypatch.setattr(loop.github, "issue_labels", lambda repo, n: next(reads))
-    monkeypatch.setattr(loop.github, "remove_label", lambda repo, n, label: True)
-
-    assert loop._release_triage("o/r", 69) is False
-
-
-def test_release_triage_accepts_an_already_absent_claim(monkeypatch):
-    reads = []
-    monkeypatch.setattr(loop.github, "issue_labels",
-                        lambda repo, n: reads.append(n) or frozenset())
-    monkeypatch.setattr(loop.github, "remove_label",
-                        lambda repo, n, label: pytest.fail("nothing to remove"))
-
-    assert loop._release_triage("o/r", 69) is True
-    assert len(reads) == 1
 
 
 def test_held_build_result_holds_instead_of_requeueing():
@@ -497,11 +483,11 @@ def test_silence_reports_undeclared(tmp_path):
 def test_prompts_do_not_demand_screenshots_of_a_headless_repo():
     # A declared-headless repo must stop hearing the vague "any user-facing surface" ask;
     # a real declaration and an unanswered one are unchanged.
-    assert "no screenshot is required" in _surfaces_phrase(
-        loop.SurfaceDeclaration(declared=True))
-    assert _surfaces_phrase(
-        loop.SurfaceDeclaration(surfaces=("frontend/",), declared=True)) == "`frontend/`"
-    assert _surfaces_phrase(loop.SurfaceDeclaration()) == \
+    assert "no screenshot is required" in surfaces_phrase(
+        SurfaceDeclaration(declared=True))
+    assert surfaces_phrase(
+        SurfaceDeclaration(surfaces=("frontend/",), declared=True)) == "`frontend/`"
+    assert surfaces_phrase(SurfaceDeclaration()) == \
         "any user-facing surface (frontend, UI templates, etc.)"
 
 
@@ -520,10 +506,15 @@ def test_work_order_helper_is_gone():
     assert not hasattr(loop, "_work_order")
 
 
+def _canned_issue(*, state="OPEN", title="t", body="b", labels=()):
+    return github.IssueView(title=title, body=body, state=state, url="",
+                            labels=frozenset(labels), comments=[])
+
+
 def _issue_view(monkeypatch, issue):
-    """Serve build_issue's single-issue read (the module's escape hatch) a canned issue row,
-    with no native blocked-by edges (the dispatch gate reads those too)."""
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: issue)
+    """Serve build_issue's whole-issue read a canned issue, with no native blocked-by edges
+    (the dispatch gate reads those too)."""
+    monkeypatch.setattr(github, "issue_view", lambda repo, n: issue)
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
 
 
@@ -531,16 +522,16 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     from agentflow import coordinated_build
     from agentflow.coordinator.record import Record, WAITING
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
                         lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: True)
+    monkeypatch.setattr(loop, "claim", lambda repo, n, _label: True)
     submission = SimpleNamespace(resume=0, pool="claude")
     monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(coordinated_build, "resume_if_held", lambda sub, records: sub)
     submitted = []
     waiting = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
@@ -548,9 +539,9 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     coordinator = SimpleNamespace(
         submit_stage=lambda sub: submitted.append(sub) or "o/r|5|build|-",
         stage_record=lambda identity: waiting)
-    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
     reconciled = []
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project", reconciled.append)
+    monkeypatch.setattr(pipeline, "reconcile_and_project", reconciled.append)
 
     out = build_issue(RepoConfig("o/r", "/tmp"), 5)
 
@@ -568,30 +559,30 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     from agentflow.coordinator import Submission
     from agentflow.coordinator.record import HELD, WAITING, Record
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     # pick_pair offers codex, but the held Build was built by claude — the resume must pin back.
     monkeypatch.setattr(loop, "pick_pair",
                         lambda operator=False: (SimpleNamespace(tool="codex"), None, ""))
     claimed = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: claimed.append(n) or True)
+    monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claimed.append(n) or True)
     base = Submission(repo="o/r", subject="5", stage="build", pool="codex",
                       complexity="standard", source="/w/.agentflow/worktrees/codex/issue-5-t")
     monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: base)
     held = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
                   repo="o/r", subject="5", state=HELD, claim=False,
                   source="/w/.agentflow/worktrees/claude/issue-5-t", input_ptr="the original brief")
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [held])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [held])
     submitted = []
     resumed_rec = Record(identity="o/r|5|build|-|s1", stage="build", pool="claude", demand=5,
                          repo="o/r", subject="5", state=WAITING, resume=1)
     coordinator = SimpleNamespace(
         submit_stage=lambda sub: submitted.append(sub) or "o/r|5|build|-|s1",
         stage_record=lambda identity: resumed_rec)
-    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coordinator)
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda c: None)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda c: None)
 
     out = build_issue(RepoConfig("o/r", "/tmp"), 5)
 
@@ -612,16 +603,16 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
     from agentflow import coordinated_build
     from agentflow.coordinator.record import Record, WAITING
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
                         lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: False)   # the race is lost
+    monkeypatch.setattr(loop, "claim", lambda repo, n, _label: False)   # the race is lost
     submission = SimpleNamespace(resume=0, pool="claude")
     monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(coordinated_build, "resume_if_held", lambda sub, records: sub)
     waiting = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
                      state=WAITING)
@@ -630,8 +621,8 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
         submit_stage=lambda sub: "o/r|5|build|-",
         stage_record=lambda identity: waiting,
         withdraw_stage=lambda identity: withdrawn.append(identity) or True)
-    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coordinator)
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project",
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(pipeline, "reconcile_and_project",
                         lambda c: pytest.fail("must not project a withdrawn submission"))
 
     out = build_issue(RepoConfig("o/r", "/tmp"), 5)
@@ -647,13 +638,14 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
     from agentflow import coordinated_build
     from agentflow.coordinator.record import HELD, Record, WAITING
 
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
                         lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: pytest.fail("must not claim a held record"))
+    monkeypatch.setattr(loop, "claim",
+                        lambda repo, n, _label: pytest.fail("must not claim a held record"))
     submission = SimpleNamespace(repo="o/r", subject="5", resume=0, pool="claude")
     monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
     # The held original at resume 0 plus a live resume successor already running at resume 1.
@@ -661,13 +653,13 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
                   repo="o/r", subject="5", state=HELD, resume=0)
     live = Record(identity="o/r|5|build|-|s1", stage="build", pool="claude", demand=5,
                   repo="o/r", subject="5", state=WAITING, resume=1)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [held, live])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [held, live])
     # resume_if_held runs for real: the latest live Build is not held, so the submission is unchanged
     # and idempotently reuses the terminal held record.
     coordinator = SimpleNamespace(
         submit_stage=lambda sub: "o/r|5|build|-",
         stage_record=lambda identity: held)
-    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coordinator)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coordinator)
 
     out = build_issue(RepoConfig("o/r", "/tmp"), 5)
 
@@ -683,8 +675,8 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
     from agentflow.coordinator import Submission
 
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
-    issue = {"number": 5, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -692,9 +684,9 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
     monkeypatch.setattr(coordinated_build, "build_submission",
                         lambda *_: Submission(repo="o/r", subject="5", stage="build",
                                               pool="claude", complexity="deep"))
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda c: None)
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda c: None)
     claim = {"ok": False}
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: claim["ok"])
+    monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claim["ok"])
 
     lost = build_issue(RepoConfig("o/r", "/tmp"), 5)          # the claim race is lost
     assert "could not claim" in lost and "withdrew" in lost
@@ -705,11 +697,11 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
 
 
 def test_build_issue_refuses_an_open_blocker(monkeypatch):
-    issue = {"number": 42, "state": "OPEN", "title": "dependent", "body": "Blocked by #41",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:standard"}]}
-    monkeypatch.setattr(loop.github, "api", lambda *a, **k: issue)   # the single-issue read
+    issue = _canned_issue(state="OPEN", title="dependent", body="Blocked by #41",
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
+    monkeypatch.setattr(github, "issue_view", lambda repo, n: issue)
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
-    monkeypatch.setattr(loop.github, "issue_state", lambda repo, n: "OPEN")   # blocker #41 open
+    monkeypatch.setattr(github, "issue_state", lambda repo, n: "OPEN")   # blocker #41 open
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     out = build_issue(RepoConfig("o/r", "/tmp"), 42)
 
@@ -717,16 +709,15 @@ def test_build_issue_refuses_an_open_blocker(monkeypatch):
 
 
 def test_build_issue_refuses_a_held_issue_and_points_at_pickup(monkeypatch):
-    issue = {"number": 7, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "agentflow:needs-grilling"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["agentflow:needs-grilling"])
     _issue_view(monkeypatch, issue)
     out = build_issue(RepoConfig("o/r", "/tmp"), 7)
     assert "pickup" in out and "7" in out
 
 
 def test_build_issue_refuses_an_untriaged_issue_and_points_at_triage(monkeypatch):
-    issue = {"number": 8, "state": "OPEN", "title": "t", "body": "b", "labels": [{"name": "bug"}]}
-    _issue_view(monkeypatch, issue)
+    _issue_view(monkeypatch, _canned_issue(labels=["bug"]))
     out = build_issue(RepoConfig("o/r", "/tmp"), 8)
     assert "triage" in out or "scope" in out
 
@@ -738,7 +729,7 @@ _MAINTAINER_REPLY = "Here is my answer / waiver."
 def _install_resumable(monkeypatch, grilling_issues, mockup_issues, reply=_MAINTAINER_REPLY,
                        comments=None):
     """Install a resumable-issue queue through the module interface: the held-label listings
-    (`github.list_issues`) and each issue's comment thread (`loop._issue_comments_or_none`)."""
+    (`github.list_issues`) and each issue's comment thread (`github.issue_comment_rows`)."""
     # The reply is from the repo owner (always allowlisted), so it counts as a resume-
     # triggering maintainer reply under the allowlist filter (issue #25).
     if comments is None:
@@ -750,9 +741,9 @@ def _install_resumable(monkeypatch, grilling_issues, mockup_issues, reply=_MAINT
 
     by_label = {"agentflow:needs-grilling": rows(grilling_issues),
                 "agentflow:needs-mockup": rows(mockup_issues)}
-    monkeypatch.setattr(loop.github, "list_issues",
+    monkeypatch.setattr(github, "list_issues",
                         lambda repo, *, label=None, limit=100: list(by_label.get(label, [])))
-    monkeypatch.setattr(loop, "_issue_comments_or_none", lambda repo, n: comments)
+    monkeypatch.setattr(github, "issue_comment_rows", lambda repo, n: comments)
 
 
 def test_next_resumable_issue_picks_up_needs_grilling_reply(monkeypatch):
@@ -796,13 +787,13 @@ def test_next_resumable_issue_returns_none_when_last_comment_is_ours(monkeypatch
 
 
 def test_next_resumable_issue_returns_none_on_gh_error(monkeypatch):
-    monkeypatch.setattr(loop.github, "list_issues", lambda repo, **k: None)
+    monkeypatch.setattr(github, "list_issues", lambda repo, **k: None)
     assert _next_resumable_issue(RepoConfig("o/r", ".")) is None
 
 
 def test_build_issue_refuses_an_in_flight_issue(monkeypatch):
-    issue = {"number": 9, "state": "OPEN", "title": "t", "body": "b",
-             "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:complexity:deep"}]}
+    issue = _canned_issue(state="OPEN", title="t", body="b",
+                         labels=["ready-for-agent", "agentflow:complexity:deep"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: {9})   # an open agentflow PR owns it
     out = build_issue(RepoConfig("o/r", "/tmp"), 9)
@@ -817,9 +808,9 @@ _MAINT = "Show me a screenshot please?"
 
 def _pr_gh(monkeypatch, prs, comments_by_pr):
     """Serve _next_pr_awaiting_reply canned open-PR rows (`github.list_open_prs`) and per-PR
-    comment threads (`loop._pr_comments`) through the module interface."""
-    monkeypatch.setattr(loop.github, "list_open_prs", lambda repo, **k: list(prs))
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: comments_by_pr.get(pr, []))
+    comment threads (`github.pr_comment_rows`) through the module interface."""
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, **k: list(prs))
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: comments_by_pr.get(pr, []))
 
 
 def test_next_pr_awaiting_reply_picks_the_unanswered_one(monkeypatch):
@@ -900,7 +891,7 @@ def test_rebase_checks_out_before_claiming_the_worktree_session(monkeypatch, tmp
 # Intake's park/kickoff comment on a needs-mockup issue: carries INTAKE_MARK, no MOCKUP_MARK.
 _MOCKUP_PARK = f"{INTAKE_MARK} — let's mock this up.\n\nA `/ui-mockups` kickoff."
 # The produce phase's own variant-round comment: the disclaimer + embedded screenshots.
-_MOCKUP_VARIANTS = (f"{_MOCKUP_DISCLAIMER}\n\n"
+_MOCKUP_VARIANTS = (f"{MOCKUP_DISCLAIMER}\n\n"
                     "**A** — inbox.\n![A](https://raw.githubusercontent.com/o/r/br/mockups/a.png)\n"
                     "Reply with a pick.")
 
@@ -908,8 +899,8 @@ _MOCKUP_VARIANTS = (f"{_MOCKUP_DISCLAIMER}\n\n"
 def test_produce_disclaimer_carries_both_marks():
     # The TRAP: the produced-variants comment must carry INTAKE_MARK so the daemon reads it as
     # ours, and MOCKUP_MARK so the produce phase can tell a drawn round from intake's park.
-    assert INTAKE_MARK in _MOCKUP_DISCLAIMER
-    assert MOCKUP_MARK in _MOCKUP_DISCLAIMER
+    assert INTAKE_MARK in MOCKUP_DISCLAIMER
+    assert MOCKUP_MARK in MOCKUP_DISCLAIMER
 
 
 def test_awaiting_recheck_false_right_after_our_variant_comment():
@@ -930,12 +921,12 @@ def test_produce_prompt_drives_ui_mockups_headless_and_one_marked_comment():
     body = PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
                                  branch="agentflow/claude/mockup-7-a-screen",
                                  surfaces="`agentflow/static/`",
-                                 scope_guidance=_SCOPE_GUIDANCE[MockupScope.SURFACE],
-                                 disclaimer=_MOCKUP_DISCLAIMER)
+                                 scope_guidance=SCOPE_GUIDANCE[MockupScope.SURFACE],
+                                 disclaimer=MOCKUP_DISCLAIMER)
     assert "/ui-mockups" in body
     assert "screenshot" in body.lower()
     assert "agentflow/static/" in body
-    assert _MOCKUP_DISCLAIMER in body           # the marker line the comment must start with
+    assert MOCKUP_DISCLAIMER in body           # the marker line the comment must start with
     assert "one comment" in body.lower()        # exactly one issue comment
     assert "push" in body.lower()               # variant HTML preserved on a branch, not lost
     assert "LOCKED" in body                      # every variant must carry a locked contract
@@ -948,8 +939,8 @@ def test_produce_prompt_scope_branches_local_vs_surface():
     def body(scope):
         return PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
                                      branch="b", surfaces="`agentflow/webui/src/`",
-                                     scope_guidance=_SCOPE_GUIDANCE[scope],
-                                     disclaimer=_MOCKUP_DISCLAIMER)
+                                     scope_guidance=SCOPE_GUIDANCE[scope],
+                                     disclaimer=MOCKUP_DISCLAIMER)
     surface, local = body(MockupScope.SURFACE), body(MockupScope.LOCAL)
     assert "wildly-different" in surface.lower() or "genuinely-different" in surface.lower()
     assert "3-4" in surface
@@ -992,9 +983,12 @@ def test_conflict_already_flagged_pings_once_not_every_cycle():
 def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed", conflict_revise=None):
     """Drive _rebase_survivor with a canned rebase result; record park / merge side effects. By
     default a conflict falls through to the park (``conflict_revise=None``), so these tests exercise
-    the ADR 0038 fallback; pass a status to model a conflict Revise that was opened instead."""
+    the ADR 0038 fallback; pass a status to model a conflict Revise that was opened instead.
+
+    Nothing has been said on the PR — the park notice itself is stubbed out here — so the
+    survivor's worktree is left where it is."""
     events = {"parked": [], "merged": []}
-    monkeypatch.setattr(loop, "_builder_worktree", lambda cfg, tool, n, sl: "/tmp/wt")
+    monkeypatch.setattr(github, "pr_comment_rows", lambda _repo, _pr: [])
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: rebase)
     monkeypatch.setattr(loop, "_conflict_revise_survivor",
                         lambda cfg, pr, n, sl, tool, branch: conflict_revise)
@@ -1030,7 +1024,7 @@ def test_rebase_survivor_conflict_opens_a_revise_before_parking(monkeypatch):
 
 def test_conflict_rebase_disposes_only_after_the_notice_is_durable(monkeypatch):
     _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT, conflict_revise=None)
-    monkeypatch.setattr(loop, "_pr_comments",
+    monkeypatch.setattr(github, "pr_comment_rows",
                         lambda repo, pr: [{"body": f"> *{loop._CONFLICT_MARK}.*"}])
     removed = []
     monkeypatch.setattr(loop, "remove_worktree_if_safe",
@@ -1038,7 +1032,7 @@ def test_conflict_rebase_disposes_only_after_the_notice_is_durable(monkeypatch):
 
     _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed")
 
-    assert removed == ["/tmp/wt"]
+    assert removed == ["/tmp/.agentflow/worktrees/claude/issue-4-x"]
 
 
 def test_rebase_survivor_reviewed_clean_never_merges(monkeypatch):
@@ -1062,16 +1056,16 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
 
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    monkeypatch.setattr(loop, "claim", lambda repo, number, _label: True)
     monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
     submission = SimpleNamespace(stage="review", transfer_from=None)
-    monkeypatch.setattr(coordinated_build, "survivor_review_submission",
+    monkeypatch.setattr(coordinated_review, "survivor_review_submission",
                         lambda *args, **kwargs: submission)
     submitted = []
     coord = SimpleNamespace(submit_stage=submitted.append)
-    monkeypatch.setattr(coordinated_build, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
     reconciled = []
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project",
+    monkeypatch.setattr(pipeline, "reconcile_and_project",
                         lambda current: reconciled.append(current))
 
     result = loop._merge_autonomous_survivor(
@@ -1088,7 +1082,7 @@ def test_autonomous_survivor_waits_instead_of_falling_back_to_same_tool(monkeypa
 
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: True)
+    monkeypatch.setattr(loop, "claim", lambda repo, number, _label: True)
     calls = []
     monkeypatch.setattr(
         loop, "pick_reviewer",
@@ -1099,10 +1093,10 @@ def test_autonomous_survivor_waits_instead_of_falling_back_to_same_tool(monkeypa
         captured.update(kwargs)
         return SimpleNamespace(stage="review", transfer_from=None)
 
-    monkeypatch.setattr(coordinated_build, "survivor_review_submission", fake_submission)
-    monkeypatch.setattr(coordinated_build, "build_coordinator",
+    monkeypatch.setattr(coordinated_review, "survivor_review_submission", fake_submission)
+    monkeypatch.setattr(pipeline, "build_coordinator",
                         lambda: SimpleNamespace(submit_stage=lambda s: None))
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda current: None)
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda current: None)
 
     result = loop._merge_autonomous_survivor(
         RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
@@ -1122,27 +1116,26 @@ def test_manual_same_tool_review_requires_warning_then_explicit_confirmation(mon
     assert "Warning: same-tool review is not independent" in warning
     assert "maintainer_confirmed=True" in warning
 
-    monkeypatch.setattr(loop.github, "api", lambda *args, **kwargs: {
-        "state": "OPEN", "headRefName": "agentflow/claude/issue-7-fix",
-        "headRefOid": "head", "closingIssuesReferences": [{"number": 7}],
-    })
+    monkeypatch.setattr(github, "pr_facts", lambda repo, pr: github.PrFacts(
+        head_ref_name="agentflow/claude/issue-7-fix", head_ref_oid="head",
+        state="OPEN", closing_issues=(7,)))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(
-        coordinated_build, "_review_assignment_facts",
+        coordinated_review, "_review_assignment_facts",
         lambda *args, **kwargs: (ReviewAssignment(reason="one journey"), ("agentflow/x.py",)))
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [])
-    monkeypatch.setattr(loop, "_claim", lambda repo, issue: True)
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(loop, "claim", lambda repo, issue, _label: True)
     captured = {}
     submission = SimpleNamespace(stage="review")
     monkeypatch.setattr(
-        coordinated_build, "survivor_review_submission",
+        coordinated_review, "survivor_review_submission",
         lambda *args, **kwargs: captured.update(kwargs) or submission)
     submitted = []
     monkeypatch.setattr(
-        coordinated_build, "build_coordinator",
+        pipeline, "build_coordinator",
         lambda: SimpleNamespace(submit_stage=submitted.append))
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda coord: [])
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda coord: [])
 
     result = loop.review_pr(
         RepoConfig("o/r", "/work"), 42, force_same_tool=True,
@@ -1161,33 +1154,32 @@ def test_manual_review_uses_latest_exact_head_author_not_branch_builder(monkeypa
     from agentflow.coordinator.record import Record
     from agentflow.review_policy import ReviewAssignment
 
-    monkeypatch.setattr(loop.github, "api", lambda *args, **kwargs: {
-        "state": "OPEN", "headRefName": "agentflow/claude/issue-7-fix",
-        "headRefOid": "fixed", "closingIssuesReferences": [{"number": 7}],
-    })
+    monkeypatch.setattr(github, "pr_facts", lambda repo, pr: github.PrFacts(
+        head_ref_name="agentflow/claude/issue-7-fix", head_ref_oid="fixed",
+        state="OPEN", closing_issues=(7,)))
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, issue: "acceptance")
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(
-        coordinated_build, "_review_assignment_facts",
+        coordinated_review, "_review_assignment_facts",
         lambda *args, **kwargs: (ReviewAssignment(reason="one journey"), ()))
     history = Record(
         identity="review-fixed", stage="review", pool="claude", demand=1,
         repo="o/r", subject="7", target="fixed", builder_lineage="claude",
         change_author_tool="codex", review_sequence=2, review_passes=1, retired=True)
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: [history])
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [history])
     choices = []
     monkeypatch.setattr(
         loop, "pick_reviewer",
         lambda author, **kwargs: choices.append((author, kwargs)) or "claude")
-    monkeypatch.setattr(loop, "_claim", lambda *_args: True)
+    monkeypatch.setattr(loop, "claim", lambda *_args: True)
     captured = []
     monkeypatch.setattr(
-        coordinated_build, "survivor_review_submission",
+        coordinated_review, "survivor_review_submission",
         lambda *args, **kwargs: captured.append(kwargs) or SimpleNamespace(stage="review"))
     monkeypatch.setattr(
-        coordinated_build, "build_coordinator",
+        pipeline, "build_coordinator",
         lambda: SimpleNamespace(submit_stage=lambda _submission: None))
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project", lambda _coord: None)
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/work"), 42) == "review submitted"
     assert choices == [("codex", {"allow_same_tool": False})]
@@ -1211,10 +1203,10 @@ def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch)
     monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
     monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: None)
     submitted = []
-    monkeypatch.setattr(coordinated_build, "survivor_review_submission",
+    monkeypatch.setattr(coordinated_review, "survivor_review_submission",
                         lambda *a, **k: submitted.append(True))
     claimed = []
-    monkeypatch.setattr(loop, "_claim", lambda repo, number: claimed.append(number) or True)
+    monkeypatch.setattr(loop, "claim", lambda repo, number, _label: claimed.append(number) or True)
 
     result = loop._merge_autonomous_survivor(
         RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
@@ -1238,13 +1230,13 @@ def _stub_conflict_env(monkeypatch, *, priors, head="sha-conf", claim=True):
 
     monkeypatch.setattr(loop, "_run",
                         lambda argv: _FakeRun(head + "\n") if "rev-parse" in argv else _FakeRun(""))
-    monkeypatch.setattr(coordinated_build.tracer, "load_records", lambda: list(priors))
-    monkeypatch.setattr(loop, "_claim", lambda repo, n: claim)
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: list(priors))
+    monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claim)
     submitted = []
-    monkeypatch.setattr(coordinated_build, "build_coordinator",
+    monkeypatch.setattr(pipeline, "build_coordinator",
                         lambda: SimpleNamespace(submit_stage=submitted.append))
     reconciled = []
-    monkeypatch.setattr(coordinated_build, "reconcile_and_project",
+    monkeypatch.setattr(pipeline, "reconcile_and_project",
                         lambda coord: reconciled.append(coord))
     return submitted, reconciled
 
@@ -1297,7 +1289,7 @@ def test_third_survivor_conflict_opens_another_bounded_revise(monkeypatch):
     submitted, _ = _stub_conflict_env(monkeypatch, priors=priors, head="sha-3")
     parked = []
     monkeypatch.setattr(loop, "_park_conflicted_survivor", lambda cfg, pr, n: parked.append(pr))
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: [])   # notice not yet durable
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [])   # notice not yet durable
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
 
     out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
@@ -1328,7 +1320,7 @@ def _stub_recheck(monkeypatch, prs, *, advanced, profile, comments=None):
     monkeypatch.setattr(loop, "_run", lambda cmd: _FakeRun("", 0))   # fetch origin succeeds
     monkeypatch.setattr(loop, "repo_profile", lambda wd: profile)
     monkeypatch.setattr(loop, "_base_advanced_for", lambda wd, branch: advanced.get(branch))
-    monkeypatch.setattr(loop, "_pr_comments", lambda repo, pr: (comments or {}).get(pr, []))
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: (comments or {}).get(pr, []))
 
     def fake_router(cfg, pr, branch, prof):
         routed.append(pr)
@@ -1380,28 +1372,6 @@ def test_recheck_defers_when_pr_listing_fails(monkeypatch):
     assert "deferring" in recheck_once(RepoConfig("o/r", "/tmp"))
 
 
-# --- issue #159: agentflow:triaging label description must not overclaim a live session ----
-
-def test_claim_triage_description_is_ownership_not_live_session(monkeypatch):
-    # Regression: the old text "A grounding session is triaging this issue" asserted active
-    # execution even when the record is waiting with 0 attempts and no provider process.
-    # The new description must be true whether the record is queued or running.
-    captured = []
-    monkeypatch.setattr(loop.github, "api", lambda args, **k: captured.append(args) or "ok")
-    monkeypatch.setattr(loop.github, "add_label", lambda repo, n, label: True)
-    result = loop._claim_triage("o/r", 7)
-
-    assert result is True
-    label_create = next(args for args in captured if "label" in args and "create" in args)
-    desc_idx = label_create.index("--description") + 1
-    description = label_create[desc_idx]
-    # Must not assert a live/active/running session (the AC: no "is triaging" phrasing)
-    assert "is triaging" not in description
-    assert "A grounding session" not in description
-    # Must convey ownership/admission purpose
-    assert any(word in description.lower() for word in ("claim", "ownership", "dispatch"))
-
-
 def test_waiting_intake_record_omitted_from_live_projection():
     # Guards the Live-view premise: a waiting Intake record (queued for admission, no attempt,
     # no family) must never appear as a running session on the live board. This is what keeps
@@ -1443,8 +1413,8 @@ class TestScreenshotHostingInstruction:
         return PRODUCE_PROMPT.format(
             repo="o/r", n=205, title="t", body="b",
             branch="agentflow/claude/issue-205-x", surfaces="agentflow/webui/src/",
-            scope_guidance=_SCOPE_GUIDANCE[MockupScope.SURFACE],
-            disclaimer=_MOCKUP_DISCLAIMER)
+            scope_guidance=SCOPE_GUIDANCE[MockupScope.SURFACE],
+            disclaimer=MOCKUP_DISCLAIMER)
 
     def test_build_prompt_pins_to_the_commit_and_namespaces_the_round(self):
         text = self._build()

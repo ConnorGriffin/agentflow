@@ -54,14 +54,23 @@ class _FakeGitHub:
 
     # --- GitHub module seam (ADR 0040) ------------------------------------------------
     def api(self, args, *, parse_json=False):
-        # Routed by leading verb — the GraphQL parent-map read vs. an issue snapshot — never by
-        # matching the read's field vector.
-        if args[0] == "api":                       # GraphQL parent-map read
-            return {"data": {"repository": {"issue": {"parent": {
-                "number": 4, "body": self.map_body,
-                "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
-        return {"state": self.state, "title": self.title, "comments": list(self.comments),
-                "url": f"https://github.com/o/r/issues/{self.number}"}
+        # The one escape-hatch read the finalizer still reaches through: the GraphQL parent-map
+        # lookup, which no typed single-fact method covers.
+        assert args[0] == "api", f"unexpected escape-hatch call: {args}"
+        return {"data": {"repository": {"issue": {"parent": {
+            "number": 4, "body": self.map_body,
+            "labels": {"nodes": [{"name": "wayfinder:map"}]}}}}}}
+
+    def issue_view(self, repo, number):
+        from agentflow import github
+        return github.IssueView(
+            title=self.title, body="", state=self.state,
+            url=f"https://github.com/o/r/issues/{self.number}",
+            labels=frozenset(self.labels),
+            comments=[github.Comment(body=c["body"], created_at="") for c in self.comments])
+
+    def issue_url(self, repo, number):             # the release's durable proof-of-release
+        return f"https://github.com/o/r/issues/{number}"
 
     def comment(self, repo, number, body):
         self.comments.append({"body": body})
@@ -75,13 +84,13 @@ class _FakeGitHub:
         self.map_body = body
         return True
 
-    def release(self, repo, number):               # stands in for loop._release_resolving
+    def release(self, repo, number, _label):       # stands in for coordinated_research.release_claim
         if "wayfinder:resolving" in self.labels:
             self.labels.remove("wayfinder:resolving")
         return True
 
-    def run(self, argv):                           # loop._run: only the git worktree cleanup remains
-        assert argv and argv[0] == "git", f"unexpected non-git loop._run call: {argv}"
+    def run(self, argv):                           # coordinated_research._run: only the git worktree cleanup remains
+        assert argv and argv[0] == "git", f"unexpected non-git coordinated_research._run call: {argv}"
         self.git_calls.append(list(argv))
         if "worktree" in argv and "remove" in argv:
             shutil.rmtree(argv[-1], ignore_errors=True)
@@ -94,11 +103,13 @@ class _FakeGitHub:
     def install(self, monkeypatch):
         from agentflow import github, loop
         monkeypatch.setattr(github, "api", self.api)
+        monkeypatch.setattr(github, "issue_view", self.issue_view)
+        monkeypatch.setattr(github, "issue_url", self.issue_url)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
         monkeypatch.setattr(github, "edit_body", self.edit_body)
-        monkeypatch.setattr(loop, "_release_resolving", self.release)
-        monkeypatch.setattr(loop, "_run", self.run)
+        monkeypatch.setattr(coordinated_research, "release_claim", self.release)
+        monkeypatch.setattr(coordinated_research, "_run", self.run)
 
 
 # --- worktree cleanup on durable resolution -------------------------------------

@@ -59,6 +59,9 @@ from agentflow.coordinator import quota
 from agentflow.coordinator.store import default_store_path
 from agentflow.runner import ClaudeRunner, CodexRunner, _WorktreeRunner
 
+# The two pools this module balances between — the tools a build, review or revise may run on.
+BUILD_POOLS = ("claude", "codex")
+
 _GATE = (
     os.environ.get("AGENTFLOW_CAPACITY_HELPER")
     or os.environ.get("AGENTFLOW_TRIAGE_GATE")

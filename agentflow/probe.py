@@ -17,33 +17,13 @@ query. When the newest update is past the last one the probe saw, something chan
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 
-from agentflow.runner import _run
+from agentflow import github
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _gh_search(repos: list[str], since: str) -> list[dict] | None:
-    """One cross-repo search for every issue/PR (open or closed) updated after `since`. This is
-    the whole per-tick API cost: a single REST search call for the entire fleet, in the search
-    endpoint's own rate bucket (separate from the GraphQL budget the full pass spends). Returns
-    the matched items, or None when the search itself failed — unknown is not 'no change'."""
-    cmd = ["gh", "search", "issues", "--include-prs", "--limit", "100",
-           "--json", "number,updatedAt"]
-    for repo in repos:
-        cmd += ["--repo", repo]
-    cmd += ["--updated", f">{since}"]
-    r = _run(cmd)
-    if r.returncode != 0:
-        return None
-    try:
-        return json.loads(r.stdout or "[]")
-    except json.JSONDecodeError:
-        return None
 
 
 class ChangeProbe:
@@ -55,7 +35,7 @@ class ChangeProbe:
     which is exactly what the daemon's heartbeat full pass exists to catch. `search` is injected
     so the decision is exercised without touching GitHub."""
 
-    def __init__(self, repos, *, search=_gh_search, now=_now_iso) -> None:
+    def __init__(self, repos, *, search=github.search, now=_now_iso) -> None:
         self._repos = [c.repo if hasattr(c, "repo") else c for c in repos]
         self._search = search
         # Only updates AFTER construction count as change; the daemon's startup full pass
@@ -63,7 +43,10 @@ class ChangeProbe:
         self._watermark = now()
 
     def changed(self) -> bool:
-        """True when something in the fleet was updated since the last look. One search call.
+        """True when something in the fleet was updated since the last look. The whole per-tick
+        cost is one cross-repo search for the entire fleet, in the search endpoint's own rate
+        bucket (separate from the GraphQL budget the full pass spends).
+
         An empty fleet (no repos) or a failed search reports no change — the heartbeat backstops
         both, and treating a `gh` blip as 'change' would run a full pass every tick during an
         outage, the opposite of the point."""
@@ -72,7 +55,7 @@ class ChangeProbe:
         items = self._search(self._repos, self._watermark)
         if not items:
             return False
-        newest = max((i.get("updatedAt", "") for i in items), default="")
+        newest = max((hit.updated_at for hit in items), default="")
         if newest > self._watermark:
             self._watermark = newest
             return True

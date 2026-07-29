@@ -12,12 +12,29 @@ coordinator, store, or provider (see tests/test_coordinator_admission.py).
 
 from __future__ import annotations
 
+import os
 from types import MappingProxyType
 
 # Each pool has an independent five-permit budget; a session reserves its whole demand
 # atomically. Every stage gets one initial attempt plus at most two continuations.
 PERMIT_BUDGET = 5
 ATTEMPT_BUDGET = 3
+
+# The machine ceiling and the per-stage caps the composed admission gate evaluates alongside the
+# permit budget (CONTEXT.md). They live here, with the rest of the admission vocabulary, rather
+# than in the dispatch layer that used to name them: the gate is assembled in the pipeline, so
+# reading them from dispatch made the pipeline defer that import to dodge an import cycle.
+# They are limits, never counters — durable running rows remain the only permit ledger.
+MACHINE_CEILING = int(os.environ.get("AGENTFLOW_MAX_SESSIONS", "4"))
+TRIAGE_CONCURRENCY = int(os.environ.get("AGENTFLOW_TRIAGE_CONCURRENCY", "3"))
+BUILD_CONCURRENCY = int(os.environ.get("AGENTFLOW_BUILD_CONCURRENCY", "2"))
+STAGE_CAPS = MappingProxyType({
+    "triage": TRIAGE_CONCURRENCY,
+    "build": BUILD_CONCURRENCY,
+    "mockup": 1,
+    "respond": 1,
+    "research": 1,
+})
 
 # Stages that own a branch/worktree. Their tool lineage is pinned across continuations
 # and they cannot silently move to the other pool (ADR 0028).
@@ -105,6 +122,17 @@ MODEL_FOR = MappingProxyType({
     ("codex", "deep"): "sol",
     ("codex", "standard"): "terra",
 })
+
+
+def native_handoff_proof(record) -> str | None:
+    """The durable proof of a stage-native handoff nobody wrote a richer one for.
+
+    The kind comes from the table above, so a stage adapter with no handoff collaborator, the
+    coordinator's own fallback, and the ``handoff_kind`` stamped on the record can never name
+    different handoffs for the same stage. An unrecognized stage has no handoff to prove, so it
+    withholds the proof and the hold is retried rather than recorded as done."""
+    kind = STAGE_NATIVE_HANDOFF.get(record.stage)
+    return f"proof:{record.identity}:{kind}" if kind else None
 
 
 def normalize_stage(stage: str) -> str:

@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of
 
-from agentflow import coordinated_build, github
+from agentflow import coordinated_build, coordinated_respond, github, pr_park, stage_worktree
 from agentflow.coordinator import RespondStageAdapter, StageRouter, Submission, tracer
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import Record
@@ -95,11 +95,11 @@ def test_public_respond_prepare_recreates_only_from_the_owned_remote_pr_branch(
             return SimpleNamespace(returncode=0, stdout="")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.stage_worktree._run", git)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
     adapter = RespondStageAdapter(
         reply_ready=lambda record, obs: False,
-        worktree_ready=coordinated_build._worktree_ready,
+        worktree_ready=stage_worktree.worktree_ready,
         observer=fake,
     )
     coord = make_coord(fake, adapter=adapter)
@@ -122,10 +122,10 @@ def test_public_respond_prepare_waits_when_the_remote_pr_branch_is_missing(
         calls.append(argv)
         return SimpleNamespace(returncode=1 if "show-ref" in argv else 0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.stage_worktree._run", git)
     adapter = RespondStageAdapter(
         reply_ready=lambda record, obs: False,
-        worktree_ready=coordinated_build._worktree_ready,
+        worktree_ready=stage_worktree.worktree_ready,
         observer=fake,
     )
     coord = make_coord(fake, adapter=adapter)
@@ -219,16 +219,16 @@ def test_public_respond_seam_requires_targeted_reply_and_clean_pushed_worktree(
             return SimpleNamespace(returncode=0, stdout="")
         return real_run(argv)
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.coordinated_respond._run", git)
     monkeypatch.setattr("agentflow.github.list_open_prs",
                         lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-1") + "\n" +
                   respond_change_marker("none") + "\n\nDone.")},
     ])
     adapter = RespondStageAdapter(
-        reply_ready=coordinated_build._reply_ready,
+        reply_ready=coordinated_respond._reply_ready,
         worktree_ready=lambda record: True,
         observer=fake,
         settle=lambda record: "pr-url",
@@ -253,13 +253,13 @@ def test_public_respond_seam_fails_closed_when_owned_worktree_is_missing(
     missing = tmp_path / ".agentflow/worktrees/claude/issue-7-missing"
     monkeypatch.setattr("agentflow.github.list_open_prs",
                         lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please make a change", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-1") + "\n" +
                   respond_change_marker("none") + "\n\nDone.")},
     ])
     adapter = RespondStageAdapter(
-        reply_ready=coordinated_build._reply_ready,
+        reply_ready=coordinated_respond._reply_ready,
         worktree_ready=lambda record: True,
         observer=fake,
     )
@@ -284,16 +284,16 @@ def test_public_respond_seam_rejects_a_reply_for_a_different_comment_target(
             return SimpleNamespace(returncode=0, stdout="0\n")
         return SimpleNamespace(returncode=0, stdout="")
 
-    monkeypatch.setattr("agentflow.loop._run", git)
+    monkeypatch.setattr("agentflow.coordinated_respond._run", git)
     monkeypatch.setattr("agentflow.github.list_open_prs",
                         lambda repo, head=None: [github.PrRow(42, head or "", "remote-head")])
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "first question", "id": "cid-1"},
         {"body": (respond_reply_disclaimer("cid-2") + "\n" +
                   respond_change_marker("none") + "\n\nAnswered another question.")},
     ])
     adapter = RespondStageAdapter(
-        reply_ready=coordinated_build._reply_ready,
+        reply_ready=coordinated_respond._reply_ready,
         worktree_ready=lambda record: True,
         observer=fake,
     )
@@ -342,7 +342,7 @@ def test_public_respond_exhaustion_has_its_own_durable_park_and_notification(
         comments.append({"body": body})
         return True
 
-    monkeypatch.setattr(coordinated_build, "_park_pr_number", lambda record: 42)
+    monkeypatch.setattr(coordinated_respond, "park_pr_number", lambda record: 42)
     monkeypatch.setattr("agentflow.github.pr_comment", pr_comment)
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda repo, pr: [github.Comment(body=c["body"], created_at="")
@@ -353,7 +353,7 @@ def test_public_respond_exhaustion_has_its_own_durable_park_and_notification(
         reply_ready=lambda record, obs: False,
         worktree_ready=lambda record: True,
         observer=fake,
-        handoff=coordinated_build._park_respond,
+        handoff=coordinated_respond._park_respond,
     )
     coord = make_coord(fake, adapter=adapter)
     ident = coord.submit_stage(_respond_sub(target="cid-1", source=RESPOND_WT))
@@ -395,7 +395,7 @@ def test_gate_admits_respond_and_keeps_unknown_stage_waiting(make_coord):
 def test_respond_submission_adopts_the_branch_lineage_and_holds_the_claim():
     from agentflow.gate import respond_reply_disclaimer
     cfg = SimpleNamespace(repo="o/r", workdir="/home/w")
-    sub = coordinated_build.respond_submission(
+    sub = coordinated_respond.respond_submission(
         cfg, 42, "agentflow/claude/issue-7-fix-thing", "please tweak the copy", "cid-9",
         "base-sha")
     assert sub is not None
@@ -411,11 +411,11 @@ def test_respond_submission_adopts_the_branch_lineage_and_holds_the_claim():
     assert "edit that existing reply in place" in prompt
     assert "do not make or push it again" in prompt
     # A non-agentflow branch or a missing comment target yields no submission.
-    assert coordinated_build.respond_submission(
+    assert coordinated_respond.respond_submission(
         cfg, 42, "feature/x", "c", "cid-9", "base-sha") is None
-    assert coordinated_build.respond_submission(
+    assert coordinated_respond.respond_submission(
         cfg, 42, "agentflow/claude/issue-7-fix-thing", "c", "", "base-sha") is None
-    assert coordinated_build.respond_submission(
+    assert coordinated_respond.respond_submission(
         cfg, 42, "agentflow/claude/issue-7-fix-thing", "c", "cid-9", "") is None
 
 
@@ -431,11 +431,11 @@ def test_reply_ready_rejects_a_generic_reply_that_is_not_bound_to_its_target(
         monkeypatch, tmp_path):
     from agentflow.gate import PR_MARK
     rec = _reply_read(monkeypatch, tmp_path)
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please tweak the copy", "id": "cid"},
         {"body": f"{PR_MARK} reply from the build agent: done"},
     ])
-    assert coordinated_build._reply_ready(rec, None) is False
+    assert coordinated_respond._reply_ready(rec, None) is False
 
 
 def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
@@ -467,9 +467,9 @@ def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
     def list_open_prs(repo, *, head=None, limit=100):
         return [github.PrRow(42, head or "", head_sha)]
 
-    monkeypatch.setattr("agentflow.loop._run", _run)
+    monkeypatch.setattr("agentflow.coordinated_respond._run", _run)
     monkeypatch.setattr("agentflow.github.list_open_prs", list_open_prs)
-    monkeypatch.setattr("agentflow.loop._pr_comments",
+    monkeypatch.setattr("agentflow.github.pr_comment_rows",
                         lambda repo, pr: [
                             {"body": "please tweak the copy", "id": "cid"},
                             {"body": (respond_reply_disclaimer("cid") + "\n" +
@@ -483,14 +483,14 @@ def test_reply_ready_rejects_an_uncommitted_tracked_edit(monkeypatch, tmp_path):
     # modified-but-uncommitted in the worktree: that change never became a pushed commit, so the
     # stage must stay incomplete rather than retire over unpushed work.
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status=" M agentflow/copy.py\n")
-    assert coordinated_build._reply_ready(rec, None) is False
+    assert coordinated_respond._reply_ready(rec, None) is False
 
 
 def test_reply_ready_ignores_an_unrelated_untracked_scratch_file(monkeypatch, tmp_path):
     # PR state proves completion. An unrelated local helper does not consume continuations after
     # the targeted reply and pushed head landed (a guarded-project regression).
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="?? run-shot.sh\n")
-    assert coordinated_build._reply_ready(rec, None) is True
+    assert coordinated_respond._reply_ready(rec, None) is True
 
 
 def test_reply_ready_ignores_nested_temporary_proof_artifacts(monkeypatch, tmp_path):
@@ -498,20 +498,20 @@ def test_reply_ready_ignores_nested_temporary_proof_artifacts(monkeypatch, tmp_p
         monkeypatch, tmp_path, ahead="0",
         status="?? tools/run-shot-dark.mjs\n?? test-results/respond/browser.trace\n"
                "?? tmp/respond.log\n")
-    assert coordinated_build._reply_ready(rec, None) is True
+    assert coordinated_respond._reply_ready(rec, None) is True
 
 
 def test_reply_ready_rejects_an_untracked_source_file(monkeypatch, tmp_path):
     # Unknown untracked files may be requested additions. They remain unproved until committed and
     # pushed; the scratch exception must not silently broaden to all untracked work.
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="?? agentflow/new_helper.py\n")
-    assert coordinated_build._reply_ready(rec, None) is False
+    assert coordinated_respond._reply_ready(rec, None) is False
 
 
 def test_reply_ready_treats_an_unreadable_worktree_as_incomplete(monkeypatch, tmp_path):
     # A failed status read cannot prove the worktree is clean, so completion is withheld.
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="", status_rc=1)
-    assert coordinated_build._reply_ready(rec, None) is False
+    assert coordinated_respond._reply_ready(rec, None) is False
 
 
 def test_reply_ready_completes_on_a_posted_reply_with_a_clean_pushed_worktree(monkeypatch, tmp_path):
@@ -519,25 +519,25 @@ def test_reply_ready_completes_on_a_posted_reply_with_a_clean_pushed_worktree(mo
     # pushed, so the stage completes — and completion is a stable read (restart idempotence: a
     # repeat over the same durable state re-proves the same result without posting a second reply).
     rec = _reply_read(monkeypatch, tmp_path, ahead="0", status="")
-    assert coordinated_build._reply_ready(rec, None) is True
-    assert coordinated_build._reply_ready(rec, None) is True
+    assert coordinated_respond._reply_ready(rec, None) is True
+    assert coordinated_respond._reply_ready(rec, None) is True
 
 
 def test_reply_ready_verifies_the_pushed_head_named_by_the_reply(monkeypatch, tmp_path):
     rec = _reply_read(monkeypatch, tmp_path, change="new-head", head="new-head",
                       baseline="old-head")
-    assert coordinated_build._reply_ready(rec, None) is True
+    assert coordinated_respond._reply_ready(rec, None) is True
 
 
 def test_reply_ready_rejects_a_pushed_head_proof_that_did_not_advance_or_match(
         monkeypatch, tmp_path):
     unchanged = _reply_read(monkeypatch, tmp_path / "unchanged", change="old-head",
                             head="old-head", baseline="old-head")
-    assert coordinated_build._reply_ready(unchanged, None) is False
+    assert coordinated_respond._reply_ready(unchanged, None) is False
 
     mismatch = _reply_read(monkeypatch, tmp_path / "mismatch", change="claimed-head",
                            head="different-head", baseline="old-head")
-    assert coordinated_build._reply_ready(mismatch, None) is False
+    assert coordinated_respond._reply_ready(mismatch, None) is False
 
 
 def test_reply_ready_completes_after_a_rebase_that_rewrote_history(monkeypatch, tmp_path):
@@ -547,7 +547,7 @@ def test_reply_ready_completes_after_a_rebase_that_rewrote_history(monkeypatch, 
     # rewritten history must NOT block completion.
     rec = _reply_read(monkeypatch, tmp_path, change="rebased-head", head="rebased-head",
                       baseline="pre-rebase-base")
-    assert coordinated_build._reply_ready(rec, None) is True
+    assert coordinated_respond._reply_ready(rec, None) is True
 
 
 def test_reply_ready_rejects_multiple_ambiguous_outcome_markers(monkeypatch, tmp_path):
@@ -555,13 +555,13 @@ def test_reply_ready_rejects_multiple_ambiguous_outcome_markers(monkeypatch, tmp
 
     rec = _reply_read(monkeypatch, tmp_path, change="none", head="new-head",
                       baseline="old-head")
-    monkeypatch.setattr("agentflow.loop._pr_comments", lambda repo, pr: [
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [
         {"body": "please change it", "id": "cid"},
         {"body": (respond_reply_disclaimer("cid") + "\n" +
                   respond_change_marker("none") + "\n" +
                   respond_change_marker("new-head"))},
     ])
-    assert coordinated_build._reply_ready(rec, None) is False
+    assert coordinated_respond._reply_ready(rec, None) is False
 
 
 def test_settle_respond_releases_the_building_claim_and_proves_it(monkeypatch):
@@ -574,14 +574,14 @@ def test_settle_respond_releases_the_building_claim_and_proves_it(monkeypatch):
         labels.clear()
         return True
 
-    def api(args, *, parse_json=False):
-        return {"labels": [{"name": n} for n in labels],
-                "url": "https://github.com/o/r/issues/7"}
+    def settlement(repo, number):
+        return github.IssueSettlement(labels=frozenset(labels),
+                                      url="https://github.com/o/r/issues/7")
 
     monkeypatch.setattr("agentflow.github.remove_label", remove_label)
-    monkeypatch.setattr("agentflow.github.api", api)
-    monkeypatch.setattr(coordinated_build, "_park_pr_number", lambda record: 42)
-    assert coordinated_build._settle_respond(rec) == "https://github.com/o/r/pull/42"
+    monkeypatch.setattr("agentflow.github.issue_settlement", settlement)
+    monkeypatch.setattr(coordinated_respond, "park_pr_number", lambda record: 42)
+    assert coordinated_respond._settle_respond(rec) == "https://github.com/o/r/pull/42"
     assert removed == ["agentflow:building"]                       # the change claim is dropped
     # Idempotent: a repeat with the label already gone re-proves the same release.
-    assert coordinated_build._settle_respond(rec) == "https://github.com/o/r/pull/42"
+    assert coordinated_respond._settle_respond(rec) == "https://github.com/o/r/pull/42"
