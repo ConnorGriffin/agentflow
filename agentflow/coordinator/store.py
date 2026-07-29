@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 from uuid import uuid4
 
+from agentflow.state import state_dir as _state_dir, state_path
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 
 SCHEMA_VERSION = 1
@@ -39,13 +40,13 @@ _COLUMNS = [f.name for f in fields(Record)]
 def state_dir() -> Path:
     """agentflow's local state directory, honoring ``AGENTFLOW_STATE`` like the rest of the
     daemon. The coordinator's store lives beneath this; callers never choose a path."""
-    return Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
+    return _state_dir()
 
 
 def default_store_path() -> Path:
     """Where the coordinator privately keeps its continuation store (ADR 0030). There is one
     store per state directory; a fresh coordinator over the same directory recovers it."""
-    return state_dir() / "coordinator" / "records.db"
+    return state_path("coordinator", "records.db")
 
 
 class StoreUnavailable(RuntimeError):

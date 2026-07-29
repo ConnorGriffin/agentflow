@@ -14,6 +14,7 @@ default (`reviewed`, no surfaces, owner-only), never a guess.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,16 +22,35 @@ _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTIL
 _UI_SURFACES_RE = re.compile(r"^ui-surfaces:\s*(.+)$", re.MULTILINE)
 _ALLOWLIST_RE = re.compile(r"^intake-allowlist:\s*(.+)", re.MULTILINE)
 
+# The two names a repo may declare its facts in, in the order they win.
+_FACT_FILES = ("AGENTS.md", "CLAUDE.md")
+
+
+def _fact_texts(workdir: str) -> Iterator[str]:
+    """The repo's own facts files that exist, in the order they win.
+
+    Every fact below is read from the same two names, in the same order, out of the checkout the
+    operator's configuration points at. Reading them here gives the file names, their precedence,
+    and the check below one home instead of three copies.
+
+    ``workdir`` arrives from configuration rather than from this process, so the file actually
+    read is proven to sit directly inside it — a configured value that pointed somewhere else
+    would otherwise get to decide a repository's autonomy profile.
+    """
+    root = Path(workdir).expanduser().resolve()
+    for name in _FACT_FILES:
+        path = (root / name).resolve()
+        if path.parent == root and path.is_file():
+            yield path.read_text(errors="replace")
+
 
 def repo_profile(workdir: str) -> str:
     """The repo's autonomy profile from its AGENTS.md/CLAUDE.md `profile:` line.
     Defaults to `reviewed` (ADR 0002) — the safe middle, never auto-merge by accident."""
-    for name in ("AGENTS.md", "CLAUDE.md"):
-        p = Path(workdir) / name
-        if p.exists():
-            m = _PROFILE_RE.search(p.read_text(errors="replace"))
-            if m:
-                return m.group(1)
+    for text in _fact_texts(workdir):
+        m = _PROFILE_RE.search(text)
+        if m:
+            return m.group(1)
     return "reviewed"
 
 
@@ -61,16 +81,14 @@ def surface_declaration(workdir: str) -> SurfaceDeclaration:
     is headless on purpose, or nothing at all. A change under one of the prefixes needs a
     before/after screenshot: the charter's UI-evidence gate (ADR 0018) reads this per repo
     instead of a hardcoded example."""
-    for name in ("AGENTS.md", "CLAUDE.md"):
-        p = Path(workdir) / name
-        if p.exists():
-            m = _UI_SURFACES_RE.search(p.read_text(errors="replace"))
-            if m:
-                values = [s.strip() for s in m.group(1).split(",") if s.strip()]
-                if [v.lower() for v in values] == [UI_SURFACES_NONE]:
-                    return SurfaceDeclaration(declared=True)
-                if values:
-                    return SurfaceDeclaration(surfaces=tuple(values), declared=True)
+    for text in _fact_texts(workdir):
+        m = _UI_SURFACES_RE.search(text)
+        if m:
+            values = [s.strip() for s in m.group(1).split(",") if s.strip()]
+            if [v.lower() for v in values] == [UI_SURFACES_NONE]:
+                return SurfaceDeclaration(declared=True)
+            if values:
+                return SurfaceDeclaration(surfaces=tuple(values), declared=True)
     return SurfaceDeclaration()
 
 
@@ -92,11 +110,9 @@ def intake_allowlist(repo: str, workdir: str) -> set[str]:
     """Authors whose comments can trigger a resume or re-intake. Always includes the repo
     owner; extend via an `intake-allowlist: alice, bob` line in AGENTS.md/CLAUDE.md."""
     owner = repo.split("/")[0]
-    for name in ("AGENTS.md", "CLAUDE.md"):
-        p = Path(workdir) / name
-        if p.exists():
-            m = _ALLOWLIST_RE.search(p.read_text(errors="replace"))
-            if m:
-                extra = {s.strip() for s in m.group(1).split(",") if s.strip()}
-                return {owner} | extra
+    for text in _fact_texts(workdir):
+        m = _ALLOWLIST_RE.search(text)
+        if m:
+            extra = {s.strip() for s in m.group(1).split(",") if s.strip()}
+            return {owner} | extra
     return {owner}
