@@ -1,4 +1,4 @@
-name: CodeQL audit export
+name: CodeQL audit dispositions
 
 on:
   push:
@@ -7,89 +7,217 @@ on:
 
 permissions:
   contents: read
-  security-events: read
+  security-events: write
 
 jobs:
-  export:
+  dismiss:
     runs-on: ubuntu-latest
     steps:
-      - name: Export alert inventory and referenced analyses
+      - name: Dismiss audited false positives individually
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
         run: |
           python - <<'PY'
-          import base64
-          import gzip
           import json
           import os
-          import urllib.parse
           import urllib.request
 
           API = "https://api.github.com"
-          COMMITS = {
-              "3c98a818d3b08837f1fca015e38f866276d2d3b4",
-              "db470640906a781a0e6e5032aadde715f92301b8",
-          }
           headers = {
               "Accept": "application/vnd.github+json",
               "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
               "X-GitHub-Api-Version": "2022-11-28",
           }
+          repository = os.environ["REPOSITORY"]
 
-          def get_json(url, *, accept=None):
-              request_headers = dict(headers)
-              if accept is not None:
-                  request_headers["Accept"] = accept
-              request = urllib.request.Request(url, headers=request_headers)
+          def request_json(url, *, method="GET", payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              request = urllib.request.Request(
+                  url, data=data, headers=headers, method=method
+              )
               with urllib.request.urlopen(request) as response:
                   return json.load(response)
 
-          repository = os.environ["REPOSITORY"]
-          alerts = []
-          for state in ("open", "closed"):
-              page = 1
-              while True:
-                  query = urllib.parse.urlencode(
-                      {"per_page": 100, "page": page, "state": state}
-                  )
-                  batch = get_json(
-                      f"{API}/repos/{repository}/code-scanning/alerts?{query}"
-                  )
-                  alerts.extend(batch)
-                  if len(batch) < 100:
-                      break
-                  page += 1
+          command_comments = {
+              17: (
+                  "Private child argv is assembled by the local launcher: "
+                  "sys.executable starts the supervisor, then the typed provider adapter "
+                  "selects claude or operator-configured AGENTFLOW_CODEX_BIN. Prompt text "
+                  "is one argv element, cwd is the owned worktree, and Popen uses an argv "
+                  "list with shell=False."
+              ),
+              18: (
+                  "AGENTFLOW_CAPACITY_HELPER (legacy TRIAGE_GATE fallback) is explicit "
+                  "operator configuration. The only argument is code-authored 'check'; "
+                  "cwd is inherited and subprocess.run uses shell=False."
+              ),
+              19: (
+                  "The operator-configured capacity helper is invoked with the fixed "
+                  "'check' argument; only the code-authored TRIAGE_SKIP_ACTIVITY "
+                  "environment fact changes. Cwd is inherited and shell=False."
+              ),
+              20: (
+                  "The operator-configured capacity helper is invoked with the fixed "
+                  "'limits' argument. No remote value reaches executable or argv "
+                  "structure; cwd is inherited and shell=False."
+              ),
+              21: (
+                  "The traced launcher/enroll path becomes cwd or one argv element after "
+                  "a literal git -C. Element zero remains code-authored 'git'; the shared "
+                  "runner receives an argv list and uses shell=False."
+              ),
+              22: (
+                  "AGENTFLOW_CAPACITY_HELPER (legacy fallback) is operator configuration "
+                  "and the sole structural argument is fixed 'limits'. Cwd is inherited "
+                  "and subprocess.run uses shell=False."
+              ),
+          }
 
-          analyses_query = urllib.parse.urlencode(
-              {"per_page": 100, "ref": "refs/heads/main"}
+          def disposition(number):
+              if number == 1:
+                  return (
+                      "false positive",
+                      "The sole CLI positional argument intentionally selects the "
+                      "read-only screenshot config. Repository, issue, and page content "
+                      "do not choose this path."
+                  )
+              if 2 <= number <= 16:
+                  return (
+                      "won't fix",
+                      "This exact sink is in the committed locked dashboard mockup. The "
+                      "server ships agentflow/webui/dist; the Svelte source/build neither "
+                      "imports nor serves this code-authored design-evidence script."
+                  )
+              if number in command_comments:
+                  return "false positive", command_comments[number]
+              if 23 <= number <= 27:
+                  return (
+                      "false positive",
+                      "The source is the private child supervisor argv assembled by the "
+                      "local launcher. Store/worktree roots are operator-owned and the "
+                      "session token is internal; repository, issue, attachment, and "
+                      "prompt text cannot name this path."
+                  )
+              if number == 35:
+                  return (
+                      "false positive",
+                      "AGENTFLOW_STATE is the operator-selected state root and the sink "
+                      "uses the fixed capacity.json child."
+                  )
+              if number == 36:
+                  return (
+                      "false positive",
+                      "AGENTFLOW_STATE is the operator-selected state root; the public "
+                      "CLI only inspects fixed daemon lock/state children."
+                  )
+              if 37 <= number <= 38:
+                  return (
+                      "false positive",
+                      "AGENTFLOW_CONFIG/XDG_CONFIG_HOME is operator configuration. "
+                      "Reading the selected runtime config is this command's intended "
+                      "filesystem interface."
+                  )
+              if 39 <= number <= 52:
+                  return (
+                      "false positive",
+                      "AGENTFLOW_STATE is the operator-selected root; this sink uses a "
+                      "fixed enable, lock, PID, stale-lock, or snapshot artifact. No "
+                      "repository or issue value names it."
+                  )
+              if 53 <= number <= 61:
+                  return (
+                      "false positive",
+                      "The source is enroll's operator-selected checkout. This sink "
+                      "inspects or writes a fixed code-authored enrollment path beneath "
+                      "the checkout the command was explicitly asked to enroll."
+                  )
+              if 64 <= number <= 68:
+                  return (
+                      "false positive",
+                      "AGENTFLOW_STATE is the operator-selected root and this live-state "
+                      "sink uses a fixed daemon-status or snapshot filename."
+                  )
+              if 69 <= number <= 71:
+                  return (
+                      "false positive",
+                      "This per-user LaunchAgent path comes from the installed executable, "
+                      "the current user's Library, or explicit operator runtime/helper "
+                      "configuration. No remote content participates."
+                  )
+              if 80 <= number <= 88:
+                  return (
+                      "false positive",
+                      "The ratchet file is the fixed ratchet.json below operator-selected "
+                      "AGENTFLOW_STATE (or an explicit maintenance/test path). Repository "
+                      "names are JSON keys, never path segments."
+                  )
+              if 89 <= number <= 93:
+                  return (
+                      "false positive",
+                      "The root is the operator-owned coordinator store and the filename "
+                      "key is an internally minted launch UUID. The private child does not "
+                      "derive either from repository, issue, attachment, or prompt text."
+                  )
+              if number in {97, 98, 99, 100, 101, 109}:
+                  return (
+                      "false positive",
+                      "Production uses the one coordinator store contained under the "
+                      "operator state root; alternate constructor paths are for explicit "
+                      "maintenance/tests. Temporary names are code-authored PID/UUID "
+                      "values."
+                  )
+              if number == 110:
+                  return (
+                      "used in tests",
+                      "This tests/test_cli.py sink is a pytest temporary output path and "
+                      "does not ship."
+                  )
+              if 116 <= number <= 118:
+                  return (
+                      "used in tests",
+                      "This tests/test_live.py sink is selected by a pytest temporary-path "
+                      "fixture and does not ship."
+                  )
+              if number == 119:
+                  return (
+                      "false positive",
+                      "The substring only recognizes image-looking Markdown links. "
+                      "Credential attachment separately parses HTTPS URLs and requires "
+                      "an exact GitHub hostname; redirect targets receive no auth header."
+                  )
+              raise AssertionError(f"no audited disposition for alert {number}")
+
+          numbers = (
+              list(range(1, 28))
+              + list(range(35, 62))
+              + list(range(64, 72))
+              + list(range(80, 94))
+              + [97, 98, 99, 100, 101, 109, 110, 116, 117, 118, 119]
           )
-          analyses = get_json(
-              f"{API}/repos/{repository}/code-scanning/analyses?{analyses_query}"
-          )
-          selected = []
-          for analysis in analyses:
-              if analysis["commit_sha"] not in COMMITS:
+          assert len(numbers) == 87 and len(set(numbers)) == 87
+
+          dismissed = 0
+          for number in numbers:
+              url = f"{API}/repos/{repository}/code-scanning/alerts/{number}"
+              alert = request_json(url)
+              location = alert["most_recent_instance"]["location"]
+              exact = f"{location['path']}:{location['start_line']}"
+              if alert["state"] != "open":
+                  print(f"skip #{number}: already {alert['state']}")
                   continue
-              sarif = get_json(
-                  analysis["url"], accept="application/sarif+json"
+              reason, rationale = disposition(number)
+              request_json(
+                  url,
+                  method="PATCH",
+                  payload={
+                      "state": "dismissed",
+                      "dismissed_reason": reason,
+                      "dismissed_comment": f"Audited {exact}. {rationale}",
+                  },
               )
-              selected.append({"analysis": analysis, "sarif": sarif})
+              dismissed += 1
+              print(f"dismissed #{number} ({reason}) at {exact}")
 
-          payload = gzip.compress(
-              json.dumps(
-                  {"alerts": alerts, "analyses": selected},
-                  separators=(",", ":"),
-              ).encode()
-          )
-          encoded = base64.b64encode(payload).decode()
-          chunk_size = 48_000
-          print("AF_CODEQL_AUDIT_BEGIN")
-          for offset in range(0, len(encoded), chunk_size):
-              print(
-                  "AF_CODEQL_AUDIT_CHUNK "
-                  f"{offset // chunk_size:04d} "
-                  f"{encoded[offset:offset + chunk_size]}"
-              )
-          print("AF_CODEQL_AUDIT_END")
+          print(f"Applied {dismissed} individual CodeQL dispositions.")
           PY

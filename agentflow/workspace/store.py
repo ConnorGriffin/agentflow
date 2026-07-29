@@ -34,6 +34,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import uuid4
 
+from agentflow.state import state_path
+
 SCHEMA_VERSION = 3
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_WORKSPACE_BUSY_MS", "2000"))
 
@@ -67,8 +69,7 @@ class WorkspaceUnavailable(RuntimeError):
 def workspace_dir() -> Path:
     """Where per-Project workspace databases live, honoring ``AGENTFLOW_STATE`` like the rest of
     the daemon. Separate from the coordinator's ``coordinator/`` subtree (ADR 0033)."""
-    root = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
-    return root / "workspace"
+    return state_path("workspace")
 
 
 def project_slug(repo: str) -> str:

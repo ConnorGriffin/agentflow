@@ -7,9 +7,11 @@ daemon that has never run as an empty fleet — not an error.
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agentflow import live, webapp
+from agentflow.workspace import channel
 
 
 def _client(read):
@@ -92,6 +94,35 @@ def test_command_with_a_missing_field_is_rejected_as_a_transport_error():
         "key": "k1", "kind": "send_turn", "repo": "o/r", "conversation_id": "c1", "prompt": "hi"})
     assert res.status_code == 400          # send_turn requires expected_revision
     assert sent == []
+
+
+@pytest.mark.parametrize("key", ["/absolute", "../escaped", "nested/escaped"])
+def test_command_key_cannot_name_a_spool_path(tmp_path, monkeypatch, key):
+    state = tmp_path / "state"
+    monkeypatch.setenv("AGENTFLOW_STATE", str(state))
+    client = _workspace_client(available=True, enqueue=channel.enqueue)
+    res = client.post("/api/command", json={
+        "key": key, "kind": "open_ask", "repo": "o/r", "conversation_id": "c1",
+        "prompt": "hi"})
+    assert res.status_code == 400
+    assert not state.exists()
+
+
+def test_command_refuses_a_workspace_symlink_outside_state(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    outside = tmp_path / "outside"
+    state.mkdir()
+    outside.mkdir()
+    (state / "workspace").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("AGENTFLOW_STATE", str(state))
+
+    client = _workspace_client(available=True, enqueue=channel.enqueue)
+    res = client.post("/api/command", json={
+        "key": "safe-key", "kind": "open_ask", "repo": "o/r", "conversation_id": "c1",
+        "prompt": "hi"})
+
+    assert res.status_code == 503
+    assert list(outside.iterdir()) == []
 
 
 def test_unknown_command_kind_is_rejected():

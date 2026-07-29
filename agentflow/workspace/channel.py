@@ -15,22 +15,40 @@ no-op that replays the same outcome.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 from agentflow import live
-from agentflow.workspace.store import workspace_dir
+from agentflow.state import OutsideStateDirectory, state_path
 
 # How fresh the daemon's last cycle must be for a command to be accepted. The daemon stamps its
 # status every fast tick (~15s); a spool write is only honored when a daemon is demonstrably
 # alive to drain it, so the web layer fails closed instead of letting commands pile up unread.
 _LIVENESS_WINDOW_S = int(os.environ.get("AGENTFLOW_WORKSPACE_LIVENESS_S", "90"))
+_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+class InvalidCommandKey(ValueError):
+    """A command key cannot safely and unambiguously name one spool entry."""
+
+
+class CommandChannelUnavailable(RuntimeError):
+    """The command spool could not be reached without leaving agentflow's state directory."""
 
 
 def commands_dir() -> Path:
-    return workspace_dir() / "commands"
+    return state_path("workspace", "commands")
+
+
+def _spool_path(key: object) -> Path:
+    if not isinstance(key, str) or _KEY.fullmatch(key) is None:
+        raise InvalidCommandKey("command key must be a simple identifier")
+    name = hashlib.sha256(key.encode()).hexdigest()
+    return commands_dir() / f"{name}.json"
 
 
 def daemon_available(*, now: float | None = None, window_s: int = _LIVENESS_WINDOW_S) -> bool:
@@ -52,12 +70,20 @@ def daemon_available(*, now: float | None = None, window_s: int = _LIVENESS_WIND
 def enqueue(command: dict) -> None:
     """Atomically write one command to the spool, keyed by its idempotency key. A repeat of the
     same key overwrites the same file, so a retried POST never enqueues a second command."""
-    key = command["key"]
-    path = commands_dir()
-    path.mkdir(parents=True, exist_ok=True)
-    tmp = path / f".{key}.{os.getpid()}.tmp"
-    tmp.write_text(json.dumps(command))
-    os.replace(tmp, path / f"{key}.json")
+    tmp: Path | None = None
+    try:
+        destination = _spool_path(command["key"])
+        tmp = destination.with_name(f".{destination.stem}.{os.getpid()}.tmp")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(command))
+        os.replace(tmp, destination)
+    except (OSError, OutsideStateDirectory) as exc:
+        try:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise CommandChannelUnavailable("command spool is unavailable") from exc
 
 
 def pending() -> list[dict]:
@@ -65,12 +91,25 @@ def pending() -> list[dict]:
     path = commands_dir()
     if not path.exists():
         return []
-    files = sorted((f for f in path.glob("*.json")), key=lambda f: f.stat().st_mtime)
-    out: list[dict] = []
-    for f in files:
+    files = []
+    for file in path.glob("*.json"):
         try:
-            out.append(json.loads(f.read_text()))
-        except (OSError, json.JSONDecodeError):
+            if not file.is_symlink():
+                files.append((file.stat().st_mtime, file))
+        except OSError:
+            continue
+    out: list[dict] = []
+    for _, file in sorted(files):
+        try:
+            command = json.loads(file.read_text())
+            destination = _spool_path(command.get("key"))
+            if file != destination:
+                if destination.exists():
+                    file.unlink()
+                else:
+                    os.replace(file, destination)
+            out.append(command)
+        except (InvalidCommandKey, OSError, OutsideStateDirectory, json.JSONDecodeError):
             continue
     return out
 
@@ -79,6 +118,6 @@ def ack(key: str) -> None:
     """Acknowledge a drained command by removing its spool file. Safe to skip on crash — the
     store's idempotency key makes a re-applied command a no-op."""
     try:
-        (commands_dir() / f"{key}.json").unlink(missing_ok=True)
-    except OSError:
+        _spool_path(key).unlink(missing_ok=True)
+    except (InvalidCommandKey, OSError, OutsideStateDirectory):
         pass
