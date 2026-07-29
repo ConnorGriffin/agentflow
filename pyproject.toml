@@ -54,6 +54,10 @@ only-include = [
     "pyproject.toml",
 ]
 
+[tool.hatch.build.targets.sdist.force-include]
+"skills/agentflow/SKILL.md" = "agentflow/_bundled/skills/agentflow/SKILL.md"
+"scripts/screenshots.mjs" = "agentflow/_bundled/scripts/screenshots.mjs"
+
 [tool.hatch.build.targets.wheel]
 packages = ["agentflow"]
 exclude = [

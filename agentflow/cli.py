@@ -35,7 +35,7 @@ def _configure_capacity_helper() -> None:
         os.environ["AGENTFLOW_CAPACITY_HELPER"] = str(Path(found).resolve())
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> int | None:
     _configure_capacity_helper()
     from agentflow.config import ConfigurationError, load_config
 
@@ -43,6 +43,22 @@ def main(argv: list[str] | None = None) -> None:
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="validate runtime configuration")
     check.add_argument("--config", help="path to config.toml")
+    doctor_command = commands.add_parser(
+        "doctor", help="check a repository's AgentFlow capabilities"
+    )
+    doctor_command.add_argument("path", nargs="?", default=None)
+    doctor_command.add_argument("--repo", dest="repo_path")
+    doctor_command.add_argument("--json", action="store_true", dest="json_output")
+    enroll_command = commands.add_parser(
+        "enroll", help="configure a repository for reproducible AgentFlow use"
+    )
+    enroll_command.add_argument("path", nargs="?", default=".")
+    enroll_command.add_argument("--apply", action="store_true")
+    enroll_command.add_argument(
+        "--profile",
+        choices=("autonomous", "reviewed", "guarded"),
+        default="reviewed",
+    )
     daemon_command = commands.add_parser("daemon", help="run the fleet daemon")
     daemon_command.add_argument("--config", help="path to config.toml")
     daemon_command.add_argument(
@@ -82,6 +98,22 @@ def main(argv: list[str] | None = None) -> None:
             f"configuration valid: {count} {noun} "
             f"({workspace_count} workspace)"
         )
+    elif args.command == "doctor":
+        from agentflow.enroll import doctor, print_doctor
+
+        report = doctor(args.repo_path or args.path or ".")
+        print_doctor(report, json_output=args.json_output)
+        return 0 if report.ready else 1
+    elif args.command == "enroll":
+        from agentflow.enroll import enroll_repository
+
+        try:
+            report = enroll_repository(
+                args.path, apply=args.apply, profile=args.profile
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        return 0 if report.ready else 1
     elif args.command == "daemon":
         from agentflow import daemon
 
