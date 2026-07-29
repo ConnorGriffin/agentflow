@@ -882,6 +882,83 @@ def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch
     assert merged == [42]
 
 
+def _settle_autonomous_clean_review(monkeypatch, *, surfaces, pr_view, comments):
+    """Settle one clean, exact-head, autonomous PR and report what the merge gate was asked.
+
+    Everything the settlement reads is fixed except the two facts under test — what the PR's diff
+    and attachments say about screenshots, and whether a maintainer question is outstanding — so a
+    park here is the merge gate's own answer, not a second copy of the rule in the caller.
+    """
+    from agentflow import gate
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record(profile="autonomous")
+    asked, parked, posted = [], [], []
+    decide = gate.decide_merge
+
+    def _spy(**kwargs):
+        asked.append(kwargs)
+        return decide(**kwargs)
+
+    def _park(_repo, _pr, _verdict, *, reason, proof_marker, **_kwargs):
+        parked.append(reason)
+        posted.append(f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->")
+
+    monkeypatch.setattr(coordinated_build, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_build, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.loop.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.loop.ui_surfaces", lambda _workdir: list(surfaces))
+    monkeypatch.setattr("agentflow.loop._pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr("agentflow.github.api", lambda *_args, **_kwargs: dict(pr_view))
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=body, created_at="")
+                                            for body in posted])
+    monkeypatch.setattr("agentflow.gate.decide_merge", _spy)
+    monkeypatch.setattr("agentflow.gate.park", _park)
+    monkeypatch.setattr("agentflow.gate.squash_merge",
+                        lambda *_args, **_kwargs: pytest.fail("a blocked PR must never merge"))
+    monkeypatch.setattr("agentflow.loop._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+    coordinated_build._REVIEW_CI_OBSERVED[record.identity] = True
+
+    proof = coordinated_build._settle_review(record)
+    coordinated_build._REVIEW_CI_OBSERVED.pop(record.identity, None)
+    return SimpleNamespace(proof=proof, asked=asked, parked=parked)
+
+
+def test_screenshotless_ui_change_is_blocked_by_the_gate_it_is_reported_to(monkeypatch):
+    """A clean autonomous PR that touches a declared user-facing surface with no before/after
+    screenshot must not merge — and the merge gate must be the thing that says so, so the fact
+    reaches it instead of being ruled on before the question is asked (ADR 0018)."""
+    from agentflow.loop import _UI_GAP_REASON
+
+    settled = _settle_autonomous_clean_review(
+        monkeypatch,
+        surfaces=["agentflow/webui/src/"],
+        pr_view={"files": [{"path": "agentflow/webui/src/App.svelte"}],
+                 "body": "Renamed the queue column.", "comments": []},
+        comments=[])
+
+    assert settled.asked and settled.asked[0]["ui_evidence_missing"] is True
+    assert settled.parked == [_UI_GAP_REASON]
+    assert settled.proof == "https://github.com/o/r/pull/42"
+
+
+def test_unanswered_maintainer_question_is_blocked_by_the_gate_it_is_reported_to(monkeypatch):
+    """Nothing merges while a maintainer question hangs on the PR (issue #18) — and, as with the
+    screenshot gap, the merge gate is asked the question rather than told the answer."""
+    settled = _settle_autonomous_clean_review(
+        monkeypatch,
+        surfaces=[],
+        pr_view={"files": [], "body": "", "comments": []},
+        comments=[{"id": "9001", "body": "Why did this drop the retry?"}])
+
+    assert settled.asked and settled.asked[0]["reply_pending"] is True
+    assert settled.parked == ["could not be auto-merged after review"]
+
+
 def test_review_settlement_releases_claim_through_public_coordinator_seam(make_coord, monkeypatch):
     from agentflow.reviewer import Verdict
 

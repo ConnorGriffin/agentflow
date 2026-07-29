@@ -178,8 +178,8 @@ def maintainer_comment(comments: list[dict]) -> str:
 
 def decide_merge(*, verdict: Verdict, ci_green: bool, reviewer_tool: str,
                  builder_tool: str, revises_used: int,
-                 ui_evidence_missing: bool = False,
-                 reply_pending: bool = False) -> MergeDecision:
+                 ui_evidence_missing: bool,
+                 reply_pending: bool) -> MergeDecision:
     """Pure. Merge only on independent review + green CI + clean verdict — and never
     when a change to a declared UI surface carries no screenshot, nor over an
     unanswered maintainer question on the PR (issue #18).

@@ -25,7 +25,8 @@ DIRTY = Verdict(clean=False, findings=(Finding("blocking", "bug"),))
 
 def d(**kw):
     base = dict(verdict=CLEAN, ci_green=True, reviewer_tool="codex",
-               builder_tool="claude", revises_used=0)
+               builder_tool="claude", revises_used=0,
+               ui_evidence_missing=False, reply_pending=False)
     return decide_merge(**{**base, **kw})
 
 

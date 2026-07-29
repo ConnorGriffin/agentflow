@@ -1905,8 +1905,7 @@ def _settle_review(record) -> str | None:
         return _park_review_settlement(
             record, verdict, workdir, pr,
             reason="review did not produce an actionable clean verdict", autonomous=True)
-    pending_reply = reply_pending(comments)
-    if not record.auto_merge_allowed or ui_gap or pending_reply:
+    if not record.auto_merge_allowed:
         reason = _UI_GAP_REASON if ui_gap else "could not be auto-merged after review"
         return _park_review_settlement(
             record, verdict, workdir, pr, reason=reason, autonomous=True)
@@ -1916,20 +1915,21 @@ def _settle_review(record) -> str | None:
     ci_green = _REVIEW_CI_OBSERVED.pop(record.identity, None)
     if ci_green is None:
         return None
-    if not ci_green:
-        return _park_review_settlement(
-            record, verdict, workdir, pr,
-            reason="CI did not complete successfully within the review settlement window",
-            autonomous=True)
+    # The one merge decision: the UI-evidence gap and an unanswered maintainer question are the
+    # gate's own blockers, decided there rather than a second time here. A clean verdict can only
+    # come back non-MERGE as a blocker or on red CI, and settlement parks either — it never churns
+    # a revise round over a red build.
     decision = decide_merge(
-        verdict=verdict, ci_green=True, reviewer_tool=record.pool,
+        verdict=verdict, ci_green=ci_green, reviewer_tool=record.pool,
         builder_tool=record.change_author_tool or record.builder_lineage or "",
         revises_used=record.round,
-        ui_evidence_missing=False, reply_pending=False)
+        ui_evidence_missing=ui_gap, reply_pending=reply_pending(comments))
     if decision is not MergeDecision.MERGE:
+        reason = (_UI_GAP_REASON if ui_gap
+                  else "CI did not complete successfully within the review settlement window"
+                  if not ci_green else "could not be auto-merged after review")
         return _park_review_settlement(
-            record, verdict, workdir, pr,
-            reason="could not be auto-merged after review", autonomous=True)
+            record, verdict, workdir, pr, reason=reason, autonomous=True)
     if _review_pr_head(record) != reviewed_head:
         return None
     if not ci_is_green(record.repo, pr, timeout=0, interval=0):
