@@ -50,3 +50,8 @@ Standards every app built in the agentflow flow must meet. Read by **both** tool
   is real, not before.
 - Domain terms come from **`CONTEXT.md`**; record load-bearing, hard-to-reverse
   decisions as **ADRs** — and don't re-litigate settled ones.
+- **ADR identity comes from the originating GitHub issue.** New records use
+  `docs/adr/adr-<issue>-<slug>.md` with heading `# ADR <issue> — Title`. Two
+  records from one issue use distinct slugs. Existing sequentially numbered ADRs
+  are legacy records: keep their names and links; do not add new ones in that
+  format.

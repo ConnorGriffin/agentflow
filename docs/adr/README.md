@@ -9,8 +9,15 @@ Supersedes earlier private-tooling ADRs 0001–0005 (the "two-tool
 split / Opus-ends, Codex-middle" era), which were written the day before GPT-5.6
 Sol shipped and are kept only for history.
 
-Format follows the project convention: `# ADR NNNN — Title`, Status + Date,
-then Context / Decision / Alternatives / Consequences.
+New ADRs follow the fleet-wide issue-keyed convention:
+`docs/adr/adr-<issue>-<slug>.md`, with heading `# ADR <issue> — Title`, then
+Status + Date and Context / Decision / Alternatives / Consequences. The issue is
+the GitHub issue that originated the decision. Multiple records from one issue
+use distinct slugs.
+
+The sequentially numbered records indexed below predate that convention. They
+are legacy records: keep their filenames and links stable, but do not add new
+ADRs in that format.
 
 ## Index
 
