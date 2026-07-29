@@ -21,6 +21,7 @@ jobs:
           python - <<'PY'
           import json
           import os
+          import urllib.error
           import urllib.request
 
           API = "https://api.github.com"
@@ -41,11 +42,9 @@ jobs:
 
           command_comments = {
               17: (
-                  "Private child argv is assembled by the local launcher: "
-                  "sys.executable starts the supervisor, then the typed provider adapter "
-                  "selects claude or operator-configured AGENTFLOW_CODEX_BIN. Prompt text "
-                  "is one argv element, cwd is the owned worktree, and Popen uses an argv "
-                  "list with shell=False."
+                  "Source: private child argv assembled by the local launcher. Executable: "
+                  "adapter-fixed claude or operator AGENTFLOW_CODEX_BIN. Prompt: one argv "
+                  "element. Cwd: owned worktree. Sink: argv-list Popen, shell=False."
               ),
               18: (
                   "AGENTFLOW_CAPACITY_HELPER (legacy TRIAGE_GATE fallback) is explicit "
@@ -198,6 +197,7 @@ jobs:
           assert len(numbers) == 87 and len(set(numbers)) == 87
 
           dismissed = 0
+          failures = []
           for number in numbers:
               url = f"{API}/repos/{repository}/code-scanning/alerts/{number}"
               alert = request_json(url)
@@ -207,17 +207,26 @@ jobs:
                   print(f"skip #{number}: already {alert['state']}")
                   continue
               reason, rationale = disposition(number)
-              request_json(
-                  url,
-                  method="PATCH",
-                  payload={
-                      "state": "dismissed",
-                      "dismissed_reason": reason,
-                      "dismissed_comment": f"Audited {exact}. {rationale}",
-                  },
-              )
+              comment = f"Audited {exact}. {rationale}"
+              if len(comment) > 275:
+                  comment = f"{comment[:272]}..."
+              try:
+                  request_json(
+                      url,
+                      method="PATCH",
+                      payload={
+                          "state": "dismissed",
+                          "dismissed_reason": reason,
+                          "dismissed_comment": comment,
+                      },
+                  )
+              except urllib.error.HTTPError as exc:
+                  failures.append(number)
+                  print(f"failed #{number}: HTTP {exc.code} {exc.read().decode()}")
+                  continue
               dismissed += 1
               print(f"dismissed #{number} ({reason}) at {exact}")
 
           print(f"Applied {dismissed} individual CodeQL dispositions.")
+          assert not failures, f"failed alerts: {failures}"
           PY
