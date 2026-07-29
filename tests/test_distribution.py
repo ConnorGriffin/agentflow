@@ -18,6 +18,14 @@ def _assert_release_contents(names: list[str], charter_path: str) -> None:
     assert not any(parts & FORBIDDEN_PARTS for parts in split_names)
     assert any(name.endswith("agentflow/webui/dist/index.html") for name in names)
     assert any(name.endswith(charter_path) for name in names)
+    assert any(
+        name.endswith("agentflow/_bundled/skills/agentflow/SKILL.md")
+        for name in names
+    )
+    assert any(
+        name.endswith("agentflow/_bundled/scripts/screenshots.mjs")
+        for name in names
+    )
 
 
 def _install_artifact(artifact: Path, environment: Path) -> Path:
@@ -121,29 +129,91 @@ def test_release_artifacts_contain_only_the_runtime_and_built_console(tmp_path):
         assert all(prompt.count(expected_charter) == 1 for prompt in prompts)
         environments[name] = environment
 
-    environment = environments["wheel"]
-    assert (environment / "bin" / "agentflow-capacity-helper").is_file()
-    checkout = tmp_path / "enrolled-repository"
-    checkout.mkdir()
-    config = tmp_path / "agentflow.toml"
-    config.write_text(
-        f"""
+    runner_bin = tmp_path / "runner-bin"
+    runner_bin.mkdir()
+    claude = runner_bin / "claude"
+    claude.write_text("#!/bin/sh\nexit 0\n")
+    claude.chmod(0o755)
+    expected_skill = (ROOT / "skills" / "agentflow" / "SKILL.md").read_bytes()
+    for name, environment in environments.items():
+        assert (environment / "bin" / "agentflow-capacity-helper").is_file()
+        checkout = tmp_path / f"{name}-enrolled-repository"
+        checkout.mkdir()
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "remote",
+                "add",
+                "origin",
+                f"git@github.com:owner/{name}-repository.git",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+            check=True,
+        )
+        config = tmp_path / f"{name}-agentflow.toml"
+        config.write_text(
+            f"""
 [[repositories]]
-repo = "owner/repository"
+repo = "owner/{name}-repository"
 workdir = "{checkout}"
 """.lstrip()
-    )
-    check = subprocess.run(
-        [
-            str(environment / "bin" / "agentflow"),
-            "check",
-            "--config",
-            str(config),
-        ],
-        env=os.environ | {"AGENTFLOW_STATE": str(tmp_path / "state")},
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    assert check.returncode == 0, check.stderr
-    assert check.stdout.strip() == "configuration valid: 1 repository (0 workspace)"
+        )
+        check = subprocess.run(
+            [
+                str(environment / "bin" / "agentflow"),
+                "check",
+                "--config",
+                str(config),
+            ],
+            env=os.environ
+            | {
+                "AGENTFLOW_STATE": str(tmp_path / f"{name}-state"),
+                "AGENTFLOW_CONFIG": str(config),
+            },
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert check.returncode == 0, check.stderr
+        assert check.stdout.strip() == "configuration valid: 1 repository (0 workspace)"
+        enroll = subprocess.run(
+            [
+                str(environment / "bin" / "agentflow"),
+                "enroll",
+                str(checkout),
+                "--apply",
+            ],
+            env=os.environ
+            | {
+                "AGENTFLOW_STATE": str(tmp_path / f"{name}-state"),
+                "AGENTFLOW_CONFIG": str(config),
+                "PATH": f"{runner_bin}{os.pathsep}{os.environ['PATH']}",
+            },
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert enroll.returncode == 0, enroll.stdout + enroll.stderr
+        codex_skill = checkout / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        assert codex_skill.read_bytes() == expected_skill
+        assert (
+            checkout / ".claude" / "skills" / "agentflow" / "SKILL.md"
+        ).resolve() == codex_skill

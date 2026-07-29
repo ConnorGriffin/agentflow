@@ -147,3 +147,6 @@ then Context / Decision / Alternatives / Consequences.
   (inherit the shipping surface, vary only the addition) or `surface` (the open whole-surface
   tournament); each variant carries a ≤150-word `LOCKED` contract copied verbatim into the ready
   brief on pick, which the reviewer judges the implementation screenshots against.
+- [0049](0049-reproducible-repository-capabilities.md) — Repository capabilities are
+  pinned in one versioned manifest; doctor distinguishes missing from drifted, and
+  safe local enrollment reproduces the Claude/Codex skill and UI runtime environment.

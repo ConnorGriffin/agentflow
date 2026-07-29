@@ -51,14 +51,15 @@ function die(msg) {
   process.exit(1);
 }
 
-// Where the globally-managed Playwright ESM might live, tried in order. Resolving
-// it dynamically keeps the harness portable — the fleet's Node/Playwright install
-// location need not match any one machine's.
-//   1. bare 'playwright'          — resolves when it's on NODE_PATH or node's search path
-//   2. `npm root -g`/playwright   — the actual global install dir on this machine
-//   3. the Homebrew global path   — the known location on the macOS dev machines
+// Enrollment installs a pinned Playwright beside the drive-local-webapp skill. Prefer
+// that reproducible project-local runtime; retain the older global locations so existing
+// enrolled repositories keep working until they are re-enrolled.
 function playwrightCandidates() {
-  const candidates = ['playwright'];
+  const candidates = [
+    join(process.cwd(), '.agents', 'skills', 'drive-local-webapp',
+      'node_modules', 'playwright', 'index.mjs'),
+    'playwright',
+  ];
   try {
     const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
     if (globalRoot) candidates.push(join(globalRoot, 'playwright', 'index.mjs'));

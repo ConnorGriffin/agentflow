@@ -1,0 +1,92 @@
+schema_version = 1
+
+[skill_installer]
+package = "skills"
+version = "1.5.9"
+
+[connor_skills]
+source = "https://github.com/ConnorGriffin/skills"
+tag = "v0.1.0"
+commit = "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
+skills = ["ui-mockups", "drive-local-webapp"]
+
+[playwright]
+version = "1.61.1"
+node_minimum = 18
+
+[[capabilities]]
+id = "repository-instructions"
+description = "shared AGENTS.md instructions discovered by Claude and Codex"
+requirement = "always"
+
+[[capabilities]]
+id = "agentflow-skill"
+description = "the repo-local AgentFlow operator skill"
+requirement = "always"
+source = "bundled"
+skill = "agentflow"
+files = [
+  { path = "SKILL.md", sha256 = "dfc16f14af284ecc0d10e02f64e16fd64995af4b068cbce5bb75577203e91138" },
+]
+
+[[capabilities]]
+id = "fleet-config"
+description = "this checkout is present in AgentFlow's config.toml"
+requirement = "always"
+
+[[capabilities]]
+id = "provider"
+description = "at least one installed AgentFlow runner"
+requirement = "always"
+
+[[capabilities]]
+id = "ui-mockups"
+description = "the repo-local UI mockup workflow"
+requirement = "ui"
+skill = "ui-mockups"
+files = [
+  { path = "SKILL.md", sha256 = "0b42c78273dca661cba5502ecae16d8a8647fb9e6eeb7b539b99818a4be6cb51" },
+  { path = "agents/openai.yaml", sha256 = "29e85e216b29bf13e9b75c6bbe92dd757d1eed393a3c0a84e3d4b9005db484cd" },
+  { path = "references/variant-agent-prompt.md", sha256 = "e4b9047aa794b80c1e617cd19fc5cb493d34f3d1efa264eb0cc696d3708510ae" },
+]
+
+[[capabilities]]
+id = "drive-local-webapp"
+description = "the repo-local browser verification workflow"
+requirement = "ui"
+skill = "drive-local-webapp"
+files = [
+  { path = "SKILL.md", sha256 = "9cbbc9b845d8d4194beea8da6a9aef0b4e4dd4e21f2aec7b29e7bb263d3b7284" },
+  { path = "agents/openai.yaml", sha256 = "fab32a96f50c20e1cc5f915564624f30cefdad5eff81bcd3f39e01b82e5baf06" },
+  { path = "package-lock.json", sha256 = "c3359191305ccfc3901f1b3097cfcd3a4bce96b4d6acd1c3e8d96e624912c9cc" },
+  { path = "package.json", sha256 = "b7c433974c6ac3f176a8337c7c58523ec1165eff1f2fdd9a69220e24cf819269" },
+  { path = "scripts/driver.mjs", sha256 = "492f60a53b7be206174d6f8476e90d3afe29696385ac4ef5669f35c6ad8d9fee" },
+  { path = "scripts/self-check.mjs", sha256 = "faab0352dd85e986ba83a2c30c77879a3490764597a439fa18bd44241602bd96" },
+]
+
+[[capabilities]]
+id = "screenshot-harness"
+description = "the canonical Playwright screenshot harness"
+requirement = "ui"
+source = "bundled"
+sha256 = "ba094b9169747467257fc6f5bfcdc6d0f47a46bd99aa9827f0a3f352a03a84ad"
+
+[[capabilities]]
+id = "playwright"
+description = "the pinned local browser runtime is installed"
+requirement = "ui"
+
+[[capabilities]]
+id = "claude"
+description = "Claude Code runner"
+requirement = "optional"
+
+[[capabilities]]
+id = "codex"
+description = "Codex runner"
+requirement = "optional"
+
+[[capabilities]]
+id = "codebase-memory"
+description = "optional structural code graph"
+requirement = "optional"
