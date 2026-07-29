@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import subprocess
-from hashlib import sha256
 from pathlib import Path
 
 from agentflow import github
@@ -116,39 +115,59 @@ def intake_claim_ready(record) -> bool:
 
 
 def apply_route(record, result: IntakeResult) -> str | None:
-    """Idempotently project the already-durable route, proving it before claim release."""
+    """Idempotently project the already-durable route, proving it before claim release.
+
+    A ``grill`` or ``mockup`` route is a handoff — it asks a human for something — so it goes
+    through the shared :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042): the
+    route's own comment is the durable marker, and the operator is pinged exactly once, when
+    that comment is newly posted, under the key the envelope derives. Every other route hands
+    the issue on to the pipeline and is projected without a ping, exactly as before.
+
+    Either way projection is idempotent across partial writes: a projection interrupted after
+    its comment landed is finished on the way out, so the remaining title/body/label mutations
+    are never stranded behind the envelope's post-once gate.
+    """
+    from agentflow.handoff import DurableHandoff, Notification, Subject
     from agentflow.loop import _release_triage
     try:
         snapshot = json.loads(record.input_ptr or "")["snapshot"]
         number = int(record.subject)
     except (ValueError, KeyError, TypeError):
         return None
-    # The live title + labels read in one snapshot doesn't fit a typed helper, so it goes
-    # through the module's named escape hatch (ADR 0040); None means GitHub couldn't be
-    # reached and the route is not projected.
-    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "title,labels"], parse_json=True)
-    if not isinstance(issue, dict):
-        return None
-    labels = [label.get("name", "") for label in issue.get("labels", [])]
     source_title = snapshot.get("title", "")
     source_body = snapshot.get("body", "")
-    apply_intake(record.repo, number, issue.get("title", source_title), labels, result,
-                 source_title, source_body)
+
+    def project() -> None:
+        # The live title + labels read in one snapshot doesn't fit a typed helper, so it goes
+        # through the module's named escape hatch (ADR 0040); None means GitHub couldn't be
+        # reached and the route is not projected.
+        issue = github.api(["issue", "view", str(number), "--repo", record.repo,
+                            "--json", "title,labels"], parse_json=True)
+        if not isinstance(issue, dict):
+            return
+        apply_intake(record.repo, number, issue.get("title", source_title),
+                     [label.get("name", "") for label in issue.get("labels", [])], result,
+                     source_title, source_body)
+
+    route = result.route.value
+    hands_off = route in ("grill", "mockup")
+    if not hands_off:
+        project()
+    elif DurableHandoff().hand_off(
+            Subject(repo=record.repo, number=number, kind="issue"),
+            identity=record.identity, stage=f"intake-route:{route}",
+            marker=result.body.strip(),
+            action=project,
+            notification=Notification(
+                "agentflow needs you", f"{record.repo} #{number}: {route}")) is None:
+        return None
     if not intake_result_is_durable(record.repo, number, result, source_title, source_body):
+        if hands_off:
+            project()   # the post-once gate skipped an interrupted projection — finish it
         return None
     if not _release_triage(record.repo, number):
         return None
-    url = f"https://github.com/{record.repo}/issues/{number}"
-    if result.route.value in ("grill", "mockup"):
-        from agentflow.notify import notify
-        sequence_id = sha256(
-            f"{record.identity}:intake-route:{result.route.value}".encode()
-        ).hexdigest()[:12]
-        if not notify("agentflow needs you", f"{record.repo} #{number}: {result.route.value}",
-                      url, sequence_id):
-            return None
-    return url
+    return f"https://github.com/{record.repo}/issues/{number}"
 
 
 def hold_intake(record) -> str | None:

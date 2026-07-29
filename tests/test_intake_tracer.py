@@ -369,17 +369,25 @@ def test_production_projection_applies_once_then_releases_claim(make_coord, monk
     assert released == [7] and len(notified) == 1
 
 
-def test_route_notification_retries_with_one_stable_delivery_identity(make_coord, monkeypatch):
+def test_route_handoff_pings_once_under_one_stable_key_across_a_restart(make_coord, monkeypatch):
+    """A grill or mockup route asks a human for something, so it is a handoff: the route's own
+    comment is the durable marker and the operator is pinged exactly once, under the key the
+    shared envelope derives (ADR 0042). A daemon that died between posting that comment and
+    releasing the triaging claim re-runs the route on restart and must neither restate it nor
+    ping again."""
     fake = IntakeSession()
-    deliveries = iter((False, True))
-    notified = []
-    monkeypatch.setattr(github, "api",
-                        lambda *a, **k: {"title": "old", "labels": [], "comments": []})
-    monkeypatch.setattr(coordinated_intake, "apply_intake", lambda *args: None)
+    notified, comments, releases = [], [], [False]
+    monkeypatch.setattr(github, "api", lambda *a, **k: {"title": "old", "labels": []})
+    monkeypatch.setattr(github, "issue_comments",
+                        lambda repo, number: [github.Comment(body=body, created_at="")
+                                              for body in comments])
+    monkeypatch.setattr(coordinated_intake, "apply_intake",
+                        lambda repo, number, title, labels, result, *rest:
+                        comments.append(result.body))
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
-    monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
+    monkeypatch.setattr(loop, "_release_triage", lambda *args: releases[0])
     monkeypatch.setattr("agentflow.notify.notify",
-                        lambda *args: notified.append(args) or next(deliveries))
+                        lambda *args: notified.append(args) or True)
     adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
                                  apply_route=coordinated_intake.apply_route)
     coord = make_coord(fake, adapter=adapter)
@@ -392,12 +400,15 @@ def test_route_notification_retries_with_one_stable_delivery_identity(make_coord
     fake.end(identity, cause=ProviderCause.PROCESS)
 
     coord.cycle("claude")  # captures the route; projection starts next cycle
-    coord.cycle("claude")  # first ntfy delivery reports failure
+    coord.cycle("claude")  # the route comment lands and pings; the claim is not yet released
     assert record_of(coord, identity).retired is False
-    coord.cycle("claude")  # stable-sequence retry succeeds
+    assert len(comments) == 1 and len(notified) == 1
 
-    assert notified[0][3] == notified[1][3]
+    releases[0] = True
+    coord.cycle("claude")  # the restart finds its own comment: no restatement, no second ping
     assert record_of(coord, identity).retired is True
+    assert len(comments) == 1 and len(notified) == 1
+    assert notified[0][3] and len(notified[0][3]) == 24
 
 
 def test_production_preparation_recreates_read_only_worktree(make_coord, monkeypatch, tmp_path):
@@ -636,11 +647,14 @@ def test_returned_grill_decision_still_posts_its_own_question(make_coord, monkey
     from agentflow.intake import IntakeRoute, intake_labels
 
     fake = IntakeSession()
-    projected = []
+    projected, comments = [], []
     monkeypatch.setattr(github, "api", lambda *a, **k: {"title": "old", "labels": []})
+    monkeypatch.setattr(github, "issue_comments",
+                        lambda repo, number: [github.Comment(body=body, created_at="")
+                                              for body in comments])
     monkeypatch.setattr(coordinated_intake, "apply_intake",
                         lambda repo, number, title, labels, result, *rest:
-                        projected.append(result))
+                        projected.append(result) or comments.append(result.body))
     monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *args: True)
     monkeypatch.setattr(loop, "_release_triage", lambda *args: True)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args: True)

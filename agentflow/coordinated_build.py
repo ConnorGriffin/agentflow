@@ -1196,127 +1196,118 @@ def _settle_mockup(record) -> str | None:
 def _hold_mockup(record) -> str | None:
     """Create Mockup's one issue-native handoff while preserving unfinished local work.
 
-    MISSING-CONTEXT already is the durable stage-native handoff; exhaustion posts one stable
-    marked comment. Both leave ``needs-mockup`` in place, release and prove the drawing claim,
-    retain the worktree, and use a stable notification sequence across crash retries.
+    The per-record proof marker is what makes the hold durable, so the crash-safe post-once →
+    prove → notify-once recipe is the shared :class:`~agentflow.handoff.DurableHandoff` envelope
+    (ADR 0042) keyed on that marker: a repeat after a daemon crash observes it and neither
+    re-posts nor pings again. The round only ever gets *one* marked comment — MISSING-CONTEXT
+    already is the durable stage-native handoff and is never restated, so it gains the marker in
+    place; an unfinished round gains the marker and the exhaustion explanation. Handing the issue
+    back to the maintainer's choice (``needs-mockup`` kept, the drawing claim released) is stage
+    bookkeeping that runs once the handoff confirms; the worktree is retained either way.
     """
+    from agentflow.handoff import DurableHandoff, Notification, Subject
     from agentflow.loop import DRAWING, MOCKUP_MARK, _MOCKUP_DISCLAIMER
-    from agentflow.notify import notify
 
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    # Labels+comments+url in one snapshot doesn't fit the typed surface, so this read (and the
-    # matching proof read below) goes through the module's escape hatch; None means unreadable.
-    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "labels,comments,url"], parse_json=True)
-    if not isinstance(issue, dict):
+    comments = github.issue_comments(record.repo, number)
+    if comments is None:
         return None
-    comments = issue.get("comments", [])
-    marked = next((comment for comment in comments
-                   if MOCKUP_MARK in comment.get("body", "")), None)
-    missing = next((comment for comment in comments
-                    if MOCKUP_MARK in comment.get("body", "")
-                    and "MISSING-CONTEXT:" in comment.get("body", "")), None)
+    marked = next((comment for comment in comments if MOCKUP_MARK in comment.body), None)
+    missing = next((comment for comment in comments if MOCKUP_MARK in comment.body
+                    and "MISSING-CONTEXT:" in comment.body), None)
     proof = "<!-- agentflow-mockup-hold:" + hashlib.sha256(
         record.identity.encode()).hexdigest()[:24] + " -->"
     explanation = ("Mockup exhausted its continuation budget before completing the visual round. "
                    "The branch and local worktree are retained for a human to continue.")
-    existing = marked or next((comment for comment in comments
-                               if proof in comment.get("body", "")), None)
-    if existing is None:
-        body = f"{_MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}"
-        if not github.comment(record.repo, number, body):
-            return None
-    elif missing is None and proof not in existing.get("body", ""):
-        comment_id = existing.get("id")
-        if not comment_id:
-            return None
-        body = f"{existing.get('body', '').rstrip()}\n\n{proof}\n\n{explanation}"
-        mutation = ("mutation($id:ID!,$body:String!){updateIssueComment("
-                    "input:{id:$id,body:$body}){issueComment{id}}}")
-        # A GraphQL comment edit is one of the escape hatch's named exotic cases (ADR 0040).
-        if github.api(["api", "graphql", "-f", f"query={mutation}",
-                       "-f", f"id={comment_id}", "-f", f"body={body}"]) is None:
-            return None
+
+    def post() -> None:
+        if marked is None:
+            github.comment(record.repo, number,
+                           f"{_MOCKUP_DISCLAIMER}\n{proof}\n\n{explanation}")
+            return
+        # The round already has its one marked comment: a MISSING-CONTEXT handoff says why on its
+        # own and gains only the marker; an unfinished one also gains the exhaustion explanation.
+        tail = proof if missing is not None else f"{proof}\n\n{explanation}"
+        github.edit_comment(marked.id, f"{marked.body.rstrip()}\n\n{tail}")
+
+    reason = "missing context" if missing is not None else "continuation budget exhausted"
+    url = DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=number, kind="issue"),
+        identity=record.identity, stage="mockup-hold",
+        marker=proof,
+        action=post,
+        notification=Notification(
+            "agentflow needs you", f"{record.repo} #{number}: Mockup held — {reason}"))
+    if url is None:
+        return None
     # A single edit that both adds and removes a label is not on the typed surface, so the write
-    # goes through the escape hatch; the proof read below is authoritative either way.
+    # goes through the escape hatch; the label read below is authoritative either way.
     github.api(["issue", "edit", str(number), "--repo", record.repo,
                 "--add-label", "agentflow:needs-mockup", "--remove-label", DRAWING])
-    state = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "labels,comments,url"], parse_json=True)
-    if not isinstance(state, dict):
+    labels = github.issue_labels(record.repo, number)
+    if labels is None or DRAWING in labels or "agentflow:needs-mockup" not in labels:
         return None
-    labels = {label.get("name") for label in state.get("labels", [])}
-    final_comments = state.get("comments", [])
-    has_proof = any(
-        proof in comment.get("body", "")
-        or (MOCKUP_MARK in comment.get("body", "")
-            and "MISSING-CONTEXT:" in comment.get("body", ""))
-        for comment in final_comments)
-    if DRAWING in labels or "agentflow:needs-mockup" not in labels or not has_proof:
-        return None
-    url = state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
-    sequence = "mockup-" + hashlib.sha256(record.identity.encode()).hexdigest()[:24]
-    reason = ("missing context" if missing is not None
-              else "continuation budget exhausted")
-    if not notify("agentflow needs you", f"{record.repo} #{number}: Mockup held — {reason}",
-                  url, sequence_id=sequence):
-        return None
-    return str(url)
+    return url
 
 
 def _hold_build(record) -> str | None:
     """Create and prove Build's exhaustion handoff without touching its worktree.
 
-    The issue comment and ``needs-grilling`` label are the durable proof. A repeat after a
-    daemon crash observes the same comment and does not notify again; the visible building
-    claim is released only after the hold exists.
+    The held-route comment is the durable marker, so the crash-safe post-once → prove →
+    notify-once recipe is the shared :class:`~agentflow.handoff.DurableHandoff` envelope
+    (ADR 0042): a daemon that dies between posting that comment and pinging the operator
+    observes the same comment on restart and does not ping again — this handoff previously
+    had no notification key at all and could double-ping. Releasing the visible building claim
+    and proving the resulting held state are stage bookkeeping that run once the handoff
+    confirms; an interrupted projection is finished on the way out so a partial write is never
+    stranded.
     """
+    from agentflow.handoff import DurableHandoff, Notification, Subject
     from agentflow.intake import apply_intake
     from agentflow.loop import BUILDING, held_build_result
-    from agentflow.notify import notify
 
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    # Title+labels+comments in one snapshot (and labels+comments+url for the proof read below) does
-    # not fit the typed surface, so both go through the module's escape hatch; None is unreadable.
-    issue = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "title,labels,comments"], parse_json=True)
-    if not isinstance(issue, dict):
-        return None
-    labels = [label.get("name", "") for label in issue.get("labels", [])]
     status = ("could not rebase past a collision with newer changes on the main branch and stopped "
               "without resolving it" if record.hold_reason == "integration collision"
               else "continuation budget exhausted")
     result = held_build_result(status, f"the retained worktree `{record.source}`")
-    already_posted = any(
-        comment.get("body", "").strip() == result.body.strip()
-        for comment in issue.get("comments", [])
-    )
-    apply_intake(record.repo, number, issue.get("title", ""), labels, result)
-    github.remove_label(record.repo, number, BUILDING)
 
-    state = github.api(["issue", "view", str(number), "--repo", record.repo,
-                        "--json", "labels,comments,url"], parse_json=True)
-    if not isinstance(state, dict):
-        return None
-    final_labels = {label.get("name") for label in state.get("labels", [])}
-    has_comment = any(
-        comment.get("body", "").strip() == result.body.strip()
-        for comment in state.get("comments", [])
-    )
-    if "agentflow:needs-grilling" not in final_labels or BUILDING in final_labels or not has_comment:
-        return None
-    url = state.get("url") or f"https://github.com/{record.repo}/issues/{number}"
+    def project() -> None:
+        # Title+labels in one live read through the named escape hatch (ADR 0040); a read that
+        # couldn't reach GitHub leaves the hold unprojected, so the envelope proves no marker
+        # and retries next cycle rather than holding over an empty read.
+        issue = github.api(["issue", "view", str(number), "--repo", record.repo,
+                            "--json", "title,labels"], parse_json=True)
+        if not isinstance(issue, dict):
+            return
+        apply_intake(record.repo, number, issue.get("title", ""),
+                     [label.get("name", "") for label in issue.get("labels", [])], result)
+
     headline = ("Build hit an integration collision" if record.hold_reason == "integration collision"
                 else "Build continuation budget exhausted")
-    if not already_posted:
-        notify("agentflow needs you", f"{record.repo} #{number}: {headline}", url)
-    return str(url)
+    url = DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=number, kind="issue"),
+        identity=record.identity, stage="build-hold",
+        marker=result.body.strip(),
+        action=project,
+        notification=Notification(
+            "agentflow needs you", f"{record.repo} #{number}: {headline}"))
+    if url is None:
+        return None
+    github.remove_label(record.repo, number, BUILDING)
+    labels = github.issue_labels(record.repo, number)
+    if labels is None:
+        return None
+    if BUILDING in labels or "agentflow:needs-grilling" not in labels:
+        project()   # the projection was interrupted after its comment landed — finish it
+        return None
+    return url
 
 
 # --- Review stage: verdict outcome, bounded-fix checkout, PR park (live; ADR 0020/0047) ---

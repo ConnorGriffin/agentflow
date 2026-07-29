@@ -21,8 +21,11 @@ The envelope is deliberately thin: stage-specific bookkeeping (deleting a finish
 checkout, recording ratchet state) is *not* part of this module — the stage does that
 itself after the call confirms (returns non-``None``).
 
-This is a purely additive keystone (ADR 0042): it migrates no existing caller, so it
-cannot change how the pipeline behaves.
+Every handoff that hands a GitHub issue or PR to a human now runs through here: the review
+and respond parks, the intake hold, the intake grill/mockup routes, and the build and mockup
+holds. What stays outside is what is not a handoff — resolving a research ticket writes no
+marker for a human to answer and pings no one, and a parked conversation turn lives in the
+workspace store rather than on an issue or PR.
 """
 
 from __future__ import annotations

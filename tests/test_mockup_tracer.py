@@ -356,101 +356,142 @@ def test_completed_mockup_releases_claim_keeps_human_boundary_and_disposes_workt
     assert coordinated_build._settle_mockup(rec) == "https://github.com/o/r/issues/11"
 
 
+def _mockup_hold_seams(monkeypatch, comments, labels, *, notified, labels_readable=None):
+    """Wire the mockup hold's shared-envelope seams (ADR 0042): the durable comment thread it
+    reads and proves the handoff through, the one marked comment it posts or edits, the label
+    edit that hands the round back to the maintainer's choice, and the operator ping. Everything
+    is stated as a fact about the issue, never as a ``gh`` argument vector. ``labels_readable``
+    is a one-element list a test flips to stand a label read that couldn't reach GitHub.
+    """
+    from agentflow import github
+
+    def post(repo, number, body):
+        comments.append(github.Comment(body=body, created_at="", id=f"IC_{len(comments)}"))
+        return True
+
+    def edit(comment_id, body):
+        for index, existing in enumerate(comments):
+            if existing.id == comment_id:
+                comments[index] = github.Comment(body=body, created_at="", id=comment_id)
+                return True
+        return False
+
+    def label_edit(args, *, parse_json=False):
+        labels.add("agentflow:needs-mockup")
+        labels.discard("agentflow:drawing-mockup")
+        return ""
+
+    monkeypatch.setattr(github, "issue_comments", lambda repo, number: list(comments))
+    monkeypatch.setattr(github, "issue_labels",
+                        lambda repo, number: None if labels_readable == [False]
+                        else frozenset(labels))
+    monkeypatch.setattr(github, "comment", post)
+    monkeypatch.setattr(github, "edit_comment", edit)
+    monkeypatch.setattr(github, "api", label_edit)
+    monkeypatch.setattr("agentflow.notify.notify",
+                        lambda *args: notified.append(args) or True)
+
+
+def _refuse_a_second_comment(monkeypatch, why):
+    def refuse(repo, number, body):
+        raise AssertionError(why)
+    monkeypatch.setattr("agentflow.github.comment", refuse)
+
+
+def _mockup_record(wt, **extra):
+    return Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
+                  repo="o/r", subject="11", lineage="claude", source=str(wt), **extra)
+
+
 def test_exhausted_mockup_posts_one_stable_handoff_and_retains_worktree(monkeypatch, tmp_path):
     wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
     wt.mkdir(parents=True)
     labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
-    comments = []
-
-    def comment(repo, number, body):
-        comments.append({"body": body})
-        return True
-
-    def api(args, *, parse_json=False):
-        if not parse_json:  # the single add-needs-mockup / remove-drawing label edit
-            labels.add("agentflow:needs-mockup")
-            labels.discard("agentflow:drawing-mockup")
-            return ""
-        return {"labels": [{"name": label} for label in labels], "comments": comments,
-                "url": "https://github.com/o/r/issues/11"}
-
-    notifications = []
-    monkeypatch.setattr("agentflow.github.comment", comment)
-    monkeypatch.setattr("agentflow.github.api", api)
-    monkeypatch.setattr("agentflow.notify.notify",
-                        lambda *args, **kwargs: notifications.append((args, kwargs)) or True)
-    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
-                 repo="o/r", subject="11", lineage="claude", source=str(wt),
-                 hold_reason="continuation budget exhausted")
+    comments, notified = [], []
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified)
+    rec = _mockup_record(wt, hold_reason="continuation budget exhausted")
 
     first = coordinated_build._hold_mockup(rec)
     second = coordinated_build._hold_mockup(rec)
     assert first == second == "https://github.com/o/r/issues/11"
-    assert len(comments) == 1 and "agentflow-mockup-hold" in comments[0]["body"]
+    assert len(comments) == 1 and "agentflow-mockup-hold" in comments[0].body
     assert labels == {"agentflow:needs-mockup"} and wt.exists()
-    assert len(notifications) == 2
-    assert notifications[0][1]["sequence_id"] == notifications[1][1]["sequence_id"]
+    # The second pass observes the same marker, so it neither restates the hold nor pings again.
+    assert len(notified) == 1
+
+
+def test_mockup_hold_interrupted_after_its_comment_does_not_ping_the_operator_twice(
+        monkeypatch, tmp_path):
+    # The crash window the envelope exists to close: the handoff comment lands, then the daemon
+    # dies before the round is finished (stood here as a label read that can't reach GitHub).
+    # The restart must finish the hold without a second comment and without a second ping.
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
+    comments, notified, readable = [], [], [False]
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified,
+                       labels_readable=readable)
+    rec = _mockup_record(wt, hold_reason="continuation budget exhausted")
+
+    assert coordinated_build._hold_mockup(rec) is None
+    assert len(comments) == 1 and len(notified) == 1
+
+    readable[0] = True
+    assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
+    assert len(comments) == 1 and len(notified) == 1
+
+
+def test_mockup_hold_ping_carries_a_stable_sequence_id(monkeypatch, tmp_path):
+    # Keyed delivery is what makes a redelivered ping replace the operator's notification
+    # instead of multiplying it, so the same held round must always derive the same key.
+    wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
+    wt.mkdir(parents=True)
+    keys = []
+    for _ in range(2):
+        comments, notified = [], []
+        _mockup_hold_seams(monkeypatch, comments,
+                           {"agentflow:needs-mockup", "agentflow:drawing-mockup"},
+                           notified=notified)
+        coordinated_build._hold_mockup(_mockup_record(wt, hold_reason="budget exhausted"))
+        keys.append(notified[0][3])
+    assert keys[0] and keys[0] == keys[1]
 
 
 def test_missing_context_comment_is_the_handoff_and_never_gets_a_second_comment(
         monkeypatch, tmp_path):
+    # MISSING-CONTEXT already says why the round stopped, so the round keeps its one comment —
+    # it gains only the per-round marker that makes the hold provable and the ping exactly-once.
     wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
     wt.mkdir(parents=True)
     labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
-    comments = [{"body": (
+    notified = []
+    comments = [SimpleNamespace(id="IC_missing", body=(
         "> *agentflow intake: mockup variants — generated by AI.*\n\n"
-        "MISSING-CONTEXT: no runnable surface") }]
-
-    def comment(repo, number, body):
-        raise AssertionError("MISSING-CONTEXT already is the durable handoff")
-
-    def api(args, *, parse_json=False):
-        if not parse_json:  # the label edit
-            labels.add("agentflow:needs-mockup")
-            labels.discard("agentflow:drawing-mockup")
-            return ""
-        return {"labels": [{"name": label} for label in labels], "comments": comments,
-                "url": "https://github.com/o/r/issues/11"}
-
-    monkeypatch.setattr("agentflow.github.comment", comment)
-    monkeypatch.setattr("agentflow.github.api", api)
-    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
-    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
-                 repo="o/r", subject="11", lineage="claude", source=str(wt))
+        "MISSING-CONTEXT: no runnable surface"))]
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified)
+    _refuse_a_second_comment(monkeypatch, "MISSING-CONTEXT already is the durable handoff")
+    rec = _mockup_record(wt)
 
     assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
     assert len(comments) == 1 and wt.exists()
+    assert "agentflow-mockup-hold" in comments[0].body
+    assert "continuation budget" not in comments[0].body   # it never restates the round's reason
+    assert len(notified) == 1 and "missing context" in notified[0][1]
 
 
 def test_partial_marked_comment_is_edited_into_the_exhaustion_handoff(monkeypatch, tmp_path):
     wt = tmp_path / ".agentflow/worktrees/claude/mockup-11-a-screen"
     wt.mkdir(parents=True)
     labels = {"agentflow:needs-mockup", "agentflow:drawing-mockup"}
-    comments = [{"id": "IC_partial", "body": (
+    notified = []
+    comments = [SimpleNamespace(id="IC_partial", body=(
         "> *agentflow intake: mockup variants — generated by AI.*\n\n"
-        "Only variant A was finished.")}]
-
-    def comment(repo, number, body):
-        raise AssertionError("the one existing variant-round comment must be edited")
-
-    def api(args, *, parse_json=False):
-        if parse_json:
-            return {"labels": [{"name": label} for label in labels], "comments": comments,
-                    "url": "https://github.com/o/r/issues/11"}
-        if "graphql" in args:  # the comment-edit mutation (an escape-hatch exotic case)
-            body_arg = next(arg for arg in args if arg.startswith("body="))
-            comments[0]["body"] = body_arg.removeprefix("body=")
-            return "{}"
-        labels.discard("agentflow:drawing-mockup")  # the label edit
-        return ""
-
-    monkeypatch.setattr("agentflow.github.comment", comment)
-    monkeypatch.setattr("agentflow.github.api", api)
-    monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
-    rec = Record(identity="o/r|11|mockup|-", stage="mockup", pool="claude", demand=5,
-                 repo="o/r", subject="11", lineage="claude", source=str(wt))
+        "Only variant A was finished."))]
+    _mockup_hold_seams(monkeypatch, comments, labels, notified=notified)
+    _refuse_a_second_comment(monkeypatch, "the one existing variant-round comment must be edited")
+    rec = _mockup_record(wt)
 
     assert coordinated_build._hold_mockup(rec) == "https://github.com/o/r/issues/11"
     assert len(comments) == 1
-    assert "agentflow-mockup-hold" in comments[0]["body"]
-    assert "continuation budget" in comments[0]["body"] and wt.exists()
+    assert "agentflow-mockup-hold" in comments[0].body
+    assert "continuation budget" in comments[0].body and wt.exists()

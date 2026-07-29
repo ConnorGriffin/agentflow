@@ -810,36 +810,60 @@ def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monke
         coordinated_build._pr_exists(record)
 
 
-def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(monkeypatch):
+def _build_hold_seams(monkeypatch, state, *, notifications, labels_readable=None,
+                      label_failures=None):
+    """Wire the build hold's shared-envelope seams (ADR 0042): the durable comment thread it reads
+    and proves the handoff through, the projection that posts the held-route comment and state
+    label, the release of the visible building claim, and the operator ping. Everything is stated
+    as a fact about the issue, never as a ``gh`` argument vector. ``labels_readable`` is a
+    one-element list a test flips to stand a label read that couldn't reach GitHub, and
+    ``label_failures`` a countdown of projections whose comment lands but whose label write is
+    interrupted.
+    """
     from agentflow import github, intake, notify as notify_module
-
-    state = {
-        "title": "Build it",
-        "url": "https://github.com/o/r/issues/7",
-        "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
-        "comments": [],
-    }
 
     def drop_building(repo, number, label):
         state["labels"] = [entry for entry in state["labels"] if entry["name"] != label]
         return True
 
     def fake_apply(repo, number, title, labels, result):
-        state["labels"] = [{"name": "agentflow:needs-grilling"},
-                           {"name": "agentflow:building"}]
         if not any(comment["body"] == result.body for comment in state["comments"]):
             state["comments"].append({"body": result.body})
+        if label_failures and label_failures[0]:
+            label_failures[0] -= 1
+        else:
+            state["labels"] = [{"name": "agentflow:needs-grilling"},
+                               {"name": "agentflow:building"}]
         return "applied"
 
-    notifications = []
-    # The handoff states the issue's title/labels/comments through the module and drops the
-    # building claim through it — never by matching gh argument vectors.
     monkeypatch.setattr(github, "api", lambda *a, **k: state)
+    monkeypatch.setattr(github, "issue_comments",
+                        lambda repo, number: [github.Comment(body=entry["body"], created_at="")
+                                              for entry in state["comments"]])
+    monkeypatch.setattr(github, "issue_labels",
+                        lambda repo, number: None if labels_readable == [False]
+                        else frozenset(entry["name"] for entry in state["labels"]))
     monkeypatch.setattr(github, "remove_label", drop_building)
     monkeypatch.setattr(intake, "apply_intake", fake_apply)
     monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
-    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-                    repo="o/r", subject="7", source="/retained/wt", claim=True)
+
+
+def _held_build_issue():
+    return {"title": "Build it", "url": "https://github.com/o/r/issues/7",
+            "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
+            "comments": []}
+
+
+def _held_build_record(**extra):
+    return Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+                  repo="o/r", subject="7", source="/retained/wt", claim=True, **extra)
+
+
+def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(monkeypatch):
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+    record = _held_build_record()
 
     assert coordinated_build._hold_build(record) == state["url"]
     assert coordinated_build._hold_build(record) == state["url"]
@@ -848,38 +872,49 @@ def test_live_exhaustion_handoff_is_idempotent_and_releases_the_visible_claim(mo
     assert len(notifications) == 1
 
 
+def test_build_hold_interrupted_after_its_comment_does_not_ping_the_operator_twice(monkeypatch):
+    # The crash window the shared envelope exists to close: the hold comment lands and the
+    # operator is pinged, then the daemon dies before the held state is proven (stood here as a
+    # label read that couldn't reach GitHub). This hold used to ping with no delivery key at all,
+    # so the restart's ping arrived as a second notification; now the comment gates it.
+    state = _held_build_issue()
+    notifications, readable = [], [False]
+    _build_hold_seams(monkeypatch, state, notifications=notifications, labels_readable=readable)
+    record = _held_build_record()
+
+    assert coordinated_build._hold_build(record) is None
+    assert len(state["comments"]) == 1 and len(notifications) == 1
+
+    readable[0] = True
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert len(state["comments"]) == 1 and len(notifications) == 1
+    assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
+    assert notifications[0][3]   # the ping carries a delivery key it previously had none of
+
+
+def test_a_hold_projection_interrupted_before_its_state_label_is_still_finished(monkeypatch):
+    # Projecting the hold is idempotent across partial writes, so the envelope's post-once gate
+    # must not strand one: a hold whose comment landed but whose state label did not still
+    # reaches the held state, on a later pass, without a second comment or a second ping.
+    state = _held_build_issue()
+    notifications = []
+    _build_hold_seams(monkeypatch, state, notifications=notifications, label_failures=[1])
+    record = _held_build_record()
+
+    assert coordinated_build._hold_build(record) is None   # the label write was interrupted
+    assert coordinated_build._hold_build(record) == state["url"]
+    assert {label["name"] for label in state["labels"]} == {"agentflow:needs-grilling"}
+    assert len(state["comments"]) == 1 and len(notifications) == 1
+
+
 def test_live_collision_handoff_names_the_collision_and_leaves_a_resumable_issue(monkeypatch):
     # A collision handoff routes through the same visible stuck-build handoff, but its comment and
     # notification name the collision — and it leaves the issue in the resume-ready state ADR 0019
     # intake picks up on a maintainer reply (needs-grilling, no building/ready-for-agent claim).
-    from agentflow import github, intake, notify as notify_module
-
-    state = {
-        "title": "Build it",
-        "url": "https://github.com/o/r/issues/7",
-        "labels": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}],
-        "comments": [],
-    }
-
-    def drop_building(repo, number, label):
-        state["labels"] = [entry for entry in state["labels"] if entry["name"] != label]
-        return True
-
-    def fake_apply(repo, number, title, labels, result):
-        state["labels"] = [{"name": "agentflow:needs-grilling"},
-                           {"name": "agentflow:building"}]
-        if not any(comment["body"] == result.body for comment in state["comments"]):
-            state["comments"].append({"body": result.body})
-        return "applied"
-
+    state = _held_build_issue()
     notifications = []
-    monkeypatch.setattr(github, "api", lambda *a, **k: state)
-    monkeypatch.setattr(github, "remove_label", drop_building)
-    monkeypatch.setattr(intake, "apply_intake", fake_apply)
-    monkeypatch.setattr(notify_module, "notify", lambda *args: notifications.append(args))
-    record = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-                    repo="o/r", subject="7", source="/retained/wt", claim=True,
-                    hold_reason="integration collision")
+    _build_hold_seams(monkeypatch, state, notifications=notifications)
+    record = _held_build_record(hold_reason="integration collision")
 
     assert coordinated_build._hold_build(record) == state["url"]
     # Resume-ready for a maintainer reply: needs-grilling only, no build claim, no ready-for-agent.
