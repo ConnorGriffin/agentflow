@@ -8,10 +8,12 @@ AgentFlow is a pre-1.0, clone-only macOS beta.
 - Python 3.11 or newer
 - Git, GitHub CLI, and uv available on `PATH`
 - Locally authenticated Claude Code and/or Codex CLI installations
+- For UI repository enrollment: Node.js 18 or newer, npm, and npx (Node.js 20
+  or newer is recommended)
 - The current `main` branch
 
-The repository tracks the built Svelte console, so Node is required only for
-console development.
+The repository tracks the built Svelte console. Headless repository enrollment
+does not require Node.js, npm, or npx. UI enrollment and console development do.
 
 ## Stability
 
