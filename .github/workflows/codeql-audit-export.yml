@@ -1,0 +1,94 @@
+name: CodeQL audit export
+
+on:
+  push:
+    branches:
+      - agentflow/codex/issue-351-security-scanning-audit-and-resolve-the
+
+permissions:
+  contents: read
+  security-events: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Export alert inventory and referenced analyses
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import base64
+          import gzip
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          API = "https://api.github.com"
+          COMMITS = {
+              "3c98a818d3b08837f1fca015e38f866276d2d3b4",
+              "db470640906a781a0e6e5032aadde715f92301b8",
+          }
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def get_json(url, *, accept=None):
+              request_headers = dict(headers)
+              if accept is not None:
+                  request_headers["Accept"] = accept
+              request = urllib.request.Request(url, headers=request_headers)
+              with urllib.request.urlopen(request) as response:
+                  return json.load(response)
+
+          repository = os.environ["REPOSITORY"]
+          alerts = []
+          page = 1
+          while True:
+              query = urllib.parse.urlencode(
+                  {"per_page": 100, "page": page, "state": "open"}
+              )
+              batch = get_json(
+                  f"{API}/repos/{repository}/code-scanning/alerts?{query}"
+              )
+              alerts.extend(batch)
+              if len(batch) < 100:
+                  break
+              page += 1
+
+          analyses_query = urllib.parse.urlencode(
+              {"per_page": 100, "ref": "refs/heads/main"}
+          )
+          analyses = get_json(
+              f"{API}/repos/{repository}/code-scanning/analyses?{analyses_query}"
+          )
+          selected = []
+          for analysis in analyses:
+              if analysis["commit_sha"] not in COMMITS:
+                  continue
+              sarif = get_json(
+                  analysis["url"], accept="application/sarif+json"
+              )
+              selected.append({"analysis": analysis, "sarif": sarif})
+
+          payload = gzip.compress(
+              json.dumps(
+                  {"alerts": alerts, "analyses": selected},
+                  separators=(",", ":"),
+              ).encode()
+          )
+          encoded = base64.b64encode(payload).decode()
+          chunk_size = 48_000
+          print("AF_CODEQL_AUDIT_BEGIN")
+          for offset in range(0, len(encoded), chunk_size):
+              print(
+                  "AF_CODEQL_AUDIT_CHUNK "
+                  f"{offset // chunk_size:04d} "
+                  f"{encoded[offset:offset + chunk_size]}"
+              )
+          print("AF_CODEQL_AUDIT_END")
+          PY
