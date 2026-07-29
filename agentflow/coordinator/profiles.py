@@ -13,10 +13,10 @@ Read-only stages (Intake, Research) get a read/search allowlist and no edit tool
 bounded code-writing stage: it keeps the full edit/test surface so the independent reviewer can
 ship clear fixes before recording its exact-head verdict. Every other stage also keeps the full
 surface (``allowed_tools is None``). The runner
-pins the MCP set to strict mode and re-supplies the operator's local servers (the code-graph
-tool) to every stage, and adds those local servers to a read-only stage's ``--tools`` allowlist
-so an exploration stage keeps the same code-graph access Build has (#244). Revise inherits the
-original builder's Build ceiling via ``builder_complexity`` (ADR 0041).
+pins the MCP set to strict mode and re-supplies only Codebase Memory to every stage, and adds
+that server to a read-only stage's ``--tools`` allowlist so an exploration stage keeps the same
+code-graph access Build has (#244). Revise inherits the original builder's Build ceiling via
+``builder_complexity`` (ADR 0041).
 """
 
 from __future__ import annotations

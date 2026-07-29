@@ -14,6 +14,7 @@ no schema for the model to call — so no test fabricates one (ADR 0044 pt 5).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from agentflow import runner as runner_mod
 from agentflow.coordinator.launcher import LocalLauncher
@@ -33,13 +34,30 @@ def _flag(cmd: list[str], name: str) -> str:
     return cmd[cmd.index(name) + 1]
 
 
+def test_every_automated_stage_receives_the_canonical_charter(tmp_path):
+    charter = (Path(__file__).parents[1] / "standards" / "CHARTER.md").read_text()
+    stages = ("intake", "build", "review", "respond", "converse",
+              "research", "mockup", "revise")
+
+    for pool, model in (("claude", "opus"), ("codex", "gpt-5.6-sol")):
+        for stage in stages:
+            record = Record(
+                f"{pool}-{stage}", stage, pool, 1,
+                model=model, source=str(tmp_path), input_ptr="do the stage",
+                complexity="deep", effort="high", builder_complexity="deep",
+            )
+            cmd = provider_command(record)
+            prompt = _flag(cmd, "-p") if pool == "claude" else cmd[-1]
+            assert charter in prompt
+
+
 def test_read_only_intake_drops_edits_pins_mcp_and_caps_turns(monkeypatch, tmp_path):
     """Intake is launched with a read/search allowlist (edit tools absent from the
     loaded surface), an MCP set pinned to strict mode, a turn ceiling, and a deny backstop — none
     of which the old uniform full-surface launch carried."""
-    # No operator-local servers → strict mode alone keeps the personal connectors out (#244); the
-    # local code-graph re-supply is exercised in test_runner.py.
-    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers", lambda: {})
+    # No Codebase Memory server → strict mode alone keeps personal connectors out (#244); the
+    # code-graph re-supply is exercised in test_runner.py.
+    monkeypatch.setattr(runner_mod, "_codebase_memory_mcp_servers", lambda: {})
     for stage, expected_tools in (
         ("intake", ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch")),
     ):
@@ -48,7 +66,7 @@ def test_read_only_intake_drops_edits_pins_mcp_and_caps_turns(monkeypatch, tmp_p
         assert tuple(tools) == expected_tools
         assert not (_EDIT_TOOLS & set(tools))  # no edit tools in the loaded surface
 
-        # Strict mode closes the personal-connector leak; with no local servers nothing is re-supplied.
+        # Strict mode closes the personal-connector leak; with no code graph nothing is re-supplied.
         assert "--strict-mcp-config" in cmd
         assert "--mcp-config" not in cmd
 
@@ -62,11 +80,11 @@ def test_read_only_intake_drops_edits_pins_mcp_and_caps_turns(monkeypatch, tmp_p
         assert set(deny) == _EDIT_TOOLS
 
 
-def test_read_only_stages_keep_the_operators_local_code_graph_server(monkeypatch, tmp_path):
-    """A read-only stage reaches the operator's re-supplied local servers (the code-graph tool):
+def test_read_only_stages_keep_codebase_memory(monkeypatch, tmp_path):
+    """A read-only stage reaches the re-supplied Codebase Memory server:
     each supplied server is allowlisted alongside the §3a read/search tools, so an exploration
     stage keeps the same code-graph access Build has (#244) while still losing the edit tools."""
-    monkeypatch.setattr(runner_mod, "_operator_local_mcp_servers",
+    monkeypatch.setattr(runner_mod, "_codebase_memory_mcp_servers",
                         lambda: {"codebase-memory-mcp": {"command": "/x/code-graph"}})
     cmd = provider_command(_record("intake", str(tmp_path)))
 
