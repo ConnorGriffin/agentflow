@@ -9,6 +9,7 @@ human — parks and build bails.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -23,8 +24,16 @@ NTFY_URL = os.environ.get("AGENTFLOW_NTFY_URL", "")
 # minutes: the operator still hears about a stuck hold, repeatedly, without being buried by it.
 _REPEAT_WINDOW_SECONDS = 24 * 3600
 
+# The keys this module records are hex digests (:mod:`agentflow.handoff` derives them with
+# sha256), so the recorded name is bounded to that alphabet rather than trusted to be safe. A key
+# of any other shape simply is not recorded: it costs a repeated ping, and it means no caller can
+# ever steer this at a path of its choosing.
+_SEQUENCE_ID = re.compile(r"^[0-9a-f]{1,64}$")
 
-def _sent_marker(sequence_id: str) -> Path:
+
+def _sent_marker(sequence_id: str) -> Path | None:
+    if not _SEQUENCE_ID.match(sequence_id):
+        return None   # not a key this module minted — never let it name a file
     root = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
     return root / "notifications" / f"{sequence_id}.sent"
 
@@ -32,15 +41,20 @@ def _sent_marker(sequence_id: str) -> Path:
 def _sent_within_window(sequence_id: str, now: float) -> bool:
     """Whether this exact handoff was pinged inside the repeat window. Absent or unreadable state
     reads as *not sent*: an unknown delivery history must never be what silences a handoff."""
+    marker = _sent_marker(sequence_id)
+    if marker is None:
+        return False
     try:
-        return now - float(_sent_marker(sequence_id).read_text().strip()) < _REPEAT_WINDOW_SECONDS
+        return now - float(marker.read_text().strip()) < _REPEAT_WINDOW_SECONDS
     except (OSError, ValueError):
         return False
 
 
 def _record_sent(sequence_id: str, now: float) -> None:
+    marker = _sent_marker(sequence_id)
+    if marker is None:
+        return
     try:
-        marker = _sent_marker(sequence_id)
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(str(now))
     except OSError:

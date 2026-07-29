@@ -102,3 +102,18 @@ def test_distinct_handoffs_are_never_collapsed_into_one_ping(monkeypatch, tmp_pa
     notify_module.notify("agentflow needs you", "#2 held", sequence_id="aaa")
     notify_module.notify("agentflow needs you", "#3 held", sequence_id="bbb")
     assert len(calls) == 2
+
+
+def test_a_key_this_module_did_not_mint_never_names_a_file(monkeypatch, tmp_path):
+    """The recorded name is bounded to the hex alphabet the handoff keys use, so no caller can
+    steer it at a path of its choosing. An unrecognized key costs a repeat ping, never a write."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setattr(notify_module, "NTFY_URL", "https://ntfy/x")
+    calls = []
+    monkeypatch.setattr(notify_module.subprocess, "run", _delivering(calls))
+
+    assert notify_module._sent_marker("../../../etc/passwd") is None
+    for _ in range(3):
+        assert notify_module.notify("t", "m", sequence_id="../../etc/passwd")
+    assert len(calls) == 3                      # never recorded, so never suppressed
+    assert list(tmp_path.rglob("*passwd*")) == []
