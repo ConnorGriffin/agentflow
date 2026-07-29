@@ -342,6 +342,9 @@ class Coordinator:
         the launcher. Newly started attempts run beyond this cycle and surface as outcomes in
         a later cycle's reconciliation."""
         with self._lock:
+            begin_cycle = getattr(self._gate, "begin_cycle", None)
+            if begin_cycle is not None:
+                begin_cycle(pool)
             outcomes = self._reconcile()
             self._discard_disabled_cold_stages()
             waiting = [r for r in self._records.values()

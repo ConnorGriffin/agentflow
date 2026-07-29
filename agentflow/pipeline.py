@@ -27,7 +27,7 @@ from pathlib import Path
 from agentflow import (coordinated_build, coordinated_converse, coordinated_intake,
                        coordinated_mockup, coordinated_research, coordinated_respond,
                        coordinated_review, coordinated_revise, github)
-from agentflow.balancer import BUILD_POOLS, pick_reviewer
+from agentflow.balancer import BUILD_POOLS, PoolStatus, pick_reviewer
 from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coordinator,
                                    IntakeStageAdapter, MockupStageAdapter, ResearchStageAdapter,
                                    RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
@@ -193,10 +193,20 @@ class _ProductionGate:
         from collections import Counter
         self._paced = Counter()
         self._active: dict[str, bool] = {}
+        # Capacity facts are one observation per pool per coordinator cycle. The gate is evaluated
+        # once for every waiting record; re-running the external helper for each one can serialize
+        # its 30-second timeout across the whole queue and hold the daemon pass for minutes.
+        self._status: dict[str, PoolStatus] = {}
         # How many permits are already running on a pool, from the durable ledger. Injected so the
         # in-flight Claude reservation is exercised without a live store; production reads the same
         # running rows the reservation itself charges.
         self._running_permits = running_permits or _durable_running_permits
+
+    def begin_cycle(self, pool: str) -> None:
+        """Start one pool admission observation, refreshing facts from the prior cycle."""
+        self._status.pop(pool, None)
+        self._active.pop(pool, None)
+        self._paced.pop(pool, None)
 
     def __call__(self, record) -> bool:
         from agentflow import balancer
@@ -216,9 +226,18 @@ class _ProductionGate:
             # session count, so a heavier session reserves proportionally more — see
             # balancer.CLAUDE_INFLIGHT_RESERVE_PCT for the intent and calibration. Codex reports live
             # per-window facts, so it needs no such reservation.
-            reserved_pct = (self._running_permits(record.pool) * balancer.CLAUDE_INFLIGHT_RESERVE_PCT
-                            if record.pool == "claude" else 0.0)
-            status = balancer._query_pool(record.pool, reserved_pct=reserved_pct)
+            status = self._status.get(record.pool)
+            if status is None:
+                status = balancer._query_pool(record.pool)
+                self._status[record.pool] = status
+            if record.pool == "claude" and status.clear:
+                reserved_pct = (
+                    self._running_permits(record.pool) * balancer.CLAUDE_INFLIGHT_RESERVE_PCT)
+                if status.spent_pct + max(0.0, reserved_pct) >= status.ceiling:
+                    status = replace(
+                        status, clear=False,
+                        reason=(f"five-hour utilization at {status.spent_pct:.0f}% "
+                                f"(ceiling {status.ceiling:.0f}%)"))
             # Launch must honor the same unattended weekly pacing that `pick_pair` applies at
             # submission: raw `_query_pool` only checks the short/five-hour ceiling, so a stage
             # queued while weekly headroom existed would otherwise launch after that weekly budget
