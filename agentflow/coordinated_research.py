@@ -134,6 +134,22 @@ _NON_OBSERVABLE_CONDITION = re.compile(
     r"ask\s+the\s+team)\b",
     re.IGNORECASE,
 )
+_GENERIC_DISPOSITION_WORDS = frozenset({
+    "a", "an", "analysis", "answer", "any", "are", "because", "be", "been", "being",
+    "broad", "build", "builds", "change", "changes", "code", "current", "currently",
+    "decision", "defer", "deferred", "deferral", "direction", "disposition", "do", "does",
+    "finding", "findings", "for", "general", "handoff", "handoffs", "implementation",
+    "implementations", "implement", "is", "issue", "it", "justified", "later", "made",
+    "must", "necessary", "need", "needed", "needs", "no", "not", "nothing", "now", "one",
+    "operator", "outcome", "overall", "project", "reason", "required", "require", "requires",
+    "research", "result", "should", "since", "so", "some", "that", "the", "thing", "this",
+    "ticket", "to", "until", "warranted", "was", "work", "yet",
+})
+_GENERIC_CONDITION_WORDS = _GENERIC_DISPOSITION_WORDS | frozenset({
+    "check", "condition", "confirm", "confirmed", "concrete", "event", "future", "happen",
+    "happened", "happens", "meaningful", "named", "observable", "observe", "observed",
+    "occur", "occurred", "occurs", "then", "trigger", "verification", "verify", "when",
+})
 
 
 def _specific_text(value) -> str | None:
@@ -149,7 +165,24 @@ def _observable_condition(value) -> str | None:
     text = _specific_text(value)
     if text is None or _NON_OBSERVABLE_CONDITION.search(text):
         return None
-    return text
+    words = set(re.findall(r"[a-z0-9]+", text.casefold()))
+    return text if len(words - _GENERIC_CONDITION_WORDS) >= 3 else None
+
+
+def _specific_summary(value) -> str | None:
+    text = _specific_text(value)
+    if text is None:
+        return None
+    words = set(re.findall(r"[a-z0-9]+", text.casefold()))
+    return text if len(words - _GENERIC_DISPOSITION_WORDS) >= 4 else None
+
+
+def _specific_candidate(value) -> str | None:
+    text = _specific_text(value)
+    if text is None:
+        return None
+    words = set(re.findall(r"[a-z0-9]+", text.casefold()))
+    return text if len(words - _GENERIC_DISPOSITION_WORDS) >= 2 else None
 
 
 def parse_disposition(findings: str) -> ResearchDisposition | None:
@@ -160,14 +193,23 @@ def parse_disposition(findings: str) -> ResearchDisposition | None:
     fenced = _DISPOSITION_JSON.fullmatch(findings[headings[0].end():].strip())
     if fenced is None:
         return None
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate disposition field")
+            result[key] = value
+        return result
+
     try:
-        payload = json.loads(fenced.group("body"))
-    except (json.JSONDecodeError, TypeError):
+        payload = json.loads(fenced.group("body"), object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, TypeError, ValueError):
         return None
     if not isinstance(payload, dict):
         return None
     kind = payload.get("disposition")
-    summary = _specific_text(payload.get("summary"))
+    summary = _specific_summary(payload.get("summary"))
     if summary is None:
         return None
     if kind == "no_build":
@@ -194,8 +236,8 @@ def parse_disposition(findings: str) -> ResearchDisposition | None:
     for candidate in raw_candidates:
         if not isinstance(candidate, dict) or set(candidate) != {"title", "build"}:
             return None
-        title = _specific_text(candidate.get("title"))
-        build = _specific_text(candidate.get("build"))
+        title = _specific_candidate(candidate.get("title"))
+        build = _specific_candidate(candidate.get("build"))
         if title is None or build is None:
             return None
         candidates.append((title, build))
@@ -259,6 +301,10 @@ def _research_worktree_ready(record) -> bool:
 _DECISIONS_HEADING = re.compile(r"^#{1,6}\s+Decisions so far\s*$", re.IGNORECASE)
 _AWAITING_HEADING = re.compile(r"^#{1,6}\s+Awaiting disposition\s*$", re.IGNORECASE)
 _ANY_HEADING = re.compile(r"^#{1,6}\s+")
+_AWAITING_ENTRY = re.compile(
+    r"^\s*-\s+.*awaiting operator disposition \(#(?P<number>\d+)\)\.?\s*$",
+    re.IGNORECASE,
+)
 
 
 def decision_line(title: str, number: int, disposition: ResearchDisposition) -> str:
@@ -331,16 +377,32 @@ def awaiting_disposition_line(title: str, number: int) -> str:
     return f"- **{clean}** — awaiting operator disposition (#{number})."
 
 
-def awaiting_disposition_present(map_body: str, number: int) -> bool:
+def _is_awaiting_entry(line: str, number: int) -> bool:
+    match = _AWAITING_ENTRY.fullmatch(line)
+    return match is not None and int(match.group("number")) == number
+
+
+def awaiting_disposition_present(map_body: str, number: int, expected: str) -> bool:
+    """Whether the map carries exactly this ticket's one expected pending entry — a stale or
+    duplicate pending line for the same ticket means *not* present, so the finalizer reconciles
+    it rather than leaving the map with two answers for one child."""
     section = _awaiting_section(map_body)
     if section is None:
         return False
-    return any(re.search(rf"awaiting operator disposition \(#{number}\)\.", line)
-               for line in section[2])
+    return [line for line in section[2] if _is_awaiting_entry(line, number)] == [expected]
 
 
-def with_awaiting_disposition(map_body: str, line: str) -> str:
-    """Append one pending research entry outside the settled decisions ledger. Pure."""
+def with_awaiting_disposition(map_body: str, line: str, number: int) -> str:
+    """Create or replace one pending entry outside the settled decisions ledger. Pure."""
+    section = _awaiting_section(map_body)
+    if section is not None:
+        idx, end, _ = section
+        lines = map_body.splitlines()
+        lines = [
+            existing for offset, existing in enumerate(lines)
+            if not (idx < offset < end and _is_awaiting_entry(existing, number))
+        ]
+        map_body = "\n".join(lines)
     return _with_map_entry(
         map_body, "Awaiting disposition", _awaiting_section(map_body), line)
 
@@ -405,14 +467,14 @@ def _append_map_awaiting(repo: str, number: int, title: str) -> bool:
     if found is None:
         return False
     map_number, map_body = found
-    if awaiting_disposition_present(map_body, number):
+    line = awaiting_disposition_line(title, number)
+    if awaiting_disposition_present(map_body, number, line):
         return True
-    new_body = with_awaiting_disposition(
-        map_body, awaiting_disposition_line(title, number))
+    new_body = with_awaiting_disposition(map_body, line, number)
     if not github.edit_body(repo, map_number, new_body):
         return False
     reread = _parent_map(repo, number)
-    return reread is not None and awaiting_disposition_present(reread[1], number)
+    return reread is not None and awaiting_disposition_present(reread[1], number, line)
 
 
 def _cleanup_worktree(record) -> None:
@@ -489,7 +551,11 @@ def resolve(record) -> str | None:
             return None
         has_comment = _findings_comment_present(final.comments, marker, findings)
         found = _parent_map(repo, number)
-        has_pending = found is not None and awaiting_disposition_present(found[1], number)
+        pending_line = awaiting_disposition_line(final.title, number)
+        has_pending = (
+            found is not None
+            and awaiting_disposition_present(found[1], number, pending_line)
+        )
         if (final.state != "OPEN" or not has_comment or not has_pending
                 or AWAITING_DISPOSITION not in final.labels or RESOLVING in final.labels):
             return None
