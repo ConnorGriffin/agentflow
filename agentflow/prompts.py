@@ -38,6 +38,12 @@ commit your work. Cover the new behavior with a test that **exercises it through
 public interface** — and, where it fits, one that **failed first for the right reason**
 (the charter test standard) — then make the suite green.
 
+Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
+`git commit -s` for new commits and `git commit --amend -s` for amendments. Each
+`Signed-off-by` email must match the Git commit author email. On a continuation, inspect
+the existing work and history first; repair an unsigned existing commit with an amendment
+where appropriate, never a separate sign-off-only or duplicate-work commit.
+
 Before opening the PR, `git fetch origin` and rebase once onto `origin/main`, then
 rerun the tests. If the rebase conflicts (or tests fail post-rebase for a reason not
 your own), stop and post a comment prefixed `INTEGRATION-COLLISION:` instead of
@@ -76,6 +82,12 @@ of guessing.""" + SHELL_CRIB
 REVISE_PROMPT = """Address the blocking review findings on PR #{n} in this worktree,
 push to the same branch, and keep the test suite green. Do NOT open a new PR.
 
+Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
+`git commit -s` for new commits and `git commit --amend -s` for amendments. Each
+`Signed-off-by` email must match the Git commit author email. On a continuation, inspect
+the existing work and history first; repair an unsigned existing commit with an amendment
+where appropriate, never a separate sign-off-only or duplicate-work commit.
+
 Make the implementation judgment yourself when the issue brief, current `main`, surrounding code,
 and tests establish a safe answer. A merge conflict is not by itself missing context: reconcile
 both intended behaviors wherever they are compatible; neither side wins merely because it is newer.
@@ -113,6 +125,12 @@ answer what they actually asked, nothing more.
 
 The PR head when this Respond began was {baseline}.
 <!-- agentflow-respond-baseline:{baseline} -->
+
+Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
+`git commit -s` for new commits and `git commit --amend -s` for amendments. Each
+`Signed-off-by` email must match the Git commit author email. On a continuation, inspect
+the existing work and history first; repair an unsigned existing commit with an amendment
+where appropriate, never a separate sign-off-only or duplicate-work commit.
 
 Before doing anything, inspect both the conversation and the branch. This prompt may be a
 continuation after a partial outcome:
@@ -197,6 +215,12 @@ copy the winner's contract word-for-word into the build brief.
 You are on branch `{branch}` in this worktree. PRESERVE the work so it is not lost with the
 worktree: commit every variant's HTML (and any forked render/screenshot files) AND the
 screenshots to this branch, then `git push -u origin {branch}`.
+
+Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
+`git commit -s` for new commits and `git commit --amend -s` for amendments. Each
+`Signed-off-by` email must match the Git commit author email. On a continuation, inspect
+the existing work and history first; repair an unsigned existing commit with an amendment
+where appropriate, never a separate sign-off-only or duplicate-work commit.
 
 This may be a continuation after an interrupted session. Before changing anything, inspect the
 branch, worktree, and issue comments. Reuse committed or local variants and finish only missing

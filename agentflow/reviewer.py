@@ -290,6 +290,11 @@ PR. A rejected push means the branch moved concurrently: do not overwrite it; le
 `fix_before_completion` finding. If your fix changes user-facing output, refresh the required
 before/after evidence, commit it, and update
 the PR body just as the original builder would. """ + SCREENSHOT_HARNESS + """
+Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
+`git commit -s` for new commits and `git commit --amend -s` for amendments. Each
+`Signed-off-by` email must match the Git commit author email. On a continuation, inspect
+the existing work and history first; repair an unsigned existing commit with an amendment
+where appropriate, never a separate sign-off-only or duplicate-work commit.
 After a successful push, re-read the PR head and
 review the complete final diff again.
 
