@@ -99,7 +99,17 @@ def create_app(
                 {"status": "unavailable",
                  "error": "the daemon is not running; no command was applied"},
                 status_code=503)
-        enqueue(command)
+        try:
+            enqueue(command)
+        except channel.InvalidCommandKey:
+            return JSONResponse(
+                {"status": "rejected", "error": "invalid command key"},
+                status_code=400)
+        except channel.CommandChannelUnavailable:
+            return JSONResponse(
+                {"status": "unavailable",
+                 "error": "the command channel is unavailable; no command was applied"},
+                status_code=503)
         return JSONResponse({"status": "queued", "key": command["key"]}, status_code=202)
 
     # The console SPA is a static build; mount it last so /api/* wins. Serving is a
