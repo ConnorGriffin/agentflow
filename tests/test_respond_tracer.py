@@ -438,6 +438,33 @@ def test_reply_ready_rejects_a_generic_reply_that_is_not_bound_to_its_target(
     assert coordinated_respond._reply_ready(rec, None) is False
 
 
+def test_reply_ready_repairs_one_change_marked_reply_missing_its_hidden_target(
+        monkeypatch, tmp_path):
+    """The daemon owns the invisible target binding when the responder drops it."""
+    from agentflow.gate import respond_change_marker
+
+    rec = _reply_read(
+        monkeypatch, tmp_path, change="new-head", head="new-head", baseline="old-head")
+    comments = [
+        {"body": "please sign the commit", "id": "cid"},
+        {"body": (
+            "> *agentflow: reply from the build agent.*\n\nFixed.\n\n"
+            + respond_change_marker("new-head")), "id": "reply-id"},
+    ]
+    monkeypatch.setattr(
+        "agentflow.github.pr_comment_rows", lambda repo, pr: list(comments))
+
+    def edit_comment(comment_id, body):
+        assert comment_id == "reply-id"
+        comments[1]["body"] = body
+        return True
+
+    monkeypatch.setattr("agentflow.github.edit_comment", edit_comment)
+
+    assert coordinated_respond._reply_ready(rec, None) is True
+    assert "<!-- agentflow-respond-target:cid -->" in comments[1]["body"]
+
+
 def _reply_read(monkeypatch, tmp_path, *, ahead="0", status="", status_rc=0,
                 change="none", head="h", baseline="h"):
     """Wire ``_reply_ready`` against a real retained worktree that exists on disk (so the pushed-

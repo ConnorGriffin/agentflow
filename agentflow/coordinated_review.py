@@ -447,7 +447,13 @@ def _verdict_ready(record, obs) -> bool:
     if record.review_axis == "fix" and not verdict.pushed_sha:
         from agentflow.review_policy import ReviewAction, ReviewState
         review = ReviewState.from_record(record)
-        if review is None or any(item.action is ReviewAction.FIX for item in review.findings):
+        # A PR-body fix changes the merge-facing GitHub artifact, not the Git head. Requiring
+        # push provenance for that one named surface rejects a valid exact-head re-verification
+        # and burns the continuation budget after the reviewer has already corrected the body.
+        if review is None or any(
+                item.action is ReviewAction.FIX
+                and item.file.strip().casefold() != "pr body"
+                for item in review.findings):
             return False
     if not _review_follow_ups_valid(record, verdict):
         return False

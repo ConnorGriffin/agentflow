@@ -148,10 +148,11 @@ Agentflow posts exactly one final clean review summary or one final park. A clea
 the outcome; depth and reason; shipped fixes; necessary follow-ups; checks and proof; and cross-tool
 or same-tool status.
 
-Every park, regardless of cause, has two sections and begins in domain language:
+Every park has two sections and begins in domain language. The first heading names the real
+boundary rather than inventing product ambiguity:
 
-1. **Maintainer decision needed:** affected application behavior, choices, consequences, and the
-   agents' recommendation.
+1. **Maintainer decision needed** only for unresolved product intent; otherwise **Action needed:**
+   affected application behavior, choices, consequences, and the agents' recommendation.
 2. **Agent handoff:** code locations, conflicting changes, checks, retained work, and the exact next
    action.
 

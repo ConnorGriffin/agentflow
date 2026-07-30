@@ -416,6 +416,31 @@ def test_fix_axis_cannot_dismiss_assigned_fixes_without_a_pushed_head():
         record, SimpleNamespace(final_message=payload)) is False
 
 
+def test_fix_axis_accepts_a_verified_pr_body_fix_without_a_pushed_head():
+    """A PR-body correction changes the merge artifact but cannot produce a new Git head."""
+    from agentflow import coordinated_review, pipeline, pr_park
+    from agentflow.coordinator.record import Record
+
+    assigned = ReviewFinding(
+        ReviewAction.FIX, "Explain what the merger should check",
+        "The charter requires a merge-facing check.", "PR body", 5)
+    record = Record(
+        identity="fix", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
+        target="head", review_depth="full", depth_reason="shared decision",
+        review_axis="fix", change_author_tool="claude",
+        review_findings=encode_findings((assigned,)))
+    payload = json.dumps({
+        "verdict": "PASS", "depth": "full", "depth_reason": "shared decision",
+        "axis": "fix", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["Updated and re-read the merge-facing PR body."],
+        "findings": [], "uncertainty": None, "decision": "",
+    })
+
+    assert coordinated_review._verdict_ready(
+        record, SimpleNamespace(final_message=payload)) is True
+
+
 def test_follow_up_must_exist_in_this_repo_and_be_returned_by_its_duplicate_search():
     from agentflow.review_policy import FollowUp
 
