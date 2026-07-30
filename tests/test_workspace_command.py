@@ -184,3 +184,16 @@ def test_pending_command_from_the_old_filename_format_remains_drainable(state):
     assert not legacy.exists()
     channel.ack("legacy-key")
     assert channel.pending() == []
+
+
+def test_new_retry_wins_over_the_old_filename_format(state):
+    old = _open_cmd(key="legacy-key", prompt="old")
+    new = _open_cmd(key="legacy-key", prompt="new")
+    spool = channel.commands_dir()
+    spool.mkdir(parents=True)
+    legacy = spool / "legacy-key.json"
+    legacy.write_text(json.dumps(old))
+    channel.enqueue(new)
+
+    assert channel.pending() == [new]
+    assert not legacy.exists()

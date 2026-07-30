@@ -106,6 +106,7 @@ def pending() -> list[dict]:
             if file != destination:
                 if destination.exists():
                     file.unlink()
+                    continue
                 else:
                     os.replace(file, destination)
             out.append(command)
