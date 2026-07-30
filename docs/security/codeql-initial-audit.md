@@ -98,6 +98,8 @@ absolute, `..`, and nested path keys and with a workspace symlink that resolves
 outside the state root. The acknowledgement interface is separately exercised
 against a traversal key. A compatibility test proves a safely named command
 left by the previous release is migrated and remains drainable.
+The workspace store's public constructor also proves repository names cannot
+escape the state root and refuses a workspace symlink that resolves outside it.
 
 ## Other findings
 

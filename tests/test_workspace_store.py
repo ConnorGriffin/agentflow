@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import pytest
 
+from agentflow.state import OutsideStateDirectory
 from agentflow.workspace.store import (ACCEPTED, PAUSED, REJECTED, REPLIED, WORKING,
                                        WorkspaceStore)
 
@@ -28,6 +29,31 @@ def _open(store, key="k-open", cid="conv-1"):
                                   idempotency_key=key, now=100)
     assert out.accepted and out.conversation_id == cid and out.revision == 0
     return cid
+
+
+@pytest.mark.parametrize("repo", ["/absolute", "../escaped"])
+def test_default_store_keeps_repository_names_inside_state(tmp_path, monkeypatch, repo):
+    state = tmp_path / "state"
+    monkeypatch.setenv("AGENTFLOW_STATE", str(state))
+
+    store = WorkspaceStore(repo)
+    try:
+        assert store.path.parent == state / "workspace"
+    finally:
+        store.close()
+
+
+def test_default_store_refuses_a_workspace_symlink_outside_state(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    outside = tmp_path / "outside"
+    state.mkdir()
+    outside.mkdir()
+    (state / "workspace").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("AGENTFLOW_STATE", str(state))
+
+    with pytest.raises(OutsideStateDirectory):
+        WorkspaceStore("ConnorGriffin/agentflow")
+    assert list(outside.iterdir()) == []
 
 
 # --- opening + the first turn ----------------------------------------------------------
