@@ -128,7 +128,10 @@ def park_context(record, verdict, *, reason: str, missing: str, uncertainty=None
         retained_work=f"`{record.source}` at `{record.target or 'unknown head'}`",
         next_action=(
             wording.next_action
-            or "Record the chosen behavior, then resume this exact retained stage on the same PR."))
+            or "Record the chosen behavior, then resume this exact retained stage on the same PR."),
+        decision_needed=(
+            uncertainty is not None
+            or any(item.action.value == "ask_maintainer" for item in actions)))
 
 
 def park_proof_marker(record, reason: str) -> str:

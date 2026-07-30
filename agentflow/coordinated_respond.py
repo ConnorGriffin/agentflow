@@ -98,7 +98,8 @@ def _reply_ready(record, obs) -> bool:
 
     A record without that exact targeted reply stays incomplete. Live orchestration; exercised
     through the Coordinator/Respond adapter seam in ``tests/test_respond_tracer.py``."""
-    from agentflow.gate import respond_reply_change, respond_reply_posted
+    from agentflow.gate import (
+        respond_reply_change, respond_reply_posted, respond_reply_target_repair)
     parsed = source_facts(record)
     if parsed is None:
         return False
@@ -107,8 +108,16 @@ def _reply_ready(record, obs) -> bool:
     if pr is None:
         return False
     comments = github.pr_comment_rows(record.repo, pr.number)
-    if comments is None or not respond_reply_posted(comments, record.target or ""):
-        return False   # no durable reply bound to this record's maintainer-comment target
+    target = record.target or ""
+    if comments is None:
+        return False
+    if not respond_reply_posted(comments, target):
+        repair = respond_reply_target_repair(comments, target)
+        if repair is None or not github.edit_comment(*repair):
+            return False
+        comments = github.pr_comment_rows(record.repo, pr.number)
+        if comments is None or not respond_reply_posted(comments, target):
+            return False
     change = respond_reply_change(comments, record.target or "")
     baseline_match = re.search(r"agentflow-respond-baseline:([^\s>]+)", record.input_ptr or "")
     baseline = baseline_match.group(1) if baseline_match is not None else ""
@@ -185,7 +194,7 @@ def _park_respond(record) -> str | None:
     proof = f"<!-- agentflow-respond-park-target:{record.target} -->"
     body = ("> *agentflow: parked for human review (Respond).*\n"
             f"{proof}\n\n"
-            "## Maintainer decision needed\n\n"
+            "## Action needed\n\n"
             f"Affected behavior: the requested application change in maintainer comment "
             f"`{record.target}` was not fully answered and proved.\n\n"
             "Options:\n"

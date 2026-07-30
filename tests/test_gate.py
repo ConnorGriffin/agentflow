@@ -391,6 +391,8 @@ def test_no_verdict_park_says_no_review_was_completed(monkeypatch):
     body = _park_body(monkeypatch, None)
     assert "(no blocking findings)" not in body
     assert "No review was completed" in body
+    assert "## Action needed" in body
+    assert "## Maintainer decision needed" not in body
 
 
 def test_no_verdict_park_has_no_findings_list(monkeypatch):
@@ -416,6 +418,18 @@ def test_findings_verdict_park_renders_findings(monkeypatch):
     assert "**fix_before_completion**" in body
     assert "**blocking**" not in body
     assert "No review was completed" not in body
+
+
+def test_real_product_uncertainty_keeps_the_maintainer_decision_heading(monkeypatch):
+    verdict = Verdict(
+        clean=False,
+        actions=(ReviewFinding(
+            ReviewAction.ASK, "Choose the launch behavior", "Product intent is unresolved.",
+            "agentflow/launch.py", 10),))
+
+    body = _park_body(monkeypatch, verdict)
+
+    assert "## Maintainer decision needed" in body
 
 
 def test_reviewed_park_reports_fixes_shipped_and_follow_ups_filed(monkeypatch):

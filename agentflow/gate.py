@@ -137,6 +137,38 @@ def respond_reply_posted(comments: list[dict], target: str) -> bool:
     )
 
 
+def respond_reply_target_repair(
+        comments: list[dict], target: str) -> tuple[str, str] | None:
+    """Bind one unambiguous change-marked Respond reply to its preceding target.
+
+    The target marker is daemon-owned proof, not prose the model should have to reproduce. Repair
+    only the exact live failure shape: one later visible Respond reply, one change marker, no
+    existing target binding, and a comment id that can be edited. Anything ambiguous stays
+    incomplete.
+    """
+    target_index = next(
+        (index for index, comment in enumerate(comments)
+         if str(comment.get("id", "")) == str(target)),
+        None,
+    )
+    if target_index is None:
+        return None
+    visible = respond_reply_disclaimer(target).splitlines()[0]
+    candidates: list[tuple[str, str]] = []
+    for comment in comments[target_index + 1:]:
+        body = comment.get("body", "")
+        raw_id = comment.get("id")
+        comment_id = raw_id.strip() if isinstance(raw_id, str) else ""
+        if (not comment_id or not body.startswith(visible) or _RESPOND_TARGET_RE.search(body)
+                or len(_RESPOND_CHANGE_RE.findall(body)) != 1):
+            continue
+        candidates.append((
+            comment_id,
+            body.replace(visible, respond_reply_disclaimer(target), 1),
+        ))
+    return candidates[0] if len(candidates) == 1 else None
+
+
 def respond_reply_change(comments: list[dict], target: str) -> str:
     """The unique targeted reply's declared branch outcome, or empty when unproved.
 
@@ -355,6 +387,7 @@ class ParkContext:
     checks: tuple[str, ...]
     retained_work: str
     next_action: str
+    decision_needed: bool = False
 
 
 def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict) -> bool:
@@ -420,7 +453,11 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
                        else "The grounded review actions listed below remain unresolved."),
             checks=tuple(verdict.checks if verdict else ()) or ("No completed checks were recorded.",),
             retained_work="The PR branch and retained stage worktree remain available.",
-            next_action="Choose an option above and resume the retained stage on the same PR.")
+            next_action="Choose an option above and resume the retained stage on the same PR.",
+            decision_needed=bool(
+                verdict and (
+                    verdict.uncertainty is not None
+                    or any(item.action.value == "ask_maintainer" for item in verdict.actions))))
     option_lines = "\n".join(f"- {item}" for item in context.options)
     decision = (
         f"Affected behavior: {context.behavior}\n\n"
@@ -465,8 +502,9 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
                       else "same-tool review; maintainer merge required")
             handoff += f"\n\nReview status: {status}."
     marker_line = f"\n<!-- {proof_marker} -->" if proof_marker else ""
+    heading = ("Maintainer decision needed" if context.decision_needed else "Action needed")
     body = (f"{PARK_MARK}{marker_line}\n\n"
-            "## Maintainer decision needed\n\n"
+            f"## {heading}\n\n"
             f"{decision}\n\n"
             "## Agent handoff\n\n"
             f"{handoff}")
