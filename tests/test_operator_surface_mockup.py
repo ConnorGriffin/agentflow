@@ -14,3 +14,4 @@ def test_operator_surface_spec_binds_only_to_its_capture_and_declares_the_locked
     assert "inline fallback" not in source
     assert "Attention" in source and "Decision Maps" in source and "Fleet health" in source
     assert "<details>" in source and "Open in GitHub" in source
+    assert "freshness.state !== 'stale' && freshness.state !== 'incomplete'" in source
