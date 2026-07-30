@@ -591,7 +591,7 @@ def test_pending_replay_converges_after_each_durable_write(boundary, tmp_path, m
 def test_pending_resolution_replaces_a_stale_untitled_map_entry(tmp_path, monkeypatch):
     gh = FakeGitHub(map_body=(
         "# Map\n\n## Awaiting disposition\n\n"
-        "- awaiting operator disposition (#5).\n"
+        "- awaiting operator disposition (#5)\n"
         "- **Audit the widget path** — awaiting operator disposition (#5).\n"
     ))
     gh.install(monkeypatch)

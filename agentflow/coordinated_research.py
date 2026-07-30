@@ -302,7 +302,7 @@ _DECISIONS_HEADING = re.compile(r"^#{1,6}\s+Decisions so far\s*$", re.IGNORECASE
 _AWAITING_HEADING = re.compile(r"^#{1,6}\s+Awaiting disposition\s*$", re.IGNORECASE)
 _ANY_HEADING = re.compile(r"^#{1,6}\s+")
 _AWAITING_ENTRY = re.compile(
-    r"^\s*-\s+.*awaiting operator disposition \(#(?P<number>\d+)\)\.\s*$",
+    r"^\s*-\s+.*awaiting operator disposition \(#(?P<number>\d+)\)\.?\s*$",
     re.IGNORECASE,
 )
 
