@@ -9,7 +9,7 @@ is the daemon-side glue, mirroring :mod:`agentflow.coordinated_converse`:
   ``(repository, ticket number, research)``, so re-discovery of the same ticket is idempotent.
 - **stage collaborators** — the disposition-aware findings ``verify``, isolated-worktree ``prepare``,
   single-writer ``resolve`` (close an explicit decision or park a handoff for operator judgment),
-  and exhaustion ``release`` (drop the claim so an incomplete ticket is eligible again).
+  and exhaustion ``park`` (name why no usable ruling could be recorded and hand the ticket back).
   These are the production wiring the daemon injects into :class:`ResearchStageAdapter`.
 
 The dispatched session writes only into its isolated worktree — a findings artifact. It never writes
@@ -28,7 +28,8 @@ from pathlib import Path
 
 from agentflow import github
 from agentflow.coordinator import Submission
-from agentflow.labels import AWAITING_DISPOSITION, RESOLVING, release as release_claim
+from agentflow.labels import (AWAITING_DISPOSITION, RESEARCH_PARKED, RESOLVING,
+                              release as release_claim)
 from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
@@ -36,10 +37,17 @@ from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 # The findings comment marker (per-ticket, stable across attempts and restarts) and the visible
 # disclaimer that fronts it, so a replay recognizes its own prior comment and never posts a second.
 _RESEARCH_DISCLAIMER = "> *agentflow research — completed by an unattended session (AI).*"
+# The park's own disclaimer and marker. A park is a different statement than a finding — the run
+# produced no ruling — so it dedups on its own marker and never collides with a findings comment.
+_PARK_DISCLAIMER = "> *agentflow research — parked by an unattended session (AI).*"
 
 
 def _findings_marker(number: int) -> str:
     return f"<!-- agentflow-research-findings:#{number} -->"
+
+
+def _park_marker(number: int) -> str:
+    return f"<!-- agentflow-research-park:#{number} -->"
 
 
 # The prompt an unattended research run executes. The run's isolated worktree is its only durable
@@ -185,14 +193,29 @@ def _specific_candidate(value) -> str | None:
     return text if len(words - _GENERIC_DISPOSITION_WORDS) >= 2 else None
 
 
-def parse_disposition(findings: str) -> ResearchDisposition | None:
-    """Parse the artifact's single final structured disposition, failing closed on any drift."""
+def _key_set_reason(kind: str, payload: dict, expected: set[str]) -> str:
+    want = ", ".join(f"`{k}`" for k in sorted(expected))
+    got = ", ".join(f"`{k}`" for k in sorted(payload)) or "no keys at all"
+    return f"a `{kind}` ruling must carry exactly {want}, and this one carried {got}"
+
+
+def _checked_disposition(findings: str) -> ResearchDisposition | str:
+    """The artifact's single final structured disposition, or — when it has none — the one
+    plain-language reason it was rejected.
+
+    Every rejection in the contract names itself right here, at the check that fails, so the park
+    comment an operator reads and the parser the daemon trusts can never disagree about why an
+    artifact was refused. The checks and their order are the contract; adding a reason to each
+    admits nothing new and refuses nothing extra."""
     headings = list(_DISPOSITION_HEADING.finditer(findings or ""))
     if len(headings) != 1:
-        return None
+        return ("the findings carried no `## Disposition` section" if not headings else
+                f"the findings carried {len(headings)} `## Disposition` sections, "
+                "and exactly one is required")
     fenced = _DISPOSITION_JSON.fullmatch(findings[headings[0].end():].strip())
     if fenced is None:
-        return None
+        return ("the `## Disposition` section was not exactly one fenced `json` block "
+                "and nothing else")
 
     def unique_object(pairs):
         result = {}
@@ -204,44 +227,75 @@ def parse_disposition(findings: str) -> ResearchDisposition | None:
 
     try:
         payload = json.loads(fenced.group("body"), object_pairs_hook=unique_object)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return None
+    except (json.JSONDecodeError, TypeError):
+        return "the fenced disposition block was not valid JSON"
+    except ValueError:
+        # unique_object's own refusal — a repeated field, which JSON itself would silently
+        # collapse to the last one written.
+        return "the fenced disposition block named the same field more than once"
     if not isinstance(payload, dict):
-        return None
+        return "the fenced disposition block was not a JSON object"
     kind = payload.get("disposition")
     summary = _specific_summary(payload.get("summary"))
     if summary is None:
-        return None
+        return ("the ruling's summary was missing, shorter than 12 characters, or said too "
+                "little of its own — it must carry at least four words specific to this ticket")
     if kind == "no_build":
         if set(payload) != {"disposition", "summary"}:
-            return None
+            return _key_set_reason(kind, payload, {"disposition", "summary"})
         return ResearchDisposition(kind=kind, summary=summary)
     if kind == "deferred":
-        if set(payload) != {"disposition", "summary", "trigger", "verification"}:
-            return None
+        expected = {"disposition", "summary", "trigger", "verification"}
+        if set(payload) != expected:
+            return _key_set_reason(kind, payload, expected)
         trigger = _observable_condition(payload.get("trigger"))
         verification = _observable_condition(payload.get("verification"))
-        if trigger is None or verification is None or trigger.casefold() == verification.casefold():
-            return None
+        if trigger is None:
+            return "the deferred ruling's trigger did not name an observable event"
+        if verification is None:
+            return "the deferred ruling's verification did not name an observable condition"
+        if trigger.casefold() == verification.casefold():
+            return ("the deferred ruling's trigger and verification were the same condition, so "
+                    "nothing distinct would prove the trigger had occurred")
         return ResearchDisposition(kind=kind, summary=summary, trigger=trigger,
                                    verification=verification)
-    if kind != "handoff_required" or set(payload) != {
-        "disposition", "summary", "candidates",
-    }:
-        return None
+    if kind != "handoff_required":
+        named = f"`{kind}`" if isinstance(kind, str) and kind else "nothing recognizable"
+        return (f"the ruling named {named} — it must be one of `no_build`, `deferred`, or "
+                "`handoff_required`")
+    expected = {"disposition", "summary", "candidates"}
+    if set(payload) != expected:
+        return _key_set_reason(kind, payload, expected)
     raw_candidates = payload.get("candidates")
     if not isinstance(raw_candidates, list) or not raw_candidates:
-        return None
+        return "the handoff ruling listed no candidate builds"
     candidates = []
     for candidate in raw_candidates:
         if not isinstance(candidate, dict) or set(candidate) != {"title", "build"}:
-            return None
+            return "a handoff candidate was not an object carrying exactly `title` and `build`"
         title = _specific_candidate(candidate.get("title"))
         build = _specific_candidate(candidate.get("build"))
         if title is None or build is None:
-            return None
+            return ("a handoff candidate's title or build description was missing, shorter than "
+                    "12 characters, or too generic to act on")
         candidates.append((title, build))
     return ResearchDisposition(kind=kind, summary=summary, candidates=tuple(candidates))
+
+
+def parse_disposition(findings: str) -> ResearchDisposition | None:
+    """Parse the artifact's single final structured disposition, failing closed on any drift."""
+    checked = _checked_disposition(findings)
+    return checked if isinstance(checked, ResearchDisposition) else None
+
+
+def rejection_reason(findings: str | None) -> str | None:
+    """Why this artifact carries no ruling the daemon can act on, in one plain sentence an operator
+    can act on — or ``None`` when it does carry a usable one. An absent or empty artifact is its own
+    reason: the run recorded nothing."""
+    if not (findings or "").strip():
+        return "the run recorded no findings at all"
+    checked = _checked_disposition(findings)
+    return checked if isinstance(checked, str) else None
 
 
 # --- submission mapping (pure over the ticket + supplied map context) --------------------
@@ -489,21 +543,33 @@ def _findings_comment_present(comments, marker: str, findings: str) -> bool:
     return any(marker in comment.body and findings in comment.body for comment in comments)
 
 
-def _await_disposition(repo: str, number: int) -> bool:
-    """Durably mark completed research as waiting for operator judgment."""
-    if not github.create_label(
-        repo, AWAITING_DISPOSITION, "d4c5f9",
-        "Completed research awaiting operator disposition",
-    ):
+# The two outcome states research leaves on a ticket it does not close, as GitHub shows them to a
+# human looking at the issue. Both take the ticket out of unattended selection; they differ in what
+# they say happened — one ruling is waiting to be chosen from, the other never arrived.
+_STATE_LABELS = {
+    AWAITING_DISPOSITION: ("d4c5f9", "Completed research awaiting operator disposition"),
+    RESEARCH_PARKED: ("b60205", "Unattended research could not rule on this ticket — needs you"),
+}
+
+
+def _mark_state(repo: str, number: int, label: str) -> bool:
+    """Durably stamp one research outcome state and re-read it as proof."""
+    colour, description = _STATE_LABELS[label]
+    if not github.create_label(repo, label, colour, description):
         return False
     labels = github.issue_labels(repo, number)
     if labels is None:
         return False
-    if AWAITING_DISPOSITION not in labels:
-        if not github.add_label(repo, number, AWAITING_DISPOSITION):
+    if label not in labels:
+        if not github.add_label(repo, number, label):
             return False
     proved = github.issue_labels(repo, number)
-    return proved is not None and AWAITING_DISPOSITION in proved
+    return proved is not None and label in proved
+
+
+def _await_disposition(repo: str, number: int) -> bool:
+    """Durably mark completed research as waiting for operator judgment."""
+    return _mark_state(repo, number, AWAITING_DISPOSITION)
 
 
 # --- resolution (the single daemon-side writer, ADR 0037) -------------------------------
@@ -579,18 +645,67 @@ def resolve(record) -> str | None:
     return final.url or f"https://github.com/{repo}/issues/{number}"
 
 
-def release(record) -> str | None:
-    """Release the shared ``wayfinder:resolving`` claim on exhaustion so the ticket is eligible again
-    next cycle (ADR 0037). Idempotent and crash-safe: a repeat re-proves the same release. Returns the
-    ticket URL as durable proof, or ``None`` to retry when the claim could not be proved released.
+def _park_comment(number: int, reason: str, findings: str | None) -> str:
+    """The one comment an exhausted run leaves behind: why the ruling was refused, what the run did
+    manage to record, and who owns the ticket now. It states a machine limit, never a judgment on the
+    question — the daemon may not close, re-file, or re-word anything (ADR 0037)."""
+    recorded = (f"\n\nWhat the run did record, so the work is not lost:\n\n---\n\n{findings}"
+                if findings else "")
+    return (
+        f"{_PARK_DISCLAIMER}\n{_park_marker(number)}\n\n"
+        "An unattended research session spent its whole budget on this ticket without producing a "
+        "ruling the daemon is allowed to record, so the ticket is parked for you.\n\n"
+        f"**Why the ruling was refused:** {reason}.\n\n"
+        "This says nothing about whether the question is a good one — only that the machine could "
+        "not answer it in the shape the decision map requires. Unattended research will not try "
+        "this ticket again. Rewrite the question so a bounded session can answer it, or answer it "
+        f"yourself in a wayfinder session.{recorded}"
+    )
 
-    The run's isolated worktree is intentionally kept on disk — a resumed attempt reuses it to pick up
-    partial findings rather than starting from scratch."""
+
+def park(record) -> str | None:
+    """Hand an exhausted research ticket back to the operator, visibly (ADR 362).
+
+    The run spent its whole recovery budget without recording a ruling the contract accepts. That
+    rejection is total and repeatable — the same artifact fails the same check every time — so no
+    later unattended attempt could do better. This is the research stage's own operator-facing
+    handoff, replacing the silent claim drop it used to do: one comment naming the exact check that
+    failed and carrying whatever the run did record, one durable park label that takes the ticket
+    out of unattended selection, and the shared claim released. The ticket stays open and is never
+    closed, re-filed, or judged.
+
+    Idempotent and crash-safe, exactly as ``resolve`` is: a repeat posts no second comment and
+    re-proves the same park. ``None`` withholds proof until comment, label, and released claim can
+    all be re-read as durable, so an interrupted park replays instead of half-parking."""
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    if not release_claim(record.repo, number, RESOLVING):
+    repo = record.repo
+    findings = read_findings(record)
+    # A parseable ruling belongs to resolve(), which the completed path already ran; reaching the
+    # park with one means the run was held before it could be recorded, which is the honest reason.
+    reason = rejection_reason(findings) or (
+        "the run was held before the daemon could record the ruling it wrote")
+    issue = github.issue_view(repo, number)
+    if issue is None:
         return None
-    return (github.issue_url(record.repo, number)
-            or f"https://github.com/{record.repo}/issues/{number}")
+    marker = _park_marker(number)
+    if not any(marker in comment.body for comment in issue.comments):
+        if not github.comment(repo, number, _park_comment(number, reason, findings)):
+            return None
+    if not _mark_state(repo, number, RESEARCH_PARKED):
+        return None
+    if not release_claim(repo, number, RESOLVING):
+        return None
+    final = github.issue_view(repo, number)
+    if final is None:
+        return None
+    if (final.state != "OPEN"
+            or not any(marker in comment.body for comment in final.comments)
+            or RESEARCH_PARKED not in final.labels
+            or RESOLVING in final.labels):
+        return None
+    # Nothing will ever resume this run, so the worktree it would have reused is just a leak.
+    _cleanup_worktree(record)
+    return final.url or f"https://github.com/{repo}/issues/{number}"

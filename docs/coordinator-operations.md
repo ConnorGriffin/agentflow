@@ -50,6 +50,16 @@ not restore `wayfinder:resolving`, and disposition every candidate through Wayfi
 each selected build is filed and indexed, while each unselected candidate is explicitly
 recorded as no-build or deferred with a concrete trigger and verification condition.
 
+### Wayfinder research parked for you
+
+A ticket carrying `wayfinder:parked` is the opposite outcome: an unattended run spent its
+whole budget without recording a ruling the contract accepts, so it handed the ticket back
+(ADR 362). The ticket's own comment names the check that refused the ruling and carries
+whatever the run did write. Unattended research will never pick it up again — rewrite the
+question so a bounded session can answer it, or answer it in a Wayfinder session. Removing
+the label does not restart it: the run's record is terminal, so a sharper question wants a
+new research ticket. Do not restore `wayfinder:resolving` by hand.
+
 ## Pause and drain
 
 ```bash

@@ -1,8 +1,8 @@
 """Worktree lifecycle for unattended research runs (issue #193).
 
-A resolved research run's isolated worktree must be removed when resolution is durable; a run
-that drops its claim without resolving (e.g. out-of-budget) must leave its worktree intact so
-the next attempt resumes from partial findings.
+A resolved research run's isolated worktree must be removed when resolution is durable. Since
+issue #362 an out-of-budget run is removed too: exhaustion parks the ticket for a human instead
+of leaving it eligible, so there is no later attempt for a retained checkout to resume.
 """
 
 from __future__ import annotations
@@ -214,9 +214,10 @@ def test_pending_disposition_also_removes_the_finished_research_worktree(tmp_pat
     assert gh.worktree_removals
 
 
-def test_release_does_not_remove_the_worktree(tmp_path, monkeypatch):
-    """release() (out-of-budget exhaustion path) must leave the worktree intact so the next
-    attempt resumes from partial findings rather than starting from scratch."""
+def test_the_exhaustion_park_removes_the_worktree(tmp_path, monkeypatch):
+    """The out-of-budget path used to retain the worktree so "the next attempt resumes". Since
+    issue #362 there is no next attempt: exhaustion parks the ticket for a human and unattended
+    research never picks it up again, so retaining the checkout only leaks disk."""
     record = _make_record(tmp_path)
     wt = Path(record.source)
     assert wt.exists()
@@ -224,8 +225,8 @@ def test_release_does_not_remove_the_worktree(tmp_path, monkeypatch):
     gh = _FakeGitHub()
     gh.install(monkeypatch)
 
-    proof = coordinated_research.release(record)
+    proof = coordinated_research.park(record)
 
-    assert proof is not None, "release() must return a proof URL"
-    assert wt.exists(), "worktree must survive a non-resolving exit so the next attempt resumes"
-    assert not gh.worktree_removals, "git worktree remove must NOT be called on exhaustion"
+    assert proof is not None, "park() must return a proof URL"
+    assert not wt.exists(), "the worktree must be removed — nothing will resume this run"
+    assert gh.worktree_removals, "git worktree remove must be called on exhaustion"

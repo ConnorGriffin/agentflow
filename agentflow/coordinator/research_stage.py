@@ -16,8 +16,9 @@ budget (ADR 0037's outcome-first rule), which is the anti-duplication guarantee.
 no-build and concrete deferred outcomes; a handoff-required result instead leaves the ticket open,
 indexes it under "Awaiting disposition", marks the pending state, releases the active claim, and
 returns durable proof so the completed run can retire. The dispatched session never writes GitHub,
-the map, or coordinator state itself (ADR 0037). On budget exhaustion ``finalize_hold`` releases the
-claim alone, leaving the ticket eligible again next cycle.
+the map, or coordinator state itself (ADR 0037). On budget exhaustion ``finalize_hold`` parks the
+ticket in the open — one comment naming why no usable ruling could be recorded, one durable label
+that takes it out of unattended selection — and never dispatches it again (ADR 362).
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ class ResearchStageAdapter(StageAdapter):
     Collaborators are injected so the stage is exercised without a real worktree or provider:
     ``findings_ready`` answers whether the session's durable findings for this ticket exist,
     ``resolve`` posts the findings and durably routes their disposition (the single result-writing
-    point), ``release`` drops the claim alone on a hold,
+    point), ``park`` hands an exhausted ticket back to the operator on a hold,
     ``worktree_ready`` proves the run's isolated worktree is present, and ``observer`` reconstructs
     the provider observation. Production wires these to the real worktree findings artifact and
     GitHub.
@@ -39,10 +40,10 @@ class ResearchStageAdapter(StageAdapter):
 
     required_outcome = "recorded findings for the ticket"
 
-    def __init__(self, *, findings_ready, resolve=None, release=None, worktree_ready=None,
+    def __init__(self, *, findings_ready, resolve=None, park=None, worktree_ready=None,
                  observer=None) -> None:
         super().__init__(outcome_ready=findings_ready, worktree_ready=worktree_ready,
-                         observer=observer, handoff=release)
+                         observer=observer, handoff=park)
         self._resolve = resolve
 
     def finalize_completed(self, record) -> str | None:

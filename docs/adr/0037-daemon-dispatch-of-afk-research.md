@@ -4,6 +4,8 @@
 - Date: 2026-07-18
 - Supersedes: [ADR 0027](0027-wayfinder-planning-boundary.md)
 - Amends: [ADR 0035](0035-workflow-engine-read-only-operator-console.md)
+- Amended by: [ADR 362](adr-362-research-exhaustion-parks-visibly.md) — research exhaustion
+  parks the ticket visibly instead of releasing it in silence
 
 ## Context
 
@@ -91,6 +93,12 @@ Missing, multiple, malformed, or vague dispositions are incomplete outcomes and 
 within the research stage's recovery budget. A durable no-build ruling or concrete
 defer is posted to the ticket, indexed explicitly under the map's "Decisions so far,"
 and only then may the ticket close.
+
+> Amended by [ADR 362](adr-362-research-exhaustion-parks-visibly.md): a run that spends
+> that whole budget without a usable disposition no longer just drops its claim to become
+> "simply eligible again next cycle." It parks the ticket visibly — one comment naming the
+> check that refused the ruling, one `wayfinder:parked` label that takes it out of
+> unattended selection — and unattended research never picks it up again.
 
 A handoff-required result does **not** grant the daemon planning authority. The daemon
 posts the findings once, adds one titled entry under the map's "Awaiting disposition,"
