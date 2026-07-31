@@ -167,9 +167,11 @@ _CLAUDE_RESULT_CAUSES = {
     "error_max_structured_output_retries": ProviderCause.PROCESS,
 }
 
-# The stream message types this classifier actively models. Every other type (system init, user
-# tool results, partial stream_event, telemetry, …) is preserved verbatim as unrecognized so
-# nothing is silently dropped and an unknown shape stays fail-safe.
+# The stream message types this classifier types a *cause* from. Every other type (system init,
+# user tool results, partial stream_event, telemetry, …) is preserved verbatim as unrecognized so
+# nothing is silently dropped and an unknown shape stays fail-safe. Preserved is not unread: the
+# dead-shell scan below reads the ``user`` tool results too, correlating each back to its own
+# tool-use block (#386) — it just establishes no cause from any single event's type.
 _CLAUDE_KNOWN_TYPES = {"assistant", "result", "rate_limit_event"}
 
 
@@ -352,10 +354,13 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                     has_end_fact=False, observed_at=None) -> ProviderObservation:
     """Extract facts from Claude's structured Agent SDK stream. A typed cause comes from the real
     stream shapes — an ``assistant`` message's error value, a rejected ``rate_limit_event``
-    (with its ``resetsAt``), or a terminal ``result.subtype`` failure — never an invented
-    ``type:error`` event. A supervisor timeout or a non-zero exit without any of those is a
-    recoverable process interruption; a clean exit leaves the cause to the stage outcome. The
-    real ``assistant.message.content`` text and terminal result output are still parsed. When
+    (with its ``resetsAt``), a terminal ``result.subtype`` failure, or every shell tool result in
+    the session being the harness's own start failure — never an invented ``type:error`` event.
+    A supervisor timeout or a non-zero exit without any of those is a recoverable process
+    interruption, and a clean exit leaves the cause to the stage outcome — except over a session
+    whose shell never started, which is a permanent environment fault however the process ended,
+    because no attempt can reach the work (#386). The real ``assistant.message.content`` text and
+    terminal result output are still parsed. When
     Claude returns a native ``structured_output``, its JSON object is the stage message; the
     accompanying ``result`` prose is only a human-readable summary and cannot satisfy the stage
     contract. Every unrecognized event or unshaped error is preserved verbatim so nothing is
