@@ -416,6 +416,42 @@ def test_fix_axis_cannot_dismiss_assigned_fixes_without_a_pushed_head():
         record, SimpleNamespace(final_message=payload))
 
 
+def test_fix_axis_accepts_a_no_push_verdict_that_rejudges_every_fix_as_no_defect():
+    """A fix session may legitimately conclude the assigned fixes were not defects at all. Its
+    verdict re-judges each ledger finding (here to discard_preference) and pushes nothing —
+    that is a settled judgment, not a dodge, and refusing it burns the whole continuation
+    budget and parks a PR no human needed to see (PR #393, 2026-07-31)."""
+    from agentflow import coordinated_review, pipeline, pr_park
+    from agentflow.coordinator.record import Record
+
+    assigned = ReviewFinding(
+        ReviewAction.FIX, "Repair shared decision", "Product rule", "agentflow/x.py", 4)
+    record = Record(
+        identity="fix", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
+        target="head", review_depth="full", depth_reason="shared decision",
+        review_axis="fix", change_author_tool="claude",
+        review_findings=encode_findings((assigned,)))
+    payload = json.dumps({
+        "verdict": "PASS", "depth": "full", "depth_reason": "shared decision",
+        "axis": "fix", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["inspected"], "findings": [
+            {"action": "discard_preference", "summary": "Repair shared decision",
+             "grounding": "the rule is scoped per-PR; nothing shared is altered",
+             "file": "agentflow/x.py", "line": 4}],
+        "uncertainty": None, "decision": "",
+    })
+
+    assert coordinated_review._verdict_ready(
+        record, SimpleNamespace(final_message=payload)) is True
+
+    # The same verdict leaving even one finding as an outstanding fix is still refused.
+    unfixed = json.loads(payload)
+    unfixed["findings"][0]["action"] = "fix_before_completion"
+    assert coordinated_review._verdict_ready(
+        record, SimpleNamespace(final_message=json.dumps(unfixed))) is False
+
+
 def test_fix_axis_accepts_a_verified_pr_body_fix_without_a_pushed_head():
     """A PR-body correction changes the merge artifact but cannot produce a new Git head."""
     from agentflow import coordinated_review, pipeline, pr_park

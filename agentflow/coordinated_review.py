@@ -481,6 +481,8 @@ def _verdict_ready(record, obs):
             and verdict.final_sha not in owned_heads):
         from agentflow.review_policy import ReviewAction, ReviewState
         review = ReviewState.from_record(record)
+        if review is None:
+            return False
         # A PR-body fix changes the merge-facing GitHub artifact, not the Git head. Requiring
         # push provenance for that one named surface rejects a valid exact-head re-verification
         # and burns the continuation budget after the reviewer has already corrected the body.
@@ -493,6 +495,18 @@ def _verdict_ready(record, obs):
                 "the fix-axis review recorded FIX findings but its verdict names no pushed fix, "
                 "and the retained checkout does not own a moved head (final_sha "
                 f"{(verdict.final_sha or 'unstated')[:12]}, target {record.target[:12]})")
+        outstanding = any(
+            item.action is ReviewAction.FIX
+            and item.file.strip().casefold() != "pr body"
+            for item in review.findings)
+        # A no-push verdict may also settle the ledger by explicitly re-judging it: when every
+        # finding it returns has left fix_before_completion, nothing remained to push. A verdict
+        # that returns no findings at all over an outstanding fix is still refused — silence is
+        # not a judgment.
+        rejudged = (bool(verdict.actions)
+                    and not any(item.action is ReviewAction.FIX for item in verdict.actions))
+        if outstanding and not rejudged:
+            return False
     if not _review_follow_ups_valid(record, verdict):
         return unverified("follow-up-evidence", "a structured follow-up in the verdict could not "
                           "be validated against the repository's live issue tracker")
@@ -560,8 +574,15 @@ def _review_worktree_reset(record, _log=None) -> bool:
         return False
     workdir, _pr = facts
     wt = Path(record.source)
-    from agentflow.runner import _worktree_is_registered
+    from agentflow.runner import _worktree_is_active, _worktree_is_registered
     runner = ClaudeRunner() if record.pool == "claude" else CodexRunner()
+    if _worktree_is_active(wt):
+        # A live sibling session still holds this checkout — the ordinary overlap while a
+        # superseded review finishes and its successor waits its turn. Contention, not a
+        # failing checkout: skip admission without charging the stuck counter, so the
+        # operator is not paged over a worktree that is working exactly as intended.
+        _REVIEW_PREPARE_FAILURES.pop(record.source, None)
+        return False
     try:
         if wt.exists() and _worktree_is_registered(workdir, wt) and getattr(record, "attempts", 0):
             runner.provision(wt)
