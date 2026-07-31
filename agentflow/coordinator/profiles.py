@@ -72,9 +72,17 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
 # already read the diff and run the suite (40–70 rounds of finished work apiece) without recording
 # a verdict. A stage absent here has no recorded sessions to justify a number.
 #
-# A round is one tool call the session issues — the quantity ``--max-turns`` actually bounds. It is
-# deliberately *not* the provider's own reported turn counter: sessions routinely report more of
-# those than the cap allows and still finish, so that counter cannot be compared against the cap.
+# A round is one tool call the session issues. It is *not* the same thing as a turn, and the pin
+# below is deliberately conservative because of it: one turn may issue several tool calls at once,
+# so a session's rounds are an **upper bound** on the turns it spent. The kill list proves it —
+# sessions the provider stopped at a cap of 40 are recorded at 44, 46, … 70 and 196 rounds, which a
+# one-for-one relationship could not produce. Pinning a turn ceiling against a round p95 therefore
+# errs high: the guard trips early, never late, and that is the safe direction for a guard whose
+# only job is to notice the ceiling drifting back under the work.
+#
+# Rounds are used rather than the provider's own reported turn counter because that counter cannot
+# be compared against the cap at all: sessions routinely report more turns than the cap allows and
+# still finish cleanly, so it does not measure the quantity the cap bounds.
 #
 # p95 rather than max, on purpose. A ceiling censors its own distribution — review's longest
 # recorded session ran 899 s against a 900 s wall, so how long it actually needed is unknown — and

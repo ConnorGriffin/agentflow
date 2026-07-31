@@ -182,6 +182,11 @@ ceiling replaces `_SESSION_TIMEOUT_S` per record. A per-session USD budget is al
 available (`error_max_budget_usd` already surfaces in the result stream) as a
 belt-and-braces cap.
 
+> **The Intake, Review, Respond and Converse turn ceilings below are superseded — see
+> §3b′ (#410).** They were drawn from the sample in §2c and drifted under the work once
+> the sample grew. They are kept here as the record of what the first calibration was.
+> The Research, Mockup, Revise and Build rows still stand: this change leaves them alone.
+
 | Stage (complexity/effort) | observed max | **wall ceiling** | **turn ceiling** | vs 2 h today |
 |---------------------------|--------------|------------------|------------------|--------------|
 | Intake (deep) | 338 s | 20 min | 40 | 6× tighter |
@@ -190,10 +195,6 @@ belt-and-braces cap.
 | Converse (deep) | 218 s | 15 min | 40 | 8× |
 | Research (deep) | 682 s (n=1) | 30 min | 80 | 4× |
 | Mockup (deep) | 2 429 s (n=1) | 60 min | 200 | 2× |
-
-> **Superseded for the read-only and review stages — see §3b′ below (#410).** The turn
-> ceilings above were drawn from the sample in §2c and drifted under the work once the
-> sample grew. They are kept here as the record of what the first calibration was.
 | Revise (carries builder complexity) | 934 s | = builder's Build ceiling | = builder's | — |
 | Build standard/low | 875 s | 25 min | 80 | 5× |
 | Build standard/medium | 286 s | 25 min | 80 | 5× |
@@ -210,11 +211,19 @@ that finding-driven Revise carries the builder's complexity.
 thin cells". They have, and the first reading showed the rule in §3b had been violated
 by drift rather than by choice.
 
-**Measure the right quantity.** The provider's own reported turn counter cannot be
-compared against `--max-turns`: sessions routinely report more of those than the cap
-allows and still finish cleanly. What the cap bounds is rounds of work — tool calls the
-session issues — so that is what the table below counts, from the recorded session
-streams rather than from the summary counter.
+**Measure the right quantity, and know what it is.** The provider's own reported turn
+counter cannot be compared against `--max-turns` at all: sessions routinely report more
+turns than the cap allows and still finish cleanly, so it does not measure what the cap
+bounds. The table below instead counts **rounds** — tool calls the session issues — read
+from the recorded session streams.
+
+A round is not a turn. One turn may issue several tool calls at once, so a session's
+rounds are an *upper bound* on the turns it spent; the kill list below shows sessions
+stopped at a cap of 40 recorded at 44, 46, … 70 and 196 rounds, which a one-for-one
+relationship could not produce. Setting a turn ceiling against a round p95 therefore errs
+high on purpose. That is the safe direction: the pin trips early rather than late, and a
+guard whose whole job is to notice the ceiling drifting back under the work should fail
+loud before the fleet does.
 
 Measured over 516 recorded sessions:
 
@@ -226,6 +235,8 @@ Measured over 516 recorded sessions:
 | Respond | 55 | 14 | 40 | **51** | 57 | 477 s | 594 s | **40** |
 | Revise | 23 | 41 | 95 | 99 | 100 | — | — | inherited |
 | Research | 6 | 33 | 39 | 39 | 39 | 608 s | 608 s | 80 |
+| Attack | 2 | 44 | 44 | **44** | 44 | 109 s | 109 s | **40** |
+| Mockup | 2 | 66 | 66 | **66** | 66 | 1 013 s | 1 013 s | 200 |
 
 **Every stage capped at 40 has its p95 above the cap**, review worst at 66 against 40 —
 and review is simultaneously pinned against its wall, its longest session running 899 s
@@ -247,11 +258,16 @@ Applying §3b's own rule to that sample:
 | Stage | wall ceiling | turn ceiling | grounding (p95) |
 |-------|--------------|--------------|-----------------|
 | Intake | 20 min (unchanged) | 40 → **80** | 45 rounds / 335 s |
-| Attack | 20 min (unchanged) | 40 → **80** | 44 rounds; mirrors intake (ADR 380), n=2 |
+| Attack | 20 min (unchanged) | 40 → **80** | 44 rounds / 109 s (n=2); mirrors intake (ADR 380) |
 | Review | 15 → **30 min** | 40 → **120** | 66 rounds / 469 s |
 | Respond | 15 → **20 min** | 40 → **80** | 51 rounds / 477 s |
 | Converse | 15 → **20 min** | 40 → **80** | shares respond's shape; no recorded sessions |
-| Research, Mockup, Build, Revise | unchanged | unchanged | already clear of their p95 |
+| Research | unchanged (30 min / 80) | unchanged | 39 rounds / 608 s — already clear |
+| Mockup | unchanged (60 min / 200) | unchanged | 66 rounds / 1 013 s (n=2) — already clear |
+| Build, Revise | unchanged | unchanged | p95 138 / 99 rounds against 80–300 — already clear |
+
+Every cell the code pins carries its sample here, and only here: `_OBSERVED_P95` in the
+profile table is this row set, so a number pinned by a test always has a stated source.
 
 **p95 with headroom, not the maximum.** Two reasons. A ceiling censors its own
 distribution — review's 899 s maximum is the wall stopping it, not the work finishing,
