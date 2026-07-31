@@ -139,6 +139,10 @@ def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):
     assert launcher._session_timeout_for(_record("review", str(tmp_path))) == 30 * 60
     assert launcher._session_timeout_for(
         _record("build", str(tmp_path), complexity="deep", effort="extra")) == 60 * 60
+    # The standard tier carries the deep tier's 45-minute wall: its drafted 25 minutes was never
+    # measured, and at recorded pace the raised 160-call allowance straddles it (§3b‴, #421).
+    assert launcher._session_timeout_for(
+        _record("build", str(tmp_path), complexity="standard", effort="low")) == 45 * 60
 
     pinned = LocalLauncher(session_timeout=0.1)
     assert pinned._session_timeout_for(_record("build", str(tmp_path))) == 0.1
@@ -237,8 +241,11 @@ def test_every_ceiling_stays_clear_of_the_work_its_cell_actually_does(tmp_path):
     p90 (55 tool calls) by the time the sample reached 210, and 31 reviews were killed at it having
     already read the diff and run the suite (#410). Build's standard tier had the same fault hidden
     by a pooled figure: its cap sat on the 80 tool calls a standard/low build does, and six standard
-    builds and revisions were killed at it (#416). This pins every cell against the recorded
-    distribution it was set from, so the next drift fails here instead of parking a pull request.
+    builds and revisions were killed at it (#416). And the wall is held to the same rule as the
+    turns: the standard tier's wall had never been measured when its turn ceiling doubled, and the
+    work the raise admits straddled it (#421). This pins every cell — both dials — against the
+    recorded distribution it was set from, so the next drift fails here instead of parking a pull
+    request.
 
     The bar is the p95 with headroom, not the maximum: the tail is unbounded (one review ran 335
     tool calls) and no ceiling that still kills a runaway could clear it."""
@@ -254,10 +261,11 @@ def test_every_ceiling_stays_clear_of_the_work_its_cell_actually_does(tmp_path):
                 f"{cell}: {profile.turn_ceiling}-turn ceiling is not clear of the "
                 f"{p95_tool_calls} tool calls its 95th-percentile session needs — ordinary long "
                 f"sessions die at it")
-            if p95_wall_s is not None:
-                assert profile.wall_ceiling_s > p95_wall_s, (
-                    f"{cell}: {profile.wall_ceiling_s}s wall is not clear of the {p95_wall_s}s "
-                    f"its 95th-percentile session needs — ordinary long sessions die at it")
+            # Every reading carries both dials now (§3b‴ filled the build/revise walls), so the
+            # wall is held unconditionally — a tool-calls-only pass may no longer arrive silently.
+            assert profile.wall_ceiling_s > p95_wall_s, (
+                f"{cell}: {profile.wall_ceiling_s}s wall is not clear of the {p95_wall_s}s "
+                f"its 95th-percentile session needs — ordinary long sessions die at it")
 
 
 def test_a_ceiling_hit_ends_as_a_recoverable_timeout():

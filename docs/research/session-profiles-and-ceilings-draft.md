@@ -186,7 +186,8 @@ belt-and-braces cap.
 > §3b′ (#410).** They were drawn from the sample in §2c and drifted under the work once
 > the sample grew. They are kept here as the record of what the first calibration was.
 > **The Build standard rows, and the Revise row that inherits them, are likewise superseded —
-> see §3b″ (#416).** The Research, Mockup and Build deep rows still stand.
+> see §3b″ (#416) for their turn ceilings and §3b‴ (#421) for their wall ceilings.** The
+> Research, Mockup and Build deep rows still stand.
 
 | Stage (complexity/effort) | observed max | **wall ceiling** | **turn ceiling** | vs 2 h today |
 |---------------------------|--------------|------------------|------------------|--------------|
@@ -345,6 +346,78 @@ this pass and are unchanged; no build or revise session in the sample was stoppe
 wall. Raising a turn ceiling does raise what a genuine runaway can burn before it dies,
 and the wall ceiling is the backstop that bounds that — 25 minutes for the standard tier,
 which is what makes 160 turns a safe number to allow.
+
+> **The wall reading arrived — see §3b‴ (#421).** The deep walls are clear against their
+> own readings; the standard tier's never-measured 25-minute wall was *not* clear of what
+> its raised turn ceiling now admits, and rose to 45 minutes. The backstop sentence above
+> now has a measured ceiling behind it.
+
+### 3b‴. The wall-clock ceilings, read per cell (#421, 2026-07-31)
+
+§3b″ doubled the standard tier's turn ceiling on a pass that read only tool calls, and
+leaned on the wall ceiling as the safety argument for the raise — a limit that had never
+been measured. This pass reads **duration** off the same session streams, per cell.
+
+**Sample.** Every recorded fleet session stream on both providers (Claude
+`~/.claude/projects`, Codex `~/.codex/sessions`), filtered to launcher-run sessions —
+identified by their fleet worktree and joined to the coordinator's record by the launch
+prompt embedded in the stream's opening user messages — with dead shells (zero tool
+calls: an environment fault, not work, #415) excluded: **661 sessions joined to a live
+record, read 2026-07-31.** A session whose record has since been rescoped or retired out
+of the store cannot be joined and is not counted, so per-cell n differs from §3b″'s
+tool-call sample; each column keeps its own n. Duration is last minus first stream
+timestamp — the same elapsed clock the wall ceiling kills on.
+
+| Cell | n | dur p50 | p90 | **p95** | max | **wall ceiling** |
+|------|---|---------|-----|---------|-----|------------------|
+| Build standard/low | 98 | 152 s | 336 s | **574 s** | 3 781 s | 25 min → **45 min** |
+| Build standard/medium | 45 | 160 s | 661 s | **755 s** | 1 432 s | 25 min → **45 min** |
+| Revise (standard, inherits the standard Build tier) | 18 | 383 s | 887 s | **909 s** | 1 133 s | inherits → **45 min** |
+| Build deep/medium | 124 | 363 s | 978 s | **1 214 s** | 6 421 s | 45 min — clear |
+| Build deep/high | 96 | 347 s | 1 491 s | **1 676 s** | 2 205 s | 45 min — clear |
+| Build deep/extra | 20 | 380 s | 2 286 s | **2 351 s** | 6 406 s | 60 min — clear |
+| Build deep/low (unnamed cell, complexity fallback) | 19 | 137 s | 450 s | 834 s | 1 198 s | fallback 45 min — clear |
+| Build standard/high (unnamed cell, complexity fallback) | 2 | — | — | — | 668 s | too thin to rule (§3b″) |
+
+Maxima above a current wall predate the per-stage walls (they ran in the uniform
+two-hour era) — uncensored evidence of how long unbounded work can run, kept in the read
+for exactly that reason. The non-build stages keep their §3b′ readings; this pass is the
+build/revise wall column only.
+
+**The deep tier's walls are genuinely clear, against their own readings:** 1 214 s,
+1 676 s and 2 351 s at p95 against 2 700 s, 2 700 s and 3 600 s — 1.5–2.2× headroom, the
+§3b band. The record can now say so instead of assuming it.
+
+**The standard tier's 25-minute wall was not clear of the work its raised turn ceiling
+admits.** The measured p95s — 574 s, 755 s, 909 s — sit under 1 500 s, but every session
+behind them ran while the old 80-turn cap was cutting the tier off, so they are readings
+of 80-turn sessions, not of the 160-turn sessions the tier now allows: lower bounds, the
+same censoring §3b′ names for maxima. The sessions that actually ran near the old cap are
+the honest guide to pace: the standard builds and revisions recorded at 82–109 tool calls
+ran **7.5–12.0 s per tool call** (714 s/95 calls at the quick end, 983 s/82 calls at the
+slow). At those recorded paces a session using the full 160-call allowance takes roughly
+**1 200–1 920 s** — a band that straddles the 1 500 s wall. That is #416's own failure
+mode arriving at the other dial: an ordinary long session killed with the work finished
+and unrecorded. The band is an estimate from recorded pace, stated as such — no 160-call
+standard session exists to measure one day after the raise.
+
+**Ruling: the standard tier's wall rises 25 → 45 minutes,** and Revise inherits it
+(ADR 0041). 2 700 s is clear of the measured p95s with 3–4.7× headroom and clear of the
+top of the estimated 160-call band with 1.4×; it also matches the deep tier's wall, whose
+200-turn allowance runs at comparable pace. §3b″'s backstop sentence now has a stated
+bound behind it: a standard runaway burns at most 45 minutes — the same exposure the deep
+tier has always accepted.
+
+**The same pin now holds both dials.** `_OBSERVED_P95` carries this pass's wall p95
+beside §3b″'s tool-call p95 for every build and revise cell — no cell carries a
+tool-calls-only reading any more — and the ceiling test asserts each cell's wall clear of
+its wall p95 exactly as it does turns. A wall drifting under its work now fails the suite
+instead of parking a pull request.
+
+**Re-read once 160-call sessions exist.** These wall p95s are censored at 80 tool calls
+of work; the first cohort of standard sessions that genuinely uses the raised allowance
+will move them up, and the pin should then ratchet on that reading rather than on this
+pace estimate.
 
 ### 3c. Fail-closed when a narrow profile is missing a capability
 
