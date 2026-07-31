@@ -29,10 +29,12 @@ from agentflow.worktree_ref import WorktreeRef
 
 # The logical stages enabled behind the coordinator — the one source
 # :func:`build_review_revise_gate` consumes. The six pipeline stages (issues #103–#108), the
-# Conversation-turn stage (``converse``) an Ask submits per operator message (ADR 0034), and the
-# unattended ``research`` stage the daemon dispatches for an AFK-able planning ticket (ADR 0037).
+# Conversation-turn stage (``converse``) an Ask submits per operator message (ADR 0034), the
+# unattended ``research`` stage the daemon dispatches for an AFK-able planning ticket (ADR 0037),
+# and the cold ``audit`` stage that countersigns or bounces a ready brief before any build starts
+# (ADR 380).
 ENABLED_STAGES = ("intake", "build", "review", "revise", "mockup", "respond", "converse",
-                  "research")
+                  "research", "audit")
 
 
 def build_review_revise_gate(record: Record) -> bool:
@@ -55,9 +57,13 @@ def _issue_number(record: Record) -> int | None:
 # Intake record must never be read as owning a ``building`` claim, nor a Build record a
 # ``triaging`` one, or one type's live record would shield the other type's stale claim from
 # reclamation (and hide it from forward-activation evidence).
+# The plan audit takes its own ``auditing`` claim rather than borrowing Intake's: the two lanes
+# own an issue at different moments — Intake before it is settled, the audit after — and one
+# shared label would let either lane's live record shield the other's stale claim from
+# reclamation, which is the exact failure this table exists to prevent (ADR 380).
 CLAIM_LANE = {"intake": "triaging", "build": "building", "review": "building",
               "revise": "building", "mockup": "drawing", "respond": "building",
-              "research": "resolving"}
+              "research": "resolving", "audit": "auditing"}
 
 
 def owned_issues(records, repo: str, lane: str | None = None) -> set[int]:
@@ -84,9 +90,11 @@ def owned_issues(records, repo: str, lane: str | None = None) -> set[int]:
 
 
 # Code-writing stages retain the legacy board lane that names their operator-facing activity.
+# The plan audit reports on the existing triage lane — it adds no operator-visible surface of its
+# own, so nothing new is drawn on the console (ADR 380).
 _STAGE_LANE = {"intake": "triaging", "build": "building", "review": "reviewing",
                "revise": "building", "mockup": "triaging", "respond": "building",
-               "research": "resolving"}
+               "research": "resolving", "audit": "triaging"}
 
 
 def live_projection(records) -> list[dict]:

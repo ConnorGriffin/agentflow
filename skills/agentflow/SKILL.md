@@ -105,6 +105,35 @@ PY
 flight is left alone. Only a ready, free issue builds — `build` adds convenience, never
 authority (the skip invariant holds).
 
+**The plan audit is part of that gate (ADR 380).** Every brief is re-read cold against the code
+before a builder is spent on it, and `build_issue` refuses an issue with no countersign
+(`not audited — run the plan audit inline`). `build` skips the *queue*, never the gate — so when
+you hit that refusal, run the audit yourself, here, before retrying:
+
+1. Read the brief off the issue and audit it against **this checkout** — open the files every
+   load-bearing claim names. Judge the five axes in `agentflow.plan_audit.PLAN_AUDIT_PROMPT`
+   (grounding · acceptance · interface shape · scope and complexity budget · cost). Taste is not
+   an objection; an empty objection list is a successful audit.
+2. **Countersign** — if it survives, stamp the durable marker and re-run `build_issue`:
+
+   ```bash
+   uv run python - "$REPO" "$N" <<'PY'
+   import sys
+   from agentflow.coordinated_plan_audit import stamp_countersign
+   repo, n = sys.argv[1], int(sys.argv[2])
+   print("countersigned" if stamp_countersign(repo, n) else "could not stamp — retry")
+   PY
+   ```
+
+3. **Bounce** — if it does not, post the numbered objections through the grill route (each with
+   its evidence, why it breaks the build, and the cheapest fix) and stop; the issue is the
+   maintainer's again. Use **Land it as ready**'s `apply_intake` call with
+   `IntakeRoute.GRILL` and `agentflow.plan_audit.bounce_body(objections)` as the body — that
+   marker is what keeps the objections from reading as a maintainer reply.
+
+Never stamp the countersign without having actually done the audit: the label is the only thing
+telling the daemon this brief was checked.
+
 ### `review <PR>` — submit or explicitly force an exact-head review
 
 Resolve `<PR>` to its repository and local enrolled checkout, then call the durable review entry

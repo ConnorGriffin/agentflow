@@ -28,8 +28,12 @@ ATTEMPT_BUDGET = 3
 MACHINE_CEILING = int(os.environ.get("AGENTFLOW_MAX_SESSIONS", "4"))
 TRIAGE_CONCURRENCY = int(os.environ.get("AGENTFLOW_TRIAGE_CONCURRENCY", "3"))
 BUILD_CONCURRENCY = int(os.environ.get("AGENTFLOW_BUILD_CONCURRENCY", "2"))
+# The plan audit is intake-shaped but lives in its own lane (ADR 380): it stands between a
+# settled brief and a builder, so a full triage queue must never be what stops one from running.
+AUDIT_CONCURRENCY = int(os.environ.get("AGENTFLOW_AUDIT_CONCURRENCY", "3"))
 STAGE_CAPS = MappingProxyType({
     "triage": TRIAGE_CONCURRENCY,
+    "audit": AUDIT_CONCURRENCY,
     "build": BUILD_CONCURRENCY,
     "mockup": 1,
     "respond": 1,
@@ -52,12 +56,17 @@ PR_BOUND = frozenset({"review", "revise", "respond"})
 # gate one of these must defer while any PR-bound stage is waiting to start on the same pool,
 # so a single high-effort build cannot seize all five permits and starve a review that needs
 # one (#293, ADR 0039). Converse/research run in their own capped lanes and are out of scope.
-ISSUE_BOUND = frozenset({"build", "mockup", "intake"})
+ISSUE_BOUND = frozenset({"build", "mockup", "intake", "audit"})
 
 # The one durable human handoff each stage creates when its budget is exhausted or a
 # permanent condition holds it (ADR 0028's exhaustion table).
 STAGE_NATIVE_HANDOFF = {
     "intake": "issue:needs-grilling",
+    # An audit that runs out of budget never countersigns — but it never unwinds the settled
+    # decision either. The issue keeps `ready-for-agent` and its dials, and the handoff is a
+    # diagnosis comment against the audit itself, not a grilling route (ADR 380). A spend-cap
+    # trip is our failure, not a defect in the brief, and must not cost a maintainer round-trip.
+    "audit": "issue:audit-held",
     "build": "issue:needs-grilling",
     "mockup": "issue:needs-mockup",
     "review": "pr:parked",
@@ -83,6 +92,10 @@ _STAGE_ALIASES = {
 _ADMISSION_ROWS = {
     ("intake", "claude", "opus", "deep", None): 1,
     ("intake", "codex", "sol", "deep", None): 1,
+    # The plan audit is intake-shaped: one bounded read-only pass over one issue, on either pool
+    # (ADR 380). It carries intake's single permit and shares its lane cap.
+    ("audit", "claude", "opus", "deep", None): 1,
+    ("audit", "codex", "sol", "deep", None): 1,
     ("review", "claude", "opus", "deep", None): 1,
     ("review", "codex", "sol", "deep", None): 2,
     ("revise", "claude", "sonnet", "standard", None): 3,

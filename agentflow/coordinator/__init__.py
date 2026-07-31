@@ -17,6 +17,7 @@ from agentflow.coordinator.converse_stage import ConverseStageAdapter
 from agentflow.coordinator.intake_stage import IntakeStageAdapter
 from agentflow.coordinator.mockup_stage import MockupStageAdapter
 from agentflow.coordinator.coordinator import Coordinator, StageOutcome, Submission
+from agentflow.coordinator.plan_audit_stage import PlanAuditStageAdapter
 from agentflow.coordinator.research_stage import ResearchStageAdapter
 from agentflow.coordinator.respond_stage import RespondStageAdapter
 from agentflow.coordinator.review_stage import ReviewStageAdapter
@@ -25,6 +26,6 @@ from agentflow.coordinator.stage_router import StageRouter
 
 __all__ = [
     "Coordinator", "StageOutcome", "Submission", "BuildStageAdapter", "ConverseStageAdapter",
-    "IntakeStageAdapter", "MockupStageAdapter", "ResearchStageAdapter", "ReviewStageAdapter",
-    "ReviseStageAdapter", "RespondStageAdapter", "StageRouter",
+    "IntakeStageAdapter", "MockupStageAdapter", "PlanAuditStageAdapter", "ResearchStageAdapter",
+    "ReviewStageAdapter", "ReviseStageAdapter", "RespondStageAdapter", "StageRouter",
 ]

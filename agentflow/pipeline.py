@@ -1,4 +1,4 @@
-"""The composition root: eight coordinated stages wired into one live pipeline (ADR 0030).
+"""The composition root: nine coordinated stages wired into one live pipeline (ADR 0030).
 
 Each ``coordinated_*`` module owns what *its* stage decides. This module owns everything that is
 true of the pipeline as a whole and of no single stage:
@@ -13,7 +13,7 @@ true of the pipeline as a whole and of no single stage:
 - **claim reconciliation** — which issues and worktrees the durable store still owns, and the
   visible claim labels that reconciliation proves orphaned.
 
-It is the one module that knows all eight stages, which is exactly why nothing else has to.
+It is the one module that knows all nine stages, which is exactly why nothing else has to.
 """
 
 from __future__ import annotations
@@ -25,17 +25,17 @@ from datetime import datetime
 from pathlib import Path
 
 from agentflow import (coordinated_build, coordinated_converse, coordinated_intake,
-                       coordinated_mockup, coordinated_research, coordinated_respond,
-                       coordinated_review, coordinated_revise, github)
+                       coordinated_mockup, coordinated_plan_audit, coordinated_research,
+                       coordinated_respond, coordinated_review, coordinated_revise, github)
 from agentflow.balancer import BUILD_POOLS, PoolStatus, pick_reviewer
 from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coordinator,
-                                   IntakeStageAdapter, MockupStageAdapter, ResearchStageAdapter,
-                                   RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
-                                   StageRouter, tracer)
+                                   IntakeStageAdapter, MockupStageAdapter, PlanAuditStageAdapter,
+                                   ResearchStageAdapter, RespondStageAdapter, ReviewStageAdapter,
+                                   ReviseStageAdapter, StageRouter, tracer)
 from agentflow.coordinator.admission import MACHINE_CEILING, STAGE_CAPS
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
-from agentflow.labels import BUILDING, DRAWING, RESOLVING, TRIAGING
+from agentflow.labels import AUDITING, BUILDING, DRAWING, RESOLVING, TRIAGING
 from agentflow.pr_park import park_pr
 from agentflow.repo_facts import repo_profile
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
@@ -104,8 +104,8 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
         _log(f"{cfg.repo}: claim reconciliation deferred — coordinator state unreadable: {exc}")
         return 0
 
-    lane_labels = (("building", BUILDING), ("triaging", TRIAGING), ("drawing", DRAWING),
-                   ("resolving", RESOLVING))
+    lane_labels = (("building", BUILDING), ("triaging", TRIAGING), ("auditing", AUDITING),
+                   ("drawing", DRAWING), ("resolving", RESOLVING))
     cleared = 0
     for lane, label in lane_labels:
         claimed = github.claimed_issues(cfg.repo, label)
@@ -143,7 +143,7 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
 
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's coordinator for all eight logical stages (issues #103–#108).
+    """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
     adapter verifies a durable starting/final-head verdict and retains the detached bounded-fix
     checkout; its Revise adapter verifies a pushed revision on the same branch and reuses that
@@ -193,9 +193,15 @@ def build_coordinator(_log=None) -> Coordinator:
         resolve=coordinated_research.resolve,
         release=coordinated_research.release,
         worktree_ready=coordinated_research._research_worktree_ready)
+    audit = PlanAuditStageAdapter(
+        worktree_reset=coordinated_plan_audit.reset_worktree,
+        apply_verdict=coordinated_plan_audit.apply_verdict,
+        claim_ready=coordinated_plan_audit.audit_claim_ready,
+        worktree_dispose=coordinated_plan_audit.dispose_worktree,
+        handoff=coordinated_plan_audit.hold_audit)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse,
-                          "research": research})
+                          "research": research, "audit": audit})
     return Coordinator(adapter=router, gate=_production_gate(),
                        disabled_cold_stages=frozenset({"mockup"}),
                        log=_log or (lambda _line: None))
@@ -272,8 +278,13 @@ class _ProductionGate:
     @staticmethod
     def reservation_limits(record) -> ReservationLimits:
         """The global limits the store enforces with the running-row reservation."""
+        # The plan audit gets its own lane and cap (ADR 380). It is intake-*shaped* — same
+        # read-only ceiling and permit — but it must not contend with intake for the same slots:
+        # audits are what stand between a settled brief and a builder, and a busy triage queue
+        # blocking them would stall the whole build queue behind it.
         lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build",
-                "respond": "respond", "mockup": "mockup", "research": "research"}
+                "respond": "respond", "mockup": "mockup", "research": "research",
+                "audit": "audit"}
         stage_lane = lane.get(record.stage, record.stage)
         return ReservationLimits(
             machine_ceiling=MACHINE_CEILING,

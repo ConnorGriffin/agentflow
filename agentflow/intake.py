@@ -321,10 +321,19 @@ STATE_LABELS = ("ready-for-agent", "agentflow:needs-grilling", "agentflow:needs-
 # Dial label prefixes — cleared when stamping new dials (or dropping to a hold route).
 _DIAL_PREFIXES = ("agentflow:complexity:", "agentflow:effort:")
 
-# Every single-valued prefixed label intake manages: the dials plus the mockup scope
-# (ADR 0048). A re-route leaves exactly one of each, so any managed label not in the new
-# set is stale and cleared — a mockup→ready promotion drops the scope with the dials.
-_MANAGED_PREFIXES = _DIAL_PREFIXES + ("agentflow:mockup:",)
+# The plan audit's countersign marker (ADR 380). It lives here, with the rest of the managed
+# label vocabulary, because *being managed* is the whole point: a re-route clears it, so an issue
+# bounced back to grilling and later promoted to ready again carries no stale countersign and its
+# new brief is audited fresh. The audit module reads it from here rather than the other way
+# round — intake must not depend on the stage that runs after it.
+_AUDIT_PREFIX = "agentflow:audit:"
+COUNTERSIGNED = f"{_AUDIT_PREFIX}countersigned"
+
+# Every single-valued prefixed label intake manages: the dials, the mockup scope (ADR 0048), and
+# the plan audit's countersign (ADR 380). A re-route leaves exactly one of each, so any managed
+# label not in the new set is stale and cleared — a mockup→ready promotion drops the scope with
+# the dials, and any re-route drops a countersign the old brief earned.
+_MANAGED_PREFIXES = _DIAL_PREFIXES + ("agentflow:mockup:", _AUDIT_PREFIX)
 
 # Bare pre-enrollment vocabulary → agentflow:* canonical form.
 # Note: ready-for-agent stays bare (ADR 0018 — settled; excluded from this map).

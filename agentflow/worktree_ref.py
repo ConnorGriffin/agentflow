@@ -5,7 +5,7 @@ Every pipeline session's checkout lives at a path that encodes a
 
     {workdir}/.agentflow/worktrees/{lane}/{name}
 
-where ``lane`` is ``{tool}``, ``{tool}-review``, or ``{tool}-intake``, ``name`` is
+where ``lane`` is ``{tool}``, ``{tool}-review``, ``{tool}-intake``, or ``{tool}-audit``, ``name`` is
 ``issue-{n}-{slug}``, ``mockup-{n}-{slug}``, ``pr-{pr}-{slug}``, ``issue-{n}``,
 ``research-{n}``, or ``ask-{token}``, and the branch is ``agentflow/{lane}/{name}``.
 
@@ -39,6 +39,7 @@ class WorktreeKind(str, Enum):
     INTAKE = "intake"
     RESEARCH = "research"
     CONVERSE = "converse"
+    AUDIT = "audit"
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,11 @@ _SHAPES: dict[WorktreeKind, _Shape] = {
     WorktreeKind.CONVERSE: _Shape("", "ask", re.compile(r"^ask-(?P<slug>.+)$"), False, True),
     WorktreeKind.REVIEW: _Shape("-review", "pr", re.compile(r"^pr-(?P<num>\d+)-(?P<slug>.+)$"), True, True),
     WorktreeKind.INTAKE: _Shape("-intake", "issue", re.compile(r"^issue-(?P<num>\d+)$"), True, False),
+    # The plan audit reads the same issue intake just triaged, so it needs its own reserved lane
+    # suffix: without one the two checkouts of the same issue would render the same path and each
+    # would be mistakable for the other (ADR 380). It comes last so a tool whose own name ends in
+    # `-audit` still has its build recognized as a build, exactly as `_lane_tool` describes.
+    WorktreeKind.AUDIT: _Shape("-audit", "issue", re.compile(r"^issue-(?P<num>\d+)$"), True, False),
 }
 
 
@@ -111,6 +117,10 @@ class WorktreeRef:
     @classmethod
     def for_intake(cls, workdir: str, tool: str, number: int) -> "WorktreeRef":
         return cls(workdir, tool, WorktreeKind.INTAKE, number, "")
+
+    @classmethod
+    def for_plan_audit(cls, workdir: str, tool: str, number: int) -> "WorktreeRef":
+        return cls(workdir, tool, WorktreeKind.AUDIT, number, "")
 
     @classmethod
     def for_research(cls, workdir: str, tool: str, number: int) -> "WorktreeRef":

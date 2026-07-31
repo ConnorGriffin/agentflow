@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 
 from agentflow import (coordinated_build, coordinated_review, coordinated_revise, github,
-                       pipeline, ratchet)
+                       pipeline, plan_audit, ratchet)
 from agentflow.balancer import pick_pair, pick_reviewer
 from agentflow.coordinator.record import WAITING
 from agentflow.coordinator.store import StoreUnavailable
@@ -24,7 +24,7 @@ from agentflow.gate import (conflict_revises_used, maintainer_comment, maintaine
                             park, reply_pending)
 from agentflow.intake import (INTAKE_MARK, _strip_quoted_lines, awaiting_recheck,
                               replies_since_intake)
-from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS,
+from agentflow.labels import (AUDITING, AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS,
                               RESEARCH_TICKET, RESOLVING, TRIAGE_SKIP, TRIAGING,
                               WAYFINDER_NON_RESEARCH, claim)
 from agentflow.notify import notify
@@ -139,10 +139,23 @@ def _free_to_dispatch(cfg: RepoConfig, issue: dict, in_flight: set[int], _log=No
     return True
 
 
+def _countersigned(issue: dict) -> bool:
+    """Whether a cold plan audit has countersigned the brief now on this issue (ADR 380).
+    Pure (test surface).
+
+    Only countersigned briefs are built: an issue that is `ready-for-agent` but has not been
+    audited yet is *not* dispatchable, and one mid-audit has no countersign either, so it cannot
+    be built while its audit is in flight. `build <N>` honors the same gate — it is convenience,
+    never authority — so a by-hand build of an un-audited issue is refused until the audit has
+    run and countersigned it.
+    """
+    return plan_audit.countersigned({lbl["name"] for lbl in issue.get("labels", [])})
+
+
 def _next_ready_issue(cfg: RepoConfig, reserved: set[int] = frozenset(),
                       _log=None) -> dict | None:
-    """The oldest ready issue free to dispatch. `reserved` skips candidates this pass has
-    already found conclusively undispatchable, so one bad queue head cannot starve later
+    """The oldest countersigned ready issue free to dispatch. `reserved` skips candidates this
+    pass has already found conclusively undispatchable, so one bad queue head cannot starve later
     runnable work (#327)."""
     rows = github.list_issues(cfg.repo, label="ready-for-agent", limit=50)
     if rows is None:
@@ -151,8 +164,40 @@ def _next_ready_issue(cfg: RepoConfig, reserved: set[int] = frozenset(),
     if in_flight is None:
         return None   # can't see what's in flight — fail closed, dispatch next cycle
     issues = sorted((_row_dict(r) for r in rows), key=lambda i: i["number"])
-    return next((i for i in issues if i["number"] not in reserved
+    return next((i for i in issues if i["number"] not in reserved and _countersigned(i)
                  and _free_to_dispatch(cfg, i, in_flight, _log)), None)
+
+
+def _audit_pending(issue: dict) -> bool:
+    """Whether this ready issue still owes the build queue a plan audit. Pure (test surface).
+
+    An issue whose brief is already countersigned is done; one carrying a live claim is already
+    owned by a session, so re-submitting it would double-claim. The `triaging` case is the one
+    that matters most: a grounding session mid-settlement is still rewriting this brief, and a
+    countersign landing inside its retry window would attest to a plan that no longer exists —
+    and be stripped as a stale managed label on the way out.
+    """
+    labels = {lbl["name"] for lbl in issue.get("labels", [])}
+    if plan_audit.countersigned(labels):
+        return False
+    return not (labels & {TRIAGING, AUDITING, BUILDING})
+
+
+def _next_audit_candidate(cfg: RepoConfig, reserved: set[int] = frozenset()) -> dict | None:
+    """The oldest ready issue whose brief has not been audited yet (ADR 380). `reserved` skips
+    issues this cycle's fan-out already claimed, before their `agentflow:triaging` label is
+    visible. An issue that already has an open agentflow PR is past the plan stage entirely, so
+    it is never audited. None on a `gh` blip (retry next cycle)."""
+    rows = github.list_issues(cfg.repo, label="ready-for-agent", limit=50)
+    if rows is None:
+        return None
+    in_flight = _issues_in_flight(cfg)
+    if in_flight is None:
+        return None
+    issues = sorted((_row_dict(r) for r in rows), key=lambda i: i["number"])
+    return next((i for i in issues
+                 if i["number"] not in reserved and i["number"] not in in_flight
+                 and _audit_pending(i)), None)
 
 
 def _untriaged(issue: dict) -> bool:
@@ -200,6 +245,12 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
         if held:
             return f"#{n}: held — resume it with `/agentflow pickup {n}`, not build"
         return f"#{n}: not ready — run `/agentflow triage {n}` (or `scope {n}`) first"
+    if not _countersigned(issue):
+        # `build <N>` skips the *queue*, never the gate (ADR 380). The plan audit is the one thing
+        # standing between a brief and a builder, so a by-hand build of an un-audited issue is
+        # refused and the operator is told to run that audit here, in this session, first.
+        return (f"#{n}: not audited — run the plan audit inline (`/agentflow build {n}` audits "
+                "first), then build")
     in_flight = _issues_in_flight(cfg)
     if in_flight is None:
         return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"

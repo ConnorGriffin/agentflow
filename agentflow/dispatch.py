@@ -14,7 +14,7 @@ from agentflow import (coordinated_build, coordinated_respond, coordinated_revie
                        pipeline)
 from agentflow.balancer import pick_pair
 from agentflow.intake import replies_since_intake
-from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
+from agentflow.labels import AUDITING, BUILDING, RESOLVING, TRIAGING, claim
 from agentflow.repo_facts import intake_allowlist
 from agentflow.coordinator.quota_poll import refresh_claude_quota
 from agentflow.coordinator.store import default_store_path
@@ -181,6 +181,52 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
     return "; ".join(submitted) if submitted else "no un-triaged issues"
 
 
+def _submit_coordinated_plan_audit(cfg, coordinator, _log) -> str:
+    """Submit one cold plan audit per un-audited ready issue (ADR 380).
+
+    Takes whichever pool has headroom, exactly like Intake — the audit must be a *cold* session,
+    not the other tool's, so it never waits for a particular one. Mirrors intake's fan-out: an
+    idempotent resubmission that reused a terminal record created nothing to run, so it is
+    reserved and skipped rather than claimed.
+    """
+    from agentflow import coordinated_plan_audit
+    from agentflow.coordinator.record import WAITING
+
+    reserved: set[int] = set()
+    submitted = []
+    while True:
+        issue = loop._next_audit_candidate(cfg, reserved)
+        if issue is None:
+            break
+        number = issue["number"]
+        if number in pipeline.owned_issues(cfg, lane=None):
+            # A non-retired coordinator record in some lane already owns this issue — including
+            # the audit we submitted on an earlier cycle, whose triaging claim may not be visible
+            # yet. Reserve and skip so one issue is never audited twice.
+            reserved.add(number)
+            continue
+        builder, _reviewer, block_msg = pick_pair()
+        if builder is None:
+            return ("; ".join(submitted) if submitted else
+                    f"#{number}: no pool has headroom ({block_msg}) — deferring")
+        submission = coordinated_plan_audit.plan_audit_submission(cfg, issue, builder.tool)
+        if submission is None:
+            return f"#{number}: plan audit source unreadable — deferring"
+        identity = coordinator.submit_stage(submission)
+        record = coordinator.stage_record(identity)
+        if record is None or record.state != WAITING or record.hold_pending or record.retired:
+            reserved.add(number)
+            continue
+        if not claim(cfg.repo, number, AUDITING):
+            # Runnable submission but the claim mutation failed: withdraw the never-started
+            # WAITING record so no unowned audit survives, mirroring intake.
+            coordinator.withdraw_stage(identity)
+            return f"#{number}: plan audit record saved; claim pending — deferring admission"
+        reserved.add(number)
+        submitted.append(f"#{number} → {builder.tool}")
+    return "; ".join(submitted) if submitted else "no un-audited ready issues"
+
+
 def _submit_coordinated_research(cfg, coordinator, _log) -> str:
     from agentflow import coordinated_research
 
@@ -211,6 +257,10 @@ def _submit_repo(cfg, coordinator, _log) -> None:
     if not dispatch_preflight(cfg.repo, cfg.workdir, pipeline.owned_worktrees(cfg), _log=_log):
         return
     _run_and_log(cfg, "intake", lambda: _submit_coordinated_intake(cfg, coordinator, _log), _log)
+    # Between "ready" and "building": every ready brief is re-read cold before a builder is ever
+    # spent on it, and only a countersigned one reaches the build queue below (ADR 380).
+    _run_and_log(cfg, "plan audit",
+                 lambda: _submit_coordinated_plan_audit(cfg, coordinator, _log), _log)
     _run_and_log(cfg, "build", lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
     # ``needs-mockup`` is a human hold, not permission to spend a five-permit deep session.
     # A maintainer enters that phase through `/agentflow pickup N` (ADR 0019); the coordinator

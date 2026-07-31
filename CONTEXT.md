@@ -236,6 +236,25 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   tollbooth: it scopes anything it can pin down confidently and holds only an
   *outcome-changing* fork it can't settle from code/data (ADR 0016).
 
+- **Plan audit** — the bounded adversarial stage standing between `ready-for-agent` and a
+  builder: a *cold* session, carrying nothing from the intake that wrote the brief, re-reads
+  that brief against the repository and judges it on five axes — grounding, acceptance,
+  interface shape, scope and complexity budget, and cost. Read-only; it never edits the brief,
+  the issue, or the code. Every ready issue is audited regardless of its dials. It answers with
+  exactly one of two verdicts, and anything unreadable is a bounce (ADR 380).
+  *Avoid:* plan review (the operator's own interactive skill), pre-build review.
+
+- **Countersign** — the plan audit's verdict that a brief survives: the issue is marked audited
+  and dispatches to build on the same cycle it otherwise would have, with nothing else changed.
+  A countersign belongs to the brief that earned it — re-triaging an issue clears it, so a new
+  brief is always audited fresh. An empty objection list is a successful audit, not a lazy one.
+
+- **Bounce** — the plan audit's other verdict: the brief does not survive, so the issue leaves
+  the build queue and becomes a held issue whose questions are the auditor's numbered
+  objections, each with its evidence, why it breaks the build if unfixed, and the cheapest fix.
+  The maintainer's reply re-runs intake exactly as it does for any other held issue.
+  *Avoid:* reject, fail (neither says the work returns to the maintainer).
+
 - **Held issue** — an issue parked at `needs-grilling` or `needs-mockup`: inert to
   agents until its missing input is durably supplied. It remains a build issue;
   the operator resolves the hold in chat and updates the issue, or uses a decision
