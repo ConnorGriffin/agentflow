@@ -443,13 +443,13 @@ def test_fix_axis_accepts_a_no_push_verdict_that_rejudges_every_fix_as_no_defect
     })
 
     assert coordinated_review._verdict_ready(
-        record, SimpleNamespace(final_message=payload)) is True
+        record, SimpleNamespace(final_message=payload))
 
     # The same verdict leaving even one finding as an outstanding fix is still refused.
     unfixed = json.loads(payload)
     unfixed["findings"][0]["action"] = "fix_before_completion"
-    assert coordinated_review._verdict_ready(
-        record, SimpleNamespace(final_message=json.dumps(unfixed))) is False
+    assert not coordinated_review._verdict_ready(
+        record, SimpleNamespace(final_message=json.dumps(unfixed)))
 
 
 def test_fix_axis_accepts_a_verified_pr_body_fix_without_a_pushed_head():

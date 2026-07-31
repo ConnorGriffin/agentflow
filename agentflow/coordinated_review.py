@@ -481,21 +481,10 @@ def _verdict_ready(record, obs):
             and verdict.final_sha not in owned_heads):
         from agentflow.review_policy import ReviewAction, ReviewState
         review = ReviewState.from_record(record)
-        if review is None:
-            return False
         # A PR-body fix changes the merge-facing GitHub artifact, not the Git head. Requiring
         # push provenance for that one named surface rejects a valid exact-head re-verification
         # and burns the continuation budget after the reviewer has already corrected the body.
-        if review is None or any(
-                item.action is ReviewAction.FIX
-                and item.file.strip().casefold() != "pr body"
-                for item in review.findings):
-            return unverified(
-                "fix-push",
-                "the fix-axis review recorded FIX findings but its verdict names no pushed fix, "
-                "and the retained checkout does not own a moved head (final_sha "
-                f"{(verdict.final_sha or 'unstated')[:12]}, target {record.target[:12]})")
-        outstanding = any(
+        outstanding = review is None or any(
             item.action is ReviewAction.FIX
             and item.file.strip().casefold() != "pr body"
             for item in review.findings)
@@ -503,10 +492,14 @@ def _verdict_ready(record, obs):
         # finding it returns has left fix_before_completion, nothing remained to push. A verdict
         # that returns no findings at all over an outstanding fix is still refused — silence is
         # not a judgment.
-        rejudged = (bool(verdict.actions)
+        rejudged = (review is not None and bool(verdict.actions)
                     and not any(item.action is ReviewAction.FIX for item in verdict.actions))
         if outstanding and not rejudged:
-            return False
+            return unverified(
+                "fix-push",
+                "the fix-axis review recorded FIX findings but its verdict names no pushed fix, "
+                "and the retained checkout does not own a moved head (final_sha "
+                f"{(verdict.final_sha or 'unstated')[:12]}, target {record.target[:12]})")
     if not _review_follow_ups_valid(record, verdict):
         return unverified("follow-up-evidence", "a structured follow-up in the verdict could not "
                           "be validated against the repository's live issue tracker")
