@@ -228,6 +228,44 @@ def _revision_ready(record, obs) -> bool:
           "created after this revise round opened")
 
 
+def _retire_dead_revises(coord) -> None:
+    """Retire a Revise whose PR is merged or closed — or whose owned branch no longer carries any
+    PR — before another attempt or continuation is charged against a change nothing can land
+    (#432), the same disposition :func:`coordinated_review._resettle_diverged_reviews` already
+    takes for a Review of a gone PR.
+
+    A Revise resolves its PR by its owned builder branch (the park's own resolution,
+    :func:`agentflow.pr_park.park_pr_number`), so an operator who closes or supersedes the PR and
+    deletes the branch otherwise leaves the record re-driving interrupted continuations and
+    finally parking against a PR number that no longer resolves — a park that stays pending and
+    silently retries forever. This runs every reconcile pass, before admission, over the durable
+    records, and deliberately includes a record whose park is already pending: retiring is the
+    only exit that unresolvable park has.
+
+    Trust boundary: an unreadable GitHub answer never retires — ``None`` means "couldn't check",
+    never "gone". Only a definite CLOSED/MERGED latest PR, or a definite empty PR-for-branch
+    answer, retires the record: every Revise descends from a blocking Review of a real PR on its
+    own branch, so a definitely empty answer means that PR and its branch are gone."""
+    from agentflow.coordinated_review import _kill_running_family
+    from agentflow.coordinator import tracer
+    from agentflow.coordinator.record import RUNNING
+    for record in tracer.load_records():
+        if record.stage != "revise" or record.retired or not record.claim:
+            continue
+        parsed = source_facts(record)
+        if parsed is None:
+            continue  # not this record's own checkout — no owned branch to resolve a PR from
+        _workdir, branch, _wt = parsed
+        prs = github.prs_for_branch(record.repo, branch, limit=1)
+        if prs is None:
+            continue  # GitHub unreadable — fail closed; a later pass retries
+        if prs and prs[0].state not in {"CLOSED", "MERGED"}:
+            continue  # an open (or unrecognized-state) PR is live revise work
+        if record.state == RUNNING:
+            _kill_running_family(record)
+        coord.retire_stale_revise(record.identity)
+
+
 def _round_evidence(comment: dict, opened_at: int) -> bool:
     """Whether one PR comment is the current revise round's durable non-code proof: agentflow-
     marked, carrying attached image evidence, and created strictly after the revise record's

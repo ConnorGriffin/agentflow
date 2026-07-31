@@ -624,12 +624,13 @@ def test_public_surface_keeps_completed_boundary_settlement_private(make_coord):
     public = {name for name in dir(coord)
               if not name.startswith("_") and callable(getattr(coord, name))}
     # The deliberate public operations beside submit_stage/cycle: the completed-stage park handoff,
-    # and the two Review-native disposals for a PR head that moved off the immutable target (#208).
+    # the two Review-native disposals for a PR head that moved off the immutable target (#208), and
+    # the Revise-native retire for a PR closed or merged out from under the revise (#432).
     # ``stage_record`` is a read-only observation, not a transition — the dispatch layer checks
     # whether a submission produced runnable work before claiming the issue (#245); ``withdraw_stage``
     # rolls back a never-started submission whose GitHub claim was lost to a race (#245).
     assert public == {"submit_stage", "cycle", "park_completed", "retire_stale_review",
-                      "park_stale_review", "stage_record", "withdraw_stage"}
+                      "retire_stale_revise", "park_stale_review", "stage_record", "withdraw_stage"}
     assert not hasattr(coord, "permits")      # permit accounting is an internal invariant
     assert not hasattr(coord, "records")      # the working set is private (_records)
 

@@ -102,6 +102,7 @@ class _Live:
         # reopened review's depth is assigned from, and the PR identity — the last kept unreadable
         # so the diverged-review reconciler stays inert here.
         monkeypatch.setattr("agentflow.github.list_open_prs", self._list_open_prs)
+        monkeypatch.setattr("agentflow.github.prs_for_branch", self._prs_for_branch)
         monkeypatch.setattr("agentflow.github.issue_body", self._issue_body)
         monkeypatch.setattr("agentflow.github.pr_content", self._pr_content)
         monkeypatch.setattr("agentflow.github.pr_facts", lambda *a, **k: None)
@@ -113,6 +114,13 @@ class _Live:
         if self.fail_gh:
             return None
         return [github.PrRow(self.number, head or "", self.head)]
+
+    def _prs_for_branch(self, repo, branch, **kwargs):
+        """The all-state PR listing behind the dead-revise reconciler (#432): the PR here is live,
+        so the listing reports it OPEN and the guard leaves the revise alone."""
+        if self.fail_gh:
+            return None
+        return [github.BranchPrRow(self.number, "OPEN", branch, "")]
 
     def _issue_body(self, repo, issue):
         return None if self.fail_gh else "Issue acceptance"
@@ -656,6 +664,115 @@ def test_revise_exhaustion_parks_the_pr_resolved_from_the_builder_worktree(make_
     assert make_coord(fake, adapter=StageRouter({"revise": revise})).cycle("claude") == []
     assert len(parked) == 1 and parked[0][:2] == ("o/r", 42)
     assert "requested revision" in parked[0][2]
+
+
+# --- a PR closed or merged out from under the revise (issue #432) -------------------------
+#
+# A Revise resolves its PR by its owned builder branch. When an operator closes or supersedes
+# that PR and deletes the branch, nothing the revise pushes can ever land: each continuation is a
+# real session spent against nothing, and the eventual park cannot even resolve a PR number — the
+# handoff stays pending and silently retries forever. The reconcile pass retires the record
+# first, driven here through the production ``reconcile_and_project`` seam with the branch's
+# all-state PR listing faked.
+
+
+def _branch_prs(monkeypatch, rows):
+    """The faked GitHub edge: the all-state PR listing for the revise's owned branch, the way the
+    dead-revise reconciler (and the park) resolves it — never a gh shellout."""
+    monkeypatch.setattr("agentflow.github.prs_for_branch", lambda repo, branch, **k: rows)
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+
+def test_a_closed_pr_retires_the_stranded_revise_silently(make_coord, monkeypatch):
+    """Reproduces #432 (issue #418, PR #429): a revise whose PR was closed and its branch deleted
+    must retire silently on the next pass — no park comment, no notification, no attempt charged.
+    Fails before the fix, where nothing consults the PR's live state and the revise keeps its
+    claim."""
+    fake = FakeSession()
+    fake.gate_open = False                                # isolate the guard pass from admission
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT))
+    _branch_prs(monkeypatch, [github.BranchPrRow(42, "CLOSED", "agentflow/claude/issue-9-x", "")])
+
+    pipeline.reconcile_and_project(coord)
+
+    rec = record_of(coord, ident)
+    assert rec.retired is True and rec.claim is False
+    assert rec.attempts == 0                              # no continuation charged
+    assert rec.handoffs == 0 and rec.notifications == 0   # nothing parked, nobody notified
+    assert rec.hold_pending is False
+
+
+def test_only_a_definite_gone_answer_retires_the_revise(make_coord, monkeypatch):
+    """``None`` means "couldn't check", never "gone": an unreadable listing retires nothing, and
+    neither does an open PR — only a definite CLOSED/MERGED state or a definitely empty listing."""
+    fake = FakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT))
+    _branch_prs(monkeypatch, None)                        # GitHub unreadable — fail closed
+
+    pipeline.reconcile_and_project(coord)
+    rec = record_of(coord, ident)
+    assert rec.retired is False and rec.claim is True
+
+    monkeypatch.setattr("agentflow.github.prs_for_branch",
+                        lambda repo, branch, **k: [github.BranchPrRow(42, "OPEN", branch, "")])
+    pipeline.reconcile_and_project(coord)
+    rec = record_of(coord, ident)
+    assert rec.retired is False and rec.claim is True     # an open PR is live revise work
+
+
+def test_a_running_revise_against_a_merged_pr_is_terminated_before_retiring(make_coord,
+                                                                            monkeypatch):
+    """A live revise session is stopped before its record retires (#220), so the orphaned family
+    does not keep burning tokens on a PR that already merged."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT))
+    coord.cycle("claude")
+    assert record_of(coord, ident).state == "running"
+
+    killed = []
+    monkeypatch.setattr(coordinated_review, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    _branch_prs(monkeypatch, [github.BranchPrRow(42, "MERGED", "agentflow/claude/issue-9-x", "")])
+
+    pipeline.reconcile_and_project(coord)
+
+    assert killed == [ident]
+    rec = record_of(coord, ident)
+    assert rec.retired is True and rec.claim is False
+
+
+def test_a_gone_pr_retires_a_revise_whose_park_can_never_resolve(make_coord, monkeypatch):
+    """The worse ending in #432: at budget exhaustion the park resolves its PR by branch; a
+    deleted branch resolves to nothing, so the handoff stays pending and silently retries every
+    cycle, forever. The guard retires the record instead — the pending, unresolvable park is
+    withdrawn with it and never retried."""
+    fake = FakeSession()
+    handoffs = []
+    adapter = _revise_adapter(fake, revision=[False], prep=[True],
+                              handoff=lambda record: handoffs.append(record.identity) or None)
+    coord = make_coord(fake, adapter=adapter)
+    ident = coord.submit_stage(_revise_sub(source=BUILD_WT))
+    for _ in range(8):
+        coord.cycle("claude")
+        if record_of(coord, ident).hold_pending:
+            break
+        fake.end(ident, cause=ProviderCause.PROCESS)
+    rec = record_of(coord, ident)
+    assert rec.hold_pending is True and rec.claim is True  # the park is stuck pending
+    assert handoffs                                        # and has already retried, proving nothing
+
+    _branch_prs(monkeypatch, [])                           # branch deleted: definitely no PR
+    pipeline.reconcile_and_project(coord)
+
+    rec = record_of(coord, ident)
+    assert rec.retired is True and rec.claim is False and rec.hold_pending is False
+    parks = len(handoffs)
+    pipeline.reconcile_and_project(coord)                  # the dead park is never retried again
+    assert len(handoffs) == parks
 
 
 # --- crash boundaries at both transfer points ---------------------------------------------
