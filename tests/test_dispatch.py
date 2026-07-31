@@ -308,11 +308,17 @@ _DIALS = ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:high
 def test_build_pass_skips_a_mislabelled_queue_head_and_submits_the_next_issue(
         monkeypatch, tmp_path):
     # A ready issue with no complexity dial can never run, so it must not starve the valid work
-    # queued behind it — the same pass reports it and submits the next candidate (#327).
+    # queued behind it — the same pass reports it and submits the next candidate (#327). The skip
+    # also self-heals: the labels came off the ready listing itself, so the missing dial is a
+    # definite fact, and stripping `ready-for-agent` sends the issue back through intake to earn
+    # its dials instead of logging the same skip forever (#433).
     from agentflow.coordinator.record import Record, WAITING
 
     _ready_queue(monkeypatch, [(462, ["ready-for-agent"]), (468, _DIALS)])
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    stripped = []
+    monkeypatch.setattr(dispatch.github, "remove_label",
+                        lambda repo, number, label: stripped.append((repo, number, label)) or True)
     claimed = []
     monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: claimed.append(number) or True)
     submitted = []
@@ -324,7 +330,31 @@ def test_build_pass_skips_a_mislabelled_queue_head_and_submits_the_next_issue(
     result = dispatch._submit_coordinated_build(RepoConfig("o/r", str(tmp_path)), coord, None)
 
     assert claimed == [468] and submitted == [468]
-    assert "#462" in result and "complexity" in result
+    assert stripped == [("o/r", 462, "ready-for-agent")]
+    assert "#462" in result and "complexity" in result and "re-triages" in result
+    assert "#468: submitted" in result
+
+
+def test_a_failed_ready_label_strip_still_reaches_the_work_behind_it(monkeypatch, tmp_path):
+    # The heal is best-effort: a strip the tracker refuses changes nothing — the skip is
+    # reported, the pass still submits the valid candidate behind it, and the untouched label
+    # simply retries next cycle.
+    from agentflow.coordinator.record import Record, WAITING
+
+    _ready_queue(monkeypatch, [(462, ["ready-for-agent"]), (468, _DIALS)])
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch.github, "remove_label", lambda repo, number, label: False)
+    claimed = []
+    monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: claimed.append(number) or True)
+    coord = SimpleNamespace(
+        submit_stage=lambda s: f"o/r|{s.subject}|build|-",
+        stage_record=lambda identity: Record(identity=identity, stage="build", pool="claude",
+                                             demand=5, state=WAITING))
+
+    result = dispatch._submit_coordinated_build(RepoConfig("o/r", str(tmp_path)), coord, None)
+
+    assert claimed == [468]
+    assert "#462" in result and "will retry next cycle" in result
     assert "#468: submitted" in result
 
 
@@ -361,6 +391,10 @@ def test_build_pass_stops_when_the_ready_queue_cannot_be_read(monkeypatch, tmp_p
     _ready_queue(monkeypatch, [(1, _DIALS)])
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
     monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("must not claim while blind"))
+    # The self-heal strips a label only on a definite "ready with no dial" answer — an unreadable
+    # queue is not one, so no label may move while blind.
+    monkeypatch.setattr(dispatch.github, "remove_label",
+                        lambda *a: pytest.fail("must not strip a label while blind"))
     coord = SimpleNamespace(
         submit_stage=lambda s: pytest.fail("must not submit while blind"),
         stage_record=lambda identity: None)
@@ -372,6 +406,7 @@ def test_build_pass_stops_when_the_ready_queue_cannot_be_read(monkeypatch, tmp_p
 def test_build_pass_reports_when_every_ready_candidate_is_undispatchable(monkeypatch, tmp_path):
     _ready_queue(monkeypatch, [(1, ["ready-for-agent"]), (2, ["ready-for-agent"])])
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch.github, "remove_label", lambda repo, number, label: True)
     monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("nothing runnable to claim"))
     coord = SimpleNamespace(submit_stage=lambda s: "id", stage_record=lambda identity: None)
 

@@ -62,7 +62,17 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
             return _report(f"#{number}: no pool has headroom ({block_msg}) — deferring")
         submission = coordinated_build.build_submission(cfg, issue, builder.tool)
         if submission is None:
-            skipped.append(f"#{number}: skipped — no agentflow:complexity:* label (ADR 0018 gate)")
+            # A definite fact, not an unreadable answer: this candidate's labels came off the
+            # ready listing itself, and they carry no complexity dial. Such an issue looks
+            # triaged to intake yet can never build — the permanent gap a reviewer-filed
+            # follow-up born `ready-for-agent` fell into (#433). Strip the ready label so the
+            # next intake pass re-triages it and stamps the dials; a failed strip changes
+            # nothing and simply retries next cycle.
+            healed = github.remove_label(cfg.repo, number, "ready-for-agent")
+            tail = ("removed ready-for-agent so intake re-triages it" if healed
+                    else "could not remove ready-for-agent — will retry next cycle")
+            skipped.append(f"#{number}: skipped — no agentflow:complexity:* label "
+                           f"(ADR 0018 gate); {tail}")
             reserved.add(number)
             continue
         identity = coordinator.submit_stage(submission)
