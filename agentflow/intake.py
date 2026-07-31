@@ -456,14 +456,30 @@ _IMAGE_HANDOFF = (
     "proceed with the text you have.")
 
 
-def intake_prompt(repo: str, issue: dict, extra: str = "") -> str:
-    """The durable provider input for one Intake stage."""
+_OWNER_COMMENTS = (
+    "\n\nMAINTAINER COMMENTS posted after filing — these are authoritative: where a comment "
+    "narrows, redirects, or defers scope stated in the body, the comment wins. Ground your route "
+    "on the *current* intent.\n---\n{comments}\n---")
+
+
+def intake_prompt(repo: str, issue: dict, extra: str = "", comments: str = "") -> str:
+    """The durable provider input for one Intake stage.
+
+    ``comments`` are maintainer comments the issue picked up after it was filed, on a *fresh*
+    intake. An issue is often narrowed, redirected, or half-deferred in its own thread minutes
+    after it is written, and reading only the body produced a confident brief for work its owner
+    had already shelved. ``extra`` is the resume channel — the maintainer's answer to an earlier
+    hold — and carries its own framing; the caller supplies one or the other, never both, so this
+    stays one rule per input: append each section if it has anything in it.
+    """
     from agentflow.intake_attachments import ATTACHMENTS_DIRNAME, extract_image_urls
     body = issue.get("body") or ""
     prompt = _fill(INTAKE_PROMPT, repo=repo, n=str(issue["number"]), disclaimer=_DISCLAIMER,
                    title=issue.get("title", ""), body=body or "(no description)")
     if extract_image_urls(body):
         prompt += _IMAGE_HANDOFF.replace("{dir}", ATTACHMENTS_DIRNAME)
+    if comments:
+        prompt += _OWNER_COMMENTS.replace("{comments}", comments)
     if extra:
         prompt += ("\n\nTHE MAINTAINER HAS REPLIED to your earlier hold — treat this as their "
                    "answer or waiver: promote to ready if the issue is now settled (they answered "

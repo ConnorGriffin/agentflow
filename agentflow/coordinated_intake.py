@@ -15,15 +15,21 @@ from agentflow.runner import _run
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
 
-def intake_submission(cfg, issue: dict, extra: str, tool: str) -> Submission | None:
-    """Map a durable issue snapshot to one idempotent Intake stage submission."""
+def intake_submission(cfg, issue: dict, extra: str, comments: str, tool: str) -> Submission | None:
+    """Map a durable issue snapshot to one idempotent Intake stage submission.
+
+    ``comments`` is required rather than defaulted: a caller that forgets to read the issue's
+    thread would otherwise silently go back to triaging issues from their body alone, with nothing
+    failing to say so. Like the rest of the snapshot it is frozen at submission time, which is what
+    keeps the durable input reproducible.
+    """
     n = issue["number"]
     target = issue.get("_intake_target") if extra else None
     source_path = WorktreeRef.for_intake(cfg.workdir, tool, n).path
     snapshot = {
         "number": n, "title": issue.get("title", ""), "body": issue.get("body") or "",
         "labels": [label.get("name", "") for label in issue.get("labels", [])],
-        "extra": extra,
+        "extra": extra, "comments": comments,
     }
     resolved = _run(["git", "-C", cfg.workdir, "rev-parse", "origin/main"])
     source_ref = resolved.stdout.strip() if resolved.returncode == 0 else ""
@@ -33,7 +39,8 @@ def intake_submission(cfg, issue: dict, extra: str, tool: str) -> Submission | N
                       pool=tool, complexity="deep", source=str(source_path), claim=True,
                       input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,
                                             "snapshot": snapshot, "source_ref": source_ref,
-                                            "prompt": intake_prompt(cfg.repo, issue, extra)},
+                                            "prompt": intake_prompt(cfg.repo, issue, extra,
+                                                                    comments)},
                                            sort_keys=True))
 
 

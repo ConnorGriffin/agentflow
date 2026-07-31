@@ -10,9 +10,12 @@ from __future__ import annotations
 import os
 import threading
 
-from agentflow import coordinated_build, coordinated_respond, coordinated_review, loop, pipeline
+from agentflow import (coordinated_build, coordinated_respond, coordinated_review, github, loop,
+                       pipeline)
 from agentflow.balancer import pick_pair
+from agentflow.intake import replies_since_intake
 from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
+from agentflow.repo_facts import intake_allowlist
 from agentflow.coordinator.quota_poll import refresh_claude_quota
 from agentflow.coordinator.store import default_store_path
 from agentflow.runner import dispatch_preflight
@@ -102,6 +105,31 @@ def _submit_coordinated_respond(cfg, coordinator, _log) -> str:
     return f"#{number}: submitted PR #{pr} to coordinator → {submission.pool} (respond)"
 
 
+def _owner_comments(cfg, issue) -> str | None:
+    """The maintainer comments a *fresh* intake must read as authoritative, or ``None`` when the
+    thread could not be read.
+
+    An issue is frequently narrowed or half-deferred in its own thread within minutes of being
+    filed; triaging from the body alone produced confident briefs for work its owner had already
+    shelved. Scoped exactly as a resume's answer text is — allowlisted authors only, our own intake
+    comments excluded, and only what postdates our last intake comment. That last part is
+    load-bearing rather than a nicety: a settled brief is written into the issue body, so replaying
+    the whole thread unconditionally would let comments already folded into it re-open the
+    question.
+
+    An issue already on the resume path gets nothing here. Its answer text is delivered through the
+    resume channel, under framing that tells the model it is answering an earlier hold; a second
+    copy under a second framing would put two contradictory instructions for the same words in one
+    prompt. That path has also already read this thread, so skipping avoids paying for it twice.
+    """
+    if issue.get("_intake_target"):
+        return ""
+    rows = github.issue_comment_rows(cfg.repo, issue["number"])
+    if rows is None:
+        return None
+    return replies_since_intake(rows, intake_allowlist(cfg.repo, cfg.workdir))
+
+
 def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
     from agentflow import coordinated_intake
     from agentflow.coordinator.record import WAITING
@@ -119,11 +147,19 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
             # picker doesn't return it again this cycle, then skip (#201).
             reserved.add(issue["number"])
             continue
+        comments = _owner_comments(cfg, issue)
+        if comments is None:
+            # Fail closed on this one issue only: triaging it now would produce a brief from a
+            # thread we could not read. Reserve it so the picker moves on, and let the rest of the
+            # pass proceed — an unreadable thread is not a reason to stop submitting other work.
+            reserved.add(issue["number"])
+            continue
         builder, _reviewer, block_msg = pick_pair()
         if builder is None:
             return ("; ".join(submitted) if submitted else
                     f"#{issue['number']}: no pool has headroom ({block_msg}) — deferring")
-        submission = coordinated_intake.intake_submission(cfg, issue, extra, builder.tool)
+        submission = coordinated_intake.intake_submission(cfg, issue, extra, comments,
+                                                          builder.tool)
         if submission is None:
             return f"#{issue['number']}: Intake source unreadable — deferring"
         identity = coordinator.submit_stage(submission)

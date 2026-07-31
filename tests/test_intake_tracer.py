@@ -70,7 +70,7 @@ def test_submission_pins_the_source_commit(monkeypatch):
     cfg = SimpleNamespace(repo="o/r", workdir="/repo")
 
     submission = coordinated_intake.intake_submission(
-        cfg, {"number": 7, "title": "t", "body": "b", "labels": []}, "", "claude")
+        cfg, {"number": 7, "title": "t", "body": "b", "labels": []}, "", "", "claude")
 
     assert submission is not None
     assert json.loads(submission.input_ptr)["source_ref"] == "abc123"
