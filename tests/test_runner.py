@@ -511,6 +511,32 @@ def test_idle_review_litter_is_archived_so_admission_can_proceed(tmp_path):
     assert _git(repo, "show", f"{refs[0]}:.pr21.diff") == "review scratch"
 
 
+def test_a_locked_review_checkout_still_refuses_and_is_left_alone(tmp_path):
+    """Archiving litter must not overrun the operator's escape hatch: a checkout a human pinned
+    refuses admission, keeps its contents, and — since the daemon retries every cycle — leaves no
+    growing trail of recovery refs behind."""
+    repo = _repo_with_origin(tmp_path)
+    runner = ClaudeRunner()
+    branch = "agentflow/claude/issue-22-pinned"
+    build = repo / ".agentflow" / "worktrees" / "claude" / "issue-22-pinned"
+    _branch_worktree(repo, build, branch)
+
+    review = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-22-pinned"
+    _git(repo, "fetch", "origin", "--quiet")
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    parked = _git(review, "rev-parse", "HEAD")
+    (review / "operator-notes.md").write_text("why I pinned this")
+    _git(repo, "worktree", "lock", str(review))
+
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError):
+            runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    assert _git(review, "rev-parse", "HEAD") == parked
+    assert (review / "operator-notes.md").read_text() == "why I pinned this"
+    assert _git(repo, "for-each-ref", "--format=%(refname)",
+                "refs/agentflow/stranded/pr-22-pinned/") == ""
+
+
 def test_freshening_review_checkout_keeps_its_ready_environment(tmp_path):
     """Repeated review preparation must not delete a ready environment and rebuild it before
     every admission attempt."""
@@ -1021,7 +1047,8 @@ def test_archiving_works_on_a_host_with_no_git_identity(tmp_path, monkeypatch):
 
 def test_a_locked_worktree_is_never_reclaimed(tmp_path):
     """A lock is a deliberate human signal; one --force is not enough to remove it, and it does
-    not get a second."""
+    not get a second. Refusing must also anchor nothing, or a caller that retries every cycle
+    buries the real stranded work under a pile of dead recovery refs."""
     repo = _repo_with_origin(tmp_path)
     wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-803-locked"
     _branch_worktree(repo, wt, "agentflow/codex/issue-803-locked")
@@ -1029,7 +1056,9 @@ def test_a_locked_worktree_is_never_reclaimed(tmp_path):
     _git(repo, "worktree", "lock", str(wt))
 
     assert runner_mod.archive_stranded_worktree(str(repo), wt) == ""
+    assert runner_mod.archive_stranded_worktree(str(repo), wt) == ""
     assert wt.exists() and (wt / "result.txt").read_text().startswith("work in progress")
+    assert _git(repo, "for-each-ref", "--format=%(refname)", "refs/agentflow/stranded/") == ""
 
 
 def test_dispatch_preflight_refuses_a_repository_that_can_no_longer_carry_a_session(

@@ -256,6 +256,17 @@ def _active_marker(wt: Path) -> Path | None:
     return marker if marker.is_absolute() else wt / marker
 
 
+def _worktree_is_locked(wt: Path) -> bool:
+    """Whether a human pinned this checkout with ``git worktree lock``. Resolved through git (the
+    :func:`_active_marker` idiom) rather than composed from the basename, so a duplicate basename
+    cannot answer for another worktree's lock."""
+    resolved = _run(["git", "-C", str(wt), "rev-parse", "--git-path", "locked"])
+    if resolved.returncode != 0 or not resolved.stdout.strip():
+        return False
+    lock = Path(resolved.stdout.strip())
+    return (lock if lock.is_absolute() else wt / lock).exists()
+
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -367,9 +378,13 @@ def archive_stranded_worktree(workdir: str, wt: Path) -> str:
     every archive and the bound would silently never apply.
 
     A single ``--force`` removes an unclean checkout; a *locked* worktree needs a second one and
-    does not get it — a lock is a deliberate human signal, so a locked worktree fails the removal
-    and stays registered.
+    does not get it — a lock is a deliberate human signal, so a locked worktree stays registered.
+    It is refused before anything is written rather than only at the removal: a caller that retries
+    every cycle would otherwise anchor a fresh recovery ref on each pass, burying the real stranded
+    work an operator greps this namespace for under an unbounded pile of dead ones.
     """
+    if _worktree_is_locked(wt):
+        return ""
     scratch = tempfile.mkdtemp(prefix="agentflow-archive-index-")
     env = {**os.environ, "GIT_INDEX_FILE": os.path.join(scratch, "index")}
     try:
