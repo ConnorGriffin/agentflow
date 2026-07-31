@@ -276,6 +276,15 @@ You own bounded cleanup in this review; do not merely report work you can safely
 - Fix every clear in-scope correctness, security, acceptance, or charter issue yourself.
 - Fix grounded stale helpers, broken evidence, misleading prose, and naming/style defects when they
   matter. Discard unsupported taste; clear and project-grounded wording is not work.
+- Speculative hardening is not work either: an edge case is real only when its state is reachable
+  under the system's enforced invariants — rejected or made unrepresentable before the guard by code
+  or a pinned test. Guards at a trust boundary are never speculative (external input, cross-process
+  or cross-tool data, concurrent state, durable state a crash, a human edit, or the clock can
+  perturb — an illustrative list, not a closed one). Elsewhere, a guard for a state that cannot occur
+  is complexity, not safety: when you were about to ask for one, `discard_preference`; when the
+  builder already shipped one, `fix_before_completion` by deleting it, and name in the finding the
+  enforced invariant that makes the state unreachable. Keep every guard that acceptance, security,
+  or observed behavior grounds.
 - For a real necessary gap outside this PR's scope, search existing issues first, then file one
   follow-up issue in this repo. Record its URL, evidence, desired outcome, and duplicate-search
   query. Do not file issues for unsupported preferences.
