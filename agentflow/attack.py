@@ -55,8 +55,10 @@ ATTACK_RESULT_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "objections": {"type": "string"},
+        "remedied": {"type": "boolean"},
+        "fork": {"type": "string"},
     },
-    "required": ["objections"],
+    "required": ["objections", "remedied", "fork"],
 }
 
 
@@ -65,6 +67,8 @@ class AttackResult:
     objections: str = ""    # the numbered objections; empty means the draft survived this round
     parsed: bool = True     # False when the fail-safe produced this rather than the attacker
     detail: str = ""
+    remedied: bool = False  # every objection above carries its own complete cheapest fix
+    fork: str = ""          # the genuine question only a human can settle, or empty
 
     @property
     def survived(self) -> bool:
@@ -76,6 +80,17 @@ class AttackResult:
         """
         return self.parsed and not self.objections
 
+    @property
+    def remedied_only(self) -> bool:
+        """Whether every surviving objection carries its own fix and none is a fork (#418).
+
+        This is the attacker's own typed judgement, never a re-reading of its prose: the
+        attacker knows which of its objections it has answered. Defaults hold — an answer that
+        never said `remedied` (an old record, an unreadable round) stays contested, so the
+        fail-safe direction is a human hold, exactly as before.
+        """
+        return self.parsed and bool(self.objections) and self.remedied and not self.fork.strip()
+
 
 def parse_attack(payload: str) -> AttackResult:
     """Validate an attack session's structured answer. Pure, fail-safe (test surface).
@@ -83,6 +98,8 @@ def parse_attack(payload: str) -> AttackResult:
     The CLI enforces :data:`ATTACK_RESULT_SCHEMA` natively, so the payload is the answer object
     itself. Anything unreadable — a non-object, a missing field, an exception — returns an
     unparsed result, which spends the round but never counts as the draft surviving. Never raises.
+    The typed remedied/fork pair is optional on the wire so answers recorded before #418 still
+    read; absent, they take the contested-side defaults.
     """
     try:
         data = json.loads(payload.strip() or "null")
@@ -90,7 +107,9 @@ def parse_attack(payload: str) -> AttackResult:
             return AttackResult(parsed=False, detail="attack output was not a structured object")
         if "objections" not in data:
             return AttackResult(parsed=False, detail="attack answer carried no objections field")
-        return AttackResult(str(data.get("objections") or "").strip())
+        return AttackResult(str(data.get("objections") or "").strip(),
+                            remedied=bool(data.get("remedied", False)),
+                            fork=str(data.get("fork") or "").strip())
     except Exception as e:  # noqa: BLE001 — fail-safe, never propagate
         return AttackResult(parsed=False, detail=f"parse error: {type(e).__name__}")
 
@@ -148,8 +167,19 @@ instead of next round. Equally, do not go easy on a draft because it reads well 
 built on a claim that isn't true is exactly what you are here to catch.
 
 Your final response IS the structured answer — the harness enforces its schema natively, so you
-do not hand-write or fence the JSON; just produce this field:
-- "objections": the numbered Markdown objections, or the empty string if the draft survives""" \
+do not hand-write or fence the JSON; just produce these fields:
+- "objections": the numbered Markdown objections, or the empty string if the draft survives
+- "remedied": true ONLY when every objection above carries a cheapest fix so complete that
+  applying it verbatim settles the objection — no judgement call left, no missing fact. If any
+  objection needs a decision or information you could not supply, this is false.
+- "fork": the one genuine either/or only a human can settle — two defensible options the draft
+  must choose between, or a missing fact nobody in this loop can obtain — stated as the question
+  itself. Empty when no such fork exists. A wording preference is never a fork.
+
+Marking "remedied" does not soften your attack: when the rounds run out, remedied objections are
+applied to the published brief verbatim, so a wrong fix ships. Attach a fix only when you would
+build from it yourself, and never manufacture one to avoid saying a human is needed — an
+unremedied objection is a legitimate answer.""" \
     + SHELL_CRIB
 
 
@@ -168,17 +198,20 @@ def attack_prompt(repo: str, number: int, title: str, body: str, *,
                  max_rounds=str(max_rounds))
 
 
-def hardening_note(rounds: int) -> str:
+def hardening_note(rounds: int, *, remedied: bool = False) -> str:
     """The one line the published brief carries about the argument behind it. Pure (test surface).
 
     The maintainer reads the brief, not our records, so what the rounds cost has to be visible in
-    the brief's own comment or it may as well not have happened. Only a draft that ran out of
-    objections is ever published — one that ran out of *rounds* goes to the maintainer instead
-    (:func:`agentflow.coordinated_attack.hold_contested`) — so this note has exactly one story to
-    tell.
+    the brief's own comment or it may as well not have happened. Two endings publish (#418): a
+    draft that ran out of objections, and one whose final round's objections all carried their
+    own fix — the fixes ride in the brief, and the note says which ending this was. A draft that
+    ran out of rounds still genuinely contested goes to the maintainer instead
+    (:func:`agentflow.coordinated_attack.hold_contested`).
     """
     if rounds <= 0:
         return ""
     times = "once" if rounds == 1 else ("twice" if rounds == 2 else f"{rounds} times")
+    ending = ("the last one's remaining objections all carried their own fix, folded into the "
+              "brief above" if remedied else "the last one had nothing left to object to")
     return (f"Before posting this I had it torn into {times} by fresh sessions that hadn't "
-            "seen how it was written — the last one had nothing left to object to.")
+            f"seen how it was written — {ending}.")

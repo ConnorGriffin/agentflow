@@ -14,13 +14,17 @@ def encode_result(result: AttackResult) -> str:
     # round whose reason was dropped between capture and settlement leaves nothing anywhere
     # saying whether the attacker found something or never answered at all.
     return json.dumps({"objections": result.objections, "parsed": result.parsed,
-                       "detail": result.detail}, sort_keys=True)
+                       "detail": result.detail, "remedied": result.remedied,
+                       "fork": result.fork}, sort_keys=True)
 
 
 def decode_result(payload: str) -> AttackResult:
+    # The remedied/fork defaults are the contested side, so a round recorded before #418 settles
+    # exactly as it always did — held, never published on a fact nobody stated.
     data = json.loads(payload)
     return AttackResult(data.get("objections", ""), bool(data.get("parsed", True)),
-                        data.get("detail", ""))
+                        data.get("detail", ""), bool(data.get("remedied", False)),
+                        data.get("fork", ""))
 
 
 class AttackStageAdapter(StageAdapter):

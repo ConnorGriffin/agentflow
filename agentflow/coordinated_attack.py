@@ -300,8 +300,34 @@ def apply_objections(record, result: AttackResult) -> str | None:
     if result.survived:
         return publish_brief(record, draft, hardening_note(record.round))
     if record.round >= max_rounds(draft.complexity):
+        if result.remedied_only:
+            # The clock ran out, but the attacker itself says every surviving objection carries
+            # its own complete fix and none is a fork (#418). That is the same class of objection
+            # the redraft loop absorbs between rounds — a ready draft, not a contested one — so
+            # the brief is published with the fixes riding in it, and only a genuine fork ever
+            # reaches the maintainer. Publication no longer requires unanimous silence.
+            return publish_brief(record, _draft_with_remedies(draft, result),
+                                 hardening_note(record.round, remedied=True))
         return hold_contested(record, draft, result)
     return None   # the argument continues — the next round's opener assumes the claim
+
+
+def _draft_with_remedies(draft: IntakeResult, result: AttackResult) -> IntakeResult:
+    """The published form of a draft whose final round ended all-remedied: the attacker's
+    objections ride in the brief with their fixes, addressed to the builder. Pure (test surface).
+
+    The fixes are appended rather than re-drafted because a redraft would face a fresh cold
+    reader on new text — the exact non-convergence the round cap exists to stop. The builder
+    self-scopes from the brief, so fixes stated against the brief's own criteria are applied
+    where applying matters.
+    """
+    from dataclasses import replace
+    addendum = ("\n\n## Final-round objections — apply these fixes\n\n"
+                "The last attacker's surviving objections, each carrying its own fix; the round "
+                "cap ended the argument before a redraft could absorb them. Build with every "
+                "fix applied — they are part of this brief, not commentary on it.\n\n"
+                f"{result.objections.strip()}")
+    return replace(draft, body=draft.body.rstrip() + addendum)
 
 
 def hold_contested(record, draft: IntakeResult, result: AttackResult) -> str | None:
@@ -322,9 +348,16 @@ def hold_contested(record, draft: IntakeResult, result: AttackResult) -> str | N
                                    proof_marker)
     from agentflow.intake import _DISCLAIMER
     number = int(record.subject)
-    argument = (f"still has objections I couldn't settle:\n\n{result.objections.strip()}"
-                if result.parsed and result.objections.strip() else
-                "ended on an answer I couldn't read, so the last word on it is missing")
+    if result.parsed and result.fork.strip():
+        # The fork leads (#418): the maintainer's question is the choice itself, not a numbered
+        # list of edits with patches attached.
+        argument = (f"comes down to a question only you can settle:\n\n{result.fork.strip()}"
+                    + (f"\n\nThe full objections behind it:\n\n{result.objections.strip()}"
+                       if result.objections.strip() else ""))
+    elif result.parsed and result.objections.strip():
+        argument = f"still has objections I couldn't settle:\n\n{result.objections.strip()}"
+    else:
+        argument = "ended on an answer I couldn't read, so the last word on it is missing"
     reason = f"contested after {record.round} attack round(s)"
     body = (f"{_DISCLAIMER}\n\nI drafted a plan for this and had it torn into by fresh sessions "
             f"that hadn't seen how it was written. After {record.round} round(s) the argument "

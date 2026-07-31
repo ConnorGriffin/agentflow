@@ -176,3 +176,8 @@ Issue-keyed records:
   sign-off, so a commit carries it the moment it is made and no stranded pull request needs a
   human amendment. Confined to the session's own checkout, only for the commit's own author,
   fail-open with one line per repository. Supersedes #357's no-hooks scope line.
+- [ADR 418](adr-418-remedied-objections-publish.md) — Publication stops requiring an empty
+  objection list: the attacker types its own answer (`remedied`, `fork`), a final round whose
+  objections all carry their own fix publishes with the fixes riding in the brief, and only a
+  genuine fork reaches the maintainer — who sees the fork first. Amends ADR 380; the round cap
+  is unchanged.
