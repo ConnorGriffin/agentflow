@@ -208,40 +208,61 @@ that finding-driven Revise carries the builder's complexity.
 
 §3b promised these numbers would ratchet "once per-attempt telemetry (#223) fills the
 thin cells". They have, and the first reading showed the rule in §3b had been violated
-by drift rather than by choice: **every stage capped at 40 had its p90 at or above the
-cap.** Review — the widest sample, n=288 against the n=70 that set the original number —
-had turns p90 = 41 and max = 87 against a cap of 40, and was simultaneously pinned
-against its wall (longest session 899 s against a 900 s ceiling). 38 sessions across the
-fleet ended at exactly the cap, burning $104.18 and recording no verdict, no fix and no
-decision; 28 of them were reviews.
+by drift rather than by choice.
 
-Measured over 465 sessions with recorded usage:
+**Measure the right quantity.** The provider's own reported turn counter cannot be
+compared against `--max-turns`: sessions routinely report more of those than the cap
+allows and still finish cleanly. What the cap bounds is rounds of work — tool calls the
+session issues — so that is what the table below counts, from the recorded session
+streams rather than from the summary counter.
 
-| Stage | n | turns p50 | p90 | p95 | max | dur p95 | dur max |
-|-------|---|-----------|-----|-----|-----|---------|---------|
-| Review | 288 | 14 | **41** | 48 | **87** | 469 s | **899 s** |
-| Intake | 108 | 18 | 37 | **41** | 53 | 335 s | 559 s |
-| Respond | 59 | 14 | **41** | 41 | 58 | 477 s | 594 s |
-| Research | 6 | 34 | 40 | 40 | 40 | 608 s | 608 s |
-| Mockup | 3 | 18 | 67 | 67 | 67 | 1 013 s | 1 013 s |
+Measured over 516 recorded sessions:
+
+| Stage | n | rounds p50 | p90 | p95 | max | dur p95 | dur max | cap |
+|-------|---|-----------|-----|-----|-----|---------|---------|-----|
+| Review | 210 | 26 | **55** | **66** | 335 | 469 s | **899 s** | **40** |
+| Build | 131 | 48 | 113 | 138 | 164 | — | — | 80–300 |
+| Intake | 87 | 19 | 39 | **45** | 52 | 335 s | 559 s | **40** |
+| Respond | 55 | 14 | 40 | **51** | 57 | 477 s | 594 s | **40** |
+| Revise | 23 | 41 | 95 | 99 | 100 | — | — | inherited |
+| Research | 6 | 33 | 39 | 39 | 39 | 608 s | 608 s | 80 |
+
+**Every stage capped at 40 has its p95 above the cap**, review worst at 66 against 40 —
+and review is simultaneously pinned against its wall, its longest session running 899 s
+against a 900 s ceiling.
+
+The direct evidence is stronger than the percentiles. **42 sessions were terminated by
+the ceiling**, the provider naming it outright ("Reached maximum number of turns (40)"),
+31 of them reviews. Rounds of work each had already finished before being cut off:
+
+- review — 40, 44, 46, 46, 47, 47, 47, 48, 48, 48, 48, 49, 50, 50, 50, 50, 50, 51, 51,
+  52, 52, 53, 53, 55, 55, 57, 60, 60, 70, 70, 196
+- respond — 40, 42, 46, 55 · intake — 48 · build — 80, 89, 92 · revise — 95, 99, 100
+
+Each had read the diff and run the suite and was stopped before it could state a verdict.
+$104.18 spent for no verdict, no fix and no decision.
 
 Applying §3b's own rule to that sample:
 
-| Stage | wall ceiling | turn ceiling | grounding |
-|-------|--------------|--------------|-----------|
-| Intake | 20 min (unchanged) | 40 → **80** | max 53 turns / 559 s |
-| Attack | 20 min (unchanged) | 40 → **80** | mirrors intake (ADR 380); n=1 |
-| Review | 15 → **30 min** | 40 → **120** | max 87 turns / 899 s |
-| Respond | 15 → **20 min** | 40 → **80** | max 58 turns / 594 s |
+| Stage | wall ceiling | turn ceiling | grounding (p95) |
+|-------|--------------|--------------|-----------------|
+| Intake | 20 min (unchanged) | 40 → **80** | 45 rounds / 335 s |
+| Attack | 20 min (unchanged) | 40 → **80** | 44 rounds; mirrors intake (ADR 380), n=2 |
+| Review | 15 → **30 min** | 40 → **120** | 66 rounds / 469 s |
+| Respond | 15 → **20 min** | 40 → **80** | 51 rounds / 477 s |
 | Converse | 15 → **20 min** | 40 → **80** | shares respond's shape; no recorded sessions |
-| Research, Mockup, Build, Revise | unchanged | unchanged | already clear of their observed max |
+| Research, Mockup, Build, Revise | unchanged | unchanged | already clear of their p95 |
 
-**A ceiling censors its own distribution**, so every "observed max" above is a lower
-bound: review's 899 s maximum is the wall stopping it, not the work finishing, and every
-turn count sitting on a cap is a session that was cut off rather than done. Hence the new
-values are set clear of the observed max rather than a hair above it, and the observed
-distribution now lives beside the ceiling table in code so the next drift fails a test
-rather than parking a pull request.
+**p95 with headroom, not the maximum.** Two reasons. A ceiling censors its own
+distribution — review's 899 s maximum is the wall stopping it, not the work finishing,
+and every round count sitting on a cap is a session cut off rather than done — so the
+observed numbers are lower bounds. And the tail is genuinely unbounded: one review ran
+335 rounds, which no ceiling that still kills a runaway could clear. Setting the bar at
+p95 and then leaving headroom above it is what makes an ordinary long session survive
+while a runaway still dies.
+
+The observed distribution now lives beside the ceiling table in code, so the next drift
+fails a test rather than parking a pull request.
 
 ### 3c. Fail-closed when a narrow profile is missing a capability
 

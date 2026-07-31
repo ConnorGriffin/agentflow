@@ -48,10 +48,10 @@ _READ_ONLY_TOOLS: dict[str, tuple[str, ...]] = {
 # regresses.
 WITHHELD_EDIT_TOOLS: tuple[str, ...] = ("Edit", "Write", "NotebookEdit")
 
-# Wall (seconds) + turn ceilings for the non-Build stages (§3b). Every ceiling sits above the
-# largest session that stage has actually recorded — that headroom is the whole point, so the
-# ceiling kills a runaway and never an ordinary long session (#410). ``_OBSERVED_MAX`` below
-# carries the distribution each cell was set from; keep the two in step when either moves.
+# Wall (seconds) + turn ceilings for the non-Build stages (§3b). Every ceiling sits clear of the
+# work its stage is recorded needing — that headroom is the whole point, so the ceiling kills a
+# runaway and never an ordinary long session (#410). ``_OBSERVED_P95`` below carries the
+# distribution each cell was set from; keep the two in step when either moves.
 _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
     "intake": (20 * _MIN, 80),
     # An attack re-reads one draft against the code — the same bounded read-only shape as intake,
@@ -64,26 +64,30 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
     "mockup": (60 * _MIN, 200),
 }
 
-# The largest wall (seconds) and turn count each stage has been recorded using, from the fleet's
-# own per-attempt telemetry — 465 sessions with usage, read 2026-07-31. This is the evidence
-# ``_STAGE_CEILINGS`` is set against, not decoration: the §3b rule is that a ceiling sits well
-# above the observed max, and the first table drifted under it unnoticed (review's cap was drawn
-# at 40 from an n=70 sample whose turns p95 was 22; by n=288 the p90 was 41 and the max 87, so one
-# review in five was killed at the cap before it could record a verdict). A stage absent here has
-# no recorded sessions to justify a number.
+# The 95th percentile wall (seconds) and rounds of work each stage has been recorded needing, from
+# the fleet's own session streams — 516 recorded sessions, read 2026-07-31. This is the evidence
+# ``_STAGE_CEILINGS`` is set against, not decoration: the §3b rule is that a ceiling sits well above
+# the work, and the first table drifted under it unnoticed. Review's cap was drawn at 40 from an
+# n=70 sample; by n=210 the p90 was 55 rounds and 31 reviews had been killed at the cap having
+# already read the diff and run the suite (40–70 rounds of finished work apiece) without recording
+# a verdict. A stage absent here has no recorded sessions to justify a number.
 #
-# Read these as lower bounds, not as the work's true maximum: a ceiling censors its own
-# distribution. Review's largest recorded session ran 899 s against a 900 s wall — the wall stopped
-# it, so how long it actually needed is unknown, and the same is true of every turn count that
-# landed on a cap. That is why each ceiling is set clear of the observed max rather than a hair
-# above it.
-_OBSERVED_MAX: dict[str, tuple[int, int]] = {
-    "intake": (559, 53),
-    "attack": (109, 12),
-    "review": (899, 87),
-    "respond": (594, 58),
-    "research": (608, 40),
-    "mockup": (1013, 67),
+# A round is one tool call the session issues — the quantity ``--max-turns`` actually bounds. It is
+# deliberately *not* the provider's own reported turn counter: sessions routinely report more of
+# those than the cap allows and still finish, so that counter cannot be compared against the cap.
+#
+# p95 rather than max, on purpose. A ceiling censors its own distribution — review's longest
+# recorded session ran 899 s against a 900 s wall, so how long it actually needed is unknown — and
+# the tail is genuinely unbounded: one review ran 335 rounds. No ceiling that still kills a runaway
+# can clear that, so the bar is p95 with headroom, and the headroom is what makes an ordinary long
+# session survive.
+_OBSERVED_P95: dict[str, tuple[int, int]] = {
+    "intake": (335, 45),
+    "attack": (109, 44),
+    "review": (469, 66),
+    "respond": (477, 51),
+    "research": (608, 39),
+    "mockup": (1013, 66),
 }
 
 # The reasoning-effort rung each work-effort dial maps to at launch (ADR 0046). Build and revise

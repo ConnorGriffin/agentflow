@@ -216,22 +216,25 @@ def test_non_build_stages_set_no_reasoning_flag(tmp_path):
         assert not any(v.startswith("model_reasoning_effort=") for v in codex_config)
 
 
-def test_every_ceiling_stays_above_the_work_its_stage_actually_does(tmp_path):
-    """A ceiling exists to kill a runaway, so it has to sit above the largest session the stage has
-    really recorded. Review's cap drifted under its own work — drawn at 40 turns from a sample whose
-    p95 was 22, it was below the p90 (41) by the time the sample reached 288, and one review in five
-    was killed at it before recording a verdict (#410). This pins every stage against the recorded
-    distribution the cell was set from, so the next drift fails here instead of parking a PR."""
-    from agentflow.coordinator.profiles import _OBSERVED_MAX, profile_for
+def test_every_ceiling_stays_clear_of_the_work_its_stage_actually_does(tmp_path):
+    """A ceiling exists to kill a runaway, so it has to sit clear of the work its stage is recorded
+    needing. Review's drifted under it: drawn at 40 from an n=70 sample, it was below the p90 (55
+    rounds) by the time the sample reached 210, and 31 reviews were killed at it having already read
+    the diff and run the suite (#410). This pins every stage against the recorded distribution its
+    cell was set from, so the next drift fails here instead of parking a pull request.
 
-    for stage, (observed_wall_s, observed_turns) in _OBSERVED_MAX.items():
+    The bar is the p95 with headroom, not the maximum: the tail is unbounded (one review ran 335
+    rounds) and no ceiling that still kills a runaway could clear it."""
+    from agentflow.coordinator.profiles import _OBSERVED_P95, profile_for
+
+    for stage, (p95_wall_s, p95_rounds) in _OBSERVED_P95.items():
         profile = profile_for(_record(stage, str(tmp_path)))
-        assert profile.turn_ceiling > observed_turns, (
-            f"{stage}: {profile.turn_ceiling}-turn ceiling is not above its recorded "
-            f"maximum of {observed_turns} turns — ordinary long sessions die at it")
-        assert profile.wall_ceiling_s > observed_wall_s, (
-            f"{stage}: {profile.wall_ceiling_s}s wall is not above its recorded "
-            f"maximum of {observed_wall_s}s — ordinary long sessions die at it")
+        assert profile.turn_ceiling > p95_rounds, (
+            f"{stage}: {profile.turn_ceiling}-turn ceiling is not clear of the {p95_rounds} rounds "
+            f"its 95th-percentile session needs — ordinary long sessions die at it")
+        assert profile.wall_ceiling_s > p95_wall_s, (
+            f"{stage}: {profile.wall_ceiling_s}s wall is not clear of the {p95_wall_s}s its "
+            f"95th-percentile session needs — ordinary long sessions die at it")
 
 
 def test_a_ceiling_hit_ends_as_a_recoverable_timeout():
