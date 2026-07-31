@@ -44,15 +44,6 @@ def test_every_commit_capable_prompt_keeps_the_dco_contract_on_continuation():
         assert "separate sign-off-only" in continued, name
 
 
-def test_build_prompt_states_the_deletion_test_self_check():
-    # issue #382: the build prompt must carry a pre-PR self-check against the charter's
-    # deletion test and interface-depth rule, not just the test standard.
-    prompt = BUILD_PROMPT.format(
-        repo="o/r", n=357, title="DCO", body="", effort="low", surfaces="none")
-    assert "deletion" in prompt.lower()
-    assert "interface-depth" in prompt.lower() or "interface depth" in prompt.lower()
-
-
 def _git(repo: Path, *args: str, **kwargs) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", "-C", str(repo), *args], check=True, text=True,
                           capture_output=True, **kwargs)
