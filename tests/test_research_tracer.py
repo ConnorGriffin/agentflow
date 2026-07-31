@@ -669,10 +669,9 @@ def test_a_dead_research_run_releases_the_resolving_claim_a_live_one_retains_it(
     edited = []
     from agentflow import github
 
-    # The claim lanes are listed in order (building, triaging, auditing, drawing, resolving);
-    # only the resolving lane holds the two research-claimed issues. The proof read shows the
-    # label gone.
-    listings = iter([[], [], [], [], [github.ClaimedIssue(5, "2020-01-01T00:00:00Z"),
+    # The claim lanes are listed in order (building, triaging, drawing, resolving); only the
+    # resolving lane holds the two research-claimed issues. The proof read shows the label gone.
+    listings = iter([[], [], [], [github.ClaimedIssue(5, "2020-01-01T00:00:00Z"),
                                   github.ClaimedIssue(6, "2020-01-01T00:00:00Z")]])
     monkeypatch.setattr(github, "claimed_issues", lambda repo, label: next(listings))
     monkeypatch.setattr(github, "remove_label",

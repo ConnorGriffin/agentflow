@@ -96,6 +96,9 @@ class IntakeResult:
     parsed: bool = True
     detail: str = ""
     infra_failed: bool = False       # a worktree/provision/launch failure, not a model decision
+    hardening: str = ""              # what the attack rounds did to this brief before it was
+                                     # published (ADR 380) — appended to the ready comment, so it
+                                     # is part of the comment the durability proof matches
 
 
 def _held(detail: str) -> IntakeResult:
@@ -321,19 +324,10 @@ STATE_LABELS = ("ready-for-agent", "agentflow:needs-grilling", "agentflow:needs-
 # Dial label prefixes — cleared when stamping new dials (or dropping to a hold route).
 _DIAL_PREFIXES = ("agentflow:complexity:", "agentflow:effort:")
 
-# The plan audit's countersign marker (ADR 380). It lives here, with the rest of the managed
-# label vocabulary, because *being managed* is the whole point: a re-route clears it, so an issue
-# bounced back to grilling and later promoted to ready again carries no stale countersign and its
-# new brief is audited fresh. The audit module reads it from here rather than the other way
-# round — intake must not depend on the stage that runs after it.
-_AUDIT_PREFIX = "agentflow:audit:"
-COUNTERSIGNED = f"{_AUDIT_PREFIX}countersigned"
-
-# Every single-valued prefixed label intake manages: the dials, the mockup scope (ADR 0048), and
-# the plan audit's countersign (ADR 380). A re-route leaves exactly one of each, so any managed
-# label not in the new set is stale and cleared — a mockup→ready promotion drops the scope with
-# the dials, and any re-route drops a countersign the old brief earned.
-_MANAGED_PREFIXES = _DIAL_PREFIXES + ("agentflow:mockup:", _AUDIT_PREFIX)
+# Every single-valued prefixed label intake manages: the dials plus the mockup scope
+# (ADR 0048). A re-route leaves exactly one of each, so any managed label not in the new
+# set is stale and cleared — a mockup→ready promotion drops the scope with the dials.
+_MANAGED_PREFIXES = _DIAL_PREFIXES + ("agentflow:mockup:",)
 
 # Bare pre-enrollment vocabulary → agentflow:* canonical form.
 # Note: ready-for-agent stays bare (ADR 0018 — settled; excluded from this map).
@@ -513,6 +507,56 @@ def intake_prompt(repo: str, issue: dict, extra: str = "", comments: str = "") -
     return prompt
 
 
+_REDRAFT = """
+
+YOUR DRAFT WAS ATTACKED. Nothing has been published — the issue is untouched and the maintainer
+has seen none of this. You drafted the plan below, a cold session with no memory of your reasoning
+tried to break it, and these are its objections. This is round {round} of at most {max_rounds};
+answer them and hand back your best plan.
+
+Your draft:
+Title: {draft_title}
+---
+{draft_body}
+---
+
+Its objections:
+---
+{objections}
+---
+
+HOW TO ANSWER:
+- Where an objection lands, FIX THE PLAN. Re-ground it against the code first — the attacker may
+  be wrong about the code too, and adopting a wrong correction is worse than the original claim.
+- Where an objection does not land, keep your plan and say why in one line under a
+  `## Answered objections` heading at the end of the brief. Standing your ground on evidence is a
+  correct answer; folding to every objection is not.
+- If the objections expose a genuine fork that only the maintainer can settle — a real choice that
+  CHANGES THE RESULT and no amount of reading the code decides — route "grill" and ask them. That
+  is not a failure; it is the one thing this whole exercise is for. Do not grill over something you
+  can decide.
+
+Answer with a complete decision, exactly as before: the whole brief again, not a diff against your
+last one. Your route may change; the dials may change."""
+
+
+def redraft_prompt(base_prompt: str, draft_title: str, draft_body: str,
+                   objections: str, *, round: int, max_rounds: int) -> str:
+    """The durable provider input for one hardening round of intake (ADR 380). Pure.
+
+    ``base_prompt`` is the grounding prompt the *first* draft came from, carried unchanged down
+    the chain — so every redraft re-grounds from the same issue snapshot the argument started
+    from, and a round replayed after a crash composes byte-identical input. It is deliberately
+    the whole prompt rather than a follow-up message: this is a new session, so it has to be
+    able to re-ground from nothing.
+    """
+    return base_prompt + _fill(
+        _REDRAFT, round=str(round), max_rounds=str(max_rounds),
+        draft_title=draft_title,
+        draft_body=draft_body.strip() or "(no draft body)",
+        objections=objections.strip() or "(no objections recorded)")
+
+
 def _ensure_label(repo: str, name: str) -> None:
     """Idempotently create the label so `--add-label` can't fail on a fresh repo."""
     color = _LABEL_COLORS.get(name, "ededed")
@@ -520,8 +564,15 @@ def _ensure_label(repo: str, name: str) -> None:
 
 
 def _result_comment(result: IntakeResult) -> str:
-    """The stable comment payload for one route, excluding an optional retitle preface."""
-    return _READY_COMMENT if result.route is IntakeRoute.READY else result.body
+    """The stable comment payload for one route, excluding an optional retitle preface.
+
+    A published brief carries one extra line saying what the attack rounds did to it before it
+    was posted (ADR 380). It is part of the stable payload rather than a second comment, so the
+    idempotence and durability proofs keep matching exactly one comment per route.
+    """
+    if result.route is not IntakeRoute.READY:
+        return result.body
+    return f"{_READY_COMMENT}\n\n{result.hardening}" if result.hardening else _READY_COMMENT
 
 
 def _comment_matches_result(body: str, result: IntakeResult) -> bool:

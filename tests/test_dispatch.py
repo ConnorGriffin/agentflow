@@ -24,8 +24,8 @@ from agentflow.loop import RepoConfig
 
 
 def test_stage_caps_remain_named_inputs_to_the_coordinator_gate():
-    assert dict(admission.STAGE_CAPS) == {"triage": 3, "audit": 3, "build": 2, "mockup": 1,
-                                          "respond": 1, "research": 1}
+    assert dict(admission.STAGE_CAPS) == {"triage": 3, "build": 2, "mockup": 1, "respond": 1,
+                                          "research": 1}
     assert admission.MACHINE_CEILING > 0
 
 
@@ -164,7 +164,7 @@ def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     # The four claim lanes are listed in order (building, triaging, drawing, resolving); only the
     # building lane holds a stale-claimed issue. The proof read back shows the label gone.
-    listings = iter([[github.ClaimedIssue(7, "2020-01-01T00:00:00Z")], [], [], [], []])
+    listings = iter([[github.ClaimedIssue(7, "2020-01-01T00:00:00Z")], [], [], []])
     monkeypatch.setattr(github, "claimed_issues", lambda repo, label: next(listings))
     removed = []
     monkeypatch.setattr(github, "remove_label",
@@ -202,8 +202,7 @@ def test_claim_reconciliation_reads_labels_off_the_hourly_budget_not_search(monk
     assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
     assert removed == [7]
     assert asked == [("o/r", "agentflow:building"), ("o/r", "agentflow:triaging"),
-                     ("o/r", "agentflow:auditing"), ("o/r", "agentflow:drawing-mockup"),
-                     ("o/r", "wayfinder:resolving")]
+                     ("o/r", "agentflow:drawing-mockup"), ("o/r", "wayfinder:resolving")]
 
 
 def test_unreadable_coordinator_state_clears_no_claim(monkeypatch):
@@ -231,7 +230,7 @@ def test_waiting_owner_retains_claim_but_settled_hold_does_not(monkeypatch):
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [waiting, held])
     # The building lane lists both issues; #7 is shielded by the live waiting build, #8 is not.
     listings = iter([[github.ClaimedIssue(7, "2020-01-01T00:00:00Z"),
-                      github.ClaimedIssue(8, "2020-01-01T00:00:00Z")], [], [], [], []])
+                      github.ClaimedIssue(8, "2020-01-01T00:00:00Z")], [], [], []])
     monkeypatch.setattr(github, "claimed_issues", lambda repo, label: next(listings))
     removed = []
     monkeypatch.setattr(github, "remove_label",
@@ -303,10 +302,7 @@ def _ready_queue(monkeypatch, rows, in_flight=frozenset()):
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set(in_flight))
 
 
-# The build queue takes only briefs the cold plan audit countersigned (ADR 380), so a fixture
-# that means "the queue would build this" carries the marker alongside its dials.
-_AUDITED = "agentflow:audit:countersigned"
-_DIALS = ["ready-for-agent", _AUDITED, "agentflow:complexity:deep", "agentflow:effort:high"]
+_DIALS = ["ready-for-agent", "agentflow:complexity:deep", "agentflow:effort:high"]
 
 
 def test_build_pass_skips_a_mislabelled_queue_head_and_submits_the_next_issue(
@@ -315,7 +311,7 @@ def test_build_pass_skips_a_mislabelled_queue_head_and_submits_the_next_issue(
     # queued behind it — the same pass reports it and submits the next candidate (#327).
     from agentflow.coordinator.record import Record, WAITING
 
-    _ready_queue(monkeypatch, [(462, ["ready-for-agent", _AUDITED]), (468, _DIALS)])
+    _ready_queue(monkeypatch, [(462, ["ready-for-agent"]), (468, _DIALS)])
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     claimed = []
     monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: claimed.append(number) or True)
@@ -374,8 +370,7 @@ def test_build_pass_stops_when_the_ready_queue_cannot_be_read(monkeypatch, tmp_p
 
 
 def test_build_pass_reports_when_every_ready_candidate_is_undispatchable(monkeypatch, tmp_path):
-    _ready_queue(monkeypatch, [(1, ["ready-for-agent", _AUDITED]),
-                               (2, ["ready-for-agent", _AUDITED])])
+    _ready_queue(monkeypatch, [(1, ["ready-for-agent"]), (2, ["ready-for-agent"])])
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("nothing runnable to claim"))
     coord = SimpleNamespace(submit_stage=lambda s: "id", stage_record=lambda identity: None)
@@ -1080,9 +1075,8 @@ def test_a_repository_that_cannot_carry_a_session_receives_no_cold_work(monkeypa
     monkeypatch.setattr(dispatch.pipeline, "owned_worktrees", lambda cfg: {"/live"})
     monkeypatch.setattr(dispatch, "dispatch_preflight",
                         lambda repo, workdir, protected, _log=None: repo != "o/poisoned")
-    for name in ("_submit_coordinated_intake", "_submit_coordinated_plan_audit",
-                 "_submit_coordinated_build", "_submit_coordinated_respond",
-                 "_submit_coordinated_research"):
+    for name in ("_submit_coordinated_intake", "_submit_coordinated_build",
+                 "_submit_coordinated_respond", "_submit_coordinated_research"):
         monkeypatch.setattr(dispatch, name,
                             lambda *a, _stage=name: submitted.append(_stage) or "done")
 
@@ -1090,9 +1084,8 @@ def test_a_repository_that_cannot_carry_a_session_receives_no_cold_work(monkeypa
     assert submitted == []
 
     dispatch._submit_repo(RepoConfig("o/healthy", "/h"), SimpleNamespace(), lambda _line: None)
-    assert submitted == ["_submit_coordinated_intake", "_submit_coordinated_plan_audit",
-                         "_submit_coordinated_build", "_submit_coordinated_respond",
-                         "_submit_coordinated_research"]
+    assert submitted == ["_submit_coordinated_intake", "_submit_coordinated_build",
+                         "_submit_coordinated_respond", "_submit_coordinated_research"]
 
 
 def _thread(*rows) -> list[dict]:

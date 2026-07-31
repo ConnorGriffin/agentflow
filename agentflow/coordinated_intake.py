@@ -9,7 +9,8 @@ from pathlib import Path
 from agentflow import github
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import PROVIDER_INPUT_V1
-from agentflow.intake import IntakeResult, apply_intake, intake_prompt, intake_result_is_durable
+from agentflow.intake import (IntakeResult, IntakeRoute, apply_intake, intake_prompt,
+                              intake_result_is_durable)
 from agentflow.labels import TRIAGING, release
 from agentflow.runner import _run
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
@@ -122,6 +123,13 @@ def intake_claim_ready(record) -> bool:
 def apply_route(record, result: IntakeResult) -> str | None:
     """Idempotently project the already-durable route, proving it before claim release.
 
+    A ``ready`` route is **not projected here at all** (ADR 380). It is a *draft*: nothing is
+    written to the issue, the triaging claim is retained, and this returns ``None`` so the record
+    stays completed-and-unretired until the attack round it opens assumes the claim. A brief
+    reaches GitHub exactly once, from :func:`agentflow.coordinated_attack.publish_brief`, after it
+    has survived its attackers — so a draft that never survives is never something the maintainer
+    had to read.
+
     A ``grill`` or ``mockup`` route is a handoff — it asks a human for something — so it goes
     through the shared :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042): the
     route's own comment is the durable marker, and the operator is pinged once the envelope can
@@ -140,6 +148,8 @@ def apply_route(record, result: IntakeResult) -> str | None:
         number = int(record.subject)
     except (ValueError, KeyError, TypeError):
         return None
+    if result.route is IntakeRoute.READY:
+        return None   # a draft, not a decision — the attack round takes it from here
     source_title = snapshot.get("title", "")
     source_body = snapshot.get("body", "")
 

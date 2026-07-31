@@ -59,7 +59,6 @@ def mockup_scope_from_labels(labels: list[str]) -> MockupScope:
 
 BUILDING = "agentflow:building"   # dispatch claim — an agent is building this issue
 TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns this issue
-AUDITING = "agentflow:auditing"   # dispatch claim — a cold plan audit owns this ready issue
 DRAWING = "agentflow:drawing-mockup"   # dispatch claim — a session is drawing this issue's variants
 RESEARCH_TICKET = "wayfinder:research"   # the one AFK-able planning ticket type the daemon may run
 RESOLVING = "wayfinder:resolving"        # shared claim — a session (human or daemon) owns this ticket
@@ -90,7 +89,6 @@ MOCKUP_MARK = "mockup variants"
 _CLAIM_LABELS = {
     BUILDING: ("fbca04", "An agent is building this issue"),
     TRIAGING: ("d4c5f9", "Intake ownership claim — prevents duplicate dispatch"),
-    AUDITING: ("c5def5", "A cold plan audit is re-reading this brief before it is built"),
     DRAWING: ("fef2c0", "A session is drawing mockup variants for this issue"),
     RESOLVING: ("5319e7", "A session is resolving this planning ticket"),
 }

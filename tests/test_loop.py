@@ -32,11 +32,6 @@ class _FakeRun:
         self.returncode = returncode
 
 
-# The plan audit's countersign (ADR 380): the build queue takes no brief without it, so a
-# fixture that means "ready to build" carries it.
-AUDITED = "agentflow:audit:countersigned"
-
-
 def _issue_row(number, labels=(), title="t", body="b"):
     """A typed issue row as the shared GitHub module's discovery listing returns."""
     return github.IssueRow(number=number, title=title, body=body,
@@ -123,7 +118,7 @@ def test_free_to_dispatch_skips_claimed_or_in_flight(monkeypatch):
 
 def test_free_to_dispatch_ignores_blocked_by_in_incidental_prose(monkeypatch):
     issue = {"number": 5, "body": "This may be Blocked by #41 after the next review.",
-             "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}
+             "labels": [{"name": "ready-for-agent"}]}
     # No native edges, and the prose isn't a real `Blocked by #N` declaration — so no blocker
     # state is ever read (a read here would mean the incidental prose was treated as a blocker).
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
@@ -138,7 +133,7 @@ def test_untriaged_skips_state_labels_and_triage_claim():
     assert _untriaged(fresh) is True
     triaging = {"number": 2, "labels": [{"name": "bug"}, {"name": "agentflow:triaging"}]}
     assert _untriaged(triaging) is False   # a grounding session already owns it — no re-dispatch
-    routed = {"number": 3, "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}
+    routed = {"number": 3, "labels": [{"name": "ready-for-agent"}]}
     assert _untriaged(routed) is False     # already has a state label
 
 
@@ -215,7 +210,7 @@ def test_issues_in_flight_still_recognizes_conventional_branch(monkeypatch):
 
 
 def test_next_ready_issue_fails_closed_when_in_flight_unknown(monkeypatch):
-    ready = [_issue_row(5, ["ready-for-agent", AUDITED], body="")]
+    ready = [_issue_row(5, ["ready-for-agent"], body="")]
     monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())   # no blockers
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: None)
@@ -245,7 +240,7 @@ def _native_edge(number, state, repo="o/r"):
 
 def test_next_ready_issue_skips_an_issue_blocked_by_an_open_issue(monkeypatch):
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     _ready_dispatch(monkeypatch, ready, {41: "OPEN"})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
@@ -255,9 +250,9 @@ def test_next_ready_issue_skips_an_issue_blocked_by_an_open_issue(monkeypatch):
 def test_next_ready_issue_logs_blocked_skip_and_selects_next_issue(monkeypatch):
     ready = [
         {"number": 43, "title": "independent", "body": "",
-         "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]},
+         "labels": [{"name": "ready-for-agent"}]},
         {"number": 42, "title": "dependent", "body": "Blocked by #41",
-         "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]},
+         "labels": [{"name": "ready-for-agent"}]},
     ]
     logs = []
     _ready_dispatch(monkeypatch, ready, {41: "OPEN"})
@@ -272,7 +267,7 @@ def test_next_ready_issue_logs_blocked_skip_and_selects_next_issue(monkeypatch):
 def test_next_ready_issue_rechecks_all_blockers_each_pass(monkeypatch):
     ready = [{"number": 42, "title": "dependent",
               "body": "Blocked by #40\n\nBlocked by #41",
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     blocker_states = {40: "CLOSED", 41: "OPEN"}
     _ready_dispatch(monkeypatch, ready, blocker_states)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
@@ -285,7 +280,7 @@ def test_next_ready_issue_rechecks_all_blockers_each_pass(monkeypatch):
 
 def test_next_ready_issue_fails_closed_when_blocker_state_is_unknown(monkeypatch):
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     logs = []
     _ready_dispatch(monkeypatch, ready, {41: None})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
@@ -297,7 +292,7 @@ def test_next_ready_issue_fails_closed_when_blocker_state_is_unknown(monkeypatch
 
 def test_next_ready_issue_fails_closed_on_malformed_blocker_state(monkeypatch):
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #41",
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     logs = []
     # A malformed blocker-state response reads back as None (unknown) through the module.
     _ready_dispatch(monkeypatch, ready, {41: None})
@@ -312,7 +307,7 @@ def test_next_ready_issue_sees_blocker_preserved_by_intake(monkeypatch):
     body = compose_ready_body("## Agent Brief\nBuild the dependent slice.",
                               "Original request.\n\nBlocked by #41")
     ready = [{"number": 42, "title": "dependent", "body": body,
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     _ready_dispatch(monkeypatch, ready, {41: "OPEN"})
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
 
@@ -341,7 +336,7 @@ def test_next_ready_issue_holds_on_open_native_blocker(monkeypatch):
     # A native blocked-by edge with no prose line at all must still hold the issue —
     # the regression this ticket exists to fix (native edges were invisible before).
     ready = [{"number": 42, "title": "dependent", "body": "",
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     native = {42: {41}}
     _ready_dispatch(monkeypatch, ready, {41: "OPEN"}, native)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
@@ -351,7 +346,7 @@ def test_next_ready_issue_holds_on_open_native_blocker(monkeypatch):
 
 def test_next_ready_issue_frees_on_closed_native_blocker(monkeypatch):
     ready = [{"number": 42, "title": "dependent", "body": "",
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     native = {42: {41}}
     _ready_dispatch(monkeypatch, ready, {41: "CLOSED"}, native)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
@@ -362,7 +357,7 @@ def test_next_ready_issue_frees_on_closed_native_blocker(monkeypatch):
 def test_next_ready_issue_unions_prose_and_native_blockers(monkeypatch):
     # Prose blocker #40 is closed; a native blocker #41 is open. Either open source holds.
     ready = [{"number": 42, "title": "dependent", "body": "Blocked by #40",
-              "labels": [{"name": "ready-for-agent"}, {"name": AUDITED}]}]
+              "labels": [{"name": "ready-for-agent"}]}]
     native = {42: {41}}
     blocker_states = {40: "CLOSED", 41: "OPEN"}
     _ready_dispatch(monkeypatch, ready, blocker_states, native)
@@ -375,7 +370,7 @@ def test_next_ready_issue_unions_prose_and_native_blockers(monkeypatch):
 
 
 def test_next_ready_issue_fails_closed_when_native_read_fails(monkeypatch):
-    ready = [_issue_row(42, ["ready-for-agent", AUDITED], title="dependent", body="")]
+    ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
     logs = []
     monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
     monkeypatch.setattr(github, "api", lambda *a, **k: None)   # native fetch failed — unknown
@@ -386,7 +381,7 @@ def test_next_ready_issue_fails_closed_when_native_read_fails(monkeypatch):
 
 
 def test_next_ready_issue_fails_closed_on_malformed_native_response(monkeypatch):
-    ready = [_issue_row(42, ["ready-for-agent", AUDITED], title="dependent", body="")]
+    ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
     # A malformed native response reads back as None through the module — never "no blockers".
     monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
     monkeypatch.setattr(github, "api", lambda *a, **k: None)
@@ -397,7 +392,7 @@ def test_next_ready_issue_fails_closed_on_malformed_native_response(monkeypatch)
 
 def test_next_ready_issue_ignores_cross_repo_native_blocker(monkeypatch):
     # A native edge pointing at another repo does not by itself hold the issue.
-    ready = [_issue_row(42, ["ready-for-agent", AUDITED], title="dependent", body="")]
+    ready = [_issue_row(42, ["ready-for-agent"], title="dependent", body="")]
     edges = [_native_edge(41, "OPEN", repo="other/repo")]
     monkeypatch.setattr(github, "list_issues", lambda repo, **k: list(ready))
     monkeypatch.setattr(github, "api", lambda *a, **k: edges)   # real filtering drops it
@@ -523,27 +518,12 @@ def _issue_view(monkeypatch, issue):
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
 
 
-def test_build_issue_refuses_a_brief_no_audit_has_countersigned(monkeypatch):
-    # `build <N>` skips the queue, never the gate (ADR 380). A brief nobody re-read must not
-    # reach a builder just because a maintainer typed the issue number — the redirect sends them
-    # to run that audit here, in the session they are already in.
-    issue = _canned_issue(labels=["ready-for-agent", "agentflow:complexity:standard"])
-    _issue_view(monkeypatch, issue)
-    monkeypatch.setattr(loop, "claim", lambda *a: pytest.fail("nothing may be claimed"))
-    monkeypatch.setattr(pipeline, "build_coordinator",
-                        lambda: pytest.fail("no build may be submitted"))
-
-    out = build_issue(RepoConfig("o/r", "/tmp"), 5)
-
-    assert "not audited" in out and "audit" in out
-
-
 def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     from agentflow import coordinated_build
     from agentflow.coordinator.record import Record, WAITING
 
     issue = _canned_issue(state="OPEN", title="t", body="b",
-                         labels=["ready-for-agent", AUDITED, "agentflow:complexity:standard"])
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -580,7 +560,7 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     from agentflow.coordinator.record import HELD, WAITING, Record
 
     issue = _canned_issue(state="OPEN", title="t", body="b",
-                         labels=["ready-for-agent", AUDITED, "agentflow:complexity:standard"])
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     # pick_pair offers codex, but the held Build was built by claude — the resume must pin back.
@@ -624,7 +604,7 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
     from agentflow.coordinator.record import Record, WAITING
 
     issue = _canned_issue(state="OPEN", title="t", body="b",
-                         labels=["ready-for-agent", AUDITED, "agentflow:complexity:standard"])
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -659,7 +639,7 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
     from agentflow.coordinator.record import HELD, Record, WAITING
 
     issue = _canned_issue(state="OPEN", title="t", body="b",
-                         labels=["ready-for-agent", AUDITED, "agentflow:complexity:standard"])
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -696,7 +676,7 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
 
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
     issue = _canned_issue(state="OPEN", title="t", body="b",
-                         labels=["ready-for-agent", AUDITED, "agentflow:complexity:standard"])
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
@@ -718,7 +698,7 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
 
 def test_build_issue_refuses_an_open_blocker(monkeypatch):
     issue = _canned_issue(state="OPEN", title="dependent", body="Blocked by #41",
-                         labels=["ready-for-agent", AUDITED, "agentflow:complexity:standard"])
+                         labels=["ready-for-agent", "agentflow:complexity:standard"])
     monkeypatch.setattr(github, "issue_view", lambda repo, n: issue)
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
     monkeypatch.setattr(github, "issue_state", lambda repo, n: "OPEN")   # blocker #41 open
@@ -813,7 +793,7 @@ def test_next_resumable_issue_returns_none_on_gh_error(monkeypatch):
 
 def test_build_issue_refuses_an_in_flight_issue(monkeypatch):
     issue = _canned_issue(state="OPEN", title="t", body="b",
-                         labels=["ready-for-agent", AUDITED, "agentflow:complexity:deep"])
+                         labels=["ready-for-agent", "agentflow:complexity:deep"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: {9})   # an open agentflow PR owns it
     out = build_issue(RepoConfig("o/r", "/tmp"), 9)

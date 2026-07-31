@@ -234,26 +234,35 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   pull if the repo declares one), rewrites the title/description, stamps the dials, and
   routes to one outcome — `ready-for-agent`, `needs-mockup`, or `needs-grilling`. Not a
   tollbooth: it scopes anything it can pin down confidently and holds only an
-  *outcome-changing* fork it can't settle from code/data (ADR 0016).
+  *outcome-changing* fork it can't settle from code/data (ADR 0016). A `ready` decision is
+  a *draft*, not a publication: it must survive its attack rounds before the issue ever
+  changes (ADR 380).
 
-- **Plan audit** — the bounded adversarial stage standing between `ready-for-agent` and a
-  builder: a *cold* session, carrying nothing from the intake that wrote the brief, re-reads
-  that brief against the repository and judges it on five axes — grounding, acceptance,
-  interface shape, scope and complexity budget, and cost. Read-only; it never edits the brief,
-  the issue, or the code. Every ready issue is audited regardless of its dials. It answers with
-  exactly one of two verdicts, and anything unreadable is a bounce (ADR 380).
-  *Avoid:* plan review (the operator's own interactive skill), pre-build review.
+- **Draft** — the brief a triage round hands back instead of publishing (ADR 380). Nothing
+  on GitHub changes while a draft exists: the maintainer never reads one, and a draft that
+  never survives its attackers was never anything anyone had to un-read.
+  *Avoid:* brief (reserved for the published artifact).
 
-- **Countersign** — the plan audit's verdict that a brief survives: the issue is marked audited
-  and dispatches to build on the same cycle it otherwise would have, with nothing else changed.
-  A countersign belongs to the brief that earned it — re-triaging an issue clears it, so a new
-  brief is always audited fresh. An empty objection list is a successful audit, not a lazy one.
+- **Attack** — one cold session asked to break a draft before it is published: it carries
+  nothing from the session that wrote it, reads only the *newest* draft against the actual
+  repository, and answers with numbered objections — each with its evidence, why it breaks
+  the build if unfixed, and the cheapest fix — or with none, which is a draft surviving,
+  not an attacker slacking. Runs at the draft's own complexity dial: a standard brief gets
+  one round on the standard tier, a deep one up to three on the deep tier. Taste is not an
+  objection. *Avoid:* plan audit, pre-build review (both suggest judging a published plan).
 
-- **Bounce** — the plan audit's other verdict: the brief does not survive, so the issue leaves
-  the build queue and becomes a held issue whose questions are the auditor's numbered
-  objections, each with its evidence, why it breaks the build if unfixed, and the cheapest fix.
-  The maintainer's reply re-runs intake exactly as it does for any other held issue.
-  *Avoid:* reject, fail (neither says the work returns to the maintainer).
+- **Redraft** — the fresh triage round that answers an attacker: it re-grounds from the
+  same issue snapshot, fixes what landed, and defends what didn't under an
+  `## Answered objections` heading *inside* the brief — the only place a settlement can
+  live, since the next attacker reads the draft and nothing else. A redraft may still
+  route to grilling when the objections expose a fork only the maintainer can settle.
+
+- **Hardened brief** — the draft that ran out of objections, published as the ready brief
+  through the ordinary intake projection, with one line saying what the argument cost. This
+  is the only way a brief reaches `ready-for-agent` from the daemon's triage. A draft that
+  runs out of *rounds* still contested is never published — it becomes a held issue whose
+  question is the surviving objections. *Avoid:* countersigned (there is no marker; the
+  publication itself is the proof).
 
 - **Held issue** — an issue parked at `needs-grilling` or `needs-mockup`: inert to
   agents until its missing input is durably supplied. It remains a build issue;
