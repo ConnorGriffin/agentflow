@@ -150,19 +150,39 @@ _PROVIDER_FAILURE_COPY = {
                     f"can run again; once it's back, {_RETRY}"),
 }
 
+# The one condition that is not the provider's at all: the machine could not carry a session, so
+# the agent never got a working command line and never reached this issue (issue #386). It needs
+# its own whole body rather than a tail on ``_NEVER_READ`` — nothing here is the coding agent's
+# provider refusing anything, and the remedy is on the machine rather than in the issue. Fixed
+# text like the others, so a restarted daemon recomposes it byte-identically.
+_ENVIRONMENT_FAILURE = (
+    "I never got as far as reading this issue — the machine that runs the coding agent couldn't "
+    "give it a working command line, so the session stopped before it could look at anything. "
+    "Nothing here is waiting on a decision from you, the issue itself is fine, and no amount of "
+    "retrying would have helped.\n\nThis is almost always too many leftover session checkouts "
+    "piling up in the repository: past a point, the safety rules the coding agent passes to "
+    "every command grow larger than the operating system will accept, and every session in that "
+    f"repository dies on its first command. Reclaim those leftover checkouts, then {_RETRY}")
+
 
 def _provider_failed(detail: str, reason: str = "unspecified") -> IntakeResult:
-    """A *permanent* provider condition stopped the session before the model ever read the
-    issue (issue #328). There is no product decision waiting, so the handoff names the failure
-    and its remediation instead of asking the human to settle a scope question that was never
-    asked. ``reason`` says *which* condition it was, so a rejected request or a spend ceiling
-    isn't misdiagnosed as an expired sign-in (issue #342); an unknown reason falls back to the
-    neutral body that prescribes no wrong remedy. The route stays ``GRILL`` so the held state
-    label and the durable-handoff marker machinery are unchanged; each body is fixed text for
-    its reason so a restarted daemon re-detects the same marker."""
-    tail = _PROVIDER_FAILURE_COPY.get(reason, _PROVIDER_FAILURE_COPY["unspecified"])
-    body = f"{_DISCLAIMER}\n\n{_NEVER_READ}{tail}"
-    return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail, infra_failed=True)
+    """A *permanent* condition stopped the session before the model ever read the issue (issue
+    #328). There is no product decision waiting, so the handoff names the failure and its
+    remediation instead of asking the human to settle a scope question that was never asked.
+    ``reason`` says *which* condition it was, so a rejected request or a spend ceiling isn't
+    misdiagnosed as an expired sign-in (issue #342), and an environment that couldn't carry a
+    session at all names the machine rather than blaming the coding agent's provider (issue
+    #386); an unknown reason falls back to the neutral body that prescribes no wrong remedy. The
+    route stays ``GRILL`` so the held state label and the durable-handoff marker machinery are
+    unchanged; each body is fixed text for its reason so a restarted daemon re-detects the same
+    marker."""
+    if reason == "environment":
+        body = _ENVIRONMENT_FAILURE
+    else:
+        body = _NEVER_READ + _PROVIDER_FAILURE_COPY.get(
+            reason, _PROVIDER_FAILURE_COPY["unspecified"])
+    return IntakeResult(IntakeRoute.GRILL, f"{_DISCLAIMER}\n\n{body}",
+                        parsed=False, detail=detail, infra_failed=True)
 
 
 def _infra_failed(detail: str) -> IntakeResult:

@@ -17,6 +17,11 @@ SHELL_CRIB = """
 Shell habits for this sandbox — following them avoids the command rejections that burn retry
 cycles. Different tools sandbox the shell differently, so if the harness ever rejects a command,
 adjust it as below rather than re-running the same form hoping it passes:
+- One exception, first: if the harness says it could not START your shell at all — it could not
+  start, spawn, or launch the shell process, rather than rejecting what the command does — that
+  is NOT an adjustable rejection. Nothing about the command caused it and no other command shape
+  will pass. Do not try variants. Say plainly that the shell would not start, and stop working
+  through the shell.
 - Keep each command to one operation. If a `;`- or `&&`-chained command is rejected, split it
   into separate commands instead of retrying the chain.
 - Prefer passing the target path to the tool over a `cd <dir> && ...` prefix: `git -C <dir> ...`,

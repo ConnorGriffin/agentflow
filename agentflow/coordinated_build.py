@@ -172,15 +172,73 @@ def _collision_comment(comment: github.Comment, admitted_at: int) -> bool:
     return created > admitted_at
 
 
+# What the held-build comment says stopped this build, chosen from the persisted hold reason so
+# a restarted daemon recomposes the same words. Until #386 every non-collision hold read as
+# "continuation budget exhausted" — true only for a build that really did run out of tries, and
+# actively misleading for a build that never reached the work at all.
+_EXHAUSTED_STATUS = "continuation budget exhausted"
+_COLLISION_STATUS = ("could not rebase past a collision with newer changes on the main branch "
+                     "and stopped without resolving it")
+_ENVIRONMENT_STATUS = ("the machine couldn't give the coding agent a working command line — "
+                       "usually too many leftover session checkouts in this repository — so it "
+                       "never reached the work, and no attempt was spent")
+# One phrase per kind of permanent provider condition, mirroring the diagnosis intake already
+# gives (issue #342); a build held for one of these is not a build that ran out of tries.
+_PERMANENT_STATUS = {
+    "access": ("the coding agent's provider refused the session outright — an expired sign-in, "
+               "a billing or plan limit, or a permission problem — so it never reached the work"),
+    "rejected-request": ("the coding agent's provider rejected the request itself, so it never "
+                         "reached the work"),
+    "spend": ("the coding agent's provider stopped the run at its configured spending cap "
+              "before it reached the work"),
+    "unspecified": ("the coding agent's provider ended the session permanently without saying "
+                    "which condition it was, so it never reached the work"),
+}
+
+
+def _marker_status(reason: str | None) -> str:
+    """The status string this record's post-once marker is derived from — deliberately frozen.
+
+    The marker is a hash of the record identity plus a status string, and a ``held`` record
+    recomposes it on every later cycle. So the words a hold *displays* cannot be the words it
+    keys on: changing them would make an issue that is already held look unheld and post a
+    second comment on the next deploy. This returns exactly the two strings the marker has
+    always been keyed on, for every reason, so no existing hold's marker moves — while
+    ``_hold_status`` is free to say something truer. Pure (test surface)."""
+    return _COLLISION_STATUS if reason == "integration collision" else _EXHAUSTED_STATUS
+
+
+def _hold_status(reason: str | None) -> tuple[str, str]:
+    """The maintainer-facing status phrase and notification headline for one persisted hold
+    reason. A collision, an environment that couldn't carry a session, and each kind of
+    permanent provider condition read as themselves; every other reason — a genuinely spent
+    budget, a replay that would have been identical, a completed stage with no successor —
+    keeps the exhaustion wording it has always had. Pure (test surface)."""
+    from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON,
+                                                   parse_permanent_hold_reason)
+    from agentflow.coordinator.providers import PermanentReason
+
+    if reason == "integration collision":
+        return _COLLISION_STATUS, "Build hit an integration collision"
+    if reason and reason.startswith(PERMANENT_HOLD_REASON):
+        permanent = parse_permanent_hold_reason(reason)
+        if permanent is PermanentReason.ENVIRONMENT:
+            return _ENVIRONMENT_STATUS, "Build never got a working session"
+        return (_PERMANENT_STATUS.get(permanent.value, _PERMANENT_STATUS["unspecified"]),
+                "Build's coding agent could not run")
+    return _EXHAUSTED_STATUS, "Build continuation budget exhausted"
+
+
 def _hold_build(record) -> str | None:
     """Create and prove Build's exhaustion handoff without touching its worktree.
 
     The crash-safe post-once → prove → notify recipe is the shared
     :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042). The marker is a hidden tag
-    derived from this record and why it stopped, carried at the end of the held-build comment:
-    the comment's own text names only which of two fixed stoppages happened, so a resumed build
-    reusing the same retained worktree would compose the identical words and read as already
-    handed off.
+    derived from this record and a frozen name for why it stopped, carried at the end of the
+    held-build comment: the comment's own text names only which of a few fixed stoppages
+    happened, so a resumed build reusing the same retained worktree would compose the identical
+    words and read as already handed off. What the comment *says* is chosen separately from what
+    the marker keys on, so the wording can improve without un-holding an issue already held.
 
     Releasing the visible building claim and proving the resulting held state are stage
     bookkeeping that run once the handoff confirms. A projection interrupted after its comment
@@ -196,9 +254,8 @@ def _hold_build(record) -> str | None:
         number = int(record.subject)
     except (TypeError, ValueError):
         return None
-    status = ("could not rebase past a collision with newer changes on the main branch and stopped "
-              "without resolving it" if record.hold_reason == "integration collision"
-              else "continuation budget exhausted")
+    status, headline = _hold_status(record.hold_reason)
+    marker_status = _marker_status(record.hold_reason)
     # The worktree is retained for the human — but no longer forever: a held source that goes a
     # day untouched may be archived to a recovery ref and reclaimed (ADR 0050), so the comment
     # that sends a maintainer to that directory must also say how to find the work if it is gone.
@@ -207,11 +264,13 @@ def _hold_build(record) -> str | None:
              f"refs/agentflow/stranded/{Path(record.source or '').name}/`)")
     result = held_build_result(status, where)
     # A hold posted before this record carried its own marker is still proof of itself, so an
-    # issue already held when the daemon deploys is never commented on twice. The marker goes
-    # *between* the disclaimer and the ask rather than at the end, so that a marked comment does
-    # not itself contain the old whole-body text and re-answer for a different record's hold.
-    legacy_marker = result.body.strip()
-    marker = proof_marker(record.identity, status, tag="build-hold")
+    # issue already held when the daemon deploys is never commented on twice. Both proofs are
+    # composed from the *frozen* marker status, never the displayed one, so a hold that landed
+    # under the old wording still recognizes itself. The marker goes *between* the disclaimer and
+    # the ask rather than at the end, so that a marked comment does not itself contain the old
+    # whole-body text and re-answer for a different record's hold.
+    legacy_marker = held_build_result(marker_status, where).body.strip()
+    marker = proof_marker(record.identity, marker_status, tag="build-hold")
     result = replace(result, body=marked_body(result.body, marker))
 
     def project() -> bool:
@@ -223,8 +282,6 @@ def _hold_build(record) -> str | None:
         apply_intake(record.repo, number, live.title, sorted(live.labels), result)
         return True
 
-    headline = ("Build hit an integration collision" if record.hold_reason == "integration collision"
-                else "Build continuation budget exhausted")
     url = DurableHandoff().hand_off(
         Subject(repo=record.repo, number=number, kind="issue"),
         identity=record.identity, stage="build-hold",
