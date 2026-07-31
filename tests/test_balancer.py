@@ -192,8 +192,10 @@ def test_cold_pool_bootstraps_from_transcript_estimate(stub_gate, isolate_state,
     """A cold daemon has never persisted a Claude quota fact (empty quota/). Before #309 this
     wedged the pool closed ('pool bootstrapping') until an operator ran an interactive turn — an
     unattended fleet never did, so the whole thing deadlocked. Now the trailing-five-hour proxy
-    seeds a bootstrap estimate so a cold pool dispatches on its own."""
+    seeds a bootstrap estimate so a cold pool dispatches on its own. The weekly fact is seeded
+    under its allowance so the five-hour bootstrap stays the decider under the paced dashboard."""
     monkeypatch.setenv("TEST_SPEND_PCT", "20")   # proxy well under the idle ceiling
+    _seed_claude_weekly(1.0)
     claude = next(p for p in pools() if p["tool"] == "claude")
     assert claude["clear"]
     assert claude["spent_pct"] == 20.0
@@ -264,7 +266,12 @@ def test_weekly_only_codex_ahead_of_pace_cannot_start_unattended_work(
     assert "11.4% released" in block_msg
 
 
-def test_weekly_pacing_does_not_replace_dashboard_raw_usage(stub_gate, monkeypatch):
+def test_ratchet_blocked_codex_pool_is_not_clear_on_the_dashboard(stub_gate, monkeypatch):
+    """The incident shape from issue #436: codex weekly spend far ahead of the released allowance
+    (64% on day 0's 11.4%) blocked every unattended dispatch, yet the published snapshot said
+    `clear: true` with headroom — affirmatively misleading. The dashboard now carries the same
+    dispatch verdict launch uses: `clear` is false, the dispatchable headroom is 0, and the
+    reason names the pacing block. The raw utilization stays in `spent_pct`."""
     monkeypatch.setenv("TEST_CODEX_CLEAR", "1")
     monkeypatch.setenv("TEST_SPEND_PCT", "64")
     monkeypatch.setenv("TEST_LIMITS", json.dumps({"windows": [{
@@ -276,12 +283,38 @@ def test_weekly_pacing_does_not_replace_dashboard_raw_usage(stub_gate, monkeypat
 
     codex = next(pool for pool in pools() if pool["tool"] == "codex")
 
-    assert codex == {
-        "tool": "codex",
-        "clear": True,
-        "spent_pct": 64.0,
-        "headroom_pct": 36.0,
-    }
+    assert codex["clear"] is False
+    assert codex["headroom_pct"] == 0.0
+    assert codex["spent_pct"] == 64.0
+    assert "released for unattended work" in codex["reason"]
+
+
+def test_ratchet_blocked_claude_pool_is_not_clear_on_the_dashboard(
+        stub_gate, isolate_state, monkeypatch):
+    """The claude mirror: a healthy five-hour reading must not show as dashboard headroom while
+    the weekly ratchet blocks unattended dispatch (#436). The window here is four days old, so
+    day 4 releases 57.1% — weekly spend of 60% blocks."""
+    monkeypatch.setenv("TEST_SPEND_PCT", "10")
+    _seed_claude_quota(10, weekly_percent=60.0)
+
+    claude = next(p for p in pools() if p["tool"] == "claude")
+
+    assert claude["clear"] is False
+    assert claude["headroom_pct"] == 0.0
+    assert claude["spent_pct"] == 10.0
+    assert "weekly spend at 60%" in claude["reason"]
+
+
+def test_a_clear_pool_still_reports_its_utilization_headroom(stub_gate, isolate_state):
+    """A pool the dispatch verdict clears keeps the utilization-derived headroom figure the
+    console has always rendered — the honesty fix only zeroes headroom that cannot dispatch."""
+    _seed_claude_quota(19)
+
+    claude = next(p for p in pools() if p["tool"] == "claude")
+
+    assert claude["clear"] is True
+    assert claude["headroom_pct"] == 81.0
+    assert claude["reason"] == ""
 
 
 @pytest.mark.parametrize(("elapsed_days", "used_percent", "eligible"), [

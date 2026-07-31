@@ -657,7 +657,13 @@ class Coordinator:
         if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
             return False  # new issue work defers while a PR-bound stage waits to start (#293)
         if not self._gate(record):
-            return False  # an independent admission gate (headroom, ceiling, cap, pacing)
+            # An independent admission gate refusal (headroom, ceiling, cap, pacing) used to be
+            # silent: a record pinned to a pool the weekly ratchet blocks sat `waiting` with its
+            # claim held for days with zero log lines while intake logged its own deferral every
+            # cycle (#436). Name the pool, the reason, and how long the record has waited — one
+            # line per record per cycle, the cadence intake's `no pool has headroom` line gets.
+            self._emit_deferral(record, now)
+            return False
         # Flip to a reservation and atomically claim demand plus any global admission limits
         # on the ledger; concurrent instances cannot push a pool, machine, or stage lane past
         # its reviewed budget (ADR 0029/0030). The fresh
@@ -685,6 +691,21 @@ class Coordinator:
             record.start_fact = None
             return False
         return True
+
+    def _emit_deferral(self, record: Record, now: int) -> None:
+        """Log why the admission gate refused this waiting record (#436), through the gate's
+        optional ``deferral_reason`` hook — the same optional-hook seam as ``begin_cycle`` and
+        ``started``. A gate without the hook, or a refusal with nothing durable to report (the
+        per-cycle pace budget), stays silent."""
+        reason_of = getattr(self._gate, "deferral_reason", None)
+        reason = reason_of(record) if reason_of is not None else None
+        if not reason:
+            return
+        waited = ""
+        if now > record.created_at > 0:
+            waited = f" for {(now - record.created_at) / 3600:.1f}h"
+        self._emit(record, f"waiting{waited} — no headroom on {record.pool} ({reason}); "
+                           "deferring this cycle; claim retained")
 
     def _commit_start(self, record: Record, fact: str, family: str | None = None) -> None:
         # The bootstrap child may have advanced the durable row while the parent waited for its
