@@ -63,8 +63,8 @@ DRAWING = "agentflow:drawing-mockup"   # dispatch claim — a session is drawing
 RESEARCH_TICKET = "wayfinder:research"   # the one AFK-able planning ticket type the daemon may run
 RESOLVING = "wayfinder:resolving"        # shared claim — a session (human or daemon) owns this ticket
 AWAITING_DISPOSITION = "wayfinder:awaiting-disposition"  # completed research needs operator judgment
-# The opposite outcome to awaiting-disposition: unattended research spent its whole budget without
-# producing a ruling the contract accepts, so the ticket is handed back and never dispatched again.
+# The opposite outcome to awaiting-disposition: an unattended research run ended without a ruling
+# the contract accepts, so the ticket is handed back and never dispatched again.
 RESEARCH_PARKED = "wayfinder:parked"
 
 HELD_LABELS = {"agentflow:needs-grilling", "agentflow:needs-mockup"}

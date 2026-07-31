@@ -44,12 +44,13 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   completion or by daemon crash recovery.
   *Avoid:* assignment-as-claim (the daemon shares the operator's GitHub identity).
 
-- **Parked research ticket** — an AFK-able ticket an unattended session spent its whole
-  budget on without producing a ruling the daemon may record. It is handed back in the
-  open — commented with the reason the ruling was refused and labelled so no later
-  unattended run picks it up — and the operator either rewrites the question or answers
-  it in a session. Distinct from a ticket awaiting disposition, where the research
-  succeeded and left candidates to choose among.
+- **Parked research ticket** — an AFK-able ticket an unattended session ended without
+  producing a ruling the daemon may record, either by spending its whole budget on the
+  question or by being stopped before it read the question at all. It is handed back in
+  the open — commented with what stopped the run and labelled so no later unattended run
+  picks it up — and the operator either rewrites the question, repairs what stopped the
+  session, or answers it in a session. Distinct from a ticket awaiting disposition, where
+  the research succeeded and left candidates to choose among.
   *Avoid:* failed research (the question is not judged, only handed back).
 
 - **Build issue** — one operator-approved, independently buildable GitHub issue that

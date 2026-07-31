@@ -68,9 +68,10 @@ STAGE_NATIVE_HANDOFF = {
     "revise": "pr:parked",
     "respond": "pr:parked",
     "converse": "ask:needs-you",
-    # An exhausted research run parks its ticket in the open: one comment naming why no usable
-    # ruling could be recorded, one durable label that takes it out of unattended selection, and
-    # the shared claim released (ADR 362, superseding ADR 0037's silent re-eligibility).
+    # A held research run parks its ticket in the open: one comment naming what stopped it — a
+    # spent budget or a provider condition that ended the session — one durable label that takes
+    # it out of unattended selection, and the shared claim released (ADR 362, superseding ADR
+    # 0037's silent re-eligibility).
     "research": "ticket:parked",
 }
 
