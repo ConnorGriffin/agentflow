@@ -21,7 +21,7 @@ fallback, ADR 0003). If neither has headroom, no capacity this cycle.
 **Paced weekly allowance (ADR 0006, issue #315).** Claude, like Codex, also gates on a *paced
 weekly allowance*: the provider's seven-day window, released 80% in seven equal daily steps from
 the window's own start. `_query_pool` reports the five-hour utilization (the load-balancing and
-dashboard signal — weekly pacing never replaces it) and carries the seven-day window along;
+raw-usage signal — weekly pacing never replaces it) and carries the seven-day window along;
 `_claude_dispatch_status` (mirroring `_codex_dispatch_status`) layers the weekly constraint on at
 each dispatch decision — builder/reviewer assignment and the final launch recheck — so a queued
 Claude session defers if its weekly allowance is spent between assignment and launch. The
@@ -450,8 +450,9 @@ def _query_pool(tool: str, operator: bool = False, *,
         reason += " · bootstrap estimate (no provider fact yet)"
     # Carry the provider's seven-day window (the paced weekly allowance, #315) so a dispatch site
     # can layer weekly pacing on with `_claude_dispatch_status`. Raw `_query_pool` still reports the
-    # five-hour utilization as `spent_pct` for load balancing and dashboard headroom — weekly pacing
-    # never replaces it. A missing seven-day fact leaves the windows empty, so the wrapper fails
+    # five-hour utilization as `spent_pct` for load balancing and raw usage — weekly pacing never
+    # replaces it (the dashboard layers the dispatch verdict on separately, #436). A missing
+    # seven-day fact leaves the windows empty, so the wrapper fails
     # closed on it independently of the five-hour bootstrap.
     weekly_fact = quota.read_quota(default_store_path(), "claude", quota.SEVEN_DAY)
     weekly_windows = (

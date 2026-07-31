@@ -214,6 +214,10 @@ class _ProductionGate:
         from collections import Counter
         self._paced = Counter()
         self._active: dict[str, bool] = {}
+        # Why the last admission check refused each pool, kept so the coordinator can log a
+        # per-record deferral instead of a record stalling silently under pacing (#436). Only
+        # a not-clear pool status is recorded: a pace-budget refusal self-resolves next cycle.
+        self._deferred: dict[str, str] = {}
         # Capacity facts are one observation per pool per coordinator cycle. The gate is evaluated
         # once for every waiting record; re-running the external helper for each one can serialize
         # its 30-second timeout across the whole queue and hold the daemon pass for minutes.
@@ -228,6 +232,7 @@ class _ProductionGate:
         self._status.pop(pool, None)
         self._active.pop(pool, None)
         self._paced.pop(pool, None)
+        self._deferred.pop(pool, None)
 
     def __call__(self, record) -> bool:
         from agentflow import balancer
@@ -271,9 +276,18 @@ class _ProductionGate:
         except Exception:
             return False
         if not status or not status.clear:
+            if status is not None and status.reason:
+                self._deferred[record.pool] = status.reason
             return False
+        self._deferred.pop(record.pool, None)
         self._active[record.pool] = status.active
         return not (status.active and self._paced[record.pool] >= balancer.ACTIVE_PACE)
+
+    def deferral_reason(self, record) -> str | None:
+        """Why the last admission check refused this record's pool — the headroom/pacing reason
+        the coordinator's per-record deferral line names (#436) — or ``None`` for a refusal
+        with nothing durable to report (the per-cycle pace budget, a query failure)."""
+        return self._deferred.get(record.pool)
 
     @staticmethod
     def reservation_limits(record) -> ReservationLimits:

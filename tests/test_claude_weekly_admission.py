@@ -250,3 +250,62 @@ def test_a_queued_claude_build_is_rechecked_and_deferred_at_launch(coord_state, 
 
     _seed_weekly(40.0, now=now)                            # weekly consumed before launch
     assert pipeline._production_gate()(record) is False
+
+
+def test_the_launch_gate_names_why_a_record_was_refused(coord_state, monkeypatch):
+    """A gate refusal carries its pacing reason (#436): the coordinator asks the gate why a
+    waiting record could not dispatch so the deferral can reach the daemon log instead of the
+    record stalling silently. A clear pool has no reason to give."""
+    tmp_path = coord_state
+    _clear_activity_gate(tmp_path, monkeypatch)
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
+    now = 1_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    _seed_five_hour(10.0, now=now)
+    record = Record(identity="436", stage="review", pool="claude",
+                    demand=1, repo="o/r", subject="436")
+
+    _seed_weekly(40.0, now=now)                            # day 0 releases only ~11.4%
+    gate = pipeline._production_gate()
+    assert gate(record) is False
+    reason = gate.deferral_reason(record)
+    assert "weekly spend at 40%" in reason and "released for unattended work" in reason
+
+    _seed_weekly(5.0, now=now)                             # under pace: nothing to report
+    gate = pipeline._production_gate()
+    assert gate(record) is True
+    assert gate.deferral_reason(record) is None
+
+
+def test_a_review_starved_by_pool_pacing_logs_a_deferral_every_cycle(coord_state, monkeypatch):
+    """The silent stall from issue #436: a review record pinned to a pool the weekly ratchet
+    blocks sat `waiting` with its claim held for days with zero log lines, while intake logged
+    `no pool has headroom (…)` every cycle. Driven through the public coordinator seam with the
+    real production gate: each cycle now logs the record identity, the pool, the pacing reason,
+    and how long the record has been waiting."""
+    from agentflow.coordinator import Coordinator
+    from agentflow.coordinator.coordinator import Submission
+
+    tmp_path = coord_state
+    _clear_activity_gate(tmp_path, monkeypatch)
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
+    now = 1_000_000
+    monkeypatch.setattr(time, "time", lambda: now)
+    _seed_five_hour(10.0, now=now)
+    _seed_weekly(40.0, now=now)                            # ratchet blocks unattended claude
+
+    lines: list[str] = []
+    coord = Coordinator(gate=pipeline._production_gate(), log=lines.append)
+    coord.submit_stage(Submission(repo="o/r", subject="499", stage="review", pool="claude"))
+
+    coord.cycle("claude", now=now + 8 * 3600)              # eight hours into the stall
+    deferrals = [l for l in lines if "deferring" in l]
+    assert len(deferrals) == 1
+    line = deferrals[0]
+    assert line.startswith("o/r: 499: review:")
+    assert "claude" in line
+    assert "weekly spend at 40%" in line and "released for unattended work" in line
+    assert "8.0h" in line
+
+    coord.cycle("claude", now=now + 8 * 3600)              # every cycle, like intake's deferral
+    assert len([l for l in lines if "deferring" in l]) == 2

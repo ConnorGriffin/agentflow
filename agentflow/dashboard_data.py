@@ -8,11 +8,12 @@ test surface; the gh queries are orchestration exercised live.
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
 from datetime import datetime, timezone
 
 from agentflow import github, live, ratchet
-from agentflow.balancer import _query_pool
+from agentflow.balancer import _claude_dispatch_status, _codex_dispatch_status, _query_pool
 from agentflow.gate import reply_pending
 from agentflow.labels import HELD_LABELS
 from agentflow.loop import _CONFLICT_MARK, RepoConfig
@@ -21,12 +22,21 @@ from agentflow.repo_facts import repo_profile
 
 
 def pools() -> list[dict]:
-    """Both prepaid pools' headroom (ADR 0006) — the 'idle while queued = bug' signal."""
+    """Both prepaid pools' headroom (ADR 0006) — the 'idle while queued = bug' signal.
+
+    `clear` carries the same unattended dispatch verdict launch applies — weekly pacing
+    included — never the raw window reading alone: the console must not show a pool as
+    dispatchable while the ratchet blocks it (#436). `spent_pct` stays the raw utilization;
+    `headroom_pct` is *dispatchable* headroom, so a blocked pool reports 0 and `reason`
+    names the block."""
+    now = time.time()
     out = []
-    for tool in ("claude", "codex"):
-        s = _query_pool(tool)
-        out.append({"tool": s.tool, "clear": s.clear,
-                    "spent_pct": s.spent_pct, "headroom_pct": round(100 - s.spent_pct, 1)})
+    for tool, dispatch_status in (("claude", _claude_dispatch_status),
+                                  ("codex", _codex_dispatch_status)):
+        s = dispatch_status(_query_pool(tool), now)
+        out.append({"tool": s.tool, "clear": s.clear, "spent_pct": s.spent_pct,
+                    "headroom_pct": round(100 - s.spent_pct, 1) if s.clear else 0.0,
+                    "reason": s.reason})
     return out
 
 
