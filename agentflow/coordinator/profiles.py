@@ -66,8 +66,10 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
 }
 
 # The 95th percentile wall (seconds) and tool calls of work each cell has been recorded needing,
-# from the fleet's own session streams — 516 recorded sessions for the tool-call columns (§3b′/§3b″)
-# and 661 for the build/revise walls (§3b‴), read 2026-07-31. This is the
+# from the fleet's own session streams, read 2026-07-31 — the stage rows over 516 recorded
+# sessions (§3b′), the per-cell build and revise tool-call rows over a re-read of the same growing
+# store later that morning at 529, three more builds in, none moving a reading (§3b″, #422), and
+# the build/revise wall column over 661 launcher sessions in the duration pass (§3b‴). This is the
 # evidence the ceiling tables are set against, not decoration: the §3b rule is that a ceiling sits
 # well above the work, and the first table drifted under it unnoticed. Review's cap was drawn at 40
 # from an n=70 sample; by n=210 the p90 was 55 tool calls and 31 reviews had been killed at the cap

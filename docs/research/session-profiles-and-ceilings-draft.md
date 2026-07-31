@@ -233,7 +233,9 @@ ceiling set clear of a tool-call p95 is therefore clear of the turn p95 to withi
 — slack nowhere near deciding this pin, whose tightest margin is 80 against 51 and whose
 widest is 120 against 66. A drift big enough to matter moves these numbers by tens.
 
-Measured over 516 recorded sessions:
+Measured over 516 recorded sessions — a snapshot of a store that grows as the fleet
+runs, taken 2026-07-31 before the three builds §3b″'s later pass caught (which is why
+its build cells sum to 134 against the 131 here; reconciled at the top of §3b″, #422):
 
 | Stage | n | tool calls p50 | p90 | p95 | max | dur p95 | dur max | cap |
 |-------|---|-----------|-----|-----|-----|---------|---------|-----|
@@ -298,8 +300,16 @@ fails a test rather than parking a pull request.
 
 ### 3b″. Per-cell reading for Build and Revise (#416, 2026-07-31)
 
-The same 516 recorded sessions, the same quantity (tool calls read off the session
-stream), broken out per `(stage, complexity, effort)` rather than pooled:
+The same session store and the same quantity (tool calls read off the session
+stream), broken out per `(stage, complexity, effort)` rather than pooled — but **not
+the same snapshot** (#422). This pass re-read the store later the same morning as
+§3b′'s, by which point it had grown to 529 recorded sessions, so the build cells
+below sum to 134 where §3b′'s pooled row counts 131. Recounting the store at each
+read point reproduces both figures exactly: three builds finalized between the reads
+— one deep/high at 69 tool calls, two standard/low at 18 and 40 — and none of them
+moves any reading in this table, so no ceiling turns on the difference. Where the
+two counts disagree, this per-cell sample is the authoritative one: it is the row
+set `_OBSERVED_P95` carries and the one the build ceilings are set from.
 
 | Cell | n | p50 | p90 | **p95** | max | **ceiling** | killed at it |
 |------|---|-----|-----|---------|-----|-------------|--------------|
