@@ -182,6 +182,11 @@ ceiling replaces `_SESSION_TIMEOUT_S` per record. A per-session USD budget is al
 available (`error_max_budget_usd` already surfaces in the result stream) as a
 belt-and-braces cap.
 
+> **The Intake, Review, Respond and Converse turn ceilings below are superseded — see
+> §3b′ (#410).** They were drawn from the sample in §2c and drifted under the work once
+> the sample grew. They are kept here as the record of what the first calibration was.
+> The Research, Mockup, Revise and Build rows still stand: this change leaves them alone.
+
 | Stage (complexity/effort) | observed max | **wall ceiling** | **turn ceiling** | vs 2 h today |
 |---------------------------|--------------|------------------|------------------|--------------|
 | Intake (deep) | 338 s | 20 min | 40 | 6× tighter |
@@ -199,6 +204,87 @@ belt-and-braces cap.
 
 Revise inherits the original builder's Build ceiling, mirroring ADR 0041's ruling
 that finding-driven Revise carries the builder's complexity.
+
+### 3b′. First ratchet against live telemetry (#410, 2026-07-31)
+
+§3b promised these numbers would ratchet "once per-attempt telemetry (#223) fills the
+thin cells". They have, and the first reading showed the rule in §3b had been violated
+by drift rather than by choice.
+
+**Measure the work, not the counter the ceiling censors.** The provider's reported turn
+counter *is* the quantity `--max-turns` bounds: every session the ceiling actually killed
+reports exactly the cap plus one — the kills under a cap of 40 all at 41 turns, the kills
+under a cap of 80 all at 81, without exception. That is exactly why its recorded
+distribution cannot calibrate the ceiling: it is truncated by the ceiling being
+calibrated. Nor is the truncation uniform — the cap did not fire on every session that
+reported past it, and dozens of sessions in the 40-capped stages report 42 to 87 turns and
+end cleanly — so a capped stage's turn distribution mixes cut-off sessions with survivors
+and describes neither.
+
+The table below therefore counts **tool calls** — the calls a session issues, read off its
+own recorded stream, a number nothing in the launch truncates. Tool calls are not turns,
+but they track them tightly: turns are tool calls plus one in about nine of every ten
+sessions that recorded both, and across the whole sample a session's turns never exceed its
+tool calls by more than two. The tie is broken the other way by a turn that issues several
+calls at once (in the extreme, one review stopped at a cap of 40 had issued 196). A turn
+ceiling set clear of a tool-call p95 is therefore clear of the turn p95 to within two turns
+— slack nowhere near deciding this pin, whose tightest margin is 80 against 51 and whose
+widest is 120 against 66. A drift big enough to matter moves these numbers by tens.
+
+Measured over 516 recorded sessions:
+
+| Stage | n | tool calls p50 | p90 | p95 | max | dur p95 | dur max | cap |
+|-------|---|-----------|-----|-----|-----|---------|---------|-----|
+| Review | 210 | 26 | **55** | **66** | 335 | 469 s | **899 s** | **40** |
+| Build | 131 | 48 | 113 | 138 | 164 | — | — | 80–300 |
+| Intake | 87 | 19 | 39 | **45** | 52 | 335 s | 559 s | **40** |
+| Respond | 55 | 14 | 40 | **51** | 57 | 477 s | 594 s | **40** |
+| Revise | 23 | 41 | 95 | 99 | 100 | — | — | inherited |
+| Research | 6 | 33 | 39 | 39 | 39 | 608 s | 608 s | 80 |
+| Attack | 2 | 44 | 44 | **44** | 44 | 109 s | 109 s | **40** |
+| Mockup | 2 | 66 | 66 | **66** | 66 | 1 013 s | 1 013 s | 200 |
+
+**Every stage capped at 40 has its p95 above the cap**, review worst at 66 against 40 —
+and review is simultaneously pinned against its wall, its longest session running 899 s
+against a 900 s ceiling.
+
+The direct evidence is stronger than the percentiles. **42 sessions were terminated by
+the ceiling**, the provider naming it outright ("Reached maximum number of turns (40)"),
+31 of them reviews. The work each had already finished before it was cut off, in tool calls:
+
+- review — 40, 44, 46, 46, 47, 47, 47, 48, 48, 48, 48, 49, 50, 50, 50, 50, 50, 51, 51,
+  52, 52, 53, 53, 55, 55, 57, 60, 60, 70, 70, 196
+- respond — 40, 42, 46, 55 · intake — 48 · build — 80, 89, 92 · revise — 95, 99, 100
+
+Each had read the diff and run the suite and was stopped before it could state a verdict.
+$104.18 spent for no verdict, no fix and no decision.
+
+Applying §3b's own rule to that sample:
+
+| Stage | wall ceiling | turn ceiling | grounding (p95) |
+|-------|--------------|--------------|-----------------|
+| Intake | 20 min (unchanged) | 40 → **80** | 45 tool calls / 335 s |
+| Attack | 20 min (unchanged) | 40 → **80** | 44 tool calls / 109 s (n=2); mirrors intake (ADR 380) |
+| Review | 15 → **30 min** | 40 → **120** | 66 tool calls / 469 s |
+| Respond | 15 → **20 min** | 40 → **80** | 51 tool calls / 477 s |
+| Converse | 15 → **20 min** | 40 → **80** | shares respond's shape; no recorded sessions |
+| Research | unchanged (30 min / 80) | unchanged | 39 tool calls / 608 s — already clear |
+| Mockup | unchanged (60 min / 200) | unchanged | 66 tool calls / 1 013 s (n=2) — already clear |
+| Build, Revise | unchanged | unchanged | p95 138 / 99 tool calls against 80–300 — already clear |
+
+Every cell the code pins carries its sample here, and only here: `_OBSERVED_P95` in the
+profile table is this row set, so a number pinned by a test always has a stated source.
+
+**p95 with headroom, not the maximum.** Two reasons. A ceiling censors its own
+distribution — review's 899 s maximum is the wall stopping it, not the work finishing,
+and every count sitting on a cap is a session cut off rather than done — so the
+observed numbers are lower bounds. And the tail is genuinely unbounded: one review ran
+335 tool calls, which no ceiling that still kills a runaway could clear. Setting the bar at
+p95 and then leaving headroom above it is what makes an ordinary long session survive
+while a runaway still dies.
+
+The observed distribution now lives beside the ceiling table in code, so the next drift
+fails a test rather than parking a pull request.
 
 ### 3c. Fail-closed when a narrow profile is missing a capability
 

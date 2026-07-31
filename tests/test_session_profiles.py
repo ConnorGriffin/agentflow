@@ -70,8 +70,8 @@ def test_read_only_intake_drops_edits_pins_mcp_and_caps_turns(monkeypatch, tmp_p
         assert "--strict-mcp-config" in cmd
         assert "--mcp-config" not in cmd
 
-        # A real turn ceiling replaces the absent one; both read-only stages cap at 40 turns.
-        assert _flag(cmd, "--max-turns") == "40"
+        # A real turn ceiling replaces the absent one, set above intake's recorded maximum (#410).
+        assert _flag(cmd, "--max-turns") == "80"
 
         # The settings deny independently strips the same edit tools — the fail-closed backstop
         # (ADR 0044 pt 5). Both the allowlist above and this deny remove the tools from the loaded
@@ -115,7 +115,7 @@ def test_review_keeps_the_full_edit_surface_for_bounded_fixes(tmp_path):
     assert "--tools" not in cmd
     assert "permissions" not in json.loads(_flag(cmd, "--settings"))
     assert "--strict-mcp-config" in cmd
-    assert _flag(cmd, "--max-turns") == "40"
+    assert _flag(cmd, "--max-turns") == "120"
 
 
 def test_revise_inherits_the_original_builders_build_ceiling(tmp_path):
@@ -136,7 +136,7 @@ def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):
     launcher-wide two-hour constant. An explicit constructor override still wins (tests/ops)."""
     launcher = LocalLauncher()
     assert launcher._session_timeout_for(_record("intake", str(tmp_path))) == 20 * 60
-    assert launcher._session_timeout_for(_record("review", str(tmp_path))) == 15 * 60
+    assert launcher._session_timeout_for(_record("review", str(tmp_path))) == 30 * 60
     assert launcher._session_timeout_for(
         _record("build", str(tmp_path), complexity="deep", effort="extra")) == 60 * 60
 
@@ -214,6 +214,27 @@ def test_non_build_stages_set_no_reasoning_flag(tmp_path):
         codex = provider_command(_codex_record(stage, str(tmp_path)))
         codex_config = [codex[i + 1] for i, arg in enumerate(codex[:-1]) if arg == "-c"]
         assert not any(v.startswith("model_reasoning_effort=") for v in codex_config)
+
+
+def test_every_ceiling_stays_clear_of_the_work_its_stage_actually_does(tmp_path):
+    """A ceiling exists to kill a runaway, so it has to sit clear of the work its stage is recorded
+    needing. Review's drifted under it: drawn at 40 from an n=70 sample, it was below the p90 (55
+    tool calls) by the time the sample reached 210, and 31 reviews were killed at it having already
+    read the diff and run the suite (#410). This pins every stage against the recorded distribution
+    its cell was set from, so the next drift fails here instead of parking a pull request.
+
+    The bar is the p95 with headroom, not the maximum: the tail is unbounded (one review ran 335
+    tool calls) and no ceiling that still kills a runaway could clear it."""
+    from agentflow.coordinator.profiles import _OBSERVED_P95, profile_for
+
+    for stage, (p95_wall_s, p95_tool_calls) in _OBSERVED_P95.items():
+        profile = profile_for(_record(stage, str(tmp_path)))
+        assert profile.turn_ceiling > p95_tool_calls, (
+            f"{stage}: {profile.turn_ceiling}-turn ceiling is not clear of the {p95_tool_calls} "
+            f"tool calls its 95th-percentile session needs — ordinary long sessions die at it")
+        assert profile.wall_ceiling_s > p95_wall_s, (
+            f"{stage}: {profile.wall_ceiling_s}s wall is not clear of the {p95_wall_s}s its "
+            f"95th-percentile session needs — ordinary long sessions die at it")
 
 
 def test_a_ceiling_hit_ends_as_a_recoverable_timeout():

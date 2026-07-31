@@ -5,9 +5,10 @@ leaking in, and a single stage-blind two-hour timeout. This table keys a profile
 record's ``(stage, complexity, effort)`` — the keys the record already carries — and returns
 the read/search allowlist, the wall-clock ceiling, the turn ceiling, and the provider
 reasoning-effort rung (build/revise only; every other stage stays provider-default) for that cell. The
-values are taken verbatim from the research table
-(``docs/research/session-profiles-and-ceilings-draft.md`` §3a/§3b); they are calibration and
-are expected to ratchet once per-attempt telemetry (#223) fills the thin cells.
+allowlists are taken verbatim from the research table
+(``docs/research/session-profiles-and-ceilings-draft.md`` §3a); the ceilings began there too and
+have since been ratcheted onto the fleet's own recorded distribution (§3b, #410) — the ratchet
+that table anticipated once per-attempt telemetry (#223) filled its thin cells.
 
 Read-only stages (Intake, Research, Attack) get a read/search allowlist and no edit tools. Review is a
 bounded code-writing stage: it keeps the full edit/test surface so the independent reviewer can
@@ -47,18 +48,53 @@ _READ_ONLY_TOOLS: dict[str, tuple[str, ...]] = {
 # regresses.
 WITHHELD_EDIT_TOOLS: tuple[str, ...] = ("Edit", "Write", "NotebookEdit")
 
-# Wall (seconds) + turn ceilings for the non-Build stages (§3b). Thin-sample stages ship the
-# conservative drafted numbers now and ratchet once #223's telemetry fills their cells.
+# Wall (seconds) + turn ceilings for the non-Build stages (§3b). Every ceiling sits clear of the
+# work its stage is recorded needing — that headroom is the whole point, so the ceiling kills a
+# runaway and never an ordinary long session (#410). ``_OBSERVED_P95`` below carries the
+# distribution each cell was set from; keep the two in step when either moves.
 _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
-    "intake": (20 * _MIN, 40),
+    "intake": (20 * _MIN, 80),
     # An attack re-reads one draft against the code — the same bounded read-only shape as intake,
     # so it carries the same ceiling (ADR 380).
-    "attack": (20 * _MIN, 40),
-    "review": (15 * _MIN, 40),
-    "respond": (15 * _MIN, 40),
-    "converse": (15 * _MIN, 40),
+    "attack": (20 * _MIN, 80),
+    "review": (30 * _MIN, 120),
+    "respond": (20 * _MIN, 80),
+    "converse": (20 * _MIN, 80),
     "research": (30 * _MIN, 80),
     "mockup": (60 * _MIN, 200),
+}
+
+# The 95th percentile wall (seconds) and tool calls of work each stage has been recorded needing,
+# from the fleet's own session streams — 516 recorded sessions, read 2026-07-31. This is the
+# evidence ``_STAGE_CEILINGS`` is set against, not decoration: the §3b rule is that a ceiling sits
+# well above the work, and the first table drifted under it unnoticed. Review's cap was drawn at 40
+# from an n=70 sample; by n=210 the p90 was 55 tool calls and 31 reviews had been killed at the cap
+# having already read the diff and run the suite (40–70 tool calls of finished work apiece) without
+# recording a verdict. A stage absent here has no recorded sessions to justify a number.
+#
+# Tool calls rather than the provider's own reported turn counter — the quantity ``--max-turns``
+# really does bound — because that counter is censored by the very ceiling being calibrated: every
+# session the cap killed reports exactly the cap plus one, while the sessions it did not kill
+# report well past it, so a capped stage's turn distribution describes neither population. Tool
+# calls are read off the session stream and nothing in the launch truncates them.
+#
+# A tool call is not a turn: one turn may issue several at once (one review stopped at a cap of 40
+# had issued 196). But a session's turns never exceed its tool calls by more than two across the
+# whole sample, so a ceiling clear of a tool-call p95 is clear of the turn p95 to within two turns —
+# against margins of tens here (§3b′).
+#
+# p95 rather than max, on purpose. A ceiling censors its own distribution — review's longest
+# recorded session ran 899 s against a 900 s wall, so how long it actually needed is unknown — and
+# the tail is genuinely unbounded: one review ran 335 tool calls. No ceiling that still kills a
+# runaway can clear that, so the bar is p95 with headroom, and the headroom is what makes an
+# ordinary long session survive.
+_OBSERVED_P95: dict[str, tuple[int, int]] = {
+    "intake": (335, 45),
+    "attack": (109, 44),
+    "review": (469, 66),
+    "respond": (477, 51),
+    "research": (608, 39),
+    "mockup": (1013, 66),
 }
 
 # The reasoning-effort rung each work-effort dial maps to at launch (ADR 0046). Build and revise

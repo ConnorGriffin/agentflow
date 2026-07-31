@@ -27,10 +27,15 @@ one-size surface and single two-hour timeout:
    is the withheld *edit* tools, not this read-only graph, that a read-only stage loses.
 3. **Per-stage wall-clock and turn ceilings replace the shared two-hour timeout**,
    sized ~1.5–2× the observed maximum per (stage, complexity, effort) cell — the
-   table in the research doc is the source of truth. Thin-sample stages (Respond,
-   Revise, Converse, Research, Mockup) ship the conservative drafted ceilings now
-   and ratchet once per-attempt telemetry (#223) fills their cells. Revise
-   inherits the original builder's Build ceiling (consistent with ADR 0041).
+   table in the research doc is the source of truth. The stages ratcheted in
+   [#410](https://github.com/ConnorGriffin/agentflow/issues/410) (Intake, Attack, Review,
+   Respond, Converse) are sized against the **p95 with headroom** instead: a ceiling
+   censors its own maximum, and the tail past the p95 is unbounded (research §3b′).
+   Thin-sample stages (Revise, Research, Mockup) ship the conservative drafted ceilings
+   now and ratchet once per-attempt telemetry (#223) fills their cells; Respond's has
+   since filled, and Converse — still with no recorded sessions of its own — carries
+   Respond's ceiling by construction. Revise inherits the original builder's Build
+   ceiling (consistent with ADR 0041).
 4. **No dollar-denominated session cap.** The objective is prepaid headroom
    (ADR 0040); wall + turn ceilings are the only kill switches.
 5. **Fail closed by construction.** A withheld capability is *removed from the
