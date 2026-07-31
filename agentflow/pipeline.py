@@ -680,6 +680,10 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     # and wrongly parking a merged PR (#208).
     coordinated_review._resume_tainted_reviews(coord)
     coordinated_review._resettle_diverged_reviews(coord)
+    # And retire a Revise whose PR is merged, closed, or gone with its branch, rather than
+    # re-driving continuations against nothing and finally parking a PR number that no longer
+    # resolves (#432).
+    coordinated_revise._retire_dead_revises(coord)
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
     # Handoffs are driven from durable state, not only this process's outcomes. A daemon may

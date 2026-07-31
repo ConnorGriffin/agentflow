@@ -330,6 +330,30 @@ class Coordinator:
                               "nothing left to review; retired silently, claim released")
             return True
 
+    def retire_stale_revise(self, identity: str) -> bool:
+        """Silently retire a Revise whose PR is gone — merged, closed, or opened from a branch that
+        no longer carries any PR — before another attempt or continuation is charged against a
+        change nothing can land (#432): the Revise-native counterpart of ``retire_stale_review``.
+        The record releases its claim with no park comment and no notification. A pending park
+        handoff is withdrawn too: a Revise park resolves its PR number by branch, so a gone PR
+        would leave that handoff pending and silently retrying forever. Idempotent: a repeat finds
+        it already retired and does nothing."""
+        with self._lock:
+            record = self._store.record_of(identity)
+            if (record is None or record.retired or record.stage != "revise"
+                    or not record.claim):
+                return False
+            self._release(record)
+            record.state = COMPLETED
+            record.claim = False
+            record.hold_pending = False
+            record.retired = True
+            if not self._persist(record, retire_descendants=True):
+                return False
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} — PR merged, closed or "
+                              "gone; nothing left to revise; retired silently, claim released")
+            return True
+
     def park_stale_review(self, identity: str) -> "StageOutcome | None":
         """Park a Review whose PR head moved off its immutable target once the auto-revise rounds are
         spent: the stranded record can open no bounded successor, so the PR is handed to a human
