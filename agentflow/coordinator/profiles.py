@@ -66,7 +66,8 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
 }
 
 # The 95th percentile wall (seconds) and tool calls of work each cell has been recorded needing,
-# from the fleet's own session streams — 516 recorded sessions, read 2026-07-31. This is the
+# from the fleet's own session streams — 516 recorded sessions for the tool-call columns (§3b′/§3b″)
+# and 661 for the build/revise walls (§3b‴), read 2026-07-31. This is the
 # evidence the ceiling tables are set against, not decoration: the §3b rule is that a ceiling sits
 # well above the work, and the first table drifted under it unnoticed. Review's cap was drawn at 40
 # from an n=70 sample; by n=210 the p90 was 55 tool calls and 31 reviews had been killed at the cap
@@ -78,8 +79,12 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
 # a pooled build figure is what hid the standard tier sitting on its own limit while six standard
 # builds and revisions were killed at it (#416). ``(None, None)`` marks a stage whose ceiling does
 # not vary by cell. The revise row is a reading of the whole standard tier it inherits (ADR 0041),
-# not of one cell. A ``None`` wall is a reading that counted tool calls only — the per-cell build
-# pass did, and the wall ceilings are not in evidence there (§3b″).
+# not of one cell. The build/revise wall column comes from a later duration pass than its tool-call
+# column, so the two carry different per-cell samples — each states its own n, and both live in the
+# research doc (§3b″ for calls, §3b‴ for walls). The standard-tier wall p95s are readings of
+# sessions the old 80-turn cap was cutting off, so they are lower bounds on what the raised
+# 160-turn allowance takes — the standard wall ceiling is sized against recorded pace over the full
+# allowance (§3b‴), not against these p95s alone.
 #
 # Tool calls rather than the provider's own reported turn counter — the quantity ``--max-turns``
 # really does bound — because that counter is censored by the very ceiling being calibrated: every
@@ -97,19 +102,20 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
 # the tail is genuinely unbounded: one review ran 335 tool calls. No ceiling that still kills a
 # runaway can clear that, so the bar is p95 with headroom, and the headroom is what makes an
 # ordinary long session survive.
-_OBSERVED_P95: dict[tuple[str, str | None, str | None], tuple[int | None, int]] = {
+_OBSERVED_P95: dict[tuple[str, str | None, str | None], tuple[int, int]] = {
     ("intake", None, None): (335, 45),
     ("attack", None, None): (109, 44),
     ("review", None, None): (469, 66),
     ("respond", None, None): (477, 51),
     ("research", None, None): (608, 39),
     ("mockup", None, None): (1013, 66),
-    ("build", "standard", "low"): (None, 80),  # n=33
-    ("build", "standard", "medium"): (None, 89),  # n=17
-    ("build", "deep", "medium"): (None, 138),  # n=35
-    ("build", "deep", "high"): (None, 157),  # n=34
-    ("build", "deep", "extra"): (None, 146),  # n=6
-    ("revise", "standard", None): (None, 100),  # n=12, inheriting the standard build tier
+    ("build", "standard", "low"): (574, 80),  # calls n=33; wall n=98 (§3b‴)
+    ("build", "standard", "medium"): (755, 89),  # calls n=17; wall n=45 (§3b‴)
+    ("build", "deep", "medium"): (1214, 138),  # calls n=35; wall n=124 (§3b‴)
+    ("build", "deep", "high"): (1676, 157),  # calls n=34; wall n=96 (§3b‴)
+    ("build", "deep", "extra"): (2351, 146),  # calls n=6; wall n=20 (§3b‴)
+    # Inheriting the standard build tier; calls n=12, wall n=18 (§3b‴).
+    ("revise", "standard", None): (909, 100),
 }
 
 # The reasoning-effort rung each work-effort dial maps to at launch (ADR 0046). Build and revise
@@ -125,22 +131,32 @@ _REASONING_BY_EFFORT: dict[str, str] = {
     "extra": "xhigh",
 }
 
-# Build ceilings keyed on (complexity, effort) (§3b, ratcheted per cell in §3b″/#416). A cell the
-# research table does not name falls back to the most conservative ceiling of its complexity.
+# Build ceilings keyed on (complexity, effort) (§3b, ratcheted per cell in §3b″/#416, walls read
+# per cell in §3b‴/#421). A cell the research table does not name falls back to the most
+# conservative ceiling of its complexity.
 # The standard turn ceilings were drawn at 80 and sat *on* the work those cells do — standard/low's
 # p95 is exactly 80, standard/medium's is 89, and a revision inheriting the tier reaches 100 — so
 # six standard builds and revisions were killed having already done the job. They now carry p95
 # with headroom, on the same rule the review stages were ratcheted on. The deep cells are clear
 # against their own readings (138, 157, 146 against 200, 200, 300) and are unchanged.
+#
+# The standard tier's wall was still the drafted 25 minutes when that turn ceiling doubled — a
+# limit never measured per cell. The §3b‴ duration pass read it: the measured p95s (574 s, 755 s,
+# 909 s for the revise inheritance) sit under 25 minutes, but every one is a reading of a session
+# the 80-turn cap was cutting off, and at the pace those near-cap sessions recorded (7.5–12 s per
+# tool call) a session using the full 160-call allowance takes roughly 1 200–1 900 s — straddling
+# the old 1 500 s wall, the same kill #416 ended arriving at the other dial. Standard now carries
+# the deep tier's 45-minute wall; the deep walls are clear against their own §3b‴ readings
+# (1 214 s, 1 676 s, 2 351 s against 2 700 s, 2 700 s, 3 600 s) and are unchanged.
 _BUILD_CEILINGS: dict[tuple[str, str], tuple[int, int]] = {
-    ("standard", "low"): (25 * _MIN, 160),
-    ("standard", "medium"): (25 * _MIN, 160),
+    ("standard", "low"): (45 * _MIN, 160),
+    ("standard", "medium"): (45 * _MIN, 160),
     ("deep", "medium"): (45 * _MIN, 200),
     ("deep", "high"): (45 * _MIN, 200),
     ("deep", "extra"): (60 * _MIN, 300),
 }
 _BUILD_DEFAULT: dict[str, tuple[int, int]] = {
-    "standard": (25 * _MIN, 160),
+    "standard": (45 * _MIN, 160),
     "deep": (45 * _MIN, 200),
 }
 

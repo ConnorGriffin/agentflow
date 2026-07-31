@@ -36,7 +36,15 @@ one-size surface and single two-hour timeout:
    into one figure and hid the standard tier sitting on its own work, where six builds
    and revisions were killed having already done most of the job. Each named build cell
    is now sized against its own p95 with headroom (research §3b″); the deep cells were
-   already clear against their own readings and are unchanged. Research and Mockup remain
+   already clear against their own readings and are unchanged.
+   [#421](https://github.com/ConnorGriffin/agentflow/issues/421) closes the gap that raise
+   left: the wall-clock ceilings had never been read per cell, and the standard tier's
+   drafted 25-minute wall was not clear of the work its doubled turn ceiling now admits —
+   at recorded pace a session using the full 160-call allowance takes roughly
+   1 200–1 900 s. The standard tier now carries the deep tier's 45-minute wall (Revise
+   inherits it), the deep walls are recorded clear against their own duration readings,
+   and the observed-distribution pin holds every build cell's wall as well as its turns
+   (research §3b‴). Research and Mockup remain
    thin-sample stages shipping the conservative drafted ceilings until per-attempt
    telemetry (#223) fills their cells; Respond's has since filled, and Converse — still
    with no recorded sessions of its own — carries Respond's ceiling by construction.
