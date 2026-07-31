@@ -211,23 +211,29 @@ that finding-driven Revise carries the builder's complexity.
 thin cells". They have, and the first reading showed the rule in §3b had been violated
 by drift rather than by choice.
 
-**Measure the right quantity, and know what it is.** The provider's own reported turn
-counter cannot be compared against `--max-turns` at all: sessions routinely report more
-turns than the cap allows and still finish cleanly, so it does not measure what the cap
-bounds. The table below instead counts **rounds** — tool calls the session issues — read
-from the recorded session streams.
+**Measure the work, not the counter the ceiling censors.** The provider's reported turn
+counter *is* the quantity `--max-turns` bounds: every session the ceiling actually killed
+reports exactly the cap plus one — the kills under a cap of 40 all at 41 turns, the kills
+under a cap of 80 all at 81, without exception. That is exactly why its recorded
+distribution cannot calibrate the ceiling: it is truncated by the ceiling being
+calibrated. Nor is the truncation uniform — the cap did not fire on every session that
+reported past it, and dozens of sessions in the 40-capped stages report 42 to 87 turns and
+end cleanly — so a capped stage's turn distribution mixes cut-off sessions with survivors
+and describes neither.
 
-A round is not a turn. One turn may issue several tool calls at once, so a session's
-rounds are an *upper bound* on the turns it spent; the kill list below shows sessions
-stopped at a cap of 40 recorded at 44, 46, … 70 and 196 rounds, which a one-for-one
-relationship could not produce. Setting a turn ceiling against a round p95 therefore errs
-high on purpose. That is the safe direction: the pin trips early rather than late, and a
-guard whose whole job is to notice the ceiling drifting back under the work should fail
-loud before the fleet does.
+The table below therefore counts **tool calls** — the calls a session issues, read off its
+own recorded stream, a number nothing in the launch truncates. Tool calls are not turns,
+but they track them tightly: turns are tool calls plus one in about nine of every ten
+sessions that recorded both, and across the whole sample a session's turns never exceed its
+tool calls by more than two. The tie is broken the other way by a turn that issues several
+calls at once (in the extreme, one review stopped at a cap of 40 had issued 196). A turn
+ceiling set clear of a tool-call p95 is therefore clear of the turn p95 to within two turns
+— slack nowhere near deciding this pin, whose tightest margin is 80 against 51 and whose
+widest is 120 against 66. A drift big enough to matter moves these numbers by tens.
 
 Measured over 516 recorded sessions:
 
-| Stage | n | rounds p50 | p90 | p95 | max | dur p95 | dur max | cap |
+| Stage | n | tool calls p50 | p90 | p95 | max | dur p95 | dur max | cap |
 |-------|---|-----------|-----|-----|-----|---------|---------|-----|
 | Review | 210 | 26 | **55** | **66** | 335 | 469 s | **899 s** | **40** |
 | Build | 131 | 48 | 113 | 138 | 164 | — | — | 80–300 |
@@ -244,7 +250,7 @@ against a 900 s ceiling.
 
 The direct evidence is stronger than the percentiles. **42 sessions were terminated by
 the ceiling**, the provider naming it outright ("Reached maximum number of turns (40)"),
-31 of them reviews. Rounds of work each had already finished before being cut off:
+31 of them reviews. The work each had already finished before it was cut off, in tool calls:
 
 - review — 40, 44, 46, 46, 47, 47, 47, 48, 48, 48, 48, 49, 50, 50, 50, 50, 50, 51, 51,
   52, 52, 53, 53, 55, 55, 57, 60, 60, 70, 70, 196
@@ -257,23 +263,23 @@ Applying §3b's own rule to that sample:
 
 | Stage | wall ceiling | turn ceiling | grounding (p95) |
 |-------|--------------|--------------|-----------------|
-| Intake | 20 min (unchanged) | 40 → **80** | 45 rounds / 335 s |
-| Attack | 20 min (unchanged) | 40 → **80** | 44 rounds / 109 s (n=2); mirrors intake (ADR 380) |
-| Review | 15 → **30 min** | 40 → **120** | 66 rounds / 469 s |
-| Respond | 15 → **20 min** | 40 → **80** | 51 rounds / 477 s |
+| Intake | 20 min (unchanged) | 40 → **80** | 45 tool calls / 335 s |
+| Attack | 20 min (unchanged) | 40 → **80** | 44 tool calls / 109 s (n=2); mirrors intake (ADR 380) |
+| Review | 15 → **30 min** | 40 → **120** | 66 tool calls / 469 s |
+| Respond | 15 → **20 min** | 40 → **80** | 51 tool calls / 477 s |
 | Converse | 15 → **20 min** | 40 → **80** | shares respond's shape; no recorded sessions |
-| Research | unchanged (30 min / 80) | unchanged | 39 rounds / 608 s — already clear |
-| Mockup | unchanged (60 min / 200) | unchanged | 66 rounds / 1 013 s (n=2) — already clear |
-| Build, Revise | unchanged | unchanged | p95 138 / 99 rounds against 80–300 — already clear |
+| Research | unchanged (30 min / 80) | unchanged | 39 tool calls / 608 s — already clear |
+| Mockup | unchanged (60 min / 200) | unchanged | 66 tool calls / 1 013 s (n=2) — already clear |
+| Build, Revise | unchanged | unchanged | p95 138 / 99 tool calls against 80–300 — already clear |
 
 Every cell the code pins carries its sample here, and only here: `_OBSERVED_P95` in the
 profile table is this row set, so a number pinned by a test always has a stated source.
 
 **p95 with headroom, not the maximum.** Two reasons. A ceiling censors its own
 distribution — review's 899 s maximum is the wall stopping it, not the work finishing,
-and every round count sitting on a cap is a session cut off rather than done — so the
+and every count sitting on a cap is a session cut off rather than done — so the
 observed numbers are lower bounds. And the tail is genuinely unbounded: one review ran
-335 rounds, which no ceiling that still kills a runaway could clear. Setting the bar at
+335 tool calls, which no ceiling that still kills a runaway could clear. Setting the bar at
 p95 and then leaving headroom above it is what makes an ordinary long session survive
 while a runaway still dies.
 

@@ -64,31 +64,30 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
     "mockup": (60 * _MIN, 200),
 }
 
-# The 95th percentile wall (seconds) and rounds of work each stage has been recorded needing, from
-# the fleet's own session streams — 516 recorded sessions, read 2026-07-31. This is the evidence
-# ``_STAGE_CEILINGS`` is set against, not decoration: the §3b rule is that a ceiling sits well above
-# the work, and the first table drifted under it unnoticed. Review's cap was drawn at 40 from an
-# n=70 sample; by n=210 the p90 was 55 rounds and 31 reviews had been killed at the cap having
-# already read the diff and run the suite (40–70 rounds of finished work apiece) without recording
-# a verdict. A stage absent here has no recorded sessions to justify a number.
+# The 95th percentile wall (seconds) and tool calls of work each stage has been recorded needing,
+# from the fleet's own session streams — 516 recorded sessions, read 2026-07-31. This is the
+# evidence ``_STAGE_CEILINGS`` is set against, not decoration: the §3b rule is that a ceiling sits
+# well above the work, and the first table drifted under it unnoticed. Review's cap was drawn at 40
+# from an n=70 sample; by n=210 the p90 was 55 tool calls and 31 reviews had been killed at the cap
+# having already read the diff and run the suite (40–70 tool calls of finished work apiece) without
+# recording a verdict. A stage absent here has no recorded sessions to justify a number.
 #
-# A round is one tool call the session issues. It is *not* the same thing as a turn, and the pin
-# below is deliberately conservative because of it: one turn may issue several tool calls at once,
-# so a session's rounds are an **upper bound** on the turns it spent. The kill list proves it —
-# sessions the provider stopped at a cap of 40 are recorded at 44, 46, … 70 and 196 rounds, which a
-# one-for-one relationship could not produce. Pinning a turn ceiling against a round p95 therefore
-# errs high: the guard trips early, never late, and that is the safe direction for a guard whose
-# only job is to notice the ceiling drifting back under the work.
+# Tool calls rather than the provider's own reported turn counter — the quantity ``--max-turns``
+# really does bound — because that counter is censored by the very ceiling being calibrated: every
+# session the cap killed reports exactly the cap plus one, while the sessions it did not kill
+# report well past it, so a capped stage's turn distribution describes neither population. Tool
+# calls are read off the session stream and nothing in the launch truncates them.
 #
-# Rounds are used rather than the provider's own reported turn counter because that counter cannot
-# be compared against the cap at all: sessions routinely report more turns than the cap allows and
-# still finish cleanly, so it does not measure the quantity the cap bounds.
+# A tool call is not a turn: one turn may issue several at once (one review stopped at a cap of 40
+# had issued 196). But a session's turns never exceed its tool calls by more than two across the
+# whole sample, so a ceiling clear of a tool-call p95 is clear of the turn p95 to within two turns —
+# against margins of tens here (§3b′).
 #
 # p95 rather than max, on purpose. A ceiling censors its own distribution — review's longest
 # recorded session ran 899 s against a 900 s wall, so how long it actually needed is unknown — and
-# the tail is genuinely unbounded: one review ran 335 rounds. No ceiling that still kills a runaway
-# can clear that, so the bar is p95 with headroom, and the headroom is what makes an ordinary long
-# session survive.
+# the tail is genuinely unbounded: one review ran 335 tool calls. No ceiling that still kills a
+# runaway can clear that, so the bar is p95 with headroom, and the headroom is what makes an
+# ordinary long session survive.
 _OBSERVED_P95: dict[str, tuple[int, int]] = {
     "intake": (335, 45),
     "attack": (109, 44),
