@@ -190,6 +190,10 @@ belt-and-braces cap.
 | Converse (deep) | 218 s | 15 min | 40 | 8× |
 | Research (deep) | 682 s (n=1) | 30 min | 80 | 4× |
 | Mockup (deep) | 2 429 s (n=1) | 60 min | 200 | 2× |
+
+> **Superseded for the read-only and review stages — see §3b′ below (#410).** The turn
+> ceilings above were drawn from the sample in §2c and drifted under the work once the
+> sample grew. They are kept here as the record of what the first calibration was.
 | Revise (carries builder complexity) | 934 s | = builder's Build ceiling | = builder's | — |
 | Build standard/low | 875 s | 25 min | 80 | 5× |
 | Build standard/medium | 286 s | 25 min | 80 | 5× |
@@ -199,6 +203,45 @@ belt-and-braces cap.
 
 Revise inherits the original builder's Build ceiling, mirroring ADR 0041's ruling
 that finding-driven Revise carries the builder's complexity.
+
+### 3b′. First ratchet against live telemetry (#410, 2026-07-31)
+
+§3b promised these numbers would ratchet "once per-attempt telemetry (#223) fills the
+thin cells". They have, and the first reading showed the rule in §3b had been violated
+by drift rather than by choice: **every stage capped at 40 had its p90 at or above the
+cap.** Review — the widest sample, n=288 against the n=70 that set the original number —
+had turns p90 = 41 and max = 87 against a cap of 40, and was simultaneously pinned
+against its wall (longest session 899 s against a 900 s ceiling). 38 sessions across the
+fleet ended at exactly the cap, burning $104.18 and recording no verdict, no fix and no
+decision; 28 of them were reviews.
+
+Measured over 465 sessions with recorded usage:
+
+| Stage | n | turns p50 | p90 | p95 | max | dur p95 | dur max |
+|-------|---|-----------|-----|-----|-----|---------|---------|
+| Review | 288 | 14 | **41** | 48 | **87** | 469 s | **899 s** |
+| Intake | 108 | 18 | 37 | **41** | 53 | 335 s | 559 s |
+| Respond | 59 | 14 | **41** | 41 | 58 | 477 s | 594 s |
+| Research | 6 | 34 | 40 | 40 | 40 | 608 s | 608 s |
+| Mockup | 3 | 18 | 67 | 67 | 67 | 1 013 s | 1 013 s |
+
+Applying §3b's own rule to that sample:
+
+| Stage | wall ceiling | turn ceiling | grounding |
+|-------|--------------|--------------|-----------|
+| Intake | 20 min (unchanged) | 40 → **80** | max 53 turns / 559 s |
+| Attack | 20 min (unchanged) | 40 → **80** | mirrors intake (ADR 380); n=1 |
+| Review | 15 → **30 min** | 40 → **120** | max 87 turns / 899 s |
+| Respond | 15 → **20 min** | 40 → **80** | max 58 turns / 594 s |
+| Converse | 15 → **20 min** | 40 → **80** | shares respond's shape; no recorded sessions |
+| Research, Mockup, Build, Revise | unchanged | unchanged | already clear of their observed max |
+
+**A ceiling censors its own distribution**, so every "observed max" above is a lower
+bound: review's 899 s maximum is the wall stopping it, not the work finishing, and every
+turn count sitting on a cap is a session that was cut off rather than done. Hence the new
+values are set clear of the observed max rather than a hair above it, and the observed
+distribution now lives beside the ceiling table in code so the next drift fails a test
+rather than parking a pull request.
 
 ### 3c. Fail-closed when a narrow profile is missing a capability
 
