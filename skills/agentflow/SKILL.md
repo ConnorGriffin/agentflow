@@ -35,9 +35,13 @@ can't make for you.
    before applying.
 2. **Choose the autonomy profile deliberately** — it's the one decision the command won't
    make for you (it silently defaults to `reviewed` if you don't ask):
-   - `reviewed` (**the safe default**) — the daemon builds and reviews, but a human merges.
-   - `guarded` — more autonomy than `reviewed`; still short of unattended merge.
-   - `autonomous` — the daemon can merge on its own once the gate is clean.
+   - `autonomous` — the daemon self-grounds, builds, reviews, and merges on its own once
+     the gate is clean. Vibe-code / low domain risk, where the worst case is a revert.
+   - `reviewed` (**the safe default**) — the daemon builds and gets it reviewed; a human
+     glances and merges. Most repos.
+   - `guarded` — the *most* conservative rung, not a middle one: grounding against real
+     data or a running app is mandatory, review is dual-tool or human, and a human always
+     merges. Safety-critical projects (ADR 0002).
 3. **Confirm the surface declaration** — an explicit `ui-surfaces:` in the repo's
    instructions wins over the tool's guess, and it's what decides whether the heavier UI
    tooling (Playwright, the screenshot harness) gets installed. Ask if it's not already
