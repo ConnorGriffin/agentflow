@@ -657,3 +657,12 @@ def test_pick_resume_copies_the_locked_contract_verbatim_into_the_brief():
     assert "LOCKED" in prompt
     assert "VERBATIM" in prompt or "verbatim" in prompt
     assert "committed mockup path" in prompt.lower() or "exact committed mockup path" in prompt.lower()
+
+
+def test_intake_prompt_names_the_interface_shape_section_and_its_escape_hatch():
+    # issue #382: the ready-route brief must carry an explicit interface-shape expectation
+    # (judged by the charter's deep-module/deletion test), never silently omitted.
+    prompt = intake_prompt("owner/repo", {"number": 1, "title": "t", "body": "b"})
+    assert "**Interface shape**" in prompt
+    assert "depth test" in prompt
+    assert "purely internal" in prompt

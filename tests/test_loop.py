@@ -449,6 +449,15 @@ def test_build_prompt_names_the_charter_test_standard():
     assert "failed first" in body.lower()
 
 
+def test_build_prompt_states_the_deletion_test_self_check():
+    # issue #382: the builder is told to apply the charter's deep-module rules before the
+    # PR goes up, the same way it is told the test standard up front.
+    body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
+                               surfaces="`agentflow/static/`")
+    assert "deletion" in body.lower()
+    assert "interface-depth" in body.lower() or "interface depth" in body.lower()
+
+
 def test_ui_surfaces_reads_the_declared_prefixes(tmp_path):
     # Parsed the same way as `profile:` — comma-separated path prefixes, per repo.
     (tmp_path / "AGENTS.md").write_text("# repo\n\nprofile: reviewed\n"
