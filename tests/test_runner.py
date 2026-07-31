@@ -439,8 +439,9 @@ def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
     detached_head = _git(detached, "rev-parse", "HEAD")
     (detached / "in-progress.txt").write_text("still being written")
 
-    with pytest.raises(subprocess.CalledProcessError):
-        runner.prepare_worktree_detached(str(repo), "origin/main", detached)
+    with worktree_session(detached):
+        with pytest.raises(subprocess.CalledProcessError):
+            runner.prepare_worktree_detached(str(repo), "origin/main", detached)
     assert _git(detached, "rev-parse", "HEAD") == detached_head
     assert (detached / "in-progress.txt").read_text() == "still being written"
 
@@ -478,6 +479,36 @@ def test_review_checkout_recovers_after_its_branch_is_rebased_away(tmp_path):
                     "--format=%(refname)", "refs/agentflow/stranded/")
     assert retained, "the superseded commit must stay reachable under a recovery ref"
     assert _git(repo, "cat-file", "-t", stranded) == "commit"
+
+
+def test_idle_review_litter_is_archived_so_admission_can_proceed(tmp_path):
+    """A finished review's checkout routinely keeps untracked scratch (a saved diff, a note).
+    When the next logical review needs the same path at a new target, that litter must not
+    stall admission forever: it is archived to a recovery ref and the checkout is rebuilt."""
+    repo = _repo_with_origin(tmp_path)
+    runner = ClaudeRunner()
+    branch = "agentflow/claude/issue-21-litter"
+    build = repo / ".agentflow" / "worktrees" / "claude" / "issue-21-litter"
+    _branch_worktree(repo, build, branch)
+
+    review = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-21-litter"
+    _git(repo, "fetch", "origin", "--quiet")
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    (review / ".pr21.diff").write_text("review scratch")
+
+    (build / "result.txt").write_text("amended after review settled")
+    _git(build, "add", "result.txt")
+    _git(build, "commit", "--amend", "--no-edit")
+    _git(build, "push", "--force", "origin", branch)
+    new_head = _git(build, "rev-parse", "HEAD")
+
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    assert _git(review, "rev-parse", "HEAD") == new_head
+    assert not (review / ".pr21.diff").exists()
+    refs = _git(repo, "for-each-ref", "--format=%(refname)",
+                "refs/agentflow/stranded/pr-21-litter/").splitlines()
+    assert refs, "the litter must be anchored under a recovery ref before the rebuild"
+    assert _git(repo, "show", f"{refs[0]}:.pr21.diff") == "review scratch"
 
 
 def test_freshening_review_checkout_keeps_its_ready_environment(tmp_path):
