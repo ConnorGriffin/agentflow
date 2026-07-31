@@ -447,13 +447,22 @@ def _verdict_ready(record, obs) -> bool:
     if record.review_axis == "fix" and not verdict.pushed_sha:
         from agentflow.review_policy import ReviewAction, ReviewState
         review = ReviewState.from_record(record)
+        if review is None:
+            return False
         # A PR-body fix changes the merge-facing GitHub artifact, not the Git head. Requiring
         # push provenance for that one named surface rejects a valid exact-head re-verification
         # and burns the continuation budget after the reviewer has already corrected the body.
-        if review is None or any(
-                item.action is ReviewAction.FIX
-                and item.file.strip().casefold() != "pr body"
-                for item in review.findings):
+        outstanding = any(
+            item.action is ReviewAction.FIX
+            and item.file.strip().casefold() != "pr body"
+            for item in review.findings)
+        # A no-push verdict may also settle the ledger by explicitly re-judging it: when every
+        # finding it returns has left fix_before_completion, nothing remained to push. A verdict
+        # that returns no findings at all over an outstanding fix is still refused — silence is
+        # not a judgment.
+        rejudged = (bool(verdict.actions)
+                    and not any(item.action is ReviewAction.FIX for item in verdict.actions))
+        if outstanding and not rejudged:
             return False
     if not _review_follow_ups_valid(record, verdict):
         return False
