@@ -52,12 +52,16 @@ PR_BOUND = frozenset({"review", "revise", "respond"})
 # gate one of these must defer while any PR-bound stage is waiting to start on the same pool,
 # so a single high-effort build cannot seize all five permits and starve a review that needs
 # one (#293, ADR 0039). Converse/research run in their own capped lanes and are out of scope.
-ISSUE_BOUND = frozenset({"build", "mockup", "intake"})
+ISSUE_BOUND = frozenset({"build", "mockup", "intake", "attack"})
 
 # The one durable human handoff each stage creates when its budget is exhausted or a
 # permanent condition holds it (ADR 0028's exhaustion table).
 STAGE_NATIVE_HANDOFF = {
     "intake": "issue:needs-grilling",
+    # An attacker that ran out of budget never read the draft, so it has nothing to say about it
+    # — and an unattacked draft is never published. The draft goes to the maintainer instead,
+    # through intake's own grilling route, so the plan is not lost (ADR 380).
+    "attack": "issue:needs-grilling",
     "build": "issue:needs-grilling",
     "mockup": "issue:needs-mockup",
     "review": "pr:parked",
@@ -83,6 +87,15 @@ _STAGE_ALIASES = {
 _ADMISSION_ROWS = {
     ("intake", "claude", "opus", "deep", None): 1,
     ("intake", "codex", "sol", "deep", None): 1,
+    # An attack is intake-shaped: one bounded read-only pass over one draft, on either pool
+    # (ADR 380). It carries intake's single permit and shares its lane cap — the rounds are
+    # triage, so they contend with triage rather than with the build queue. Unlike intake it has
+    # standard rows too: the attack runs at the *draft's* complexity dial, so a standard brief is
+    # argued with by the standard tier rather than spending deep-model headroom on it.
+    ("attack", "claude", "opus", "deep", None): 1,
+    ("attack", "claude", "sonnet", "standard", None): 1,
+    ("attack", "codex", "sol", "deep", None): 1,
+    ("attack", "codex", "terra", "standard", None): 1,
     ("review", "claude", "opus", "deep", None): 1,
     ("review", "codex", "sol", "deep", None): 2,
     ("revise", "claude", "sonnet", "standard", None): 3,
