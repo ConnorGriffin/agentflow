@@ -59,7 +59,21 @@ def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
 
 
 def owned_worktrees(cfg, *, store_path=None) -> set[str]:
-    """Coordinator-owned sources in ``cfg.repo`` that startup recovery must retain."""
+    """Coordinator-owned sources in ``cfg.repo`` that worktree recovery must retain.
+
+    Scoped to records in a *live* state — waiting, running, or completed-but-not-yet-retired.
+    Something is coming for those checkouts, so reclaiming one would pull the ground out from
+    under an admission that is about to happen.
+
+    A **held** record's source is deliberately excluded (ADR 0050). A hold is terminal and is
+    never retired, so held sources accumulate for the life of the store — on the live fleet they
+    were the large majority of everything "owned", and they were the dominant term in the growth
+    that made a whole repository unusable. A maintainer resume rebuilds the checkout from the
+    branch regardless, and reclamation archives the uncommitted state to a recovery ref first, so
+    what a resume loses is a directory, not work.
+    """
+    from agentflow.coordinator.record import HELD
+
     path = Path(store_path or default_store_path())
     if not path.exists():
         return set()
@@ -67,6 +81,7 @@ def owned_worktrees(cfg, *, store_path=None) -> set[str]:
         os.path.realpath(record.source)
         for record in tracer.load_records(path)
         if record.repo == cfg.repo and record.source and not record.retired
+        and record.state != HELD
     }
 
 

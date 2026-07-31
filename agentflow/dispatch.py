@@ -15,6 +15,7 @@ from agentflow.balancer import pick_pair
 from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
 from agentflow.coordinator.quota_poll import refresh_claude_quota
 from agentflow.coordinator.store import default_store_path
+from agentflow.runner import dispatch_preflight
 
 
 def _spawn(fn) -> threading.Thread:
@@ -163,7 +164,16 @@ def _submit_coordinated_research(cfg, coordinator, _log) -> str:
 
 
 def _submit_repo(cfg, coordinator, _log) -> None:
-    """Discover and durably submit each stage kind; no provider starts in this layer."""
+    """Discover and durably submit each stage kind; no provider starts in this layer.
+
+    A repository whose environment can no longer carry a session receives no cold work at all
+    this pass (ADR 0050) — feeding agents into it produces sessions that die before they can say
+    why. The gate stops *new* submissions only: records submitted in earlier passes still admit
+    and launch through reconciliation, which is a bounded backlog that the reclamation sweep is
+    meanwhile curing.
+    """
+    if not dispatch_preflight(cfg.repo, cfg.workdir, pipeline.owned_worktrees(cfg), _log=_log):
+        return
     _run_and_log(cfg, "intake", lambda: _submit_coordinated_intake(cfg, coordinator, _log), _log)
     _run_and_log(cfg, "build", lambda: _submit_coordinated_build(cfg, coordinator, _log), _log)
     # ``needs-mockup`` is a human hold, not permission to spend a five-permit deep session.

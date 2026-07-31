@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime
+from pathlib import Path
 
 from agentflow import github, worktree_ref
 from agentflow.intake import held_build_result
@@ -64,7 +65,10 @@ def resume_if_held(submission, records):
     latest Build for this issue is that held record, this bumps the submission to the next resume
     dimension, whose fresh identity opens a genuinely new bounded execution (a fresh
     ``ATTEMPT_BUDGET``) that still reuses the same issue, brief, builder lineage, and retained
-    worktree ``source``. Otherwise the submission is returned unchanged, so an ordinary duplicate
+    worktree ``source``. That source is a path, not a promise the directory is still there: a held
+    Build is no longer protected from reclamation, so a long-idle one may have been archived to a
+    recovery ref and the resume then rebuilds the checkout from the branch tip (ADR 0050).
+    Otherwise the submission is returned unchanged, so an ordinary duplicate
     stays idempotent and a repeated resume — whose successor is already live — never opens a second
     concurrent Build. Pure: the resume decision is the test surface."""
     from agentflow.coordinator.record import HELD
@@ -195,7 +199,13 @@ def _hold_build(record) -> str | None:
     status = ("could not rebase past a collision with newer changes on the main branch and stopped "
               "without resolving it" if record.hold_reason == "integration collision"
               else "continuation budget exhausted")
-    result = held_build_result(status, f"the retained worktree `{record.source}`")
+    # The worktree is retained for the human — but no longer forever: a held source that goes a
+    # day untouched may be archived to a recovery ref and reclaimed (ADR 0050), so the comment
+    # that sends a maintainer to that directory must also say how to find the work if it is gone.
+    where = (f"the retained worktree `{record.source}` (if it has since been reclaimed, its "
+             f"uncommitted work is on a recovery ref — `git for-each-ref "
+             f"refs/agentflow/stranded/{Path(record.source or '').name}/`)")
+    result = held_build_result(status, where)
     # A hold posted before this record carried its own marker is still proof of itself, so an
     # issue already held when the daemon deploys is never commented on twice. The marker goes
     # *between* the disclaimer and the ask rather than at the end, so that a marked comment does

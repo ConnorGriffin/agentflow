@@ -1037,3 +1037,45 @@ def test_dispatch_policy_never_imports_the_dispatch_loop():
         assert frozenset(ring) == _TOLERATED_IMPORT_CYCLE, (
             "import cycle — a deferred import is standing in for a module that should not be "
             f"reached at all: {' -> '.join([*ring, ring[0]])}")
+
+
+def test_only_live_records_protect_a_worktree_from_reclamation(tmp_path, monkeypatch):
+    """A hold is terminal and is never retired, so held sources would otherwise be protected for
+    the life of the store — they were the majority of everything 'owned' when a repository grew
+    past what its sessions could survive (ADR 0050)."""
+    from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
+
+    store = tmp_path / "records.db"
+    store.write_text("")
+
+    def record(state, source, *, stage="build", repo="o/r", retired=False):
+        return Record(identity=f"{repo}|1|{stage}|{source}", stage=stage, pool="claude",
+                      demand=1, repo=repo, source=source, state=state, retired=retired)
+
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda path=None: [
+        record(WAITING, "/queued"), record(RUNNING, "/running"), record(COMPLETED, "/finishing"),
+        record(HELD, "/held-build"), record(HELD, "/held-review", stage="review"),
+        record(COMPLETED, "/retired", retired=True),
+        record(RUNNING, "/other-repo", repo="o/elsewhere"),
+    ])
+
+    assert pipeline.owned_worktrees(RepoConfig("o/r", "/tmp"), store_path=store) == {
+        "/queued", "/running", "/finishing"}
+
+
+def test_a_repository_that_cannot_carry_a_session_receives_no_cold_work(monkeypatch):
+    submitted = []
+    monkeypatch.setattr(dispatch.pipeline, "owned_worktrees", lambda cfg: {"/live"})
+    monkeypatch.setattr(dispatch, "dispatch_preflight",
+                        lambda repo, workdir, protected, _log=None: repo != "o/poisoned")
+    for name in ("_submit_coordinated_intake", "_submit_coordinated_build",
+                 "_submit_coordinated_respond", "_submit_coordinated_research"):
+        monkeypatch.setattr(dispatch, name,
+                            lambda *a, _stage=name: submitted.append(_stage) or "done")
+
+    dispatch._submit_repo(RepoConfig("o/poisoned", "/p"), SimpleNamespace(), lambda _line: None)
+    assert submitted == []
+
+    dispatch._submit_repo(RepoConfig("o/healthy", "/h"), SimpleNamespace(), lambda _line: None)
+    assert submitted == ["_submit_coordinated_intake", "_submit_coordinated_build",
+                         "_submit_coordinated_respond", "_submit_coordinated_research"]

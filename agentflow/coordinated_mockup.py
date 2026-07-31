@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
+from pathlib import Path
 
 from agentflow import github, worktree_ref
 from agentflow.labels import DRAWING, MOCKUP_MARK, mockup_scope_from_labels
@@ -209,7 +210,10 @@ def _hold_mockup(record) -> str | None:
                   None)
     missing = marked is not None and "MISSING-CONTEXT:" in marked.body
     explanation = ("Mockup exhausted its continuation budget before completing the visual round. "
-                   "The branch and local worktree are retained for a human to continue.")
+                   "The branch and local worktree are retained for a human to continue. If the "
+                   "worktree has since been reclaimed, its uncommitted work is on a recovery ref "
+                   "— `git for-each-ref refs/agentflow/stranded/"
+                   f"{Path(record.source or '').name}/`.")
     reason = "missing context" if missing else "continuation budget exhausted"
     proof = proof_marker(record.identity, reason, tag="mockup-hold")
     # The marker a hold posted before it was scoped to the reason, still proof of itself on an

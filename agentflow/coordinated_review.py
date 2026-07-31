@@ -508,6 +508,12 @@ def _review_worktree_reset(record, _log=None) -> bool:
     checkout exactly as it is so an interrupted review keeps its fixes; it is never reset or
     cleaned. A fresh logical review may reuse a clean prior checkout and reset it to its own
     target. Any git failure skips admission without consuming a permit or attempt.
+
+    A *parked* review's checkout is no longer kept indefinitely: once the record is held it stops
+    being protected from reclamation, so a long-idle one may have been archived to a recovery ref
+    (ADR 0050). The answered-park resume then rebuilds detached at the record's immutable target
+    and the bounded fixes live on the stranded ref rather than in the checkout — the accepted
+    trade for a registration count that stays survivable.
     """
     from agentflow.runner import ClaudeRunner, CodexRunner
     facts = review_source_facts(record)
@@ -582,6 +588,10 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
     already bound to this exact comment and only completes the marker, opening no second lifecycle,
     claim, or notification. Live orchestration; its mapping is
     :func:`decision_resume_review_submission`.
+
+    The resume binds a *held* review, whose checkout reclamation may have archived while it waited
+    (ADR 0050); the resumed stage then starts from the immutable target rather than from whatever
+    the parked session left on disk.
     """
     from agentflow.coordinator.record import HELD
     from agentflow.gate import decision_resume_disclaimer, park_awaiting_decision

@@ -22,7 +22,12 @@ def worktree_ready(record) -> bool:
     worktree is reused *as it is* — a continuation must keep its local changes, so it is never
     rebuilt. An absent Build worktree may start a new branch from ``origin/main``; a continuation
     stage may only recover the existing branch from its local or remote PR ref. Any git failure
-    returns False, so admission is skipped with no permit and no attempt consumed."""
+    returns False, so admission is skipped with no permit and no attempt consumed.
+
+    A checkout is absent more often than it used to be: reclamation may since have archived a
+    long-idle held session to a recovery ref (ADR 0050). That is the intended path, not a
+    degradation — the branch survives, so this re-adds from it and the stage restarts from the
+    branch tip, with the uncommitted delta recoverable under ``refs/agentflow/stranded/``."""
     from agentflow.runner import ClaudeRunner, CodexRunner, _worktree_is_registered
     parsed = source_facts(record)
     if parsed is None:

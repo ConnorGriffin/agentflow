@@ -1,8 +1,10 @@
 """Provider command construction and fail-closed worktree plumbing."""
 
+import datetime
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -764,3 +766,262 @@ def test_a_sessions_leftover_untracked_files_do_not_block_reuse_but_edits_do(tmp
 
     with worktree_session(wt):
         assert resettable_head(str(repo), wt) == ""
+
+
+# --- bounded retention: archive-then-reclaim (ADR 0050) ---------------------------------
+
+def _age_worktree(wt: Path, seconds: float) -> None:
+    """Backdate every clock reclamation reads on this checkout — the directory's own mtime, its
+    registration's index, and its HEAD commit. Idleness is seeded explicitly so no test ever
+    sleeps for it."""
+    old = time.time() - seconds
+    stamp = datetime.datetime.fromtimestamp(old).isoformat()
+    subprocess.run(["git", "-C", str(wt), "-c", "user.name=agentflow test",
+                    "-c", "user.email=agentflow@example.com",
+                    "commit", "--amend", "--no-edit", "--allow-empty"],
+                   env={**os.environ, "GIT_COMMITTER_DATE": stamp, "GIT_AUTHOR_DATE": stamp},
+                   check=True, capture_output=True)
+    index = Path(_git(wt, "rev-parse", "--git-path", "index"))
+    index = index if index.is_absolute() else wt / index
+    os.utime(index, (old, old))
+    os.utime(wt, (old, old))
+
+
+def _stranded_session(repo: Path, number: int, *, hours: float, push: bool = True) -> Path:
+    """One session checkout holding both a modified tracked file and an untracked one — the
+    shape that pins a registration forever today — with its clocks pushed into the past."""
+    wt = repo / ".agentflow" / "worktrees" / "codex" / f"issue-{number}-stranded"
+    _branch_worktree(repo, wt, f"agentflow/codex/issue-{number}-stranded", push=push)
+    (wt / "result.txt").write_text(f"uncommitted edit {number}")
+    (wt / "notes.md").write_text(f"untracked note {number}")
+    _age_worktree(wt, hours * 3600)
+    return wt
+
+
+def _incomplete_builds(monkeypatch, *, complete: set[int] = frozenset()) -> None:
+    """State every seeded build as still building — except the numbers in ``complete``, whose
+    branch has been squash-merged and pruned from the remote."""
+    from agentflow import github
+
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset(
+        {"ready-for-agent"} if issue in complete else {"agentflow:building"}))
+    monkeypatch.setattr(runner_mod, "_pr_state_for_branch", lambda repo, branch: (
+        "MERGED" if any(f"issue-{n}-" in branch for n in complete) else None))
+
+
+def test_recovery_bounds_stranded_sessions_and_keeps_their_work_on_a_ref(tmp_path, monkeypatch):
+    """The outage bar: a repository seeded past the cap comes back down to it, and every
+    reclaimed session's exact content — including the untracked file — survives on its ref."""
+    repo = _repo_with_origin(tmp_path)
+    _incomplete_builds(monkeypatch, complete={200})
+    seeded = [_stranded_session(repo, 100 + i, hours=30 + i)
+              for i in range(runner_mod.RETAINED_WORKTREE_CAP + 3)]
+    # Complete, but undisposable: an untracked file and a branch origin no longer contains.
+    merged = _stranded_session(repo, 200, hours=90)
+    _git(repo, "push", "origin", "--delete", "agentflow/codex/issue-200-stranded")
+    _git(repo, "fetch", "--prune", "origin")
+
+    report = recover_stale_worktrees("owner/repo", str(repo))
+
+    assert len(report.retained) == runner_mod.RETAINED_WORKTREE_CAP
+    assert [path for path, _ref in report.archived] == [
+        str(merged), *(str(wt) for wt in reversed(seeded[-3:]))]  # oldest first
+    for path, ref in report.archived:
+        number = int(Path(path).name.split("-")[1])
+        assert not Path(path).exists()
+        assert _git(repo, "show", f"{ref}:result.txt") == f"uncommitted edit {number}"
+        assert _git(repo, "show", f"{ref}:notes.md") == f"untracked note {number}"
+    assert all(Path(path).exists() for path in report.retained)
+
+
+def test_recovery_never_archives_active_protected_or_fresh_sessions(tmp_path, monkeypatch):
+    """Everything with a live claim on it survives, whatever the cap says: a marked session, a
+    source a live coordinator record owns, and one that simply has not been idle long enough."""
+    repo = _repo_with_origin(tmp_path)
+    _incomplete_builds(monkeypatch)
+    monkeypatch.setattr(runner_mod, "RETAINED_WORKTREE_CAP", 0)
+    protected = _stranded_session(repo, 301, hours=90)
+    marked = _stranded_session(repo, 302, hours=90)
+    fresh = _stranded_session(repo, 303, hours=1)
+    expendable = _stranded_session(repo, 304, hours=90)
+
+    child = subprocess.Popen(["sleep", "30"])
+    try:
+        with worktree_session(marked):
+            runner_mod._active_marker(marked).write_text(str(child.pid))
+            runner_mod._ACTIVE_WORKTREES.clear()  # a freshly started recovery process
+            report = recover_stale_worktrees("owner/repo", str(repo),
+                                             protected={os.path.realpath(protected)})
+    finally:
+        child.terminate()
+        child.wait()
+
+    assert [path for path, _ref in report.archived] == [str(expendable)]
+    assert set(report.retained) == {str(protected), str(marked), str(fresh)}
+    assert protected.exists() and marked.exists() and fresh.exists()
+
+
+def test_unknown_completion_is_archived_only_once_idle_and_over_the_cap(tmp_path, monkeypatch):
+    """Deliberate narrowing: a session GitHub cannot answer for is no longer retained forever.
+    It is still retained while it is under the cap or recently touched — and when it finally
+    goes, its work goes to a ref, which is what makes the narrowing safe."""
+    from agentflow import github
+
+    repo = _repo_with_origin(tmp_path)
+    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: None)  # unreadable
+    monkeypatch.setattr(runner_mod, "_pr_state_for_branch", lambda repo, branch: "OPEN")
+    idle = [_stranded_session(repo, 400 + i, hours=30 + i)
+            for i in range(runner_mod.RETAINED_WORKTREE_CAP + 1)]
+    recent = _stranded_session(repo, 499, hours=2)
+
+    report = recover_stale_worktrees("owner/repo", str(repo))
+
+    assert [path for path, _ref in report.archived] == [str(idle[-1])]
+    assert set(report.retained) == {str(wt) for wt in idle[:-1]} | {str(recent)}
+    ref = report.archived[0][1]
+    assert _git(repo, "show", f"{ref}:notes.md") == "untracked note 412"
+
+
+def test_archives_are_ordered_by_idleness_not_by_when_the_checkout_was_made(tmp_path, monkeypatch):
+    repo = _repo_with_origin(tmp_path)
+    _incomplete_builds(monkeypatch)
+    monkeypatch.setattr(runner_mod, "RETAINED_WORKTREE_CAP", 1)
+    middle = _stranded_session(repo, 501, hours=60)
+    oldest = _stranded_session(repo, 502, hours=100)
+    newest = _stranded_session(repo, 503, hours=30)
+
+    report = recover_stale_worktrees("owner/repo", str(repo))
+
+    assert [path for path, _ref in report.archived] == [str(oldest), str(middle)]
+    assert report.retained == (str(newest),)
+
+
+def test_a_sweep_archives_no_more_than_its_budget_and_converges(tmp_path, monkeypatch):
+    repo = _repo_with_origin(tmp_path)
+    _incomplete_builds(monkeypatch)
+    monkeypatch.setattr(runner_mod, "RETAINED_WORKTREE_CAP", 1)
+    monkeypatch.setattr(runner_mod, "SWEEP_ARCHIVE_BUDGET", 2)
+    for i in range(4):
+        _stranded_session(repo, 600 + i, hours=100 - i)
+
+    first = recover_stale_worktrees("owner/repo", str(repo))
+    assert len(first.archived) == 2 and len(first.retained) == 2
+
+    second = recover_stale_worktrees("owner/repo", str(repo))
+    assert len(second.archived) == 1 and len(second.retained) == 1
+
+
+def test_research_and_conversation_checkouts_are_never_reclaimed(tmp_path, monkeypatch):
+    """A conversation's checkout is its only durable output and is reused across turns while each
+    turn's record retires — so it is excluded outright, not merely protected."""
+    repo = _repo_with_origin(tmp_path)
+    _incomplete_builds(monkeypatch)
+    monkeypatch.setattr(runner_mod, "RETAINED_WORKTREE_CAP", 0)
+    root = repo / ".agentflow" / "worktrees"
+    ask = root / "claude" / "ask-2f9c1d"
+    research = root / "claude" / "research-77"
+    for wt in (ask, research):
+        _detached_worktree(repo, wt)
+        _age_worktree(wt, 200 * 3600)
+    build = _stranded_session(repo, 700, hours=200)
+
+    report = recover_stale_worktrees("owner/repo", str(repo))
+
+    assert [path for path, _ref in report.archived] == [str(build)]
+    assert set(report.retained) == {str(ask), str(research)}
+    assert ask.exists() and research.exists()
+
+
+def test_archiving_a_clean_checkout_anchors_its_head_without_inventing_a_commit(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-800-clean"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-800-clean")
+    head = _git(wt, "rev-parse", "HEAD")
+
+    ref = runner_mod.archive_stranded_worktree(str(repo), wt)
+
+    assert ref.startswith("refs/agentflow/stranded/issue-800-clean/")
+    assert _git(repo, "rev-parse", ref) == head  # HEAD itself, no snapshot commit on top
+    assert not wt.exists()
+
+
+def test_a_failed_archive_leaves_the_checkout_and_its_real_index_untouched(tmp_path, monkeypatch):
+    """The snapshot is built in a scratch index. Staging into the real one would read as tracked
+    modification forever and permanently stall every later reset of this checkout."""
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-801-anchorless"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-801-anchorless")
+    head = _git(wt, "rev-parse", "HEAD")
+    (wt / "scratch.md").write_text("untracked draft")
+
+    real_run = runner_mod._run
+
+    def refuse_update_ref(cmd, *args, **kwargs):
+        if "update-ref" in cmd:
+            return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr="denied")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(runner_mod, "_run", refuse_update_ref)
+
+    assert runner_mod.archive_stranded_worktree(str(repo), wt) == ""
+    assert wt.exists() and (wt / "scratch.md").exists()
+    assert runner_mod.resettable_head(str(repo), wt) == head
+
+
+def test_archiving_works_on_a_host_with_no_git_identity(tmp_path, monkeypatch):
+    """agentflow commits nowhere else, so nothing else would notice a missing identity — and the
+    bound would silently stop applying on such a host."""
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-802-anonymous"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-802-anonymous")
+    (wt / "result.txt").write_text("work done by nobody in particular")
+    _git(repo, "config", "--unset", "user.email")
+    _git(repo, "config", "--unset", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    monkeypatch.delenv("GIT_AUTHOR_NAME", raising=False)
+    monkeypatch.delenv("GIT_COMMITTER_NAME", raising=False)
+
+    ref = runner_mod.archive_stranded_worktree(str(repo), wt)
+
+    assert ref and not wt.exists()
+    assert _git(repo, "show", f"{ref}:result.txt") == "work done by nobody in particular"
+
+
+def test_a_locked_worktree_is_never_reclaimed(tmp_path):
+    """A lock is a deliberate human signal; one --force is not enough to remove it, and it does
+    not get a second."""
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-803-locked"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-803-locked")
+    (wt / "result.txt").write_text("work in progress the operator pinned")
+    _git(repo, "worktree", "lock", str(wt))
+
+    assert runner_mod.archive_stranded_worktree(str(repo), wt) == ""
+    assert wt.exists() and (wt / "result.txt").read_text().startswith("work in progress")
+
+
+def test_dispatch_preflight_refuses_a_repository_that_can_no_longer_carry_a_session(
+        tmp_path, monkeypatch):
+    repo = _repo_with_origin(tmp_path)
+    owned = repo / ".agentflow" / "worktrees" / "codex" / "issue-900-owned"
+    _branch_worktree(repo, owned, "agentflow/codex/issue-900-owned")
+    monkeypatch.setattr(runner_mod, "recover_stale_worktrees",
+                        lambda *a, **k: pytest.fail("the gate must never sweep"))
+    logs = []
+
+    assert runner_mod.dispatch_preflight("owner/repo", str(repo), set(), _log=logs.append)
+    assert logs == []
+
+    before = _git(repo, "worktree", "list", "--porcelain")
+    monkeypatch.setattr(runner_mod, "WORKTREE_DISPATCH_CEILING", 1)
+    assert not runner_mod.dispatch_preflight(
+        "owner/repo", str(repo), {os.path.realpath(owned)}, _log=logs.append)
+    assert _git(repo, "worktree", "list", "--porcelain") == before  # count-only: nothing changed
+    refusal = logs[-1]
+    assert "REFUSING" in refusal
+    assert "1 agentflow-owned" in refusal and "1 foreign" in refusal and "1 protected" in refusal
+
+    monkeypatch.setattr(runner_mod, "_registered_worktrees", lambda workdir: None)
+    assert runner_mod.dispatch_preflight("owner/repo", str(repo), set(), _log=logs.append)
+    assert "could not read the registry" in logs[-1]  # fails open, loudly

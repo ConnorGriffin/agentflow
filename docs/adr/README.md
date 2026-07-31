@@ -157,3 +157,7 @@ ADRs in that format.
 - [0049](0049-reproducible-repository-capabilities.md) — Repository capabilities are
   pinned in one versioned manifest; doctor distinguishes missing from drifted, and
   safe local enrollment reproduces the Claude/Codex skill and UI runtime environment.
+- [0050](0050-bounded-worktree-retention.md) — Retention is bounded: a stranded session's
+  work is archived to a recovery ref and its checkout reclaimed, held sources lose their
+  protection, and the daemon refuses to dispatch into a repository past a registration
+  ceiling. Amends 0028 and 0043.
