@@ -1,10 +1,14 @@
 """Test the hardening rounds through their interface — the fail-safe objection parser, the pure
-round-chain mappings, and the settlement that decides publish / redraft / hold (ADR 380).
+round-chain mappings, and the settlement that decides publish / redraft / hold (ADR 380/418).
 
 The point of the loop is that a brief nobody argued with never reaches a builder, so the
-load-bearing assertions here are the negative ones: a ready draft is *not* published by intake's
-own settlement, an unreadable answer never reads as the draft surviving, and a draft out of rounds
-still contested goes to the maintainer rather than to the build queue.
+load-bearing assertions here are the negative ones: a ready draft is *not* published while an
+attacker is still owed one, an unreadable answer never reads as the draft surviving, and a draft
+whose argument still needs a human goes to the maintainer rather than to the build queue.
+
+The equally load-bearing positive one is newer: an objection that came with its own fix is work,
+not a decision, and running out of attackers must not turn it into a human hold. The gate spent
+its whole production life publishing nothing because it could not tell those apart (#418).
 
 The GitHub-touching tests state facts through the shared `github` module's interface (ADR 0040) —
 a canned typed read, or a recorded typed write — never a `gh` argument vector.
@@ -16,8 +20,8 @@ import pytest
 
 from agentflow import coordinated_attack, coordinated_intake
 from agentflow import intake as intake_mod
-from agentflow.attack import (MAX_ATTACK_ROUNDS, AttackResult, attack_prompt, hardening_note,
-                              max_rounds, parse_attack)
+from agentflow.attack import (ATTACK_RESULT_SCHEMA, MAX_ATTACK_ROUNDS, AttackResult, attack_prompt,
+                              hardening_note, max_rounds, parse_attack)
 from agentflow.coordinator.admission import ADMISSION_MATRIX, admission_demand
 from agentflow.coordinator.attack_stage import decode_result, encode_result
 from agentflow.coordinator.intake_stage import encode_result as encode_draft
@@ -65,11 +69,47 @@ def test_an_unreadable_answer_spends_the_round_but_never_clears_the_draft(payloa
 
 
 def test_the_answer_survives_a_durable_round_trip():
-    original = parse_attack('{"objections": "1. unverifiable claim"}')
+    original = parse_attack('{"objections": "1. unverifiable claim", "forks": "1. yours to call"}')
     assert decode_result(encode_result(original)) == original
+    assert decode_result(encode_result(original)).forked, \
+        "which objections need a human must survive the trip — the gate branches on it"
     unreadable = parse_attack("not json")
     assert decode_result(encode_result(unreadable)) == unreadable, \
         "the *reason* a round was spent must survive the trip too"
+
+
+# --- the answer says what KIND of objection each one is ---------------------------------------
+
+def test_the_attacker_is_asked_which_of_its_objections_need_a_human():
+    # The whole fix lives here: the gate can only tell an edit from a decision if the answer
+    # carries the difference. Nothing downstream re-reads the objection prose to guess.
+    assert set(ATTACK_RESULT_SCHEMA["required"]) == {"objections", "forks"}
+
+
+def test_an_objection_that_names_its_own_fix_is_the_drafters_to_answer():
+    result = parse_attack('{"objections": "1. Reword criterion 3.", "forks": ""}')
+    assert result.parsed and not result.survived
+    assert result.answerable and not result.forked
+
+
+def test_a_named_fork_is_nobody_in_the_loops_to_answer():
+    result = parse_attack('{"objections": "1. Two defensible shapes here.", '
+                          '"forks": "1. Which store owns the row?"}')
+    assert result.forked and not result.answerable
+
+
+def test_a_missing_forks_field_reads_as_no_fork_rather_than_as_unreadable():
+    # Silence about forks is the ordinary answer — most rounds have none — and its safe
+    # direction is the drafter answering the objections, which is what every non-final round
+    # already does with them.
+    result = parse_attack('{"objections": "1. Reword criterion 3."}')
+    assert result.parsed and result.answerable and not result.forked
+
+
+def test_an_unreadable_answer_is_never_answerable():
+    # The fail-safe direction holds for the new field too: nobody read the draft, so nobody
+    # can vouch that what it says is only editing.
+    assert not parse_attack("not json").answerable
 
 
 # --- the round cap comes from the draft's own dial -------------------------------------------
@@ -112,14 +152,32 @@ def test_taste_is_not_an_objection_and_empty_is_a_success():
     assert "EMPTY objection list is a SUCCESSFUL" in prompt
 
 
+def test_the_prompt_asks_for_the_forks_and_shuts_the_lever_it_opens():
+    prompt = attack_prompt("o/r", 418, "a plan", "body")
+    assert '"forks"' in prompt
+    assert "A FORK IS NOT A STRONGER OBJECTION" in prompt, \
+        "an attacker that can escalate by relabelling would use it — say so where it is asked"
+    assert "fail to answer under `## Answered objections`" in prompt, \
+        "a finding the drafter kept dismissing is exactly what the maintainer is for"
+
+
 def test_the_redraft_regrounds_from_the_same_base_prompt():
     prompt = redraft_prompt("THE GROUNDING PROMPT", "a plan", "the draft body",
                             "1. an objection", round=2, max_rounds=3)
     assert prompt.startswith("THE GROUNDING PROMPT")
     assert "the draft body" in prompt and "1. an objection" in prompt
+    assert "round 2 of at most 3" in prompt
     assert "## Answered objections" in prompt, \
         "standing its ground must leave a trace inside the brief"
     assert 'route "grill"' in prompt, "a genuine fork still escapes to the maintainer"
+
+
+def test_the_last_redraft_is_told_nothing_will_attack_its_answer():
+    prompt = redraft_prompt("THE GROUNDING PROMPT", "a plan", "the draft body",
+                            "1. an objection", round=4, max_rounds=3, final=True)
+    assert "last cold reader" in prompt and "round 4 of at most 3" not in prompt
+    assert 'route "grill"' in prompt, \
+        "the last redraft is the last chance to escalate, so the escape must still be there"
 
 
 def test_the_published_brief_says_what_the_argument_cost():
@@ -127,6 +185,12 @@ def test_the_published_brief_says_what_the_argument_cost():
     assert "once" in hardening_note(1)
     assert "twice" in hardening_note(2)
     assert "3 times" in hardening_note(3)
+
+
+def test_a_brief_published_after_applying_the_last_objections_says_so():
+    assert "nothing left to object to" in hardening_note(3)
+    assert "with those applied" in hardening_note(3, answered=True), \
+        "the maintainer reads the brief, not our records — the two endings must read differently"
 
 
 # --- the round chain: pure record-to-record mappings ------------------------------------------
@@ -249,15 +313,29 @@ def test_objections_with_rounds_left_keep_the_argument_going(monkeypatch):
         "None is how a round says the argument continues — the next opener assumes the claim"
 
 
-def test_a_draft_out_of_rounds_still_contested_is_held_never_published(monkeypatch):
-    outcome, calls = _settle(monkeypatch, _attack_record(round=3), AttackResult("1. still wrong"))
+def test_publication_no_longer_requires_an_empty_objection_list(monkeypatch):
+    # THE defect. The gate published nothing in its entire production life because the only way
+    # through it was an attacker with nothing to say, and a cold reader given a real brief always
+    # has something. An objection that came with its own fix is work, and running out of attackers
+    # does not turn work into a decision — it gets the same redraft every other round's gets.
+    outcome, calls = _settle(monkeypatch, _attack_record(round=3),
+                             AttackResult("1. Reword criterion 3.", ""))
+    assert outcome is None and not calls, \
+        "the last round's objections are answered, and that answer is what gets published"
+
+
+def test_a_draft_out_of_rounds_with_a_real_fork_is_held_never_published(monkeypatch):
+    result = AttackResult("1. Two defensible shapes.", "1. Which store owns the row?")
+    outcome, calls = _settle(monkeypatch, _attack_record(round=3), result)
     assert outcome == "url" and "publish" not in calls
-    assert calls["hold"][1].objections == "1. still wrong"
+    assert calls["hold"][1].forks == "1. Which store owns the row?"
 
 
 def test_a_standard_draft_gets_exactly_one_round(monkeypatch):
+    # The cap is untouched: one attacker for a standard draft, and no second one buys itself a
+    # round by objecting.
     record = _attack_record(_draft(Complexity.STANDARD), round=1)
-    outcome, calls = _settle(monkeypatch, record, AttackResult("1. wrong"))
+    outcome, calls = _settle(monkeypatch, record, AttackResult("1. wrong", "1. yours to call"))
     assert "hold" in calls and "publish" not in calls
 
 
@@ -329,13 +407,34 @@ def _install(monkeypatch, fake):
 
 
 def test_a_ready_route_is_a_draft_intake_never_projects(monkeypatch):
-    # The gate itself: triage deciding "ready" no longer touches GitHub. If this regressed, every
-    # brief would publish un-attacked and the whole loop would be decoration.
+    # The gate itself: triage deciding "ready" no longer touches GitHub while an attacker is
+    # still owed one. If this regressed, every brief would publish un-attacked and the whole
+    # loop would be decoration.
     fake = _install(monkeypatch, FakeGH())
     settled = coordinated_intake.apply_route(_intake_record(), _draft())
     assert settled is None
     assert fake.posted_comment is None and fake.written_body is None and fake.title is None
     assert not fake.added and not fake.removed, "a draft leaves the issue untouched"
+
+
+def test_the_redraft_with_no_attacker_left_is_published_by_intakes_own_settlement(monkeypatch):
+    # The argument ends on a redraft, not on an attacker: the last round's objections were
+    # answered, and nothing is left to argue with the answer.
+    published = {}
+    monkeypatch.setattr(coordinated_attack, "publish_brief",
+                        lambda r, d, note: (published.setdefault("note", note), "url")[1])
+    assert coordinated_intake.apply_route(_intake_record(round=3), _draft()) == "url"
+    assert published["note"] == hardening_note(3, answered=True)
+
+
+def test_a_redraft_that_re_sizes_itself_deeper_earns_the_attacker_it_asks_for(monkeypatch):
+    # The dial is the classifier, and a redraft may move it. A standard draft that has already
+    # had its one attacker but comes back sized deep is owed more scrutiny, not a publish.
+    monkeypatch.setattr(coordinated_attack, "publish_brief",
+                        lambda r, d, note: "url")
+    assert coordinated_intake.apply_route(_intake_record(round=1),
+                                          _draft(Complexity.STANDARD)) == "url"
+    assert coordinated_intake.apply_route(_intake_record(round=1), _draft()) is None
 
 
 def test_the_hardening_note_rides_inside_the_one_ready_comment(monkeypatch):
@@ -369,15 +468,35 @@ def test_the_contested_hold_hands_over_the_draft_and_the_objections(monkeypatch)
     monkeypatch.setattr(coordinated_attack, "release",
                         lambda repo, n, label: released.append(label) or True)
 
-    url = coordinated_attack.hold_contested(
-        _attack_record(round=3), _draft(), AttackResult("1. still wrong"))
+    result = AttackResult("1. Reword criterion 3.\n2. Two defensible shapes.",
+                          "2. Which store owns the row?")
+    url = coordinated_attack.hold_contested(_attack_record(round=3), _draft(), result)
     assert url is not None
     assert captured["stage"] == "attack-contested"
     assert GRILLING in fake.added and READY in fake.removed, \
         "a contested draft leaves the build queue and waits for the maintainer"
-    assert "## Agent Brief\nthe plan" in fake.posted_comment, "the draft is not lost"
-    assert "1. still wrong" in fake.posted_comment, "the objections are the question"
+    body = fake.posted_comment
+    assert "## Agent Brief\nthe plan" in body, "the draft is not lost"
+    assert "a call only you can make" in body
+    assert body.index("Which store owns the row?") < body.index("Reword criterion 3."), \
+        "the maintainer is here for the fork, not for a numbered list of edits with patches"
     assert released == ["agentflow:triaging"]
+
+
+def test_an_unread_last_round_is_still_handed_over_as_unread(monkeypatch):
+    from agentflow import handoff as handoff_mod
+
+    fake = _install(monkeypatch, FakeGH())
+    monkeypatch.setattr(handoff_mod.DurableHandoff, "hand_off",
+                        lambda self, subject, **kw: (kw["action"](), "url")[1])
+    monkeypatch.setattr(coordinated_attack.github, "issue_headline",
+                        lambda repo, n: IssueView(title="a title", body="", state="OPEN",
+                                                  url="", labels={READY}, comments=[]))
+    monkeypatch.setattr(coordinated_attack, "release", lambda repo, n, label: True)
+
+    coordinated_attack.hold_contested(_attack_record(round=3), _draft(), parse_attack("not json"))
+    assert "answer I couldn't read" in fake.posted_comment, \
+        "an unread draft is not a settled one — that is a different question for the maintainer"
 
 
 # --- the session the attack runs in ------------------------------------------------------------
@@ -484,8 +603,121 @@ def test_a_survived_draft_is_settlements_not_another_round(monkeypatch):
     assert not _drive_attack_opener(monkeypatch, record).submitted
 
 
-def test_a_draft_out_of_rounds_is_settlements_not_another_round(monkeypatch):
+def test_the_last_rounds_objections_still_open_their_redraft(monkeypatch):
+    record = _attack_record(round=3, outcome=encode_result(AttackResult("1. Reword it.", "")))
+    coord = _drive_attack_opener(monkeypatch, record)
+    assert len(coord.submitted) == 1
+    assert coord.submitted[0].stage == "intake", "the cap on attackers is untouched"
+    assert "last cold reader" in json.loads(coord.submitted[0].input_ptr)["prompt"]
+
+
+def test_a_fork_out_of_rounds_is_settlements_not_another_round(monkeypatch):
     # The guard that keeps a transiently unsettled contested hold from buying itself an
     # extra round beyond the cap.
-    record = _attack_record(round=3, outcome=encode_result(AttackResult("1. wrong")))
+    record = _attack_record(round=3,
+                            outcome=encode_result(AttackResult("1. wrong", "1. yours to call")))
     assert not _drive_attack_opener(monkeypatch, record).submitted
+
+
+def test_an_unread_last_round_is_settlements_not_another_round(monkeypatch):
+    record = _attack_record(round=3, outcome=encode_result(parse_attack("not json")))
+    assert not _drive_attack_opener(monkeypatch, record).submitted
+
+
+def test_a_redraft_with_no_attacker_left_opens_no_attacker(monkeypatch):
+    # The mirror of the guard above, on the intake side: a redraft whose publish failed
+    # transiently must retry the publish, never buy itself a fourth attacker.
+    record = _intake_record(round=3, outcome=encode_draft(_draft()))
+    assert not _drive_intake_opener(monkeypatch, record).submitted
+
+
+# --- replaying what the gate actually did in production ---------------------------------------
+
+# Excerpts — verbatim — from the contested holds this gate really posted. Each is the attacker's
+# own objection heading followed by its own `Cheapest fix`. All three issues were handed to the
+# maintainer to arbitrate edits that arrived with their own wording, which is #418.
+RECORDED_OBJECTIONS = {
+    401: (
+        "## 1. Criterion 3 cannot tell a correct implementation from one that leaves a wrong "
+        "sign-off unrepaired\n\n"
+        "**Cheapest fix.** Restate criterion 3 in two halves: *a commit already carrying the "
+        "author-matching sign-off gets exactly one; a commit carrying only a non-matching "
+        "sign-off still gets the correct one appended.* That one sentence forces "
+        "`addIfDifferent` and is testable with the machinery criterion 2 already builds."
+    ),
+    411: (
+        '4. **"The set of reason texts is identical before and after, pinned by a test" is not '
+        "testable without inventing something the charter would reject.**\n\n"
+        "   *Cheapest fix.* Replace it with the two concrete observations it is standing in "
+        "for, both of which are testable through the existing interfaces: (a) a turn-capped "
+        "intake and a turn-capped attack hold under exactly `\"continuation budget exhausted\"` "
+        "(already AC 11), and (b) `proof_marker(identity, reason, tag=\"intake-hold\")` / "
+        '`tag="attack-hold"` are byte-identical before and after the change for each of the two '
+        "existing reason strings — no registry required."
+    ),
+    417: (
+        "## 2. Criterion 8 passes on today's code, so it cannot judge the new read\n\n"
+        "**Cheapest fix.** Reword to isolate the new read: with the comment thread, PR facts "
+        "and PR content all readable and **only the check-status read** returning unknown, "
+        "settlement posts no clean summary, does not merge, and posts no park comment; "
+        "repeating that N times leaves the PR with no new agentflow comment and the record "
+        "unsettled."
+    ),
+}
+
+
+def _replay(monkeypatch, answer, *, complexity=Complexity.DEEP):
+    """Drive one attacker answer through the whole gate at the round cap, end to end.
+
+    Settlement first; if the argument continues, the opener drives the redraft and that
+    redraft's own settlement decides. Returns whichever ending fired.
+    """
+    ending = {}
+    monkeypatch.setattr(coordinated_attack, "hold_contested",
+                        lambda r, d, res: (ending.setdefault("held", res), "url")[1])
+    monkeypatch.setattr(coordinated_attack, "publish_brief",
+                        lambda r, d, note: (ending.setdefault("published", d), "url")[1])
+    result = parse_attack(json.dumps(answer))
+    draft = _draft(complexity)
+    record = _attack_record(draft, round=max_rounds(complexity), outcome=encode_result(result))
+    if coordinated_attack.apply_objections(record, result) is not None:
+        return ending
+    redraft = _drive_attack_opener(monkeypatch, record).submitted[0]
+    coordinated_intake.apply_route(
+        _Record("intake", round=redraft.round, source=redraft.source,
+                input_ptr=redraft.input_ptr, identity="o/r|380|intake|last"),
+        draft)
+    return ending
+
+
+@pytest.mark.parametrize("issue", [401, 411, 417])
+def test_the_holds_this_gate_really_posted_would_now_be_published(monkeypatch, issue):
+    assert "Cheapest fix" in RECORDED_OBJECTIONS[issue], \
+        "these are the recorded objections precisely because each arrived with its own remedy"
+    ending = _replay(monkeypatch, {"objections": RECORDED_OBJECTIONS[issue], "forks": ""})
+    assert "published" in ending and "held" not in ending
+
+
+def test_a_draft_carrying_a_real_either_or_still_holds(monkeypatch):
+    ending = _replay(monkeypatch, {
+        "objections": "1. The plan gives the retry clock to the daemon without saying why.",
+        "forks": "1. Does the retry clock belong to the daemon or to the runner? Both are "
+                 "defensible and no amount of reading the code decides it."})
+    assert "held" in ending and "published" not in ending
+
+
+@pytest.mark.parametrize("complexity", [Complexity.STANDARD, Complexity.DEEP])
+def test_one_round_and_three_rounds_end_the_same_way(monkeypatch, complexity):
+    # A standard draft reaches the cap after a single attacker, so if the two paths diverged it
+    # would be the standard one that kept parking issues on the maintainer.
+    ending = _replay(monkeypatch, {"objections": RECORDED_OBJECTIONS[401], "forks": ""},
+                     complexity=complexity)
+    assert "published" in ending and "held" not in ending
+
+
+@pytest.mark.parametrize("complexity", [Complexity.STANDARD, Complexity.DEEP])
+def test_one_round_and_three_rounds_escalate_the_same_way(monkeypatch, complexity):
+    ending = _replay(monkeypatch, {"objections": "1. Two defensible shapes.",
+                                   "forks": "1. Which one do you want?"},
+                     complexity=complexity)
+    assert "held" in ending and "published" not in ending

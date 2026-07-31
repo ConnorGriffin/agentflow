@@ -13,14 +13,14 @@ def encode_result(result: AttackResult) -> str:
     # `detail` rides along so *why* an unreadable answer spent a round survives the trip — a
     # round whose reason was dropped between capture and settlement leaves nothing anywhere
     # saying whether the attacker found something or never answered at all.
-    return json.dumps({"objections": result.objections, "parsed": result.parsed,
-                       "detail": result.detail}, sort_keys=True)
+    return json.dumps({"objections": result.objections, "forks": result.forks,
+                       "parsed": result.parsed, "detail": result.detail}, sort_keys=True)
 
 
 def decode_result(payload: str) -> AttackResult:
     data = json.loads(payload)
-    return AttackResult(data.get("objections", ""), bool(data.get("parsed", True)),
-                        data.get("detail", ""))
+    return AttackResult(data.get("objections", ""), data.get("forks", ""),
+                        bool(data.get("parsed", True)), data.get("detail", ""))
 
 
 class AttackStageAdapter(StageAdapter):

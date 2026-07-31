@@ -588,9 +588,13 @@ def _open_attack_on_completed_intake(coord: Coordinator, intake_identity: str) -
     (ADR 380). Nothing is written to GitHub here: the draft is unpublished by design, and the
     grill/mockup/close routes never reach this opener because their settlement retires the record
     (a transiently unsettled one is skipped by the route check and retried by settlement, not by
-    us). Submission is idempotent on the attack identity (repo, subject, attack, round), so a
-    repeat or restart never opens a second attacker for the same round. Live — its mapping is
-    covered through :func:`coordinated_attack.attack_submission`."""
+    us). A redraft that has already used the last round the cap allows opens nothing: its publish
+    belongs to settlement, and a transiently unsettled one must never buy itself an attacker
+    beyond the cap (ADR 418) — the mirror of the same guard on the attack side. Submission is
+    idempotent on the attack identity (repo, subject, attack, round), so a repeat or restart never
+    opens a second attacker for the same round. Live — its mapping is covered through
+    :func:`coordinated_attack.attack_submission`."""
+    from agentflow.attack import max_rounds
     from agentflow.coordinator.intake_stage import decode_result
     from agentflow.intake import IntakeRoute
     records = {record.identity: record for record in tracer.load_records()}
@@ -603,6 +607,8 @@ def _open_attack_on_completed_intake(coord: Coordinator, intake_identity: str) -
         return
     if draft.route is not IntakeRoute.READY:
         return
+    if intake.round >= max_rounds(draft.complexity):
+        return  # out of attackers — this redraft is published by settlement, not argued with
     builder, _reviewer, _block_msg = pick_pair()
     if builder is None:
         return  # ADR 0020: no pool has headroom this cycle — the completed intake keeps its
@@ -616,12 +622,14 @@ def _open_next_round_on_completed_attack(coord: Coordinator, attack_identity: st
     """A completed attack round that leaves the argument open drives the next round and transfers
     the ``triaging`` claim before the attack record retires — no ownership gap (ADR 380).
     Readable objections open a redraft; an unreadable answer renews the attack on the same draft,
-    since there is nothing for a drafter to answer. The settled endings — a survived draft's
-    publish, a contested draft's hold at the round cap — belong to the attack record's own
-    settlement, so both are skipped here and a transient settlement failure is retried there
-    rather than answered with an extra round. Submission is idempotent on the successor identity,
-    so a repeat or restart never opens the same round twice. Live — its mapping is covered
-    through :func:`coordinated_attack.redraft_submission` and
+    since there is nothing for a drafter to answer. At the cap that redraft still opens — the last
+    round's objections are answered like any other round's, and the answer is published with no
+    attacker left to read it (ADR 418) — but only when they are the drafter's to answer. The
+    settled endings — a survived draft's publish, a hold on a fork or an unread round — belong to
+    the attack record's own settlement, so all are skipped here and a transient settlement failure
+    is retried there rather than answered with an extra round. Submission is idempotent on the
+    successor identity, so a repeat or restart never opens the same round twice. Live — its
+    mapping is covered through :func:`coordinated_attack.redraft_submission` and
     :func:`coordinated_attack.renewed_attack_submission`."""
     from agentflow.attack import max_rounds
     from agentflow.coordinator.attack_stage import decode_result
@@ -639,8 +647,8 @@ def _open_next_round_on_completed_attack(coord: Coordinator, attack_identity: st
     draft = coordinated_attack._draft(payload) if payload is not None else None
     if draft is None:
         return
-    if attack.round >= max_rounds(draft.complexity):
-        return  # out of rounds — the contested hold is settlement's, never another round
+    if attack.round >= max_rounds(draft.complexity) and not result.answerable:
+        return  # a fork or an unread round at the cap — the hold is settlement's, never a round
     builder, _reviewer, _block_msg = pick_pair()
     if builder is None:
         return  # ADR 0020: no pool has headroom this cycle — the completed attack keeps its

@@ -123,12 +123,13 @@ def intake_claim_ready(record) -> bool:
 def apply_route(record, result: IntakeResult) -> str | None:
     """Idempotently project the already-durable route, proving it before claim release.
 
-    A ``ready`` route is **not projected here at all** (ADR 380). It is a *draft*: nothing is
-    written to the issue, the triaging claim is retained, and this returns ``None`` so the record
-    stays completed-and-unretired until the attack round it opens assumes the claim. A brief
-    reaches GitHub exactly once, from :func:`agentflow.coordinated_attack.publish_brief`, after it
-    has survived its attackers — so a draft that never survives is never something the maintainer
-    had to read.
+    A ``ready`` route is **not projected here** while an attacker is still owed one (ADR 380).
+    It is a *draft*: nothing is written to the issue, the triaging claim is retained, and this
+    returns ``None`` so the record stays completed-and-unretired until the attack round it opens
+    assumes the claim. The one exception is the redraft that answers the last round the cap
+    allows: no attacker is left to read it, every objection behind it was one the drafter could
+    answer, and it is published here rather than held (ADR 418). Whether an attacker is still
+    owed is the attack module's arithmetic, not intake's — this asks it.
 
     A ``grill`` or ``mockup`` route is a handoff — it asks a human for something — so it goes
     through the shared :class:`~agentflow.handoff.DurableHandoff` envelope (ADR 0042): the
@@ -149,7 +150,8 @@ def apply_route(record, result: IntakeResult) -> str | None:
     except (ValueError, KeyError, TypeError):
         return None
     if result.route is IntakeRoute.READY:
-        return None   # a draft, not a decision — the attack round takes it from here
+        from agentflow.coordinated_attack import publish_redrafted_brief
+        return publish_redrafted_brief(record, result)
     source_title = snapshot.get("title", "")
     source_body = snapshot.get("body", "")
 

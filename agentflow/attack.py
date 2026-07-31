@@ -15,6 +15,11 @@ reopens the plan.
 This module owns the attacker's rubric prompt and its objections, and nothing else. The rounds
 themselves are the intake↔attack record chain in :mod:`agentflow.coordinated_attack`.
 
+The attacker's answer says two things, not one: what it objects to, and which of those objections
+is a **fork** — a call only the maintainer can make. Everything else is the drafter's to answer,
+which is exactly what the redraft between rounds already does with it. Publication therefore never
+required unanimous silence: it requires that nothing is left needing a human (ADR 418).
+
 Parsing is fail-safe, but its safe direction is not intake's. An objection we cannot read is not
 an objection: a session that returned nothing readable did not clear the draft, so an unreadable
 verdict spends a round *without* being mistaken for a clean bill of health (:func:`parse_attack`).
@@ -28,12 +33,14 @@ from dataclasses import dataclass
 from agentflow.intake import _fill
 from agentflow.shell_crib import SHELL_CRIB
 
-# How many times one draft may be attacked before the argument goes to the maintainer instead.
-# Scaled by the complexity dial the draft itself carries — the dial triage already stamps *is*
-# the classifier for how much adversarial intensity the ask deserves (ADR 380): a standard brief
-# gets one cold read, a deep one earns up to three. Bounded because an unbounded argument is a
-# way to never ship: each round costs a real session, and a plan that is still contested after
-# three cold attackers is not going to be settled by a fourth — that is a maintainer's call.
+# How many times one draft may be attacked. Scaled by the complexity dial the draft itself
+# carries — the dial triage already stamps *is* the classifier for how much adversarial intensity
+# the ask deserves (ADR 380): a standard brief gets one cold read, a deep one earns up to three.
+# Bounded because an unbounded argument is a way to never ship: each round costs a real session,
+# and a fourth cold reader on a fourth rewritten draft finds a fourth set of things to say rather
+# than converging. What running out of attackers means is that the last round's objections get
+# answered and the answer is published, with no attacker left to read it — the maintainer is
+# called only for what the drafter cannot answer at all (ADR 418).
 _ROUNDS_BY_COMPLEXITY = {"standard": 1, "deep": 3}
 MAX_ATTACK_ROUNDS = max(_ROUNDS_BY_COMPLEXITY.values())
 
@@ -55,14 +62,16 @@ ATTACK_RESULT_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "objections": {"type": "string"},
+        "forks": {"type": "string"},
     },
-    "required": ["objections"],
+    "required": ["objections", "forks"],
 }
 
 
 @dataclass(frozen=True, slots=True)
 class AttackResult:
     objections: str = ""    # the numbered objections; empty means the draft survived this round
+    forks: str = ""         # the ones among them only the maintainer can settle; usually empty
     parsed: bool = True     # False when the fail-safe produced this rather than the attacker
     detail: str = ""
 
@@ -76,13 +85,33 @@ class AttackResult:
         """
         return self.parsed and not self.objections
 
+    @property
+    def forked(self) -> bool:
+        """Whether anything here needs the maintainer rather than the drafter (ADR 418)."""
+        return bool(self.forks.strip())
+
+    @property
+    def answerable(self) -> bool:
+        """Whether everything this round raised is the drafter's own to answer.
+
+        The distinction the gate branches on: a readable attacker that objected and named no
+        fork has described work, not a decision. Between rounds the redraft absorbs exactly
+        this, and running out of attackers does not change what kind of objection it is.
+        """
+        return self.parsed and bool(self.objections) and not self.forked
+
 
 def parse_attack(payload: str) -> AttackResult:
     """Validate an attack session's structured answer. Pure, fail-safe (test surface).
 
     The CLI enforces :data:`ATTACK_RESULT_SCHEMA` natively, so the payload is the answer object
-    itself. Anything unreadable — a non-object, a missing field, an exception — returns an
-    unparsed result, which spends the round but never counts as the draft surviving. Never raises.
+    itself. Anything unreadable — a non-object, a missing objections field, an exception —
+    returns an unparsed result, which spends the round but never counts as the draft surviving.
+
+    A missing ``forks`` field reads as *no fork*, not as unreadable. Silence about forks is the
+    ordinary answer — most rounds have none — and the safe direction for it is the drafter
+    answering the objections, which is what happens in every round that is not the last. Never
+    raises.
     """
     try:
         data = json.loads(payload.strip() or "null")
@@ -90,7 +119,8 @@ def parse_attack(payload: str) -> AttackResult:
             return AttackResult(parsed=False, detail="attack output was not a structured object")
         if "objections" not in data:
             return AttackResult(parsed=False, detail="attack answer carried no objections field")
-        return AttackResult(str(data.get("objections") or "").strip())
+        return AttackResult(str(data.get("objections") or "").strip(),
+                            str(data.get("forks") or "").strip())
     except Exception as e:  # noqa: BLE001 — fail-safe, never propagate
         return AttackResult(parsed=False, detail=f"parse error: {type(e).__name__}")
 
@@ -147,9 +177,25 @@ attack on a draft that deserved to survive, and saying so is how a good plan get
 instead of next round. Equally, do not go easy on a draft because it reads well — a fluent plan
 built on a claim that isn't true is exactly what you are here to catch.
 
+NAME THE FORKS SEPARATELY. Everything you object to goes back to the drafter, who fixes the plan
+and hands back a new one — that is what your cheapest fix is for, and it is why an objection
+carrying one costs nobody anything but a rewrite. A few objections are not like that: a real
+choice between defensible options that changes the result and no amount of reading the code
+decides, a fact nobody in this loop can supply, or a finding you have now watched the drafter try
+and fail to answer under `## Answered objections`. Those need the maintainer, and they are the
+only thing that stops this plan from being built at all.
+
+A FORK IS NOT A STRONGER OBJECTION. Calling an edit a fork does not make it land harder; it wakes
+a human to approve a sentence you already wrote, and that is a failed attack, not a thorough one.
+If you know what the plan should say instead, it is an objection. Declare a fork only when you
+genuinely do not know which answer is right and neither does the code.
+
 Your final response IS the structured answer — the harness enforces its schema natively, so you
-do not hand-write or fence the JSON; just produce this field:
-- "objections": the numbered Markdown objections, or the empty string if the draft survives""" \
+do not hand-write or fence the JSON; just produce these two fields:
+- "objections": the numbered Markdown objections, or the empty string if the draft survives
+- "forks": the ones among them — by number, each with the question the maintainer has to answer —
+  that are genuine forks, or the empty string if every objection you raised is settled by the
+  drafter applying the fix you named""" \
     + SHELL_CRIB
 
 
@@ -168,17 +214,20 @@ def attack_prompt(repo: str, number: int, title: str, body: str, *,
                  max_rounds=str(max_rounds))
 
 
-def hardening_note(rounds: int) -> str:
+def hardening_note(rounds: int, *, answered: bool = False) -> str:
     """The one line the published brief carries about the argument behind it. Pure (test surface).
 
     The maintainer reads the brief, not our records, so what the rounds cost has to be visible in
-    the brief's own comment or it may as well not have happened. Only a draft that ran out of
-    objections is ever published — one that ran out of *rounds* goes to the maintainer instead
-    (:func:`agentflow.coordinated_attack.hold_contested`) — so this note has exactly one story to
-    tell.
+    the brief's own comment or it may as well not have happened. Two endings reach print: the last
+    attacker had nothing left to say, or it had objections the drafter then answered with no
+    attacker left to read the answer (``answered``, ADR 418). A draft that still needed the
+    maintainer was never published at all
+    (:func:`agentflow.coordinated_attack.hold_contested`), so it has no line here.
     """
     if rounds <= 0:
         return ""
     times = "once" if rounds == 1 else ("twice" if rounds == 2 else f"{rounds} times")
+    ending = ("the last round's objections all came with their own fix, and this is the draft "
+              "with those applied." if answered else "the last one had nothing left to object to.")
     return (f"Before posting this I had it torn into {times} by fresh sessions that hadn't "
-            "seen how it was written — the last one had nothing left to object to.")
+            f"seen how it was written — {ending}")

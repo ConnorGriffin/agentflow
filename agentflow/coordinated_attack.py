@@ -5,10 +5,11 @@ instead opens an **attack**: one cold session that never saw the drafting sessio
 the plan while breaking it is still free. Its objections go back to a *fresh* triage session that
 answers them and redrafts, and that redraft is attacked again. Each attacker reads only the newest
 draft — never the rounds behind it — so what a settlement is worth must be written into the draft
-itself. Only a draft that runs out of objections is published, so an issue is `ready-for-agent`
-exactly when the argument about it is over; one that runs out of *rounds* still contested goes to
-the maintainer (:func:`hold_contested`), never to a builder. Nothing downstream knows any of this
-happened.
+itself. The argument is over when nothing is left that a human has to decide: a draft the last
+attacker had nothing to say about is published, and so is the redraft that answers a last round
+whose objections all came with their own fix (ADR 418). What still needs the maintainer — a fork
+the attacker named, or a round nobody could read — goes to them (:func:`hold_contested`), never to
+a builder. Nothing downstream knows any of this happened.
 
 The rounds are the same claim-transfer chain Build→Review→Revise already uses (ADR 0028): each
 round's record hands the issue's ``triaging`` claim to the next round's record inside one
@@ -150,8 +151,10 @@ def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submis
 
     A redraft is an ordinary Intake stage — same adapter, same schema, same read-only profile —
     carrying the completed attack rounds as its round number. Only its prompt differs, and only
-    by the draft and the objections appended to the grounding prompt it re-grounds from. Pure;
-    ``None`` when the attack round's durable input cannot be read.
+    by the draft and the objections appended to the grounding prompt it re-grounds from. The
+    redraft that answers the last round the cap allows is told it is the last one, since its
+    answer is published rather than attacked (ADR 418). Pure; ``None`` when the attack round's
+    durable input cannot be read.
     """
     payload = _chain(attack_record)
     ref = WorktreeRef.parse(attack_record.source)
@@ -163,9 +166,10 @@ def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submis
     number = int(attack_record.subject)
     snapshot = payload["snapshot"]
     base_prompt = payload.get("base_prompt", "")
+    round = attack_record.round + 1
+    cap = max_rounds(draft.complexity)
     prompt = redraft_prompt(base_prompt, draft.title or snapshot.get("title", ""), draft.body,
-                            result.objections, round=attack_record.round + 1,
-                            max_rounds=max_rounds(draft.complexity))
+                            result.objections, round=round, max_rounds=cap, final=round > cap)
     return Submission(
         repo=attack_record.repo, subject=attack_record.subject, stage="intake",
         pool=tool, complexity="deep", round=attack_record.round, claim=True,
@@ -285,11 +289,14 @@ def apply_objections(record, result: AttackResult) -> str | None:
     takes it from there (a redraft against readable objections, a renewed attack after an
     unreadable answer), exactly as a completed Build holds its claim until its Review exists.
 
-    A draft that runs out of rounds still contested is **never published**: a builder spent on a
-    plan three cold readers couldn't settle is the exact waste this design exists to prevent, so
-    the argument goes to the maintainer with the surviving objections as the question
-    (:func:`hold_contested`). Ordinary disagreement never gets that far — a triage round that
-    hits a genuine fork routes to grilling itself, which ends the chain and hands the issue over.
+    Running out of attackers is not itself an ending. What the last round said decides that
+    (ADR 418): objections the drafter can answer get the same redraft every other round's get,
+    and *that* redraft is published because no attacker is left to read it
+    (:func:`publish_redrafted_brief`) — so this returns ``None`` and the argument continues one
+    last step. Only what the drafter cannot answer — a genuine fork the attacker named, or an
+    answer nobody could read — reaches the maintainer (:func:`hold_contested`). A builder spent
+    on a plan whose open question was never settled is the waste this design exists to prevent;
+    a builder spent on a plan whose last edit came with its own wording is not.
     """
     payload = _chain(record)
     if payload is None:
@@ -299,19 +306,34 @@ def apply_objections(record, result: AttackResult) -> str | None:
         return None
     if result.survived:
         return publish_brief(record, draft, hardening_note(record.round))
-    if record.round >= max_rounds(draft.complexity):
+    if record.round >= max_rounds(draft.complexity) and not result.answerable:
         return hold_contested(record, draft, result)
     return None   # the argument continues — the next round's opener assumes the claim
 
 
-def hold_contested(record, draft: IntakeResult, result: AttackResult) -> str | None:
-    """Hand a draft that ran out of rounds still contested to the maintainer (ADR 380).
+def publish_redrafted_brief(record, draft: IntakeResult) -> str | None:
+    """Publish a redraft that has no attacker left to face, or ``None`` while one is still owed.
 
-    This is a product outcome, not an infrastructure one: every session ran and answered, the
-    drafter and its attackers just never converged. The maintainer gets the newest draft and the
-    surviving objections as the question, through intake's own grilling route — one reply
-    restarts triage exactly as it does for any other held issue, and the next draft earns a
-    fresh set of attackers. When the last round's answer was unreadable rather than objecting,
+    Intake's own settlement asks this of every ``ready`` route it decides, because that is the
+    one thing a triage session cannot know about its own draft: whether the round cap leaves an
+    attacker to read it (ADR 380/418). While one does, the draft stays unpublished and the
+    attack opener takes the claim, exactly as before. When none does, this redraft *is* the end
+    of the argument — every objection behind it was one the drafter could answer, or it would
+    have gone to the maintainer instead of coming back here — so it publishes.
+    """
+    if record.round < max_rounds(draft.complexity):
+        return None
+    return publish_brief(record, draft, hardening_note(record.round, answered=True))
+
+
+def hold_contested(record, draft: IntakeResult, result: AttackResult) -> str | None:
+    """Hand a draft the drafter cannot finish on its own to the maintainer (ADR 380/418).
+
+    This is a product outcome, not an infrastructure one: every session ran and answered, and
+    what is left is a call nobody in the loop is allowed to make. The comment **leads with that
+    call** — the maintainer is here for the fork, not for a numbered list of edits, and burying
+    the question under the edits is what made this hold read as busywork. Everything else the
+    last attacker raised follows as context. When the answer was unreadable rather than objecting,
     the hold says that instead: an unread draft is not a settled one, and publishing it on our
     own say-so is the one thing this design refuses to do.
 
@@ -322,13 +344,21 @@ def hold_contested(record, draft: IntakeResult, result: AttackResult) -> str | N
                                    proof_marker)
     from agentflow.intake import _DISCLAIMER
     number = int(record.subject)
-    argument = (f"still has objections I couldn't settle:\n\n{result.objections.strip()}"
-                if result.parsed and result.objections.strip() else
-                "ended on an answer I couldn't read, so the last word on it is missing")
+    objections = result.objections.strip() if result.parsed else ""
+    if result.forked:
+        argument = f"came down to a call only you can make:\n\n{result.forks.strip()}"
+    else:
+        # The only other way in. An objection the drafter can answer never reaches this hold —
+        # it gets its redraft and that redraft is published (:func:`apply_objections`), so what
+        # is left here is a round nobody could read.
+        argument = "ended on an answer I couldn't read, so the last word on it is missing"
+    rest = (f"\n\nThe rest of what that round raised, for context:\n\n{objections}"
+            if objections else "")
     reason = f"contested after {record.round} attack round(s)"
     body = (f"{_DISCLAIMER}\n\nI drafted a plan for this and had it torn into by fresh sessions "
             f"that hadn't seen how it was written. After {record.round} round(s) the argument "
-            f"{argument}\n\nHere's the draft as it stands:\n\n{draft.body.strip() or '(no draft body)'}"
+            f"{argument}{rest}"
+            f"\n\nHere's the draft as it stands:\n\n{draft.body.strip() or '(no draft body)'}"
             f"\n\nSettle what's contested (or run `/agentflow pickup {number}` to drive it live) "
             "and I'll take it from there — your reply restarts triage, and the next draft gets "
             "argued with fresh.")

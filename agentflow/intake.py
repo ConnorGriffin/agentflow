@@ -534,8 +534,7 @@ _REDRAFT = """
 
 YOUR DRAFT WAS ATTACKED. Nothing has been published — the issue is untouched and the maintainer
 has seen none of this. You drafted the plan below, a cold session with no memory of your reasoning
-tried to break it, and these are its objections. This is round {round} of at most {max_rounds};
-answer them and hand back your best plan.
+tried to break it, and these are its objections. {standing}
 
 Your draft:
 Title: {draft_title}
@@ -563,8 +562,17 @@ Answer with a complete decision, exactly as before: the whole brief again, not a
 last one. Your route may change; the dials may change."""
 
 
+_STANDING = ("This is round {round} of at most {max_rounds}; answer them and hand back your best "
+             "plan.")
+
+_LAST_STANDING = ("That was the last cold reader this plan gets — nothing will attack what you "
+                  "hand back, and what you hand back is published as the brief a builder is "
+                  "spent on. Answer the objections and hand back your best plan.")
+
+
 def redraft_prompt(base_prompt: str, draft_title: str, draft_body: str,
-                   objections: str, *, round: int, max_rounds: int) -> str:
+                   objections: str, *, round: int, max_rounds: int,
+                   final: bool = False) -> str:
     """The durable provider input for one hardening round of intake (ADR 380). Pure.
 
     ``base_prompt`` is the grounding prompt the *first* draft came from, carried unchanged down
@@ -572,9 +580,15 @@ def redraft_prompt(base_prompt: str, draft_title: str, draft_body: str,
     from, and a round replayed after a crash composes byte-identical input. It is deliberately
     the whole prompt rather than a follow-up message: this is a new session, so it has to be
     able to re-ground from nothing.
+
+    ``final`` is the redraft that answers the last round the cap allows (ADR 418). It is told so
+    plainly, because "no attacker will read this" changes what a careful drafter does with the
+    remaining objections — and because the grill escape below is now the last one there is.
     """
     return base_prompt + _fill(
-        _REDRAFT, round=str(round), max_rounds=str(max_rounds),
+        _REDRAFT,
+        standing=(_LAST_STANDING if final else
+                  _fill(_STANDING, round=str(round), max_rounds=str(max_rounds))),
         draft_title=draft_title,
         draft_body=draft_body.strip() or "(no draft body)",
         objections=objections.strip() or "(no objections recorded)")
