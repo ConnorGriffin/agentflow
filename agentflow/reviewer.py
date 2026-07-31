@@ -307,7 +307,9 @@ You own bounded cleanup in this review; do not merely report work you can safely
   or observed behavior grounds.
 - For a real necessary gap outside this PR's scope, search existing issues first, then file one
   follow-up issue in this repo. Record its URL, evidence, desired outcome, and duplicate-search
-  query. Do not file issues for unsupported preferences.
+  query. Do not file issues for unsupported preferences. File it with NO labels — never
+  `ready-for-agent` and never any `agentflow:*` label: a follow-up enters intake like any other
+  new issue and earns its dials there; one born ready is unbuildable (ADR 0018).
 - If a choice is materially ambiguous, changes product intent, needs missing context, or cannot be
   verified safely, do not guess. Record exactly two options, missing guidance, and your
   recommendation for agentflow's one private cross-tool decision handoff. Do not comment on GitHub.
