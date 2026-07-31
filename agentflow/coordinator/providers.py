@@ -16,6 +16,7 @@ by a Codex-specific policy in the coordinator.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -43,18 +44,20 @@ class PermanentReason(str, Enum):
     """*Which* permanent condition ended the attempt — a fact, not a policy (ADR 0030).
 
     ``ProviderCause.PERMANENT`` covers conditions with nothing in common but "a human has to
-    act": a refused sign-in, a request the provider itself rejected, a configured spend ceiling.
-    They need different remediations, so the adapter preserves which one fired and the stage
-    handoff picks its copy from it (issue #342). This is a sibling of ``cause``, never a
-    replacement: ``classification()`` still reads ``cause`` alone, so no trigger changes
-    category. Anything else permanent — including a synthesized non-provider observation —
-    stays ``UNSPECIFIED`` so the handoff never prescribes a wrong remedy.
+    act": a refused sign-in, a request the provider itself rejected, a configured spend ceiling,
+    an environment that could not carry a session at all. They need different remediations, so
+    the adapter preserves which one fired and the stage handoff picks its copy from it (issue
+    #342). This is a sibling of ``cause``, never a replacement: ``classification()`` still reads
+    ``cause`` alone, so no trigger changes category. Anything else permanent — including a
+    synthesized non-provider observation — stays ``UNSPECIFIED`` so the handoff never prescribes
+    a wrong remedy.
     """
 
     UNSPECIFIED = "unspecified"              # permanent, but nothing typed named which kind
     ACCESS = "access"                        # sign-in, billing, plan, or permission refusal
     REJECTED_REQUEST = "rejected-request"    # the provider refused the request itself
     SPEND = "spend"                          # a configured cost ceiling stopped the run
+    ENVIRONMENT = "environment"              # the shell never started, so nothing was attempted
 
 
 # How each typed cause maps to the coordinator's outcome-first classification label. The
@@ -264,6 +267,86 @@ def _claude_quota_fact(info: dict, observed_at: int) -> QuotaFact | None:
     return build_fact("claude", pct, resets_at, observed_at, "claude:rate_limit_event")
 
 
+# --- the dead shell (issue #386) ---------------------------------------------------------
+#
+# A session whose shell cannot be *spawned* never reaches the work at all. That is not the
+# agent failing at the task and not a provider condition; it is the environment refusing to
+# carry a session, and it needs its own ending so the maintainer is not told the agent ran out
+# of tries. The facts are already in the stream: the harness reports the refusal as the shell
+# tool's own error result.
+
+# The shell tool whose results are read here. Only a call that tries to *start a process*
+# counts — a session that never asked for one cannot have had its shell refused.
+_SHELL_TOOLS = frozenset({"Bash"})
+
+# The harness's own exec-level start-failure line, anchored to its beginning. This is the
+# harness reporting that it could not bring a process into existence — not model prose and not
+# a command's own output, which `docs/research/provider-interruption-signals.md` forbids
+# diagnosing from. The observed instance is the sandbox profile outgrowing the OS argument
+# limit ("Could not start /bin/zsh: … exceed the OS exec argument limit (E2BIG)", ADR 0050),
+# but any refusal to spawn the shell is the same ending, so the shape — not that one cause —
+# is what is matched.
+_SHELL_START_FAILURE = re.compile(
+    r"\s*(?:could not|failed to|unable to|cannot)\s+(?:start|spawn|launch|execute)\b",
+    re.IGNORECASE)
+
+
+def _message_blocks(event) -> list:
+    """The content blocks of a stream event's API message, or an empty list."""
+    message = event.get("message") if isinstance(event, dict) else None
+    content = message.get("content") if isinstance(message, dict) else None
+    return content if isinstance(content, list) else []
+
+
+def _tool_result_text(block: dict) -> str:
+    """A ``tool_result`` block's text, whether it carries a bare string or content blocks."""
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(part["text"] for part in content
+                         if isinstance(part, dict) and isinstance(part.get("text"), str))
+    return ""
+
+
+def _shell_never_started(events) -> bool:
+    """Whether this session asked for a shell and never got one — no command ever ran (#386).
+
+    Two independent anchors, both required, so nothing here is diagnosed from loose keyword
+    matching. Each shell result is correlated back to its own ``tool_use`` block, so only a real
+    shell call is read; and *every* one of those results must be the harness's exec-level
+    start-failure line. A single shell result that is anything else means a command did run, and
+    a rejection after that is an ordinary adjustable one — the kind the shell crib teaches a
+    session to work around — not a dead shell.
+    """
+    shell_calls = {
+        block["id"] for event in events for block in _message_blocks(event)
+        if isinstance(block, dict) and block.get("type") == "tool_use"
+        and block.get("name") in _SHELL_TOOLS and isinstance(block.get("id"), str)}
+    if not shell_calls:
+        return False
+    refused = False
+    for event in events:
+        for block in _message_blocks(event):
+            if (not isinstance(block, dict) or block.get("type") != "tool_result"
+                    or block.get("tool_use_id") not in shell_calls):
+                continue
+            if (block.get("is_error") is True
+                    and _SHELL_START_FAILURE.match(_tool_result_text(block))):
+                refused = True
+            else:
+                return False   # a shell result that is not a start failure — a command ran
+    return refused
+
+
+# The endings a dead shell may claim: the ones that would otherwise read as an ordinary
+# incomplete or interrupted session. A provider that reported a typed condition of its own
+# (capacity, permanent, server) keeps it — that is the real story, and a dead shell never
+# overrides a fact the provider itself established.
+_ENVIRONMENT_OVERRIDABLE = frozenset({
+    ProviderCause.NONE, ProviderCause.PROCESS, ProviderCause.TIMEOUT, ProviderCause.UNKNOWN})
+
+
 def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
                     partial_output="", family=None, process_alive=False,
                     has_end_fact=False, observed_at=None) -> ProviderObservation:
@@ -357,6 +440,13 @@ def classify_claude(events, *, exit_status=None, signal=None, timed_out=False,
             cause = ProviderCause.TIMEOUT
         elif signal is not None or (exit_status not in (None, 0)):
             cause = ProviderCause.PROCESS
+    if cause in _ENVIRONMENT_OVERRIDABLE and _shell_never_started(events):
+        # The environment could not carry a session: the agent never reached the work, so
+        # neither a continuation nor a wait can help and the ending is a human hold (#386). It
+        # stays a PERMANENT *cause* so the classification table and every branch reading it are
+        # untouched; only the reason says this was the environment rather than the provider.
+        cause = ProviderCause.PERMANENT
+        permanent_reason = PermanentReason.ENVIRONMENT
     return ProviderObservation(
         cause=cause, permanent_reason=permanent_reason,
         reset_at=reset_at, exit_status=exit_status, signal=signal,
@@ -383,7 +473,11 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
     """Extract facts from a Codex attempt. Only a typed ``account_fact`` (from the account/
     rate-limit surface) may establish capacity vs. a permanent plan problem; the model's
     prose is captured as ``final_message`` but never diagnoses. An untyped failure — even a
-    non-zero exit — remains a bounded unknown interruption unless the supervisor timed out."""
+    non-zero exit — remains a bounded unknown interruption unless the supervisor timed out.
+
+    A Codex session that loses its shell is *not* recognized here: the exec JSON surface carries
+    no typed tool-result fact to correlate a refusal back to a shell call, and its prose never
+    diagnoses, so a Codex dead shell keeps today's classification (ADR 386)."""
     cause = ProviderCause.NONE
     permanent_reason = PermanentReason.UNSPECIFIED
     reset_at = None

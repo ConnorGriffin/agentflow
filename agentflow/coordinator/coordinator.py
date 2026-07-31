@@ -722,7 +722,9 @@ class Coordinator:
     def _finalize(self, record: Record) -> StageOutcome | None:
         """Classify an ended provider family and release its reservation atomically (ADR
         0028 precedence): a verified stage outcome completes it; a permanent provider
-        condition holds it; a recoverable interruption waits within budget. An incomplete or
+        condition holds it — refunding the attempt when that condition is the environment
+        failing to carry a session at all, since nothing about the work was attempted (#386);
+        a recoverable interruption waits within budget. An incomplete or
         unknown ending waits only when a fresh attempt would have new recovery state to act on —
         retained partial work continues, a clean exit missing its outcome earns one targeted
         repair — and otherwise holds rather than replaying an identical session (issue #225).
@@ -760,10 +762,25 @@ class Coordinator:
         if label == "permanent":
             reason = getattr(obs, "permanent_reason", PermanentReason.UNSPECIFIED)
             record.hold_reason = permanent_hold_reason(reason)
+            attempt_no = record.attempts
+            environment = reason is PermanentReason.ENVIRONMENT
+            if environment and record.attempt_committed:
+                # The environment could not carry a session, so nothing about the work was
+                # attempted and the attempt is refunded (#386) — the same accounting a capacity
+                # pause uses, through the same committed-flag discipline, so a hold re-observed
+                # after a crash can never refund twice. It still holds immediately rather than
+                # requeueing: unlike a capacity reset, nothing lifts on its own here.
+                record.attempts -= 1
+                record.attempt_committed = False
             if not self._hold(record):
                 return None
-            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
-                              f"permanent; handoff pending; claim retained")
+            if environment:
+                self._emit(record, f"attempt {attempt_no}/{ATTEMPT_BUDGET} held (environment) — "
+                                  "the session never got a working shell and never reached the "
+                                  "work; attempt refunded; handoff pending; claim retained")
+            else:
+                self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} held ({cause}) — "
+                                  f"permanent; handoff pending; claim retained")
             # The stage adapter proves a live external handoff; the coordinator finalizes it
             # idempotently and crash-safely.
             return self._finalize_hold(record)

@@ -206,10 +206,12 @@ def hold_intake(record) -> str | None:
     remediation instead of the generic "I couldn't ground this" ask, which would send the
     maintainer hunting for a decision that was never made (issue #328). The reason also says
     *which* permanent condition it was, so a rejected request or a spend ceiling gets its own
-    diagnosis instead of re-authenticate advice for a healthy sign-in (issue #342). Every other
-    hold reason keeps the grounding-ambiguity copy. Only the body differs — route, state label,
-    and the envelope are identical either way; the reason comes from the persisted record, never
-    a fresh observation, so a restart recomposes the same marker."""
+    diagnosis instead of re-authenticate advice for a healthy sign-in (issue #342) — and an
+    environment that could not carry a session at all names the machine, not the coding agent's
+    provider (issue #386). Every other hold reason keeps the grounding-ambiguity copy. Only the
+    body differs — route, state label, and the envelope are identical either way; the reason
+    comes from the persisted record, never a fresh observation, so a restart recomposes the same
+    marker."""
     from dataclasses import replace as replace_result
 
     from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON,
