@@ -186,6 +186,14 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   section with code locations, conflicting changes, checks, retained work, and the exact
   next action. Intermediate review agents remain silent.
 
+- **Head check gate** — the third unwaivable mechanical gate, alongside cross-tool review
+  and screenshot evidence: before a review may finish clean, the checks reported on the
+  *exact reviewed commit* are read from GitHub, never from the branch tip and never from
+  the verdict. A red check opens a revise round rather than clearing; pending, absent,
+  skipped, and cancelled checks change nothing; an unreadable answer defers only the clean
+  settlement. A reviewer cannot clear it by not looking.
+  *Avoid:* CI gate (the merge-time CI wait is a different, older thing).
+
 - **Brief** — at `autonomous`/`reviewed`, the spec a builder starts from: the issue
   itself (acceptance criteria + file pointers). The builder self-scopes from it.
 
