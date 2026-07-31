@@ -536,19 +536,25 @@ class _WorktreeRunner:
         orphaned — its git metadata was lost (e.g. a daemon killed mid-prepare).
         Git holds no state for it and ``worktree add`` would fail on the existing
         dir every cycle, so it is discarded and rebuilt. A *registered* worktree
-        is never force-discarded here: a busy or dirty one still fails closed.
+        is never force-discarded here: a busy or locked one still fails closed.
 
         A clean checkout parked on a commit that has left the remote — the ordinary
         aftermath of a rebase or force-push on the branch under review — is moved onto
         ``ref`` rather than left to stall the stage forever. Its old commit is anchored
         under a recovery ref first, so no work is destroyed by the move.
+
+        An *idle but unclean* checkout — the untracked scratch or edits a finished
+        session routinely leaves behind — must not stall the stage forever either:
+        refusing here would fail every future admission at this path until a human
+        deletes the directory. Its entire state is archived to a recovery ref
+        (:func:`archive_stranded_worktree`, ADR 0050) and the checkout rebuilt, so
+        nothing is lost and the stage proceeds.
         """
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
-            if _worktree_is_registered(workdir, wt):
-                head = _worktree_head(workdir, wt)
-                if not head:
-                    raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
+            if not _worktree_is_registered(workdir, wt):
+                discard_orphaned_worktree(workdir, wt)
+            elif head := _worktree_head(workdir, wt):
                 if not _commit_is_on_origin(workdir, head) \
                         and not retain_stranded_commit(workdir, wt, head):
                     raise subprocess.CalledProcessError(1, ["git", "update-ref"])
@@ -559,7 +565,8 @@ class _WorktreeRunner:
                 # Keep it while removing every other ignored or untracked artifact.
                 _run(["git", "-C", str(wt), "clean", "-fdx", "-e", ".venv/"]).check_returncode()
                 return
-            discard_orphaned_worktree(workdir, wt)
+            elif _worktree_is_active(wt) or not archive_stranded_worktree(workdir, wt):
+                raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
         wt.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
 
