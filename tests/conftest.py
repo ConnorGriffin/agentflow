@@ -25,7 +25,7 @@ import pytest
 from agentflow import coordinated_review, pipeline
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
-from agentflow.coordinator.providers import (PermanentReason, ProviderCause,
+from agentflow.coordinator.providers import (EndingReason, ProviderCause,
                                              ProviderObservation)
 
 
@@ -157,7 +157,7 @@ class FakeSession:
     def end(self, identity: str, *, success: bool = False,
             cause: ProviderCause = ProviderCause.UNKNOWN, reset_at: int | None = None,
             end_fact: bool = True, usage=None,
-            permanent_reason: PermanentReason = PermanentReason.UNSPECIFIED) -> None:
+            ending_reason: EndingReason = EndingReason.UNSPECIFIED) -> None:
         """Script how ``identity``'s provider ended and mark its family dead. A scripted end is a
         provider that finished on its own, so by default it leaves a durable supervisor end fact —
         the signal that separates a genuine failure from a family a daemon restart took down (which
@@ -165,7 +165,7 @@ class FakeSession:
         attempt reported, so a test can drive per-attempt telemetry through the public seam."""
         from agentflow.coordinator.telemetry import AttemptUsage
         self._script[identity] = _Ending(
-            ProviderObservation(cause=cause, permanent_reason=permanent_reason,
+            ProviderObservation(cause=cause, ending_reason=ending_reason,
                                 reset_at=reset_at, has_end_fact=end_fact,
                                 usage=usage or AttemptUsage()), success)
         self.kill(identity)

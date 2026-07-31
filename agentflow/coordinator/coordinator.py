@@ -29,7 +29,7 @@ from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
-from agentflow.coordinator.providers import PermanentReason, ProviderCause
+from agentflow.coordinator.providers import EndingReason, ProviderCause
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
@@ -59,7 +59,7 @@ REPAIR_BUDGET = 1
 PERMANENT_HOLD_REASON = "permanent provider condition"
 
 
-def permanent_hold_reason(reason: PermanentReason) -> str:
+def permanent_hold_reason(reason: EndingReason) -> str:
     """The durable ``hold_reason`` for a permanent park, naming *which* condition fired.
 
     The category alone told every parked issue the same story, so a rejected request drew
@@ -70,15 +70,32 @@ def permanent_hold_reason(reason: PermanentReason) -> str:
     return f"{PERMANENT_HOLD_REASON} ({reason.value})"
 
 
-def parse_permanent_hold_reason(hold_reason: str) -> PermanentReason:
+def parse_permanent_hold_reason(hold_reason: str) -> EndingReason:
     """The permanent reason a durable ``hold_reason`` names, or ``UNSPECIFIED``. Fail-safe:
     a reason written before this suffix existed, or one this build doesn't know, reads as
     unspecified rather than as a wrong remediation."""
     inner = (hold_reason or "").partition("(")[2].rpartition(")")[0].strip()
     try:
-        return PermanentReason(inner)
+        return EndingReason(inner)
     except ValueError:
-        return PermanentReason.UNSPECIFIED
+        return EndingReason.UNSPECIFIED
+
+
+# The durable ``hold_reason`` clause a stage stamps when the attempt that spent its last try was
+# cut off at the per-stage turn cap rather than reasoning its way to the end of the budget (#411).
+# Stage handoffs read it so a maintainer can tell "cut off at its ceiling" from "ran out of tries":
+# those two want opposite responses, and until now both read as a spent budget.
+TURN_CAP_HOLD_CLAUSE = " — the last attempt was cut off at its turn cap"
+
+
+def ended_at_turn_cap(hold_reason: str | None) -> bool:
+    """Whether a durable hold reason records the turn cap as what stopped its last attempt."""
+    return TURN_CAP_HOLD_CLAUSE in (hold_reason or "")
+
+
+def _cut_off_at_turn_cap(obs) -> bool:
+    """Whether an observation says the per-stage turn cap is what stopped this attempt."""
+    return getattr(obs, "ending_reason", EndingReason.UNSPECIFIED) is EndingReason.TURN_CAP
 
 # The required-outcome noun each stage proves, for the completion log line (ADR 0028).
 _OUTCOME_LABEL = {
@@ -758,12 +775,15 @@ class Coordinator:
         if collision is not None:
             return self._settle_collision(record, collision)
         label = obs.classification()
-        cause = obs.cause.value
+        # Two ceilings now end in the clock class — the supervisor's wall-clock deadline and the
+        # per-stage turn cap (#411) — and only one of them is answered by giving the session more
+        # room, so the log names which one stopped it rather than saying "timeout" for both.
+        cause = "turn cap" if _cut_off_at_turn_cap(obs) else obs.cause.value
         if label == "permanent":
-            reason = getattr(obs, "permanent_reason", PermanentReason.UNSPECIFIED)
+            reason = getattr(obs, "ending_reason", EndingReason.UNSPECIFIED)
             record.hold_reason = permanent_hold_reason(reason)
             attempt_no = record.attempts
-            environment = reason is PermanentReason.ENVIRONMENT
+            environment = reason is EndingReason.ENVIRONMENT
             if environment and record.attempt_committed:
                 # The environment could not carry a session, so nothing about the work was
                 # attempted and the attempt is refunded (#386) — the same accounting a capacity
@@ -822,6 +842,7 @@ class Coordinator:
         continuation always has."""
         if record.attempts >= ATTEMPT_BUDGET:
             record.hold_reason = ("continuation budget exhausted"
+                                  + (TURN_CAP_HOLD_CLAUSE if _cut_off_at_turn_cap(obs) else "")
                                   + (f" — last unverified check: {record.verify_miss}"
                                      if record.verify_miss else ""))
             if not self._hold(record):

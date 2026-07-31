@@ -139,6 +139,25 @@ def park_context(record, verdict, *, reason: str, missing: str, uncertainty=None
             or any(item.action.value == "ask_maintainer" for item in actions)))
 
 
+def review_park_missing(record) -> str:
+    """What a parked review tells the maintainer it is missing, chosen from the persisted hold
+    reason so a crash-resumed handoff composes the same words.
+
+    No decision was ever recorded for this head, so the honest fact is an execution failure —
+    inventing a product choice here is what made a parked review unanswerable (#344). *Which*
+    execution failure matters too: a review whose session was cut off at the per-stage turn
+    ceiling never got to finish thinking, and wants a different answer from one that thought and
+    ran out of room (#411). The park's own headline stays fixed either way — its post-once proof
+    keys on that. Pure (test surface)."""
+    from agentflow.coordinator.coordinator import ended_at_turn_cap
+    if ended_at_turn_cap(getattr(record, "hold_reason", None)):
+        return ("No review verdict was recorded for this exact head: the last review session was "
+                "cut off at its per-stage turn ceiling before it could reach one — it was stopped "
+                "mid-review, not left short of an answer. Do not treat this as a clean review.")
+    return ("No review verdict was recorded for this exact head: the review executions failed "
+            "rather than judging the change. Do not treat this as a clean review.")
+
+
 def park_proof_marker(record, reason: str) -> str:
     """One low-noise current-park proof scoped to this durable stage decision."""
     digest = hashlib.sha256(f"{record.identity}:{reason}".encode()).hexdigest()[:20]
@@ -174,12 +193,10 @@ def park_pr(record) -> str | None:
         notice = "conflict decision needs your judgment"
     elif record.stage == "review":
         reason = "exhausted its review budget without a durable verdict"
-        # No decision was ever recorded for this head, so the honest fact is an execution failure —
-        # inventing a product choice here is what made a parked review unanswerable (#344). The
-        # consequences and recommendation follow the same rule: nothing may name an uncertainty
-        # this park deliberately does not have, or an option it does not offer.
-        missing = ("No review verdict was recorded for this exact head: the review executions "
-                   "failed rather than judging the change. Do not treat this as a clean review.")
+        missing = review_park_missing(record)
+        # The options, consequences and recommendation follow the same rule that line does:
+        # nothing may name an uncertainty this park deliberately does not have, or an option it
+        # does not offer (#344).
         wording = ParkCopy(
             options=(f"Resume the review on this exact head: `/agentflow review {pr}`.",
                      "Review the retained change by hand and decide this PR yourself."),

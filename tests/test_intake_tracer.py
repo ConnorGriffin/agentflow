@@ -12,7 +12,7 @@ from conftest import FakeSession, permits, record_of, starts_until_held
 from agentflow import coordinated_intake, github, intake as intake_mod, loop
 from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import tracer
-from agentflow.coordinator.providers import (PermanentReason, ProviderCause,
+from agentflow.coordinator.providers import (EndingReason, ProviderCause,
                                              ProviderObservation)
 
 _READY_MESSAGE = ('{"route":"ready","title":"Scoped","body":"brief",'
@@ -53,9 +53,9 @@ class IntakeSession(FakeSession):
     def observe(self, record) -> ProviderObservation:
         ending = self._script.get(record.identity)
         cause = ending.obs.cause if ending else ProviderCause.UNKNOWN
-        reason = (ending.obs.permanent_reason if ending
-                  else PermanentReason.UNSPECIFIED)
-        return ProviderObservation(cause=cause, permanent_reason=reason,
+        reason = (ending.obs.ending_reason if ending
+                  else EndingReason.UNSPECIFIED)
+        return ProviderObservation(cause=cause, ending_reason=reason,
                                    final_message=self.message)
 
 
@@ -209,7 +209,7 @@ def test_permanent_hold_preserves_its_reason_for_the_stage_handoff(make_coord):
     identity = coord.submit_stage(_submission())
     coord.cycle("claude")
     fake.end(identity, cause=ProviderCause.PERMANENT,
-             permanent_reason=PermanentReason.REJECTED_REQUEST)
+             ending_reason=EndingReason.REJECTED_REQUEST)
 
     assert [outcome.status for outcome in coord.cycle("claude")] == ["held"]
     # The reason names *which* permanent condition fired, and it is durable on the record
@@ -517,12 +517,12 @@ def test_exhaustion_hold_is_idempotent_across_a_restart(make_coord, monkeypatch)
     assert applied == [7] and len(notified) == 1
 
 
-def _permanent_hold(coord, fake, identity, reason=PermanentReason.ACCESS):
+def _permanent_hold(coord, fake, identity, reason=EndingReason.ACCESS):
     """Drive one Intake attempt to a permanent provider condition — the provider ends the
     session before the model ever returns a decision — and settle the resulting hold.
     ``reason`` scripts *which* permanent condition the provider reported."""
     coord.cycle("claude")
-    fake.end(identity, cause=ProviderCause.PERMANENT, permanent_reason=reason)
+    fake.end(identity, cause=ProviderCause.PERMANENT, ending_reason=reason)
     return [outcome.status for outcome in coord.cycle("claude")]
 
 
@@ -621,8 +621,8 @@ def test_rejected_request_park_never_sends_the_maintainer_to_re_authenticate(mak
     the same path as a refused sign-in, but it is not a credential problem (issue #342). Telling
     the maintainer to re-authenticate sends them to check a healthy sign-in while the real cause
     stays invisible, so the two parks must read differently."""
-    rejected = _park_for(make_coord, monkeypatch, PermanentReason.REJECTED_REQUEST)
-    access = _park_for(make_coord, monkeypatch, PermanentReason.ACCESS, subject="8")
+    rejected = _park_for(make_coord, monkeypatch, EndingReason.REJECTED_REQUEST)
+    access = _park_for(make_coord, monkeypatch, EndingReason.ACCESS, subject="8")
 
     assert "rejected the request itself" in rejected.body
     for misdiagnosis in ("Re-authenticate", "expired sign-in", "billing", "permission"):
@@ -635,7 +635,7 @@ def test_rejected_request_park_never_sends_the_maintainer_to_re_authenticate(mak
 def test_spend_ceiling_park_names_the_cap_not_a_credential_problem(make_coord, monkeypatch):
     """A run stopped by its own configured cost ceiling is a budget decision, not a broken
     sign-in — the park says so and offers the remedy that actually applies."""
-    parked = _park_for(make_coord, monkeypatch, PermanentReason.SPEND)
+    parked = _park_for(make_coord, monkeypatch, EndingReason.SPEND)
 
     assert "spending cap" in parked.body
     for misdiagnosis in ("Re-authenticate", "expired sign-in", "billing", "permission"):
@@ -645,20 +645,20 @@ def test_spend_ceiling_park_names_the_cap_not_a_credential_problem(make_coord, m
 def test_untyped_permanent_park_stays_neutral_about_the_remedy(make_coord, monkeypatch):
     """A permanent end nothing typed still parks — but it prescribes no remedy it can't justify,
     because guessing 're-authenticate' is exactly the misdiagnosis this removes."""
-    parked = _park_for(make_coord, monkeypatch, PermanentReason.UNSPECIFIED)
+    parked = _park_for(make_coord, monkeypatch, EndingReason.UNSPECIFIED)
 
     assert "ended the session permanently" in parked.body
     for misdiagnosis in ("Re-authenticate", "expired sign-in", "billing", "permission"):
         assert misdiagnosis not in parked.body
 
 
-def test_every_permanent_reason_parks_to_the_same_state(make_coord, monkeypatch):
+def test_every_ending_reason_parks_to_the_same_state(make_coord, monkeypatch):
     """Only the diagnosis differs: whichever permanent condition ended the run, the issue lands
     in the same parked state with the same route, so nothing downstream reads the reason."""
     from agentflow.intake import intake_labels
 
     parked = [_park_for(make_coord, monkeypatch, reason, subject=str(20 + n))
-              for n, reason in enumerate(PermanentReason)]
+              for n, reason in enumerate(EndingReason)]
 
     assert {p.route for p in parked} == {parked[0].route}
     assert {tuple(intake_labels(p)) for p in parked} == {tuple(intake_labels(parked[0]))}

@@ -128,7 +128,7 @@ def test_revise_inherits_the_original_builders_build_ceiling(tmp_path):
 
     standard = provider_command(_record(
         "revise", str(tmp_path), builder_complexity="standard", effort="low"))
-    assert _flag(standard, "--max-turns") == "80"     # = Build standard/low
+    assert _flag(standard, "--max-turns") == "160"    # = Build standard/low
 
 
 def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):
@@ -216,25 +216,48 @@ def test_non_build_stages_set_no_reasoning_flag(tmp_path):
         assert not any(v.startswith("model_reasoning_effort=") for v in codex_config)
 
 
-def test_every_ceiling_stays_clear_of_the_work_its_stage_actually_does(tmp_path):
-    """A ceiling exists to kill a runaway, so it has to sit clear of the work its stage is recorded
-    needing. Review's drifted under it: drawn at 40 from an n=70 sample, it was below the p90 (55
-    tool calls) by the time the sample reached 210, and 31 reviews were killed at it having already
-    read the diff and run the suite (#410). This pins every stage against the recorded distribution
-    its cell was set from, so the next drift fails here instead of parking a pull request.
+def _records_a_reading_covers(stage, complexity, effort, source, build_cells):
+    """Every record one recorded reading has to hold against.
+
+    A build reading is a reading of one cell, so it holds against that cell. A revise reading is a
+    reading of the whole build tier revise inherits (ADR 0041), so it holds against every effort
+    that tier can resolve to — the named cells and the unnamed fallback alike. Everything else
+    resolves per stage, with no cell to vary."""
+    if stage == "revise":
+        efforts = [e for (c, e) in build_cells if c == complexity] + [None]
+        return [_record(stage, source, builder_complexity=complexity, effort=e) for e in efforts]
+    if complexity is None:
+        return [_record(stage, source)]
+    return [_record(stage, source, complexity=complexity, effort=effort)]
+
+
+def test_every_ceiling_stays_clear_of_the_work_its_cell_actually_does(tmp_path):
+    """A ceiling exists to kill a runaway, so it has to sit clear of the work the cell it applies to
+    is recorded needing. Review's drifted under it: drawn at 40 from an n=70 sample, it was below the
+    p90 (55 tool calls) by the time the sample reached 210, and 31 reviews were killed at it having
+    already read the diff and run the suite (#410). Build's standard tier had the same fault hidden
+    by a pooled figure: its cap sat on the 80 tool calls a standard/low build does, and six standard
+    builds and revisions were killed at it (#416). This pins every cell against the recorded
+    distribution it was set from, so the next drift fails here instead of parking a pull request.
 
     The bar is the p95 with headroom, not the maximum: the tail is unbounded (one review ran 335
     tool calls) and no ceiling that still kills a runaway could clear it."""
-    from agentflow.coordinator.profiles import _OBSERVED_P95, profile_for
+    from agentflow.coordinator.profiles import (_BUILD_CEILINGS, _OBSERVED_P95,
+                                                profile_for)
 
-    for stage, (p95_wall_s, p95_tool_calls) in _OBSERVED_P95.items():
-        profile = profile_for(_record(stage, str(tmp_path)))
-        assert profile.turn_ceiling > p95_tool_calls, (
-            f"{stage}: {profile.turn_ceiling}-turn ceiling is not clear of the {p95_tool_calls} "
-            f"tool calls its 95th-percentile session needs — ordinary long sessions die at it")
-        assert profile.wall_ceiling_s > p95_wall_s, (
-            f"{stage}: {profile.wall_ceiling_s}s wall is not clear of the {p95_wall_s}s its "
-            f"95th-percentile session needs — ordinary long sessions die at it")
+    for (stage, complexity, effort), (p95_wall_s, p95_tool_calls) in _OBSERVED_P95.items():
+        cell = "/".join(p for p in (stage, complexity, effort) if p)
+        for record in _records_a_reading_covers(
+                stage, complexity, effort, str(tmp_path), _BUILD_CEILINGS):
+            profile = profile_for(record)
+            assert profile.turn_ceiling > p95_tool_calls, (
+                f"{cell}: {profile.turn_ceiling}-turn ceiling is not clear of the "
+                f"{p95_tool_calls} tool calls its 95th-percentile session needs — ordinary long "
+                f"sessions die at it")
+            if p95_wall_s is not None:
+                assert profile.wall_ceiling_s > p95_wall_s, (
+                    f"{cell}: {profile.wall_ceiling_s}s wall is not clear of the {p95_wall_s}s "
+                    f"its 95th-percentile session needs — ordinary long sessions die at it")
 
 
 def test_a_ceiling_hit_ends_as_a_recoverable_timeout():
