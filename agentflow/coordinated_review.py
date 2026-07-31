@@ -521,8 +521,15 @@ def _review_worktree_reset(record, _log=None) -> bool:
         return False
     workdir, _pr = facts
     wt = Path(record.source)
-    from agentflow.runner import _worktree_is_registered
+    from agentflow.runner import _worktree_is_active, _worktree_is_registered
     runner = ClaudeRunner() if record.pool == "claude" else CodexRunner()
+    if _worktree_is_active(wt):
+        # A live sibling session still holds this checkout — the ordinary overlap while a
+        # superseded review finishes and its successor waits its turn. Contention, not a
+        # failing checkout: skip admission without charging the stuck counter, so the
+        # operator is not paged over a worktree that is working exactly as intended.
+        _REVIEW_PREPARE_FAILURES.pop(record.source, None)
+        return False
     try:
         if wt.exists() and _worktree_is_registered(workdir, wt) and getattr(record, "attempts", 0):
             runner.provision(wt)

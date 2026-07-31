@@ -10,6 +10,7 @@ coordinator.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import replace
@@ -686,6 +687,33 @@ def test_a_review_checkout_that_keeps_failing_surfaces_in_the_log(tmp_path, monk
     assert len(logs) == 2
     coordinated_review._REVIEW_PREPARE_FAILURES.pop(record.source, None)
 
+
+
+def test_a_review_checkout_held_by_a_live_sibling_session_is_contention_not_stuck(tmp_path):
+    """A checkout occupied by a live session — the superseded review still finishing while its
+    successor record waits its turn — is ordinary contention, not a stuck checkout. Admission
+    skips quietly every cycle and succeeds as soon as the sibling releases the worktree; no
+    breadcrumb ever pages a human after a checkout that is working exactly as intended."""
+    repo = _repo_with_origin(tmp_path)
+    live = _git(repo, "rev-parse", "HEAD")
+    wt = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-97-x"
+    _git(repo, "worktree", "add", "--detach", str(wt), live)
+    marker = Path(_git(wt, "rev-parse", "--git-path", "agentflow-active"))
+    marker = marker if marker.is_absolute() else wt / marker
+    marker.write_text(str(os.getpid()))               # a live sibling session holds the checkout
+    record = SimpleNamespace(repo="o/r", source=str(wt), target=live, pool="claude")
+    coordinated_review._REVIEW_PREPARE_FAILURES.pop(record.source, None)
+    logs: list[str] = []
+
+    for _ in range(12):  # far past every surfacing threshold — contention never pages
+        assert coordinated_review._review_worktree_reset(record, _log=logs.append) is False
+    assert logs == []
+    assert record.source not in coordinated_review._REVIEW_PREPARE_FAILURES
+
+    marker.unlink()                                   # the sibling session ends
+    assert coordinated_review._review_worktree_reset(record, _log=logs.append) is True
+    assert _git(wt, "rev-parse", "HEAD") == live
+    assert logs == []
 
 
 def test_a_review_whose_head_was_rebased_away_reads_as_awaiting_retarget_not_stuck(
