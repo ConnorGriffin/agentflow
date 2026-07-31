@@ -281,8 +281,10 @@ def _worktree_is_active(wt: Path) -> bool:
 
 def _worktree_head(workdir: str, wt: Path) -> str:
     """The commit an idle, owned, clean worktree is parked on — ``""`` when it is any of
-    busy, foreign, dirty, or unreadable. Everything a caller may not disturb answers ``""``,
-    so both reuse and removal fail closed on the same evidence."""
+    busy, foreign, dirty, or unreadable. It licenses only *taking the checkout as it stands*:
+    removal refuses outright on ``""``, while detached preparation refuses reuse-in-place and
+    then earns the right to rebuild separately, by archiving the state to a recovery ref
+    (ADR 0050). A ``""`` is never on its own a licence to disturb the worktree."""
     target = os.path.realpath(wt)
     main = os.path.realpath(workdir)
     if target == main:
