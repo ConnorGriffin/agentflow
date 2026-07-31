@@ -161,3 +161,7 @@ ADRs in that format.
   work is archived to a recovery ref and its checkout reclaimed, held sources lose their
   protection, and the daemon refuses to dispatch into a repository past a registration
   ceiling. Amends 0028 and 0043.
+- [0051](0051-deploying-the-running-daemon.md) — Merged is not running: the detached
+  runtime checkout is set to `origin/main` rather than fast-forwarded, divergence is
+  named in the log, and the restart that completes a deploy yields to live sessions.
+  Amends 0050.
