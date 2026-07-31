@@ -439,8 +439,9 @@ def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
     detached_head = _git(detached, "rev-parse", "HEAD")
     (detached / "in-progress.txt").write_text("still being written")
 
-    with pytest.raises(subprocess.CalledProcessError):
-        runner.prepare_worktree_detached(str(repo), "origin/main", detached)
+    with worktree_session(detached):
+        with pytest.raises(subprocess.CalledProcessError):
+            runner.prepare_worktree_detached(str(repo), "origin/main", detached)
     assert _git(detached, "rev-parse", "HEAD") == detached_head
     assert (detached / "in-progress.txt").read_text() == "still being written"
 
@@ -478,6 +479,62 @@ def test_review_checkout_recovers_after_its_branch_is_rebased_away(tmp_path):
                     "--format=%(refname)", "refs/agentflow/stranded/")
     assert retained, "the superseded commit must stay reachable under a recovery ref"
     assert _git(repo, "cat-file", "-t", stranded) == "commit"
+
+
+def test_idle_review_litter_is_archived_so_admission_can_proceed(tmp_path):
+    """A finished review's checkout routinely keeps untracked scratch (a saved diff, a note).
+    When the next logical review needs the same path at a new target, that litter must not
+    stall admission forever: it is archived to a recovery ref and the checkout is rebuilt."""
+    repo = _repo_with_origin(tmp_path)
+    runner = ClaudeRunner()
+    branch = "agentflow/claude/issue-21-litter"
+    build = repo / ".agentflow" / "worktrees" / "claude" / "issue-21-litter"
+    _branch_worktree(repo, build, branch)
+
+    review = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-21-litter"
+    _git(repo, "fetch", "origin", "--quiet")
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    (review / ".pr21.diff").write_text("review scratch")
+
+    (build / "result.txt").write_text("amended after review settled")
+    _git(build, "add", "result.txt")
+    _git(build, "commit", "--amend", "--no-edit")
+    _git(build, "push", "--force", "origin", branch)
+    new_head = _git(build, "rev-parse", "HEAD")
+
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    assert _git(review, "rev-parse", "HEAD") == new_head
+    assert not (review / ".pr21.diff").exists()
+    refs = _git(repo, "for-each-ref", "--format=%(refname)",
+                "refs/agentflow/stranded/pr-21-litter/").splitlines()
+    assert refs, "the litter must be anchored under a recovery ref before the rebuild"
+    assert _git(repo, "show", f"{refs[0]}:.pr21.diff") == "review scratch"
+
+
+def test_a_locked_review_checkout_still_refuses_and_is_left_alone(tmp_path):
+    """Archiving litter must not overrun the operator's escape hatch: a checkout a human pinned
+    refuses admission, keeps its contents, and — since the daemon retries every cycle — leaves no
+    growing trail of recovery refs behind."""
+    repo = _repo_with_origin(tmp_path)
+    runner = ClaudeRunner()
+    branch = "agentflow/claude/issue-22-pinned"
+    build = repo / ".agentflow" / "worktrees" / "claude" / "issue-22-pinned"
+    _branch_worktree(repo, build, branch)
+
+    review = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-22-pinned"
+    _git(repo, "fetch", "origin", "--quiet")
+    runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    parked = _git(review, "rev-parse", "HEAD")
+    (review / "operator-notes.md").write_text("why I pinned this")
+    _git(repo, "worktree", "lock", str(review))
+
+    for _ in range(2):
+        with pytest.raises(subprocess.CalledProcessError):
+            runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+    assert _git(review, "rev-parse", "HEAD") == parked
+    assert (review / "operator-notes.md").read_text() == "why I pinned this"
+    assert _git(repo, "for-each-ref", "--format=%(refname)",
+                "refs/agentflow/stranded/pr-22-pinned/") == ""
 
 
 def test_freshening_review_checkout_keeps_its_ready_environment(tmp_path):
@@ -990,7 +1047,8 @@ def test_archiving_works_on_a_host_with_no_git_identity(tmp_path, monkeypatch):
 
 def test_a_locked_worktree_is_never_reclaimed(tmp_path):
     """A lock is a deliberate human signal; one --force is not enough to remove it, and it does
-    not get a second."""
+    not get a second. Refusing must also anchor nothing, or a caller that retries every cycle
+    buries the real stranded work under a pile of dead recovery refs."""
     repo = _repo_with_origin(tmp_path)
     wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-803-locked"
     _branch_worktree(repo, wt, "agentflow/codex/issue-803-locked")
@@ -998,7 +1056,9 @@ def test_a_locked_worktree_is_never_reclaimed(tmp_path):
     _git(repo, "worktree", "lock", str(wt))
 
     assert runner_mod.archive_stranded_worktree(str(repo), wt) == ""
+    assert runner_mod.archive_stranded_worktree(str(repo), wt) == ""
     assert wt.exists() and (wt / "result.txt").read_text().startswith("work in progress")
+    assert _git(repo, "for-each-ref", "--format=%(refname)", "refs/agentflow/stranded/") == ""
 
 
 def test_dispatch_preflight_refuses_a_repository_that_can_no_longer_carry_a_session(

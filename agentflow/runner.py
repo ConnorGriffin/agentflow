@@ -256,6 +256,17 @@ def _active_marker(wt: Path) -> Path | None:
     return marker if marker.is_absolute() else wt / marker
 
 
+def _worktree_is_locked(wt: Path) -> bool:
+    """Whether a human pinned this checkout with ``git worktree lock``. Resolved through git (the
+    :func:`_active_marker` idiom) rather than composed from the basename, so a duplicate basename
+    cannot answer for another worktree's lock."""
+    resolved = _run(["git", "-C", str(wt), "rev-parse", "--git-path", "locked"])
+    if resolved.returncode != 0 or not resolved.stdout.strip():
+        return False
+    lock = Path(resolved.stdout.strip())
+    return (lock if lock.is_absolute() else wt / lock).exists()
+
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -281,8 +292,10 @@ def _worktree_is_active(wt: Path) -> bool:
 
 def _worktree_head(workdir: str, wt: Path) -> str:
     """The commit an idle, owned, clean worktree is parked on — ``""`` when it is any of
-    busy, foreign, dirty, or unreadable. Everything a caller may not disturb answers ``""``,
-    so both reuse and removal fail closed on the same evidence."""
+    busy, foreign, dirty, or unreadable. It licenses only *taking the checkout as it stands*:
+    removal refuses outright on ``""``, while detached preparation refuses reuse-in-place and
+    then earns the right to rebuild separately, by archiving the state to a recovery ref
+    (ADR 0050). A ``""`` is never on its own a licence to disturb the worktree."""
     target = os.path.realpath(wt)
     main = os.path.realpath(workdir)
     if target == main:
@@ -365,9 +378,13 @@ def archive_stranded_worktree(workdir: str, wt: Path) -> str:
     every archive and the bound would silently never apply.
 
     A single ``--force`` removes an unclean checkout; a *locked* worktree needs a second one and
-    does not get it — a lock is a deliberate human signal, so a locked worktree fails the removal
-    and stays registered.
+    does not get it — a lock is a deliberate human signal, so a locked worktree stays registered.
+    It is refused before anything is written rather than only at the removal: a caller that retries
+    every cycle would otherwise anchor a fresh recovery ref on each pass, burying the real stranded
+    work an operator greps this namespace for under an unbounded pile of dead ones.
     """
+    if _worktree_is_locked(wt):
+        return ""
     scratch = tempfile.mkdtemp(prefix="agentflow-archive-index-")
     env = {**os.environ, "GIT_INDEX_FILE": os.path.join(scratch, "index")}
     try:
@@ -536,19 +553,25 @@ class _WorktreeRunner:
         orphaned — its git metadata was lost (e.g. a daemon killed mid-prepare).
         Git holds no state for it and ``worktree add`` would fail on the existing
         dir every cycle, so it is discarded and rebuilt. A *registered* worktree
-        is never force-discarded here: a busy or dirty one still fails closed.
+        is never force-discarded here: a busy or locked one still fails closed.
 
         A clean checkout parked on a commit that has left the remote — the ordinary
         aftermath of a rebase or force-push on the branch under review — is moved onto
         ``ref`` rather than left to stall the stage forever. Its old commit is anchored
         under a recovery ref first, so no work is destroyed by the move.
+
+        An *idle but unclean* checkout — the untracked scratch or edits a finished
+        session routinely leaves behind — must not stall the stage forever either:
+        refusing here would fail every future admission at this path until a human
+        deletes the directory. Its entire state is archived to a recovery ref
+        (:func:`archive_stranded_worktree`, ADR 0050) and the checkout rebuilt, so
+        nothing is lost and the stage proceeds.
         """
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
-            if _worktree_is_registered(workdir, wt):
-                head = _worktree_head(workdir, wt)
-                if not head:
-                    raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
+            if not _worktree_is_registered(workdir, wt):
+                discard_orphaned_worktree(workdir, wt)
+            elif head := _worktree_head(workdir, wt):
                 if not _commit_is_on_origin(workdir, head) \
                         and not retain_stranded_commit(workdir, wt, head):
                     raise subprocess.CalledProcessError(1, ["git", "update-ref"])
@@ -559,7 +582,8 @@ class _WorktreeRunner:
                 # Keep it while removing every other ignored or untracked artifact.
                 _run(["git", "-C", str(wt), "clean", "-fdx", "-e", ".venv/"]).check_returncode()
                 return
-            discard_orphaned_worktree(workdir, wt)
+            elif _worktree_is_active(wt) or not archive_stranded_worktree(workdir, wt):
+                raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
         wt.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
 
