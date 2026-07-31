@@ -52,10 +52,12 @@ For an issue at `agentflow:needs-grilling` or `agentflow:needs-mockup`:
 2. Read the issue, its intake comment (the questions/kickoff), and any replies.
 3. **Ground** first if it helps — read the code; if the repo declares a read-only data
    pull (ciq's `ciq-pull-db` → `ciq.readonly.db`), run it and check real numbers.
-4. **needs-grilling →** grill the user *live*, one question at a time, in **their voice**:
-   the app's behavior and their real numbers, never code symbols / ADR numbers / file
-   paths. Symptom + concrete options + your recommendation. When the decision tree is
-   locked, go to **Land it as ready** below.
+4. **needs-grilling →** run `/grilling` and grill the user *live* — it owns the cadence
+   (the whole answerable frontier per numbered round) and the voice rules. Non-negotiable
+   here: speak in **their voice** — the app's behavior and their real numbers, never code
+   symbols / ADR numbers / file paths — and every question carries symptom + concrete
+   options + your recommendation. When the decision tree is locked, go to **Land it as
+   ready** below.
 5. **needs-mockup →** decide the scope first (ADR 0048): `local` (an addition inside a
    shipping surface — inherit `agentflow/webui/`'s identity, vary only the addition) or
    `surface` (a whole-surface replacement — the open 3-4 concept tournament). Run
