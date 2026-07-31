@@ -9,7 +9,7 @@ is the daemon-side glue, mirroring :mod:`agentflow.coordinated_converse`:
   ``(repository, ticket number, research)``, so re-discovery of the same ticket is idempotent.
 - **stage collaborators** — the disposition-aware findings ``verify``, isolated-worktree ``prepare``,
   single-writer ``resolve`` (close an explicit decision or park a handoff for operator judgment),
-  and exhaustion ``park`` (name why no usable ruling could be recorded and hand the ticket back).
+  and hold-time ``park`` (name what stopped the run and hand the ticket back).
   These are the production wiring the daemon injects into :class:`ResearchStageAdapter`.
 
 The dispatched session writes only into its isolated worktree — a findings artifact. It never writes
@@ -645,34 +645,96 @@ def resolve(record) -> str | None:
     return final.url or f"https://github.com/{repo}/issues/{number}"
 
 
-def _park_comment(number: int, reason: str, findings: str | None) -> str:
-    """The one comment an exhausted run leaves behind: why the ruling was refused, what the run did
-    manage to record, and who owns the ticket now. It states a machine limit, never a judgment on the
+# How a park names a permanent provider condition, keyed by *which* one fired. A provider that
+# refuses a session and a spend ceiling that stops one need different remediations, so each gets its
+# own diagnosis rather than re-authenticate advice for a healthy sign-in (issue #342).
+_PROVIDER_PARK_COPY = {
+    "access": ("refused the session outright — an expired sign-in, a billing or plan limit, or a "
+               "permission problem. Re-authenticate the coding agent, or check its billing, plan, "
+               "and permissions"),
+    "rejected-request": ("rejected the request itself — too large for the model, an unrecognized "
+                         "model, or a request it would not accept. The coding agent's sign-in is "
+                         "fine; what it was asked to send is what needs a look"),
+    "spend": ("stopped the run at its configured spending cap. The coding agent's sign-in is fine; "
+              "raise or reset the cap for this work"),
+    "unspecified": ("ended the session permanently without saying which condition it was. The "
+                    "coding agent's health needs a look before it can run anything again"),
+}
+
+
+def _park_story(record, findings: str | None) -> tuple[str, str, str, str]:
+    """What this park is: the sentence that opens the comment, the label on its reason line, the
+    reason itself, and what the operator does next.
+
+    The record's durable hold reason picks the story, exactly as Intake's hold picks its body
+    (issues #328, #342). A run a permanent provider condition killed never read the question, so
+    telling its operator the machine spent a budget failing to answer — and to go rewrite the
+    question — would send them rewriting something no session ever saw. Only the story differs:
+    the comment, the park label, the released claim, and the re-proof are identical for every
+    reason, because the consequence is the same either way. Nothing here judges the question."""
+    from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON,
+                                                   parse_permanent_hold_reason)
+    hold_reason = record.hold_reason or ""
+    if hold_reason.startswith(PERMANENT_HOLD_REASON):
+        which = parse_permanent_hold_reason(hold_reason).value
+        return ("An unattended research session could not get far enough to rule on this ticket, "
+                "so the ticket is parked for you.",
+                "Why there is no ruling",
+                "the coding agent " + _PROVIDER_PARK_COPY.get(
+                    which, _PROVIDER_PARK_COPY["unspecified"]),
+                "Nothing here says anything about the question itself — the session never got to "
+                "read it. Unattended research will not try this ticket again: once the coding "
+                "agent is healthy, file a fresh research ticket for the same question, or answer "
+                "it in a wayfinder session.")
+    reason = rejection_reason(findings)
+    if reason is None:
+        # A parseable ruling belongs to resolve(), which the completed path runs before any hold.
+        # Reaching the park with one means the artifact on disk changed after the run was verified
+        # as incomplete, so the honest story is a ruling written but never recorded — never a
+        # rejected check, which would name a check that did not fail.
+        return ("An unattended research session wrote a ruling for this ticket but was held before "
+                "the daemon could record it, so the ticket is parked for you.",
+                "Why it was not recorded",
+                "the run was held before the daemon could record the ruling it wrote",
+                "The ruling it wrote is below, unrecorded — the decision map does not carry it. "
+                "Unattended research will not try this ticket again: settle it in a wayfinder "
+                "session, or file a fresh research ticket.")
+    return ("An unattended research session ended without producing a ruling the daemon is allowed "
+            "to record, so the ticket is parked for you.",
+            "Why the ruling was refused", reason,
+            "This says nothing about whether the question is a good one — only that the machine "
+            "could not answer it in the shape the decision map requires. Unattended research will "
+            "not try this ticket again. Rewrite the question so a bounded session can answer it, "
+            "or answer it yourself in a wayfinder session.")
+
+
+def _park_comment(number: int, story: tuple[str, str, str, str], findings: str | None) -> str:
+    """The one comment a parked run leaves behind: what stopped it, why, what it did manage to
+    record, and who owns the ticket now. It states a machine limit, never a judgment on the
     question — the daemon may not close, re-file, or re-word anything (ADR 0037)."""
+    opening, reason_label, reason, next_step = story
     recorded = (f"\n\nWhat the run did record, so the work is not lost:\n\n---\n\n{findings}"
                 if findings else "")
     return (
         f"{_PARK_DISCLAIMER}\n{_park_marker(number)}\n\n"
-        "An unattended research session spent its whole budget on this ticket without producing a "
-        "ruling the daemon is allowed to record, so the ticket is parked for you.\n\n"
-        f"**Why the ruling was refused:** {reason}.\n\n"
-        "This says nothing about whether the question is a good one — only that the machine could "
-        "not answer it in the shape the decision map requires. Unattended research will not try "
-        "this ticket again. Rewrite the question so a bounded session can answer it, or answer it "
-        f"yourself in a wayfinder session.{recorded}"
+        f"{opening}\n\n"
+        f"**{reason_label}:** {reason}.\n\n"
+        f"{next_step}{recorded}"
     )
 
 
 def park(record) -> str | None:
-    """Hand an exhausted research ticket back to the operator, visibly (ADR 362).
+    """Hand a held research ticket back to the operator, visibly (ADR 362).
 
-    The run spent its whole recovery budget without recording a ruling the contract accepts. That
-    rejection is total and repeatable — the same artifact fails the same check every time — so no
-    later unattended attempt could do better. This is the research stage's own operator-facing
-    handoff, replacing the silent claim drop it used to do: one comment naming the exact check that
-    failed and carrying whatever the run did record, one durable park label that takes the ticket
-    out of unattended selection, and the shared claim released. The ticket stays open and is never
-    closed, re-filed, or judged.
+    This is the research stage's own operator-facing handoff, replacing the silent claim drop it
+    used to do: one comment saying what stopped the run and why, carrying whatever the run did
+    record, one durable park label that takes the ticket out of unattended selection, and the
+    shared claim released. The ticket stays open and is never closed, re-filed, or judged.
+
+    Every hold reaches here, not only exhaustion, so the comment's story comes from the record's
+    durable hold reason (see :func:`_park_story`) — the ordinary case is a run that spent its
+    budget without a ruling the contract accepts, which is total and repeatable, but a permanent
+    provider condition parks the same ticket for an entirely different reason and must say so.
 
     Idempotent and crash-safe, exactly as ``resolve`` is: a repeat posts no second comment and
     re-proves the same park. ``None`` withholds proof until comment, label, and released claim can
@@ -683,16 +745,13 @@ def park(record) -> str | None:
         return None
     repo = record.repo
     findings = read_findings(record)
-    # A parseable ruling belongs to resolve(), which the completed path already ran; reaching the
-    # park with one means the run was held before it could be recorded, which is the honest reason.
-    reason = rejection_reason(findings) or (
-        "the run was held before the daemon could record the ruling it wrote")
+    story = _park_story(record, findings)
     issue = github.issue_view(repo, number)
     if issue is None:
         return None
     marker = _park_marker(number)
     if not any(marker in comment.body for comment in issue.comments):
-        if not github.comment(repo, number, _park_comment(number, reason, findings)):
+        if not github.comment(repo, number, _park_comment(number, story, findings)):
             return None
     if not _mark_state(repo, number, RESEARCH_PARKED):
         return None

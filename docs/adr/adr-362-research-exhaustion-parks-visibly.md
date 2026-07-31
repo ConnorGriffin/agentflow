@@ -56,6 +56,15 @@ session can answer it, or answers it in a human wayfinder session.
 as durable, exactly as durable resolution does, so an interrupted park replays rather than
 being recorded as done. Running it twice produces one comment and one label.
 
+**The comment's story comes from the run's durable hold reason.** Exhaustion is the ordinary
+way a research run ends up here, but it is not the only one: a permanent provider condition —
+a refused sign-in, a request the provider rejected, a configured spend ceiling — stops the
+session before it reads the question at all, and lands in the same park. That park says so and
+names the remediation, rather than telling the maintainer the machine spent a budget failing to
+answer and asking them to rewrite a question no session ever saw. This is the same rule Intake's
+hold already follows (issues #328 and #342): only the words differ, while the label, the released
+claim, and the re-proof are identical, because the ticket is equally terminal either way.
+
 **The rejection reason is produced by the parser itself**, at the check that fails, so the
 sentence the operator reads and the rule the daemon enforces cannot drift apart. The
 disposition contract is unchanged by a single character: the same artifacts that parsed

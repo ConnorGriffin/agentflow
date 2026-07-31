@@ -52,13 +52,22 @@ recorded as no-build or deferred with a concrete trigger and verification condit
 
 ### Wayfinder research parked for you
 
-A ticket carrying `wayfinder:parked` is the opposite outcome: an unattended run spent its
-whole budget without recording a ruling the contract accepts, so it handed the ticket back
-(ADR 362). The ticket's own comment names the check that refused the ruling and carries
-whatever the run did write. Unattended research will never pick it up again — rewrite the
-question so a bounded session can answer it, or answer it in a Wayfinder session. Removing
-the label does not restart it: the run's record is terminal, so a sharper question wants a
-new research ticket. Do not restore `wayfinder:resolving` by hand.
+A ticket carrying `wayfinder:parked` is the opposite outcome: an unattended run ended without
+recording a ruling the contract accepts, so it handed the ticket back (ADR 362). Read the
+ticket's own comment before acting — it says which of two things happened, and they need
+different responses:
+
+- **The run answered, and the answer was refused.** The comment names the exact check that
+  refused the ruling and carries whatever the run did write. Rewrite the question so a bounded
+  session can answer it, or answer it in a Wayfinder session.
+- **The coding agent never got to read the question** — a refused sign-in, a rejected request,
+  or a spend ceiling stopped the session. The comment names that condition and its remediation.
+  The question itself is untouched, so once the coding agent is healthy, file a fresh research
+  ticket asking it again.
+
+Either way, unattended research will never pick this ticket up again, and removing the label
+does not restart it: the run's record is terminal, so a new question wants a new research
+ticket. Do not restore `wayfinder:resolving` by hand.
 
 ## Pause and drain
 

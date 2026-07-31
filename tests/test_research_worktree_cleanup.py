@@ -27,6 +27,7 @@ def _make_record(tmp_path, number=7):
         subject=str(number),
         pool="claude",
         source=str(wt),
+        hold_reason="continuation budget exhausted",
     )
 
 

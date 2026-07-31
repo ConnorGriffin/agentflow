@@ -25,11 +25,13 @@ def _R(returncode=0, stdout=""):
     return SimpleNamespace(returncode=returncode, stdout=stdout)
 
 
-def _record(tmp_path, number=7):
-    """A held research record whose source points at the run's real worktree directory."""
+def _record(tmp_path, number=7, hold_reason="continuation budget exhausted"):
+    """A held research record whose source points at the run's real worktree directory. The hold
+    reason is the record's own durable field — it is what the park's comment is chosen from."""
     wt = tmp_path / ".agentflow" / "worktrees" / "claude" / f"research-{number}"
     wt.mkdir(parents=True)
-    return SimpleNamespace(repo="o/r", subject=str(number), pool="claude", source=str(wt))
+    return SimpleNamespace(repo="o/r", subject=str(number), pool="claude", source=str(wt),
+                           hold_reason=hold_reason)
 
 
 def _plant(record, text):
@@ -204,7 +206,8 @@ def test_a_run_that_recorded_nothing_is_parked_too(tmp_path, monkeypatch):
 
 def test_a_usable_ruling_reaching_the_park_says_the_run_was_held_first(tmp_path, monkeypatch):
     """A parseable ruling belongs to resolve(), so reaching the park with one means the run was
-    held before it could be recorded. The comment must say that, not invent a rejected check."""
+    held before it could be recorded. The comment must say that, not invent a rejected check —
+    and it must not open by asserting no ruling was produced, which its own reason line denies."""
     record = _record(tmp_path)
     _plant(record, "## Disposition\n\n```json\n{\"disposition\":\"no_build\","
                    "\"summary\":\"The widget path already routes through the shared router.\"}\n```\n")
@@ -212,7 +215,43 @@ def test_a_usable_ruling_reaching_the_park_says_the_run_was_held_first(tmp_path,
     ticket.install(monkeypatch)
 
     assert coordinated_research.park(record) is not None
-    assert "held before the daemon could record the ruling" in ticket.park_comments[0]
+    body = ticket.park_comments[0]
+    assert "held before the daemon could record the ruling" in body
+    assert "without producing a ruling" not in body, \
+        "the opening must not contradict the reason line by denying the ruling exists"
+    assert "Why the ruling was refused" not in body, "no check refused this artifact"
+
+
+# --- a provider condition parks the same ticket, but never blames the question ----------
+
+@pytest.mark.parametrize("which,expected", [
+    ("access", "Re-authenticate the coding agent"),
+    ("rejected-request", "rejected the request itself"),
+    ("spend", "configured spending cap"),
+    ("unspecified", "without saying which condition it was"),
+])
+def test_a_provider_killed_run_names_the_provider_not_the_question(tmp_path, monkeypatch,
+                                                                   which, expected):
+    """Every hold reaches the park, not only exhaustion. A permanent provider condition stops the
+    session before it reads the question, so the comment must name that condition and its
+    remediation — telling the maintainer the machine spent a budget failing to answer, and to go
+    rewrite the question, would send them rewriting something no session ever saw (issue #342)."""
+    record = _record(tmp_path, hold_reason=f"permanent provider condition ({which})")
+    ticket = _FakeTicket()
+    ticket.install(monkeypatch)
+
+    assert coordinated_research.park(record) is not None
+    body = ticket.park_comments[0]
+    assert expected in body
+    assert "Rewrite the question" not in body, \
+        "the session never read the question, so it must not be blamed"
+    assert "recorded no findings at all" not in body, \
+        "an empty artifact is not the reason — the provider is"
+    assert "will not try this ticket again" in body, "the park is terminal either way"
+    # Parked exactly as any other hold is: the record is terminal, so leaving it unlabelled would
+    # restore the very invisibility this park exists to end.
+    assert RESEARCH_PARKED in ticket.labels
+    assert RESOLVING not in ticket.labels
 
 
 def test_parking_twice_leaves_one_comment_and_one_label(tmp_path, monkeypatch):
