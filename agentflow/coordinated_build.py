@@ -177,6 +177,8 @@ def _collision_comment(comment: github.Comment, admitted_at: int) -> bool:
 # "continuation budget exhausted" — true only for a build that really did run out of tries, and
 # actively misleading for a build that never reached the work at all.
 _EXHAUSTED_STATUS = "continuation budget exhausted"
+_TURN_CAP_STATUS = ("used up its tries with the last coding session cut off at its per-stage turn "
+                    "ceiling — it was stopped mid-work rather than running out of things to try")
 _COLLISION_STATUS = ("could not rebase past a collision with newer changes on the main branch "
                      "and stopped without resolving it")
 _ENVIRONMENT_STATUS = ("the machine couldn't give the coding agent a working command line — "
@@ -211,21 +213,25 @@ def _marker_status(reason: str | None) -> str:
 def _hold_status(reason: str | None) -> tuple[str, str]:
     """The maintainer-facing status phrase and notification headline for one persisted hold
     reason. A collision, an environment that couldn't carry a session, and each kind of
-    permanent provider condition read as themselves; every other reason — a genuinely spent
-    budget, a replay that would have been identical, a completed stage with no successor —
-    keeps the exhaustion wording it has always had. Pure (test surface)."""
-    from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON,
+    permanent provider condition read as themselves; a budget spent on sessions the turn ceiling
+    kept cutting off says so, because that is fixed by raising the ceiling and not by re-running
+    the same build; every other reason — a genuinely spent budget, a replay that would have been
+    identical, a completed stage with no successor — keeps the exhaustion wording it has always
+    had. Pure (test surface)."""
+    from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON, ended_at_turn_cap,
                                                    parse_permanent_hold_reason)
-    from agentflow.coordinator.providers import PermanentReason
+    from agentflow.coordinator.providers import EndingReason
 
     if reason == "integration collision":
         return _COLLISION_STATUS, "Build hit an integration collision"
     if reason and reason.startswith(PERMANENT_HOLD_REASON):
         permanent = parse_permanent_hold_reason(reason)
-        if permanent is PermanentReason.ENVIRONMENT:
+        if permanent is EndingReason.ENVIRONMENT:
             return _ENVIRONMENT_STATUS, "Build never got a working session"
         return (_PERMANENT_STATUS.get(permanent.value, _PERMANENT_STATUS["unspecified"]),
                 "Build's coding agent could not run")
+    if ended_at_turn_cap(reason):
+        return _TURN_CAP_STATUS, "Build was cut off at its turn ceiling"
     return _EXHAUSTED_STATUS, "Build continuation budget exhausted"
 
 
