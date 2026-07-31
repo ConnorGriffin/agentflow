@@ -14,7 +14,7 @@ from agentflow.coordinated_build import (_ENVIRONMENT_STATUS, _EXHAUSTED_STATUS,
 from agentflow.coordinator import Submission
 from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON, parse_permanent_hold_reason,
                                                permanent_hold_reason)
-from agentflow.coordinator.providers import (PermanentReason, ProviderCause, classify_claude,
+from agentflow.coordinator.providers import (EndingReason, ProviderCause, classify_claude,
                                              classify_codex)
 from agentflow.intake import _provider_failed
 from agentflow.shell_crib import SHELL_CRIB
@@ -58,7 +58,7 @@ def test_a_session_whose_shell_never_started_is_an_environment_fault():
     # own — for a reason that names the environment rather than the coding agent's provider.
     obs = classify_claude(_dead_shell_stream(), exit_status=0)
     assert obs.classification() == "permanent"
-    assert obs.permanent_reason is PermanentReason.ENVIRONMENT
+    assert obs.ending_reason is EndingReason.ENVIRONMENT
 
 
 def test_a_clean_incomplete_session_is_not_an_environment_fault():
@@ -70,7 +70,7 @@ def test_a_clean_incomplete_session_is_not_an_environment_fault():
     ]
     obs = classify_claude(stream, exit_status=0)
     assert obs.cause is ProviderCause.NONE
-    assert obs.permanent_reason is PermanentReason.UNSPECIFIED
+    assert obs.ending_reason is EndingReason.UNSPECIFIED
 
 
 def test_a_session_that_ran_one_command_is_an_ordinary_rejection_not_a_dead_shell():
@@ -108,7 +108,7 @@ def test_a_provider_condition_the_stream_reported_still_wins_over_a_dead_shell()
 def test_a_timed_out_session_with_a_dead_shell_is_still_an_environment_fault():
     # A session that hung because it had no shell must not be waited on: no reset lifts this.
     obs = classify_claude(_dead_shell_stream(), timed_out=True)
-    assert obs.permanent_reason is PermanentReason.ENVIRONMENT
+    assert obs.ending_reason is EndingReason.ENVIRONMENT
 
 
 def test_a_codex_dead_shell_keeps_todays_classification():
@@ -147,7 +147,7 @@ def test_a_dead_shell_holds_the_stage_at_once_and_spends_no_attempt(make_coord):
 
     record = record_of(coord, identity)
     assert record.attempts == 0                  # refunded — nothing about the work was attempted
-    assert record.hold_reason == permanent_hold_reason(PermanentReason.ENVIRONMENT)
+    assert record.hold_reason == permanent_hold_reason(EndingReason.ENVIRONMENT)
     assert record.hold_reason != "continuation budget exhausted"
     assert permits(coord, "claude") == 0         # the reservation is released, not looping
 
@@ -195,7 +195,7 @@ def test_a_maintainer_resume_of_an_environment_hold_starts_from_a_full_budget(ma
 
 def test_the_intake_hold_for_an_environment_fault_names_the_fault_and_its_remedy():
     # Exactly the two lines the intake handoff runs to pick its copy from the persisted reason.
-    reason = permanent_hold_reason(PermanentReason.ENVIRONMENT)
+    reason = permanent_hold_reason(EndingReason.ENVIRONMENT)
     assert reason.startswith(PERMANENT_HOLD_REASON)         # keeps the existing hold path
     body = _provider_failed(reason, parse_permanent_hold_reason(reason).value).body
 
@@ -217,8 +217,8 @@ def test_each_permanent_condition_keeps_its_own_intake_diagnosis():
 
 def test_the_build_hold_comment_no_longer_collapses_every_ending_into_exhaustion():
     """Fails on today's code, where every non-collision hold reads as a spent budget."""
-    environment, _ = _hold_status(permanent_hold_reason(PermanentReason.ENVIRONMENT))
-    access, _ = _hold_status(permanent_hold_reason(PermanentReason.ACCESS))
+    environment, _ = _hold_status(permanent_hold_reason(EndingReason.ENVIRONMENT))
+    access, _ = _hold_status(permanent_hold_reason(EndingReason.ACCESS))
     exhausted, _ = _hold_status("continuation budget exhausted")
     collision, _ = _hold_status("integration collision")
 
@@ -242,13 +242,13 @@ def test_an_already_held_build_composes_the_same_handoff_marker_as_before():
 
     for reason in ("integration collision", "continuation budget exhausted",
                    "no new recovery state to act on", "completed stage has no successor",
-                   permanent_hold_reason(PermanentReason.ACCESS),
-                   permanent_hold_reason(PermanentReason.UNSPECIFIED), None):
+                   permanent_hold_reason(EndingReason.ACCESS),
+                   permanent_hold_reason(EndingReason.UNSPECIFIED), None):
         assert _marker_status(reason) == todays_status(reason)
 
     # And the wording a permanent hold now displays is genuinely different from what it keys on,
     # which is the whole reason the two are separate.
-    permanent = permanent_hold_reason(PermanentReason.ACCESS)
+    permanent = permanent_hold_reason(EndingReason.ACCESS)
     assert _hold_status(permanent)[0] != _marker_status(permanent)
 
 
