@@ -172,3 +172,7 @@ Issue-keyed records:
   ends with no usable ruling parks its ticket visibly (one comment naming the check that
   refused it, one `wayfinder:parked` label) instead of silently releasing the claim, and
   research dispatch stops claiming tickets for runs that will never start.
+- [ADR 401](adr-401-commit-time-signoff.md) — Preparing a session checkout installs the
+  sign-off, so a commit carries it the moment it is made and no stranded pull request needs a
+  human amendment. Confined to the session's own checkout, only for the commit's own author,
+  fail-open with one line per repository. Supersedes #357's no-hooks scope line.
