@@ -48,6 +48,16 @@ Standards every app built in the agentflow flow must meet. Read by **both** tool
 - **Match the surrounding code** — idiom, naming, comment density.
 - **No dead code, no speculative abstraction.** Build the seam when the second caller
   is real, not before.
+- **Earn every guard.** An edge case is real only when its state is reachable under the
+  system's **enforced** invariants — *enforced* meaning the state is rejected or made
+  unrepresentable before the guard, by code or by a pinned test; a comment or a survey of
+  today's callers is not enforcement. Guards at a trust boundary are never speculative:
+  external input, cross-process or cross-tool data, concurrent state, and durable state a
+  crash, a human edit, or the clock can perturb — an illustrative list, not a closed one.
+  Elsewhere, a guard for a state that cannot occur is complexity, not safety: adding one is
+  a defect, and removing one is a legitimate fix **only when the removal names the enforced
+  invariant** that makes the state unreachable. Keep every guard that acceptance criteria,
+  security or adversarial input, or observed behavior grounds.
 - Domain terms come from **`CONTEXT.md`**; record load-bearing, hard-to-reverse
   decisions as **ADRs** — and don't re-litigate settled ones.
 - **ADR identity comes from the originating GitHub issue.** New records use

@@ -22,6 +22,21 @@ def test_reviewer_prompt_exposes_only_the_four_action_vocabulary():
     assert " nit" not in prompt
 
 
+def test_reviewer_prompt_calibrates_against_speculative_hardening():
+    prompt = " ".join(REVIEW_PROMPT.split()).lower()
+
+    assert "speculative hardening is not work" in prompt
+    assert "reachable under the system's enforced invariants" in prompt
+    # The carve-out, so the calibration never argues away a real trust boundary.
+    assert "trust boundary are never speculative" in prompt
+    assert "an illustrative list, not a closed one" in prompt
+    # Routed through the existing actions — discard the ask, delete the guard a builder shipped,
+    # and say what makes the state unreachable.
+    assert "when you were about to ask for one, `discard_preference`" in prompt
+    assert "`fix_before_completion` by deleting it" in prompt
+    assert "name in the finding the enforced invariant" in prompt
+
+
 def test_pass_with_no_findings_is_clean():
     assert parse_verdict('{"verdict": "PASS", "findings": []}').clean is True
 
