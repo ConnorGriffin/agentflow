@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,8 @@ from agentflow import (coordinated_build, coordinated_mockup, coordinated_respon
 from agentflow.coordinator import MockupStageAdapter
 from agentflow.coordinator import admission
 from agentflow.coordinator.providers import ProviderCause
+from agentflow.coordinator.record import WAITING, Record
+from agentflow.intake import INTAKE_MARK
 from agentflow.loop import RepoConfig
 
 
@@ -611,6 +614,7 @@ def test_intake_skips_an_issue_a_live_pipeline_stage_already_owns(monkeypatch):
         return None if 42 in reserved else ({"number": 42, "labels": []}, "")
 
     monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(github, "issue_comment_rows", lambda repo, issue: [])
     monkeypatch.setattr(dispatch.pipeline, "owned_issues",
                         lambda cfg, lane=None: {42})
     monkeypatch.setattr(dispatch, "pick_pair",
@@ -631,6 +635,7 @@ def test_intake_still_claims_a_genuinely_new_issue(monkeypatch):
         return None if 42 in reserved else ({"number": 42, "labels": []}, "")
 
     monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(github, "issue_comment_rows", lambda repo, issue: [])
     monkeypatch.setattr(dispatch.pipeline, "owned_issues", lambda cfg, lane=None: set())
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_intake, "intake_submission",
@@ -662,6 +667,7 @@ def test_intake_does_not_claim_a_dedup_hit_on_a_completed_record(monkeypatch):
             return None if 393 in reserved else ({"number": 393, "labels": []}, extra)
 
         monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+        monkeypatch.setattr(github, "issue_comment_rows", lambda repo, issue: [])
         monkeypatch.setattr(dispatch.pipeline, "owned_issues",
                             lambda cfg, lane=None: set())
         monkeypatch.setattr(dispatch, "pick_pair",
@@ -691,6 +697,7 @@ def test_intake_withdraws_the_submission_when_the_claim_fails(monkeypatch):
         return None if 42 in reserved else ({"number": 42, "labels": []}, "")
 
     monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(github, "issue_comment_rows", lambda repo, issue: [])
     monkeypatch.setattr(dispatch.pipeline, "owned_issues", lambda cfg, lane=None: set())
     monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_intake, "intake_submission",
@@ -1079,3 +1086,133 @@ def test_a_repository_that_cannot_carry_a_session_receives_no_cold_work(monkeypa
     dispatch._submit_repo(RepoConfig("o/healthy", "/h"), SimpleNamespace(), lambda _line: None)
     assert submitted == ["_submit_coordinated_intake", "_submit_coordinated_build",
                          "_submit_coordinated_respond", "_submit_coordinated_research"]
+
+
+def _thread(*rows) -> list[dict]:
+    """GitHub's own comment rows, shaped as the intake predicates read them."""
+    return [{"author": {"login": login}, "body": body, "id": f"IC_{i}"}
+            for i, (login, body) in enumerate(rows)]
+
+
+def _intake_prompt_for(monkeypatch, cfg, issue, thread, *, extra="") -> str:
+    """Run one issue through cold intake submission and return the prompt it durably recorded."""
+    from agentflow import coordinated_intake
+
+    def candidate(cfg, reserved=frozenset()):
+        return None if issue["number"] in reserved else (issue, extra)
+
+    monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(github, "issue_comment_rows", lambda repo, number: thread)
+    monkeypatch.setattr(dispatch.pipeline, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch, "claim", lambda *a: True)
+    monkeypatch.setattr(coordinated_intake, "_run",
+                        lambda cmd: SimpleNamespace(returncode=0, stdout="abc123\n"))
+    recorded = []
+    coord = SimpleNamespace(
+        submit_stage=lambda submission: recorded.append(submission) or "id",
+        stage_record=lambda identity: Record(identity="id", stage="triage", pool="claude",
+                                             demand=5, state=WAITING))
+
+    dispatch._submit_coordinated_intake(cfg, coord, None)
+    assert recorded, "the issue was never submitted"
+    return json.loads(recorded[0].input_ptr)["prompt"]
+
+
+def test_a_fresh_intake_reads_the_owners_later_comments_as_authoritative(monkeypatch):
+    """An issue is routinely narrowed in its own thread minutes after it is filed. Triaging from
+    the body alone produced a confident brief for the half its owner had just deferred."""
+    cfg = RepoConfig("connor/repo", "/tmp")
+    monkeypatch.setattr(dispatch, "intake_allowlist", lambda repo, workdir: {"connor"})
+    issue = {"number": 493, "title": "expose per-night provenance", "body": "as filed",
+             "labels": []}
+
+    prompt = _intake_prompt_for(monkeypatch, cfg, issue, _thread(
+        ("connor", "the provenance half is deferred — the live work is the conditioning gate"),
+        ("driveby", "+1, and please also rewrite the parser"),
+    ))
+
+    assert "the live work is the conditioning gate" in prompt
+    assert "the comment wins" in prompt         # stated as authority, not background
+    assert "rewrite the parser" not in prompt   # not an allowlisted author
+
+
+def test_a_re_intake_ignores_comments_already_settled_into_the_brief(monkeypatch):
+    """A settled route rewrites the issue body, so replaying the whole thread would let a comment
+    already folded into the brief re-open the question it closed."""
+    cfg = RepoConfig("connor/repo", "/tmp")
+    monkeypatch.setattr(dispatch, "intake_allowlist", lambda repo, workdir: {"connor"})
+    issue = {"number": 12, "title": "t", "body": "b", "labels": []}
+
+    prompt = _intake_prompt_for(monkeypatch, cfg, issue, _thread(
+        ("connor", "an old aside from before we triaged it"),
+        ("connor", f"> *{INTAKE_MARK} disclaimer.* routed ready"),
+        ("connor", "but drop the migration for now"),
+    ))
+
+    assert "drop the migration" in prompt
+    assert "an old aside" not in prompt
+    assert "routed ready" not in prompt  # nor our own intake comment itself
+
+
+def test_an_issue_answering_an_earlier_hold_keeps_one_comment_channel(monkeypatch):
+    """The resume path already delivers these comments as the maintainer's answer, under framing
+    that says so. A second copy under a second framing would put two contradictory instructions
+    for the same words in one prompt — and would pay to read the thread twice."""
+    cfg = RepoConfig("connor/repo", "/tmp")
+    monkeypatch.setattr(dispatch, "intake_allowlist", lambda repo, workdir: {"connor"})
+    monkeypatch.setattr(github, "issue_comment_rows",
+                        lambda repo, number: pytest.fail("the resume path already read the thread"))
+    issue = {"number": 12, "title": "t", "body": "b", "labels": [],
+             "_intake_target": "IC_answer"}
+
+    prompt = _intake_prompt_for(monkeypatch, cfg, issue, None,
+                                extra="yes, waive the visual spec")
+
+    assert "THE MAINTAINER HAS REPLIED" in prompt
+    assert "yes, waive the visual spec" in prompt
+    assert "the comment wins" not in prompt
+
+
+def test_an_empty_thread_triages_exactly_as_before(monkeypatch):
+    cfg = RepoConfig("connor/repo", "/tmp")
+    monkeypatch.setattr(dispatch, "intake_allowlist", lambda repo, workdir: {"connor"})
+
+    prompt = _intake_prompt_for(
+        monkeypatch, cfg, {"number": 5, "title": "t", "body": "b", "labels": []}, [])
+
+    assert "MAINTAINER COMMENTS" not in prompt
+
+
+def test_an_unreadable_thread_defers_only_that_issue(monkeypatch):
+    """Triaging on a thread we could not read is exactly the failure this closes, so it fails
+    closed — but one unreadable issue must not sink the other work in the pass."""
+    from agentflow import coordinated_intake
+
+    cfg = RepoConfig("connor/repo", "/tmp")
+    monkeypatch.setattr(dispatch, "intake_allowlist", lambda repo, workdir: {"connor"})
+    queue = [{"number": 8, "title": "unreadable", "body": "b", "labels": []},
+             {"number": 9, "title": "fine", "body": "b", "labels": []}]
+
+    def candidate(cfg, reserved=frozenset()):
+        return next(((issue, "") for issue in queue if issue["number"] not in reserved), None)
+
+    monkeypatch.setattr(loop, "_next_intake_candidate", candidate)
+    monkeypatch.setattr(github, "issue_comment_rows",
+                        lambda repo, number: None if number == 8 else [])
+    monkeypatch.setattr(dispatch.pipeline, "owned_issues", lambda cfg, lane=None: set())
+    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch, "claim", lambda *a: True)
+    submitted = []
+    monkeypatch.setattr(coordinated_intake, "intake_submission",
+                        lambda cfg, issue, extra, comments, tool:
+                        submitted.append(issue["number"]) or SimpleNamespace(pool="claude"))
+    coord = SimpleNamespace(
+        submit_stage=lambda submission: "id",
+        stage_record=lambda identity: Record(identity="id", stage="triage", pool="claude",
+                                             demand=5, state=WAITING))
+
+    result = dispatch._submit_coordinated_intake(cfg, coord, None)
+
+    assert submitted == [9]
+    assert "#9" in result
