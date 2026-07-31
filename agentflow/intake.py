@@ -424,9 +424,12 @@ WRITE the body for your route (Markdown), starting with this exact line:
 - ready -> an Agent Brief with these sections: **Summary**; **Verified** (re-derive the claim
   against named functions/branches on the real data — quote the numbers); **Current behavior**
   (grounded numbers); **Desired behavior**; **Key interfaces** (where the change lives — say
-  "explore fresh; pointers, not line numbers", and name any traps); **Acceptance criteria** (a
-  checkbox list; bake grounded numeric literals in where they apply, and include a test that
-  would fail if the bug regressed); **Out of scope** (explicit don'ts).
+  "explore fresh; pointers, not line numbers", and name any traps); **Interface shape** (one or
+  two sentences on what the caller-facing front door should look like, judged by the charter's
+  depth test; if the change is purely internal to an existing interface, say so instead of
+  omitting the section); **Acceptance criteria** (a checkbox list; bake grounded numeric literals
+  in where they apply, and include a test that would fail if the bug regressed); **Out of scope**
+  (explicit don'ts).
 - grill -> questions IN THE MAINTAINER'S VOICE: talk about the app's behavior and their real
   numbers, NEVER about code symbols, ADR numbers, or file paths. Lead with the symptom/impact,
   give 2-3 concrete options grounded in real examples, and say which you'd pick and why. Max 5.

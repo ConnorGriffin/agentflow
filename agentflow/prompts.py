@@ -44,6 +44,9 @@ Before every push, ensure every non-merge commit you create or amend is DCO-sign
 the existing work and history first; repair an unsigned existing commit with an amendment
 where appropriate, never a separate sign-off-only or duplicate-work commit.
 
+Before opening the PR, check any module you introduced against the charter's deletion
+test and interface-depth rule, and deepen or inline whatever fails.
+
 Before opening the PR, `git fetch origin` and rebase once onto `origin/main`, then
 rerun the tests. If the rebase conflicts (or tests fail post-rebase for a reason not
 your own), stop and post a comment prefixed `INTEGRATION-COLLISION:` instead of
