@@ -26,7 +26,7 @@ from conftest import FakeSession, permits, record_of
 from agentflow import coordinated_research, dispatch, loop, pipeline
 from agentflow.coordinator import ResearchStageAdapter, StageRouter, tracer
 from agentflow.coordinator.providers import ProviderCause
-from agentflow.coordinator.record import HELD, RUNNING, Record
+from agentflow.coordinator.record import HELD, RUNNING, WAITING, Record
 from agentflow.loop import RepoConfig
 
 REPO = "o/r"
@@ -141,7 +141,7 @@ def _adapter(fake):
     return ResearchStageAdapter(
         findings_ready=coordinated_research._findings_ready,
         resolve=coordinated_research.resolve,
-        release=coordinated_research.release,
+        park=coordinated_research.park,
         observer=fake)
 
 
@@ -614,8 +614,11 @@ def test_pending_resolution_replaces_a_stale_untitled_map_entry(tmp_path, monkey
     )
 
 
-def test_exhaustion_releases_the_claim_so_the_ticket_is_eligible_again(make_coord, coord_state,
-                                                                       tmp_path, monkeypatch):
+def test_exhaustion_parks_the_ticket_for_a_human_instead_of_releasing_it_silently(
+        make_coord, coord_state, tmp_path, monkeypatch):
+    """Exhaustion is the research stage's own operator-facing handoff (ADR 362). It used to drop
+    the shared claim and say nothing, which left the ticket looking untouched while no later
+    unattended attempt could ever run."""
     gh = FakeGitHub()
     gh.install(monkeypatch)
     fake = FakeSession()
@@ -631,9 +634,14 @@ def test_exhaustion_releases_the_claim_so_the_ticket_is_eligible_again(make_coor
             break
         fake.end(ident, cause=ProviderCause.PROCESS)                   # never records findings
     assert outcome is not None and outcome.status == "held"
-    assert outcome.handoff == "ticket:claim-released"
-    assert gh.state == "OPEN"                                          # not resolved — just released
-    assert "wayfinder:resolving" not in gh.labels                     # eligible again next cycle
+    assert outcome.handoff == "ticket:parked"
+    assert gh.state == "OPEN"                                          # never closed, never judged
+    assert "wayfinder:parked" in gh.labels                             # out of unattended selection
+    assert "wayfinder:resolving" not in gh.labels                      # the shared claim is released
+    parked = [c for c in gh.comments if "agentflow-research-park" in c["body"]]
+    assert len(parked) == 1
+    assert "recorded no findings at all" in parked[0]["body"]
+    assert "will not try this ticket again" in parked[0]["body"]
 
 
 # --- capacity: research reserves its own lane/cap and shows in the live board -----------
@@ -708,9 +716,9 @@ def test_with_decision_creates_the_section_when_absent():
     assert "## Decisions so far" in updated and "(#9)" in updated
 
 
-# --- dispatch: claim the shared label before submitting -------------------------------
+# --- dispatch: submit, inspect the record, then claim only a runnable run ----------------
 
-def test_research_dispatch_claims_then_enters_the_coordinator(monkeypatch):
+def _dispatch_ticket(monkeypatch):
     monkeypatch.setattr(loop, "_next_research_ticket",
                         lambda cfg, _log=None: {"number": 5, "title": "r", "body": "",
                                                 "labels": [{"name": "wayfinder:research"}]})
@@ -718,14 +726,55 @@ def test_research_dispatch_claims_then_enters_the_coordinator(monkeypatch):
                         lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr("agentflow.coordinated_research.research_map_context",
                         lambda repo, n: "")
-    events = []
+
+
+class _FakeCoordinator:
+    """Just enough coordinator for dispatch: a submission resolves to whatever record the stable
+    (repo, ticket, research) identity already points at, and a withdrawal is observable."""
+
+    def __init__(self, record):
+        self.record = record
+        self.events: list[str] = []
+        self.withdrawn: list[str] = []
+
+    def submit_stage(self, submission):
+        self.events.append(submission.stage)
+        return f"{submission.repo}:{submission.subject}:{submission.stage}"
+
+    def stage_record(self, _identity):
+        return self.record
+
+    def withdraw_stage(self, identity):
+        self.withdrawn.append(identity)
+
+
+def test_research_dispatch_submits_then_claims_a_runnable_run(monkeypatch):
+    _dispatch_ticket(monkeypatch)
+    coord = _FakeCoordinator(
+        SimpleNamespace(state=WAITING, hold_pending=False, retired=False))
     monkeypatch.setattr(dispatch, "claim",
-                        lambda repo, n, _label: events.append("claim") or True)
-    coord = SimpleNamespace(submit_stage=lambda s: events.append(s.stage))
+                        lambda repo, n, _label: coord.events.append("claim") or True)
 
     assert "submitted" in dispatch._submit_coordinated_research(
         RepoConfig(REPO, "/tmp"), coord, None)
-    assert events == ["claim", "research"]                            # claim visible before submission
+    assert coord.events == ["research", "claim"]   # the record is inspected before it is claimed
+    assert coord.withdrawn == []
+
+
+def test_research_dispatch_claims_nothing_when_the_ticket_is_already_parked(monkeypatch):
+    """A parked ticket's stable identity resolves to a terminal held record, so nothing new was
+    created to run. Claiming there stamped a shared claim for a session that never started, which
+    orphan reconciliation stripped an hour later and the next cycle restamped forever (ADR 362)."""
+    _dispatch_ticket(monkeypatch)
+    coord = _FakeCoordinator(
+        SimpleNamespace(state=HELD, hold_pending=False, retired=False))
+    monkeypatch.setattr(dispatch, "claim", lambda repo, n, _label: (_ for _ in ()).throw(
+        AssertionError("a terminal record must never be claimed")))
+
+    report = dispatch._submit_coordinated_research(RepoConfig(REPO, "/tmp"), coord, None)
+
+    assert "parked" in report
+    assert "submitted to coordinator" not in report   # no session started; the log must not say one did
 
 
 # --- worktree provisioning: the run gets a real repo to investigate ---------------------
@@ -770,17 +819,13 @@ def test_a_research_run_defers_when_its_worktree_cannot_be_provisioned(tmp_path)
     assert adapter.prepare(sub) is False
 
 
-def test_research_dispatch_refuses_submission_when_the_claim_cannot_be_set(monkeypatch):
-    monkeypatch.setattr(loop, "_next_research_ticket",
-                        lambda cfg, _log=None: {"number": 5, "title": "r", "body": "",
-                                                "labels": [{"name": "wayfinder:research"}]})
-    monkeypatch.setattr(dispatch, "pick_pair",
-                        lambda: (SimpleNamespace(tool="claude"), None, ""))
-    monkeypatch.setattr("agentflow.coordinated_research.research_map_context",
-                        lambda repo, n: "")
+def test_research_dispatch_withdraws_the_submission_when_the_claim_cannot_be_set(monkeypatch):
+    """A runnable submission whose claim mutation fails leaves no unowned research work behind."""
+    _dispatch_ticket(monkeypatch)
+    coord = _FakeCoordinator(
+        SimpleNamespace(state=WAITING, hold_pending=False, retired=False))
     monkeypatch.setattr(dispatch, "claim", lambda repo, n, _label: False)
-    coord = SimpleNamespace(submit_stage=lambda s: (_ for _ in ()).throw(
-        AssertionError("must not submit without the claim")))
 
     assert "could not claim" in dispatch._submit_coordinated_research(
         RepoConfig(REPO, "/tmp"), coord, None)
+    assert coord.withdrawn == [f"{REPO}:5:research"]
