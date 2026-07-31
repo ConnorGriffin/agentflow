@@ -427,8 +427,8 @@ PROVIDER_INPUT_V1 = "agentflow-provider-input-v1"
 
 def _stage_result_schema(stage: str) -> dict | None:
     """The provider-neutral result contract a stage's terminal decision must match, or None
-    for a code-writing stage that emits no structured decision. Intake and Review own their
-    schemas (domain validation lives with their parsers); this seam only names which stage
+    for a code-writing stage that emits no structured decision. Intake, Review and the attack own
+    their schemas (domain validation lives with their parsers); this seam only names which stage
     uses which, so no provider-specific schema detail leaks into coordinator policy."""
     if stage == "intake":
         from agentflow.intake import INTAKE_RESULT_SCHEMA
@@ -436,6 +436,9 @@ def _stage_result_schema(stage: str) -> dict | None:
     if stage == "review":
         from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
         return REVIEW_VERDICT_SCHEMA
+    if stage == "attack":
+        from agentflow.attack import ATTACK_RESULT_SCHEMA
+        return ATTACK_RESULT_SCHEMA
     return None
 
 

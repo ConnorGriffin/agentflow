@@ -1,4 +1,4 @@
-"""The composition root: eight coordinated stages wired into one live pipeline (ADR 0030).
+"""The composition root: nine coordinated stages wired into one live pipeline (ADR 0030).
 
 Each ``coordinated_*`` module owns what *its* stage decides. This module owns everything that is
 true of the pipeline as a whole and of no single stage:
@@ -13,7 +13,7 @@ true of the pipeline as a whole and of no single stage:
 - **claim reconciliation** — which issues and worktrees the durable store still owns, and the
   visible claim labels that reconciliation proves orphaned.
 
-It is the one module that knows all eight stages, which is exactly why nothing else has to.
+It is the one module that knows all nine stages, which is exactly why nothing else has to.
 """
 
 from __future__ import annotations
@@ -24,14 +24,14 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from agentflow import (coordinated_build, coordinated_converse, coordinated_intake,
-                       coordinated_mockup, coordinated_research, coordinated_respond,
-                       coordinated_review, coordinated_revise, github)
-from agentflow.balancer import BUILD_POOLS, PoolStatus, pick_reviewer
-from agentflow.coordinator import (BuildStageAdapter, ConverseStageAdapter, Coordinator,
-                                   IntakeStageAdapter, MockupStageAdapter, ResearchStageAdapter,
-                                   RespondStageAdapter, ReviewStageAdapter, ReviseStageAdapter,
-                                   StageRouter, tracer)
+from agentflow import (coordinated_attack, coordinated_build, coordinated_converse,
+                       coordinated_intake, coordinated_mockup, coordinated_research,
+                       coordinated_respond, coordinated_review, coordinated_revise, github)
+from agentflow.balancer import BUILD_POOLS, PoolStatus, pick_pair, pick_reviewer
+from agentflow.coordinator import (AttackStageAdapter, BuildStageAdapter, ConverseStageAdapter,
+                                   Coordinator, IntakeStageAdapter, MockupStageAdapter,
+                                   ResearchStageAdapter, RespondStageAdapter, ReviewStageAdapter,
+                                   ReviseStageAdapter, StageRouter, tracer)
 from agentflow.coordinator.admission import MACHINE_CEILING, STAGE_CAPS
 from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
@@ -143,7 +143,7 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
 
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
 def build_coordinator(_log=None) -> Coordinator:
-    """The daemon's coordinator for all eight logical stages (issues #103–#108).
+    """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
     adapter verifies a durable starting/final-head verdict and retains the detached bounded-fix
     checkout; its Revise adapter verifies a pushed revision on the same branch and reuses that
@@ -193,9 +193,15 @@ def build_coordinator(_log=None) -> Coordinator:
         resolve=coordinated_research.resolve,
         release=coordinated_research.release,
         worktree_ready=coordinated_research._research_worktree_ready)
+    attack = AttackStageAdapter(
+        worktree_reset=coordinated_attack.reset_worktree,
+        apply_objections=coordinated_attack.apply_objections,
+        claim_ready=coordinated_attack.attack_claim_ready,
+        worktree_dispose=coordinated_attack.dispose_worktree,
+        handoff=coordinated_attack.hold_attack)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse,
-                          "research": research})
+                          "research": research, "attack": attack})
     return Coordinator(adapter=router, gate=_production_gate(),
                        disabled_cold_stages=frozenset({"mockup"}),
                        log=_log or (lambda _line: None))
@@ -272,8 +278,12 @@ class _ProductionGate:
     @staticmethod
     def reservation_limits(record) -> ReservationLimits:
         """The global limits the store enforces with the running-row reservation."""
+        # The attack shares intake's triage lane and cap (ADR 380): the rounds *are* triage —
+        # the issue is still being decided — so they contend with triage for its slots rather
+        # than taking capacity from the build queue.
         lane = {"intake": "triage", "build": "build", "review": "build", "revise": "build",
-                "respond": "respond", "mockup": "mockup", "research": "research"}
+                "respond": "respond", "mockup": "mockup", "research": "research",
+                "attack": "triage"}
         stage_lane = lane.get(record.stage, record.stage)
         return ReservationLimits(
             machine_ceiling=MACHINE_CEILING,
@@ -519,17 +529,91 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
     if submission is not None:
         coord.submit_stage(submission)
 
+def _open_attack_on_completed_intake(coord: Coordinator, intake_identity: str) -> None:
+    """A completed Intake whose route is a ready *draft* opens exactly one cold attack round and
+    transfers the ``triaging`` claim before the intake record retires — no ownership gap
+    (ADR 380). Nothing is written to GitHub here: the draft is unpublished by design, and the
+    grill/mockup/close routes never reach this opener because their settlement retires the record
+    (a transiently unsettled one is skipped by the route check and retried by settlement, not by
+    us). Submission is idempotent on the attack identity (repo, subject, attack, round), so a
+    repeat or restart never opens a second attacker for the same round. Live — its mapping is
+    covered through :func:`coordinated_attack.attack_submission`."""
+    from agentflow.coordinator.intake_stage import decode_result
+    from agentflow.intake import IntakeRoute
+    records = {record.identity: record for record in tracer.load_records()}
+    intake = records.get(intake_identity)
+    if intake is None or intake.stage != "intake" or not intake.outcome:
+        return
+    try:
+        draft = decode_result(intake.outcome)
+    except (ValueError, KeyError, TypeError):
+        return
+    if draft.route is not IntakeRoute.READY:
+        return
+    builder, _reviewer, _block_msg = pick_pair()
+    if builder is None:
+        return  # ADR 0020: no pool has headroom this cycle — the completed intake keeps its
+                # claim and this opener re-drives next cycle.
+    submission = coordinated_attack.attack_submission(intake, draft, builder.tool)
+    if submission is not None:
+        coord.submit_stage(submission)
+
+
+def _open_next_round_on_completed_attack(coord: Coordinator, attack_identity: str) -> None:
+    """A completed attack round that leaves the argument open drives the next round and transfers
+    the ``triaging`` claim before the attack record retires — no ownership gap (ADR 380).
+    Readable objections open a redraft; an unreadable answer renews the attack on the same draft,
+    since there is nothing for a drafter to answer. The settled endings — a survived draft's
+    publish, a contested draft's hold at the round cap — belong to the attack record's own
+    settlement, so both are skipped here and a transient settlement failure is retried there
+    rather than answered with an extra round. Submission is idempotent on the successor identity,
+    so a repeat or restart never opens the same round twice. Live — its mapping is covered
+    through :func:`coordinated_attack.redraft_submission` and
+    :func:`coordinated_attack.renewed_attack_submission`."""
+    from agentflow.attack import max_rounds
+    from agentflow.coordinator.attack_stage import decode_result
+    records = {record.identity: record for record in tracer.load_records()}
+    attack = records.get(attack_identity)
+    if attack is None or attack.stage != "attack" or not attack.outcome:
+        return
+    try:
+        result = decode_result(attack.outcome)
+    except (ValueError, KeyError, TypeError):
+        return
+    if result.survived:
+        return  # the publish path — settlement owns it
+    payload = coordinated_attack._chain(attack)
+    draft = coordinated_attack._draft(payload) if payload is not None else None
+    if draft is None:
+        return
+    if attack.round >= max_rounds(draft.complexity):
+        return  # out of rounds — the contested hold is settlement's, never another round
+    builder, _reviewer, _block_msg = pick_pair()
+    if builder is None:
+        return  # ADR 0020: no pool has headroom this cycle — the completed attack keeps its
+                # claim and this opener re-drives next cycle.
+    if result.parsed and result.objections:
+        submission = coordinated_attack.redraft_submission(attack, result, builder.tool)
+    else:
+        submission = coordinated_attack.renewed_attack_submission(attack, builder.tool)
+    if submission is not None:
+        coord.submit_stage(submission)
+
+
 # Each completed stage's claim-transfer opener, keyed by the stage it consumes.
 _OPENERS = {"build": _open_review_on_completed_build,
             "review": _open_revise_on_blocking_review,
-            "revise": _open_review_on_completed_revise}
+            "revise": _open_review_on_completed_revise,
+            "intake": _open_attack_on_completed_intake,
+            "attack": _open_next_round_on_completed_attack}
 
 
 def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     """Reconcile every Build/Review/Revise pool and republish the live board as a projection of the
     running records (ADR 0030). A completed Build opens its Review, a blocking Review opens its
-    Revise, and a completed Revise opens its next Review — each before the projection, so the claim
-    transfers with no ownership gap. The openers are driven from the *durable records*, not this
+    Revise, a completed Revise opens its next Review, a drafting Intake opens its cold attack, and
+    an unsettled attack opens its next round — each before the projection, so the claim transfers
+    with no ownership gap. The openers are driven from the *durable records*, not this
     cycle's outcomes: any completed record still holding the change claim has no successor yet —
     whether it completed just now, the daemon died between completion and its opener, or a prior
     opener failed on a transient read — so every pass re-drives the transfer idempotently rather

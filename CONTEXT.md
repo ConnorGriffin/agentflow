@@ -234,7 +234,35 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   pull if the repo declares one), rewrites the title/description, stamps the dials, and
   routes to one outcome — `ready-for-agent`, `needs-mockup`, or `needs-grilling`. Not a
   tollbooth: it scopes anything it can pin down confidently and holds only an
-  *outcome-changing* fork it can't settle from code/data (ADR 0016).
+  *outcome-changing* fork it can't settle from code/data (ADR 0016). A `ready` decision is
+  a *draft*, not a publication: it must survive its attack rounds before the issue ever
+  changes (ADR 380).
+
+- **Draft** — the brief a triage round hands back instead of publishing (ADR 380). Nothing
+  on GitHub changes while a draft exists: the maintainer never reads one, and a draft that
+  never survives its attackers was never anything anyone had to un-read.
+  *Avoid:* brief (reserved for the published artifact).
+
+- **Attack** — one cold session asked to break a draft before it is published: it carries
+  nothing from the session that wrote it, reads only the *newest* draft against the actual
+  repository, and answers with numbered objections — each with its evidence, why it breaks
+  the build if unfixed, and the cheapest fix — or with none, which is a draft surviving,
+  not an attacker slacking. Runs at the draft's own complexity dial: a standard brief gets
+  one round on the standard tier, a deep one up to three on the deep tier. Taste is not an
+  objection. *Avoid:* plan audit, pre-build review (both suggest judging a published plan).
+
+- **Redraft** — the fresh triage round that answers an attacker: it re-grounds from the
+  same issue snapshot, fixes what landed, and defends what didn't under an
+  `## Answered objections` heading *inside* the brief — the only place a settlement can
+  live, since the next attacker reads the draft and nothing else. A redraft may still
+  route to grilling when the objections expose a fork only the maintainer can settle.
+
+- **Hardened brief** — the draft that ran out of objections, published as the ready brief
+  through the ordinary intake projection, with one line saying what the argument cost. This
+  is the only way a brief reaches `ready-for-agent` from the daemon's triage. A draft that
+  runs out of *rounds* still contested is never published — it becomes a held issue whose
+  question is the surviving objections. *Avoid:* countersigned (there is no marker; the
+  publication itself is the proof).
 
 - **Held issue** — an issue parked at `needs-grilling` or `needs-mockup`: inert to
   agents until its missing input is durably supplied. It remains a build issue;

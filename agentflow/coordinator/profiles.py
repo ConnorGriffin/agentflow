@@ -9,7 +9,7 @@ values are taken verbatim from the research table
 (``docs/research/session-profiles-and-ceilings-draft.md`` §3a/§3b); they are calibration and
 are expected to ratchet once per-attempt telemetry (#223) fills the thin cells.
 
-Read-only stages (Intake, Research) get a read/search allowlist and no edit tools. Review is a
+Read-only stages (Intake, Research, Attack) get a read/search allowlist and no edit tools. Review is a
 bounded code-writing stage: it keeps the full edit/test surface so the independent reviewer can
 ship clear fixes before recording its exact-head verdict. Every other stage also keeps the full
 surface (``allowed_tools is None``). The runner
@@ -32,6 +32,10 @@ _MIN = 60
 _READ_ONLY_TOOLS: dict[str, tuple[str, ...]] = {
     "intake": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch"),
     "research": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebSearch", "WebFetch"),
+    # An attacker must open the files the draft cites, so it gets intake's read/search surface —
+    # and no edit tools at all: it breaks the plan, it never rewrites the draft or the code, and
+    # it never touches the issue (ADR 380).
+    "attack": ("Read", "Bash", "Grep", "Glob", "ToolSearch", "WebFetch"),
 }
 
 # The edit capabilities a read-only profile withholds. The allowlist (``--tools``) removes them
@@ -47,6 +51,9 @@ WITHHELD_EDIT_TOOLS: tuple[str, ...] = ("Edit", "Write", "NotebookEdit")
 # conservative drafted numbers now and ratchet once #223's telemetry fills their cells.
 _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
     "intake": (20 * _MIN, 40),
+    # An attack re-reads one draft against the code — the same bounded read-only shape as intake,
+    # so it carries the same ceiling (ADR 380).
+    "attack": (20 * _MIN, 40),
     "review": (15 * _MIN, 40),
     "respond": (15 * _MIN, 40),
     "converse": (15 * _MIN, 40),
