@@ -68,9 +68,11 @@ STAGE_NATIVE_HANDOFF = {
     "revise": "pr:parked",
     "respond": "pr:parked",
     "converse": "ask:needs-you",
-    # Research holds by releasing its shared claim so the ticket is simply eligible again next
-    # cycle (ADR 0037) — there is no operator-facing park; the release itself is the handoff.
-    "research": "ticket:claim-released",
+    # A held research run parks its ticket in the open: one comment naming what stopped it — a
+    # spent budget or a provider condition that ended the session — one durable label that takes
+    # it out of unattended selection, and the shared claim released (ADR 362, superseding ADR
+    # 0037's silent re-eligibility).
+    "research": "ticket:parked",
 }
 
 # Legacy orchestration labels normalize to a logical stage before lookup so the ambiguous

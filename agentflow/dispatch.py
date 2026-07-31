@@ -183,20 +183,33 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
 
 def _submit_coordinated_research(cfg, coordinator, _log) -> str:
     from agentflow import coordinated_research
+    from agentflow.coordinator.record import WAITING
 
     ticket = loop._next_research_ticket(cfg, _log=_log)
     if not ticket:
         return "no wayfinder:research tickets to resolve"
+    number = ticket["number"]
     builder, _reviewer, block_msg = pick_pair()
     if builder is None:
-        return f"#{ticket['number']}: no pool has headroom to research ({block_msg}) — deferring"
-    map_context = coordinated_research.research_map_context(cfg.repo, ticket["number"])
+        return f"#{number}: no pool has headroom to research ({block_msg}) — deferring"
+    map_context = coordinated_research.research_map_context(cfg.repo, number)
     submission = coordinated_research.research_submission(
         cfg, ticket, builder.tool, map_context=map_context)
-    if not claim(cfg.repo, ticket["number"], RESOLVING):
-        return f"#{ticket['number']}: could not claim wayfinder:resolving — refusing submission"
-    coordinator.submit_stage(submission)
-    return f"#{ticket['number']}: submitted to coordinator → {builder.tool} (research)"
+    identity = coordinator.submit_stage(submission)
+    record = coordinator.stage_record(identity)
+    # The stable (repo, ticket, research) identity resolved to a terminal record: an exhausted run
+    # already parked this ticket and nothing new was created to run. Claiming here would stamp
+    # wayfinder:resolving for a session that never starts — orphan reconciliation strips it an hour
+    # later, the next cycle restamps it, and the log claims a submission that did not happen. That
+    # is #308's failure in the research lane; claim nothing and report the park (ADR 362).
+    if record is None or record.state != WAITING or record.hold_pending or record.retired:
+        return f"#{number}: research parked — a maintainer owns this ticket now"
+    if not claim(cfg.repo, number, RESOLVING):
+        # Runnable submission but the claim mutation failed: withdraw the never-started WAITING
+        # record so no unowned research work survives, mirroring Intake.
+        coordinator.withdraw_stage(identity)
+        return f"#{number}: could not claim wayfinder:resolving — withdrew the submission"
+    return f"#{number}: submitted to coordinator → {builder.tool} (research)"
 
 
 def _submit_repo(cfg, coordinator, _log) -> None:

@@ -165,3 +165,10 @@ ADRs in that format.
   runtime checkout is set to `origin/main` rather than fast-forwarded, divergence is
   named in the log, and the restart that completes a deploy yields to live sessions.
   Amends 0050.
+
+Issue-keyed records:
+
+- [ADR 362](adr-362-research-exhaustion-parks-visibly.md) — An unattended research run that
+  ends with no usable ruling parks its ticket visibly (one comment naming the check that
+  refused it, one `wayfinder:parked` label) instead of silently releasing the claim, and
+  research dispatch stops claiming tickets for runs that will never start.
