@@ -442,9 +442,14 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
             return
         if not verdict.clean:
             coord.park_completed(review_identity)
+            return
+        _open_revise_on_red_check(coord, review, records)
         return
-    if verdict.clean or not verdict.blocking:
-        return  # a clean (or non-blocking) verdict is the merge path, not a revise
+    if verdict.clean:
+        _open_revise_on_red_check(coord, review, records)
+        return
+    if not verdict.blocking:
+        return  # a non-blocking verdict is the merge path, not a revise
     if (review.round >= MAX_REVISES
             or not revise_round_budget_remains(records.values(), review.repo, review.subject)):
         # The auto-revise rounds are spent and the review still blocks: no revise, review, or
@@ -467,6 +472,54 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking)
     submission = coordinated_revise.revise_submission(
         review, complexity, findings, target_sha=verdict.final_sha or review.target)
+    if submission is not None:
+        coord.submit_stage(submission)
+
+
+def _open_revise_on_red_check(coord: Coordinator, review, records: dict) -> None:
+    """A clean verdict whose exact reviewed head carries a red check spends a revise round on the
+    machine-fixable failure instead of settling clean (ADR 417). Settlement leaves such a record
+    unsettled and silent, so this opener — re-driven idempotently from durable records like every
+    claim transfer — owns the round. Every park disposition is settlement's own: spent rounds,
+    ``action_required``, a UI-evidence gap, and an unreadable answer all return without opening
+    anything here. The revise is handed the failing check names and the head SHA only — the
+    builder has the repository and rediscovers the cause locally; fetching CI logs would be a
+    second failure mode for a fact it can obtain itself."""
+    from agentflow.gate import ui_evidence_gap
+    from agentflow.repo_facts import ui_surfaces
+    from agentflow.worktree_ref import review_source_facts
+
+    verdict = coordinated_review._review_verdict(review)
+    reviewed_head = verdict.final_sha or review.target
+    if (review.round >= MAX_REVISES
+            or not revise_round_budget_remains(records.values(), review.repo, review.subject)):
+        return  # spent rounds park at settlement, with the failing check named there
+    facts = coordinated_review._review_pr_facts(review)
+    if facts is None or facts["state"] != "OPEN" or facts["head"] != reviewed_head:
+        return  # merged, moved, and unreadable heads all belong to settlement's own paths
+    source = review_source_facts(review)
+    if source is None:
+        return
+    workdir, pr = source
+    if ui_evidence_gap(review.repo, pr, ui_surfaces(workdir)):
+        return  # the screenshot gate's park outranks a revise round
+    head_checks = github.commit_head_checks(review.repo, reviewed_head)
+    if head_checks is None or not head_checks.failing or head_checks.action_required:
+        return
+    complexity = review.builder_complexity
+    build_facts = coordinated_revise._revise_builder_source(review)
+    if build_facts is None or not complexity:
+        # The same permanent condition as the blocking path: no revise can ever open from this
+        # record, so park the PR for a human exactly once (issue #105).
+        coord.park_completed(review.identity)
+        return
+    findings = "\n".join(
+        f"- The check `{name}` completed red on the reviewed head {reviewed_head}. Reproduce the "
+        "failure locally in the PR branch and fix it. Do not fetch CI logs. If it does not "
+        "reproduce, push nothing — the next settlement re-reads the check."
+        for name in head_checks.failing)
+    submission = coordinated_revise.revise_submission(
+        review, complexity, findings, target_sha=reviewed_head)
     if submission is not None:
         coord.submit_stage(submission)
 
