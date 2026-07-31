@@ -68,6 +68,14 @@ class IssueSettlement:
 
 
 @dataclass(frozen=True)
+class IssueStanding:
+    """An issue's live labels and open/closed state — the pair a claim proof weighs together:
+    the claim label is still there, *and* the issue is still open to act on."""
+    labels: frozenset[str]
+    state: str
+
+
+@dataclass(frozen=True)
 class IssueView:
     """One issue read whole, for the cold paths that must weigh several facts at once."""
     title: str
@@ -284,6 +292,17 @@ def issue_headline(repo: str, issue: int) -> IssueHeadline | None:
     if not isinstance(data, dict):
         return None
     return IssueHeadline(title=str(data.get("title") or ""), labels=_labels_of(data))
+
+
+def issue_standing(repo: str, issue: int) -> IssueStanding | None:
+    """The issue's live labels and state, or ``None`` if they can't be read. The two travel
+    together because closing an issue does not strip its labels: a claim proof that read them
+    apart could see the claim on an issue that closed between the reads and admit a session
+    against a subject nothing can act on (#438)."""
+    data = _read_json(["issue", "view", str(issue), "--repo", repo, "--json", "labels,state"])
+    if not isinstance(data, dict):
+        return None
+    return IssueStanding(labels=_labels_of(data), state=str(data.get("state") or ""))
 
 
 def issue_settlement(repo: str, issue: int) -> IssueSettlement | None:

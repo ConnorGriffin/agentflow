@@ -610,3 +610,25 @@ def test_a_draft_out_of_rounds_is_settlements_not_another_round(monkeypatch):
     # extra round beyond the cap.
     record = _attack_record(round=3, outcome=encode_result(AttackResult("1. wrong")))
     assert not _drive_attack_opener(monkeypatch, record).submitted
+
+
+# --- the pre-admission claim proof weighs the label and the issue's state as one ------------
+
+def test_attack_claim_proof_refuses_a_closed_issue_still_carrying_the_label(monkeypatch):
+    # Closing an issue does not strip its labels (#438): a chain whose issue closed
+    # mid-argument must not launch another round on the label alone.
+    from agentflow.labels import TRIAGING
+    monkeypatch.setattr(coordinated_attack.github, "issue_standing",
+                        lambda repo, n: coordinated_attack.github.IssueStanding(
+                            labels=frozenset({TRIAGING}), state="CLOSED"))
+    assert coordinated_attack.attack_claim_ready(_attack_record()) is False
+
+
+def test_attack_claim_proof_admits_an_open_issue_with_the_label_and_fails_closed(monkeypatch):
+    from agentflow.labels import TRIAGING
+    monkeypatch.setattr(coordinated_attack.github, "issue_standing",
+                        lambda repo, n: coordinated_attack.github.IssueStanding(
+                            labels=frozenset({TRIAGING}), state="OPEN"))
+    assert coordinated_attack.attack_claim_ready(_attack_record()) is True
+    monkeypatch.setattr(coordinated_attack.github, "issue_standing", lambda repo, n: None)
+    assert coordinated_attack.attack_claim_ready(_attack_record()) is False

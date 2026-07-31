@@ -73,6 +73,16 @@ def test_issue_state_reads_and_fails_closed(monkeypatch):
     assert github.issue_state(REPO, 5) is None
 
 
+def test_issue_standing_pairs_labels_with_state_and_fails_closed(monkeypatch):
+    # Closing an issue does not strip its labels, so a claim proof must see both facts in one
+    # snapshot (#438) — and an unreadable pair is unknown, never "unlabelled and open".
+    _stub_json(monkeypatch, {"labels": [{"name": "agentflow:triaging"}], "state": "CLOSED"})
+    assert github.issue_standing(REPO, 5) == github.IssueStanding(
+        labels=frozenset({"agentflow:triaging"}), state="CLOSED")
+    _stub(monkeypatch, returncode=1)
+    assert github.issue_standing(REPO, 5) is None
+
+
 def test_pr_state_reads_and_fails_closed(monkeypatch):
     _stub_json(monkeypatch, {"state": "MERGED"})
     assert github.pr_state(REPO, 9) == "MERGED"

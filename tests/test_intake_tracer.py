@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 from conftest import FakeSession, permits, record_of, starts_until_held
 
-from agentflow import coordinated_intake, github, intake as intake_mod, loop
+from agentflow import coordinated_intake, github, intake as intake_mod, loop, pipeline
 from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import (EndingReason, ProviderCause,
@@ -93,17 +93,17 @@ def test_preparation_proves_the_triaging_claim_before_admission(make_coord):
 
 
 def test_production_claim_proof_fails_closed_on_missing_label(monkeypatch):
-    monkeypatch.setattr(github, "issue_labels",
-                        lambda repo, issue: frozenset({"ready-for-agent"}))
+    monkeypatch.setattr(github, "issue_standing", lambda repo, issue: github.IssueStanding(
+        labels=frozenset({"ready-for-agent"}), state="OPEN"))
     record = SimpleNamespace(repo="o/r", subject="7")
 
     assert coordinated_intake.intake_claim_ready(record) is False
 
 
-def test_production_claim_proof_fails_closed_when_labels_unreadable(monkeypatch):
+def test_production_claim_proof_fails_closed_when_standing_unreadable(monkeypatch):
     # A read that couldn't reach GitHub comes back as None (unknown) — the claim proof
     # refuses to admit rather than treating unknown as "claim absent".
-    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: None)
+    monkeypatch.setattr(github, "issue_standing", lambda repo, issue: None)
     record = SimpleNamespace(repo="o/r", subject="7")
 
     assert coordinated_intake.intake_claim_ready(record) is False
@@ -111,10 +111,22 @@ def test_production_claim_proof_fails_closed_when_labels_unreadable(monkeypatch)
 
 def test_production_claim_proof_admits_on_present_triaging_label(monkeypatch):
     from agentflow.labels import TRIAGING
-    monkeypatch.setattr(github, "issue_labels", lambda repo, issue: frozenset({TRIAGING}))
+    monkeypatch.setattr(github, "issue_standing", lambda repo, issue: github.IssueStanding(
+        labels=frozenset({TRIAGING}), state="OPEN"))
     record = SimpleNamespace(repo="o/r", subject="7")
 
     assert coordinated_intake.intake_claim_ready(record) is True
+
+
+def test_production_claim_proof_refuses_a_closed_issue_still_carrying_the_label(monkeypatch):
+    # Closing an issue does not strip its labels (#438): the label alone must not admit a
+    # session to triage a closed issue.
+    from agentflow.labels import TRIAGING
+    monkeypatch.setattr(github, "issue_standing", lambda repo, issue: github.IssueStanding(
+        labels=frozenset({TRIAGING}), state="CLOSED"))
+    record = SimpleNamespace(repo="o/r", subject="7")
+
+    assert coordinated_intake.intake_claim_ready(record) is False
 
 
 def test_parsed_route_is_durable_before_projection_even_after_bad_exit(make_coord):
@@ -726,3 +738,137 @@ def test_exhaustion_holds_nothing_when_the_thread_is_unreadable(make_coord, monk
             fake.end(identity, cause=ProviderCause.NONE)
     assert not held
     assert applied == [] and released == [] and notified == []
+
+
+# --- an issue closed out from under a queued intake or attack (issue #438) -----------------
+#
+# Closing an issue does not strip its labels, so an intake record waiting behind pool pacing
+# still passes a labels-only claim proof the moment headroom returns and spends a real session
+# triaging a closed issue (#432/#433/#436 were all one cycle from exactly that). The reconcile
+# pass retires the record first, driven here through the production ``reconcile_and_project``
+# seam with only the issue's state and the release helper's label edges faked.
+
+
+def _issue_edges(monkeypatch, state, removed):
+    """The faked GitHub edges the dead-intake reconciler touches: the issue's open/closed state,
+    and the label read/remove pair the release helper proves the triaging claim off with."""
+    from agentflow.labels import TRIAGING
+    carried = {"labels": frozenset({TRIAGING})}
+
+    def remove_label(repo, n, label):
+        removed.append((n, label))
+        carried["labels"] = carried["labels"] - {label}
+        return True
+
+    monkeypatch.setattr(github, "issue_state", lambda repo, n: state)
+    monkeypatch.setattr(github, "issue_labels", lambda repo, n: carried["labels"])
+    monkeypatch.setattr(github, "remove_label", remove_label)
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+
+
+def test_a_closed_issue_retires_the_queued_intake_silently(make_coord, monkeypatch):
+    """Reproduces #438: an intake record whose issue was closed while it sat waiting retires
+    silently on the next pass — no attempt charged, no hold, no notification — and the triaging
+    label comes off the closed issue so the operator's label view agrees. Fails before the fix,
+    where nothing consults the issue's state and the record keeps its claim."""
+    from agentflow.labels import TRIAGING
+    fake = IntakeSession()
+    fake.gate_open = False                                # isolate the guard pass from admission
+    coord = make_coord(fake)
+    identity = coord.submit_stage(_submission())
+    removed = []
+    _issue_edges(monkeypatch, "CLOSED", removed)
+
+    pipeline.reconcile_and_project(coord)
+
+    rec = record_of(coord, identity)
+    assert rec.retired is True and rec.claim is False
+    assert rec.attempts == 0                              # no session charged
+    assert rec.handoffs == 0 and rec.notifications == 0   # nothing held, nobody notified
+    assert removed == [(7, TRIAGING)]                     # the label view agrees
+
+
+def test_a_closed_issue_retires_the_attack_round_the_same_way(make_coord, monkeypatch):
+    """The attack stage carries triage's claim across rounds, so a draft chain whose issue
+    closed mid-argument ends by the same silent disposition."""
+    from agentflow.labels import TRIAGING
+    fake = IntakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    identity = coord.submit_stage(Submission(repo="o/r", subject="7", stage="attack",
+                                             pool="claude", source="/read-only/issue-7"))
+    removed = []
+    _issue_edges(monkeypatch, "CLOSED", removed)
+
+    pipeline.reconcile_and_project(coord)
+
+    rec = record_of(coord, identity)
+    assert rec.retired is True and rec.claim is False
+    assert removed == [(7, TRIAGING)]
+
+
+def test_only_a_definite_closed_answer_retires_the_intake(make_coord, monkeypatch):
+    """``None`` means "couldn't check", never "closed": an unreadable state retires nothing,
+    and neither does an open issue — that is live triage work."""
+    fake = IntakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    identity = coord.submit_stage(_submission())
+    removed = []
+    _issue_edges(monkeypatch, None, removed)              # GitHub unreadable — fail closed
+
+    pipeline.reconcile_and_project(coord)
+    rec = record_of(coord, identity)
+    assert rec.retired is False and rec.claim is True and removed == []
+
+    monkeypatch.setattr(github, "issue_state", lambda repo, n: "OPEN")
+    pipeline.reconcile_and_project(coord)
+    rec = record_of(coord, identity)
+    assert rec.retired is False and rec.claim is True and removed == []
+
+
+def test_an_unprovable_label_release_leaves_the_record_for_a_later_pass(make_coord, monkeypatch):
+    """The triaging label must provably come off the closed issue before the record forgets the
+    claim — a release GitHub refused leaves the record intact, and the next pass retries."""
+    fake = IntakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    identity = coord.submit_stage(_submission())
+    removed = []
+    _issue_edges(monkeypatch, "CLOSED", removed)
+    monkeypatch.setattr(github, "remove_label", lambda repo, n, label: False)
+
+    pipeline.reconcile_and_project(coord)
+    rec = record_of(coord, identity)
+    assert rec.retired is False and rec.claim is True     # the claim GitHub still shows survives
+
+    _issue_edges(monkeypatch, "CLOSED", removed)          # the label edit works again
+    pipeline.reconcile_and_project(coord)
+    rec = record_of(coord, identity)
+    assert rec.retired is True and rec.claim is False
+
+
+def test_a_running_intake_on_a_closed_issue_is_terminated_before_retiring(make_coord,
+                                                                          monkeypatch):
+    """A live triage session is stopped before its record retires, so the orphaned family does
+    not keep burning tokens deciding an issue nobody can act on."""
+    from agentflow import coordinated_review
+    fake = IntakeSession()
+    adapter = IntakeStageAdapter(worktree_reset=lambda record: True, observer=fake,
+                                 apply_route=lambda *args: "proof")
+    coord = make_coord(fake, adapter=adapter)
+    identity = coord.submit_stage(_submission())
+    coord.cycle("claude")
+    assert record_of(coord, identity).state == "running"
+
+    killed = []
+    monkeypatch.setattr(coordinated_review, "_kill_running_family",
+                        lambda rec: killed.append(rec.identity))
+    removed = []
+    _issue_edges(monkeypatch, "CLOSED", removed)
+
+    pipeline.reconcile_and_project(coord)
+
+    assert killed == [identity]
+    rec = record_of(coord, identity)
+    assert rec.retired is True and rec.claim is False
