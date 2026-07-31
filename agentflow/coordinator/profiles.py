@@ -7,8 +7,9 @@ the read/search allowlist, the wall-clock ceiling, the turn ceiling, and the pro
 reasoning-effort rung (build/revise only; every other stage stays provider-default) for that cell. The
 allowlists are taken verbatim from the research table
 (``docs/research/session-profiles-and-ceilings-draft.md`` §3a); the ceilings began there too and
-have since been ratcheted onto the fleet's own recorded distribution (§3b, #410) — the ratchet
-that table anticipated once per-attempt telemetry (#223) filled its thin cells.
+have since been ratcheted onto the fleet's own recorded distribution (§3b′, #410; §3b″ per build
+cell, #416) — the ratchet that table anticipated once per-attempt telemetry (#223) filled its
+thin cells.
 
 Read-only stages (Intake, Research, Attack) get a read/search allowlist and no edit tools. Review is a
 bounded code-writing stage: it keeps the full edit/test surface so the independent reviewer can
@@ -64,13 +65,21 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
     "mockup": (60 * _MIN, 200),
 }
 
-# The 95th percentile wall (seconds) and tool calls of work each stage has been recorded needing,
+# The 95th percentile wall (seconds) and tool calls of work each cell has been recorded needing,
 # from the fleet's own session streams — 516 recorded sessions, read 2026-07-31. This is the
-# evidence ``_STAGE_CEILINGS`` is set against, not decoration: the §3b rule is that a ceiling sits
+# evidence the ceiling tables are set against, not decoration: the §3b rule is that a ceiling sits
 # well above the work, and the first table drifted under it unnoticed. Review's cap was drawn at 40
 # from an n=70 sample; by n=210 the p90 was 55 tool calls and 31 reviews had been killed at the cap
 # having already read the diff and run the suite (40–70 tool calls of finished work apiece) without
-# recording a verdict. A stage absent here has no recorded sessions to justify a number.
+# recording a verdict. A cell absent here has no recorded sessions to justify a number.
+#
+# Keyed the way the ceilings themselves resolve — ``(stage, complexity, effort)`` — so a reading and
+# the ceiling it justifies cannot drift apart. Build's ceiling is per cell, so its readings are too:
+# a pooled build figure is what hid the standard tier sitting on its own limit while six standard
+# builds and revisions were killed at it (#416). ``(None, None)`` marks a stage whose ceiling does
+# not vary by cell. The revise row is a reading of the whole standard tier it inherits (ADR 0041),
+# not of one cell. A ``None`` wall is a reading that counted tool calls only — the per-cell build
+# pass did, and the wall ceilings are not in evidence there (§3b″).
 #
 # Tool calls rather than the provider's own reported turn counter — the quantity ``--max-turns``
 # really does bound — because that counter is censored by the very ceiling being calibrated: every
@@ -88,13 +97,19 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
 # the tail is genuinely unbounded: one review ran 335 tool calls. No ceiling that still kills a
 # runaway can clear that, so the bar is p95 with headroom, and the headroom is what makes an
 # ordinary long session survive.
-_OBSERVED_P95: dict[str, tuple[int, int]] = {
-    "intake": (335, 45),
-    "attack": (109, 44),
-    "review": (469, 66),
-    "respond": (477, 51),
-    "research": (608, 39),
-    "mockup": (1013, 66),
+_OBSERVED_P95: dict[tuple[str, str | None, str | None], tuple[int | None, int]] = {
+    ("intake", None, None): (335, 45),
+    ("attack", None, None): (109, 44),
+    ("review", None, None): (469, 66),
+    ("respond", None, None): (477, 51),
+    ("research", None, None): (608, 39),
+    ("mockup", None, None): (1013, 66),
+    ("build", "standard", "low"): (None, 80),  # n=33
+    ("build", "standard", "medium"): (None, 89),  # n=17
+    ("build", "deep", "medium"): (None, 138),  # n=35
+    ("build", "deep", "high"): (None, 157),  # n=34
+    ("build", "deep", "extra"): (None, 146),  # n=6
+    ("revise", "standard", None): (None, 100),  # n=12, inheriting the standard build tier
 }
 
 # The reasoning-effort rung each work-effort dial maps to at launch (ADR 0046). Build and revise
@@ -110,17 +125,22 @@ _REASONING_BY_EFFORT: dict[str, str] = {
     "extra": "xhigh",
 }
 
-# Build ceilings keyed on (complexity, effort) (§3b). A cell the research table does not name
-# falls back to the most conservative ceiling of its complexity.
+# Build ceilings keyed on (complexity, effort) (§3b, ratcheted per cell in §3b″/#416). A cell the
+# research table does not name falls back to the most conservative ceiling of its complexity.
+# The standard turn ceilings were drawn at 80 and sat *on* the work those cells do — standard/low's
+# p95 is exactly 80, standard/medium's is 89, and a revision inheriting the tier reaches 100 — so
+# six standard builds and revisions were killed having already done the job. They now carry p95
+# with headroom, on the same rule the review stages were ratcheted on. The deep cells are clear
+# against their own readings (138, 157, 146 against 200, 200, 300) and are unchanged.
 _BUILD_CEILINGS: dict[tuple[str, str], tuple[int, int]] = {
-    ("standard", "low"): (25 * _MIN, 80),
-    ("standard", "medium"): (25 * _MIN, 80),
+    ("standard", "low"): (25 * _MIN, 160),
+    ("standard", "medium"): (25 * _MIN, 160),
     ("deep", "medium"): (45 * _MIN, 200),
     ("deep", "high"): (45 * _MIN, 200),
     ("deep", "extra"): (60 * _MIN, 300),
 }
 _BUILD_DEFAULT: dict[str, tuple[int, int]] = {
-    "standard": (25 * _MIN, 80),
+    "standard": (25 * _MIN, 160),
     "deep": (45 * _MIN, 200),
 }
 

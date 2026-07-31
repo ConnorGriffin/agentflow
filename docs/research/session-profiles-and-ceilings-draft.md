@@ -185,7 +185,8 @@ belt-and-braces cap.
 > **The Intake, Review, Respond and Converse turn ceilings below are superseded — see
 > §3b′ (#410).** They were drawn from the sample in §2c and drifted under the work once
 > the sample grew. They are kept here as the record of what the first calibration was.
-> The Research, Mockup, Revise and Build rows still stand: this change leaves them alone.
+> **The Build standard rows, and the Revise row that inherits them, are likewise superseded —
+> see §3b″ (#416).** The Research, Mockup and Build deep rows still stand.
 
 | Stage (complexity/effort) | observed max | **wall ceiling** | **turn ceiling** | vs 2 h today |
 |---------------------------|--------------|------------------|------------------|--------------|
@@ -270,10 +271,18 @@ Applying §3b's own rule to that sample:
 | Converse | 15 → **20 min** | 40 → **80** | shares respond's shape; no recorded sessions |
 | Research | unchanged (30 min / 80) | unchanged | 39 tool calls / 608 s — already clear |
 | Mockup | unchanged (60 min / 200) | unchanged | 66 tool calls / 1 013 s (n=2) — already clear |
-| Build, Revise | unchanged | unchanged | p95 138 / 99 tool calls against 80–300 — already clear |
+| Build, Revise | unchanged | unchanged | ~~p95 138 / 99 tool calls against 80–300 — already clear~~ **wrong; superseded by §3b″ (#416)** |
+
+> **The Build/Revise row above is withdrawn.** It compares one figure pooled across all
+> build cells against the whole range of build ceilings, which are set per cell. The pooled
+> p95 of 138 is the deep tier's number and the ceiling it clears is the deep tier's ceiling;
+> the standard tier, sitting on its own ceiling, averaged out of view. The kill list ten
+> lines above contradicts the row directly — three builds and three revisions are on it.
+> §3b″ breaks the same sample out per cell.
 
 Every cell the code pins carries its sample here, and only here: `_OBSERVED_P95` in the
-profile table is this row set, so a number pinned by a test always has a stated source.
+profile table is this row set (plus §3b″'s), so a number pinned by a test always has a
+stated source.
 
 **p95 with headroom, not the maximum.** Two reasons. A ceiling censors its own
 distribution — review's 899 s maximum is the wall stopping it, not the work finishing,
@@ -285,6 +294,47 @@ while a runaway still dies.
 
 The observed distribution now lives beside the ceiling table in code, so the next drift
 fails a test rather than parking a pull request.
+
+### 3b″. Per-cell reading for Build and Revise (#416, 2026-07-31)
+
+The same 516 recorded sessions, the same quantity (tool calls read off the session
+stream), broken out per `(stage, complexity, effort)` rather than pooled:
+
+| Cell | n | p50 | p90 | **p95** | max | **ceiling** | killed at it |
+|------|---|-----|-----|---------|-----|-------------|--------------|
+| Build standard/low | 33 | 30 | 65 | **80** | 92 | 80 → **160** | 1 |
+| Build standard/medium | 17 | 23 | 82 | **89** | 89 | 80 → **160** | 2 |
+| Revise (standard, inherits the standard Build tier) | 12 | 45 | 99 | **100** | 100 | 80 → **160** | 3 |
+| Build deep/medium | 35 | 40 | 94 | **138** | 144 | 200 (unchanged) | 0 |
+| Build deep/high | 34 | 78 | 138 | **157** | 164 | 200 (unchanged) | 0 |
+| Build deep/extra | 6 | 113 | 146 | **146** | 146 | 300 (unchanged) | 0 |
+
+**The standard tier was sitting on its own work.** Standard/low's p95 lands exactly on
+its ceiling; standard/medium's is 9 above it; a revision inheriting the tier reaches 100
+against 80. All six of the ceiling kills in §3b′'s build and revise lists are in this
+tier — 80, 89 and 92 for builds, 95, 99 and 100 for revisions — with the provider naming
+the cause outright ("Reached maximum number of turns (80)"). Each had done most of the
+job and lost it.
+
+**The deep tier is clear against its own readings** — 138, 157 and 146 against 200, 200
+and 300, with no kills — so those cells do not move.
+
+**Raising Build raises Revise.** A revision carries the original builder's cell (ADR
+0041) rather than a ceiling of its own, so the standard tier's rise covers it and no
+separate Revise ceiling is introduced.
+
+**Two cells are unmeasured and are given no number of their own.** Build deep/low (n=8,
+p95 86) and Build standard/high (n=1, 63 tool calls) are not named in the ceiling table
+and fall back to the per-complexity default — 200 and 160 respectively. Deep/low is
+comfortably clear at that fallback; standard/high's single session is too thin a sample
+to rule on either way, and is recorded here as unmeasured rather than dressed up as a
+reading.
+
+**Only tool calls were read per cell.** The wall-clock ceilings are not in evidence in
+this pass and are unchanged; no build or revise session in the sample was stopped by its
+wall. Raising a turn ceiling does raise what a genuine runaway can burn before it dies,
+and the wall ceiling is the backstop that bounds that — 25 minutes for the standard tier,
+which is what makes 160 turns a safe number to allow.
 
 ### 3c. Fail-closed when a narrow profile is missing a capability
 

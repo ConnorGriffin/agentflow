@@ -31,11 +31,19 @@ one-size surface and single two-hour timeout:
    [#410](https://github.com/ConnorGriffin/agentflow/issues/410) (Intake, Attack, Review,
    Respond, Converse) are sized against the **p95 with headroom** instead: a ceiling
    censors its own maximum, and the tail past the p95 is unbounded (research §3b′).
-   Thin-sample stages (Revise, Research, Mockup) ship the conservative drafted ceilings
-   now and ratchet once per-attempt telemetry (#223) fills their cells; Respond's has
-   since filled, and Converse — still with no recorded sessions of its own — carries
-   Respond's ceiling by construction. Revise inherits the original builder's Build
-   ceiling (consistent with ADR 0041).
+   [#416](https://github.com/ConnorGriffin/agentflow/issues/416) extends that same rule
+   to **Build, per cell**: the earlier "already clear" reading pooled every build cell
+   into one figure and hid the standard tier sitting on its own work, where six builds
+   and revisions were killed having already done most of the job. Each named build cell
+   is now sized against its own p95 with headroom (research §3b″); the deep cells were
+   already clear against their own readings and are unchanged. Research and Mockup remain
+   thin-sample stages shipping the conservative drafted ceilings until per-attempt
+   telemetry (#223) fills their cells; Respond's has since filled, and Converse — still
+   with no recorded sessions of its own — carries Respond's ceiling by construction.
+   Revise inherits the original builder's Build cell (consistent with ADR 0041) and is
+   judged against that inherited ceiling rather than one of its own. A cell with no
+   measured sample is named unmeasured and falls back to its complexity's default; it is
+   never given a number that reads as measured.
 4. **No dollar-denominated session cap.** The objective is prepaid headroom
    (ADR 0040); wall + turn ceilings are the only kill switches.
 5. **Fail closed by construction.** A withheld capability is *removed from the
