@@ -197,9 +197,11 @@ agentflow's own code so the shape is identical:
 1. Compose the **Agent Brief** (Markdown), starting with the disclaimer line, with these
    sections: **Summary** · **Verified** (claim re-derived against named code on the real
    data, with numbers) · **Current behavior** · **Desired behavior** · **Key interfaces**
-   ("explore fresh; pointers, not line numbers" + traps) · **Acceptance criteria** (a
-   checkbox list; grounded numeric literals where they apply, and a test that fails if the
-   bug regressed) · **Out of scope**.
+   ("explore fresh; pointers, not line numbers" + traps) · **Interface shape** (one or two
+   sentences on the caller-facing front door judged by the charter's depth test; if the
+   change is purely internal to an existing interface, say so instead of omitting the
+   section) · **Acceptance criteria** (a checkbox list; grounded numeric literals where
+   they apply, and a test that fails if the bug regressed) · **Out of scope**.
 2. Pick the two dials: `complexity` ∈ {standard, deep}, `effort` ∈ {low, medium, high, extra}.
 3. Write it with the shared core (retitles, **writes the brief into the issue body** —
    where the builder and reviewer actually read it, ADR 0016/0022 — preserving the
