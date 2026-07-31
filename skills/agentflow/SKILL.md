@@ -1,6 +1,6 @@
 ---
 name: agentflow
-description: Drive the agentflow pipeline by hand at any phase — resume a held issue, resume a parked PR, force-triage one, scope a discussed issue straight to ready, or enter the mockup phase. Use when the user says "/agentflow <verb> <N>", "pickup <N>", "revise a parked/stalled PR", "let's scope this", or wants to work an issue or PR interactively instead of waiting for the daemon.
+description: Drive the agentflow pipeline by hand at any phase — enroll a repo into the fleet, resume a held issue, resume a parked PR, force-triage one, scope a discussed issue straight to ready, or enter the mockup phase. Use when the user says "/agentflow <verb> <N>", "enroll this repo", "pickup <N>", "revise a parked/stalled PR", "let's scope this", or wants to work an issue or PR interactively instead of waiting for the daemon.
 ---
 
 # /agentflow — the interactive surface (ADR 0019)
@@ -21,7 +21,37 @@ marker the daemon keys resume off — keep it).
 ## Verbs
 
 `/agentflow <verb> <N>` in a repo enrolled in the fleet. `pickup`/`triage`/`scope`/`build`
-take an issue `<N>`; `review` and `revise` take a **PR** (number or URL).
+take an issue `<N>`; `review` and `revise` take a **PR** (number or URL); `enroll` is the
+odd one out — it takes a **repository path**, not an issue or PR, since it's what makes a
+repo part of the fleet in the first place. There's no issue to race the daemon over, so
+`enroll` needs no `agentflow:triaging` claim.
+
+### `enroll <path>` — bring a repo into the fleet
+The first thing you do for a new repo, before any of the verbs above apply. Wraps
+`agentflow enroll` (ADR 0049, `docs/capabilities.md`) with the judgment calls the command
+can't make for you.
+1. **Dry run first** — `agentflow enroll <path> --profile <profile>` with no `--apply` is
+   the default; it prints the plan without writing anything. Read it back to the operator
+   before applying.
+2. **Choose the autonomy profile deliberately** — it's the one decision the command won't
+   make for you (it silently defaults to `reviewed` if you don't ask):
+   - `reviewed` (**the safe default**) — the daemon builds and reviews, but a human merges.
+   - `guarded` — more autonomy than `reviewed`; still short of unattended merge.
+   - `autonomous` — the daemon can merge on its own once the gate is clean.
+3. **Confirm the surface declaration** — an explicit `ui-surfaces:` in the repo's
+   instructions wins over the tool's guess, and it's what decides whether the heavier UI
+   tooling (Playwright, the screenshot harness) gets installed. Ask if it's not already
+   declared rather than trusting the proposal silently.
+4. **Apply, then verify** — rerun with `--apply`, then confirm health with the inspection
+   command: `agentflow doctor --repo <path>`. It should report every required capability
+   `ok`, not `missing` or `drifted`.
+5. **Do the one thing enrollment refuses to do:** harden pull-request CI on public repos —
+   apply prints a warning that it doesn't touch this, and it's the only manual GitHub
+   follow-up. Queue labels need **no** manual step (intake creates them on demand), and the
+   fleet's `config.toml` entry is already written by `--apply` — don't duplicate either.
+6. **Review and commit** the files enrollment generated inside the target repo (repository
+   instructions, the bundled skill, the screenshot harness if UI-enabled) — apply writes
+   them to disk but doesn't commit.
 
 ### Claiming — prevent daemon races on manual verbs
 
