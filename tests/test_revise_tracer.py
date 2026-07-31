@@ -467,9 +467,9 @@ def test_revision_ready_rejects_a_head_that_does_not_descend_from_the_reviewed_s
                         lambda repo, head=None: [github.PrRow(42, head or "", "sha-rewound")])
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda repo, pr: [])
 
-    assert coordinated_revise._revision_ready(record, None) is False  # rewound head, no evidence
+    assert not coordinated_revise._revision_ready(record, None)  # rewound head, no evidence
     ancestor[0] = 0                                       # the head descends from the reviewed SHA
-    assert coordinated_revise._revision_ready(record, None) is True
+    assert coordinated_revise._revision_ready(record, None)
 
 
 def _revise_head_read(tmp_path, monkeypatch, *, head, target="sha-a",
@@ -514,7 +514,7 @@ def test_revision_ready_completes_on_a_rebased_head_the_worktree_owns(tmp_path, 
     history and burn the continuation budget."""
     record = _revise_head_read(tmp_path, monkeypatch, head="rebased-head",
                                descends=False, rewound=False)
-    assert coordinated_revise._revision_ready(record, None) is True
+    assert coordinated_revise._revision_ready(record, None)
 
 
 def test_revision_ready_rejects_a_rewound_head_even_with_a_clean_worktree(tmp_path, monkeypatch):
@@ -523,7 +523,7 @@ def test_revision_ready_rejects_a_rewound_head_even_with_a_clean_worktree(tmp_pa
     comment to fall back on either."""
     record = _revise_head_read(tmp_path, monkeypatch, head="older-head",
                                descends=False, rewound=True)
-    assert coordinated_revise._revision_ready(record, None) is False
+    assert not coordinated_revise._revision_ready(record, None)
 
 
 def test_revision_ready_rejects_a_rewritten_head_the_worktree_does_not_own(tmp_path, monkeypatch):
@@ -531,10 +531,10 @@ def test_revision_ready_rejects_a_rewritten_head_the_worktree_does_not_own(tmp_p
     dirty — is not proven the reviser's own pushed work, so it stays incomplete."""
     elsewhere = _revise_head_read(tmp_path / "a", monkeypatch, head="rebased-head",
                                   local_head="some-other-head")
-    assert coordinated_revise._revision_ready(elsewhere, None) is False
+    assert not coordinated_revise._revision_ready(elsewhere, None)
     dirty = _revise_head_read(tmp_path / "b", monkeypatch, head="rebased-head",
                               status=" M changed.py\n")
-    assert coordinated_revise._revision_ready(dirty, None) is False
+    assert not coordinated_revise._revision_ready(dirty, None)
 
 
 # --- retained worktree reuse: a miss costs nothing; an interrupt keeps local work ---------

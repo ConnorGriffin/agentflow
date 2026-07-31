@@ -111,9 +111,9 @@ def test_a_verdict_for_another_sha_does_not_complete_review():
     other = ProviderObservation(
         final_message='{"verdict": "PASS", "reviewed_sha": "sha-b", "findings": []}')
     none = ProviderObservation(final_message="I looked but wrote no verdict object.")
-    assert coordinated_review._verdict_ready(record, match) is True
-    assert coordinated_review._verdict_ready(record, other) is False   # a different head SHA
-    assert coordinated_review._verdict_ready(record, none) is False    # no verdict at all
+    assert coordinated_review._verdict_ready(record, match)
+    assert not coordinated_review._verdict_ready(record, other)   # a different head SHA
+    assert not coordinated_review._verdict_ready(record, none)    # no verdict at all
 
 
 # --- the exact PR head SHA is the review's identity --------------------------------------
@@ -1706,3 +1706,71 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
         "exact-head review is already running; it was not preempted"
     assert claimed == [7]                                  # the issue is never claimed twice
     assert len([r for r in _records(coord) if r.stage == "review"]) == 2
+
+
+# --- a prior attempt's pushed fix must not park the continuation review (#346 class) ------
+
+def test_a_continuation_verdict_over_a_prior_attempts_pushed_fix_verifies(monkeypatch):
+    """The park factory this class of fix targets: an earlier attempt of the same logical review
+    pushed the fixes, the continuation honestly reports ``pushed_sha: ""``, and verification
+    rejected the honest verdict every attempt until the PR parked. When the retained checkout
+    proves the moved head, the verdict verifies and the proof is persisted for settlement."""
+    record = Record(identity="o/r|7|review|sha-a|afix", stage="review", pool="claude", demand=1,
+                    repo="o/r", subject="7", target="sha-a", review_axis="fix",
+                    source="/wt/pr-7-x")
+    payload = json.dumps({"verdict": "PASS", "reviewed_sha": "sha-a",
+                          "final_sha": "sha-b", "pushed_sha": "", "findings": []})
+    monkeypatch.setattr(coordinated_review, "_review_checkout_owns_head",
+                        lambda rec, head: head == "sha-b")
+
+    result = coordinated_review._verdict_ready(
+        record, ProviderObservation(final_message=payload))
+
+    assert result
+    assert record.review_prior_push == "sha-b"      # durable proof for settlement
+
+
+def test_an_unowned_moved_head_still_fails_and_names_the_check(monkeypatch):
+    """A third-party push must not be excused: with no checkout ownership the verdict stays
+    rejected — and the miss now names the exact failed check instead of a silent False."""
+    record = Record(identity="o/r|7|review|sha-a|afix", stage="review", pool="claude", demand=1,
+                    repo="o/r", subject="7", target="sha-a", review_axis="fix",
+                    source="/wt/pr-7-x")
+    payload = json.dumps({"verdict": "PASS", "reviewed_sha": "sha-a",
+                          "final_sha": "sha-b", "pushed_sha": "", "findings": []})
+    monkeypatch.setattr(coordinated_review, "_review_checkout_owns_head",
+                        lambda rec, head: False)
+
+    result = coordinated_review._verdict_ready(
+        record, ProviderObservation(final_message=payload))
+
+    assert not result
+    assert result.check == "verdict-parse" and "provenance" in result.detail
+    assert record.review_prior_push is None
+
+
+def test_settlement_reparses_with_the_recorded_prior_push_proof():
+    """Settlement must accept the same verdict verification accepted: it re-parses the captured
+    payload against the durable ``review_prior_push`` fact, never a checkout that may be gone."""
+    payload = json.dumps({"verdict": "PASS", "reviewed_sha": "sha-a",
+                          "final_sha": "sha-b", "pushed_sha": "", "findings": []})
+    record = Record(identity="o/r|7|review|sha-a|afix", stage="review", pool="claude", demand=1,
+                    repo="o/r", subject="7", target="sha-a", review_axis="fix",
+                    outcome=payload, review_prior_push="sha-b")
+
+    verdict = coordinated_review._review_verdict(record)
+
+    assert verdict.parsed and verdict.clean and verdict.final_sha == "sha-b"
+
+
+def test_park_comment_names_the_last_unverified_check():
+    """The park comment prints the recorded miss, so the human reading the park sees what
+    actually stopped the machine instead of a generic budget line."""
+    record = Record(identity="o/r|7|review|sha-a", stage="review", pool="claude", demand=1,
+                    repo="o/r", subject="7", target="sha-a", source="/wt/pr-7-x",
+                    verify_miss="fix-push: the fix-axis review recorded FIX findings")
+    ctx = pr_park.park_context(
+        record, None, reason="exhausted its review budget without a durable verdict",
+        missing="No review verdict was recorded for this exact head.")
+
+    assert any(c.startswith("Last unverified check: fix-push") for c in ctx.checks)

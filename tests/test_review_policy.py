@@ -412,8 +412,8 @@ def test_fix_axis_cannot_dismiss_assigned_fixes_without_a_pushed_head():
         "checks": ["inspected"], "findings": [], "uncertainty": None, "decision": "",
     })
 
-    assert coordinated_review._verdict_ready(
-        record, SimpleNamespace(final_message=payload)) is False
+    assert not coordinated_review._verdict_ready(
+        record, SimpleNamespace(final_message=payload))
 
 
 def test_fix_axis_accepts_a_no_push_verdict_that_rejudges_every_fix_as_no_defect():
@@ -443,13 +443,13 @@ def test_fix_axis_accepts_a_no_push_verdict_that_rejudges_every_fix_as_no_defect
     })
 
     assert coordinated_review._verdict_ready(
-        record, SimpleNamespace(final_message=payload)) is True
+        record, SimpleNamespace(final_message=payload))
 
     # The same verdict leaving even one finding as an outstanding fix is still refused.
     unfixed = json.loads(payload)
     unfixed["findings"][0]["action"] = "fix_before_completion"
-    assert coordinated_review._verdict_ready(
-        record, SimpleNamespace(final_message=json.dumps(unfixed))) is False
+    assert not coordinated_review._verdict_ready(
+        record, SimpleNamespace(final_message=json.dumps(unfixed)))
 
 
 def test_fix_axis_accepts_a_verified_pr_body_fix_without_a_pushed_head():
@@ -474,7 +474,7 @@ def test_fix_axis_accepts_a_verified_pr_body_fix_without_a_pushed_head():
     })
 
     assert coordinated_review._verdict_ready(
-        record, SimpleNamespace(final_message=payload)) is True
+        record, SimpleNamespace(final_message=payload))
 
 
 def test_follow_up_must_exist_in_this_repo_and_be_returned_by_its_duplicate_search():
@@ -564,7 +564,7 @@ def test_full_taint_clears_only_after_clean_product_then_standards(monkeypatch):
         })
 
     assert coordinated_review._verdict_ready(
-        product, SimpleNamespace(final_message=payload("product"))) is True
+        product, SimpleNamespace(final_message=payload("product")))
     assert product.review_taint_cleared is False
 
     standards_submission = coordinated_review.review_axis_successor_submission(
@@ -579,7 +579,7 @@ def test_full_taint_clears_only_after_clean_product_then_standards(monkeypatch):
         builder_complexity="deep", **standards_submission.review.record_fields())
 
     assert coordinated_review._verdict_ready(
-        standards, SimpleNamespace(final_message=payload("standards"))) is True
+        standards, SimpleNamespace(final_message=payload("standards")))
     assert standards.review_taint_cleared is True
 
 
@@ -604,7 +604,7 @@ def test_full_taint_stays_until_post_push_product_and_standards_complete(monkeyp
         "uncertainty": None, "decision": "",
     })
     assert coordinated_review._verdict_ready(
-        product, SimpleNamespace(final_message=pushed_payload)) is True
+        product, SimpleNamespace(final_message=pushed_payload))
     assert product.review_taint_cleared is False
 
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
@@ -906,3 +906,20 @@ def test_a_resumed_review_keeps_the_head_lineage_and_ledger_and_settles_the_deci
     assert unresolved_uncertainty([parked, SimpleNamespace(
         created_at=400, review_sequence=4, identity="resumed",
         review_uncertainty=None, review_handoff=submission.review.handoff)]) is None
+
+
+def test_a_changed_final_head_owned_by_a_prior_attempt_is_accepted():
+    """The structured-result twin of the legacy rule: a moved final head with no in-payload push
+    provenance parses when the caller proved that head durably (an earlier attempt of the same
+    logical review pushed it and the retained checkout owns it). In-payload fixes still demand
+    in-payload provenance — only the caller-proven head is excused."""
+    result = parse_review_result(json.dumps({
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "start",
+        "final_sha": "fixed", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["re-verified the prior fix on the branch"], "findings": [],
+        "uncertainty": None,
+    }), expected_sha="start", owned_heads=("fixed",))
+
+    assert result.parsed is True
+    assert result.final_sha == "fixed" and result.pushed_sha == ""

@@ -111,6 +111,11 @@ def park_context(record, verdict, *, reason: str, missing: str, uncertainty=None
     checks = (tuple(verdict.checks) if verdict is not None and verdict.checks
               else (ledger.checks if ledger is not None and ledger.checks else (
                   "No completed check proof was recorded before the stage stopped.",)))
+    miss = getattr(record, "verify_miss", "")
+    if miss:
+        # The last attempt's first failed verification conjunct, so the human reading the park
+        # sees what actually stopped the machine instead of a generic budget line.
+        checks = (f"Last unverified check: {miss}",) + tuple(checks)
     conflicts = (
         f"Missing guidance: {uncertainty.missing_guidance}. "
         f"Agent recommendation: {uncertainty.recommendation}."

@@ -189,3 +189,21 @@ def test_review_fix_ledger_rejects_a_push_that_is_not_the_final_reviewed_head():
     }'''
     verdict = parse_verdict(payload, expected_sha="start")
     assert verdict.parsed is False and verdict.clean is False
+
+
+def test_parse_verdict_accepts_a_prior_attempt_final_head_the_caller_proved():
+    """A continuation reviewer whose fixes were pushed by an earlier attempt of the same logical
+    review honestly reports ``pushed_sha: ""`` — the prompt orders exactly that — and the strict
+    provenance rule rejected it, so the honest verdict could never parse and the review parked
+    after burning its budget (the #346-class park). A final head the caller proved durably
+    (``owned_heads``) is accepted; an unproven one stays rejected."""
+    import json
+    payload = json.dumps({"verdict": "PASS", "reviewed_sha": "sha-a",
+                          "final_sha": "sha-b", "pushed_sha": "", "findings": []})
+
+    strict = parse_verdict(payload, expected_sha="sha-a")
+    assert strict.parsed is False and "provenance" in strict.detail
+
+    accepted = parse_verdict(payload, expected_sha="sha-a", owned_heads=("sha-b",))
+    assert accepted.parsed is True and accepted.clean is True
+    assert accepted.final_sha == "sha-b" and accepted.pushed_sha == ""

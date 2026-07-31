@@ -36,6 +36,7 @@ from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
+from agentflow.coordinator.verification import VERIFIED, miss_summary
 from agentflow.review_policy import ReviewState
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
@@ -729,7 +730,12 @@ class Coordinator:
         obs = self._adapter.observe(record)
         self._release(record)
         outcome = self._adapter.capture(record, obs)
-        verified = outcome is not None or self._adapter.verify(record, obs)
+        verification = VERIFIED if outcome is not None else self._adapter.verify(record, obs)
+        verified = bool(verification)
+        # An unverified attempt keeps which conjunct stopped it (when the verifier is typed), so
+        # the recovery envelope, hold reason, telemetry, and park comment all name the exact miss
+        # instead of leaving each park to be re-diagnosed from session transcripts.
+        record.verify_miss = "" if verified else miss_summary(verification)
         # Every ended family — completed, superseded, or held — records its spend exactly once,
         # keyed by this attempt's launch token (ADR 0040 per-attempt telemetry).
         self._record_telemetry(record, obs, outcome=outcome, verified=verified)
@@ -781,7 +787,9 @@ class Coordinator:
         if recovery.kind == REPAIR and record.repairs < REPAIR_BUDGET:
             record.repairs += 1
             return self._continue(record, obs, recovery.envelope, cause, repair=True)
-        record.hold_reason = "no new recovery state to act on"
+        record.hold_reason = ("no new recovery state to act on"
+                              + (f" — last unverified check: {record.verify_miss}"
+                                 if record.verify_miss else ""))
         if not self._hold(record):
             return None
         self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} ended ({cause}) with no "
@@ -796,7 +804,9 @@ class Coordinator:
         prompt (issue #225). At the budget the stage holds for a human, exactly as an exhausted
         continuation always has."""
         if record.attempts >= ATTEMPT_BUDGET:
-            record.hold_reason = "continuation budget exhausted"
+            record.hold_reason = ("continuation budget exhausted"
+                                  + (f" — last unverified check: {record.verify_miss}"
+                                     if record.verify_miss else ""))
             if not self._hold(record):
                 return None
             self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} interrupted "
@@ -925,6 +935,7 @@ class Coordinator:
             restart_resumes=record.restart_resumes, round=record.round,
             conflict_round=record.conflict_round,
             verified=verified, outcome=outcome or "",
+            verify_miss=record.verify_miss,
             cause=obs.cause.value, classification=obs.classification(),
             started_at=record.started_at, finalized_at=int(time.time()),
             usage=getattr(obs, "usage", AttemptUsage()))

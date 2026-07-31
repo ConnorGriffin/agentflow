@@ -41,6 +41,10 @@ def _envelope(record, missing: str, *, worktree: str | None = None) -> str:
         f"- This is a continuation; {record.attempts} of {ATTEMPT_BUDGET} attempts have run.",
         f"- The prior attempt ended without the required outcome: {missing}.",
     ]
+    miss = getattr(record, "verify_miss", "")
+    if miss:
+        lines.append(f"- The verifier's exact failed check was — {miss}. Satisfy that check; "
+                     "work behind it may already be durable and must not be redone.")
     if worktree:
         lines.append(
             f"- Your work in progress is retained at {worktree}; build on it, do not restart.")

@@ -96,59 +96,82 @@ def _reply_ready(record, obs) -> bool:
       marked head plus the clean owned worktree sitting on it prove the reviser's work either way, so
       the baseline need not be an ancestor of the pushed head.
 
-    A record without that exact targeted reply stays incomplete. Live orchestration; exercised
-    through the Coordinator/Respond adapter seam in ``tests/test_respond_tracer.py``."""
+    A record without that exact targeted reply stays incomplete, as a typed
+    :class:`~agentflow.coordinator.verification.Verification` naming the first failed check.
+    Live orchestration; exercised through the Coordinator/Respond adapter seam in
+    ``tests/test_respond_tracer.py``."""
+    from agentflow.coordinator.verification import VERIFIED, unverified
     from agentflow.gate import (
         respond_reply_change, respond_reply_posted, respond_reply_target_repair)
     parsed = source_facts(record)
     if parsed is None:
-        return False
+        return unverified("pr-branch-facts",
+                          f"the record's source {record.source!r} does not parse as an owned "
+                          "PR-branch worktree")
     _workdir, branch, wt = parsed
     pr = github.open_pr_for_branch(record.repo, branch)
     if pr is None:
-        return False
+        return unverified("open-pr", f"no open PR found for branch {branch!r}")
     comments = github.pr_comment_rows(record.repo, pr.number)
     target = record.target or ""
     if comments is None:
-        return False
+        return unverified("pr-comments-read",
+                          f"the PR #{pr.number} comment list is unreadable from GitHub")
     if not respond_reply_posted(comments, target):
         repair = respond_reply_target_repair(comments, target)
         if repair is None or not github.edit_comment(*repair):
-            return False
+            return unverified("targeted-reply",
+                              f"no marked agentflow reply names target {target!r} among "
+                              f"{len(comments)} PR comments, and no repairable near-miss "
+                              "marker was found")
         comments = github.pr_comment_rows(record.repo, pr.number)
         if comments is None or not respond_reply_posted(comments, target):
-            return False
+            return unverified("targeted-reply",
+                              f"the repaired reply marker for target {target!r} still does not "
+                              "read back from GitHub")
     change = respond_reply_change(comments, record.target or "")
     baseline_match = re.search(r"agentflow-respond-baseline:([^\s>]+)", record.input_ptr or "")
     baseline = baseline_match.group(1) if baseline_match is not None else ""
     if not change or not baseline:
-        return False
+        return unverified("reply-change-marker",
+                          f"the targeted reply's change marker is {change!r} and the record's "
+                          f"baseline is {baseline!r}; both must be present")
     # A reply exists. The owned worktree is mandatory evidence: without it there is no way to
     # prove that a requested branch change was either pushed or never left locally. Fail closed and
     # let preparation recover the PR branch before another attempt.
     if not wt.exists():
-        return False
+        return unverified("retained-worktree",
+                          f"the owned worktree {wt} is gone; preparation must recover the "
+                          "branch before the pushed outcome can be proven")
     head = pr.head_ref_oid or ""
     if change != "none" and (change == baseline or change != head):
-        return False
+        return unverified("pushed-head",
+                          f"the reply marks change {change[:12]!r} but the live PR head is "
+                          f"{head[:12]!r} (baseline {baseline[:12]!r}); a no-op or stale push "
+                          "cannot count")
     fetched = _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
     if fetched.returncode != 0:
-        return False
+        return unverified("branch-fetch", f"fetching origin/{branch} into the owned worktree "
+                          "failed; the pushed head cannot be compared")
     ahead = _run(["git", "-C", str(wt), "rev-list", "--count", f"{head}..HEAD"])
     if not head or ahead.returncode != 0 or ahead.stdout.strip() not in ("", "0"):
-        return False
+        count = ahead.stdout.strip() if ahead.returncode == 0 else "unreadable"
+        return unverified("unpushed-commits",
+                          f"the owned worktree holds {count or '0'} commit(s) absent from the "
+                          f"pushed head {head[:12]!r}")
     # Tracked/staged changes and arbitrary untracked files are relevant retained branch work and
     # still block. Ignore only the known root-level screenshot runner regression: broader treatment
     # of untracked files as scratch could retire a requested new source file before it is pushed.
     status = _run(["git", "-C", str(wt), "status", "--porcelain", "--untracked-files=all"])
     if status.returncode != 0:
-        return False
+        return unverified("worktree-status", "the owned worktree's git status is unreadable")
     for line in status.stdout.splitlines():
         if not line.strip():
             continue
         if not line.startswith("?? ") or not _untracked_respond_scratch(line[3:]):
-            return False
-    return True
+            return unverified("uncommitted-changes",
+                              f"the owned worktree retains an unpushed local change: {line!r}")
+    return VERIFIED
 
 
 def _settle_respond(record) -> str | None:

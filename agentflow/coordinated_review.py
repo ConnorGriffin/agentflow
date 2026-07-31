@@ -428,31 +428,63 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         review=state, transfer_from=transfer_from, supersede=supersede)
 
 
-def _verdict_ready(record, obs) -> bool:
+def _prior_attempt_push(record, obs) -> str:
+    """The stated final head whose push provenance is an earlier attempt of this same logical
+    review — proven, never trusted: the stated ``final_sha`` must differ from the immutable
+    target, and the retained detached checkout must own it (``HEAD`` equals it, tree clean).
+    A continuation reviewer honestly reports ``pushed_sha: ""`` when the fixes it re-verified
+    were pushed by the attempt before it; without this proof that honest verdict could never
+    parse, and the review burned its budget and parked over work that was already done.
+    Returns ``""`` when unproven."""
+    import json
+    try:
+        data = json.loads((getattr(obs, "final_message", "") or "").strip())
+    except ValueError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    candidate = str(data.get("final_sha") or "")
+    if not candidate or candidate == record.target:
+        return ""
+    return candidate if _review_checkout_owns_head(record, candidate) else ""
+
+
+def _verdict_ready(record, obs):
     """The Review outcome is a parsed verdict anchored to its exact starting SHA.
 
     A reviewer may push bounded fixes, but the captured final message must still name
     ``record.target`` as ``reviewed_sha`` and name the fully re-reviewed post-fix head as
     ``final_sha``. Settlement independently requires the live PR head to equal that final SHA.
+    A moved final head pushed by an *earlier attempt* of this same logical review is accepted
+    when the retained checkout proves it (:func:`_prior_attempt_push`); the proof is persisted
+    on the record so settlement re-parses against the same durable fact. Returns a typed
+    :class:`~agentflow.coordinator.verification.Verification` naming the first failed check.
     """
+    from agentflow.coordinator.verification import VERIFIED, unverified
     from agentflow.reviewer import parse_verdict
     if not record.target:
-        return False
+        return unverified("target-sha", "the review record carries no immutable target SHA")
+    owned = _prior_attempt_push(record, obs)
+    if owned:
+        # Persisted by the coordinator with the verified completed record, so settlement and
+        # successor handoffs consume the proof without re-reading a checkout that may be gone.
+        record.review_prior_push = owned
+    owned_heads = (owned,) if owned else ()
     verdict = parse_verdict(
         obs.final_message or "", expected_sha=record.target,
         expected_depth=record.review_depth, expected_axis=record.review_axis,
-        expected_author=record.change_author_tool)
+        expected_author=record.change_author_tool, owned_heads=owned_heads)
     if not verdict.parsed:
-        return False
-    if record.review_axis == "fix" and not verdict.pushed_sha:
+        return unverified("verdict-parse",
+                          verdict.detail or "no usable verdict object in the final message")
+    if (record.review_axis == "fix" and not verdict.pushed_sha
+            and verdict.final_sha not in owned_heads):
         from agentflow.review_policy import ReviewAction, ReviewState
         review = ReviewState.from_record(record)
-        if review is None:
-            return False
         # A PR-body fix changes the merge-facing GitHub artifact, not the Git head. Requiring
         # push provenance for that one named surface rejects a valid exact-head re-verification
         # and burns the continuation budget after the reviewer has already corrected the body.
-        outstanding = any(
+        outstanding = review is None or any(
             item.action is ReviewAction.FIX
             and item.file.strip().casefold() != "pr body"
             for item in review.findings)
@@ -460,12 +492,17 @@ def _verdict_ready(record, obs) -> bool:
         # finding it returns has left fix_before_completion, nothing remained to push. A verdict
         # that returns no findings at all over an outstanding fix is still refused — silence is
         # not a judgment.
-        rejudged = (bool(verdict.actions)
+        rejudged = (review is not None and bool(verdict.actions)
                     and not any(item.action is ReviewAction.FIX for item in verdict.actions))
         if outstanding and not rejudged:
-            return False
+            return unverified(
+                "fix-push",
+                "the fix-axis review recorded FIX findings but its verdict names no pushed fix, "
+                "and the retained checkout does not own a moved head (final_sha "
+                f"{(verdict.final_sha or 'unstated')[:12]}, target {record.target[:12]})")
     if not _review_follow_ups_valid(record, verdict):
-        return False
+        return unverified("follow-up-evidence", "a structured follow-up in the verdict could not "
+                          "be validated against the repository's live issue tracker")
     if (record.review_tainted and not record.review_taint_cleared
             and record.cross_tool_covered and not verdict.pushed_sha
             and record.review_axis in {"combined", "standards"}):
@@ -480,7 +517,7 @@ def _verdict_ready(record, obs) -> bool:
             # Product, fix, pushed, or unresolved passes keep taint until the final clean
             # independent combined/standards result.
             record.review_taint_cleared = True
-    return True
+    return VERIFIED
 
 
 def _review_follow_ups_valid(record, verdict) -> bool:
@@ -966,7 +1003,11 @@ def _review_verdict(review):
     verdict = parse_verdict(
         payload, expected_sha=review.target,
         expected_depth=review.review_depth, expected_axis=review.review_axis,
-        expected_author=review.change_author_tool)
+        expected_author=review.change_author_tool,
+        # The durable prior-attempt push proof recorded at verify time (an earlier attempt of
+        # this same logical review pushed the moved final head) — settlement must accept the
+        # same verdict verification accepted, without re-reading a checkout that may be gone.
+        owned_heads=((review.review_prior_push,) if review.review_prior_push else ()))
     prior = ReviewState.from_record(review)
     if prior is None:
         return replace(verdict, clean=False, parsed=False,

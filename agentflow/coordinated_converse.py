@@ -167,11 +167,16 @@ def read_proposal_draft(record) -> dict | None:
 
 # --- stage collaborators (injected into ConverseStageAdapter) ---------------------------
 
-def _reply_ready(record, obs) -> bool:
+def _reply_ready(record, obs):
     """The Converse outcome is a durable reply for this exact turn (ADR 0034 outcome-first).
     Independent of provider exit: a bad exit that still wrote the reply completes; a clean exit
     that wrote nothing does not, and the turn continues within budget."""
-    return read_reply(record) is not None
+    from agentflow.coordinator.verification import VERIFIED, unverified
+    if read_reply(record) is None:
+        return unverified("turn-reply",
+                          f"no durable reply file for turn {record.target!r} in the turn's "
+                          "worktree")
+    return VERIFIED
 
 
 def _ask_worktree_ready(record) -> bool:

@@ -80,6 +80,11 @@ class Record:
     handoff_proof: str | None = None     # proof the stage-native human handoff exists (crash-safe)
     hold_pending: bool = False           # classified as a hold, awaiting its durable handoff
     hold_reason: str | None = None       # exhaustion, permanent cause, or no-successor boundary
+    verify_miss: str = ""                # the last attempt's first failed verification conjunct
+                                         # ("check: live detail") — named in recovery envelopes,
+                                         # hold reasons, telemetry, and the park comment, so a
+                                         # park states what stopped it instead of "budget
+                                         # exhausted"; cleared whenever an attempt verifies
     retired: bool = False
     builder_lineage: str | None = None   # original builder; current exact-head author is separate
     builder_complexity: str | None = None  # the original builder complexity, carried so a later
@@ -101,6 +106,11 @@ class Record:
     review_axis: str = "combined"        # combined | product | standards | fix
     change_author_tool: str | None = None # author of the exact change set under review
     reviewed_from_sha: str | None = None  # start of the range supplied to this pass
+    review_prior_push: str | None = None  # a moved final head whose push provenance is an earlier
+                                          # attempt of this same logical review, proven at verify
+                                          # time by the retained checkout owning it — settlement
+                                          # re-parses the captured verdict with this durable fact
+                                          # instead of re-reading a checkout that may be gone
     review_passes: int = 0                # consecutive change-making review passes
     review_sequence: int = 0              # same-head private handoffs/Full axes identity
     cross_tool_covered: bool = False      # another tool reviewed the current exact head

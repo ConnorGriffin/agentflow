@@ -40,10 +40,12 @@ class StageCalls:
         fn = self._hook("observe")
         return fn(record) if fn is not None else ProviderObservation()
 
-    def verify(self, record, obs) -> bool:
-        """No verifier means no outcome can be proven — never a completion by default."""
+    def verify(self, record, obs):
+        """No verifier means no outcome can be proven — never a completion by default. The
+        adapter's answer passes through as-is: a typed Verification keeps its named miss for
+        the coordinator to persist; a legacy bool stays a bool. Callers branch on truthiness."""
         fn = self._hook("verify")
-        return bool(fn(record, obs)) if fn is not None else False
+        return fn(record, obs) if fn is not None else False
 
     def capture(self, record, obs) -> str | None:
         fn = self._hook("capture")
@@ -93,7 +95,7 @@ class StageRouter:
     def observe(self, record) -> ProviderObservation:
         return self._for(record).observe(record)
 
-    def verify(self, record, obs) -> bool:
+    def verify(self, record, obs):
         return self._for(record).verify(record, obs)
 
     def capture(self, record, obs) -> str | None:
