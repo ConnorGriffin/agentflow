@@ -12,9 +12,11 @@ tested without spawning a provider (see tests/test_runner.py).
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -508,6 +510,143 @@ def worktree_session(wt: Path):
                     pass
 
 
+# --- commit-time sign-off in a session checkout (ADR 401) ------------------------------------
+# One breadcrumb per repository per remedy, so a repository running unenforced says so once
+# instead of once per attempt. Keyed on the common git dir — every checkout of one repository
+# shares it. Shaped after the daemon's per-repo sweep map.
+_SIGNOFF_UNENFORCED: dict[str, str] = {}
+
+_SIGNOFF_HOOK = """#!/bin/sh
+# Installed by agentflow when this session checkout was prepared (ADR 401). Certifies a commit
+# at the moment it is made, so a session cannot create an unsigned commit and strand its own
+# pull request. Signs only for the identity this checkout commits as: a commit authored by
+# anyone else is left exactly as written, because a sign-off is a personal certification and
+# the engine makes none in a third party's name.
+message="$1"
+ident=""
+if [ -z "$GIT_AUTHOR_EMAIL" ] || [ -z "$GIT_AUTHOR_NAME" ]; then
+    ident=$(git var GIT_AUTHOR_IDENT 2>/dev/null)
+fi
+name="$GIT_AUTHOR_NAME"
+email="$GIT_AUTHOR_EMAIL"
+[ -n "$name" ] || name=$(printf '%s' "$ident" | sed -n 's/ <[^<]*$//p')
+[ -n "$email" ] || email=$(printf '%s' "$ident" | sed -n 's/.*<\\(.*\\)>.*/\\1/p')
+configured=$(git config --get user.email)
+author_key=$(printf '%s' "$email" | tr 'A-Z' 'a-z')
+checkout_key=$(printf '%s' "$configured" | tr 'A-Z' 'a-z')
+if [ -n "$email" ] && [ "$author_key" = "$checkout_key" ]; then
+    # Keyed on the author's own address, not on the trailer alone: a message already carrying
+    # somebody else's sign-off still needs this one, or the check stays red.
+    if ! grep -i '^Signed-off-by:' "$message" | grep -qiF "<$email>"; then
+        git interpret-trailers --in-place --trailer "Signed-off-by: $name <$email>" "$message"
+    fi
+fi
+"""
+
+
+def _repository_name(wt: Path, common: Path) -> str:
+    """How a repository is named in a log line: its origin URL, or the shared git dir."""
+    url = _run(["git", "-C", str(wt), "remote", "get-url", "origin"])
+    return url.stdout.strip() if url.returncode == 0 and url.stdout.strip() else str(common)
+
+
+def _signoff_unenforced(wt: Path, common: Path, remedy: str) -> None:
+    """Say once per repository that its session commits are not being signed for it.
+
+    Written straight to the daemon's own stream in the daemon's own line shape rather than
+    through :func:`agentflow.daemon.log`: the daemon reaches this module, so importing it back —
+    however the import is spelled — is the import ring ``test_dispatch`` refuses. The shape is
+    pinned by test rather than by this sentence.
+    """
+    if _SIGNOFF_UNENFORCED.get(str(common)) == remedy:
+        return
+    _SIGNOFF_UNENFORCED[str(common)] = remedy
+    print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} agentflow: "
+          f"{_repository_name(wt, common)}: session commits are not signed off automatically — "
+          f"{remedy}. The pull-request sign-off check still gates every merge.", flush=True)
+
+
+def _absolute(wt: Path, *rev_parse: str) -> Path:
+    """A path git reports for ``wt``, always absolute — ``core.hooksPath`` resolves a relative
+    value against the current directory, not the git dir, so a relative one cannot be stored."""
+    resolved = _run(["git", "-C", str(wt), "rev-parse", *rev_parse])
+    resolved.check_returncode()
+    path = Path(resolved.stdout.strip())
+    return path if path.is_absolute() else (wt / path)
+
+
+def _write_hook(path: Path, body: str) -> None:
+    path.write_text(body)
+    path.chmod(0o755)
+
+
+def _install_commit_signoff(wt: Path) -> None:
+    """Make this checkout sign off its own commits as it makes them, and never raise.
+
+    Instruction alone was observed to not hold (#357 shipped it; a build ran after it and still
+    pushed an unsigned commit), and the branch is only legitimately rewritable inside the session
+    that authored it — so the sign-off is added mechanically at commit time, here.
+
+    Enforcement is confined to this checkout: a hooks directory under the worktree's own git dir
+    (never inside the tree, which the reuse gates read as litter) pointed at by a *per-worktree*
+    ``core.hooksPath``, so the maintainer's shared checkout keeps committing exactly as it does
+    now. That costs one key in the shared repository config — ``extensions.worktreeConfig`` —
+    which is the only thing written there.
+
+    ``core.hooksPath`` replaces the hooks directory wholesale rather than overlaying it, so every
+    hook the repository already has is forwarded from the installed directory and the signer hands
+    off to an existing commit-msg hook. The hand-off target is read from the *repository* scope at
+    install time: on a re-provisioned checkout the effective value is already this directory, and
+    chaining off that would make every commit recurse.
+
+    Fails open by contract: :meth:`_WorktreeRunner.provision`'s callers read a raised
+    ``CalledProcessError`` as "do not admit this stage", so a checkout that cannot be enforced
+    runs unenforced with one breadcrumb per repository. The pull-request sign-off check is the
+    outer backstop, unchanged.
+    """
+    common = wt
+    try:
+        git_dir = _absolute(wt, "--absolute-git-dir")
+        common = _absolute(wt, "--git-common-dir")
+        bare = _run(["git", "-C", str(wt), "config", "--local", "--get", "core.bare"])
+        rooted = _run(["git", "-C", str(wt), "config", "--local", "--get", "core.worktree"])
+        if bare.stdout.strip().lower() == "true" or rooted.stdout.strip():
+            # Git's own guidance: these must be relocated before per-worktree config is enabled.
+            _signoff_unenforced(wt, common, "its shared configuration sets core.bare or "
+                                            "core.worktree, which must be relocated to the main "
+                                            "checkout before sign-off can be enforced per session")
+            return
+        enabled = _run(["git", "-C", str(wt), "config", "--local", "--get",
+                        "extensions.worktreeConfig"])
+        if enabled.stdout.strip().lower() != "true":
+            _run(["git", "-C", str(wt), "config", "--local",
+                  "extensions.worktreeConfig", "true"]).check_returncode()
+        configured = _run(["git", "-C", str(wt), "config", "--local", "--get", "core.hooksPath"])
+        source = Path(configured.stdout.strip()) if configured.stdout.strip() else common / "hooks"
+        if not source.is_absolute():
+            source = wt / source
+        installed = git_dir / "agentflow-hooks"
+        shutil.rmtree(installed, ignore_errors=True)  # regenerate, never layer: provision re-runs
+        installed.mkdir(parents=True)
+        chained = None
+        if source.is_dir():
+            for entry in sorted(source.iterdir()):
+                if entry.name.endswith(".sample") or not os.access(entry, os.X_OK) \
+                        or not entry.is_file():
+                    continue
+                if entry.name == "commit-msg":
+                    chained = entry
+                    continue
+                _write_hook(installed / entry.name,
+                            f'#!/bin/sh\nexec {shlex.quote(str(entry))} "$@"\n')
+        hand_off = f'exec {shlex.quote(str(chained))} "$@"' if chained else "exit 0"
+        _write_hook(installed / "commit-msg", f"{_SIGNOFF_HOOK}{hand_off}\n")
+        _run(["git", "-C", str(wt), "config", "--worktree",
+              "core.hooksPath", str(installed)]).check_returncode()
+    except Exception as e:  # noqa: BLE001 — an unenforced checkout still builds; a raise stops it
+        _signoff_unenforced(wt, common, f"preparing its hooks failed ({type(e).__name__}: {e})")
+
+
 class _WorktreeRunner:
     """Shared provider/worktree plumbing; subclasses supply tool commands and model maps."""
 
@@ -540,8 +679,14 @@ class _WorktreeRunner:
         _run(add).check_returncode()
 
     def provision(self, wt: Path) -> None:
+        """Ready a prepared checkout for a session: its dependency environment, then commit-time
+        sign-off. One failure semantic for callers — a ``CalledProcessError`` means the
+        environment could not be built and the stage must not be admitted. The sign-off install
+        is deliberately not that: it never raises, so a checkout that cannot be enforced still
+        runs (:func:`_install_commit_signoff`)."""
         if (wt / "uv.lock").exists() and not (wt / ".venv" / "bin" / "python").exists():
             _run(["uv", "sync", "--all-extras"], cwd=str(wt)).check_returncode()
+        _install_commit_signoff(wt)
 
     def prepare_worktree_detached(self, workdir: str, ref: str, wt: Path) -> None:
         """A detached worktree at `ref` (e.g. `origin/<pr-branch>`) — for review.
