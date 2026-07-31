@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -111,18 +112,59 @@ class MockupScope(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class WorktreeRecovery:
-    """What a recovery pass changed and which owned sessions it left for recovery."""
+    """What a recovery pass changed and which owned sessions it left for recovery.
+
+    ``archived`` carries ``(path, stranded-ref)`` for each session whose uncommitted state was
+    snapshotted to a durable ref before its checkout was reclaimed. The ref travels with the path
+    because the path is exactly what stops existing: it is the only thing that lets an operator —
+    or the hold comment that named that directory — find the work again.
+    """
 
     removed: tuple[str, ...]
     retained: tuple[str, ...]
+    archived: tuple[tuple[str, str], ...] = ()
 
 
-def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None) -> subprocess.CompletedProcess:
+# How long a stranded session must sit untouched before reclamation may archive it. This floor is
+# the *whole* protection for a checkout with no session marker — a `/agentflow pickup` session or a
+# hand-cut worktree under `.agentflow/worktrees` — because none of the clocks below move for an
+# editor writing nested files without running git. It is not a belt on top of a real activity
+# signal; do not shorten it on the assumption that it is.
+STRANDED_IDLE_SECONDS = 24 * 3600
+
+# How many idle, unprotected, agentflow-owned sessions a repository keeps registered. The newest
+# survive; everything older is archived to a stranded ref and reclaimed, because every surviving
+# registration costs a deny path in the provider sandbox profile and that profile has a hard byte
+# ceiling (ADR 0050).
+RETAINED_WORKTREE_CAP = 12
+
+# The most archives one sweep performs. A sweep runs ahead of dispatch in the same pass, so an
+# unbounded backlog would delay admission and snapshot publication for as long as it took to drain;
+# successive sweeps converge instead.
+SWEEP_ARCHIVE_BUDGET = 20
+
+# Above this many *registered* worktrees, a repository stops receiving new cold work (ADR 0050).
+# It is a count proxy for a byte cliff: the Claude CLI builds one sandbox deny path per registered
+# worktree, and at ~246 registrations on the machine that produced this number the profile alone
+# crossed the OS exec-argument limit (~1.6 MB) and every session lost its shell on the first
+# command. Path lengths vary by machine and repository, so the number does not port — re-measure
+# before trusting it elsewhere.
+#
+# Read-only measurement across the nine enrolled repositories, 2026-07-30
+# (`git worktree list --porcelain` per repo + the coordinator store):
+#   post-sweep floor = foreign registrations + live-state protected sources + RETAINED_WORKTREE_CAP
+#   worst case (agentflow itself): 47 foreign + 6 protected + 12 = 65; every other repo ≤ 33.
+# 175 leaves ~110 of headroom over that floor and still refuses well below the observed cliff.
+WORKTREE_DISPATCH_CEILING = 175
+
+
+def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     if cmd and Path(str(cmd[0])).name in {"claude", "codex"}:
         raise RuntimeError("provider commands may only be executed by the coordinator launcher")
     t = timeout if timeout is not None else int(os.environ.get("AGENTFLOW_GH_TIMEOUT", "120"))
     try:
-        return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=t)
+        return subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=t, env=env)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
 
@@ -298,6 +340,100 @@ def retain_stranded_commit(workdir: str, wt: Path, commit: str) -> bool:
     without keeping the checkout hostage to it."""
     ref = f"refs/agentflow/stranded/{wt.name}/{commit[:12]}"
     return _run(["git", "-C", workdir, "update-ref", ref, commit]).returncode == 0
+
+
+def archive_stranded_worktree(workdir: str, wt: Path) -> str:
+    """Snapshot everything a stranded session left behind — committed, staged, unstaged, and
+    untracked — onto a durable recovery ref, then reclaim the checkout. Returns the ref name, or
+    ``""`` when any step failed, in which case the worktree is left exactly as it was found.
+
+    This is what makes a bound on registrations safe (ADR 0050). :func:`remove_worktree_if_safe`
+    can only reclaim work git can already prove is durable, so a session that died with edits in
+    the tree pins its registration forever. Here safety is redefined: the work must be
+    *recoverable*, not the directory *present*. Nothing is ever force-committed onto a branch —
+    the snapshot is plumbing only, parented on the checkout's own HEAD and named under
+    ``retain_stranded_commit``'s namespace, so no branch, no PR, and no reflog moves.
+
+    The tree is built in a **scratch index**, never the worktree's own. A failure partway through
+    must leave no trace: staging into the real index would read as tracked modification forever
+    and permanently defeat :func:`resettable_head`, which tolerates untracked litter but not
+    staged litter. Gitignored paths are deliberately left out — the archive is the session's work,
+    not its provisioning.
+
+    The commit identity is set explicitly because agentflow creates commits nowhere else and
+    passes no identity environment: without it, a host with no global git identity would fail
+    every archive and the bound would silently never apply.
+
+    A single ``--force`` removes an unclean checkout; a *locked* worktree needs a second one and
+    does not get it — a lock is a deliberate human signal, so a locked worktree fails the removal
+    and stays registered.
+    """
+    scratch = tempfile.mkdtemp(prefix="agentflow-archive-index-")
+    env = {**os.environ, "GIT_INDEX_FILE": os.path.join(scratch, "index")}
+    try:
+        if _run(["git", "-C", str(wt), "read-tree", "HEAD"], env=env).returncode != 0:
+            return ""
+        if _run(["git", "-C", str(wt), "add", "-A"], env=env).returncode != 0:
+            return ""
+        written = _run(["git", "-C", str(wt), "write-tree"], env=env)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    tree = written.stdout.strip() if written.returncode == 0 else ""
+    if not tree:
+        return ""
+    head = _run(["git", "-C", str(wt), "rev-parse", "HEAD"])
+    head_tree = _run(["git", "-C", str(wt), "rev-parse", "HEAD^{tree}"])
+    if head.returncode != 0 or head_tree.returncode != 0 or not head.stdout.strip():
+        return ""
+    if tree == head_tree.stdout.strip():
+        commit = head.stdout.strip()  # nothing uncommitted — HEAD itself is the whole snapshot
+    else:
+        snapshot = _run(["git", "-C", str(wt),
+                         "-c", "user.name=agentflow", "-c", "user.email=agentflow@local",
+                         "commit-tree", tree, "-p", head.stdout.strip(),
+                         "-m", "agentflow: archived stranded session work"])
+        commit = snapshot.stdout.strip() if snapshot.returncode == 0 else ""
+    if not commit:
+        return ""
+    ref = f"refs/agentflow/stranded/{wt.name}/{commit[:12]}"
+    if _run(["git", "-C", workdir, "update-ref", ref, commit]).returncode != 0:
+        return ""
+    anchored = _run(["git", "-C", workdir, "rev-parse", ref])
+    if anchored.returncode != 0 or anchored.stdout.strip() != commit:
+        return ""  # the ref did not take — never reclaim work we cannot prove is anchored
+    if _run(["git", "-C", workdir, "worktree", "remove", "--force", str(wt)]).returncode != 0:
+        return ""
+    return ref
+
+
+def _worktree_idle_seconds(wt: Path) -> float:
+    """How long this checkout has sat untouched, by the most recent local clock we can read:
+    the directory's own mtime, its registration's index, and its HEAD commit's date.
+
+    Only local evidence, so the answer costs nothing and cannot be wrong about a remote. The index
+    path is resolved through git (the ``_active_marker`` idiom) rather than composed from the
+    basename: git disambiguates duplicate basenames with numeric suffixes, so a hand-built admin
+    path can silently read *another* worktree's clock.
+
+    ``0.0`` when nothing is readable — the fail-closed answer, since idleness only ever unlocks
+    reclamation.
+    """
+    stamps: list[float] = []
+    try:
+        stamps.append(wt.stat().st_mtime)
+    except OSError:
+        pass
+    resolved = _run(["git", "-C", str(wt), "rev-parse", "--git-path", "index"])
+    if resolved.returncode == 0 and resolved.stdout.strip():
+        index = Path(resolved.stdout.strip())
+        try:
+            stamps.append((index if index.is_absolute() else wt / index).stat().st_mtime)
+        except OSError:
+            pass
+    committed = _run(["git", "-C", str(wt), "log", "-1", "--format=%ct", "HEAD"])
+    if committed.returncode == 0 and committed.stdout.strip().isdigit():
+        stamps.append(float(committed.stdout.strip()))
+    return max(0.0, time.time() - max(stamps)) if stamps else 0.0
 
 
 def discard_orphaned_worktree(workdir: str, wt: Path) -> None:
@@ -791,15 +927,45 @@ def _legacy_session_tool(owned_path: str, branch: str | None) -> str | None:
     return None
 
 
+# The two kinds excluded from reclamation outright. Neither has a completion rule, so neither can
+# ever read as finished; a conversation's checkout is reused across turns while each turn's record
+# retires, so between turns it has no store protection under any definition — and that checkout is
+# the conversation's *only* durable output. Archiving them would reclaim every idle Ask and every
+# research checkout in the fleet. Both populations are small and human-driven, so leaving them out
+# does not reopen the unbounded growth this bound exists to close.
+_UNRECLAIMABLE_KINDS = (WorktreeKind.RESEARCH, WorktreeKind.CONVERSE)
+
+
 def recover_stale_worktrees(repo: str, workdir: str,
                             protected: set[str] = frozenset()) -> WorktreeRecovery:
-    """Prune stale registrations and remove completed agentflow-owned sessions.
+    """Prune stale registrations, remove completed agentflow-owned sessions, and archive the
+    stranded ones a repository can no longer afford to keep registered (ADR 0050).
 
     Git's registry establishes repository ownership; the path is used only after
     ownership is known to recognize agentflow's current and legacy session names.
     Completion lookups and the final clean/pushed checks all fail closed. ``protected`` contains
-    durable coordinator-owned sources; recovery retains them even when they are clean and no
-    provider is currently alive, because a waiting continuation still owns that worktree.
+    the coordinator's *live-state* owned sources; recovery retains them even when they are clean
+    and no provider is currently alive, because a waiting continuation still owns that worktree. A
+    held record's source is not in that set: a maintainer resume rebuilds the checkout from the
+    branch anyway, and held records are never retired, so protecting them would exempt the very
+    population that grows without bound.
+
+    Two classes of session are otherwise kept forever, and both are reclaimed here through the
+    same archive-then-remove path:
+
+    - one whose completion cannot be confirmed (including one GitHub simply would not answer for),
+      which deliberately narrows the old "unknown → retain forever" rule; and
+    - one that *is* complete but whose removal fails safety — routine, not exceptional, since a
+      single untracked file or a squash-merged branch whose commits origin has pruned is enough.
+
+    Neither is reclaimed on age alone. A session must be idle past :data:`STRANDED_IDLE_SECONDS`
+    to be eligible at all, and then only the oldest beyond :data:`RETAINED_WORKTREE_CAP` are
+    archived, at most :data:`SWEEP_ARCHIVE_BUDGET` per sweep. An archive that fails leaves its
+    worktree registered and reported as retained — work is never lost, only relocated.
+
+    Removal of *completed* sessions is deliberately not idle-gated: it has never been, it destroys
+    nothing git cannot already reproduce, and gating it would leave finished checkouts lying
+    around for a day for no gain.
     """
     _run(["git", "-C", workdir, "worktree", "prune"])
     registered = _registered_worktrees(workdir)
@@ -807,6 +973,7 @@ def recover_stale_worktrees(repo: str, workdir: str,
         return WorktreeRecovery((), ())
     removed: list[str] = []
     retained: list[str] = []
+    stranded: list[tuple[float, str]] = []
     for path, branch in registered:
         owned_path = os.path.realpath(path)
         ref = WorktreeRef.parse(owned_path)
@@ -820,14 +987,76 @@ def recover_stale_worktrees(repo: str, workdir: str,
         if _worktree_is_active(Path(path)):
             retained.append(path)
             continue
+        # Read the idle clock *before* anything else touches this checkout. The disposability
+        # check below runs `git status` inside it, which refreshes the stat cache and rewrites the
+        # index — resetting the very clock the floor reads, so a complete-but-undisposable session
+        # would appear freshly worked on at every sweep and never age out.
+        idle = _worktree_idle_seconds(Path(path))
+        reclaimable = tool in ("claude", "codex") and (
+            ref is None or ref.kind not in _UNRECLAIMABLE_KINDS)
         complete = (_session_is_complete(repo, ref, branch) if ref is not None
                     else _pr_state_for_branch(repo, branch) in ("OPEN", "MERGED", "CLOSED"))
         if not complete:
-            if tool in ("claude", "codex"):
+            if reclaimable:
+                stranded.append((idle, path))
+            elif tool in ("claude", "codex"):
                 retained.append(path)
             continue
         if remove_worktree_if_safe(workdir, Path(path)):
             removed.append(path)
+        elif reclaimable:
+            stranded.append((idle, path))
         else:
             retained.append(path)
-    return WorktreeRecovery(tuple(removed), tuple(retained))
+
+    archived: list[tuple[str, str]] = []
+    eligible = [path for seconds, path in sorted(stranded, reverse=True)
+                if seconds >= STRANDED_IDLE_SECONDS]
+    over_cap = eligible[:-RETAINED_WORKTREE_CAP] if RETAINED_WORKTREE_CAP else eligible
+    budgeted = over_cap[:SWEEP_ARCHIVE_BUDGET]  # oldest first, so successive sweeps converge
+    for path in budgeted:
+        stranded_ref = archive_stranded_worktree(workdir, Path(path))
+        if stranded_ref:
+            archived.append((path, stranded_ref))
+        else:
+            retained.append(path)
+    retained += [path for _seconds, path in stranded if path not in set(budgeted)]
+    return WorktreeRecovery(tuple(removed), tuple(retained), tuple(archived))
+
+
+def dispatch_preflight(repo: str, workdir: str, protected: set[str], _log=None) -> bool:
+    """Whether this repository's environment can still carry a new session — asked before any
+    cold work is submitted into it (ADR 0050).
+
+    The daemon's own git calls are unsandboxed, so it never sees the failure it causes: past a
+    few hundred registered worktrees the provider's sandbox profile exceeds the OS exec-argument
+    limit and every session in that repository dies on its first shell command, with no PR, no
+    comment, and no way to say why. Three attempts were burned that way on one issue before a
+    human diagnosed it. So the daemon checks the *precondition* rather than waiting for victims.
+
+    Count-only and local: one ``git worktree list``, no GitHub call, no mutation. Reclamation is
+    the heartbeat's job — this only refuses. The refusal names the breakdown because the remedy
+    differs: reclamation can only reach agentflow's own sessions, so a breach driven by *foreign*
+    registrations (another tool's worktrees, hand-cut checkouts) is one the sweep will never fix
+    and the operator has to prune by hand.
+
+    A `git` we cannot read fails **open**. A broken git in the daemon is its own outage; freezing
+    the whole fleet on it would trade a repository-scoped failure for a fleet-wide one.
+    """
+    _log = _log or (lambda _line: None)
+    registered = _registered_worktrees(workdir)
+    if registered is None:
+        _log(f"{repo}: worktree preflight could not read the registry — dispatching anyway")
+        return True
+    if len(registered) <= WORKTREE_DISPATCH_CEILING:
+        return True
+    owned = sum(1 for path, branch in registered
+                if WorktreeRef.parse(os.path.realpath(path)) is not None
+                or _legacy_session_tool(os.path.realpath(path), branch) is not None)
+    held_by_store = sum(1 for path, _ in registered if os.path.realpath(path) in protected)
+    _log(f"{repo}: REFUSING to dispatch — {len(registered)} registered worktrees exceeds the "
+         f"{WORKTREE_DISPATCH_CEILING} ceiling ({owned} agentflow-owned, "
+         f"{len(registered) - owned} foreign, {held_by_store} protected by live records). "
+         "Sessions in this repository would lose their shell before running a command. "
+         "Reclamation only reaches agentflow-owned sessions; prune foreign worktrees by hand.")
+    return False

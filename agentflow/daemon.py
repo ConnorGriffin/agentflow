@@ -76,6 +76,11 @@ FULL_PASS_SECONDS = int(os.environ.get(
 HEARTBEAT_SECONDS = 60
 STALE_SECONDS = 3 * 3600
 
+# How often one repository's worktrees are reclaimed. Kept per-repo and process-local inside
+# `recover_worktrees`, so every caller shares one cadence and a restart always sweeps.
+SWEEP_INTERVAL_SECONDS = int(os.environ.get("AGENTFLOW_SWEEP_SECONDS", "3600"))
+_LAST_SWEEP: dict[str, float] = {}
+
 def log(msg: str) -> None:
     print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} agentflow: {msg}", flush=True)
 
@@ -96,7 +101,24 @@ def _recheck(cfg: RepoConfig, _log=None) -> str:
 
 
 def dispatch_cycle(repos: list[RepoConfig], _log=log, *, submit_new: bool = True) -> None:
-    """Reconcile coordinator records, optionally submit cold work, then serialize merge rechecks."""
+    """Reclaim worktrees, reconcile coordinator records, optionally submit cold work, then
+    serialize merge rechecks.
+
+    Reclamation runs **first and inside this pass**, never beside it. It reads which sources the
+    coordinator owns and then spends minutes confirming completion against GitHub; if a pass could
+    admit work during that window, a resumed session's working directory could be archived out
+    from under a live provider. Nothing else protects it — the on-disk activity marker is only
+    written by the by-hand path, so for daemon-launched sessions the store snapshot *is* the
+    protection. Running here puts sweep and admission under the same single-flight guard.
+
+    A paused daemon does not reclaim. Pause is the operator's stop signal, and the only thing
+    protecting a hand-worked checkout with no marker is its idle age — deleting directories right
+    after a human said "stop" is the wrong surprise. The consequence is real and accepted: while
+    dispatch is disabled the bound is not enforced, and a dormant daemon that still opens
+    continuations and Ask turns slowly regrows registrations until it is re-enabled.
+    """
+    if submit_new:
+        recover_worktrees(repos, _log=_log)
     dispatch.run_cycle(repos, submit_new=submit_new, _log=_log)
     if submit_new:
         cycle(repos, run=_recheck, _log=_log)
@@ -142,21 +164,41 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
 
 
 def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _log=log) -> None:
-    """Run fail-closed worktree recovery once at startup.
+    """Run fail-closed worktree recovery, at startup and then on a per-repository cadence.
 
-    Durable coordinator records protect every owned source. The live board is not consulted; it
-    is regenerated from running records on the next reconciliation pass.
+    Durable coordinator records protect every live-state owned source. The live board is not
+    consulted; it is regenerated from running records on the next reconciliation pass.
+
+    The cadence lives here rather than at the call sites so a repository is swept at most once an
+    hour however many passes ask. Startup stamps the clock, so the full pass that immediately
+    follows it — and every ``--once`` run — does not pay a second back-to-back sweep. The clock is
+    process-local and resets with the daemon, deliberately: a restart should sweep.
+
+    Hourly, not per-pass: the reclamation floor is a day, and confirming completion costs one or
+    two GitHub calls per owned registration against a loop designed to spend about one call per
+    tick.
     """
     from agentflow import pipeline
     for cfg in repos:
         try:
+            now = time.monotonic()
+            swept_at = _LAST_SWEEP.get(cfg.repo)
+            if swept_at is not None and (now - swept_at) < SWEEP_INTERVAL_SECONDS:
+                continue
+            _LAST_SWEEP[cfg.repo] = now
             protected = pipeline.owned_worktrees(cfg)
             report = sweep(cfg.repo, cfg.workdir, protected)
-            if report.removed or report.retained:
-                _log(f"{cfg.repo}: startup worktree recovery removed {len(report.removed)}, "
-                     f"retained {len(report.retained)} for recovery")
-        except Exception as e:  # noqa: BLE001 — one repo cannot block daemon startup
-            _log(f"{cfg.repo}: startup worktree recovery error: {type(e).__name__}: {e}")
+            if report.removed or report.retained or report.archived:
+                line = (f"{cfg.repo}: worktree recovery removed {len(report.removed)} completed, "
+                        f"archived {len(report.archived)} stranded, "
+                        f"retained {len(report.retained)} for recovery")
+                if report.archived:
+                    # The stranded ref is the only remaining handle on that work, and the hold
+                    # comment a maintainer reads still names the directory — so print both.
+                    line += " — " + ", ".join(f"{path} -> {ref}" for path, ref in report.archived)
+                _log(line)
+        except Exception as e:  # noqa: BLE001 — one repo cannot block a pass
+            _log(f"{cfg.repo}: worktree recovery error: {type(e).__name__}: {e}")
 
 
 def _dead_family_running(_log=log) -> bool:

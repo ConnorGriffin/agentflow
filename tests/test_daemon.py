@@ -553,3 +553,87 @@ def test_heartbeat_survives_a_cycle_longer_than_the_stale_threshold(tmp_path, mo
     finally:
         stop.set()
         beat.join()
+
+
+# --- bounded worktree reclamation on the pass clock (ADR 0050) --------------------------
+
+def _swept(seen, archived=()):
+    """A stand-in reclamation pass that records the repo and protected set it was handed."""
+    from agentflow.runner import WorktreeRecovery
+
+    def sweep(repo, workdir, protected):
+        seen.append((repo, protected))
+        return WorktreeRecovery((), (), archived)
+    return sweep
+
+
+def test_the_full_pass_reclaims_before_it_submits_and_a_paused_one_never_does(monkeypatch):
+    """Reclamation reads which sources are owned and then spends minutes confirming completion.
+    Running it inside the pass is what stops it archiving a checkout an admission is about to
+    launch into. A paused daemon reclaims nothing at all — pause is the operator's stop signal."""
+    order = []
+    monkeypatch.setattr(daemon, "recover_worktrees",
+                        lambda repos, _log=None: order.append("reclaim"))
+    monkeypatch.setattr(daemon.dispatch, "run_cycle",
+                        lambda repos, submit_new=True, _log=None:
+                        order.append(f"dispatch:{submit_new}"))
+    monkeypatch.setattr(daemon, "recheck_once", lambda cfg: "")
+
+    daemon.dispatch_cycle([A], _log=lambda _line: None)
+    assert order[:2] == ["reclaim", "dispatch:True"]
+
+    order.clear()
+    daemon.dispatch_cycle([A], _log=lambda _line: None, submit_new=False)
+    assert order == ["dispatch:False"]
+
+
+def test_reclamation_runs_at_most_once_per_interval_per_repository(monkeypatch):
+    from agentflow import pipeline
+
+    monkeypatch.setattr(daemon, "_LAST_SWEEP", {})
+    monkeypatch.setattr(pipeline, "owned_worktrees", lambda cfg: {"/live/source"})
+    seen = []
+
+    daemon.recover_worktrees([A, B], sweep=_swept(seen), _log=lambda _line: None)
+    daemon.recover_worktrees([A, B], sweep=_swept(seen), _log=lambda _line: None)
+    assert seen == [("owner/a", {"/live/source"}), ("owner/b", {"/live/source"})]
+
+    daemon._LAST_SWEEP["owner/a"] -= daemon.SWEEP_INTERVAL_SECONDS + 1
+    daemon.recover_worktrees([A, B], sweep=_swept(seen), _log=lambda _line: None)
+    assert [repo for repo, _protected in seen] == ["owner/a", "owner/b", "owner/a"]
+
+
+def test_startup_and_the_pass_that_immediately_follows_it_reclaim_once(monkeypatch):
+    from agentflow import pipeline
+
+    monkeypatch.setattr(daemon, "_LAST_SWEEP", {})
+    asked = []
+    monkeypatch.setattr(pipeline, "owned_worktrees",
+                        lambda cfg: asked.append(cfg.repo) or set())
+    monkeypatch.setattr(daemon.dispatch, "run_cycle",
+                        lambda repos, submit_new=True, _log=None: None)
+    monkeypatch.setattr(daemon, "recheck_once", lambda cfg: "")
+    seen = []
+
+    daemon.recover_worktrees([A], sweep=_swept(seen), _log=lambda _line: None)
+    daemon.dispatch_cycle([A], _log=lambda _line: None)
+
+    assert seen == [("owner/a", set())]
+    assert asked == ["owner/a"]  # the pass right after startup does not sweep again
+
+
+def test_a_sweep_that_only_archives_still_reports_its_recovery_refs(monkeypatch):
+    """The steady-state sweep removes nothing and retains nothing — it archives. If that case
+    logged nothing, the only handle on the reclaimed work would never be printed."""
+    from agentflow import pipeline
+
+    monkeypatch.setattr(daemon, "_LAST_SWEEP", {})
+    monkeypatch.setattr(pipeline, "owned_worktrees", lambda cfg: set())
+    logs = []
+    archived = (("/a/wt/issue-9-x", "refs/agentflow/stranded/issue-9-x/abc123abc123"),)
+
+    daemon.recover_worktrees([A], sweep=_swept([], archived=archived), _log=logs.append)
+
+    assert len(logs) == 1
+    assert "archived 1 stranded" in logs[0]
+    assert "refs/agentflow/stranded/issue-9-x/abc123abc123" in logs[0]
