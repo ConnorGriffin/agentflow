@@ -179,7 +179,8 @@ def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict:
 def parse_verdict(payload: str, expected_sha: str | None = None, *,
                   expected_depth: str | ReviewDepth | None = None,
                   expected_axis: str | ReviewAxis | None = None,
-                  expected_author: str | None = None) -> Verdict:
+                  expected_author: str | None = None,
+                  owned_heads: tuple[str, ...] = ()) -> Verdict:
     """Validate a reviewer's structured verdict. Pure, defensive, fail-safe (test surface).
 
     The CLI enforces `REVIEW_VERDICT_SCHEMA` natively, so the payload is the verdict object
@@ -199,7 +200,8 @@ def parse_verdict(payload: str, expected_sha: str | None = None, *,
         if "depth" in data:
             result = parse_review_result(
                 stripped, expected_sha=expected_sha, expected_depth=expected_depth,
-                expected_axis=expected_axis, expected_author=expected_author)
+                expected_axis=expected_axis, expected_author=expected_author,
+                owned_heads=owned_heads)
             if not result.parsed:
                 return _unparseable(result.detail)
             compatibility_findings = tuple(
@@ -241,7 +243,11 @@ def parse_verdict(payload: str, expected_sha: str | None = None, *,
                 or not isinstance(raw_follow_ups, list)
                 or not all(isinstance(v, str) for v in raw_follow_ups)):
             return _unparseable("fixes or follow_up_issues is not a string list")
-        if final_sha != reviewed_sha and not pushed_sha:
+        if (final_sha != reviewed_sha and not pushed_sha
+                and final_sha not in owned_heads):
+            # A continuation reviewer whose fixes were pushed by an earlier attempt of the same
+            # logical review honestly reports pushed_sha: "" — the caller proves that head's
+            # provenance durably (the retained checkout owns it) and names it in owned_heads.
             return _unparseable("changed final head has no push provenance")
         if pushed_sha and (pushed_sha != final_sha or final_sha == reviewed_sha):
             return _unparseable("pushed_sha does not identify a new final head")

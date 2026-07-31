@@ -173,18 +173,23 @@ def _revision_ready(record, obs) -> bool:
       Build or a prior revise round predates this round and cannot complete it (issue #118).
 
     A branch whose head still equals the reviewed SHA and carries no such evidence comment pushed
-    and proved nothing, so it stays incomplete and continues. Live orchestration; exercised with
-    faked GitHub reads in ``tests/test_revise_tracer.py``."""
+    and proved nothing, so it stays incomplete and continues — as a typed
+    :class:`~agentflow.coordinator.verification.Verification` naming the first failed check.
+    Live orchestration; exercised with faked GitHub reads in ``tests/test_revise_tracer.py``."""
+    from agentflow.coordinator.verification import VERIFIED, unverified
     parsed = source_facts(record)
     if parsed is None or not record.target:
-        return False
+        return unverified("pr-branch-facts",
+                          f"the record's source {record.source!r} does not parse as an owned "
+                          f"PR-branch worktree (target {str(record.target or 'missing')[:12]})")
     _workdir, branch, wt = parsed
     prs = github.list_open_prs(record.repo, head=branch)
     if prs is None:
         raise RuntimeError(f"cannot verify Revise outcome for {record.repo}:{branch}")
     if not prs:
-        return False
+        return unverified("open-pr", f"no open PR found for branch {branch!r}")
     head = prs[0].head_ref_oid
+    moved_but_unproven = ""
     if head and head != record.target:
         # A moved head is the pushed revision when it descends from the reviewed SHA, or — when the
         # history was rewritten (a rebase the finding asked for) — when the retained builder worktree
@@ -192,22 +197,35 @@ def _revision_ready(record, obs) -> bool:
         # the remote head is local). A rewind to an *ancestor* of the reviewed SHA still never counts,
         # and with no worktree to ask, the head comparison stands alone.
         if not wt.exists():
-            return True
+            return VERIFIED
         _run(["git", "-C", str(wt), "fetch", "--quiet", "origin", branch])
         if _run(["git", "-C", str(wt), "merge-base", "--is-ancestor",
                  record.target, head]).returncode == 0:
-            return True
+            return VERIFIED
         rewound = _run(["git", "-C", str(wt), "merge-base", "--is-ancestor",
                         head, record.target]).returncode == 0
         if not rewound and worktree_owns_head(wt, head):
-            return True
+            return VERIFIED
+        moved_but_unproven = (
+            f"the PR head moved to {head[:12]!r} but it is a rewind of the reviewed SHA"
+            if rewound else
+            f"the PR head moved to {head[:12]!r} but neither descends from the reviewed SHA "
+            "nor is owned by the retained worktree")
     # No new code, but an evidence-only revision still completes on its durable non-code proof: an
     # agentflow-authored PR comment (our marker, never the maintainer's) that attaches evidence
     # and postdates this revise round.
     comments = github.pr_comment_rows(record.repo, prs[0].number)
     if comments is None:
-        return False
-    return any(_round_evidence(c, record.created_at) for c in comments)
+        return unverified("pr-comments-read",
+                          f"the PR #{prs[0].number} comment list is unreadable from GitHub")
+    if any(_round_evidence(c, record.created_at) for c in comments):
+        return VERIFIED
+    return unverified(
+        "pushed-revision",
+        (moved_but_unproven or
+         f"the PR head still equals the reviewed SHA {record.target[:12]!r}")
+        + f", and none of the {len(comments)} PR comments is an agentflow evidence comment "
+          "created after this revise round opened")
 
 
 def _round_evidence(comment: dict, opened_at: int) -> bool:

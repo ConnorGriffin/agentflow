@@ -200,6 +200,8 @@ class AttemptTelemetry:
     classification: str              # coordinator label (recoverable/permanent/incomplete/unknown)
     started_at: int                  # epoch the attempt was admitted
     finalized_at: int                # epoch the coordinator finalized the ended family
+    verify_miss: str = ""            # the first failed verification conjunct ("check: detail")
+                                     # when unverified and the verifier is typed, else ""
     usage: AttemptUsage = field(default_factory=AttemptUsage)
 
     def outcome_key(self) -> str:

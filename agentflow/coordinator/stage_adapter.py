@@ -53,11 +53,14 @@ class StageAdapter:
         Extraction only — whether the stage is done is ``verify``'s call, never the provider's."""
         return self._observer.observe(record)
 
-    def verify(self, record, obs) -> bool:
+    def verify(self, record, obs):
         """Whether the stage's own required outcome is durable (ADR 0028 outcome-first).
         Independent of how the provider exited: a bad exit that still produced the outcome
-        completes the stage, and a clean exit that did not produce it does not."""
-        return bool(self._outcome_ready(record, obs))
+        completes the stage, and a clean exit that did not produce it does not. Returns the
+        collaborator's answer as-is — a typed :class:`~agentflow.coordinator.verification.
+        Verification` names the exact failed conjunct; a legacy bool stays valid and simply
+        carries no miss. Callers branch on truthiness either way."""
+        return self._outcome_ready(record, obs)
 
     def recover(self, record, obs):
         """A worktree-owning stage carries its partial work forward across a continuation, so a

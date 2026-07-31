@@ -423,8 +423,15 @@ def _string_list(value: Any) -> tuple[str, ...] | None:
 def parse_review_result(payload: str, *, expected_sha: str | None = None,
                         expected_depth: str | ReviewDepth | None = None,
                         expected_axis: str | ReviewAxis | None = None,
-                        expected_author: str | None = None) -> ReviewResult:
-    """Parse one strict ADR 0047 result; malformed proof always fails closed."""
+                        expected_author: str | None = None,
+                        owned_heads: tuple[str, ...] = ()) -> ReviewResult:
+    """Parse one strict ADR 0047 result; malformed proof always fails closed.
+
+    ``owned_heads`` are final heads whose push provenance the caller has already proven durably —
+    an earlier attempt of the same logical review pushed them, and the retained checkout owns
+    them. A continuation reviewer honestly reports ``pushed_sha: ""`` (it pushed nothing itself),
+    so a moved final head named in ``owned_heads`` is accepted without in-payload provenance;
+    every other provenance rule stays strict."""
     try:
         data = json.loads(payload)
         if not isinstance(data, dict):
@@ -444,7 +451,8 @@ def parse_review_result(payload: str, *, expected_sha: str | None = None,
             return _invalid("fixes or checks is not a non-empty string list")
         if not checks:
             return _invalid("review checks are missing")
-        if final_sha != reviewed_sha and not pushed_sha:
+        if (final_sha != reviewed_sha and not pushed_sha
+                and final_sha not in owned_heads):
             return _invalid("changed final head has no push provenance")
         if pushed_sha and (pushed_sha != final_sha or final_sha == reviewed_sha):
             return _invalid("push provenance does not identify a new final head")

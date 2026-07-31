@@ -189,3 +189,54 @@ def test_a_stage_with_no_recovery_classifier_keeps_the_full_budget(make_coord):
     identity = coord.submit_stage(_review())
     assert starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE) == 3
     assert record_of(coord, identity).recovery_envelope is None
+
+
+# --- a typed verify miss is named everywhere a human or fresh session looks ---------------
+
+class MissingProofSession(FakeSession):
+    """A worktree stage whose verifier is typed: every unverified ending names the conjunct."""
+
+    def verify(self, record, obs):
+        from agentflow.coordinator.verification import VERIFIED, unverified
+        ending = self._script.get(record.identity)
+        if ending and ending.success:
+            return VERIFIED
+        return unverified("targeted-reply", "no marked agentflow reply names target 'IC_1'")
+
+    def recover(self, record, obs) -> Recovery:
+        return durable_progress(record, "a posted reply to the answered comment")
+
+
+def test_a_typed_verify_miss_is_named_in_envelope_hold_reason_and_telemetry(make_coord):
+    """The diagnosability contract end to end: an unverified ending records its first failed
+    conjunct on the record, hands it to the fresh session's envelope, stamps it into every
+    attempt's telemetry, and the exhaustion hold reason carries it — no more silent False."""
+    from agentflow.coordinator.telemetry import read_attempts
+    fake = MissingProofSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="respond", pool="claude", target="IC_1",
+        source="/wt/pr-7", input_ptr="answer the maintainer comment"))
+    coord.cycle("claude")                              # attempt 1 running
+    fake.end(identity, cause=ProviderCause.NONE)       # clean exit, reply not recognized
+    assert coord.cycle("claude") == []                 # continuation granted, not parked
+
+    rec = record_of(coord, identity)
+    assert rec.verify_miss.startswith("targeted-reply: ")
+    assert "targeted-reply" in (rec.recovery_envelope or "")
+
+    starts_until_held(coord, fake, identity, "claude", ProviderCause.NONE)
+    rec = record_of(coord, identity)
+    assert rec.state == "held" and "targeted-reply" in (rec.hold_reason or "")
+    entries = read_attempts(coord._store.path)
+    assert entries and all(e.verify_miss.startswith("targeted-reply") for e in entries)
+
+
+def test_the_recovery_envelope_names_the_exact_failed_check():
+    from agentflow.coordinator.record import Record
+    record = Record(identity="o/r|7|respond|IC_1", stage="respond", pool="claude", demand=3,
+                    repo="o/r", subject="7", attempts=1, source="/wt/pr-7",
+                    verify_miss="pushed-head: the reply marks change 'abc' but the live PR "
+                                "head is 'def'")
+    env = durable_progress(record, "a posted reply to the answered comment").envelope
+    assert "pushed-head" in env and "must not be redone" in env
