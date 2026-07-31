@@ -380,6 +380,127 @@ def test_the_contested_hold_hands_over_the_draft_and_the_objections(monkeypatch)
     assert released == ["agentflow:triaging"]
 
 
+# --- the remedied ending: the cap no longer converts fixes into a human hold (#418) ------------
+
+# The shape of the recorded objections that motivated this: every surviving objection on #401,
+# #411 and #417 carried the attacker's own "Cheapest fix" and named no fork. Excerpted, not
+# invented — these are the fixtures the gate is judged against.
+_REMEDIED_SETS = {
+    401: ("1. Criterion 3 as written can pass without driving addIfDifferent. "
+          "Cheapest fix: restate it in two halves so a test cannot go green without both.\n"
+          "2. The ~100-line helper has no named home. Cheapest fix: name the module so the "
+          "interface stays deep."),
+    411: ("1. The turn-cap clause never reaches the handoff copy. Cheapest fix: thread the "
+          "clause through the hold reason and pin the copy by test."),
+    417: ("1. Criterion 4's notification clause cannot discriminate. Cheapest fix: delete the "
+          "clause and keep the byte-identical-park half.\n"
+          "2. Criterion 8 passes on today's code. Cheapest fix: isolate the check-status read."),
+}
+
+
+def test_parse_reads_the_typed_remedied_and_fork_pair():
+    result = parse_attack(json.dumps(
+        {"objections": "1. x. Cheapest fix: y.", "remedied": True, "fork": ""}))
+    assert result.remedied and not result.fork and result.remedied_only
+
+
+def test_an_answer_without_the_typed_pair_stays_contested():
+    """Old recorded answers predate the pair; their defaults must hold, never publish."""
+    result = parse_attack(json.dumps({"objections": "1. x"}))
+    assert not result.remedied and not result.remedied_only
+    assert not decode_result(encode_result(result)).remedied_only
+
+
+def test_remedied_only_needs_all_three_facts():
+    assert not AttackResult("", remedied=True).remedied_only, "empty list is survival, not remedy"
+    assert not AttackResult("1. x", remedied=False).remedied_only
+    assert not AttackResult("1. x", remedied=True, fork="A or B?").remedied_only
+    assert not AttackResult("1. x", parsed=False, remedied=True).remedied_only
+    assert AttackResult("1. x", remedied=True).remedied_only
+
+
+def test_the_typed_pair_survives_the_durable_round_trip():
+    original = AttackResult("1. x", remedied=True, fork="ship A or ship B?")
+    assert decode_result(encode_result(original)) == original
+
+
+@pytest.mark.parametrize("issue", sorted(_REMEDIED_SETS))
+def test_replayed_remedied_objection_sets_publish_at_the_cap(monkeypatch, issue):
+    """The recorded #401/#411/#417 shapes — every objection remedied, no fork — publish with the
+    fixes riding in the brief, instead of holding for the maintainer."""
+    result = AttackResult(_REMEDIED_SETS[issue], remedied=True)
+    outcome, calls = _settle(monkeypatch, _attack_record(round=3), result)
+    assert outcome == "url" and "hold" not in calls
+    published, note = calls["publish"]
+    assert "## Final-round objections — apply these fixes" in published.body
+    assert "Cheapest fix" in published.body
+    assert note == hardening_note(3, remedied=True) and "folded into the brief" in note
+
+
+def test_publication_no_longer_requires_an_empty_objection_list(monkeypatch):
+    """The regression pin the issue asks for: a non-empty, all-remedied final round publishes.
+    If the gate ever again publishes only on survived (empty list), this fails."""
+    outcome, calls = _settle(monkeypatch, _attack_record(round=3),
+                             AttackResult("1. real, with its fix.", remedied=True))
+    assert "publish" in calls and "hold" not in calls
+
+
+def test_a_genuine_fork_still_holds_even_when_marked_remedied(monkeypatch):
+    result = AttackResult("1. x. Cheapest fix: y.", remedied=True,
+                          fork="Should enrollment refuse or repair on drift?")
+    outcome, calls = _settle(monkeypatch, _attack_record(round=3), result)
+    assert "hold" in calls and "publish" not in calls
+
+
+def test_the_single_round_standard_path_publishes_remedied_objections_too(monkeypatch):
+    record = _attack_record(_draft(Complexity.STANDARD), round=1)
+    outcome, calls = _settle(monkeypatch, record,
+                             AttackResult("1. x. Cheapest fix: y.", remedied=True))
+    assert "publish" in calls and "hold" not in calls
+
+
+def test_mid_round_remedied_objections_still_redraft_not_publish(monkeypatch):
+    """With rounds left, the loop keeps absorbing fixes the normal way — the remedied ending
+    exists only at the cap, so the cap still bounds the argument and its value is unchanged."""
+    outcome, calls = _settle(monkeypatch, _attack_record(round=1),
+                             AttackResult("1. x. Cheapest fix: y.", remedied=True))
+    assert outcome is None and not calls
+
+
+def test_an_unreadable_final_round_is_still_held_despite_the_new_ending(monkeypatch):
+    outcome, calls = _settle(monkeypatch, _attack_record(round=3), parse_attack("not json"))
+    assert "hold" in calls and "publish" not in calls
+
+
+def test_the_contested_hold_leads_with_the_fork(monkeypatch):
+    from agentflow import handoff as handoff_mod
+
+    fake = _install(monkeypatch, FakeGH())
+    monkeypatch.setattr(handoff_mod.DurableHandoff, "hand_off",
+                        lambda self, subject, *, identity, stage, marker, action, notification:
+                        (action(), "https://github.com/o/r/issues/380")[1])
+    monkeypatch.setattr(coordinated_attack.github, "issue_headline",
+                        lambda repo, n: IssueView(title="a title", body="", state="OPEN",
+                                                  url="", labels={READY}, comments=[]))
+    monkeypatch.setattr(coordinated_attack, "release", lambda repo, n, label: True)
+
+    result = AttackResult("1. detail. Cheapest fix: z.",
+                          fork="Should enrollment refuse or repair on drift?")
+    url = coordinated_attack.hold_contested(_attack_record(round=3), _draft(), result)
+    assert url is not None
+    fork_at = fake.posted_comment.index("refuse or repair")
+    objections_at = fake.posted_comment.index("1. detail")
+    assert fork_at < objections_at, "the maintainer's question is the fork, not the edit list"
+    assert "question only you can settle" in fake.posted_comment
+
+
+def test_the_attacker_is_told_the_stakes_of_the_typed_pair():
+    prompt = attack_prompt("o/r", 380, "t", "b")
+    assert '"remedied"' in prompt and '"fork"' in prompt
+    assert "applied to the published brief verbatim" in prompt
+    assert "A wording preference is never a fork" in prompt
+
+
 # --- the session the attack runs in ------------------------------------------------------------
 
 def test_the_attack_runs_read_only_under_intakes_ceiling():
