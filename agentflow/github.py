@@ -643,6 +643,88 @@ def pr_checks_passed(repo: str, pr: int) -> bool:
     return _gh(["pr", "checks", str(pr), "--repo", repo]).returncode == 0
 
 
+# The head check gate's state mapping (ADR 417), across both vocabularies GitHub returns in one
+# rollup context list: check runs speak `conclusion`, legacy statuses speak `state`. `cancelled`
+# and `stale` are deliberately not red — a cancelled run recorded no verdict, and parking a PR on
+# one is a false human interrupt. An outcome named by neither table changes nothing: a missing
+# entry never invents a disposition.
+_CHECK_RUN_RED = frozenset({"FAILURE", "TIMED_OUT", "ACTION_REQUIRED"})
+_STATUS_RED = frozenset({"FAILURE", "ERROR"})
+_STATUS_PENDING = frozenset({"PENDING", "EXPECTED"})
+
+
+@dataclass(frozen=True)
+class HeadChecks:
+    """The checks reported on one exact commit — the head check gate's whole answer (ADR 417).
+
+    ``failing`` carries the red contexts' names (empty means not red), because the revise finding
+    and the park body both must name the check, and a second read to fetch names would defeat the
+    first. ``pending`` reports whether anything is still running — it never blocks a settlement,
+    only distinguishes "green" from "not finished" for whoever logs it. A commit with no checks at
+    all reads as neither red nor pending: absent checks settle exactly as today."""
+    sha: str
+    failing: tuple[str, ...] = ()
+    pending: bool = False
+    action_required: bool = False
+
+
+def head_checks_from_rollup(nodes: list[dict], sha: str) -> HeadChecks:
+    """Map one status-check-rollup context list onto the gate's typed answer. Pure (test
+    surface); the two-vocabulary mapping above is the whole behavior."""
+    failing: list[str] = []
+    pending = False
+    action_required = False
+    for node in nodes:
+        kind = node.get("__typename", "")
+        if kind == "CheckRun":
+            if (node.get("status") or "").upper() != "COMPLETED":
+                pending = True
+                continue
+            conclusion = (node.get("conclusion") or "").upper()
+            if conclusion in _CHECK_RUN_RED:
+                failing.append(node.get("name") or "unnamed check")
+                action_required = action_required or conclusion == "ACTION_REQUIRED"
+        elif kind == "StatusContext":
+            state = (node.get("state") or "").upper()
+            if state in _STATUS_RED:
+                failing.append(node.get("context") or "unnamed status")
+            elif state in _STATUS_PENDING:
+                pending = True
+    return HeadChecks(sha=sha, failing=tuple(failing), pending=pending,
+                      action_required=action_required)
+
+
+_ROLLUP_QUERY = (
+    "query($owner:String!,$name:String!,$oid:GitObjectID!){"
+    "repository(owner:$owner,name:$name){object(oid:$oid){... on Commit{"
+    "statusCheckRollup{contexts(first:100){nodes{__typename "
+    "... on CheckRun{name status conclusion} "
+    "... on StatusContext{context state}}}}}}}}")
+
+
+def commit_head_checks(repo: str, sha: str) -> HeadChecks | None:
+    """The status-check rollup for one exact commit, or ``None`` when GitHub is unreadable.
+
+    The commit's rollup is the one read that returns check runs *and* legacy status contexts in a
+    single list, which is what makes the two-vocabulary mapping tractable; there is no `gh`
+    porcelain for an arbitrary commit's rollup, so this is a named GraphQL escape-hatch call.
+    A missing commit (rewritten away by a force-push) is unreadable, not green: the gate must
+    defer, never guess. A commit whose rollup is null simply has no checks."""
+    owner, _, name = repo.partition("/")
+    data = api(["api", "graphql",
+                "-f", f"query={_ROLLUP_QUERY}",
+                "-f", f"owner={owner}", "-f", f"name={name}", "-f", f"oid={sha}"],
+               parse_json=True)
+    if not isinstance(data, dict):
+        return None
+    commit = ((data.get("data") or {}).get("repository") or {}).get("object")
+    if not isinstance(commit, dict):
+        return None
+    rollup = commit.get("statusCheckRollup") or {}
+    nodes = (rollup.get("contexts") or {}).get("nodes") or []
+    return head_checks_from_rollup([n for n in nodes if isinstance(n, dict)], sha)
+
+
 def merge_pr(repo: str, pr: int) -> bool:
     """Squash-merge the PR and delete its head branch. Returns whether the command succeeded."""
     return _gh(["pr", "merge", str(pr), "--repo", repo,

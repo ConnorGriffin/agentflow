@@ -852,6 +852,8 @@ def test_clean_reviewed_settlement_posts_one_summary_and_returns_durable_proof(m
         "agentflow.gate.post_clean_review_summary",
         lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.github.commit_head_checks",
+                        lambda _repo, sha: github.HeadChecks(sha=sha))
 
     proof = coordinated_review._settle_review(record)
     assert proof == "https://github.com/o/r/pull/42"
@@ -881,6 +883,8 @@ def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeyp
     monkeypatch.setattr("agentflow.github.remove_label",
                         lambda repo, issue, label: label_edits.append((issue, label)) or True)
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.github.commit_head_checks",
+                        lambda _repo, sha: github.HeadChecks(sha=sha))
     coordinated_review._REVIEW_CI_OBSERVED[record.identity] = True
 
     assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
@@ -913,6 +917,8 @@ def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch
                         lambda _repo, pr: merged.append(pr) or True)
     monkeypatch.setattr("agentflow.github.remove_label", lambda *_args: True)
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.github.commit_head_checks",
+                        lambda _repo, sha: github.HeadChecks(sha=sha))
     coordinated_review._REVIEW_CI_OBSERVED[record.identity] = True
 
     assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
@@ -968,6 +974,8 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, content, comments,
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+    monkeypatch.setattr("agentflow.github.commit_head_checks",
+                        lambda _repo, sha: github.HeadChecks(sha=sha))
     coordinated_review._REVIEW_CI_OBSERVED[record.identity] = ci_green
 
     proof = coordinated_review._settle_review(record)
@@ -1052,6 +1060,8 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+    monkeypatch.setattr("agentflow.github.commit_head_checks",
+                        lambda _repo, sha: github.HeadChecks(sha=sha))
 
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
@@ -1240,6 +1250,8 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
                         lambda *args, **kwargs: pytest.fail("forced same-tool review skips CI merge"))
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
+    monkeypatch.setattr("agentflow.github.commit_head_checks",
+                        lambda _repo, sha: github.HeadChecks(sha=sha))
 
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
