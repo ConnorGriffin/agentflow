@@ -278,6 +278,20 @@ First, prove you looked: run `gh pr view {pr} --json headRefOid,files,body` and
 {surfaces}), also run `gh pr view {pr} --json comments` to check for attached screenshots.
 Judge the PR as a merge-ready artifact — its body and evidence, not only its diff.
 
+Also read the checks reported on the exact head you are reviewing (`gh pr checks {pr}`) and
+record what you saw in your "checks" proof. A red check you can fix, fix and push like any other
+correction. A red check you cannot fix is `fix_before_completion` — never PASS over it. Pending
+checks block nothing. (A mechanical gate also reads the reviewed head's checks at settlement,
+independent of your verdict — you cannot waive this one.)
+
+If your local test run fails for reasons that look environmental, a differential run against
+`main` counts as evidence ONLY when the baseline is demonstrably the baseline — same interpreter,
+same installed package, the compared tree actually checked out — and your "checks" proof states
+how you verified that. Dismiss a failure the change could plausibly reach only with an
+individually named cause, never wholesale because the set matches `main`. A local run too noisy
+to read is unusable evidence: say so, and lean on the PR's own checks instead of reasoning
+around the noise.
+
 You own bounded cleanup in this review; do not merely report work you can safely finish:
 - Fix every clear in-scope correctness, security, acceptance, or charter issue yourself.
 - Fix grounded stale helpers, broken evidence, misleading prose, and naming/style defects when they

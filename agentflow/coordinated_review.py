@@ -775,8 +775,53 @@ def _prepare_review_settlement(record) -> bool:
     return True
 
 
+# The head check gate's two park reasons (ADR 417). Each is a fixed constant — the failing check
+# names ride in the park *context*, never the reason, because the reason derives the park's proof
+# marker: a reason that varied with the failing set would churn the marker and rewrite the park
+# body every cycle the set changed.
+RED_CHECK_SPENT_REASON = ("has a failing check on its reviewed head and no automatic revise "
+                          "rounds remain")
+ACTION_REQUIRED_REASON = "has a check on its reviewed head that is asking for a human directly"
+
+
+def _red_check_lines(checks) -> tuple[str, ...]:
+    """The park/handoff Checks lines for one red rollup: every failing check named against the
+    exact commit it was read on. Pure (test surface)."""
+    return tuple(f"Check `{name}` completed red on reviewed head {checks.sha}."
+                 for name in checks.failing)
+
+
+def _settle_red_check(record, verdict, workdir: str, pr: int, checks,
+                      *, autonomous: bool) -> str | None:
+    """One red rollup caught at a would-be-clean settlement (ADR 417).
+
+    ``action_required`` parks immediately — that check is by definition asking for a human, and
+    sending a builder at it is guaranteed spend for a guaranteed park. Spent revise rounds park
+    too, with the failing check named. Otherwise the record is left unsettled, *silently* — no
+    comment announces the overruled clean verdict — and the revise opener spends a round on the
+    machine-fixable failure. An unreadable store defers like any other unreadable answer here.
+    """
+    if checks.action_required:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=ACTION_REQUIRED_REASON, autonomous=autonomous,
+            checks=_red_check_lines(checks),
+            missing="A check on the reviewed head requires direct human action.")
+    try:
+        records = tracer.load_records()
+    except StoreUnavailable:
+        return None
+    if (record.round >= MAX_REVISES
+            or not revise_round_budget_remains(records, record.repo, record.subject)):
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=RED_CHECK_SPENT_REASON, autonomous=autonomous,
+            checks=_red_check_lines(checks),
+            missing="The reviewed head's build is red and the automatic revise rounds are spent.")
+    return None  # the revise opener owns this round; nothing settles or posts this cycle
+
+
 def _park_review_settlement(record, verdict, workdir: str, pr: int,
-                            *, reason: str, autonomous: bool) -> str | None:
+                            *, reason: str, autonomous: bool,
+                            checks=None, missing=None) -> str | None:
     """Idempotently park, prove, clean up, and notify one completed Review.
 
     The park-comment-once-then-notify envelope is the shared :class:`DurableHandoff` recipe (ADR
@@ -798,8 +843,8 @@ def _park_review_settlement(record, verdict, workdir: str, pr: int,
             record.repo, pr, verdict, reason=reason,
             context=park_context(
                 record, verdict, reason=reason,
-                missing=verdict.detail or "Grounded review actions remain unresolved.",
-                uncertainty=chain_uncertainty(record)),
+                missing=missing or verdict.detail or "Grounded review actions remain unresolved.",
+                uncertainty=chain_uncertainty(record), checks=checks),
             proof_marker=marker),
         notification=Notification(
             "agentflow needs you", f"{record.repo} PR #{pr}: reviewed — your action"))
@@ -864,8 +909,18 @@ def _settle_review(record) -> str | None:
 
     surfaces = ui_surfaces(workdir)
     ui_gap = ui_evidence_gap(record.repo, pr, surfaces)
+    # The head check gate (ADR 417): a clean exit first reads the checks on the exact reviewed
+    # head, from GitHub — a reviewer cannot clear it by not looking. It is consulted only on the
+    # exits that would otherwise finish clean: an unreadable answer defers only the clean
+    # settlement, and every park below still completes. Pending and absent checks change nothing.
     if not autonomous:
         if verdict.clean and not ui_gap:
+            head_checks = github.commit_head_checks(record.repo, reviewed_head)
+            if head_checks is None:
+                return None
+            if head_checks.failing:
+                return _settle_red_check(
+                    record, verdict, workdir, pr, head_checks, autonomous=False)
             if not post_clean_review_summary(record.repo, pr, verdict):
                 return None
             slug = _review_slug(record)
@@ -878,6 +933,12 @@ def _settle_review(record) -> str | None:
             record, verdict, workdir, pr, reason=reason, autonomous=False)
     if record.review_tainted and not record.review_taint_cleared:
         if verdict.clean and not ui_gap:
+            head_checks = github.commit_head_checks(record.repo, reviewed_head)
+            if head_checks is None:
+                return None
+            if head_checks.failing:
+                return _settle_red_check(
+                    record, verdict, workdir, pr, head_checks, autonomous=True)
             if not post_clean_review_summary(record.repo, pr, verdict):
                 return None
             slug = _review_slug(record)
@@ -896,6 +957,18 @@ def _settle_review(record) -> str | None:
         return _park_review_settlement(
             record, verdict, workdir, pr, reason=reason, autonomous=True)
 
+    # The auto-merge arm's own head check gate consult: only when this exit would otherwise be a
+    # clean merge — a UI gap or an unanswered maintainer question is already a park, and a park
+    # must still complete when the check read is unreadable (ADR 417). A caught red opens a revise
+    # round here too, ahead of the merge decision; the merge-time CI wait below is unchanged.
+    pending_reply = reply_pending(comments)
+    if not ui_gap and not pending_reply:
+        head_checks = github.commit_head_checks(record.repo, reviewed_head)
+        if head_checks is None:
+            return None
+        if head_checks.failing:
+            return _settle_red_check(
+                record, verdict, workdir, pr, head_checks, autonomous=True)
     # CI already completed in prepare_completed, outside SQLite's write transaction. Recheck it
     # once without polling, together with the exact head, immediately before merge.
     ci_green = _REVIEW_CI_OBSERVED.pop(record.identity, None)
@@ -903,9 +976,8 @@ def _settle_review(record) -> str | None:
         return None
     # The one merge decision: the UI-evidence gap and an unanswered maintainer question are the
     # gate's own blockers, decided there rather than a second time here. A clean verdict can only
-    # come back non-MERGE as a blocker or on red CI, and settlement parks either — it never churns
-    # a revise round over a red build.
-    pending_reply = reply_pending(comments)
+    # come back non-MERGE as a blocker or on pending CI, and settlement parks either — a red head
+    # never reaches it (the gate above owns red), so no revise round churns here.
     decision = decide_merge(
         verdict=verdict, ci_green=ci_green, reviewer_tool=record.pool,
         builder_tool=record.change_author_tool or record.builder_lineage or "",

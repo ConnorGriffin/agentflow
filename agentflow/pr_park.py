@@ -84,13 +84,16 @@ class ParkCopy:
     next_action: str = ""
 
 
-def park_context(record, verdict, *, reason: str, missing: str, uncertainty=None, wording=None):
+def park_context(record, verdict, *, reason: str, missing: str, uncertainty=None, wording=None,
+                 checks=None):
     """Build the concrete two-section park contract from durable stage state.
 
     ``uncertainty`` is the exact-head chain's unanswered decision, supplied by the caller so one
     park reads the durable chain once. ``wording`` lets a park with no recorded decision at all
     describe its own execution failure end to end, instead of borrowing options, consequences, and
-    a recommendation that all name a decision nobody recorded.
+    a recommendation that all name a decision nobody recorded. ``checks`` lets a stage that
+    observed the check facts itself (the head check gate, ADR 417) print them instead of the
+    reviewer's own claimed proof.
     """
     from agentflow.gate import ParkContext
     from agentflow.review_policy import ReviewState
@@ -108,7 +111,8 @@ def park_context(record, verdict, *, reason: str, missing: str, uncertainty=None
     if not locations:
         locations = (f"PR #{park_pr_number(record) or '?'} exact head {record.target or 'unknown'}",)
     ledger = ReviewState.from_record(record)
-    checks = (tuple(verdict.checks) if verdict is not None and verdict.checks
+    checks = (tuple(checks) if checks
+              else tuple(verdict.checks) if verdict is not None and verdict.checks
               else (ledger.checks if ledger is not None and ledger.checks else (
                   "No completed check proof was recorded before the stage stopped.",)))
     miss = getattr(record, "verify_miss", "")
