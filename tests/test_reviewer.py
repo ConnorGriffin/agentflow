@@ -37,6 +37,17 @@ def test_reviewer_prompt_calibrates_against_speculative_hardening():
     assert "name in the finding the enforced invariant" in prompt
 
 
+def test_reviewer_prompt_files_follow_ups_bare_of_pipeline_labels():
+    # A follow-up born `ready-for-agent` with no dials sits in the permanent gap between
+    # "looks triaged" and "can never build" (#433) — the prompt orders it filed label-free so
+    # intake triages it and stamps its dials like any other new issue.
+    prompt = " ".join(REVIEW_PROMPT.split())
+
+    assert "File it with NO labels" in prompt
+    assert "never `ready-for-agent` and never any `agentflow:*` label" in prompt
+    assert "earns its dials there" in prompt
+
+
 def test_pass_with_no_findings_is_clean():
     assert parse_verdict('{"verdict": "PASS", "findings": []}').clean is True
 
