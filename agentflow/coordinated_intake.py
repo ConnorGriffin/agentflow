@@ -113,11 +113,46 @@ def _intake_ref(record) -> WorktreeRef | None:
 
 
 def intake_claim_ready(record) -> bool:
-    """Prove the durable Intake record still owns GitHub's triaging claim before admission."""
-    labels = github.issue_labels(record.repo, int(record.subject))
-    if labels is None:   # fail closed: a read that couldn't reach GitHub stays unknown
+    """Prove the durable Intake record still owns GitHub's triaging claim before admission —
+    on an issue that is still open. Closing an issue does not strip its labels, so the label
+    alone would admit a session to triage a closed issue (#438); refusing here keeps the
+    session unspent while :func:`_retire_dead_intakes` retires the record."""
+    standing = github.issue_standing(record.repo, int(record.subject))
+    if standing is None:   # fail closed: a read that couldn't reach GitHub stays unknown
         return False
-    return TRIAGING in labels
+    return TRIAGING in standing.labels and standing.state != "CLOSED"
+
+
+def _retire_dead_intakes(coord) -> None:
+    """Retire an Intake — or the attack round carrying its transferred claim — whose issue has
+    been closed under it, before a session is spent triaging or arguing a subject nothing can
+    act on (#438), the same disposition :func:`coordinated_revise._retire_dead_revises` takes
+    for a Revise of a gone PR.
+
+    Fixing an issue by hand while its triage sits queued is a legitimate operator action, and
+    closing the issue does not strip its labels: the record would otherwise pass its claim
+    proof the moment pool headroom returned and launch a real session against the closed
+    issue. This runs every reconcile pass, before admission, over the durable records. The
+    triaging label comes off the closed issue *before* the record retires, so the operator's
+    label view agrees; a release that cannot prove the label is gone leaves the record for a
+    later pass rather than retiring over a claim GitHub still shows.
+
+    Trust boundary: an unreadable GitHub answer never retires — ``None`` means "couldn't
+    check", never "closed". Only a definite CLOSED state retires the record."""
+    from agentflow.coordinated_review import _kill_running_family
+    from agentflow.coordinator import tracer
+    from agentflow.coordinator.record import RUNNING
+    for record in tracer.load_records():
+        if record.stage not in ("intake", "attack") or record.retired or not record.claim:
+            continue
+        state = github.issue_state(record.repo, int(record.subject))
+        if state != "CLOSED":
+            continue  # unreadable (None) fails closed; an open issue is live triage work
+        if record.state == RUNNING:
+            _kill_running_family(record)
+        if not release(record.repo, int(record.subject), TRIAGING):
+            continue  # the label must provably come off before the record drops the claim
+        coord.retire_stale_intake(record.identity)
 
 
 def apply_route(record, result: IntakeResult) -> str | None:

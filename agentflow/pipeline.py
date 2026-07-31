@@ -698,6 +698,10 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     # re-driving continuations against nothing and finally parking a PR number that no longer
     # resolves (#432).
     coordinated_revise._retire_dead_revises(coord)
+    # And retire an Intake or attack round whose issue was closed under it — stripping the
+    # triaging label the closure left behind — rather than spending a session triaging or
+    # arguing a closed issue the moment pool headroom returns (#438).
+    coordinated_intake._retire_dead_intakes(coord)
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
     # Handoffs are driven from durable state, not only this process's outcomes. A daemon may

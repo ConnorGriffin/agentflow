@@ -231,12 +231,16 @@ def attack_claim_ready(record) -> bool:
     """Prove the durable attack record still owns GitHub's triaging claim before admission.
 
     It is triage's claim, transferred — an attack round is still the issue being decided, and
-    the moment that claim is gone something else has taken the issue over.
+    the moment that claim is gone something else has taken the issue over. The issue must also
+    still be open: closing it does not strip its labels, so a chain whose issue closed
+    mid-argument would otherwise keep arguing a decision nobody can act on (#438); refusing
+    here keeps the session unspent while :func:`coordinated_intake._retire_dead_intakes`
+    retires the record.
     """
-    labels = github.issue_labels(record.repo, int(record.subject))
-    if labels is None:   # fail closed: a read that couldn't reach GitHub stays unknown
+    standing = github.issue_standing(record.repo, int(record.subject))
+    if standing is None:   # fail closed: a read that couldn't reach GitHub stays unknown
         return False
-    return TRIAGING in labels
+    return TRIAGING in standing.labels and standing.state != "CLOSED"
 
 
 def publish_brief(record, draft: IntakeResult, hardening: str) -> str | None:

@@ -354,6 +354,30 @@ class Coordinator:
                               "gone; nothing left to revise; retired silently, claim released")
             return True
 
+    def retire_stale_intake(self, identity: str) -> bool:
+        """Silently retire an Intake or attack round whose issue is closed — before any session is
+        charged triaging or arguing a subject nothing can act on (#438): the triage-side
+        counterpart of ``retire_stale_review``/``retire_stale_revise``. The record releases its
+        claim with no comment and no notification; the caller has already stripped the GitHub
+        triaging label, so the operator's label view agrees. A pending hold handoff is withdrawn
+        too — a held triage of a closed issue asks a human for a decision nobody can act on.
+        Idempotent: a repeat finds it already retired and does nothing."""
+        with self._lock:
+            record = self._store.record_of(identity)
+            if (record is None or record.retired or record.stage not in ("intake", "attack")
+                    or not record.claim):
+                return False
+            self._release(record)
+            record.state = COMPLETED
+            record.claim = False
+            record.hold_pending = False
+            record.retired = True
+            if not self._persist(record, retire_descendants=True):
+                return False
+            self._emit(record, f"attempt {record.attempts}/{ATTEMPT_BUDGET} — issue closed; "
+                              "nothing left to triage; retired silently, claim released")
+            return True
+
     def park_stale_review(self, identity: str) -> "StageOutcome | None":
         """Park a Review whose PR head moved off its immutable target once the auto-revise rounds are
         spent: the stranded record can open no bounded successor, so the PR is handed to a human
