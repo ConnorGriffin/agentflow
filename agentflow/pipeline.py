@@ -218,6 +218,12 @@ class _ProductionGate:
         # per-record deferral instead of a record stalling silently under pacing (#436). Only
         # a not-clear pool status is recorded: a pace-budget refusal self-resolves next cycle.
         self._deferred: dict[str, str] = {}
+        # A capacity observation that *raised* left no status object at all, so no reason string
+        # exists for the deferral line to name (#365). The crash is recorded here against the
+        # record's own pool and reported once per pool per cycle — a raising check raises for
+        # every record on that pool, so one line is honest and N would be spam. ``None`` marks
+        # an already-reported crash, keeping the rest of the cycle silent.
+        self._crashed: dict[str, str | None] = {}
         # Capacity facts are one observation per pool per coordinator cycle. The gate is evaluated
         # once for every waiting record; re-running the external helper for each one can serialize
         # its 30-second timeout across the whole queue and hold the daemon pass for minutes.
@@ -233,6 +239,7 @@ class _ProductionGate:
         self._active.pop(pool, None)
         self._paced.pop(pool, None)
         self._deferred.pop(pool, None)
+        self._crashed.pop(pool, None)
 
     def __call__(self, record) -> bool:
         from agentflow import balancer
@@ -273,7 +280,13 @@ class _ProductionGate:
                 status = balancer._codex_dispatch_status(status, time.time())
             elif status is not None and record.pool == "claude":
                 status = balancer._claude_dispatch_status(status, time.time())
-        except Exception:
+        except Exception as e:
+            # Still refuse — a crashed check must never admit — but not in silence: with no
+            # status object there is no reason for the deferral line to surface, so name the
+            # crash itself (#365). Keyed by the record's own pool: the migration scan can
+            # observe the other pool mid-cycle, and the crash concerns the pool it hit.
+            self._crashed.setdefault(
+                record.pool, f"capacity check failed: {type(e).__name__}: {e}")
             return False
         if not status or not status.clear:
             if status is not None and status.reason:
@@ -285,8 +298,13 @@ class _ProductionGate:
 
     def deferral_reason(self, record) -> str | None:
         """Why the last admission check refused this record's pool — the headroom/pacing reason
-        the coordinator's per-record deferral line names (#436) — or ``None`` for a refusal
-        with nothing durable to report (the per-cycle pace budget, a query failure)."""
+        the coordinator's per-record deferral line names (#436), or the capacity-check crash
+        that refused with no status at all (#365, reported once per pool per cycle) — or
+        ``None`` for a refusal with nothing durable to report (the per-cycle pace budget)."""
+        crash = self._crashed.get(record.pool)
+        if crash is not None:
+            self._crashed[record.pool] = None  # one line per pool per cycle, never per record
+            return crash
         return self._deferred.get(record.pool)
 
     @staticmethod
