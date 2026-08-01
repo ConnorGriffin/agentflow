@@ -106,9 +106,12 @@ def install(config: Path) -> None:
     }
     helper = os.environ.get("AGENTFLOW_CAPACITY_HELPER")
     if helper:
-        daemon_environment["AGENTFLOW_CAPACITY_HELPER"] = str(
-            Path(helper).expanduser().resolve()
-        )
+        helper_path = Path(helper).expanduser().resolve()
+        if not helper_path.is_file():
+            raise ServiceError(
+                f"AGENTFLOW_CAPACITY_HELPER does not resolve to a file: {helper}"
+            )
+        daemon_environment["AGENTFLOW_CAPACITY_HELPER"] = str(helper_path)
     daemon_plist = _write_service(
         DAEMON_LABEL,
         [executable, "daemon"],

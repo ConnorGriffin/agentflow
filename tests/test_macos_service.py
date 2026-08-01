@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
-from agentflow.macos_service import probe_console
+import pytest
+
+from agentflow.macos_service import ServiceError, install, probe_console
 
 
 class _SnapshotHandler(BaseHTTPRequestHandler):
@@ -53,3 +56,21 @@ def test_probe_console_reports_unreachable_on_a_non_ok_status():
     finally:
         server.shutdown()
         thread.join(timeout=5)
+
+
+def test_install_rejects_a_capacity_helper_that_does_not_resolve_to_a_file(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("AGENTFLOW_CAPACITY_HELPER", str(tmp_path / "missing-helper"))
+    config = tmp_path / "agentflow.toml"
+    config.write_text("")
+
+    with pytest.raises(ServiceError, match="AGENTFLOW_CAPACITY_HELPER"):
+        install(config)
+
+    # Nothing is left behind for launchctl to load: a bad helper path fails before
+    # either service's plist is written or (re)loaded.
+    assert not (home / "Library" / "LaunchAgents" / "agentflow.daemon.plist").exists()
+    assert not (home / "Library" / "LaunchAgents" / "agentflow.console.plist").exists()
