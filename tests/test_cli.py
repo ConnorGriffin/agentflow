@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from unittest import mock
 
-from agentflow import cli
+from agentflow import cli, live
 
 
 ROOT = Path(__file__).parents[1]
@@ -97,6 +97,10 @@ workspace = true
         ("publish", ["owner/first", "owner/second"]),
     ]
     assert not (state / "daemon.lock").exists()
+    # The unmocked live.mark_cycle write lands inside the private test directory, not wherever
+    # AGENTFLOW_STATE pointed when agentflow.live was first imported (issue #396).
+    assert live.DAEMON_FILE == tmp_path / "daemon-status.json"
+    assert live.daemon_status() != {}
 
 
 def test_resume_status_and_pause_control_cold_submission(tmp_path):
@@ -174,6 +178,9 @@ workdir = "{checkout}"
         "capacity helper not configured" in call.args[0]
         for call in daemon_log.call_args_list
     )
+    # The unmocked live.mark_cycle write lands inside the private test directory (issue #396).
+    assert live.DAEMON_FILE == tmp_path / "daemon-status.json"
+    assert live.daemon_status() != {}
 
 
 def test_service_install_supervises_the_daemon_with_explicit_runtime_paths(tmp_path):
