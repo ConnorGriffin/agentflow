@@ -145,6 +145,27 @@ def test_console_starts_from_the_same_public_command():
     start_console.assert_called_once_with()
 
 
+def test_status_reports_the_daemon_and_console_independently(
+    tmp_path, capsys, monkeypatch
+):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path / "state"))
+
+    with mock.patch("agentflow.macos_service.probe_console", return_value=True):
+        cli.main(["status"])
+    reachable = capsys.readouterr().out.splitlines()
+
+    with mock.patch("agentflow.macos_service.probe_console", return_value=False):
+        cli.main(["status"])
+    unreachable = capsys.readouterr().out.splitlines()
+
+    assert reachable[-1] == "console: reachable"
+    assert unreachable[-1] == "console: unreachable"
+    # Dispatch pause and daemon process are already independent facts (issue #371); the
+    # console line is a third, equally independent fact — none of the three implies another.
+    assert reachable[0] == unreachable[0]
+    assert reachable[1] == unreachable[1]
+
+
 def test_public_daemon_selects_the_bundled_capacity_helper(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENTFLOW_CAPACITY_HELPER", raising=False)
     monkeypatch.delenv("AGENTFLOW_TRIAGE_GATE", raising=False)
@@ -260,10 +281,30 @@ workdir = "{checkout}"
     path_entries = environment["PATH"].split(os.pathsep)
     assert str(Path(service["ProgramArguments"][0]).parent) in path_entries
     assert str(fake_bin) in path_entries
+
+    console_plist_path = home / "Library" / "LaunchAgents" / "agentflow.console.plist"
+    with console_plist_path.open("rb") as stream:
+        console_service = plistlib.load(stream)
+    assert console_service["Label"] == "agentflow.console"
+    assert console_service["ProgramArguments"] == [
+        service["ProgramArguments"][0],
+        "console",
+    ]
+    assert console_service["KeepAlive"] is True
+    assert "RunAtLoad" not in console_service
+    console_environment = console_service["EnvironmentVariables"]
+    assert console_environment["AGENTFLOW_STATE"] == str(state.resolve())
+    assert "AGENTFLOW_CONFIG" not in console_environment
+    assert "AGENTFLOW_CAPACITY_HELPER" not in console_environment
+    assert console_service["StandardOutPath"] != service["StandardOutPath"]
+    assert Path(console_service["StandardOutPath"]).name == "agentflow-console.log"
+
     domain = f"gui/{os.getuid()}"
     assert launchctl_log.read_text().splitlines() == [
         f"bootout {domain}/agentflow.daemon",
         f"bootstrap {domain} {plist_path}",
+        f"bootout {domain}/agentflow.console",
+        f"bootstrap {domain} {console_plist_path}",
     ]
     state.mkdir()
     (state / "enabled").touch()
@@ -280,8 +321,12 @@ workdir = "{checkout}"
     assert removed.returncode == 0, removed.stderr
     assert removed.stdout.strip() == "daemon service removed"
     assert not plist_path.exists()
+    assert not console_plist_path.exists()
     assert config.exists()
+    # Removing the service stops both processes but never touches dispatch pause state:
+    # the console and daemon lifecycle is independent of cold submission (issue #371).
     assert (state / "enabled").exists()
-    assert launchctl_log.read_text().splitlines()[-1] == (
-        f"bootout {domain}/agentflow.daemon"
-    )
+    assert launchctl_log.read_text().splitlines()[-2:] == [
+        f"bootout {domain}/agentflow.daemon",
+        f"bootout {domain}/agentflow.console",
+    ]

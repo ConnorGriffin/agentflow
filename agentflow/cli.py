@@ -131,12 +131,15 @@ def main(argv: list[str] | None = None) -> int | None:
         (_state_dir() / "enabled").unlink(missing_ok=True)
         print("cold submission paused")
     elif args.command == "status":
+        from agentflow.macos_service import probe_console
+
         state = _state_dir()
         print(
             "cold submission: "
             + ("enabled" if (state / "enabled").exists() else "paused")
         )
         print("daemon: " + ("running" if _daemon_running(state) else "stopped"))
+        print("console: " + ("reachable" if probe_console() else "unreachable"))
     elif args.command == "console":
         from agentflow import webapp
 

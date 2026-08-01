@@ -41,6 +41,32 @@ ownership, attempts, permits, claims, or recovery; use the coordinator records a
 An orphaned visible claim is held for a one-hour safety grace before removal so a short,
 deterministic interactive scope operation cannot race the daemon.
 
+## Console service
+
+`uv run agentflow service install` starts the daemon and the read-only operator console
+(ADR 0035) as two separate per-user LaunchAgents from the same installed checkout — restart
+after an unexpected exit is `KeepAlive`, one job per process. Pausing cold submission
+(`uv run agentflow pause`) does not touch either service; the console stays up and readable
+while dispatch is paused. Only `service install` (reload) and `service remove` change
+which processes are running.
+
+- **URL** — the console binds only to loopback: `http://127.0.0.1:8788`. It never queries
+  GitHub directly; it serves the daemon's last published snapshot.
+- **Logs** — `~/Library/Logs/agentflow.log` (daemon) and
+  `~/Library/Logs/agentflow-console.log` (console), each the corresponding LaunchAgent's
+  combined stdout/stderr.
+- **Health check** — `uv run agentflow status` reports `daemon`, `console`, and `cold
+  submission` as three independent facts (process failure and dispatch pause are not the
+  same thing, and neither implies the other). The `console` line is a live `GET
+  /api/snapshot` probe against `127.0.0.1:8788`; the same check can be run by hand:
+  `curl -sf http://127.0.0.1:8788/api/snapshot`.
+- **Restart** — `uv run agentflow service install` rewrites both LaunchAgents with the
+  current executable and environment, then reloads both in place (`launchctl bootout` +
+  `bootstrap`).
+- **Removal** — `uv run agentflow service remove` stops and unloads both LaunchAgents and
+  deletes only their generated plists. It does not touch coordinator state, configuration,
+  or the cold-submission enabled flag.
+
 ### Wayfinder research awaiting disposition
 
 Closed Wayfinder research always has a durable disposition; no hidden issues-to-file list
