@@ -12,8 +12,10 @@ from conftest import FakeSession, permits, record_of, starts_until_held
 from agentflow import coordinated_intake, github, intake as intake_mod, loop, pipeline
 from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import tracer
+from agentflow.coordinator.record import WAITING
 from agentflow.coordinator.providers import (EndingReason, ProviderCause,
                                              ProviderObservation)
+from agentflow.worktree_ref import WorktreeRef
 
 _READY_MESSAGE = ('{"route":"ready","title":"Scoped","body":"brief",'
                   '"complexity":"deep","effort":"medium"}')
@@ -138,8 +140,7 @@ def test_parsed_route_is_durable_before_projection_even_after_bad_exit(make_coor
     coord = make_coord(fake, adapter=adapter)
     identity = coord.submit_stage(_submission())
     coord.cycle("claude")
-    fake.message = ('{"route":"ready","title":"Scoped","body":"brief",'
-                    '"complexity":"deep","effort":"medium"}')
+    fake.message = '{"route":"grill","body":"question"}'
     fake.end(identity, cause=ProviderCause.PROCESS)
 
     outcomes = coord.cycle("claude")
@@ -163,8 +164,7 @@ def test_completed_projection_logs_durable_claim_release(make_coord):
     coord = make_coord(fake, adapter=adapter, log=lines.append)
     identity = coord.submit_stage(_submission())
     coord.cycle("claude")
-    fake.message = ('{"route":"ready","title":"Scoped","body":"brief",'
-                    '"complexity":"deep","effort":"medium"}')
+    fake.message = '{"route":"grill","body":"question"}'
     fake.end(identity, cause=ProviderCause.PROCESS)
 
     coord.cycle("claude")
@@ -189,6 +189,43 @@ def test_unprojected_completed_intake_keeps_rollback_draining(make_coord):
 
     assert record_of(coord, identity).state == "completed"
     assert tracer.owned_issues(coord._store.load().values(), "o/r", lane="triaging") == {7}
+
+
+def test_ready_draft_transfers_to_a_durable_attacker_before_any_projection(
+        make_coord, monkeypatch):
+    """A ready intake is a draft until the attack record owns it (#451)."""
+    fake = IntakeSession()
+    projected = []
+    adapter = IntakeStageAdapter(
+        worktree_reset=lambda record: True, observer=fake,
+        apply_route=lambda *args: projected.append(args) or "must not project")
+    coord = make_coord(fake, adapter=adapter)
+    source = str(WorktreeRef.for_intake("/repo", "claude", 7).path)
+    submission = Submission(
+        repo="o/r", subject="7", stage="intake", pool="claude", source=source,
+        input_ptr=json.dumps({"snapshot": {"title": "as filed", "body": "raw"},
+                              "source_ref": "abc123", "prompt": "grounding"}))
+    identity = coord.submit_stage(submission)
+    coord.cycle("claude")
+    fake.message = _READY_MESSAGE
+    fake.end(identity, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")  # capture the durable result
+    coord.cycle("claude")  # ready must not settle through Intake's projection
+
+    intake = record_of(coord, identity)
+    assert intake.state == "completed" and intake.claim and not intake.retired
+    assert projected == []
+
+    monkeypatch.setattr(pipeline.tracer, "load_records",
+                        lambda: list(coord._store.load().values()))
+    monkeypatch.setattr(pipeline, "pick_pair",
+                        lambda: (type("Builder", (), {"tool": "codex"})(), None, ""))
+    pipeline._open_attack_on_completed_intake(coord, identity)
+
+    records = coord._store.load()
+    attack = next(record for record in records.values() if record.stage == "attack")
+    assert attack.state == WAITING and attack.claim and not attack.retired
+    assert records[identity].retired and not records[identity].claim
 
 
 def test_unparsed_clean_exit_gets_one_targeted_repair_then_holds(make_coord):
@@ -258,7 +295,7 @@ def test_completed_intake_disposes_its_worktree_before_retiring(make_coord, tmp_
         repo="o/r", subject="7", stage="intake", pool="claude",
         source=str(wt), input_ptr="durable issue"))
     coord.cycle("claude")
-    fake.message = _READY_MESSAGE
+    fake.message = '{"route":"grill","body":"question"}'
     fake.end(identity, cause=ProviderCause.PROCESS)
 
     coord.cycle("claude")   # classifies the ended attempt -> completed
