@@ -381,6 +381,7 @@ def _park_body(monkeypatch, verdict):
         return True
 
     monkeypatch.setattr(gate.github, "pr_comment", pr_comment)
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: [])
     gate.park("o/r", 99, verdict, reason="exhausted its review budget without a durable verdict")
     assert captured, "park() did not post a PR comment"
     return captured[0]
@@ -510,8 +511,8 @@ def test_clean_summary_posts_once_with_depth_proof_and_cross_tool_status(monkeyp
         clean=True, reviewer_tool="codex", change_author_tool="claude",
         depth_reason="one journey", checks=("affected tests passed",))
 
-    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
-    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
+    assert gate.post_clean_review_summary("o/r", 9, verdict, "sha-a") is True
+    assert gate.post_clean_review_summary("o/r", 9, verdict, "sha-a") is True
     assert len(comments) == 1
     assert "Targeted" in comments[0].body and "affected tests passed" in comments[0].body
     assert "cross-tool review" in comments[0].body
@@ -527,14 +528,15 @@ def test_clean_summary_states_exact_same_tool_human_merge_status(monkeypatch):
         clean=True, reviewer_tool="claude", change_author_tool="claude",
         depth_reason="reviewed fallback", checks=("affected checks passed",))
 
-    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
+    assert gate.post_clean_review_summary("o/r", 9, verdict, "sha-a") is True
     assert "same-tool review; maintainer merge required" in comments[0].body
 
 
 def test_clean_summary_replaces_stale_same_tool_status_without_duplicate_marker(monkeypatch):
     marker = "<!-- agentflow-clean-review-summary -->"
     comments = [github.Comment(
-        body=f"> *agentflow: clean review.*\n{marker}\n\n"
+        body=f"> *agentflow: clean review.*\n{marker}\n"
+             "<!-- agentflow-clean-review-head:sha-a -->\n\n"
              "Review status: same-tool review; maintainer merge required.",
         created_at="", id="comment-1")]
 
@@ -553,7 +555,44 @@ def test_clean_summary_replaces_stale_same_tool_status_without_duplicate_marker(
         clean=True, reviewer_tool="codex", change_author_tool="claude",
         depth_reason="independent recovery", checks=("exact head checked",))
 
-    assert gate.post_clean_review_summary("o/r", 9, verdict) is True
+    assert gate.post_clean_review_summary("o/r", 9, verdict, "sha-a") is True
     assert comments[0].body.count(marker) == 1
     assert "Review status: cross-tool review." in comments[0].body
     assert "same-tool review; maintainer merge required" not in comments[0].body
+
+
+def test_clean_summary_at_a_new_head_preserves_and_retires_the_old_evidence(monkeypatch):
+    marker = "<!-- agentflow-clean-review-summary -->"
+    comments = [github.Comment(
+        body=f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->\n\nOutcome: clean.",
+        created_at="", id="old")]
+    posts = []
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    def post(_repo, _pr, body):
+        posts.append(body)
+        comments.append(github.Comment(body, "", id="new"))
+        return True
+
+    monkeypatch.setattr(gate.github, "pr_comment", post)
+    monkeypatch.setattr(gate.github, "edit_comment", lambda comment_id, body:
+                        comments.__setitem__(0, github.Comment(body, "", id=comment_id)) or True)
+
+    assert gate.post_clean_review_summary("o/r", 9, CLEAN, "sha-b") is True
+    assert "agentflow-superseded-review-summary" in comments[0].body
+    assert "sha-a" in comments[0].body
+    assert len(posts) == 1 and "sha-b" in posts[0]
+
+
+def test_park_retires_the_current_clean_summary_before_posting(monkeypatch):
+    marker = "<!-- agentflow-clean-review-summary -->"
+    comments = [github.Comment(body=f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->",
+                               created_at="", id="clean")]
+    posts = []
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr(gate.github, "edit_comment", lambda comment_id, body:
+                        comments.__setitem__(0, github.Comment(body, "", id=comment_id)) or True)
+    monkeypatch.setattr(gate.github, "pr_comment", lambda *_args: posts.append(_args) or True)
+
+    gate.park("o/r", 9, None)
+    assert "agentflow-superseded-review-summary" in comments[0].body
+    assert len(posts) == 1

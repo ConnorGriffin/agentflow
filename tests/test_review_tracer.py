@@ -850,14 +850,14 @@ def test_clean_reviewed_settlement_posts_one_summary_and_returns_durable_proof(m
 
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
-        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
+        lambda repo, pr, verdict, head: summarized.append((repo, pr, head)) or True)
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.github.commit_head_checks",
                         lambda _repo, sha: github.HeadChecks(sha=sha))
 
     proof = coordinated_review._settle_review(record)
     assert proof == "https://github.com/o/r/pull/42"
-    assert summarized == [("o/r", 42)]
+    assert summarized == [("o/r", 42, "sha-a")]
 
 
 def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeypatch):
@@ -914,6 +914,28 @@ def test_already_merged_review_settlement_releases_build_claim(monkeypatch):
     assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
     assert label_edits == [(7, "agentflow:building"), ("7", "ready-for-agent")]
     assert len(finished) == 1
+
+
+def test_merged_clean_review_summary_is_stamped_with_its_reviewed_head(monkeypatch):
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record()
+    summarized = []
+    reads = iter((frozenset({"agentflow:building"}), frozenset()))
+    monkeypatch.setattr(coordinated_review, "_review_verdict",
+                        lambda _r: Verdict(clean=True, change_author_tool="claude"))
+    monkeypatch.setattr(coordinated_review, "_review_pr_facts",
+                        lambda _r: {"head": "merged-sha", "state": "MERGED"})
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.github.issue_labels", lambda *_args: next(reads))
+    monkeypatch.setattr("agentflow.github.remove_label", lambda *_args: True)
+    monkeypatch.setattr("agentflow.gate.post_clean_review_summary",
+                        lambda repo, pr, verdict, head: summarized.append((repo, pr, head)) or True)
+    monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+
+    assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
+    assert summarized == [("o/r", 42, "sha-a")]
 
 
 @pytest.mark.parametrize("pr_state", ["MERGED", "OPEN"])
@@ -1128,7 +1150,7 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
 
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
-        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
+        lambda repo, pr, verdict, head: summarized.append((repo, pr, head)) or True)
     adapter = ReviewStageAdapter(
         verdict_ready=lambda _record, _obs: True, worktree_reset=lambda _record: True,
         observer=fake, settle=coordinated_review._settle_review,
@@ -1144,9 +1166,9 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
     coord.cycle("claude")
     settled = record_of(coord, ident)
     assert settled.retired is True and settled.claim is False
-    assert summarized == [("o/r", 42)]
+    assert summarized == [("o/r", 42, "sha-a")]
     make_coord(fake, adapter=adapter).cycle("claude")
-    assert summarized == [("o/r", 42)]
+    assert summarized == [("o/r", 42, "sha-a")]
 
 
 def test_completed_product_review_keeps_its_verdict_when_provider_artifacts_disappear(
@@ -1276,7 +1298,7 @@ def test_completed_conflict_decision_transfers_to_revise_before_settlement(
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
-        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
+        lambda repo, pr, verdict, head: summarized.append((repo, pr, head)) or True)
 
     pipeline.reconcile_and_project(coord)
 
@@ -1318,7 +1340,7 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
 
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
-        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
+        lambda repo, pr, verdict, head: summarized.append((repo, pr, head)) or True)
     adapter = ReviewStageAdapter(
         verdict_ready=lambda _record, _obs: True, worktree_reset=lambda _record: True,
         observer=fake, settle=coordinated_review._settle_review,
@@ -1336,7 +1358,7 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
     settled = record_of(coord, ident)
     assert settled.auto_merge_allowed is False
     assert settled.retired is True and settled.claim is False
-    assert summarized == [("o/r", 42)]
+    assert summarized == [("o/r", 42, "sha-a")]
 
 
 # --- pure Build → Review submission mapping ----------------------------------------------

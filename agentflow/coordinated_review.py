@@ -887,9 +887,10 @@ def _settle_review(record) -> str | None:
     if pr_facts is None:
         return None
     head = pr_facts["head"]
+    reviewed_head = verdict.final_sha or record.target
     if pr_facts["state"] == "MERGED":
         if (verdict.change_author_tool
-                and not post_clean_review_summary(record.repo, pr, verdict)):
+                and not post_clean_review_summary(record.repo, pr, verdict, reviewed_head)):
             return None
         if not release(record.repo, int(record.subject), BUILDING):
             return None
@@ -901,7 +902,6 @@ def _settle_review(record) -> str | None:
             record.identity)
         github.remove_label(record.repo, record.subject, "ready-for-agent")
         return f"https://github.com/{record.repo}/pull/{pr}"
-    reviewed_head = verdict.final_sha or record.target
     if head != reviewed_head:
         # The head moved after this clean verdict was recorded (a maintainer rebase, a manual push,
         # a conflict fix). Do not park a superseded head: leave the completed record in place so the
@@ -923,7 +923,7 @@ def _settle_review(record) -> str | None:
             if head_checks.failing:
                 return _settle_red_check(
                     record, verdict, workdir, pr, head_checks, autonomous=False)
-            if not post_clean_review_summary(record.repo, pr, verdict):
+            if not post_clean_review_summary(record.repo, pr, verdict, reviewed_head):
                 return None
             slug = _review_slug(record)
             _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
@@ -941,7 +941,7 @@ def _settle_review(record) -> str | None:
             if head_checks.failing:
                 return _settle_red_check(
                     record, verdict, workdir, pr, head_checks, autonomous=True)
-            if not post_clean_review_summary(record.repo, pr, verdict):
+            if not post_clean_review_summary(record.repo, pr, verdict, reviewed_head):
                 return None
             slug = _review_slug(record)
             _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
@@ -1005,7 +1005,7 @@ def _settle_review(record) -> str | None:
             reason="could not be squash-merged (branch protection, conflict, or transient error)",
             autonomous=True)
     if (verdict.change_author_tool
-            and not post_clean_review_summary(record.repo, pr, verdict)):
+            and not post_clean_review_summary(record.repo, pr, verdict, reviewed_head)):
         return None
     if not release(record.repo, int(record.subject), BUILDING):
         return None
