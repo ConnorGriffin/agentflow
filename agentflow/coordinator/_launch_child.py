@@ -102,6 +102,12 @@ def main(args: list[str]) -> None:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            except PermissionError:
+                # Do not claim this attempt ended while its provider may still be running.
+                # The event artifact is the durable operator-facing record of why this
+                # supervisor remains until it can observe the provider's real exit.
+                print("agentflow: permission denied stopping provider process group; "
+                      "waiting for provider exit", file=output, flush=True)
             try:
                 return process.wait(timeout=5)
             except subprocess.TimeoutExpired:
@@ -109,6 +115,9 @@ def main(args: list[str]) -> None:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except PermissionError:
+                    print("agentflow: permission denied force-stopping provider process group; "
+                          "waiting for provider exit", file=output, flush=True)
                 return process.wait()
 
         # Reconciliation signals this supervisor, not the provider's separate session. Turn that
