@@ -74,3 +74,42 @@ def test_install_rejects_a_capacity_helper_that_does_not_resolve_to_a_file(
     # either service's plist is written or (re)loaded.
     assert not (home / "Library" / "LaunchAgents" / "agentflow.daemon.plist").exists()
     assert not (home / "Library" / "LaunchAgents" / "agentflow.console.plist").exists()
+
+
+def test_install_rejects_a_relative_capacity_helper(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.chdir(tmp_path)
+    helper = tmp_path / "capacity-helper"
+    helper.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("AGENTFLOW_CAPACITY_HELPER", "capacity-helper")
+    config = tmp_path / "agentflow.toml"
+    config.write_text("")
+
+    with pytest.raises(ServiceError, match="absolute path"):
+        install(config)
+
+    assert not (home / "Library" / "LaunchAgents" / "agentflow.daemon.plist").exists()
+
+
+def test_install_rejects_a_capacity_helper_with_relative_path_segments(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setattr(Path, "home", lambda: home)
+    real = tmp_path / "real"
+    real.mkdir()
+    helper = real / "capacity-helper"
+    helper.write_text("#!/bin/sh\n")
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    monkeypatch.setenv(
+        "AGENTFLOW_CAPACITY_HELPER", str(decoy / ".." / "real" / "capacity-helper")
+    )
+    config = tmp_path / "agentflow.toml"
+    config.write_text("")
+
+    with pytest.raises(ServiceError, match="relative path segments"):
+        install(config)
+
+    assert not (home / "Library" / "LaunchAgents" / "agentflow.daemon.plist").exists()

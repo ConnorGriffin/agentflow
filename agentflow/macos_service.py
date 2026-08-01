@@ -88,6 +88,25 @@ def _write_service(label: str, program_args: list[str], environment: dict, log_n
     return plist_path
 
 
+def _validated_helper_path(helper: str) -> Path:
+    """Reject a malformed ``AGENTFLOW_CAPACITY_HELPER`` before any filesystem access.
+
+    The raw value must already be an absolute, ``..``-free path — checked with plain
+    string comparisons against the un-resolved value itself — before it is ever handed
+    to a filesystem call. Only a value that clears both checks reaches ``resolve()``."""
+    expanded = str(Path(helper).expanduser())
+    if not expanded.startswith(os.sep):
+        raise ServiceError(f"AGENTFLOW_CAPACITY_HELPER must be an absolute path: {helper}")
+    if os.path.normpath(expanded) != expanded:
+        raise ServiceError(
+            f"AGENTFLOW_CAPACITY_HELPER must not contain relative path segments: {helper}"
+        )
+    helper_path = Path(expanded).resolve()
+    if not helper_path.is_file():
+        raise ServiceError(f"AGENTFLOW_CAPACITY_HELPER does not resolve to a file: {helper}")
+    return helper_path
+
+
 def install(config: Path) -> None:
     """Write and reload the per-user daemon and console services with explicit runtime paths.
 
@@ -106,12 +125,7 @@ def install(config: Path) -> None:
     }
     helper = os.environ.get("AGENTFLOW_CAPACITY_HELPER")
     if helper:
-        helper_path = Path(helper).expanduser().resolve()
-        if not helper_path.is_file():
-            raise ServiceError(
-                f"AGENTFLOW_CAPACITY_HELPER does not resolve to a file: {helper}"
-            )
-        daemon_environment["AGENTFLOW_CAPACITY_HELPER"] = str(helper_path)
+        daemon_environment["AGENTFLOW_CAPACITY_HELPER"] = str(_validated_helper_path(helper))
     daemon_plist = _write_service(
         DAEMON_LABEL,
         [executable, "daemon"],
