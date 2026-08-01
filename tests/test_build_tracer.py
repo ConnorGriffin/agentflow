@@ -149,6 +149,12 @@ def test_interactive_start_leaves_the_background_pace_slot_intact(monkeypatch):
     # background start — which then spends it, deferring the next background record.
     from agentflow.balancer import PoolStatus
     from agentflow.coordinator.record import Record
+    # The gate's in-flight reservation reads the durable ledger through _durable_running_permits.
+    # The suite-wide isolation fixture (conftest.py) gives this test its own empty private store,
+    # so this reads 0 running permits regardless of how busy the operator's actual fleet is
+    # (issue #396) — otherwise five or more live running permits alone would refuse the stubbed
+    # 10%-against-85%-ceiling background start below, for a reason unrelated to pacing.
+    assert pipeline._durable_running_permits("claude") == 0
     gate = pipeline._production_gate()
     monkeypatch.setattr("agentflow.balancer._query_pool",
                         lambda tool, **_: PoolStatus(tool, True, 10.0, active=True,

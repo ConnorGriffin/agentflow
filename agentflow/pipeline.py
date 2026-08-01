@@ -210,7 +210,7 @@ def build_coordinator(_log=None) -> Coordinator:
 class _ProductionGate:
     """One dispatch cycle's composed durable admission policy."""
 
-    def __init__(self, running_permits=None) -> None:
+    def __init__(self) -> None:
         from collections import Counter
         self._paced = Counter()
         self._active: dict[str, bool] = {}
@@ -228,10 +228,8 @@ class _ProductionGate:
         # once for every waiting record; re-running the external helper for each one can serialize
         # its 30-second timeout across the whole queue and hold the daemon pass for minutes.
         self._status: dict[str, PoolStatus] = {}
-        # How many permits are already running on a pool, from the durable ledger. Injected so the
-        # in-flight Claude reservation is exercised without a live store; production reads the same
-        # running rows the reservation itself charges.
-        self._running_permits = running_permits or _durable_running_permits
+        # How many permits are already running on a pool, from the durable ledger.
+        self._running_permits = _durable_running_permits
 
     def begin_cycle(self, pool: str) -> None:
         """Start one pool admission observation, refreshing facts from the prior cycle."""

@@ -22,7 +22,7 @@ from itertools import count
 
 import pytest
 
-from agentflow import coordinated_review, pipeline
+from agentflow import coordinated_review, daemon, live, pipeline, ratchet
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.providers import (EndingReason, ProviderCause,
@@ -81,6 +81,47 @@ def _no_real_gh(request, monkeypatch):
         return real_run(cmd, *args, **kwargs)
 
     monkeypatch.setattr(subprocess, "run", guarded)
+
+
+def _isolate_ratchet_defaults(monkeypatch, path):
+    """``ratchet.record``, ``record_once``, and ``status`` default their ``path`` argument to
+    the module-level ``STATE`` constant captured when the function was defined, so patching
+    ``ratchet.STATE`` alone cannot redirect a caller that relies on the default. Patch each
+    function's own bound default directly."""
+    for name in ("record", "record_once", "status"):
+        fn = getattr(ratchet, name)
+        monkeypatch.setattr(fn, "__defaults__", (path,))
+
+
+@pytest.fixture(autouse=True)
+def _isolated_agentflow_state(tmp_path, monkeypatch):
+    """Give every test a private agentflow state directory without asking for a fixture.
+
+    A test that never requested ``coord_state`` used to fall through to whatever
+    ``AGENTFLOW_STATE`` (or the ``~/.agentflow`` default) the operator's session happened to
+    have: a pacing test could read the live fleet's durable coordinator ledger and pass or fail
+    by how busy the machine was, and daemon CLI tests could write the operator's live
+    ``daemon-status.json`` through ``agentflow.live``. Setting ``AGENTFLOW_STATE`` alone is not
+    enough — ``agentflow.live``, ``agentflow.daemon``, and ``agentflow.ratchet`` each bind their
+    own state paths at import time, before any fixture runs — so those already-bound module
+    constants (and ratchet's default ``path`` arguments) are patched here directly.
+    """
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+
+    monkeypatch.setattr(live, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(live, "LIVE_FILE", tmp_path / "live-sessions.json")
+    monkeypatch.setattr(live, "DAEMON_FILE", tmp_path / "daemon-status.json")
+    monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
+
+    monkeypatch.setattr(daemon, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(daemon, "ENABLE_FLAG", tmp_path / "enabled")
+    monkeypatch.setattr(daemon, "LOCK", tmp_path / "daemon.lock")
+
+    ratchet_path = tmp_path / "ratchet.json"
+    monkeypatch.setattr(ratchet, "STATE", ratchet_path)
+    _isolate_ratchet_defaults(monkeypatch, ratchet_path)
+
+    return tmp_path
 
 
 @pytest.fixture(autouse=True)
@@ -213,11 +254,12 @@ def record_of(coord, identity: str):
 
 
 @pytest.fixture
-def coord_state(tmp_path, monkeypatch):
-    """Isolate each test's coordinator store under a private state directory. Reopening a
-    Coordinator in the same test replays a crash over the same durable store."""
-    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
-    return tmp_path
+def coord_state(_isolated_agentflow_state):
+    """The private state directory the suite-wide ``_isolated_agentflow_state`` fixture already
+    established — a compatibility accessor for tests that seed or inspect their private
+    coordinator store. Isolation itself is automatic; this fixture no longer creates it.
+    Reopening a Coordinator in the same test replays a crash over the same durable store."""
+    return _isolated_agentflow_state
 
 
 @pytest.fixture
