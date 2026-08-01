@@ -145,19 +145,22 @@ RETAINED_WORKTREE_CAP = 12
 # successive sweeps converge instead.
 SWEEP_ARCHIVE_BUDGET = 20
 
-# Above this many *registered* worktrees, a repository stops receiving new cold work (ADR 0050).
-# It is a count proxy for a byte cliff: the Claude CLI builds one sandbox deny path per registered
-# worktree, and at ~246 registrations on the machine that produced this number the profile alone
-# crossed the OS exec-argument limit (~1.6 MB) and every session lost its shell on the first
-# command. Path lengths vary by machine and repository, so the number does not port — re-measure
-# before trusting it elsewhere.
+# Above this many *registered* worktrees, a repository stops receiving new cold work (ADR 0050,
+# recalibrated by ADR 442). It is a count proxy for a byte cliff: the Claude CLI embeds a sandbox
+# profile in every shell spawn's argv — three filesystem deny paths per linked worktree — and the
+# whole command line must stay under the OS exec-argument limit (kern.argmax = 1,048,576 bytes
+# here). Measured against the 2026-07-31 dead-shell incident (#442): the two builds that died at
+# launch hit the cliff at 52/51 linked worktrees (210/207 deny paths, ~1.1 MB spawn argv), i.e.
+# 53/52 listed registrations as this gate counts them. Synthetic repos on the same machine and
+# CLI (2.1.212) put the slope at ~24 KB of profile per registration over a ~0.4 MB base
+# (60 linked → 1.8 MB, 120 → 3.2 MB). The retired 175 came from an older ~246-registration /
+# ~1.6 MB measurement the current CLI no longer matches — per-registration cost moves with CLI
+# version and path length, so re-measure before trusting this number on another machine.
 #
-# Read-only measurement across the nine enrolled repositories, 2026-07-30
-# (`git worktree list --porcelain` per repo + the coordinator store):
-#   post-sweep floor = foreign registrations + live-state protected sources + RETAINED_WORKTREE_CAP
-#   worst case (agentflow itself): 47 foreign + 6 protected + 12 = 65; every other repo ≤ 33.
-# 175 leaves ~110 of headroom over that floor and still refuses well below the observed cliff.
-WORKTREE_DISPATCH_CEILING = 175
+# 40 refuses ~12 registrations below the observed death point: the margin covers what a burst of
+# concurrent sessions adds between preflight and spawn (the incident hour grew the registry from
+# ~41 listed at 15:01 to 53 at 16:13 with no refusal at 175).
+WORKTREE_DISPATCH_CEILING = 40
 
 
 def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None,
@@ -1198,10 +1201,11 @@ def dispatch_preflight(repo: str, workdir: str, protected: set[str], _log=None) 
     cold work is submitted into it (ADR 0050).
 
     The daemon's own git calls are unsandboxed, so it never sees the failure it causes: past a
-    few hundred registered worktrees the provider's sandbox profile exceeds the OS exec-argument
-    limit and every session in that repository dies on its first shell command, with no PR, no
-    comment, and no way to say why. Three attempts were burned that way on one issue before a
-    human diagnosed it. So the daemon checks the *precondition* rather than waiting for victims.
+    machine-dependent count of registered worktrees (53 listed in the 2026-07-31 incident, #442)
+    the provider's sandbox profile exceeds the OS exec-argument limit and every session in that
+    repository dies on its first shell command, with no PR, no comment, and no way to say why.
+    Three attempts were burned that way on one issue before a human diagnosed it. So the daemon
+    checks the *precondition* rather than waiting for victims.
 
     Count-only and local: one ``git worktree list``, no GitHub call, no mutation. Reclamation is
     the heartbeat's job — this only refuses. The refusal names the breakdown because the remedy
