@@ -64,7 +64,12 @@ class IntakeStageAdapter(StageAdapter):
     def finalize_completed(self, record) -> str | None:
         if not record.outcome:
             return None
-        url = self._apply_route(record, decode_result(record.outcome))
+        result = decode_result(record.outcome)
+        # Ready is a draft, not a projection. Its cold attacker has to assume the triaging
+        # claim in the coordinator's transfer transaction before this record can retire.
+        if result.route is IntakeRoute.READY:
+            return None
+        url = self._apply_route(record, result)
         if url is None:
             return None
         # Dispose the read-only worktree before returning the proof that lets the coordinator
