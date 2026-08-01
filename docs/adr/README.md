@@ -172,6 +172,10 @@ Issue-keyed records:
   ends with no usable ruling parks its ticket visibly (one comment naming the check that
   refused it, one `wayfinder:parked` label) instead of silently releasing the claim, and
   research dispatch stops claiming tickets for runs that will never start.
+- [ADR 380](adr-380-pre-publish-hardening.md) — A triage draft is attacked cold, in rounds,
+  before it is ever published: a cold session judges the draft on five axes and answers with
+  objections or none, objections go to a redraft that is attacked again, and only a survivor is
+  published as the ready brief. Amended by ADR 418.
 - [ADR 401](adr-401-commit-time-signoff.md) — Preparing a session checkout installs the
   sign-off, so a commit carries it the moment it is made and no stranded pull request needs a
   human amendment. Confined to the session's own checkout, only for the commit's own author,
