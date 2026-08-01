@@ -1085,3 +1085,18 @@ def test_dispatch_preflight_refuses_a_repository_that_can_no_longer_carry_a_sess
     monkeypatch.setattr(runner_mod, "_registered_worktrees", lambda workdir: None)
     assert runner_mod.dispatch_preflight("owner/repo", str(repo), set(), _log=logs.append)
     assert "could not read the registry" in logs[-1]  # fails open, loudly
+
+
+def test_the_dispatch_ceiling_refuses_below_the_registration_count_that_killed_sessions(
+        monkeypatch):
+    """Fails on today's code: the 175 ceiling admitted the launches that died on 2026-07-31
+    (#442) at 53/52 listed registrations, when the Claude CLI's sandbox profile — three deny
+    paths per linked worktree, embedded in every shell spawn's argv — crossed the OS
+    exec-argument limit and every command in those sessions failed to spawn. The ceiling is
+    only a guard if it refuses before the measured death point, with margin for the
+    registrations concurrent sessions add between preflight and spawn."""
+    death_point = [(f"/w/issue-{n}", None) for n in range(52)]
+    monkeypatch.setattr(runner_mod, "_registered_worktrees", lambda workdir: death_point)
+    logs = []
+    assert not runner_mod.dispatch_preflight("owner/repo", "/w", set(), _log=logs.append)
+    assert "REFUSING" in logs[-1]
