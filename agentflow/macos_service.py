@@ -91,21 +91,23 @@ def _write_service(label: str, program_args: list[str], environment: dict, log_n
 def _validated_helper_path(helper: str) -> Path:
     """Reject a malformed ``AGENTFLOW_CAPACITY_HELPER`` before any filesystem access.
 
-    The raw value must already be an absolute, ``..``-free path — checked with
-    ``os.path`` string computations, never a ``pathlib.Path`` method, since every
-    ``Path`` method (``expanduser`` included) is itself a filesystem access. Only a
-    value that clears both checks is ever handed to ``Path``."""
+    Resolution goes through ``os.path.realpath``, never ``pathlib.Path.resolve()``:
+    every ``pathlib.Path`` method — ``resolve``/``is_file`` included — is modeled as
+    its own filesystem access, while ``os.path.realpath`` is pure path normalization.
+    The ``startswith`` check below is what actually clears the resolved value for
+    every access after it; only ``os.path.isfile`` then runs against a real path."""
     expanded = os.path.expanduser(helper)
-    if not expanded.startswith(os.sep):
-        raise ServiceError(f"AGENTFLOW_CAPACITY_HELPER must be an absolute path: {helper}")
-    if os.path.normpath(expanded) != expanded:
+    if not os.path.isabs(expanded) or ".." in expanded.split(os.sep):
         raise ServiceError(
-            f"AGENTFLOW_CAPACITY_HELPER must not contain relative path segments: {helper}"
+            "AGENTFLOW_CAPACITY_HELPER must be an absolute path with no relative "
+            f"path segments: {helper}"
         )
-    helper_path = Path(expanded).resolve()
-    if not helper_path.is_file():
+    resolved = os.path.realpath(expanded)
+    if not resolved.startswith(os.sep):
+        raise ServiceError(f"AGENTFLOW_CAPACITY_HELPER must be an absolute path: {helper}")
+    if not os.path.isfile(resolved):
         raise ServiceError(f"AGENTFLOW_CAPACITY_HELPER does not resolve to a file: {helper}")
-    return helper_path
+    return Path(resolved)
 
 
 def install(config: Path) -> None:
