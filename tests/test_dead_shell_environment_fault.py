@@ -1,4 +1,4 @@
-"""A session whose shell never started is an environment fault, not a spent budget (#386).
+"""A session whose shell never started is an environment fault, not a retried budget (#386).
 
 Driven through the real surfaces: the Claude classifier reads a fixture stream exactly as the
 provider adapter does, the coordinator settles it through ``submit_stage``/``cycle``, and the
@@ -130,10 +130,21 @@ class _DeadShellObserver:
         return False
 
 
-def test_a_dead_shell_holds_the_stage_at_once_and_spends_no_attempt(make_coord):
+class _PendingDeadShellObserver(_DeadShellObserver):
+    """Makes the external handoff fail once, exposing the restart boundary."""
+
+    def __init__(self, handoff):
+        self._handoff = handoff
+
+    def finalize_hold(self, record):
+        return self._handoff(record)
+
+
+def test_a_dead_shell_holds_the_dispatched_stage_at_once_with_its_attempt(make_coord):
     """Fails on today's code: a dead shell reads as an ordinary incomplete ending, so the stage
     consumes its attempt, continues, and — at the budget — is recorded as having run out of
-    tries. It must instead hold on the first ending with the budget untouched."""
+    tries. It must instead hold on the first ending while preserving the dispatched attempt's
+    durable accounting."""
     fake = FakeSession()
     coord = make_coord(fake, adapter=_DeadShellObserver())
     identity = coord.submit_stage(Submission(repo="o/r", subject="493", stage="intake",
@@ -146,15 +157,14 @@ def test_a_dead_shell_holds_the_stage_at_once_and_spends_no_attempt(make_coord):
     assert [(o.identity, o.status) for o in outcomes] == [(identity, "held")]
 
     record = record_of(coord, identity)
-    assert record.attempts == 0                  # refunded — nothing about the work was attempted
+    assert record.attempts == 1                  # the dispatched session is not erased on park
     assert record.hold_reason == permanent_hold_reason(EndingReason.ENVIRONMENT)
     assert record.hold_reason != "continuation budget exhausted"
     assert permits(coord, "claude") == 0         # the reservation is released, not looping
 
 
 def test_a_dead_shell_never_requeues_a_continuation(make_coord):
-    # A refunded attempt must not become a free retry: the stage is terminal, so cycling again
-    # never launches a second provider.
+    # A parked environment fault is terminal, so cycling again never launches a second provider.
     fake = FakeSession()
     coord = make_coord(fake, adapter=_DeadShellObserver())
     identity = coord.submit_stage(Submission(repo="o/r", subject="494", stage="intake",
@@ -166,12 +176,12 @@ def test_a_dead_shell_never_requeues_a_continuation(make_coord):
     for _ in range(3):
         assert coord.cycle("claude") == []
     assert record_of(coord, identity).state == "held"
-    assert record_of(coord, identity).attempts == 0
+    assert record_of(coord, identity).attempts == 1
 
 
-def test_a_maintainer_resume_of_an_environment_hold_starts_from_a_full_budget(make_coord):
-    # The point of the refund: a build held this way shows none of its three attempts consumed,
-    # and the deliberate resume opens a genuinely fresh bounded execution from there.
+def test_a_maintainer_resume_of_an_environment_hold_starts_a_fresh_budget(make_coord):
+    # Resume creates a distinct execution, so the human gets a fresh bounded run without
+    # rewriting what the parked, dispatched session actually consumed.
     fake = FakeSession()
     coord = make_coord(fake, adapter=_DeadShellObserver())
     sub = Submission(repo="o/r", subject="495", stage="build", pool="claude",
@@ -182,13 +192,38 @@ def test_a_maintainer_resume_of_an_environment_hold_starts_from_a_full_budget(ma
     coord.cycle("claude")
 
     held = record_of(coord, identity)
-    assert held.state == "held" and held.attempts == 0
+    assert held.state == "held" and held.attempts == 1
 
     resumed = resume_if_held(sub, list(coord._store.load().values()))
     assert resumed.resume == 1
     successor = coord.submit_stage(resumed)
     assert successor != identity
     assert record_of(coord, successor).attempts == 0     # the full ATTEMPT_BUDGET is available
+
+
+def test_a_restart_finalizes_a_pending_dead_shell_hold_with_its_dispatched_attempt(make_coord):
+    """The pending durable boundary keeps the attempt when the external handoff needs a retry."""
+    fake = FakeSession()
+    proofs = iter((None, "issue-proof"))
+    adapter = _PendingDeadShellObserver(handoff=lambda record: next(proofs))
+    coord = make_coord(
+        fake,
+        adapter=adapter,
+    )
+    identity = coord.submit_stage(Submission(repo="o/r", subject="496", stage="build",
+                                             pool="claude", complexity="deep",
+                                             builder_lineage="claude"))
+    coord.cycle("claude")
+    fake.kill(identity)
+
+    assert coord.cycle("claude") == []
+    pending = record_of(coord, identity)
+    assert pending.hold_pending is True and pending.attempts == 1
+
+    restarted = make_coord(fake, adapter=adapter)
+    assert [outcome.status for outcome in restarted.cycle("claude")] == ["held"]
+    held = record_of(restarted, identity)
+    assert held.attempts == 1 and held.handoff_proof == "issue-proof"
 
 
 # --- the two comments a maintainer reads ---------------------------------------------------
