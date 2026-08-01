@@ -289,7 +289,8 @@ def _next_research_ticket(cfg: RepoConfig, _log=None) -> dict | None:
     return None
 
 
-def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
+def _next_resumable_issue(cfg: RepoConfig,
+                          reserved: set[int] = frozenset()) -> tuple[dict, str] | None:
     """A `needs-grilling` or `needs-mockup` issue whose latest comment is the maintainer's
     reply — return it with their answer text so intake can resolve it (ADR 0019). A waiver
     reply on a mockup-held issue ("skip the mockup, build it") promotes to ready; a locked-spec
@@ -308,6 +309,8 @@ def _next_resumable_issue(cfg: RepoConfig) -> tuple[dict, str] | None:
             seen.add(issue["number"])
             deduped.append(issue)
     for issue in deduped:
+        if issue["number"] in reserved:
+            continue
         claims = {lbl["name"] for lbl in issue["labels"]}
         if TRIAGING in claims or DRAWING in claims:
             continue   # Intake or the current Mockup round already owns this held issue
@@ -331,8 +334,8 @@ def _next_intake_candidate(cfg: RepoConfig,
     """The next issue to triage — a held issue the maintainer just answered (resume, ADR
     0019) or the oldest un-triaged one (ADR 0016) — with its resume text. Skips issues a
     concurrent fan-out already claimed this cycle (`reserved`). None when the queue is empty."""
-    resumable = _next_resumable_issue(cfg)
-    if resumable and resumable[0]["number"] not in reserved:
+    resumable = _next_resumable_issue(cfg, reserved)
+    if resumable:
         return resumable
     issue = _next_untriaged_issue(cfg, reserved)
     return (issue, "") if issue else None

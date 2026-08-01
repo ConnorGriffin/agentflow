@@ -145,7 +145,7 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
     from agentflow.coordinator.record import WAITING
 
     reserved: set[int] = set()
-    submitted = []
+    outcomes = []
     while True:
         picked = loop._next_intake_candidate(cfg, reserved)
         if picked is None:
@@ -166,7 +166,7 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
             continue
         builder, _reviewer, block_msg = pick_pair()
         if builder is None:
-            return ("; ".join(submitted) if submitted else
+            return ("; ".join(outcomes) if outcomes else
                     f"#{issue['number']}: no pool has headroom ({block_msg}) — deferring")
         submission = coordinated_intake.intake_submission(cfg, issue, extra, comments,
                                                           builder.tool)
@@ -180,6 +180,8 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
         # strip it and the next cycle would recreate it forever (#308). Reserve and skip.
         if record is None or record.state != WAITING or record.hold_pending or record.retired:
             reserved.add(issue["number"])
+            outcomes.append(f"#{issue['number']}: maintainer reply already triaged — "
+                            "awaiting a new reply")
             continue
         if not claim(cfg.repo, issue["number"], TRIAGING):
             # Runnable submission but the claim mutation failed: withdraw the never-started
@@ -187,8 +189,8 @@ def _submit_coordinated_intake(cfg, coordinator, _log) -> str:
             coordinator.withdraw_stage(identity)
             return f"#{issue['number']}: Intake record saved; claim pending — deferring admission"
         reserved.add(issue["number"])
-        submitted.append(f"#{issue['number']} → {builder.tool}")
-    return "; ".join(submitted) if submitted else "no un-triaged issues"
+        outcomes.append(f"#{issue['number']} → {builder.tool}")
+    return "; ".join(outcomes) if outcomes else "no un-triaged issues"
 
 
 def _submit_coordinated_research(cfg, coordinator, _log) -> str:
