@@ -343,6 +343,64 @@ def test_real_supervisor_remembers_sigterm_from_provider_spawn(coord_state):
     assert observation.has_end_fact is True
 
 
+def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeypatch):
+    """The child-stop command boundary keeps supervising when the OS denies its signal.
+
+    It only publishes the normal terminal result after it observes the provider exit, so the
+    coordinator never mistakes a still-running provider for an ended attempt.
+    """
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import read_session
+
+    class ChildExit(Exception):
+        pass
+
+    class StartedStore:
+        def __init__(self, _path):
+            pass
+
+        def child_start(self, identity, token, family):
+            return True
+
+        def close(self):
+            pass
+
+    class Provider:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
+    handlers = {}
+    monkeypatch.setattr(_launch_child.os, "fork", lambda: 0)
+    monkeypatch.setattr(_launch_child.os, "setsid", lambda: None)
+    monkeypatch.setattr(_launch_child.os, "_exit",
+                        lambda code: (_ for _ in ()).throw(ChildExit(code)))
+    monkeypatch.setattr(_launch_child.signal, "signal",
+                        lambda signum, handler: handlers.setdefault(signum, handler))
+    monkeypatch.setattr(_launch_child, "Store", StartedStore)
+    monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
+
+    def start_provider(*args, **kwargs):
+        handlers[signal.SIGTERM](signal.SIGTERM, None)
+        return Provider()
+
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", start_provider)
+    monkeypatch.setattr(_launch_child.os, "killpg",
+                        lambda _pid, _signum: (_ for _ in ()).throw(PermissionError()))
+
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "",
+                            "provider"])
+
+    assert exited.value.args == (0,)
+    session = read_session(tmp_path / "records.db", "token")
+    assert session.has_end_fact is True
+    assert session.exit_status == 0
+    assert "permission denied stopping provider process group" in session.partial_output
+
+
 def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tmp_path):
     """The path named in the boundary is also the provider process's real working directory,
     which is what the Claude project settings and OS workspace sandbox confine."""
