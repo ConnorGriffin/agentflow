@@ -31,7 +31,7 @@ def _commit_prompts() -> dict[str, str]:
             repo="o/r", n=357, title="DCO", body="", branch="mockup-357", surfaces="none",
             scope_guidance=SCOPE_GUIDANCE[MockupScope.SURFACE], disclaimer=MOCKUP_DISCLAIMER),
         "review": REVIEW_PROMPT.format(
-            pr=357, starting_sha="abc", acceptance="DCO", surfaces="none"),
+            pr=357, issue=356, starting_sha="abc", acceptance="DCO", surfaces="none"),
     }
 
 

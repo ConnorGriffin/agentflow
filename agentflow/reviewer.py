@@ -265,7 +265,7 @@ def parse_verdict(payload: str, expected_sha: str | None = None, *,
 
 
 REVIEW_PROMPT = """You are the independent cross-tool reviewer-and-fixer for PR #{pr} in this repo.
-A different agent built it to satisfy a specific issue. The review started at exact head
+A different agent built it to satisfy issue #{issue}. The review started at exact head
 `{starting_sha}`. Decide if it is safe to merge, and ship any clear fixes you find.
 
 The issue's acceptance criteria — judge against THIS, not your own wishlist:
@@ -309,7 +309,11 @@ You own bounded cleanup in this review; do not merely report work you can safely
   follow-up issue in this repo. Record its URL, evidence, desired outcome, and duplicate-search
   query. Do not file issues for unsupported preferences. File it with NO labels — never
   `ready-for-agent` and never any `agentflow:*` label: a follow-up enters intake like any other
-  new issue and earns its dials there; one born ready is unbuildable (ADR 0018).
+  new issue and earns its dials there; one born ready is unbuildable (ADR 0018). Open its
+  **description at creation** with an origin line naming both this ticket and this pull request —
+  e.g. "Discovered while reviewing #{issue} (pull request #{pr})." — never as a comment and never
+  added after filing: a comment isn't read by whatever grounds the issue next, and a later edit to
+  the description is overwritten when the issue is groomed.
 - If a choice is materially ambiguous, changes product intent, needs missing context, or cannot be
   verified safely, do not guess. Record exactly two options, missing guidance, and your
   recommendation for agentflow's one private cross-tool decision handoff. Do not comment on GitHub.
