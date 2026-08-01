@@ -91,7 +91,8 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         return None
     workdir, slug = parts
     brief = REVIEW_PROMPT.format(
-        pr=pr_number, starting_sha=head_sha, acceptance=acceptance or "(none provided)",
+        pr=pr_number, issue=build_record.subject, starting_sha=head_sha,
+        acceptance=acceptance or "(none provided)",
         surfaces=surfaces or "any user-facing surface")
     state = review or ReviewState(change_author_tool=build_record.pool)
     assignment = state.assignment
@@ -407,7 +408,8 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
     if not head_sha or builder_tool not in BUILD_POOLS or reviewer_tool not in BUILD_POOLS:
         return None
     prompt = REVIEW_PROMPT.format(
-        pr=pr_number, starting_sha=head_sha, acceptance=acceptance or "(none provided)",
+        pr=pr_number, issue=issue, starting_sha=head_sha,
+        acceptance=acceptance or "(none provided)",
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
     state = review or ReviewState(change_author_tool=builder_tool)
     assignment = state.assignment

@@ -147,7 +147,7 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
     # both guards the bracing and locks ADR 0018's two always-on gates into the rubric,
     # without which the reviewer structurally can't block on them.
     body = REVIEW_PROMPT.format(
-        pr=42, starting_sha="abc123", acceptance="ships a thing",
+        pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
         surfaces="`agentflow/static/`")
     assert "#42" in body and "ships a thing" in body
     # the reviewer must actually fetch the body/files, not just the diff
@@ -159,12 +159,23 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
     assert "follow-up issue" in body.lower()           # necessary out-of-scope work is not lost
 
 
+def test_review_prompt_carries_the_originating_issue_and_requires_provenance():
+    # #409: the reviewer must know which issue it's reviewing, and any follow-up issue it
+    # files must open its description with an origin line naming both, written at creation.
+    body = REVIEW_PROMPT.format(
+        pr=398, issue=391, starting_sha="abc", acceptance="a", surfaces="none")
+    assert "#391" in body
+    assert "origin line" in body.lower()
+    assert "at creation" in body.lower()
+    assert "groomed" in body.lower()  # states why: a later edit is overwritten by grooming
+
+
 def test_review_prompt_judges_screenshots_against_the_locked_contract():
     # ADR 0048: when the brief carries a LOCKED visual contract, the reviewer compares the
     # implementation screenshots to it — a STATED-line violation is fix_before_completion, while
     # unstated visual taste stays discard_preference (the four-action split is preserved).
     body = REVIEW_PROMPT.format(
-        pr=42, starting_sha="abc", acceptance="a", surfaces="`agentflow/webui/src/`")
+        pr=42, issue=41, starting_sha="abc", acceptance="a", surfaces="`agentflow/webui/src/`")
     lower = body.lower()
     assert "locked visual contract" in lower
     assert "stated" in lower                            # only a stated-line violation blocks
