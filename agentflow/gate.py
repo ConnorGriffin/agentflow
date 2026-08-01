@@ -372,6 +372,9 @@ def squash_merge(repo: str, pr_number: int) -> bool:
 
 
 _CLEAN_REVIEW_MARKER = "<!-- agentflow-clean-review-summary -->"
+_CLEAN_REVIEW_HEAD_PREFIX = "<!-- agentflow-clean-review-head:"
+_CLEAN_REVIEW_HEAD_SUFFIX = " -->"
+_SUPERSEDED_REVIEW_MARKER = "<!-- agentflow-superseded-review-summary -->"
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,7 +393,27 @@ class ParkContext:
     decision_needed: bool = False
 
 
-def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict) -> bool:
+def _reviewed_head(comment: github.Comment) -> str | None:
+    """Return the head recorded on a clean summary, if this is a stamped summary."""
+    start = comment.body.find(_CLEAN_REVIEW_HEAD_PREFIX)
+    if start < 0:
+        return None
+    start += len(_CLEAN_REVIEW_HEAD_PREFIX)
+    end = comment.body.find(_CLEAN_REVIEW_HEAD_SUFFIX, start)
+    return comment.body[start:end] if end >= start else None
+
+
+def _supersede_summary(comment: github.Comment) -> bool:
+    """Retire a current summary without losing the evidence it recorded."""
+    if not comment.id:
+        return False
+    return github.edit_comment(
+        comment.id,
+        comment.body.replace(_CLEAN_REVIEW_MARKER, _SUPERSEDED_REVIEW_MARKER, 1))
+
+
+def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict,
+                              reviewed_head: str) -> bool:
     """Publish and prove exactly one current final summary after a clean review chain."""
     status = ("cross-tool review"
               if verdict.reviewer_tool != verdict.change_author_tool
@@ -400,7 +423,8 @@ def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict) -> bo
                   or "- None.")
     checks = "\n".join(f"- {item}" for item in verdict.checks) or "- No proof recorded."
     body = (
-        f"> *agentflow: clean review.*\n{_CLEAN_REVIEW_MARKER}\n\n"
+        f"> *agentflow: clean review.*\n{_CLEAN_REVIEW_MARKER}\n"
+        f"{_CLEAN_REVIEW_HEAD_PREFIX}{reviewed_head}{_CLEAN_REVIEW_HEAD_SUFFIX}\n\n"
         "Outcome: clean.\n\n"
         f"Review depth: {verdict.depth.value.title()} — "
         f"{verdict.depth_reason or 'legacy review assignment'}\n\n"
@@ -412,15 +436,16 @@ def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict) -> bo
     if comments is None:
         return False
     marked = [comment for comment in comments if _CLEAN_REVIEW_MARKER in comment.body]
-    if marked:
-        canonical, *duplicates = marked
-        if canonical.body != body and not github.edit_comment(canonical.id, body):
+    matching = [comment for comment in marked if _reviewed_head(comment) == reviewed_head]
+    canonical = matching[0] if matching else None
+    for comment in marked:
+        if comment is canonical:
+            continue
+        if not _supersede_summary(comment):
             return False
-        for duplicate in duplicates:
-            replacement = duplicate.body.replace(
-                _CLEAN_REVIEW_MARKER, "<!-- agentflow-superseded-review-summary -->")
-            if not github.edit_comment(duplicate.id, replacement):
-                return False
+    if canonical is not None:
+        if canonical.body != body and (not canonical.id or not github.edit_comment(canonical.id, body)):
+            return False
     elif not github.pr_comment(repo, pr_number, body):
         return False
     proved = github.pr_comments(repo, pr_number)
@@ -439,6 +464,12 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
     will say so explicitly rather than listing an empty findings section that
     reads as a clean review.
     """
+    comments = github.pr_comments(repo, pr_number)
+    if comments is None:
+        return
+    for summary in (comment for comment in comments if _CLEAN_REVIEW_MARKER in comment.body):
+        if not _supersede_summary(summary):
+            return
     if context is None:
         context = ParkContext(
             behavior=f"The PR cannot safely complete because it {reason}.",
@@ -509,9 +540,8 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
             "## Agent handoff\n\n"
             f"{handoff}")
     if proof_marker:
-        comments = github.pr_comments(repo, pr_number)
-        parked = ([] if comments is None else [
-            comment for comment in comments if PARK_MARK in comment.body])
+        parked = [
+            comment for comment in comments if PARK_MARK in comment.body]
         if parked:
             if parked[-1].id:
                 github.edit_comment(parked[-1].id, body)

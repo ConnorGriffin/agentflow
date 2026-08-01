@@ -109,7 +109,7 @@ def _wire_clean_settlement(monkeypatch, record, *, profile="reviewed", head_chec
     monkeypatch.setattr("agentflow.gate.park", _park)
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
-        lambda repo, pr, verdict: summarized.append((repo, pr)) or True)
+        lambda repo, pr, verdict, head: summarized.append((repo, pr, head)) or True)
     monkeypatch.setattr("agentflow.coordinated_review._finish_review",
                         lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
@@ -172,7 +172,7 @@ def test_all_pending_or_absent_or_skipped_checks_settle_exactly_as_today(monkeyp
         world = _wire_clean_settlement(monkeypatch, record, head_checks=rollup)
         assert (coordinated_review._settle_review(record)
                 == "https://github.com/o/r/pull/42")
-        assert world.summarized == [("o/r", 42)] and world.parked == []
+        assert world.summarized == [("o/r", 42, "sha-a")] and world.parked == []
 
 
 def test_only_the_check_read_unreadable_defers_the_clean_settlement_silently(monkeypatch):
