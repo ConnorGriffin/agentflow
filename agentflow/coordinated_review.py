@@ -34,7 +34,7 @@ from agentflow.balancer import BUILD_POOLS, pick_reviewer
 from agentflow.coordinator import Coordinator, tracer
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
-from agentflow.labels import BUILDING, claim
+from agentflow.labels import BUILDING, claim, release
 from agentflow.pr_park import (chain_uncertainty, exact_head_review_chain, park_context,
                                park_proof_marker)
 from agentflow.prompts import UI_GAP_REASON
@@ -891,6 +891,8 @@ def _settle_review(record) -> str | None:
         if (verdict.change_author_tool
                 and not post_clean_review_summary(record.repo, pr, verdict)):
             return None
+        if not release(record.repo, int(record.subject), BUILDING):
+            return None
         slug = _review_slug(record)
         _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),
                        record.pool, pr, slug, merged=True)
@@ -1004,6 +1006,8 @@ def _settle_review(record) -> str | None:
             autonomous=True)
     if (verdict.change_author_tool
             and not post_clean_review_summary(record.repo, pr, verdict)):
+        return None
+    if not release(record.repo, int(record.subject), BUILDING):
         return None
     slug = _review_slug(record)
     _finish_review(SimpleNamespace(repo=record.repo, workdir=workdir),

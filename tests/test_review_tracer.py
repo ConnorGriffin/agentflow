@@ -882,6 +882,8 @@ def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeyp
                         lambda *args, **kwargs: finished.append((args, kwargs)))
     monkeypatch.setattr("agentflow.github.remove_label",
                         lambda repo, issue, label: label_edits.append((issue, label)) or True)
+    reads = iter((frozenset({"agentflow:building"}), frozenset()))
+    monkeypatch.setattr("agentflow.github.issue_labels", lambda *_args: next(reads))
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.github.commit_head_checks",
                         lambda _repo, sha: github.HeadChecks(sha=sha))
@@ -889,7 +891,66 @@ def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeyp
 
     assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
     assert merged == [42] and len(finished) == 1
-    assert label_edits == [("7", "ready-for-agent")]   # the merged issue's ready label is dropped
+    assert label_edits == [(7, "agentflow:building"), ("7", "ready-for-agent")]
+
+
+def test_already_merged_review_settlement_releases_build_claim(monkeypatch):
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record()
+    label_edits, finished = [], []
+    reads = iter((frozenset({"agentflow:building"}), frozenset()))
+    monkeypatch.setattr(coordinated_review, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_review, "_review_pr_facts",
+                        lambda _r: {"head": "merged-sha", "state": "MERGED"})
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.github.issue_labels", lambda *_args: next(reads))
+    monkeypatch.setattr("agentflow.github.remove_label",
+                        lambda _repo, issue, label: label_edits.append((issue, label)) or True)
+    monkeypatch.setattr("agentflow.coordinated_review._finish_review",
+                        lambda *args, **kwargs: finished.append((args, kwargs)))
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+
+    assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
+    assert label_edits == [(7, "agentflow:building"), ("7", "ready-for-agent")]
+    assert len(finished) == 1
+
+
+@pytest.mark.parametrize("pr_state", ["MERGED", "OPEN"])
+def test_merged_review_settlement_stays_unsettled_when_build_claim_release_fails(
+        monkeypatch, pr_state):
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record(profile="autonomous")
+    finished, ready_removals = [], []
+    monkeypatch.setattr(coordinated_review, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(coordinated_review, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": pr_state})
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.coordinated_review.repo_profile",
+                        lambda _workdir: "autonomous")
+    monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: [])
+    monkeypatch.setattr("agentflow.coordinated_review._finish_review",
+                        lambda *args, **kwargs: finished.append((args, kwargs)))
+    monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
+    monkeypatch.setattr(coordinated_review, "release", lambda *_args: False)
+    monkeypatch.setattr("agentflow.github.remove_label",
+                        lambda _repo, issue, label: ready_removals.append((issue, label)) or True)
+
+    if pr_state == "OPEN":
+        monkeypatch.setattr("agentflow.gate.ci_is_green", lambda *args, **kwargs: True)
+        monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
+        monkeypatch.setattr("agentflow.gate.reply_pending", lambda _comments: False)
+        monkeypatch.setattr("agentflow.gate.squash_merge", lambda *_args: True)
+        monkeypatch.setattr("agentflow.github.commit_head_checks",
+                            lambda _repo, sha: github.HeadChecks(sha=sha))
+        coordinated_review._REVIEW_CI_OBSERVED[record.identity] = True
+
+    try:
+        assert coordinated_review._settle_review(record) is None
+    finally:
+        coordinated_review._REVIEW_CI_OBSERVED.pop(record.identity, None)
+    assert finished == [] and ready_removals == []
 
 
 def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch):
@@ -916,6 +977,7 @@ def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch
     monkeypatch.setattr("agentflow.gate.squash_merge",
                         lambda _repo, pr: merged.append(pr) or True)
     monkeypatch.setattr("agentflow.github.remove_label", lambda *_args: True)
+    monkeypatch.setattr("agentflow.github.issue_labels", lambda *_args: frozenset())
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.github.commit_head_checks",
                         lambda _repo, sha: github.HeadChecks(sha=sha))
@@ -971,6 +1033,7 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, content, comments,
     if merges:
         monkeypatch.setattr("agentflow.gate.ci_is_green", lambda *args, **kwargs: True)
         monkeypatch.setattr("agentflow.github.remove_label", lambda *_args: True)
+        monkeypatch.setattr("agentflow.github.issue_labels", lambda *_args: frozenset())
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
