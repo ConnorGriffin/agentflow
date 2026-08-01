@@ -56,24 +56,63 @@ def test_capability_manifest_pins_the_complete_public_skill_release():
     pins = {
         item["skill"]: {file["path"]: file["sha256"] for file in item["files"]}
         for item in manifest["capabilities"]
-        if item.get("skill") in {"ui-mockups", "drive-local-webapp"}
+        if item.get("skill") in {"ui-craft", "drive-local-webapp"}
     }
 
     assert manifest["skill_installer"]["version"] == "1.5.9"
     assert manifest["connor_skills"] == {
         "source": "https://github.com/ConnorGriffin/skills",
-        "tag": "v0.1.0",
-        "commit": "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52",
-        "skills": ["ui-mockups", "drive-local-webapp"],
+        "tag": "v0.3.0",
+        "commit": "230e71a55ab07f0cd9beaa61649b583cb9d1bde1",
+        "skills": ["ui-craft", "drive-local-webapp"],
     }
-    assert pins["ui-mockups"] == {
-        "SKILL.md": "0b42c78273dca661cba5502ecae16d8a8647fb9e6eeb7b539b99818a4be6cb51",
-        "agents/openai.yaml": (
-            "29e85e216b29bf13e9b75c6bbe92dd757d1eed393a3c0a84e3d4b9005db484cd"
-        ),
-        "references/variant-agent-prompt.md": (
-            "e4b9047aa794b80c1e617cd19fc5cb493d34f3d1efa264eb0cc696d3708510ae"
-        ),
+    assert pins["ui-craft"] == {
+        "SKILL.md": "a33d188dd0cd9b648795e959338f98fd6f9f135fd0c6cef4ddd48d0011a3f7c7",
+        "agents/openai.yaml": "87e22f100ffc1d87b342ada266ccddbcc271b20709cfe5c3e7b5179c635f9b56",
+        "reference/audit.md": "ec0f1c0a472493e048d6ed7de07d40e6b39398c183c6c27c060045a55886a579",
+        "reference/brand.md": "6523c1d15a9127a3e7fe46c2509a8eab4bc586c3eceb523b9b091af580b84d3a",
+        "reference/build.md": "bc750e2e19b5e2220e5586e3f4d8e87aca29d4da782db06b23a7c2b8964de6af",
+        "reference/codex.md": "6301dd5df63d2f06829a486e8b18f6f1f2cd549c45f347137fbebc60578bb2ac",
+        "reference/critique.md": "b41b26ecf8b9a8a1960bfa1346dcca9c4980bfc439768c131e743e070b287ed7",
+        "reference/design-rules.md": "a9bb21e324e30ca641dd0503365660cb8b3d63e345070a471d6dd07f3b830469",
+        "reference/document.md": "e0a95b583c00c10c34342df8e862bbc5e80ae70b2e2d45ac0562f18626c63b58",
+        "reference/init.md": "36138702e864a139113e6b1f2b8ee9bd3c3d38233880e8c3021d3390d4ac8d62",
+        "reference/lock.md": "cd3d645487998242a7fb974468af86f10047ee2a7f2e5ce0623eac9f6ea3c781",
+        "reference/polish.md": "abee7a59b47e26fdb3852d58fa21c19101aafc428587b0043e1ca7517ef5cbab",
+        "reference/product.md": "9ea8cc99ec208f4c1addc66369980ec6ee2a0ae7732aa8f14672aeed3418b6aa",
+        "reference/resettle.md": "ee42459887603619f8d17e906903275d03f4fe3b35fc6ec923618deccd8d85e8",
+        "reference/variant-agent-prompt.md": "e4b9047aa794b80c1e617cd19fc5cb493d34f3d1efa264eb0cc696d3708510ae",
+        "scripts/command-metadata.json": "759cc4028134797401d8050aa97c111bfc5ece9db1caba92df24e01ff7ba743d",
+        "scripts/context-signals.mjs": "7846ab9d3f71171b041bd9090b34136686589d53ff87bdc91313f3cee1702ff9",
+        "scripts/context.mjs": "d3a9254e5375e09b2ee12724dd9d5738d9b311b638ad2bce01563737d7eadcba",
+        "scripts/critique-storage.mjs": "0ae2c767ee8e5d7820c3a2a5bc96aeb3721d25fafda54b72e419af9e1775444a",
+        "scripts/detect-csp.mjs": "2d80520bef13cb93107699714bc0d2be5a2787a9aa079ecec91b94508a8125a4",
+        "scripts/detect.mjs": "f5dfd05ca1e314acd8ed79c6301a20a1b844f2eb6691bd63e04116a8e7efb187",
+        "scripts/detector/browser/injected/index.mjs": "4c0fb5155e1eeef365e0c526b9c80ab250392f9fb68156b3acaaba5b1e974a19",
+        "scripts/detector/cli/main.mjs": "1ead1f652d202417351d259161a26a7a36a963b627c3caa5a6d1851ec3eaa677",
+        "scripts/detector/design-system.mjs": "6339cb3e13c7d203badc051af5e4deb820f8aaabde82636fc0140521e5534193",
+        "scripts/detector/detect-antipatterns-browser.js": "0c069d9cd423819a8671397ea313c20b092571fc6f309de0d4fb82e6757b0ece",
+        "scripts/detector/detect-antipatterns.mjs": "f5240e4162b270efafd099b81d315309a6f25a83a887aedf02bf9bcf3ed5c724",
+        "scripts/detector/engines/browser/detect-url.mjs": "7ef2274debad8467e9dec97261b1ad2581f221b308c1b4b3fcc501a551080088",
+        "scripts/detector/engines/regex/detect-text.mjs": "cb9365dce43719483be6831243493356fc6e71d7b960b070d8712aec2b5a8dea",
+        "scripts/detector/engines/static-html/css-cascade.mjs": "919a55f7f73771e8911ae842f729d700b82c3bd8c991f45900bab5a245b0525f",
+        "scripts/detector/engines/static-html/detect-html.mjs": "f8729c12ef4b40af1146b516ac02fbdcc61be43052163914e67309f5dad92ee0",
+        "scripts/detector/engines/visual/screenshot-contrast.mjs": "b4520b3f001079bd175bf20d46c5197b1b8ec5fb98fdf72c50a24c0b6598ee99",
+        "scripts/detector/findings.mjs": "555330225cda4da2221e000c2d06abcbbd03c2c0246a5b066b5c81f8057ccce6",
+        "scripts/detector/node/file-system.mjs": "4004ac034bd6c09419558608b1185271e4ceb741e8edb3b06082af122ac14697",
+        "scripts/detector/profile/profiler.mjs": "5e201f3557360bd368a3977fecf925f376fd95f8a4dd6c4cc63fbd62848cda43",
+        "scripts/detector/registry/antipatterns.mjs": "22adf773f16d1738edc7b7735fde267561ccc5d7b1c8ef8c52d6709b70808ba3",
+        "scripts/detector/rules/checks.mjs": "2e51f831a9b85d648a3aede84ffbe3eb7ecfaa65a5df42ec047da147f75b3273",
+        "scripts/detector/shared/color.mjs": "01a68231413473f2c1183e12663ccf8aca26a87d067de75fbf3c21e73b751a83",
+        "scripts/detector/shared/constants.mjs": "2e61e0815e7216fe74ce89eccfff2761bb72268964d804ee89987119130e4edd",
+        "scripts/detector/shared/inline-ignores.mjs": "74c80303e25f017b4671ae299b9fca424a5f7714203d19207a8d8896dfd2eecc",
+        "scripts/detector/shared/page.mjs": "b4cef5548d84fa90d15e6b42b20be9ef74ed05e4e6e46076ec5acc61b343315c",
+        "scripts/lib/design-parser.mjs": "096747b1225f0b78f6fe155477324c592f4fc38021b7007177e70b2dc55df588",
+        "scripts/lib/impeccable-config.mjs": "b8da16081a158d2aa6e86ff4fa74028977ee73e6559eda13e6a068b60123c7cb",
+        "scripts/lib/impeccable-paths.mjs": "e8a8fb45408e92e08bdc6cbc5e94c53b42166f7dd468ffeab98b1808dfa09362",
+        "scripts/lib/is-generated.mjs": "ed5b0b00e99ed385db541c7a068cb85f72456a4b6aa7a5460037d24b58bd90cd",
+        "scripts/lib/target-args.mjs": "8f8b902d9ec7dbad0431226bb8aea935cd67d68878d19d95a605be0585056f31",
+        "scripts/palette.mjs": "6e43ef19ede979019ebf86175fed0d6876473ddc1cf6c40c8b310e7ac4c5f45a",
     }
     assert pins["drive-local-webapp"] == {
         "SKILL.md": "9cbbc9b845d8d4194beea8da6a9aef0b4e4dd4e21f2aec7b29e7bb263d3b7284",
@@ -113,7 +152,7 @@ def test_doctor_json_names_missing_required_capabilities(tmp_path, capsys):
         "repository-instructions",
         "agentflow-skill",
         "fleet-config",
-        "ui-mockups",
+        "ui-craft",
         "drive-local-webapp",
         "screenshot-harness",
         "playwright",
@@ -135,7 +174,7 @@ def test_doctor_distinguishes_a_drifted_skill_from_a_missing_one(tmp_path, capsy
     report = json.loads(capsys.readouterr().out)
     states = {item["id"]: item["status"] for item in report["capabilities"]}
     assert states["agentflow-skill"] == "drifted"
-    assert states["ui-mockups"] == "missing"
+    assert states["ui-craft"] == "missing"
 
 
 def test_doctor_treats_an_extra_managed_skill_file_as_drift(tmp_path, capsys):
@@ -364,7 +403,7 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
 
     def install_skills(root):
         for agent_root in (".agents/skills", ".claude/skills"):
-            for name in ("ui-mockups", "drive-local-webapp"):
+            for name in ("ui-craft", "drive-local-webapp"):
                 skill = root / agent_root / name / "SKILL.md"
                 skill.parent.mkdir(parents=True, exist_ok=True)
                 skill.write_text(f"---\nname: {name}\n---\n")
@@ -626,8 +665,8 @@ def test_skill_installer_success_for_only_one_agent_path_is_not_ready(
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
-                    "\trefs/tags/v0.1.0\n"
+                    "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+                    "\trefs/tags/v0.3.0\n"
                 ),
                 stderr="",
             )
@@ -638,13 +677,13 @@ def test_skill_installer_success_for_only_one_agent_path_is_not_ready(
         if command[-2:] == ["rev-parse", "HEAD"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout="558d1a0cf3cea0e5a97c48eb8d50b2453b433f52\n",
+                stdout="230e71a55ab07f0cd9beaa61649b583cb9d1bde1\n",
                 stderr="",
             )
         if command[0] == "npx":
             assert command[:3] == ["npx", "skills@1.5.9", "add"]
             assert command[3].endswith("/source")
-            for name in ("ui-mockups", "drive-local-webapp"):
+            for name in ("ui-craft", "drive-local-webapp"):
                 skill = tmp_path / ".agents" / "skills" / name / "SKILL.md"
                 skill.parent.mkdir(parents=True, exist_ok=True)
                 skill.write_text("installed in Codex only\n")
@@ -664,18 +703,18 @@ def test_skill_installer_success_for_only_one_agent_path_is_not_ready(
         item["id"]: item["status"]
         for item in json.loads(capsys.readouterr().out)["capabilities"]
     }
-    assert states["ui-mockups"] == "missing"
-    assert not (tmp_path / ".agents" / "skills" / "ui-mockups").exists()
+    assert states["ui-craft"] == "missing"
+    assert not (tmp_path / ".agents" / "skills" / "ui-craft").exists()
 
 
 @pytest.mark.parametrize(
     "stdout",
     [
-        "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52\trefs/tags/v0.1.0\n",
+        "230e71a55ab07f0cd9beaa61649b583cb9d1bde1\trefs/tags/v0.3.0\n",
         (
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.1.0\n"
-            "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
-            "\trefs/tags/v0.1.0^{}\n"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.3.0\n"
+            "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+            "\trefs/tags/v0.3.0^{}\n"
         ),
     ],
 )
@@ -694,15 +733,15 @@ def test_release_verification_accepts_lightweight_and_annotated_tags(
     resolved, error = _resolved_skill_release(_manifest())
 
     assert error is None
-    assert resolved == "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
+    assert resolved == "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
     assert commands == [
         [
             "git",
             "ls-remote",
             "--tags",
             "https://github.com/ConnorGriffin/skills",
-            "refs/tags/v0.1.0",
-            "refs/tags/v0.1.0^{}",
+            "refs/tags/v0.3.0",
+            "refs/tags/v0.3.0^{}",
         ]
     ]
 
@@ -747,7 +786,7 @@ def test_enroll_rejects_a_moved_skill_tag_before_mutating_the_checkout(
         if command[:3] == ["git", "ls-remote", "--tags"]:
             return SimpleNamespace(
                 returncode=0,
-                stdout="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.1.0\n",
+                stdout="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.3.0\n",
                 stderr="",
             )
         return original_run(command, **kwargs)
@@ -791,13 +830,13 @@ def test_enroll_rolls_back_if_tag_moves_between_preflight_and_install(
         if command[:3] == ["git", "ls-remote", "--tags"]:
             tag_reads += 1
             commit = (
-                "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
+                "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
                 if tag_reads == 1
                 else "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
             )
             return SimpleNamespace(
                 returncode=0,
-                stdout=f"{commit}\trefs/tags/v0.1.0\n",
+                stdout=f"{commit}\trefs/tags/v0.3.0\n",
                 stderr="",
             )
         return original_run(command, **kwargs)
@@ -824,7 +863,7 @@ def test_enroll_rejects_drifted_public_skills_without_running_installer(
     tmp_path, monkeypatch, capsys
 ):
     (tmp_path / "frontend").mkdir()
-    drifted = tmp_path / ".agents" / "skills" / "ui-mockups" / "SKILL.md"
+    drifted = tmp_path / ".agents" / "skills" / "ui-craft" / "SKILL.md"
     drifted.parent.mkdir(parents=True)
     drifted.write_text("local edits\n")
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
@@ -846,8 +885,8 @@ def test_enroll_rejects_drifted_public_skills_without_running_installer(
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
-                    "\trefs/tags/v0.1.0\n"
+                    "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+                    "\trefs/tags/v0.3.0\n"
                 ),
                 stderr="",
             )
@@ -874,7 +913,7 @@ def test_enroll_treats_existing_non_skill_destinations_as_conflicts(
     tmp_path, monkeypatch, capsys, shape
 ):
     (tmp_path / "frontend").mkdir()
-    destination = tmp_path / ".agents" / "skills" / "ui-mockups"
+    destination = tmp_path / ".agents" / "skills" / "ui-craft"
     destination.parent.mkdir(parents=True)
     if shape == "regular-file":
         destination.write_text("preserve me\n")
@@ -901,8 +940,8 @@ def test_enroll_treats_existing_non_skill_destinations_as_conflicts(
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
-                    "\trefs/tags/v0.1.0\n"
+                    "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+                    "\trefs/tags/v0.3.0\n"
                 ),
                 stderr="",
             )
@@ -1171,7 +1210,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     config_before = config.read_bytes()
 
     def destination_status(directory, manifest):
-        if directory.name in {"ui-mockups", "drive-local-webapp"}:
+        if directory.name in {"ui-craft", "drive-local-webapp"}:
             return "ok" if installed else "absent"
         return original_destination_status(directory, manifest)
 
@@ -1182,9 +1221,9 @@ def test_enroll_public_ui_command_path_reports_each_stage(
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.1.0\n"
-                    "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52"
-                    "\trefs/tags/v0.1.0^{}\n"
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/tags/v0.3.0\n"
+                    "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+                    "\trefs/tags/v0.3.0^{}\n"
                 ),
                 stderr="",
             )
@@ -1204,7 +1243,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
                 stdout=(
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
                     if active_failure == "git-head-mismatch"
-                    else "558d1a0cf3cea0e5a97c48eb8d50b2453b433f52\n"
+                    else "230e71a55ab07f0cd9beaa61649b583cb9d1bde1\n"
                 ),
                 stderr="",
             )
@@ -1212,7 +1251,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
             if active_failure == "npx":
                 return SimpleNamespace(returncode=127, stdout="", stderr="missing npx")
             installed = True
-            for name in ("ui-mockups", "drive-local-webapp"):
+            for name in ("ui-craft", "drive-local-webapp"):
                 codex = tmp_path / ".agents" / "skills" / name
                 codex.mkdir(parents=True)
                 claude = tmp_path / ".claude" / "skills" / name
@@ -1270,7 +1309,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
         pass
     else:
         assert commands[npx_index][3].endswith("/source")
-        assert "v0.1.0" not in commands[npx_index][3]
+        assert "v0.3.0" not in commands[npx_index][3]
     if failure in source_failures:
         pass
     elif failure == "npx":

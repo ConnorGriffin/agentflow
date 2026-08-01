@@ -21,12 +21,23 @@ Standards every app built in the agentflow flow must meet. Read by **both** tool
 
 ## UI — never invented at build time
 
-- Any user-facing surface goes through **`/ui-mockups` to a *locked* visual spec**
-  before it is implemented. No ad-hoc UI.
-- A PR that changes a user-facing surface **attaches before/after screenshots**
-  (headless Playwright) as proof-of-match to the locked spec — the unattended
+- Any user-facing surface goes through **`/ui-craft lock` to a *locked* visual
+  spec** before it is implemented — a ★ LOCKED mockup **plus its lock manifest**
+  (`mockups/<surface>.lock.md`: numbered gate/eye terms, a precedence line for
+  design-system conflicts, fixture obligations, verbatim strings). No ad-hoc UI.
+- Implementation runs as **`/ui-craft build`**: the manifest is the contract.
+  Locked-artifact contradictions are surfaced, never arbitrated in private;
+  deviations go through `/ui-craft resettle`, never a quiet diff; every `gate`
+  term gets a rendered assertion that has been **shown to fail** when its
+  feature is knocked out; replacing a test file transfers its assertions or
+  names the drops in the PR.
+- A PR that changes a user-facing surface attaches **paired mock-vs-build
+  screenshots** (headless Playwright, same fixture and viewports — fixtures
+  must actually exercise the locked visuals) and a **fidelity ledger** walking
+  every manifest term to `met` / `re-settle` / `blocked` — the unattended
   stand-in for a live demo ([ADR 0018](docs/adr/0018-two-dials-review-by-evidence.md)).
-  A UI change with no screenshot is a **blocking** gap, not a nit.
+  A UI change missing the pairs or the ledger is a **blocking** gap, not a nit.
+  Green gates are not the finish line; the walked manifest is.
 
 ## The pull request — framed for the human who merges
 

@@ -32,7 +32,7 @@ def test_mockup_submission_is_one_stable_variant_round_on_the_original_lineage()
     # and the assertion read the same convention, and the drawing/review pair reads as one issue.
     expected = WorktreeRef.for_mockup("/home/w", "claude", 11, "compare-navigation-concepts")
     assert first.source == expected.path
-    assert "/ui-mockups" in first.input_ptr and "EXACTLY ONE comment" in first.input_ptr
+    assert "/ui-craft" in first.input_ptr and "EXACTLY ONE comment" in first.input_ptr
     assert "continuation" in first.input_ptr and "NEVER post another" in first.input_ptr
 
 

@@ -12,7 +12,7 @@ exactly one outcome:
   code/data, or a request that contradicts a recorded ADR; it posts questions in the
   *maintainer's* voice and holds (ADR 0019).
 - `agentflow:needs-mockup` — a user-facing surface beyond a minor bugfix; holds for a
-  `/ui-mockups` pass.
+  `/ui-craft lock` pass.
 
 Same shape as the reviewer: a tool-agnostic session does the grounding and emits a
 decision that matches the provider-neutral `INTAKE_RESULT_SCHEMA`, enforced natively by
@@ -433,7 +433,7 @@ WRITE the body for your route (Markdown), starting with this exact line:
 - grill -> questions IN THE MAINTAINER'S VOICE: talk about the app's behavior and their real
   numbers, NEVER about code symbols, ADR numbers, or file paths. Lead with the symptom/impact,
   give 2-3 concrete options grounded in real examples, and say which you'd pick and why. Max 5.
-- mockup -> a short `/ui-mockups` kickoff: name the one surface in scope, STATE THE SCOPE
+- mockup -> a short `/ui-craft lock` kickoff: name the one surface in scope, STATE THE SCOPE
   you chose (local vs surface — see MOCKUP SCOPE below), and give the concept axes to explore
   (a `surface` round: 3-4 wildly-different whole-surface concepts; a `local` round: a few ways
   the ADDITION itself could work, inside the shipping surface's existing identity).

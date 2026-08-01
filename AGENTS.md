@@ -14,7 +14,7 @@ ui-surfaces: agentflow/webui/src/
   stdlib dashboard is gone (ADR 0026). Build the console with `npm ci && npm run build`
   in `agentflow/webui/`; serve it with `uv run agentflow-web`. The server only reads
   the snapshot the daemon publishes — it never queries GitHub (ADR 0026). **Any UI
-  change goes through `/ui-mockups` first** (charter gate), and must honor
+  change goes through `/ui-craft lock` first** (charter gate), and must honor
   `PRODUCT.md`/`DESIGN.md` (no side-stripe accents, etc.).
 - **No hazards:** no real data / PHI, no live credentials. (The daemon *spawns* agent
   sessions, but a build session working on this repo doesn't need to.)
