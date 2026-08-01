@@ -91,10 +91,11 @@ def _write_service(label: str, program_args: list[str], environment: dict, log_n
 def _validated_helper_path(helper: str) -> Path:
     """Reject a malformed ``AGENTFLOW_CAPACITY_HELPER`` before any filesystem access.
 
-    The raw value must already be an absolute, ``..``-free path — checked with plain
-    string comparisons against the un-resolved value itself — before it is ever handed
-    to a filesystem call. Only a value that clears both checks reaches ``resolve()``."""
-    expanded = str(Path(helper).expanduser())
+    The raw value must already be an absolute, ``..``-free path — checked with
+    ``os.path`` string computations, never a ``pathlib.Path`` method, since every
+    ``Path`` method (``expanduser`` included) is itself a filesystem access. Only a
+    value that clears both checks is ever handed to ``Path``."""
+    expanded = os.path.expanduser(helper)
     if not expanded.startswith(os.sep):
         raise ServiceError(f"AGENTFLOW_CAPACITY_HELPER must be an absolute path: {helper}")
     if os.path.normpath(expanded) != expanded:
