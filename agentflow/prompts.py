@@ -204,7 +204,7 @@ The issue as filed / scoped:
 
 {scope_guidance}
 
-Run the `/ui-mockups` skill for this repo's user-facing surface(s): {surfaces}, following it
+Run the `/ui-craft` skill in its `lock` mode for this repo's user-facing surface(s): {surfaces}, following it
 headless. Screenshot each variant this way — """ + SCREENSHOT_HARNESS + """
 
 Every variant MUST carry a `LOCKED` contract of AT MOST 150 words — the durable spec the build

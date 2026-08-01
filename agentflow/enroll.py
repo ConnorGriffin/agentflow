@@ -340,7 +340,7 @@ def doctor(workdir: str) -> CapabilityReport:
                 else "install Claude Code or Codex"
             )
             install = "Install Claude Code or Codex and ensure its command is on PATH"
-        elif name in {"agentflow-skill", "ui-mockups", "drive-local-webapp"}:
+        elif name in {"agentflow-skill", "ui-craft", "drive-local-webapp"}:
             skill_name = spec["skill"]
             status = _skill_status(root, skill_name, spec["files"])
             available = status == "ok"

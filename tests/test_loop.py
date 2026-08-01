@@ -898,7 +898,7 @@ def test_rebase_checks_out_before_claiming_the_worktree_session(monkeypatch, tmp
 # --- issue #29: the mockup-production phase --------------------------------------------
 
 # Intake's park/kickoff comment on a needs-mockup issue: carries INTAKE_MARK, no MOCKUP_MARK.
-_MOCKUP_PARK = f"{INTAKE_MARK} — let's mock this up.\n\nA `/ui-mockups` kickoff."
+_MOCKUP_PARK = f"{INTAKE_MARK} — let's mock this up.\n\nA `/ui-craft lock` kickoff."
 # The produce phase's own variant-round comment: the disclaimer + embedded screenshots.
 _MOCKUP_VARIANTS = (f"{MOCKUP_DISCLAIMER}\n\n"
                     "**A** — inbox.\n![A](https://raw.githubusercontent.com/o/r/br/mockups/a.png)\n"
@@ -925,14 +925,14 @@ def test_awaiting_recheck_false_right_after_our_variant_comment():
 
 
 def test_produce_prompt_drives_ui_mockups_headless_and_one_marked_comment():
-    # The produce session's marching orders: run /ui-mockups for the repo's surfaces, screenshot,
+    # The produce session's marching orders: run /ui-craft lock for the repo's surfaces, screenshot,
     # commit variants to a branch, and post exactly ONE issue comment starting with the marker.
     body = PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
                                  branch="agentflow/claude/mockup-7-a-screen",
                                  surfaces="`agentflow/static/`",
                                  scope_guidance=SCOPE_GUIDANCE[MockupScope.SURFACE],
                                  disclaimer=MOCKUP_DISCLAIMER)
-    assert "/ui-mockups" in body
+    assert "/ui-craft" in body
     assert "screenshot" in body.lower()
     assert "agentflow/static/" in body
     assert MOCKUP_DISCLAIMER in body           # the marker line the comment must start with

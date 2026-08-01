@@ -5,7 +5,7 @@ This slice ships the console shell + the **Inbox** tab bound to the current
 `/api/snapshot` contract; Live / Fleet / History are stubs.
 
 Locked visual spec: [`mockups/dashboard-v2-combined.html`](../../mockups/dashboard-v2-combined.html)
-(any UI change goes through `/ui-mockups` first — charter gate).
+(any UI change goes through `/ui-craft lock` first — charter gate).
 
 ## Develop
 
