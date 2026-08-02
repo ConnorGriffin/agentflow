@@ -54,7 +54,15 @@ root reservation by design — that is why Codex review is priced at demand two 
 Claude's terminal `result` event carries `modelUsage` keyed by the model that ran, so
 coordinator dollars and slice dollars are separable per attempt today. What is missing is
 only that `agentflow/coordinator/telemetry.py` takes the model label when `modelUsage` has
-exactly one key, so a mixed-tier session records no model at all.
+exactly one key, so a mixed-tier session's per-model breakdown is discarded.
+
+*Corrected by [#467](https://github.com/ConnorGriffin/agentflow/issues/467)'s audit, after this
+record was accepted:* the consequence is worse than the null this ADR originally described. The
+cohort cell is keyed on the record's **routing dial** model, which is populated in all 854
+audited records — not on the provider-reported label, which is null in 849 of them. A
+coordinated build therefore records the coordinator's own dial and reads as a fully deep build
+while most of its turns ran cheap: silently wrong rather than visibly missing, and not fixable
+by populating the provider label alone.
 
 ## Decision
 
@@ -133,9 +141,12 @@ durable record, one worktree, one provider attempt, one tool lineage.
 
 - Coordinated build is a change to the Build stage adapter and its prompt, not an engine
   change. Dispatch, admission, permits, and continuation stay as they are.
-- Mixed-tier sessions must stop recording a null model. Until telemetry keeps the per-model
-  breakdown, a coordinated build is invisible to ADR 0040's model-keyed cohort cells and
-  the re-review has no readout.
+- Telemetry must keep the per-model breakdown. Until it does, a coordinated build is not
+  merely absent from ADR 0040's model-keyed cohort cells — it is **misfiled into the
+  coordinator's own cell** and reads as an ordinary all-deep build, so the re-review has no
+  readout and the number it would read is wrong rather than missing
+  ([#467](https://github.com/ConnorGriffin/agentflow/issues/467)'s audit;
+  [#472](https://github.com/ConnorGriffin/agentflow/issues/472) closes it).
 - The whole coordinated build shares one wall clock, so a runaway burns to a single kill.
   Commit-per-slice bounds the loss to the slice in flight.
 - The re-review reads two effects, not one. Tier-split spend answers whether the premium
