@@ -176,6 +176,11 @@ Issue-keyed records:
   before it is ever published: a cold session judges the draft on five axes and answers with
   objections or none, objections go to a redraft that is attacked again, and only a survivor is
   published as the ready brief. Amended by ADR 418.
+- [ADR 386](adr-386-dead-shell-environment-fault.md) — A session whose shell cannot start is an
+  environment fault, not a spent budget: the ending is named for the machine, refunds the attempt
+  it could never have used, and holds for a human with a diagnosis the maintainer can act on
+  instead of a misleading "ran out of tries". Amends 0028; extends 0030's provider seam. Amended
+  by ADR 454.
 - [ADR 401](adr-401-commit-time-signoff.md) — Preparing a session checkout installs the
   sign-off, so a commit carries it the moment it is made and no stranded pull request needs a
   human amendment. Confined to the session's own checkout, only for the commit's own author,
@@ -185,3 +190,25 @@ Issue-keyed records:
   objections all carry their own fix publishes with the fixes riding in the brief, and only a
   genuine fork reaches the maintainer — who sees the fork first. Amends ADR 380; the round cap
   is unchanged.
+- [ADR 425](adr-425-retire-clean-summary-on-park.md) — A park retires the current clean review
+  summary: every clean summary stamps its exact reviewed head, publishing for a new head
+  supersedes the old one in place, and any park supersedes every current clean summary before
+  the park comment is written, so a pull request needing attention never shows a clean verdict
+  as current. Applies 0047; follows ADR 417.
+- [ADR 442](adr-442-dispatch-ceiling-below-the-measured-argv-cliff.md) — The worktree dispatch
+  ceiling is recalibrated to sit below the argv cliff measured from the transcripts of three
+  dead sessions: the sandbox adds three filesystem deny paths per linked worktree to every
+  command, so enough worktrees push the spawn past the OS argument limit and every shell
+  command fails. Recalibrates 0050's number; the gate's design is unchanged.
+- [ADR 454](adr-454-dispatched-environment-holds-keep-attempt.md) — A dispatched environment
+  hold keeps its attempt: the fault still holds immediately and never auto-retries, but a
+  session the launch handshake proved started stays charged through the pending handoff and the
+  parked record, so replay after a restart cannot produce an attempt-zero park. Amends ADR 386.
+- [ADR 464](adr-464-slice-runs-in-session.md) — A coordinated build's slice runs as an
+  in-session subagent of the coordinator, not a separately launched runner session: one
+  logical Build stage, one reservation, one worktree, one tool lineage. Spend is attributed
+  per tier from the per-model breakdown, each finished slice is committed before the next
+  starts, and the coordinator carries its own unmeasured ceiling cell. The route is a
+  committed switch, off by default and set per cell; the coordinator picks each slice's
+  model from a configured allowed set rather than being pinned to the cheap tier.
+  Admission (ADR 0029) is unchanged.
