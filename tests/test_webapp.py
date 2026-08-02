@@ -30,6 +30,21 @@ def test_never_ran_daemon_reads_as_an_empty_fleet():
     assert body["repos"] == [] and body["running"] == []
     assert body["dispatch"] == {"enabled": False}
     assert body["daemon"]["gh_fresh_at"] is None, "no freshness stamp to lie with"
+    # schema-v2 fields (ADR 0036): the same versioned contract shape, no claimed freshness.
+    assert body["schema_version"] == 2
+    assert body["repositories"] == []
+    assert body["fleet"] == {"recent_landed": []}
+
+
+def test_a_published_schema_v2_snapshot_passes_through_verbatim():
+    published = {"dispatch": {"enabled": True}, "daemon": {"gh_fresh_at": "2026-07-30T00:00:00+00:00"},
+                 "pools": [], "running": [], "repos": [], "schema_version": 2,
+                 "generated_at": "2026-07-30T00:00:00+00:00",
+                 "repositories": [{"name_with_owner": "o/r",
+                                   "github": {"status": "fresh"}, "maps": {"active": [], "active_total": 0}}],
+                 "fleet": {"recent_landed": []}}
+    body = _client(lambda: published).get("/api/snapshot").json()
+    assert body == published
 
 
 def test_endpoint_reads_fresh_every_poll(tmp_path, monkeypatch):

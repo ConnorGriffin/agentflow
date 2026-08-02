@@ -156,9 +156,21 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
     """Produce the GitHub-backed fleet snapshot and publish it for the console — the
     daemon is its only producer (ADR 0026), once per tick, dormant included (dormant is
     exactly when the operator watches). A `gh` outage skips one publish, never the loop;
-    the console keeps serving the previous snapshot, honestly aged."""
+    the console keeps serving the previous snapshot, honestly aged.
+
+    Composes the existing v1 snapshot with the additive schema-v2 Decision Map projection
+    (ADR 0036) — the map read runs every tick, including dormant, since it is not gated by
+    dispatch. `previous_snapshot` lets the projection preserve last-verified per-repository
+    map data across a failed or budget-skipped read rather than inventing an empty one."""
     try:
-        live.write_snapshot(produce(repos, dispatch_enabled=ENABLE_FLAG.exists()))
+        from agentflow import operator_projection
+        v1 = produce(repos, dispatch_enabled=ENABLE_FLAG.exists())
+        previous = live.read_snapshot()
+        v2 = operator_projection.project(
+            repos, previous_snapshot=previous, heartbeat_seconds=FULL_PASS_SECONDS)
+        merged = {**v1, **v2,
+                  "fleet": operator_projection.fleet_recent_landed(v1.get("repos") or [])}
+        live.write_snapshot(merged)
     except Exception as e:  # noqa: BLE001 — a bad publish must not kill the daemon
         _log(f"snapshot publish error: {type(e).__name__}: {e}")
 

@@ -637,3 +637,39 @@ def test_a_sweep_that_only_archives_still_reports_its_recovery_refs(monkeypatch)
     assert len(logs) == 1
     assert "archived 1 stranded" in logs[0]
     assert "refs/agentflow/stranded/issue-9-x/abc123abc123" in logs[0]
+
+
+# --- publish_snapshot composes v1 + schema-v2 (ADR 0036) --------------------------------
+
+def test_publish_snapshot_composes_v1_and_schema_v2(tmp_path, monkeypatch):
+    """The daemon publishes one file carrying both the existing v1 fields and the additive
+    schema-v2 Decision Map projection — exercised end-to-end through the real snapshot file,
+    the way the console's endpoint reads it."""
+    monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
+    monkeypatch.setattr(github, "decision_maps",
+                        lambda repo, **kw: github.MapsRead(maps=(), total_count=0, cost=1,
+                                                           remaining=4999))
+    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
+
+    v1 = {"dispatch": {"enabled": True}, "daemon": {"gh_fresh_at": "2026-07-30T00:00:00+00:00"},
+          "pools": [], "running": [], "repos": [{"repo": "owner/a", "recent_merges": []}]}
+    daemon.publish_snapshot([A], produce=lambda repos, dispatch_enabled: v1)
+
+    published = live.read_snapshot()
+    assert published["dispatch"] == {"enabled": True}, "v1 fields survive verbatim"
+    assert published["schema_version"] == 2
+    assert [r["name_with_owner"] for r in published["repositories"]] == ["owner/a"]
+    assert published["fleet"] == {"recent_landed": []}
+
+
+def test_publish_snapshot_skips_the_whole_publish_on_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
+
+    def boom(repos, dispatch_enabled):
+        raise RuntimeError("gh outage")
+
+    daemon.publish_snapshot([A], produce=boom, _log=print)
+
+    assert live.read_snapshot() is None
+    assert "snapshot publish error" in capsys.readouterr().out

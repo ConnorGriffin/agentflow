@@ -40,7 +40,9 @@ EMPTY_WORKSPACE = {"workspace": {"read_model_at": None, "revision": 0, "availabl
                    "projects": []}
 
 # What the console sees before any daemon has ever published: an empty fleet with no
-# freshness stamp — the same contract shape, never an error (ADR 0026).
+# freshness stamp — the same contract shape, never an error (ADR 0026). `repositories`/
+# `fleet` are the additive schema-v2 fields (ADR 0036): empty arrays, no `github.status`
+# claiming freshness that was never verified.
 NEVER_RAN = {
     "dispatch": {"enabled": False},
     "daemon": {"enabled": False, "last_cycle_at": None,
@@ -48,6 +50,10 @@ NEVER_RAN = {
     "pools": [],
     "running": [],
     "repos": [],
+    "schema_version": 2,
+    "generated_at": None,
+    "repositories": [],
+    "fleet": {"recent_landed": []},
 }
 
 
