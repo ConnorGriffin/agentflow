@@ -23,6 +23,22 @@ coordinated build wins by moving mechanical turns onto the cheap tier, not by ru
 slices at the same time. Concurrency is not the mechanism, so the one thing launched
 sessions are uniquely good at buys nothing here.
 
+Cost is not the only motivation, and it may not be the larger one. A model reasons worse as
+its context window fills, so a monolithic deep build spends its last turns — the ones that
+finish the work — on the widest, most polluted context it will ever hold. Slicing attacks
+that directly: each slice reasons over a small, purpose-built context. If that produces
+better first-pass work, the saving compounds beyond the tier premium into fewer blocking
+review findings, fewer revise rounds, and fewer follow-up bug fixes. That effect is a
+hypothesis this map cannot measure in advance — history has no coordinated builds in it —
+but it points the same way as the cost argument, and it is why the shape is worth shipping
+rather than merely worth pricing.
+
+It also decides the shape, because the two candidates handle context very differently. An
+in-session subagent is not a shared window: it gets its own fresh context, returning only
+its result to the parent. So the quality argument is fully available in-session, and only
+the coordinator's own window grows. A launched session buys the same fresh context at the
+cost of an engine change.
+
 Launched slices also cannot fit the admission budget they would have to run under. A Claude
 deep build already reserves four or five of a pool's five permits, and ADR 0029 sets the
 minimum code-writing demand at three precisely so two writers can never share a pool. A
@@ -65,6 +81,11 @@ durable record, one worktree, one provider attempt, one tool lineage.
   reads as measured; it ratchets once telemetry fills it. The coordinator additionally
   holds each slice to an internal turn budget so a single runaway slice cannot consume the
   whole wall.
+- **A slice's return to the coordinator is bounded.** The quality argument only holds while
+  contexts stay narrow, and the one window that does grow across a coordinated build is the
+  coordinator's. A slice returns a result, never its transcript. What exactly it returns is
+  [#468](https://github.com/ConnorGriffin/agentflow/issues/468)'s question; that it must be
+  bounded is settled here.
 - **A slice needs a defined session profile** under ADR 0044. It is code-writing work, so
   it inherits the Build allowlist with MCP pinned strict; a slice never widens the surface
   its coordinator was launched with.
@@ -93,5 +114,9 @@ durable record, one worktree, one provider attempt, one tool lineage.
   the re-review has no readout.
 - The whole coordinated build shares one wall clock, so a runaway burns to a single kill.
   Commit-per-slice bounds the loss to the slice in flight.
+- The re-review reads two effects, not one. Tier-split spend answers whether the premium
+  shrank; ADR 0040's existing guardrails — review BLOCK rate and blocking findings, revise
+  rounds, merge rate — are what would show the context-narrowing effect, and they must be
+  read as a result here rather than only as a floor not to fall through.
 - The coordinated pull request stays in one tool lineage, so the cross-tool reviewer
   remains genuinely independent and review is unchanged: one pull request, one review.
