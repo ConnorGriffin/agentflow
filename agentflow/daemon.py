@@ -55,8 +55,9 @@ from agentflow.dashboard_data import snapshot
 from agentflow.loop import RepoConfig, recheck_once
 from agentflow.probe import ChangeProbe
 from agentflow.runner import recover_stale_worktrees
+from agentflow.state import state_dir
 
-STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
+STATE_DIR = state_dir()
 ENABLE_FLAG = STATE_DIR / "enabled"
 LOCK = STATE_DIR / "daemon.lock"
 
