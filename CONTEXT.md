@@ -197,18 +197,40 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Brief** — at `autonomous`/`reviewed`, the spec a builder starts from: the issue
   itself (acceptance criteria + file pointers). The builder self-scopes from it.
 
-- **Self-scope** — a builder reading the repo and grounding against real data to
+- **Self-scope** — a *session* reading the repo and grounding against real data to
   decide its own touch-set and approach, instead of being handed a frozen spec.
   Trusted at `autonomous`/`reviewed`; disallowed for *domain facts* at `guarded`.
+  A property of the session, not of every actor inside it: a coordinated build
+  self-scopes at its slicer and forbids its workers to (ADR 465).
 
-- **Work order** — a *frozen hermetic spec* used only at `guarded`: grounding
-  pre-done at scope time (real-data facts as literals + fixtures), a file allow-list,
-  and named invariant tests, so the builder never guesses a domain fact. Not a
-  per-tool cage — the grounding mechanism for high domain risk.
+- **Work order** — the form a brief takes when the builder that writes the code will
+  *not* self-scope: grounding pre-done as literals and fixtures, named invariant tests,
+  and the files the work is expected to touch. Two situations need one — `guarded`,
+  where a builder *must not* guess a domain fact, and a coordinated build, where workers
+  *cannot afford to look*. Not a per-tool cage, and never a second build input: it rides
+  in the brief (ADR 0022, ADR 465).
 
-- **Gap protocol** — at `guarded`, a builder that hits an unstated domain fact,
-  threshold, or fixture stops and posts a marker rather than guessing (a
-  plausible-wrong guess is the expensive failure). Retained as a per-level safety.
+- **Gap protocol** — a builder that hits an unstated domain fact, threshold, or fixture
+  stops rather than guessing (a plausible-wrong guess is the expensive failure). At
+  `guarded` it posts a marker for the operator. Inside a coordinated build it has an
+  inner form: the worker stops and asks its coordinator, which answers a repo fact it can
+  verify and parks a domain or intent fact — the operator only ever sees the second kind.
+
+- **Coordinated build** — a build whose deep **coordinator** delegates the issue's slices
+  to cheaper in-session workers and lands them on one pull request, which gets today's
+  unchanged single review. A route a build may take, off by default and switched per cell
+  (ADR 464).
+
+- **Slice** — one worker's portion of a coordinated build: a stated outcome, the files it
+  is expected to touch, the grounding it needs, and the test that says it is done. Sealed
+  for *deciding* (no domain fact or scope choice comes from outside it) and open for
+  *reading* (it may read around to match the house style). Committed green before the next
+  slice starts.
+
+- **Slicer** — the duty that cuts a work order into slices at pickup, against the repo as
+  it actually stands, as the coordinator's first in-session worker. Intake decides whether
+  work is separable at all and grounds it; the slicer decides where the cuts fall, because
+  a list of files goes stale between scope time and build time and grounding does not.
 
 - **Pool / headroom** — each prepaid plan (Claude, Codex) is a *pool* of rate-limit
   capacity. A pool can report multiple windows, such as a 300-minute window and a

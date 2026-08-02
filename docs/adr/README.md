@@ -212,3 +212,11 @@ Issue-keyed records:
   committed switch, off by default and set per cell; the coordinator picks each slice's
   model from a configured allowed set rather than being pinned to the cheap tier.
   Admission (ADR 0029) is unchanged.
+- [ADR 465](adr-465-work-order-is-the-non-self-scoping-brief.md) — A work order is the form
+  a brief takes when the builder that writes the code will not self-scope: `guarded` because
+  it must not guess, a coordinated build because its workers cannot afford to look. Intake
+  writes the durable grounding and the separability judgment at scope time; the slicer cuts
+  the file-level slices at pickup against current `main`, because a file list rots and
+  grounding does not. A slice is sealed for deciding and open for reading, a gap stops the
+  worker and not the build, and self-scope is sharpened to a property of the session — which
+  is what makes the route legal at `reviewed`. Constrains 0005 and 0022; extends ADR 464.
