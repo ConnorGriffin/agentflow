@@ -19,7 +19,7 @@ launched runner session the coordinator dispatches and tracks.
 Map #463's audit fixes the economics: cost is linear in session length
 (`$ = 0.063 × turns^0.99`, flat at ~$0.060/turn from 20 to 160 turns), and the lever is the
 **tier premium** — at an equal 25 turns, standard costs $0.81 and deep costs $2.35. A
-coordinated build wins by moving mechanical turns onto the cheap tier, not by running
+coordinated build wins by letting mechanical turns run on the cheap tier, not by running
 slices at the same time. Concurrency is not the mechanism, so the one thing launched
 sessions are uniquely good at buys nothing here.
 
@@ -61,6 +61,23 @@ exactly one key, so a mixed-tier session records no model at all.
 **A slice runs as an in-session subagent of the coordinator.** One logical Build stage, one
 durable record, one worktree, one provider attempt, one tool lineage.
 
+- **Coordinated build is a switch, off by default, set per cell.** It is a route a build may
+  take, never the shape every build takes. The switch is committed fleet configuration with
+  the same status as the admission and routing matrices: changing it takes a reviewed pull
+  request, and a per-repository setting may narrow it but never widen it (ADR 0029). Turning
+  the switch off is also the revert path — a coordinated build that is not worth its
+  complexity stops happening without any code being removed. *Which* cells are switched on,
+  and on what pre-dispatch signal, is
+  [#466](https://github.com/ConnorGriffin/agentflow/issues/466)'s question.
+- **The coordinator chooses each slice's model from a configured allowed set.** It is not
+  pinned to the cheap tier. The configuration declares, per cell, which models a coordinator
+  may launch a slice on; the coordinator picks within that set per slice, so a genuinely
+  hard slice can take the deep model while mechanical ones take the cheap one. The set is a
+  ceiling the coordinator works under, never a budget it can exceed: an unbounded choice
+  would make per-cell spend unpredictable and let a coordinator route around ADR 0046's
+  settled spend policy from inside a session, where no reviewed configuration governs it.
+  Per-tier attribution therefore reads twice — whether the tier premium shrank, and whether
+  the coordinator's own choices were good ones.
 - **Admission is untouched.** A coordinated build reserves its ordinary Build cell and its
   slices reserve nothing, exactly as ADR 0029's root-reservation rule already states for
   descendants. The scheduler sees one build; the fleet's headroom accounting is unchanged.
@@ -101,6 +118,13 @@ durable record, one worktree, one provider attempt, one tool lineage.
 - **In-session slices with a new per-slice billing record.** Rejected. The provider does
   not bill per subagent, so the record would be reconstructed rather than observed, and
   ADR 0040's contract is per logical stage — a slice is not one.
+- **Pinning slices to the cheap tier.** Rejected. It reads the tier premium as the whole
+  point and throws away the coordinator's judgment about which slices are actually hard;
+  a slice forced onto a model too small for it fails, and a failed slice is redone, which
+  is the expensive outcome the shape exists to avoid.
+- **Letting the coordinator pick any model freely.** Rejected. Per-cell spend stops being
+  predictable, and the choice moves inside a session where no reviewed configuration
+  governs it — an in-session route around ADR 0046.
 - **A hard per-slice wall-clock kill.** Rejected in favour of the internal turn budget plus
   commit-per-slice. Killing the session is the provider's lever, not the coordinator's;
   durable committed progress is what the recovery path actually needs.

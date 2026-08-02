@@ -208,5 +208,7 @@ Issue-keyed records:
   in-session subagent of the coordinator, not a separately launched runner session: one
   logical Build stage, one reservation, one worktree, one tool lineage. Spend is attributed
   per tier from the per-model breakdown, each finished slice is committed before the next
-  starts, and the coordinator carries its own unmeasured ceiling cell. Admission (ADR 0029)
-  is unchanged.
+  starts, and the coordinator carries its own unmeasured ceiling cell. The route is a
+  committed switch, off by default and set per cell; the coordinator picks each slice's
+  model from a configured allowed set rather than being pinned to the cheap tier.
+  Admission (ADR 0029) is unchanged.
