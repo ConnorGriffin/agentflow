@@ -185,3 +185,9 @@ Issue-keyed records:
   objections all carry their own fix publishes with the fixes riding in the brief, and only a
   genuine fork reaches the maintainer — who sees the fork first. Amends ADR 380; the round cap
   is unchanged.
+- [ADR 464](adr-464-slice-runs-in-session.md) — A coordinated build's slice runs as an
+  in-session subagent of the coordinator, not a separately launched runner session: one
+  logical Build stage, one reservation, one worktree, one tool lineage. Spend is attributed
+  per tier from the per-model breakdown, each finished slice is committed before the next
+  starts, and the coordinator carries its own unmeasured ceiling cell. Admission (ADR 0029)
+  is unchanged.
