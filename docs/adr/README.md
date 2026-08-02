@@ -220,3 +220,11 @@ Issue-keyed records:
   grounding does not. A slice is sealed for deciding and open for reading, a gap stops the
   worker and not the build, and self-scope is sharpened to a property of the session — which
   is what makes the route legal at `reviewed`. Constrains 0005 and 0022; extends ADR 464.
+- [ADR 466](adr-466-coordinated-build-routing-gate.md) — The coordinated-build route is gated
+  on the dials *plus* a slice-bearing work order: `deep` with `high` or `extra` effort
+  pre-filters the cells, and intake's separability judgment is the actual gate, so an
+  indivisible deep issue is never routed. Two cells switch on and agentflow dogfoods alone;
+  the allowed slice-model set is `{sonnet, opus}` with `sonnet` the default; a coordinator
+  that declines to decompose collapses to one slice and continues in place rather than
+  re-dispatching; revise stays monolithic. Fills in ADR 464's switch; changes no cell of
+  0041 or 0046.
