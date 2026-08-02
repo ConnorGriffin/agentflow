@@ -131,16 +131,21 @@ describe('deriveFleet / deriveCapacity', () => {
     expect(deriveFleet(noLandings)[0].landings).toBe('no landings yet');
   });
 
-  it('renders visibly different landing cells for equal counts with different freshness', () => {
-    const stale = { ...SNAP, repos: [{ ...SNAP.repos[0], recent_merges: [
-      { number: 1, title: 'a', merged_at: '2026-07-17T12:00:00Z' },
-    ] }] };
-    const fresh = { ...SNAP, repos: [{ ...SNAP.repos[0], recent_merges: [
-      { number: 1, title: 'a', merged_at: '2026-07-29T12:00:00Z' },
-    ] }] };
-    expect(deriveFleet(stale)[0].landings).toBe('1 recent · latest 13d ago');
-    expect(deriveFleet(fresh)[0].landings).toBe('1 recent · latest 1d ago');
-    expect(deriveFleet(stale)[0].landings).not.toBe(deriveFleet(fresh)[0].landings);
+  it('renders visibly different landing cells for two repositories at the same count', () => {
+    /* The count-alone regression case: both repositories sit at the ten-per-repository
+       cap, one landed yesterday and one thirteen days ago. */
+    const tenLandings = (newestDay) => Array.from({ length: 10 }, (_, i) => ({
+      number: i + 1, title: `landing ${i + 1}`,
+      merged_at: `2026-07-${newestDay - i}T12:00:00Z`,
+    }));
+    const equalCounts = { ...SNAP, repos: [
+      { ...SNAP.repos[0], repo: 'o/quiet', recent_merges: tenLandings(17) },
+      { ...SNAP.repos[0], repo: 'o/busy', recent_merges: tenLandings(29) },
+    ] };
+    const [busy, quiet] = deriveFleet(equalCounts);
+    expect(busy.landings).toBe('10 recent · latest 1d ago');
+    expect(quiet.landings).toBe('10 recent · latest 13d ago');
+    expect(busy.landings).not.toBe(quiet.landings);
   });
 
   it('labels an unverified or stale map read alongside the attention count', () => {
