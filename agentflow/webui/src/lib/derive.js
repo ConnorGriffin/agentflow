@@ -211,22 +211,59 @@ export function deriveMaps(snap) {
   return out;
 }
 
+/* Joins the v1 `repos[]` list (keyed by `repo`) against the schema-v2 `repositories[]`
+   list (keyed by `name_with_owner`) to attach map-read freshness to each row — the two
+   lists are not guaranteed the same order or length (a repo can be missing from either
+   side), so the join goes by name, never by index. */
 export function deriveFleet(snap) {
-  return (snap?.repos || []).map((r) => {
-    const needsAttention = (r.held || []).length > 0 || (r.parked || []).length > 0;
+  const nowMs = Date.now();
+  const byName = new Map((snap?.repositories || []).map((rr) => [rr.name_with_owner, rr]));
+  const rows = (snap?.repos || []).map((r) => {
+    const needsYou = (r.held || []).length + (r.parked || []).length;
+    const status = byName.get(r.repo)?.github?.status;
+    const merges = r.recent_merges || [];
+    const newest = merges.length
+      ? merges.reduce((m, cur) => (Date.parse(cur.merged_at) > Date.parse(m) ? cur.merged_at : m),
+                       merges[0].merged_at)
+      : null;
+    const landings = merges.length
+      ? `${merges.length} recent · latest ${rel(newest, nowMs)}`
+      : 'no landings yet';
+    const parts = [needsYou > 0 ? `${needsYou} ${needsYou === 1 ? 'needs' : 'need'} you` : 'healthy'];
+    if (status === 'stale') parts.push('map data stale');
+    else if (status && status !== 'fresh') parts.push('map data unverified');
     return {
-      name: short(r.repo), profile: r.profile,
+      name: short(r.repo), repoKey: r.repo, profile: r.profile,
       work: `${(r.in_flight || []).length} in flight · ${(r.ready || []).length} ready`,
-      health: needsAttention ? 'needs attention' : 'healthy',
+      landings, health: parts.join(' · '), healthy: needsYou === 0,
     };
   });
+  /* Attention-first (held/parked work waiting on the human), then alphabetical
+     case-insensitively by short name, `owner/name` as the tiebreak. */
+  return rows
+    .sort((a, b) => {
+      if (a.healthy !== b.healthy) return a.healthy ? 1 : -1;
+      const an = a.name.toLowerCase(), bn = b.name.toLowerCase();
+      if (an !== bn) return an < bn ? -1 : 1;
+      return a.repoKey < b.repoKey ? -1 : a.repoKey > b.repoKey ? 1 : 0;
+    })
+    .map(({ repoKey, ...row }) => row);
 }
 
+/* `spent_pct` is the raw window utilization; `headroom_pct` is *dispatchable* headroom
+   and reads 0 for any blocked pool by definition (agentflow/dashboard_data.py) — neither
+   may appear on a paused pool's line, since the published window number can disagree
+   completely with whatever the block reason actually names (e.g. weekly pacing). A
+   paused pool's own reason string is the only number allowed to reach the operator. */
 export function deriveCapacity(snap) {
-  return (snap?.pools || []).map((p) => ({
-    name: p.tool,
-    detail: p.clear ? `${p.headroom_pct}% headroom · ${p.running} running` : (p.reason || 'blocked'),
-  }));
+  return (snap?.pools || []).map((p) => {
+    const running = p.running || 0;
+    const runningLabel = running === 0 ? 'nothing running' : `${running} running`;
+    const detail = p.clear
+      ? `taking work, ${runningLabel}, ${p.spent_pct}% used`
+      : `paused, ${runningLabel} · ${p.reason || 'blocked'}`;
+    return { name: p.tool, detail };
+  });
 }
 
 /* The masthead/banner state: worst-case across every repository's Decision Map freshness

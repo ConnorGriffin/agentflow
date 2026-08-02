@@ -90,7 +90,8 @@
       {#each briefing.fleet as repo}
         <article class="repo">
           <strong>{repo.name}</strong><span>{repo.profile}</span><span>{repo.work}</span>
-          <span class={repo.health === 'healthy' ? 'healthy' : ''}>{repo.health}</span>
+          <span>{repo.landings}</span>
+          <span class={repo.healthy ? 'healthy' : ''}>{repo.health}</span>
         </article>
       {:else}
         <div class="empty">No repositories were included in this projection.</div>
@@ -172,7 +173,7 @@
   .support { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 7px; }
   .fleet { border-top: 1px solid var(--line); }
   .repo {
-    display: grid; grid-template-columns: minmax(170px, 1.6fr) 110px 1fr 1fr; gap: 18px;
+    display: grid; grid-template-columns: minmax(150px, 1.3fr) 100px 1fr 1fr 1fr; gap: 18px;
     padding: 12px 0; border-bottom: 1px solid var(--line); align-items: center;
   }
   .repo strong { font-size: 14px; }

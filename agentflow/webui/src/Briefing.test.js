@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
 import Briefing from './Briefing.svelte';
 
@@ -10,7 +10,11 @@ const SNAP = {
   generated_at: '2026-07-30T12:00:00+00:00',
   pools: [{ tool: 'claude', clear: true, spent_pct: 20, headroom_pct: 80, running: 1 }],
   repos: [
-    { repo: 'o/r', profile: 'reviewed', ready: [], held: [], parked: [], recent_merges: [],
+    { repo: 'o/r', profile: 'reviewed', ready: [], held: [], parked: [],
+      recent_merges: [
+        { number: 60, title: 'older landing', merged_at: '2026-07-20T12:00:00Z' },
+        { number: 61, title: 'newest landing', merged_at: '2026-07-29T12:00:00Z' },
+      ],
       in_flight: [{ number: 20, title: 'awaiting merge', builder: 'codex' }],
       ratchet: { samples: 0, correction_rate: 0, ready_to_loosen: false } },
   ],
@@ -38,6 +42,9 @@ const SNAP = {
   ],
   fleet: { recent_landed: [] },
 };
+
+beforeEach(() => vi.useFakeTimers({ now: new Date('2026-07-30T12:00:00Z') }));
+afterEach(() => vi.useRealTimers());
 
 describe('Briefing.svelte — typical state', () => {
   it('renders the continuous hierarchy: Attention, then Decision Maps, then Fleet health', () => {
@@ -82,5 +89,53 @@ describe('Briefing.svelte — empty state', () => {
     expect(screen.getByText('No operator actions in this projection.')).toBeTruthy();
     expect(screen.getByText('No active Decision Maps in this bounded projection.')).toBeTruthy();
     expect(screen.getByText('No repositories were included in this projection.')).toBeTruthy();
+  });
+});
+
+describe('Briefing.svelte — fleet health', () => {
+  it('renders a healthy repository\'s landing freshness and health cells', () => {
+    const { container } = render(Briefing, { snap: SNAP });
+    const repo = container.querySelector('.repo');
+    expect(repo.textContent).toContain('2 recent · latest 1d ago');
+    expect(repo.textContent).toContain('healthy');
+  });
+
+  it('renders a busy repository\'s held count as needing you', () => {
+    const busy = { ...SNAP, repos: [{ ...SNAP.repos[0],
+      held: [{ number: 10, title: 'needs a call', state: 'needs-grilling', reason: 'r', since: null }] }] };
+    const { container } = render(Briefing, { snap: busy });
+    expect(container.querySelector('.repo').textContent).toContain('1 needs you');
+  });
+
+  it('renders an unavailable (never-verified) map read in words on the fleet row', () => {
+    const unavailable = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
+      github: { status: 'unavailable' } }] };
+    const { container } = render(Briefing, { snap: unavailable });
+    expect(container.querySelector('.repo').textContent).toContain('map data unverified');
+  });
+
+  it('renders partially observed repositories — some fresh, some not — each labelled on its own row', () => {
+    const partial = { ...SNAP,
+      repos: [SNAP.repos[0], { ...SNAP.repos[0], repo: 'o/s' }],
+      repositories: [SNAP.repositories[0], { ...SNAP.repositories[0], name_with_owner: 'o/s',
+        github: { status: 'stale' } }],
+    };
+    const { container } = render(Briefing, { snap: partial });
+    const rows = [...container.querySelectorAll('.repo')].map((r) => r.textContent);
+    expect(rows.some((r) => r.includes('map data stale'))).toBe(true);
+    expect(rows.some((r) => !r.includes('map data'))).toBe(true);
+  });
+
+  it('renders a paused pool\'s block reason, never its published utilization as "% used"', () => {
+    const paused = { ...SNAP, pools: [
+      { tool: 'claude', clear: false, spent_pct: 0.0, headroom_pct: 0.0, running: 0,
+        reason: 'weekly spend at 98% exceeds 80.0% released for unattended work' },
+    ] };
+    const { container } = render(Briefing, { snap: paused });
+    const capacity = container.querySelector('.capacity').textContent;
+    expect(capacity).toContain('weekly spend at 98% exceeds 80.0% released for unattended work');
+    expect(capacity).not.toMatch(/0(\.0)?% used/);
+    expect(capacity).not.toMatch(/headroom/);
+    expect(capacity).not.toMatch(/slot/i);
   });
 });
