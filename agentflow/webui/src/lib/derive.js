@@ -134,3 +134,131 @@ export const STAGES = [
   { key: 'building', label: 'building', glyph: '◑' },
   { key: 'reviewing', label: 'reviewing', glyph: '◕' },
 ];
+
+/* --- Operator briefing (ADR 0035/0036, locked spec #183) -----------------------------
+   Turns the schema-v2 nested contract (`snap.repositories[].maps`/`.github`) plus the
+   existing v1 fields (`snap.repos[].held/parked/in_flight`, `snap.pools`) into the flat
+   attention/maps/fleet/capacity shape the locked mockups/operator-surface-finalist.html
+   renders. The backend already computed frontier classification, handoff verification,
+   bounds, and freshness (ADR 0036: "the browser derives presentation only") — every
+   function below only flattens, formats, and ranks what the daemon already decided. */
+
+const ATTENTION_KIND = { merge: 'Merge', held: 'Held', parked: 'Parked', loosen: 'Trust' };
+
+function attentionDetail(item) {
+  if (item.kind === 'merge') return `${short(item.repo)} · ${item.profile} · reviewer ${item.reviewer}`;
+  if (item.kind === 'held') return `${short(item.repo)} · ${(HELD[item.state] || {}).label || item.state}`;
+  if (item.kind === 'parked') return `${short(item.repo)} · ${(PARKED[item.reason] || {}).why || item.reason}`;
+  return short(item.repo);
+}
+
+/* Reuses `deriveInbox`'s exact ranking (guarded merge > reviewed merge > held > parked >
+   loosen, oldest-first within a weight) rather than re-deriving it — this section and the
+   v1 Inbox tab answer the same question ("what needs you") from the same source fields. */
+export function deriveAttention(snap) {
+  return deriveInbox(snap).map((item) => {
+    if (item.kind === 'loosen') {
+      return {
+        kind: ATTENTION_KIND.loosen, title: `${short(item.repo)} ready to loosen`,
+        detail: `${item.samples} decisions · ${Math.round((item.rate || 0) * 100)}% corrected`,
+        url: `https://github.com/${item.repo}`,
+      };
+    }
+    const path = item.kind === 'held' ? 'issues' : 'pull';
+    return {
+      kind: ATTENTION_KIND[item.kind] || item.kind,
+      title: `#${item.number} ${item.title}`,
+      detail: attentionDetail(item),
+      url: `https://github.com/${item.repo}/${path}/${item.number}`,
+    };
+  });
+}
+
+function handoffLabel(handoff) {
+  const pipe = handoff.pipeline;
+  const state = pipe && (pipe.state === 'merged' ? `PR #${pipe.pr_number} merged`
+    : pipe.state === 'in_review' ? `PR #${pipe.pr_number} in review`
+    : pipe.state === 'pr_open' ? `PR #${pipe.pr_number} open` : 'building');
+  return `#${handoff.number} ${handoff.title} — ${state || 'building'}`;
+}
+
+/* One flat row per active map across every repository, in the order the daemon returned
+   them. `frontier` reads "Not verified" whenever that repository's map read is not fresh
+   (ADR 0036: stale/incomplete data never claims a verified frontier) — never recomputed
+   from the child list, only gated on the freshness the backend already stamped. */
+export function deriveMaps(snap) {
+  const out = [];
+  for (const repo of snap?.repositories || []) {
+    const verified = repo.github?.status === 'fresh';
+    for (const m of repo.maps?.active || []) {
+      out.push({
+        title: m.title,
+        repository: short(repo.name_with_owner),
+        progress: `${m.progress.closed} of ${m.progress.total} decided`,
+        status: m.complete ? 'bounded' : `truncated · ${m.progress.total} total`,
+        frontier: !verified ? 'Not verified'
+          : m.frontier.length ? m.frontier.map((f) => `#${f.number} ${f.title}`).join(', ')
+          : 'None open',
+        tickets: m.tickets.map((t) => `#${t.number} ${t.title} — ${t.status}`),
+        support: [
+          ...(m.adrs || []).map((a) => ({ url: a.url, label: a.label })),
+          ...(m.handoffs || []).map((h) => ({ url: h.url, label: handoffLabel(h) })),
+          { url: m.url, label: 'Map on GitHub ↗' },
+        ],
+      });
+    }
+  }
+  return out;
+}
+
+export function deriveFleet(snap) {
+  return (snap?.repos || []).map((r) => {
+    const needsAttention = (r.held || []).length > 0 || (r.parked || []).length > 0;
+    return {
+      name: short(r.repo), profile: r.profile,
+      work: `${(r.in_flight || []).length} in flight · ${(r.ready || []).length} ready`,
+      health: needsAttention ? 'needs attention' : 'healthy',
+    };
+  });
+}
+
+export function deriveCapacity(snap) {
+  return (snap?.pools || []).map((p) => ({
+    name: p.tool,
+    detail: p.clear ? `${p.headroom_pct}% headroom · ${p.running} running` : (p.reason || 'blocked'),
+  }));
+}
+
+/* The masthead/banner state: worst-case across every repository's Decision Map freshness
+   (ADR 0036's three states). No repository read yet at all reads as `incomplete`, the same
+   honest-empty contract the endpoint itself returns before any daemon has published. */
+export function deriveFreshness(snap) {
+  const repos = snap?.repositories || [];
+  if (!repos.length) {
+    return { state: 'incomplete', label: 'Projection unavailable',
+            message: 'No daemon-published projection yet. Open GitHub for authoritative state.' };
+  }
+  const statuses = repos.map((r) => r.github?.status || 'unavailable');
+  if (statuses.every((s) => s === 'fresh')) {
+    return { state: 'fresh',
+            label: snap.generated_at ? `Updated ${rel(snap.generated_at, Date.now())}` : 'Updated' };
+  }
+  if (statuses.includes('unavailable')) {
+    return { state: 'incomplete', label: 'Projection incomplete',
+            message: 'One or more repositories have never published a verified Decision Map '
+              + 'read. Open GitHub for authoritative state.' };
+  }
+  return { state: 'stale', label: 'Some repositories are stale',
+          message: 'One or more repositories have not refreshed within two heartbeats. '
+            + 'Frontier and map data may be out of date.' };
+}
+
+export function deriveBriefing(snap) {
+  return {
+    freshness: deriveFreshness(snap),
+    attention: deriveAttention(snap),
+    maps: deriveMaps(snap),
+    fleet: deriveFleet(snap),
+    capacity: deriveCapacity(snap),
+  };
+}
