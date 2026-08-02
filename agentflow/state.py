@@ -25,7 +25,15 @@ def state_dir() -> Path:
     """agentflow's local state directory, honoring ``AGENTFLOW_STATE``. Fully resolved, so every
     path derived from it is compared against one canonical root."""
     configured = os.environ.get("AGENTFLOW_STATE") or "~/.agentflow"
-    return Path(configured).expanduser().resolve()
+    expanded = os.path.expanduser(configured)
+    if not os.path.isabs(expanded) or ".." in expanded.split(os.sep):
+        raise OutsideStateDirectory(
+            "AGENTFLOW_STATE must be an absolute path with no relative path segments"
+        )
+    resolved = os.path.realpath(expanded)
+    if not resolved.startswith(os.sep):
+        raise OutsideStateDirectory("AGENTFLOW_STATE must resolve to an absolute path")
+    return Path(resolved)
 
 
 def state_path(*segments: str) -> Path:

@@ -152,6 +152,66 @@ class PipelinePrRow:
 
 
 @dataclass(frozen=True)
+class HandoffCandidateRow:
+    """One issue a Decision Map child ``blocking``-links to — a handed-off Build Issue
+    candidate until its marker, label namespace, and repository are verified (ADR 0036)."""
+    number: int
+    title: str
+    url: str
+    body: str
+    labels: frozenset[str]
+    repo: str
+
+
+@dataclass(frozen=True)
+class MapChildRow:
+    """One Decision Map decision-child issue, with just enough of its dependency graph to
+    classify the frontier and discover handoff candidates (ADR 0036)."""
+    number: int
+    title: str
+    url: str
+    state: str
+    assigned: bool
+    blocked_by_open: int
+    blocked_by_closed: int
+    blocked_by_total: int
+    handoff_candidates: tuple[HandoffCandidateRow, ...]
+
+
+@dataclass(frozen=True)
+class MapRow:
+    """One Decision Map issue (``wayfinder:map``) with its bounded decision set, in GitHub's
+    native ``subIssues`` order (ADR 0036)."""
+    number: int
+    title: str
+    url: str
+    updated_at: str
+    body: str
+    children: tuple[MapChildRow, ...]
+    children_total: int
+
+
+@dataclass(frozen=True)
+class MapsRead:
+    """One repository's bounded Decision Map read: the active maps found, GitHub's own
+    ``totalCount`` for overflow, and the point cost/remaining budget the daemon's stop
+    signal reads (ADR 0036)."""
+    maps: tuple[MapRow, ...]
+    total_count: int
+    cost: int | None
+    remaining: int | None
+
+
+@dataclass(frozen=True)
+class HandoffLinkRow:
+    """A verified handoff Build Issue's native closing-PR references — just the join key;
+    the console resolves full pipeline evidence from the PR listings it already reads."""
+    number: int
+    pr_numbers: tuple[int, ...]
+    attempt_count: int
+
+
+@dataclass(frozen=True)
 class Comment:
     """One comment on an issue or PR."""
     body: str
@@ -748,6 +808,148 @@ def merge_pr(repo: str, pr: int) -> bool:
     """Squash-merge the PR and delete its head branch. Returns whether the command succeeded."""
     return _gh(["pr", "merge", str(pr), "--repo", repo,
                 "--squash", "--delete-branch"]).returncode == 0
+
+
+# --- Decision Map projection (ADR 0036) -----------------------------------------
+#
+# Two raw GraphQL calls, kept inside the seam like the check-rollup escape hatch above: `gh`'s
+# porcelain has no notion of sub-issues or dependency edges. Discovery and per-map detail are
+# combined into one nested query rather than the five separate detail calls ADR 0036 budgets
+# for — GraphQL's nesting answers "give me each active map's children and their blockers" in
+# one round trip, which is fewer requests than the ceiling allows, never more. The second call
+# is exactly the ADR's "one handoff/pipeline batch query": it asks only for each verified
+# handoff's closing-PR numbers, aliased per issue number since there is no batch-by-number
+# porcelain; full pipeline evidence (title, merge commit, review, CI) is then resolved from the
+# PR listings the daemon already reads (:func:`list_pipeline_prs`), not re-fetched here.
+
+_MAP_LABEL = "wayfinder:map"
+
+_MAPS_QUERY = (
+    "query($owner:String!,$name:String!,$label:[String!],$mapsFirst:Int!,"
+    "$childrenFirst:Int!,$edgesFirst:Int!){"
+    "rateLimit{cost remaining}"
+    "repository(owner:$owner,name:$name){"
+    "issues(states:[OPEN],labels:$label,first:$mapsFirst,"
+    "orderBy:{field:UPDATED_AT,direction:DESC}){"
+    "totalCount nodes{number title url updatedAt body "
+    "subIssues(first:$childrenFirst){totalCount nodes{"
+    "number title url state "
+    "assignees(first:1){totalCount} "
+    "blockedBy(first:$edgesFirst){totalCount nodes{number state}} "
+    "blocking(first:$edgesFirst){nodes{"
+    "number title url body labels(first:20){nodes{name}} repository{nameWithOwner}"
+    "}}"
+    "}}"
+    "}}"
+    "}}"
+    "}")
+
+
+def _handoff_candidate_row(node: dict, repo: str) -> HandoffCandidateRow:
+    return HandoffCandidateRow(
+        number=node["number"], title=node.get("title", "") or "", url=node.get("url", "") or "",
+        body=node.get("body", "") or "", labels=_labels_of(node),
+        repo=((node.get("repository") or {}).get("nameWithOwner")) or repo)
+
+
+def _map_child_row(node: dict, repo: str) -> MapChildRow:
+    blocked = node.get("blockedBy") or {}
+    blocked_nodes = [n for n in (blocked.get("nodes") or []) if isinstance(n, dict)]
+    open_count = sum(1 for n in blocked_nodes if (n.get("state") or "").upper() != "CLOSED")
+    closed_count = len(blocked_nodes) - open_count
+    blocking = node.get("blocking") or {}
+    candidates = tuple(
+        _handoff_candidate_row(n, repo) for n in (blocking.get("nodes") or [])
+        if isinstance(n, dict) and isinstance(n.get("number"), int))
+    return MapChildRow(
+        number=node["number"], title=node.get("title", "") or "", url=node.get("url", "") or "",
+        state=node.get("state", "") or "",
+        assigned=bool((node.get("assignees") or {}).get("totalCount")),
+        blocked_by_open=open_count, blocked_by_closed=closed_count,
+        blocked_by_total=blocked.get("totalCount") if isinstance(blocked.get("totalCount"), int)
+        else len(blocked_nodes),
+        handoff_candidates=candidates)
+
+
+def _map_row(node: dict, repo: str) -> MapRow:
+    sub = node.get("subIssues") or {}
+    children_nodes = [c for c in (sub.get("nodes") or []) if isinstance(c, dict)]
+    children = tuple(_map_child_row(c, repo) for c in children_nodes)
+    return MapRow(
+        number=node["number"], title=node.get("title", "") or "", url=node.get("url", "") or "",
+        updated_at=node.get("updatedAt", "") or "", body=node.get("body", "") or "",
+        children=children,
+        children_total=sub.get("totalCount") if isinstance(sub.get("totalCount"), int)
+        else len(children))
+
+
+def decision_maps(repo: str, *, limit: int = 5, children_limit: int = 50,
+                  edges_limit: int = 10) -> MapsRead | None:
+    """The repository's active Decision Maps (open issues labeled ``wayfinder:map``), newest
+    first, each with its bounded decision-child set and just enough dependency-graph data to
+    classify the frontier and discover handoff candidates — or ``None`` when the read failed.
+    An enrolled repository with no maps returns an empty read, not ``None`` (ADR 0036)."""
+    owner, _, name = repo.partition("/")
+    data = api(["api", "graphql", "-f", f"query={_MAPS_QUERY}",
+               "-f", f"owner={owner}", "-f", f"name={name}",
+               "-f", f"label[]={_MAP_LABEL}",
+               "-F", f"mapsFirst={limit}", "-F", f"childrenFirst={children_limit}",
+               "-F", f"edgesFirst={edges_limit}"],
+              parse_json=True)
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return None
+    rate = payload.get("rateLimit") or {}
+    issues = ((payload.get("repository") or {}).get("issues")) or {}
+    nodes = issues.get("nodes")
+    if not isinstance(nodes, list):
+        return None
+    maps = tuple(_map_row(n, repo) for n in nodes if isinstance(n, dict))
+    return MapsRead(
+        maps=maps,
+        total_count=issues.get("totalCount") if isinstance(issues.get("totalCount"), int)
+        else len(maps),
+        cost=rate.get("cost") if isinstance(rate.get("cost"), int) else None,
+        remaining=rate.get("remaining") if isinstance(rate.get("remaining"), int) else None)
+
+
+def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow] | None:
+    """The native closing-PR numbers for each verified handoff Build Issue in ``numbers``
+    (ADR 0036's join key), or ``None`` when the read failed. An empty ``numbers`` makes no
+    call and returns ``{}``. Batched as one query with one alias per issue — there is no
+    porcelain for "these N issues' closing PRs" in a single call."""
+    wanted = sorted({n for n in numbers if isinstance(n, int)})
+    if not wanted:
+        return {}
+    owner, _, name = repo.partition("/")
+    fields = "".join(
+        f'i{n}:issue(number:{n}){{closedByPullRequestsReferences'
+        f'(first:5,includeClosedPrs:true){{totalCount nodes{{number}}}}}}'
+        for n in wanted)
+    query = f"query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{fields}}}}}"
+    data = api(["api", "graphql", "-f", f"query={query}",
+               "-f", f"owner={owner}", "-f", f"name={name}"], parse_json=True)
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return None
+    repo_node = payload.get("repository")
+    if not isinstance(repo_node, dict):
+        return None
+    out: dict[int, HandoffLinkRow] = {}
+    for n in wanted:
+        node = repo_node.get(f"i{n}") or {}
+        refs = node.get("closedByPullRequestsReferences") or {}
+        pr_nodes = [p for p in (refs.get("nodes") or []) if isinstance(p, dict)]
+        pr_numbers = tuple(p["number"] for p in pr_nodes if isinstance(p.get("number"), int))
+        out[n] = HandoffLinkRow(
+            number=n, pr_numbers=pr_numbers,
+            attempt_count=refs.get("totalCount") if isinstance(refs.get("totalCount"), int)
+            else len(pr_numbers))
+    return out
 
 
 # --- escape hatch --------------------------------------------------------------

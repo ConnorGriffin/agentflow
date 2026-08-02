@@ -15,6 +15,20 @@ def test_an_unset_setting_falls_back_to_the_home_directory(monkeypatch):
     assert state_dir().name == ".agentflow"
 
 
+def test_a_relative_state_directory_is_refused_before_any_file_access(monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_STATE", "relative-state")
+
+    with pytest.raises(OutsideStateDirectory, match="absolute path"):
+        state_dir()
+
+
+def test_a_state_directory_with_parent_segments_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path / "state" / ".." / "other"))
+
+    with pytest.raises(OutsideStateDirectory, match="relative path segments"):
+        state_dir()
+
+
 def test_segments_name_a_file_inside_the_directory(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
     assert state_path("notifications", "abc.sent") == tmp_path.resolve() / "notifications/abc.sent"

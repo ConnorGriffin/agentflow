@@ -3,13 +3,17 @@
   import Live from './Live.svelte';
   import Fleet from './Fleet.svelte';
   import History from './History.svelte';
-  import { deriveInbox, pct, headroomColor, rel } from './lib/derive.js';
+  import Briefing from './Briefing.svelte';
+  import { deriveInbox, deriveBriefing, pct, headroomColor, rel } from './lib/derive.js';
 
+  // Briefing (ADR 0035/0036, #183) is additive: a new tab reading the same schema-v2
+  // snapshot, alongside the retained v1 console until the final retirement slice.
   const TABS = [
     { key: 'inbox', label: 'Inbox', n: 1 },
     { key: 'live', label: 'Live', n: 2 },
     { key: 'fleet', label: 'Fleet', n: 3 },
     { key: 'history', label: 'History', n: 4 },
+    { key: 'briefing', label: 'Briefing', n: 5 },
   ];
   const POLL_MS = 4000; // 3–5s browser refresh; the server just re-reads the daemon's file
 
@@ -29,6 +33,7 @@
     if (key === 'inbox') return items.length;
     if (key === 'live') return (snap?.running || []).length;
     if (key === 'fleet') return (snap?.repos || []).length;
+    if (key === 'briefing') return snap ? deriveBriefing(snap).attention.length : 0;
     return historyCount;
   }
 
@@ -110,7 +115,7 @@
       </span>
     </button>
   {/each}
-  <span class="navhint"><kbd>1</kbd>–<kbd>4</kbd> views · <kbd>j</kbd>/<kbd>k</kbd> move</span>
+  <span class="navhint"><kbd>1</kbd>–<kbd>5</kbd> views · <kbd>j</kbd>/<kbd>k</kbd> move</span>
 </nav>
 
 <main>
@@ -126,9 +131,13 @@
     <section class="view fleet" role="tabpanel" aria-label="Fleet">
       <Fleet {snap} />
     </section>
-  {:else}
+  {:else if view === 'history'}
     <section class="view" role="tabpanel" aria-label="History">
       <History {snap} />
+    </section>
+  {:else}
+    <section class="view" role="tabpanel" aria-label="Briefing">
+      <Briefing {snap} />
     </section>
   {/if}
 </main>

@@ -276,7 +276,8 @@ def repo_view(cfg: RepoConfig) -> dict:
                       for p in _prs(cfg.repo, "open")],
         "parked": _parked_prs(cfg.repo),
         "recent_merges": [{"number": p.number, "title": p.title,
-                           "merged_at": p.merged_at}
+                           "merged_at": p.merged_at,
+                           "url": github.pr_url(cfg.repo, p.number)}
                           for p in _prs(cfg.repo, "merged")][:10],
         "ratchet": ratchet.status(cfg.repo),
     }

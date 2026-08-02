@@ -16,7 +16,9 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATE_DIR = Path(os.environ.get("AGENTFLOW_STATE", os.path.expanduser("~/.agentflow")))
+from agentflow.state import state_dir
+
+STATE_DIR = state_dir()
 LIVE_FILE = STATE_DIR / "live-sessions.json"
 DAEMON_FILE = STATE_DIR / "daemon-status.json"
 SNAPSHOT_FILE = STATE_DIR / "snapshot.json"
