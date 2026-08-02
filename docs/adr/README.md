@@ -228,3 +228,10 @@ Issue-keyed records:
   that declines to decompose collapses to one slice and continues in place rather than
   re-dispatching; revise stays monolithic. Fills in ADR 464's switch; changes no cell of
   0041 or 0046.
+- [ADR 468](adr-468-slice-ledger-and-revert-condition.md) — The per-slice commits *are* the
+  slice ledger, so a coordinated build's durable state is its branch and no parallel record is
+  kept; a slice returns only its summary, commit, invariant-test result and bounded concerns,
+  and the coordinator never writes code itself. The dated re-review reads ADR 0040's existing
+  guardrails at ADR 0040's existing bar: revert on a degraded guardrail or a saving at or below
+  zero, tune on a saving under 20% with clean guardrails, and record "extend, do not judge" when
+  the cell is too thin. Revert is the ADR 464 switch. Constrains 0043's recovery envelope.
