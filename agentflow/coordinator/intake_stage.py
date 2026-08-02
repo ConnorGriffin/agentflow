@@ -7,7 +7,7 @@ import json
 from agentflow.coordinator.recovery import targeted_repair
 from agentflow.coordinator.stage_adapter import StageAdapter
 from agentflow.intake import IntakeResult, IntakeRoute, parse_intake
-from agentflow.runner import Complexity, Effort
+from agentflow.runner import Complexity, Effort, MockupScope
 
 
 def encode_result(result: IntakeResult) -> str:
@@ -15,17 +15,22 @@ def encode_result(result: IntakeResult) -> str:
         "route": result.route.value, "body": result.body, "title": result.title,
         "complexity": result.complexity.value if result.complexity else None,
         "effort": result.effort.value if result.effort else None,
+        "mockup_scope": result.mockup_scope.value if result.mockup_scope else None,
         "parsed": result.parsed,
     }, sort_keys=True)
 
 
 def decode_result(payload: str) -> IntakeResult:
     data = json.loads(payload)
+    scope = data.get("mockup_scope")
     return IntakeResult(
-        IntakeRoute(data["route"]), data.get("body", ""), data.get("title", ""),
-        Complexity(data["complexity"]) if data.get("complexity") else None,
-        Effort(data["effort"]) if data.get("effort") else None,
-        bool(data.get("parsed", True)),
+        route=IntakeRoute(data["route"]),
+        body=data.get("body", ""),
+        title=data.get("title", ""),
+        complexity=Complexity(data["complexity"]) if data.get("complexity") else None,
+        effort=Effort(data["effort"]) if data.get("effort") else None,
+        mockup_scope=MockupScope(scope) if scope in {"local", "surface"} else None,
+        parsed=bool(data.get("parsed", True)),
     )
 
 

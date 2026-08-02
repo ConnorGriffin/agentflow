@@ -40,6 +40,37 @@ def test_valid_structured_routes_capture_through_the_stage_interface():
     assert mockup.route is IntakeRoute.MOCKUP
 
 
+def test_mockup_scope_survives_durable_handoff_projection(monkeypatch):
+    """A captured mockup route must retain its scope while DurableHandoff settles it."""
+    from agentflow.coordinator.intake_stage import decode_result
+
+    comments, added = [], []
+    outcome = _capture(
+        '{"route":"mockup","title":"","body":"kickoff",'
+        '"complexity":null,"effort":null,"mockup_scope":"surface"}')
+    record = SimpleNamespace(
+        outcome=outcome, repo="o/r", subject="7", identity="o/r|7|intake|-",
+        input_ptr=json.dumps({"snapshot": {"title": "old", "body": "original"}}),
+    )
+    monkeypatch.setattr(github, "issue_headline",
+                        lambda *_: github.IssueHeadline("old", frozenset({"agentflow:triaging"})))
+    monkeypatch.setattr(github, "issue_comments",
+                        lambda *_: [github.Comment(body=body, created_at="") for body in comments])
+    monkeypatch.setattr(github, "comment", lambda _repo, _number, body: comments.append(body))
+    monkeypatch.setattr(github, "create_label", lambda *_: True)
+    monkeypatch.setattr(github, "add_label", lambda _repo, _number, label: added.append(label) or True)
+    monkeypatch.setattr(github, "remove_label", lambda *_: True)
+    monkeypatch.setattr(coordinated_intake, "intake_result_is_durable", lambda *_: True)
+    monkeypatch.setattr(coordinated_intake, "release", lambda *_: True)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *_: True)
+
+    adapter = IntakeStageAdapter(worktree_reset=lambda _: True,
+                                 apply_route=coordinated_intake.apply_route)
+
+    assert adapter.finalize_completed(record) == "https://github.com/o/r/issues/7"
+    assert added == ["agentflow:needs-mockup", "agentflow:mockup:surface"]
+
+
 def test_invalid_structured_output_captures_no_outcome():
     # A ready with no complexity, and a non-object payload, both yield no captured outcome —
     # the stage stays incomplete and retries rather than projecting partial content.
