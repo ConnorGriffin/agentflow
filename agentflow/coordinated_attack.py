@@ -83,8 +83,9 @@ def _dial(draft: IntakeResult) -> str:
 def attack_submission(intake_record, draft: IntakeResult, tool: str) -> Submission | None:
     """Open the cold attack on a triage draft, assuming its ``triaging`` claim (ADR 380).
 
-    The round number joins the identity, so each attack is a genuinely new stage with its own
-    budget and a repeat can never collide with the round before it. Pure: the mapping is the test
+    The round number and the cycle's target (the maintainer reply that opened it) join the
+    identity, so each attack is a genuinely new stage with its own budget and a repeat can never
+    collide with the round before it — nor with a retired round of an earlier cycle. Pure: the mapping is the test
     surface (ADR 0020). ``None`` when the drafting round's durable input cannot be read.
     """
     from agentflow.coordinator.intake_stage import encode_result
@@ -104,7 +105,7 @@ def attack_submission(intake_record, draft: IntakeResult, tool: str) -> Submissi
                            round=round, max_rounds=max_rounds(draft.complexity))
     return Submission(
         repo=intake_record.repo, subject=intake_record.subject, stage="attack",
-        pool=tool, complexity=_dial(draft), round=round, claim=True,
+        target=intake_record.target, pool=tool, complexity=_dial(draft), round=round, claim=True,
         source=str(WorktreeRef.for_attack(ref.workdir, tool, number).path),
         input_ptr=json.dumps({"format": PROVIDER_INPUT_V1, "snapshot": snapshot,
                               "source_ref": payload["source_ref"], "prompt": prompt,
@@ -136,7 +137,7 @@ def renewed_attack_submission(attack_record, tool: str) -> Submission | None:
                            round=round, max_rounds=max_rounds(draft.complexity))
     return Submission(
         repo=attack_record.repo, subject=attack_record.subject, stage="attack",
-        pool=tool, complexity=_dial(draft), round=round, claim=True,
+        target=attack_record.target, pool=tool, complexity=_dial(draft), round=round, claim=True,
         source=str(WorktreeRef.for_attack(ref.workdir, tool, number).path),
         input_ptr=json.dumps({"format": PROVIDER_INPUT_V1, "snapshot": snapshot,
                               "source_ref": payload["source_ref"], "prompt": prompt,
@@ -168,7 +169,7 @@ def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submis
                             max_rounds=max_rounds(draft.complexity))
     return Submission(
         repo=attack_record.repo, subject=attack_record.subject, stage="intake",
-        pool=tool, complexity="deep", round=attack_record.round, claim=True,
+        target=attack_record.target, pool=tool, complexity="deep", round=attack_record.round, claim=True,
         source=str(WorktreeRef.for_intake(ref.workdir, tool, number).path),
         input_ptr=json.dumps({"format": PROVIDER_INPUT_V1, "snapshot": snapshot,
                               "source_ref": payload["source_ref"], "prompt": prompt,

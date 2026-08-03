@@ -133,9 +133,10 @@ def test_the_published_brief_says_what_the_argument_cost():
 
 class _Record:
     def __init__(self, stage, *, round=0, source="", input_ptr="", pool="claude",
-                 identity="o/r|380|x|-", outcome=None):
+                 identity="o/r|380|x|-", outcome=None, target=None):
         self.repo = "o/r"
         self.subject = "380"
+        self.target = target
         self.stage = stage
         self.round = round
         self.source = source
@@ -222,6 +223,62 @@ def test_an_unreadable_chain_payload_opens_nothing(mapper):
     broken.input_ptr = "not json"
     broken.source = str(WorktreeRef.for_attack("/w", "claude", 380).path)
     assert mapper(broken) is None
+
+
+def _intake_chain_payload():
+    return json.dumps({"format": PROVIDER_INPUT_V1,
+                       "snapshot": {"title": "as filed", "body": "raw ask"},
+                       "source_ref": "abc123", "prompt": "THE GROUNDING PROMPT"}, sort_keys=True)
+
+
+def _drive_one_argument(coord, fake, *, target):
+    """Run one whole grill cycle for issue 380 the way the daemon does — the maintainer-reply
+    cycle carries the reply comment id as its target, a fresh-issue cycle carries none — and
+    return the attack round's durable record."""
+    from agentflow.coordinator import Submission
+
+    intake = coord.submit_stage(Submission(
+        repo="o/r", subject="380", stage="intake", target=target, pool="claude",
+        source=str(WorktreeRef.for_intake("/w", "claude", 380).path),
+        input_ptr=_intake_chain_payload()))
+    coord.cycle("claude")
+    fake.end(intake, success=True)
+    coord.cycle("claude")
+    attack = coord.submit_stage(
+        coordinated_attack.attack_submission(coord.stage_record(intake), _draft(), "claude"))
+    coord.cycle("claude")
+    fake.end(attack, success=True)
+    coord.cycle("claude")
+    return coord.stage_record(attack)
+
+
+def test_a_second_grill_cycle_opens_its_own_attack_rather_than_reviving_the_retired_one(
+        make_coord):
+    """A maintainer reply restarts the argument, and its attack round must be a genuinely new
+    stage. The reply-keyed cycle is a different target from the one that already ran, so the
+    round the reply opens can never land on the retired round-1 record of the argument before
+    it — landing there hands the claim to a completed, retired record, nothing launches, and the
+    issue reads as already triaged forever (#373/#378/#472/#473).
+    """
+    from conftest import FakeSession
+
+    fake = FakeSession()
+    coord = make_coord(fake)
+
+    first = _drive_one_argument(coord, fake, target=None)
+    # The first argument ends: its redraft assumes the claim, retiring the attack round behind it.
+    coord.submit_stage(
+        coordinated_attack.redraft_submission(first, AttackResult("1. the premise is wrong"),
+                                              "claude"))
+    retired = coord.stage_record(first.identity)
+    assert retired.retired and retired.state == "completed" and not retired.claim
+
+    second = _drive_one_argument(coord, fake, target="c99")
+
+    assert second.identity != first.identity, \
+        "the reply's attack round is its own stage, not the retired one's identity"
+    assert second.target == "c99"
+    assert second.claim and not second.retired
 
 
 # --- settlement: publish, next round, or hold — never a contested publish ---------------------

@@ -618,8 +618,8 @@ def _open_attack_on_completed_intake(coord: Coordinator, intake_identity: str) -
     (ADR 380). Nothing is written to GitHub here: the draft is unpublished by design, and the
     grill/mockup/close routes never reach this opener because their settlement retires the record
     (a transiently unsettled one is skipped by the route check and retried by settlement, not by
-    us). Submission is idempotent on the attack identity (repo, subject, attack, round), so a
-    repeat or restart never opens a second attacker for the same round. Live — its mapping is
+    us). Submission is idempotent on the attack identity (repo, subject, attack, cycle target, round), so a
+    repeat or restart never opens a second attacker for the same round of the same cycle. Live — its mapping is
     covered through :func:`coordinated_attack.attack_submission`."""
     from agentflow.coordinator.intake_stage import decode_result
     from agentflow.intake import IntakeRoute
