@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { deriveAttention, deriveMaps, deriveFleet, deriveCapacity, deriveFreshness,
          deriveBriefing } from './derive.js';
 
@@ -19,7 +19,11 @@ const SNAP = {
       held: [{ number: 10, title: 'needs a call', state: 'needs-grilling',
                reason: 'a real fork the pipeline could not settle', since: '2026-07-29T00:00:00Z' }],
       in_flight: [{ number: 20, title: 'awaiting merge', builder: 'codex' }],
-      parked: [], recent_merges: [],
+      parked: [],
+      recent_merges: [
+        { number: 60, title: 'older landing', merged_at: '2026-07-20T12:00:00Z' },
+        { number: 61, title: 'newest landing', merged_at: '2026-07-29T12:00:00Z' },
+      ],
       ratchet: { samples: 0, correction_rate: 0, ready_to_loosen: false } },
   ],
   repositories: [
@@ -50,6 +54,9 @@ const SNAP = {
   ],
   fleet: { recent_landed: [] },
 };
+
+beforeEach(() => vi.useFakeTimers({ now: new Date('2026-07-30T12:00:00Z') }));
+afterEach(() => vi.useRealTimers());
 
 describe('deriveFreshness', () => {
   it('reads a fully fresh fleet as fresh, labelled by generated_at', () => {
@@ -112,17 +119,105 @@ describe('deriveMaps', () => {
 });
 
 describe('deriveFleet / deriveCapacity', () => {
-  it('flags a repository with held work as needing attention', () => {
+  it('flags a repository with held work as needing you, and its landing freshness', () => {
     expect(deriveFleet(SNAP)).toEqual([
-      { name: 'r', profile: 'reviewed', work: '1 in flight · 1 ready', health: 'needs attention' },
+      { name: 'r', profile: 'reviewed', work: '1 in flight · 1 ready',
+        landings: '2 recent · latest 1d ago', health: '1 needs you', healthy: false },
     ]);
   });
 
-  it('reads pool headroom, and a blocked pool by its reason', () => {
+  it('reads no landings as an honest empty label, not a zero count', () => {
+    const noLandings = { ...SNAP, repos: [{ ...SNAP.repos[0], recent_merges: [] }] };
+    expect(deriveFleet(noLandings)[0].landings).toBe('no landings yet');
+  });
+
+  it('renders visibly different landing cells for two repositories at the same count', () => {
+    /* The count-alone regression case: both repositories sit at the ten-per-repository
+       cap, one landed yesterday and one thirteen days ago. */
+    const tenLandings = (newestDay) => Array.from({ length: 10 }, (_, i) => ({
+      number: i + 1, title: `landing ${i + 1}`,
+      merged_at: `2026-07-${newestDay - i}T12:00:00Z`,
+    }));
+    const equalCounts = { ...SNAP, repos: [
+      { ...SNAP.repos[0], repo: 'o/quiet', recent_merges: tenLandings(17) },
+      { ...SNAP.repos[0], repo: 'o/busy', recent_merges: tenLandings(29) },
+    ] };
+    const [busy, quiet] = deriveFleet(equalCounts);
+    expect(busy.landings).toBe('10 recent · latest 1d ago');
+    expect(quiet.landings).toBe('10 recent · latest 13d ago');
+    expect(busy.landings).not.toBe(quiet.landings);
+  });
+
+  it('labels an unverified or stale map read alongside the attention count', () => {
+    const stale = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
+      github: { status: 'stale' } }] };
+    expect(deriveFleet(stale)[0].health).toBe('1 needs you · map data stale');
+    const unavailable = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
+      github: { status: 'unavailable' } }] };
+    expect(deriveFleet(unavailable)[0].health).toBe('1 needs you · map data unverified');
+  });
+
+  it('reads a fully healthy repository as healthy, no join penalty when fresh', () => {
+    const healthy = { ...SNAP, repos: [{ ...SNAP.repos[0], held: [], parked: [] }] };
+    expect(deriveFleet(healthy)[0].health).toBe('healthy');
+    expect(deriveFleet(healthy)[0].healthy).toBe(true);
+  });
+
+  it('orders repositories needing you first, then alphabetically case-insensitively, ' +
+     'owner/name as tiebreak — grouping never keys off unobserved map freshness', () => {
+    const repoRow = (repo, over) => ({
+      repo, profile: 'reviewed', ready: [], held: [], parked: [], in_flight: [], recent_merges: [],
+      ratchet: { samples: 0, correction_rate: 0, ready_to_loosen: false }, ...over,
+    });
+    const mixed = {
+      repos: [
+        repoRow('o/dotfiles'),
+        repoRow('o/Brewgen', { held: [{ number: 1, title: 't', state: 'needs-grilling',
+                                        reason: 'r', since: null }] }),
+        repoRow('o/agentflow', { held: [{ number: 2, title: 't', state: 'needs-grilling',
+                                          reason: 'r', since: null }] }),
+        repoRow('o/homelab'),
+      ],
+      repositories: [
+        { name_with_owner: 'o/dotfiles', github: { status: 'unavailable' } },
+        { name_with_owner: 'o/Brewgen', github: { status: 'unavailable' } },
+        { name_with_owner: 'o/agentflow', github: { status: 'unavailable' } },
+        { name_with_owner: 'o/homelab', github: { status: 'unavailable' } },
+      ],
+    };
+    expect(deriveFleet(mixed).map((r) => r.name)).toEqual(['agentflow', 'Brewgen', 'dotfiles', 'homelab']);
+  });
+});
+
+describe('deriveCapacity', () => {
+  it('reads a taking-work pool as availability first, then running, then utilization', () => {
     expect(deriveCapacity(SNAP)).toEqual([
-      { name: 'claude', detail: '80% headroom · 1 running' },
-      { name: 'codex', detail: 'weekly pace' },
+      { name: 'claude', detail: 'taking work, 1 running, 20% used' },
+      { name: 'codex', detail: 'paused, nothing running · weekly pace' },
     ]);
+  });
+
+  it('never shows the published utilization as "% used" nor a headroom figure for a paused pool', () => {
+    const pools = [
+      { tool: 'claude', clear: false, spent_pct: 0.0, headroom_pct: 0.0, running: 0,
+        reason: 'weekly spend at 98% exceeds 80.0% released for unattended work' },
+      { tool: 'codex', clear: false, spent_pct: 40.0, headroom_pct: 0.0, running: 1,
+        reason: 'weekly spend at 40% exceeds 22.9% released' },
+    ];
+    const [claude, codex] = deriveCapacity({ pools });
+    expect(claude.detail).toBe('paused, nothing running · weekly spend at 98% exceeds 80.0% released for unattended work');
+    expect(claude.detail).not.toMatch(/0(\.0)?% used/);
+    expect(claude.detail).not.toMatch(/headroom/);
+    expect(codex.detail).toBe('paused, 1 running · weekly spend at 40% exceeds 22.9% released');
+    expect(codex.detail).not.toMatch(/40(\.0)?% used/);
+  });
+
+  it('never mentions a slot count, in any state', () => {
+    const pools = [
+      { tool: 'claude', clear: true, spent_pct: 38, headroom_pct: 62, running: 3, reason: null },
+      { tool: 'codex', clear: false, spent_pct: 40, headroom_pct: 0, running: 0, reason: 'weekly pace' },
+    ];
+    for (const p of deriveCapacity({ pools })) expect(p.detail).not.toMatch(/slot/i);
   });
 });
 
