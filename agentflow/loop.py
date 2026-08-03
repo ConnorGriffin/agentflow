@@ -609,7 +609,7 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
 
     Submitting one takes the PR back from the maintainer, so the summary the earlier — now
     tainted — review left behind is retired with it: an unmergeable PR under active re-review
-    must not keep sitting at the top of the operator's merge queue. A successful re-rebase
+    must not keep sitting at the top of the operator's merge queue. A successful rebase
     force-pushes the branch onto current `main`, so the PR normally stops being eligible next
     cycle and there is no later retry — a retirement that failed is said out loud in this
     cycle's status instead of leaving a stale hand-off nobody can see."""
