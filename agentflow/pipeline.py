@@ -249,11 +249,12 @@ class _ProductionGate:
         # capacity — may still defer it. Background stages keep the full clear + pacing gate.
         if record.interactive:
             return True
-        # A record's own floodgates flag (ADR 0025 amendment) has the same effect as the
-        # fleet-wide toggle but scoped to this one record, so its status is never shared through
-        # the per-pool cache — a plain record sharing the pool this cycle must still see the
-        # ordinary ceiling.
-        fg = record.floodgates
+        # Effective floodgates for this admission check: this record's own flag (ADR 0025
+        # amendment) or the fleet-wide toggle. Either way its status is never written to the
+        # per-pool cache (below) — a plain record sharing the pool this cycle, or the same
+        # record on a later poll after the operator closes the global flag mid-cycle, must
+        # still see a fresh, unlifted status rather than one cached while floodgates was open.
+        fg = record.floodgates or balancer.floodgates_active()
         try:
             # Claude admission reserves conservative five-hour headroom for work already running on
             # the pool before another session starts (#305): its provider quota fact only updates
@@ -301,7 +302,7 @@ class _ProductionGate:
         # Floodgates (this record's own flag or the fleet-wide toggle) also lifts the per-cycle
         # active-pacing budget — the ordinary ceiling/weekly checks above already cleared, so this
         # is the last gate standing between it and admission.
-        if fg or balancer.floodgates_active():
+        if fg:
             return True
         return not (status.active and self._paced[record.pool] >= balancer.ACTIVE_PACE)
 

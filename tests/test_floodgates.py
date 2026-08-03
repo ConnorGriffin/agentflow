@@ -137,3 +137,44 @@ def test_floodgates_does_not_touch_ceiling_for_signature_when_not_active():
     assert balancer.ceiling_for(False) == balancer.IDLE_CEILING_PCT
     assert balancer.ceiling_for(True) == balancer.ACTIVE_CEILING_PCT
     assert balancer.ceiling_for(False, floodgates=True) == 100.0
+
+
+# --- _ProductionGate: global toggle takes effect on the very next dispatch decision --------
+
+class _Record:
+    def __init__(self, pool, floodgates=False, interactive=False, stage="build"):
+        self.pool = pool
+        self.floodgates = floodgates
+        self.interactive = interactive
+        self.stage = stage
+
+
+def test_global_floodgates_opening_mid_cycle_lifts_a_plain_records_cached_block(monkeypatch):
+    """A pool status cached as blocked earlier in the cycle (for a plain, non-floodgates
+    record) must not keep refusing a second plain record on the same pool once the operator
+    opens the fleet-wide toggle mid-cycle — the toggle must take effect on the very next
+    dispatch decision, not merely on the next cycle (ADR 0025 amendment)."""
+    from agentflow.pipeline import _ProductionGate
+
+    blocked = balancer.PoolStatus(tool="claude", clear=False, spent_pct=90.0, reason="blocked",
+                                   active=False, ceiling=85.0)
+    clear = balancer.PoolStatus(tool="claude", clear=True, spent_pct=10.0, active=False,
+                                 ceiling=100.0)
+
+    def fake_query_pool(tool, *, floodgates=False, **kwargs):
+        return clear if floodgates else blocked
+
+    monkeypatch.setattr(balancer, "_query_pool", fake_query_pool)
+    monkeypatch.setattr(balancer, "_claude_dispatch_status", lambda status, now, floodgates=False: status)
+    global_flag = {"on": False}
+    monkeypatch.setattr(balancer, "floodgates_active", lambda: global_flag["on"])
+
+    gate = _ProductionGate()
+
+    first = _Record(pool="claude")
+    assert gate(first) is False  # cached as blocked, global flag still closed
+
+    global_flag["on"] = True  # operator opens the fleet-wide toggle mid-cycle
+
+    second = _Record(pool="claude")  # a second plain record, same pool, same cycle
+    assert gate(second) is True
