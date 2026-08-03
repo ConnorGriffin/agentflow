@@ -14,6 +14,7 @@ continuation, which is how a fresh provider session picks up where an interrupte
 from __future__ import annotations
 
 from agentflow.coordinator.stage_adapter import StageAdapter
+from agentflow.coordinator.verification import unprepared
 
 
 class BuildStageAdapter(StageAdapter):
@@ -33,14 +34,18 @@ class BuildStageAdapter(StageAdapter):
         self._integration_collision = integration_collision
         self._main_head = main_head
 
-    def prepare(self, record) -> bool:
+    def prepare(self, record):
         """Reuse the retained branch and worktree before admission, with one Build-only guard: a
         continuation that reported an integration collision stays unprepared while ``origin/main``
         still equals the head it collided on. That retry is provably identical, so it is deferred —
         never launched — until main moves (issue #209)."""
         if record.collision_main_sha is not None and self._main_head is not None:
             if self._main_head(record) == record.collision_main_sha:
-                return False
+                return unprepared(
+                    "collision-unmoved",
+                    f"the builder reported an integration collision against origin/main "
+                    f"{record.collision_main_sha[:12]}, which has not moved since — an identical "
+                    f"retry, deferred until origin/main advances past it")
         return super().prepare(record)
 
     def integration_collision(self, record) -> str | None:

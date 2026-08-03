@@ -130,7 +130,7 @@ def test_production_claim_proof_fails_closed_on_missing_label(monkeypatch):
         labels=frozenset({"ready-for-agent"}), state="OPEN"))
     record = SimpleNamespace(repo="o/r", subject="7")
 
-    assert coordinated_intake.intake_claim_ready(record) is False
+    assert not coordinated_intake.intake_claim_ready(record)
 
 
 def test_production_claim_proof_fails_closed_when_standing_unreadable(monkeypatch):
@@ -139,7 +139,7 @@ def test_production_claim_proof_fails_closed_when_standing_unreadable(monkeypatc
     monkeypatch.setattr(github, "issue_standing", lambda repo, issue: None)
     record = SimpleNamespace(repo="o/r", subject="7")
 
-    assert coordinated_intake.intake_claim_ready(record) is False
+    assert not coordinated_intake.intake_claim_ready(record)
 
 
 def test_production_claim_proof_admits_on_present_triaging_label(monkeypatch):
@@ -148,7 +148,7 @@ def test_production_claim_proof_admits_on_present_triaging_label(monkeypatch):
         labels=frozenset({TRIAGING}), state="OPEN"))
     record = SimpleNamespace(repo="o/r", subject="7")
 
-    assert coordinated_intake.intake_claim_ready(record) is True
+    assert coordinated_intake.intake_claim_ready(record)
 
 
 def test_production_claim_proof_refuses_a_closed_issue_still_carrying_the_label(monkeypatch):
@@ -159,7 +159,7 @@ def test_production_claim_proof_refuses_a_closed_issue_still_carrying_the_label(
         labels=frozenset({TRIAGING}), state="CLOSED"))
     record = SimpleNamespace(repo="o/r", subject="7")
 
-    assert coordinated_intake.intake_claim_ready(record) is False
+    assert not coordinated_intake.intake_claim_ready(record)
 
 
 def test_parsed_route_is_durable_before_projection_even_after_bad_exit(make_coord):

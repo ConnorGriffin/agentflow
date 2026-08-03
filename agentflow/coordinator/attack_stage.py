@@ -43,10 +43,12 @@ class AttackStageAdapter(StageAdapter):
         self._claim_ready = claim_ready or (lambda _record: True)
         self._worktree_dispose = worktree_dispose or (lambda _record: True)
 
-    def prepare(self, record) -> bool:
+    def prepare(self, record):
         # Rebuild first, then prove the transferred triaging claim immediately before admission.
-        # A removed or unreadable claim fails closed without consuming a permit or attempt.
-        return bool(super().prepare(record) and self._claim_ready(record))
+        # A removed or unreadable claim fails closed without consuming a permit or attempt. `and`
+        # yields the first falsy operand, so whichever of the two refused survives to the
+        # coordinator instead of being erased back to a silent False (#405).
+        return super().prepare(record) and self._claim_ready(record)
 
     def capture(self, record, obs) -> str | None:
         # A session that produced no final message at all never ran; leave it uncaptured so the

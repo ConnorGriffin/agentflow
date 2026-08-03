@@ -47,10 +47,12 @@ class IntakeStageAdapter(StageAdapter):
         # adapter's read-only stage side-effect-free; production wires the real disposer.
         self._worktree_dispose = worktree_dispose or (lambda _record: True)
 
-    def prepare(self, record) -> bool:
+    def prepare(self, record):
         # Rebuild first, then prove the GitHub claim immediately before admission. A removed or
-        # unreadable claim fails closed without consuming a permit or attempt.
-        return bool(super().prepare(record) and self._claim_ready(record))
+        # unreadable claim fails closed without consuming a permit or attempt. `and` yields the
+        # first falsy operand, so whichever of the two refused is the answer the coordinator
+        # persists — wrapping this in bool() would erase it back to a silent False (#405).
+        return super().prepare(record) and self._claim_ready(record)
 
     def capture(self, record, obs) -> str | None:
         result = parse_intake(obs.final_message or "")

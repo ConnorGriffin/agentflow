@@ -24,6 +24,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agentflow import github, worktree_ref
+from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.labels import DRAWING, MOCKUP_MARK, mockup_scope_from_labels
 from agentflow.prompts import MOCKUP_DISCLAIMER, PRODUCE_PROMPT, SCOPE_GUIDANCE
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
@@ -113,17 +114,27 @@ def _mockup_missing_context(record) -> bool:
                for comment in (github.issue_comment_rows(record.repo, number) or []))
 
 
-def _mockup_claim_ready(record) -> bool:
+def _mockup_claim_ready(record):
     """Prove Mockup's visible drawing claim immediately before admission."""
 
     try:
         number = int(record.subject)
     except (TypeError, ValueError):
-        return False
+        return unprepared("subject-unreadable",
+                          f"the record's subject is not an issue number: {record.subject!r}")
     labels = github.issue_labels(record.repo, number)
     if labels is None:
-        return False
-    return DRAWING in labels and "agentflow:needs-mockup" in labels
+        return unprepared("labels-unreadable",
+                          f"GitHub did not answer for {record.repo}#{number}, so the drawing "
+                          f"claim cannot be proved")
+    if DRAWING not in labels:
+        return unprepared("claim-released",
+                          f"{record.repo}#{number} no longer carries the drawing claim; "
+                          f"something else has taken the issue over")
+    if "agentflow:needs-mockup" not in labels:
+        return unprepared("mockup-not-wanted",
+                          f"{record.repo}#{number} no longer asks for a mockup round")
+    return PREPARED
 
 
 def _settle_mockup(record) -> str | None:

@@ -1,4 +1,4 @@
-"""Typed verification results — an unverified outcome names the exact check that failed.
+"""Typed answers — a refusal names the exact check that said no, on either side of the provider.
 
 A stage's ``outcome_ready`` collaborator answers whether the required durable outcome exists
 (ADR 0028 outcome-first). Historically that answer was a bare bool, and every ``False`` was
@@ -11,27 +11,42 @@ stamps it into the attempt's telemetry, names it in recovery envelopes and hold 
 park comment prints it, so a parked PR states which conjunct stopped it instead of "budget
 exhausted".
 
-Legacy verifiers (and test fakes) that still return plain bools stay valid: they simply carry no
-miss, and :func:`miss_summary` reads them as untyped.
+The same type now answers the *preparation* question a stage's ``prepare`` asks before the
+provider ever runs (#405). A preparation refusal costs no permit and no attempt, so it used to be
+invisible: a review checkout refused every cycle for half an hour over one untracked scratch file
+and the daemon could only say admission was stuck (#397/#399). The typed answer carries the same
+check id and live detail, plus one preparation-only fact — :attr:`Verification.expected`, set by
+a refusal that is ordinary contention (a live sibling still holding a checkout) rather than
+something a human should chase. An expected refusal is still published; it simply does not count
+toward the repeat-breadcrumb cadence.
+
+Legacy collaborators (and test fakes) that still return plain bools stay valid: they simply carry
+no miss, and :func:`miss_summary` reads them as untyped.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+#: How much of a corrupt durable payload a refusal detail may quote (see :func:`payload_preview`).
+PREVIEW_LIMIT = 160
+
 
 @dataclass(frozen=True)
 class Verification:
-    """One verify answer: truthy when the outcome is durable, else the first failed check.
+    """One answer: truthy when the check passes, else the first check that refused.
 
     ``check`` is a stable kebab-case id of the conjunct that failed (``"fix-push"``,
-    ``"targeted-reply"``); ``detail`` is one sentence of live values — what was actually read
-    from GitHub, git, or the payload — so the miss is diagnosable without the transcript.
+    ``"branch-mismatch"``); ``detail`` is one sentence of live values — what was actually read
+    from GitHub, git, or the payload — so the refusal is diagnosable without the transcript.
+    ``expected`` marks a refusal the fleet is *supposed* to produce sometimes, so the repeat
+    breadcrumb stays quiet for it.
     """
 
     ok: bool
     check: str = ""
     detail: str = ""
+    expected: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -44,6 +59,8 @@ class Verification:
 
 
 VERIFIED = Verification(True)
+#: The truthy preparation answer. Same value as :data:`VERIFIED`, named for the question it answers.
+PREPARED = VERIFIED
 
 
 def unverified(check: str, detail: str = "") -> Verification:
@@ -51,6 +68,31 @@ def unverified(check: str, detail: str = "") -> Verification:
     return Verification(False, check, detail)
 
 
+def unprepared(check: str, detail: str = "", *, expected: bool = False) -> Verification:
+    """The falsy preparation answer for one named refusing check (#405)."""
+    return Verification(False, check, detail, expected)
+
+
 def miss_summary(result) -> str:
-    """The miss of any verify result — typed or legacy bool (``""`` when verified/untyped)."""
+    """The miss of any result — typed or legacy bool (``""`` when it passed, or is untyped)."""
     return result.summary() if isinstance(result, Verification) else ""
+
+
+def refusal_expected(result) -> bool:
+    """Whether a refusal is ordinary contention rather than something to chase. Untyped and
+    passing answers are never expected, so a legacy bool keeps the loud cadence it has today."""
+    return isinstance(result, Verification) and not result.ok and result.expected
+
+
+def payload_preview(field: str, value) -> str:
+    """Name a corrupt durable payload and quote a bounded, single-line, escaped prefix of it.
+
+    ``input_ptr`` is external text a crash or a hand edit can leave arbitrarily long and
+    multi-line. The refusal it produces travels into the durable record, the daemon log, and the
+    published snapshot, so the payload itself is never copied: ``repr`` escapes every newline and
+    the quote is capped at :data:`PREVIEW_LIMIT` characters with an explicit truncation marker.
+    """
+    quoted = repr(value)
+    if len(quoted) > PREVIEW_LIMIT:
+        quoted = f"{quoted[:PREVIEW_LIMIT]}… (truncated)"
+    return f"{field} is not a readable payload: {quoted}"

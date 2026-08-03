@@ -36,7 +36,7 @@ from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
-from agentflow.coordinator.verification import VERIFIED, miss_summary
+from agentflow.coordinator.verification import VERIFIED, miss_summary, refusal_expected
 from agentflow.review_policy import ReviewState
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
@@ -203,6 +203,11 @@ class Coordinator:
         # launch — i.e. one found alive after a fresh coordinator reloaded the durable store.
         self._started_here: set[str] = set()
         self._recovered_logged: set[str] = set()
+        # Consecutive unexpected preparation refusals per record identity, so a genuinely stuck
+        # stage (one whose checkout never comes up) keeps a periodic breadcrumb instead of
+        # silently no-op'ing admission every cycle (#399/#405). Process-local, like the rest of
+        # this bookkeeping — a daemon restart re-arms it, and the durable refusal survives anyway.
+        self._prepare_misses: dict[str, int] = {}
 
     # --- public interface ---------------------------------------------------------------
 
@@ -568,6 +573,32 @@ class Coordinator:
 
     # --- admission ----------------------------------------------------------------------
 
+    @staticmethod
+    def _note_refusal(record: Record, summary: str, expected: bool) -> None:
+        """Set what is currently refusing ``record``. The record holds one refusal — whatever
+        refused it in the latest cycle — so a preparation refusal, a capacity refusal, and
+        nothing-refusing-any-more all write the same two fields (#405)."""
+        record.refusal = summary
+        record.refusal_expected = expected
+
+    def _breadcrumb_refusal(self, record: Record, prepared) -> None:
+        """Print a stuck preparation periodically — quiet on the first miss, once on the second,
+        then every tenth. That cadence is Review's, generalized: a refusal that clears next cycle
+        should page nobody, and one that never clears should not print 20 lines a minute either.
+
+        An *expected* refusal (a live sibling still holding a checkout) neither counts nor prints:
+        it is the fleet working as intended, and the record still publishes it. Which refusals are
+        benign is the collaborator's call, never a list of check ids kept here."""
+        summary = miss_summary(prepared)
+        if not summary or refusal_expected(prepared):
+            self._prepare_misses.pop(record.identity, None)
+            return
+        misses = self._prepare_misses[record.identity] = \
+            self._prepare_misses.get(record.identity, 0) + 1
+        if misses >= 2 and (misses - 2) % 10 == 0:
+            self._emit(record, f"unprepared for {misses} consecutive cycles — {summary}; "
+                               "no permit or attempt consumed; claim retained")
+
     def _admit(self, record: Record, now: int) -> str:
         """Try to start one attempt. Returns ``unprepared`` (the stage adapter refused before
         admission — no permit, no attempt), ``deferred`` (an issue-bound stage yielded the pool to
@@ -576,15 +607,31 @@ class Coordinator:
         ``not_started`` (admitted but no provider came into existence — no attempt consumed)."""
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
-        if not self._adapter.prepare(record):
+        # The refusal this cycle observes is compared against the durable one at the end, so a
+        # stage that refuses identically every tick costs one write, not one per cycle (#405).
+        was_refused = (record.refusal, record.refusal_expected)
+        prepared = self._adapter.prepare(record)
+        if not prepared:
+            self._note_refusal(record, miss_summary(prepared), refusal_expected(prepared))
+            self._breadcrumb_refusal(record, prepared)
             # Do not let an unpreparable PR-bound record keep the pool's issue work behind the
             # PR-priority barrier. It owns no permit and gets another preparation attempt next
             # cycle; until then, other useful work may use the idle pool.
             if record.stage in PR_BOUND:
                 record.eligible_at = max(record.eligible_at, now + 1)
                 self._persist(record)
+            elif (record.refusal, record.refusal_expected) != was_refused:
+                self._persist(record)
             return "unprepared"
+        # Preparation answered yes, so whatever refused it earlier is over — clear it before the
+        # later admission checks run, or a stage that is now perfectly preparable would keep
+        # publishing the checkout that used to refuse it while capacity is what actually holds it.
+        # `_begin_start` may then put its own capacity reason in the cleared slot.
+        self._note_refusal(record, "", False)
+        self._prepare_misses.pop(record.identity, None)
         if not self._begin_start(record, now):
+            if (record.refusal, record.refusal_expected) != was_refused:
+                self._persist(record)
             # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
             # deliberate yield, not a capacity refusal: it must not block the pool head-of-line, or
             # the very review it is yielding to (processed later in the cycle) is never reached (#293).
@@ -642,9 +689,11 @@ class Coordinator:
         lineage and worktree source, so its move re-pins the lineage to ``dest_pool`` and rewrites
         the tool segment of the source path — without both, ``_source_facts`` rejects the moved
         record and it never admits (#273). A move that does not start reverts every moved field, so
-        a record that could not reserve is never stranded off its home pool."""
+        a record that could not reserve is never stranded off its home pool — the refusal included,
+        or a failed probe of the destination would leave the home record publishing a
+        destination-specific reason for a move that never happened (#405)."""
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
-                record.lineage, record.source)
+                record.lineage, record.source, record.refusal, record.refusal_expected)
         record.pool = dest_pool
         record.model = MODEL_FOR.get((dest_pool, record.complexity), "opus")
         demand = admission_demand(
@@ -657,7 +706,7 @@ class Coordinator:
             record.source = _repool_source(record.source, dest_pool)
         if self._admit(record, now) != STARTED:
             (record.pool, record.model, record.demand, record.auto_merge_allowed,
-             record.lineage, record.source) = home
+             record.lineage, record.source, record.refusal, record.refusal_expected) = home
             record.state = WAITING
             self._persist(record)
 
@@ -691,7 +740,14 @@ class Coordinator:
             # claim held for days with zero log lines while intake logged its own deferral every
             # cycle (#436). Name the pool, the reason, and how long the record has waited — one
             # line per record per cycle, the cadence intake's `no pool has headroom` line gets.
-            self._emit_deferral(record, now)
+            # The reason is read *once*: the same observation is what gets recorded and what gets
+            # logged, so the record and the daemon line can never disagree about the cause. It
+            # lands in the slot preparation just cleared; `_admit` persists whatever the cycle
+            # finally settled on, so a capacity reason that has not changed costs no write (#405).
+            reason_of = getattr(self._gate, "deferral_reason", None)
+            reason = reason_of(record) if reason_of is not None else None
+            self._note_refusal(record, reason or "", False)
+            self._emit_deferral(record, now, reason)
             return False
         # Flip to a reservation and atomically claim demand plus any global admission limits
         # on the ledger; concurrent instances cannot push a pool, machine, or stage lane past
@@ -721,14 +777,17 @@ class Coordinator:
             return False
         return True
 
-    def _emit_deferral(self, record: Record, now: int) -> None:
-        """Log why the admission gate refused this waiting record (#436), through the gate's
-        optional ``deferral_reason`` hook — the same optional-hook seam as ``begin_cycle`` and
-        ``started``. A gate without the hook, or a refusal with nothing durable to report (the
-        per-cycle pace budget), stays silent."""
-        reason_of = getattr(self._gate, "deferral_reason", None)
-        reason = reason_of(record) if reason_of is not None else None
+    def _emit_deferral(self, record: Record, now: int, reason: str | None) -> None:
+        """Log why the admission gate refused this waiting record (#436), from the reason
+        ``_begin_start`` already read — never a second lookup, so the line and the durable refusal
+        describe one observation. A gate with nothing durable to report (the per-cycle pace
+        budget) stays silent, and the gate's optional ``should_emit_deferral`` hook may suppress
+        the line while the record keeps the reason: one capacity-check crash refuses every record
+        on the pool, so it is worth saying once and worth publishing on each of them."""
         if not reason:
+            return
+        permitted = getattr(self._gate, "should_emit_deferral", None)
+        if permitted is not None and not permitted(record):
             return
         waited = ""
         if now > record.created_at > 0:

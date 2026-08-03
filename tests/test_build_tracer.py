@@ -824,14 +824,14 @@ def test_live_build_preparation_verifies_branch_and_provisions_before_admission(
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, expected, ""),
     )
 
-    assert stage_worktree.worktree_ready(record) is True
+    assert stage_worktree.worktree_ready(record)
     assert provisioned == [wt]
 
     monkeypatch.setattr(
         stage_worktree, "_run",
         lambda cmd, cwd=None, timeout=None: subprocess.CompletedProcess(cmd, 0, "wrong", ""),
     )
-    assert stage_worktree.worktree_ready(record) is False
+    assert not stage_worktree.worktree_ready(record)
 
 
 def test_pr_outcome_read_failure_does_not_look_like_an_absent_pr(tmp_path, monkeypatch):

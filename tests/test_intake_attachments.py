@@ -181,6 +181,6 @@ def test_reset_worktree_stages_screenshot_into_the_read_only_checkout(monkeypatc
         pool="claude", subject="191", source=source,
         input_ptr=json.dumps({"snapshot": {"body": _IMG_TAG}, "source_ref": "abc123"}))
 
-    assert coordinated_intake.reset_worktree(record) is True
+    assert coordinated_intake.reset_worktree(record)
     staged = list((Path(source) / ATTACHMENTS_DIRNAME).glob("attachment-*"))
     assert len(staged) == 1 and staged[0].read_bytes() == _PNG

@@ -31,10 +31,12 @@ class StageCalls:
     def _hook(self, name):
         return getattr(self._adapter, name, None) if self._adapter is not None else None
 
-    def prepare(self, record) -> bool:
-        """A stage that owns no source to rebuild is always ready to be admitted."""
+    def prepare(self, record):
+        """A stage that owns no source to rebuild is always ready to be admitted. The adapter's
+        answer passes through as-is: a typed Verification keeps the named check that refused for
+        the coordinator to persist; a legacy bool stays a bool. Callers branch on truthiness."""
         fn = self._hook("prepare")
-        return bool(fn(record)) if fn is not None else True
+        return fn(record) if fn is not None else True
 
     def observe(self, record) -> ProviderObservation:
         fn = self._hook("observe")
@@ -89,7 +91,7 @@ class StageRouter:
     def _for(self, record) -> StageCalls:
         return self._adapters.get(record.stage, _NO_ADAPTER)
 
-    def prepare(self, record) -> bool:
+    def prepare(self, record):
         return self._for(record).prepare(record)
 
     def observe(self, record) -> ProviderObservation:

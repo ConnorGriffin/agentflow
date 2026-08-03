@@ -637,7 +637,7 @@ def test_production_reset_self_heals_an_orphaned_review_checkout_dir(tmp_path):
     assert wt.exists() and not _worktree_registered(repo, wt)
 
     record = SimpleNamespace(repo="o/r", source=str(wt), target=reviewed_sha, pool="claude")
-    assert coordinated_review._review_worktree_reset(record) is True
+    assert coordinated_review._review_worktree_reset(record)
     assert _worktree_registered(repo, wt)
     assert _git(wt, "rev-parse", "HEAD") == reviewed_sha
     assert _git(wt, "branch", "--show-current") == ""  # detached — review holds no branch
@@ -654,46 +654,70 @@ def test_production_reset_ignores_a_leftover_other_tool_checkout_of_the_same_pr(
     claude_wt = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-42-x"
 
     record = SimpleNamespace(repo="o/r", source=str(claude_wt), target=reviewed_sha, pool="claude")
-    assert coordinated_review._review_worktree_reset(record) is True
+    assert coordinated_review._review_worktree_reset(record)
     assert _git(claude_wt, "rev-parse", "HEAD") == reviewed_sha
     assert codex_wt.exists() and _worktree_registered(repo, codex_wt)  # other tool untouched
 
 
-def test_a_review_checkout_that_keeps_failing_surfaces_in_the_log(tmp_path, monkeypatch):
-    """Issue #171: a genuinely stuck review (one whose checkout never succeeds) must become
-    visible rather than no-op'ing admission silently every cycle. The first miss can be transient
-    and stays quiet; a repeat surfaces once, then re-reminds periodically so a long-stuck review
-    keeps a breadcrumb instead of a single line lost to scrollback."""
+def _stuck_review_coord(make_coord, wt, target, logs):
+    """A coordinator whose Review stage prepares through the real production checkout code, so
+    the breadcrumb cadence and the checkout's own refusal are exercised as one piece."""
+    fake = FakeSession()
+    review = ReviewStageAdapter(verdict_ready=lambda r, o: False,
+                                worktree_reset=coordinated_review._review_worktree_reset,
+                                observer=fake)
+    coord = make_coord(fake, adapter=StageRouter({"review": review}),
+                       gate=tracer.build_review_revise_gate, log=logs.append)
+    coord.submit_stage(_review(subject="99", target=target, source=str(wt)))
+    return coord
+
+
+def test_a_review_checkout_that_keeps_failing_names_the_check_and_the_path(
+        tmp_path, monkeypatch, make_coord):
+    """Issue #171/#405: a genuinely stuck review (one whose checkout never succeeds) must become
+    visible rather than no-op'ing admission silently every cycle — and it must say *what* refused.
+    The first miss can be transient and stays quiet; a repeat surfaces once naming the failing
+    check and the offending checkout path, then re-reminds periodically. The old line said only
+    that admission was stuck, which is what sent #397/#399 to a human with nothing to go on."""
     repo = _repo_with_origin(tmp_path)
     wt = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-99-x"
     # A target that still exists: the checkout, not the reviewed head, is what is broken.
     live = _git(repo, "rev-parse", "HEAD")
-    record = SimpleNamespace(repo="o/r", source=str(wt), target=live, pool="claude")
     monkeypatch.setattr(
         "agentflow.runner.ClaudeRunner.prepare_worktree_detached",
         lambda *a, **k: (_ for _ in ()).throw(
             subprocess.CalledProcessError(1, ["git", "worktree", "add"])))
-    coordinated_review._REVIEW_PREPARE_FAILURES.pop(record.source, None)
     logs: list[str] = []
+    coord = _stuck_review_coord(make_coord, wt, live, logs)
 
-    assert coordinated_review._review_worktree_reset(record, _log=logs.append) is False
-    assert logs == []  # a single miss can be transient
-    assert coordinated_review._review_worktree_reset(record, _log=logs.append) is False
-    assert len(logs) == 1 and "admission is stuck" in logs[0]  # the repeat is surfaced
-    for _ in range(9):  # failures 3..11 stay quiet — one breadcrumb, not one per cycle
-        coordinated_review._review_worktree_reset(record, _log=logs.append)
-    assert len(logs) == 1
-    coordinated_review._review_worktree_reset(record, _log=logs.append)  # the 12th re-reminds
-    assert len(logs) == 2
-    coordinated_review._REVIEW_PREPARE_FAILURES.pop(record.source, None)
+    def breadcrumbs():
+        return [line for line in logs if "unprepared for" in line]
+
+    coord.cycle("claude")
+    assert breadcrumbs() == []                              # a single miss can be transient
+    coord.cycle("claude")
+    assert len(breadcrumbs()) == 1                          # the repeat is surfaced
+    assert "checkout-failed" in breadcrumbs()[0]            # the check that refused, by name
+    assert str(wt) in breadcrumbs()[0]                      # and the checkout it refused on
+    assert "admission is stuck" not in breadcrumbs()[0]
+    for _ in range(9):  # misses 3..11 stay quiet — one breadcrumb, not one per cycle
+        coord.cycle("claude")
+    assert len(breadcrumbs()) == 1
+    coord.cycle("claude")                                   # the 12th re-reminds
+    assert len(breadcrumbs()) == 2
+
+    published = tracer.refusal_projection(_records(coord))
+    assert len(published) == 1 and published[0]["refusal"].startswith("checkout-failed: ")
+    assert published[0]["expected"] is False
 
 
-
-def test_a_review_checkout_held_by_a_live_sibling_session_is_contention_not_stuck(tmp_path):
+def test_a_review_checkout_held_by_a_live_sibling_session_is_contention_not_stuck(
+        tmp_path, make_coord):
     """A checkout occupied by a live session — the superseded review still finishing while its
     successor record waits its turn — is ordinary contention, not a stuck checkout. Admission
     skips quietly every cycle and succeeds as soon as the sibling releases the worktree; no
-    breadcrumb ever pages a human after a checkout that is working exactly as intended."""
+    breadcrumb ever pages a human after a checkout that is working exactly as intended. The
+    contention is still published, marked expected, so the board can show it without alarm."""
     repo = _repo_with_origin(tmp_path)
     live = _git(repo, "rev-parse", "HEAD")
     wt = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-97-x"
@@ -701,43 +725,44 @@ def test_a_review_checkout_held_by_a_live_sibling_session_is_contention_not_stuc
     marker = Path(_git(wt, "rev-parse", "--git-path", "agentflow-active"))
     marker = marker if marker.is_absolute() else wt / marker
     marker.write_text(str(os.getpid()))               # a live sibling session holds the checkout
-    record = SimpleNamespace(repo="o/r", source=str(wt), target=live, pool="claude")
-    coordinated_review._REVIEW_PREPARE_FAILURES.pop(record.source, None)
     logs: list[str] = []
+    coord = _stuck_review_coord(make_coord, wt, live, logs)
 
     for _ in range(12):  # far past every surfacing threshold — contention never pages
-        assert coordinated_review._review_worktree_reset(record, _log=logs.append) is False
-    assert logs == []
-    assert record.source not in coordinated_review._REVIEW_PREPARE_FAILURES
+        coord.cycle("claude")
+    assert [line for line in logs if "unprepared for" in line] == []
+    published = tracer.refusal_projection(_records(coord))
+    assert len(published) == 1 and published[0]["expected"] is True
+    assert published[0]["refusal"].startswith("sibling-active: ")
 
     marker.unlink()                                   # the sibling session ends
-    assert coordinated_review._review_worktree_reset(record, _log=logs.append) is True
+    assert coordinated_review._review_worktree_reset(
+        SimpleNamespace(repo="o/r", source=str(wt), target=live, pool="claude"))
     assert _git(wt, "rev-parse", "HEAD") == live
-    assert logs == []
 
 
 def test_a_review_whose_head_was_rebased_away_reads_as_awaiting_retarget_not_stuck(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, make_coord):
     """A reviewed head that has been rebased or amended away leaves a record no human can clear —
     the diverged-review reconciler supersedes it at the live head once a reviewer pool has
     headroom. Reporting that as a stuck checkout sends someone after a checkout that is fine."""
     repo = _repo_with_origin(tmp_path)
     wt = repo / ".agentflow" / "worktrees" / "claude-review" / "pr-98-x"
     gone = "0" * 40
-    record = SimpleNamespace(repo="o/r", source=str(wt), target=gone, pool="claude")
     monkeypatch.setattr(
         "agentflow.runner.ClaudeRunner.prepare_worktree_detached",
         lambda *a, **k: (_ for _ in ()).throw(
             subprocess.CalledProcessError(1, ["git", "reset"])))
-    coordinated_review._REVIEW_PREPARE_FAILURES.pop(record.source, None)
     logs: list[str] = []
+    coord = _stuck_review_coord(make_coord, wt, gone, logs)
 
-    assert coordinated_review._review_worktree_reset(record, _log=logs.append) is False
-    assert coordinated_review._review_worktree_reset(record, _log=logs.append) is False
-    assert len(logs) == 1
-    assert "awaiting retarget" in logs[0] and gone[:12] in logs[0]
-    assert "admission is stuck" not in logs[0]
-    coordinated_review._REVIEW_PREPARE_FAILURES.pop(record.source, None)
+    coord.cycle("claude")
+    coord.cycle("claude")
+    breadcrumbs = [line for line in logs if "unprepared for" in line]
+    assert len(breadcrumbs) == 1
+    assert "reviewed-head-gone" in breadcrumbs[0]
+    assert "awaiting retarget" in breadcrumbs[0] and gone[:12] in breadcrumbs[0]
+    assert "admission is stuck" not in breadcrumbs[0]
 
 
 def _worktree_registered(repo: Path, wt: Path) -> bool:

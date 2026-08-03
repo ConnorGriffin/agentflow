@@ -33,6 +33,7 @@ from agentflow import github
 from agentflow.attack import AttackResult, attack_prompt, hardening_note, max_rounds
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import PROVIDER_INPUT_V1
+from agentflow.coordinator.verification import PREPARED, payload_preview, unprepared
 from agentflow.intake import (IntakeResult, IntakeRoute, apply_intake, intake_result_is_durable,
                               redraft_prompt)
 from agentflow.labels import TRIAGING, release
@@ -177,20 +178,29 @@ def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submis
         transfer_from=attack_record.identity)
 
 
-def reset_worktree(record) -> bool:
-    """Discard and rebuild the attacker's read-only checkout from its durable source pointer."""
+def reset_worktree(record):
+    """Discard and rebuild the attacker's read-only checkout from its durable source pointer.
+
+    Every refusal is named (#405), and an unreadable chain payload is quoted only through the
+    bounded single-line preview — the draft under attack rides in that payload, so it must never
+    be copied into the record, the daemon log, or the published snapshot."""
     from agentflow.runner import ClaudeRunner, CodexRunner
     if not record.source or not record.input_ptr:
-        return False
+        return unprepared("source-missing",
+                          "the round carries no checkout pointer and chain payload to rebuild "
+                          "the argument from")
     payload = _chain(record)
     if payload is None:
-        return False
+        return unprepared("input-unreadable", payload_preview("input_ptr", record.input_ptr))
     source_ref = payload.get("source_ref")
     if not isinstance(source_ref, str) or not source_ref:
-        return False
+        return unprepared("source-ref-invalid",
+                          f"the chain's frozen commit is not a usable ref: {source_ref!r}")
     ref = _attack_ref(record)
     if ref is None:
-        return False
+        return unprepared("worktree-ref-unreadable",
+                          f"the round's checkout pointer does not parse as this issue's own "
+                          f"attack worktree: {record.source!r}")
     wt = Path(ref.path)
     if wt.exists():
         _run(["git", "-C", ref.workdir, "worktree", "remove", "--force", str(wt)])
@@ -198,9 +208,11 @@ def reset_worktree(record) -> bool:
     try:
         runner.prepare_worktree_detached(ref.workdir, source_ref, wt)
         runner.provision(wt)
-    except subprocess.CalledProcessError:
-        return False
-    return True
+    except subprocess.CalledProcessError as e:
+        return unprepared("checkout-failed",
+                          f"preparing the read-only checkout at {wt} from {source_ref[:12]} "
+                          f"exited {e.returncode}")
+    return PREPARED
 
 
 def dispose_worktree(record) -> bool:
@@ -228,7 +240,7 @@ def _attack_ref(record) -> WorktreeRef | None:
     return ref
 
 
-def attack_claim_ready(record) -> bool:
+def attack_claim_ready(record):
     """Prove the durable attack record still owns GitHub's triaging claim before admission.
 
     It is triage's claim, transferred — an attack round is still the issue being decided, and
@@ -240,8 +252,17 @@ def attack_claim_ready(record) -> bool:
     """
     standing = github.issue_standing(record.repo, int(record.subject))
     if standing is None:   # fail closed: a read that couldn't reach GitHub stays unknown
-        return False
-    return TRIAGING in standing.labels and standing.state != "CLOSED"
+        return unprepared("claim-unreadable",
+                          f"GitHub did not answer for {record.repo}#{record.subject}, so the "
+                          f"transferred triaging claim cannot be proved")
+    if TRIAGING not in standing.labels:
+        return unprepared("claim-released",
+                          f"{record.repo}#{record.subject} no longer carries the triaging claim; "
+                          f"something else has taken the issue over")
+    if standing.state == "CLOSED":
+        return unprepared("subject-closed",
+                          f"{record.repo}#{record.subject} was closed mid-argument")
+    return PREPARED
 
 
 def publish_brief(record, draft: IntakeResult, hardening: str) -> str | None:

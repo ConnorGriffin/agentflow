@@ -54,8 +54,8 @@ def test_a_stage_waits_for_the_worktree_it_owns_before_admission(stage):
     """The shared preparation: no durable source means nothing to resume, so the stage is not
     ready and the coordinator spends neither a permit nor an attempt."""
     adapter = BARE_ADAPTERS[stage]()
-    assert adapter.prepare(_record(stage, source=None)) is False
-    assert adapter.prepare(_record(stage, source="/tmp/wt")) is True
+    assert not adapter.prepare(_record(stage, source=None))
+    assert adapter.prepare(_record(stage, source="/tmp/wt"))
 
 
 @pytest.mark.parametrize("stage", sorted(BARE_ADAPTERS))
@@ -77,7 +77,7 @@ def test_a_stage_with_no_adapter_registered_falls_back_like_a_bare_coordinator()
     router = StageRouter({"build": BARE_ADAPTERS["build"]()})
     record = _record("review")
     obs = ProviderObservation()
-    assert router.prepare(record) is True
+    assert router.prepare(record)
     assert router.observe(record) == ProviderObservation()
     assert router.verify(record, obs) is False
     assert router.capture(record, obs) is None
