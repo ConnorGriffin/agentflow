@@ -17,8 +17,8 @@ import glob
 import json
 import os
 import re
-from collections import Counter, defaultdict
-from pathlib import Path
+from collections import defaultdict
+from pathlib import Path, PurePath
 
 from agentflow.loop import RepoConfig
 
@@ -125,7 +125,7 @@ def claude_session_dirs(repos: list[RepoConfig], claude_root: str = DEFAULT_CLAU
 
 def parse_claude_file(path, repo, label, fleet=True):
     s = _new_session("claude", path, label, repo, fleet)
-    cmds, reads = Counter(), Counter()
+    cmds, reads = defaultdict(int), defaultdict(int)
     streak = 0
     with open(path, errors="replace") as fh:
         for line in fh:
@@ -195,13 +195,15 @@ def collect_claude(repos: list[RepoConfig], claude_root: str = DEFAULT_CLAUDE_RO
 
 
 def _repo_for_cwd(cwd: str, repos: list[RepoConfig]) -> str | None:
-    try:
-        resolved = Path(cwd).resolve()
-    except (OSError, RuntimeError):
-        return None
+    """Which configured repo a rollout's recorded working directory sits under.
+
+    The recorded value comes out of a file another tool wrote, so it is compared
+    lexically and never resolved against this machine's filesystem.
+    """
+    recorded = PurePath(os.path.normpath(cwd))
     for cfg in repos:
         try:
-            resolved.relative_to(Path(cfg.workdir).resolve())
+            recorded.relative_to(Path(cfg.workdir).resolve())
         except ValueError:
             continue
         return cfg.repo
@@ -223,7 +225,7 @@ def parse_codex_file(path, repos: list[RepoConfig]):
         fleet = ".agentflow/worktrees" in cwd
         label = cwd.split("worktrees/", 1)[-1]
         s = _new_session("codex", path, label, repo, fleet)
-        cmds, reads = Counter(), Counter()
+        cmds, reads = defaultdict(int), defaultdict(int)
         streak = 0
         totals = {}
         for line in fh:
@@ -293,10 +295,12 @@ def collect_sessions(
     repos: list[RepoConfig],
     *,
     include_manual: bool = False,
-    claude_root: str = DEFAULT_CLAUDE_ROOT,
-    codex_root: str = DEFAULT_CODEX_ROOT,
+    claude_root: str | None = None,
+    codex_root: str | None = None,
 ) -> list[dict]:
-    sessions = collect_claude(repos, claude_root) + collect_codex(repos, codex_root)
+    sessions = collect_claude(repos, claude_root or DEFAULT_CLAUDE_ROOT) + collect_codex(
+        repos, codex_root or DEFAULT_CODEX_ROOT
+    )
     if not include_manual:
         sessions = [s for s in sessions if s["fleet"]]
     return sessions
@@ -337,8 +341,8 @@ def format_report(sessions: list[dict], *, top: int = 25) -> str:
     for s in sorted(sessions, key=lambda x: -x["output_tokens"])[:top]:
         lines.append(_fmt_row(s))
 
-    agg = defaultdict(Counter)
-    repeat_global = Counter()
+    agg = defaultdict(lambda: defaultdict(int))
+    repeat_global = defaultdict(int)
     for s in sessions:
         key = (s["repo"], s["phase"], s["source"])
         a = agg[key]
@@ -362,7 +366,7 @@ def format_report(sessions: list[dict], *, top: int = 25) -> str:
 
     lines.append("")
     lines.append("== Most-repeated commands across corpus ==")
-    for cmd, n in repeat_global.most_common(20):
+    for cmd, n in sorted(repeat_global.items(), key=lambda kv: -kv[1])[:20]:
         lines.append(f"{n:>5}  {cmd}")
 
     return "\n".join(lines)
@@ -383,12 +387,15 @@ def format_excerpt(path: str, *, max_chars: int = 9000, window: int = 1) -> str:
     """
     calls = []  # {id, name, input, error, result}
     by_id = {}
+    claude_shaped = False
     with open(path, errors="replace") as fh:
         for line in fh:
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if d.get("type") in ("assistant", "user"):
+                claude_shaped = True
             if d.get("type") == "assistant":
                 for b in _blocks(d):
                     if b.get("type") == "tool_use":
@@ -406,6 +413,13 @@ def format_excerpt(path: str, *, max_chars: int = 9000, window: int = 1) -> str:
                             content = " ".join(x.get("text", "") for x in content
                                                if isinstance(x, dict))
                         c["result"] = str(content or "")
+
+    if not claude_shaped:
+        # Codex rollouts rank in the same report, so this path is reached by drilling
+        # into a codex row — say so rather than reporting an empty Claude session.
+        return (f"# {path}\n"
+                "# no Claude session records here — excerpts read Claude session "
+                "transcripts only; read this one directly\n")
 
     keep = set()
     for i, c in enumerate(calls):

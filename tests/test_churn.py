@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import json
 
-from agentflow import churn
+import pytest
+
+from agentflow import churn, cli
 from agentflow.loop import RepoConfig
 
 
@@ -43,8 +45,8 @@ def _tool_result(tool_id, *, is_error=False, content="ok"):
 
 
 def test_claude_session_dirs_matches_repos_configured_workdir_not_a_username_pattern(tmp_path):
-    # A workdir far from any /Users/connor/Code/ConnorGriffin/<repo> shape must still match —
-    # this is exactly what breaks with a hardcoded per-user prefix pattern.
+    # A workdir outside any per-user checkout layout must still match — this is exactly
+    # what breaks with a hardcoded per-user prefix pattern.
     workdir = tmp_path / "checkouts" / "sample-app"
     workdir.mkdir(parents=True)
     claude_root = tmp_path / "claude-projects"
@@ -133,3 +135,81 @@ def test_format_excerpt_keeps_only_error_windows(tmp_path):
     assert "ERR" in excerpt
     assert "command failed" in excerpt
     assert "2 tool calls, 1 errors" in excerpt
+
+
+def test_format_excerpt_says_a_codex_rollout_is_unreadable_rather_than_empty(tmp_path):
+    # Codex sessions rank in the same table, so an operator drilling into the worst row
+    # can land here; reporting "0 tool calls" would read as "nothing happened".
+    path = tmp_path / "rollout.jsonl"
+    path.write_text("\n".join([
+        json.dumps({"type": "session_meta",
+                    "payload": {"originator": "codex_exec", "cwd": "/w/.agentflow/worktrees/x"}}),
+        json.dumps({"type": "response_item",
+                    "payload": {"type": "function_call", "arguments": '{"command": "false"}'}}),
+        json.dumps({"type": "response_item",
+                    "payload": {"type": "function_call_output", "output": '{"exit_code": 1}'}}),
+    ]) + "\n")
+
+    excerpt = churn.format_excerpt(str(path))
+
+    assert "0 tool calls" not in excerpt
+    assert "no Claude session records here" in excerpt
+
+
+def _write_config(tmp_path, entries):
+    config = tmp_path / "agentflow.toml"
+    config.write_text("".join(
+        f'[[repositories]]\nrepo = "{repo}"\nworkdir = "{workdir}"\n\n'
+        for repo, workdir in entries
+    ))
+    return config
+
+
+def _point_roots_at(monkeypatch, tmp_path, claude_root):
+    monkeypatch.setattr(churn, "DEFAULT_CLAUDE_ROOT", str(claude_root))
+    monkeypatch.setattr(churn, "DEFAULT_CODEX_ROOT", str(tmp_path / "empty-codex"))
+
+
+def test_churn_command_reports_only_the_requested_repos_sessions(tmp_path, monkeypatch, capsys):
+    claude_root = tmp_path / "claude-projects"
+    wanted = tmp_path / "checkouts" / "sample-app"
+    other = tmp_path / "checkouts" / "other-app"
+    wanted.mkdir(parents=True)
+    other.mkdir(parents=True)
+    _write_claude_session(claude_root, wanted, "issue-1", [
+        _assistant_tool_use("Bash", "1", {"command": "npm test"}),
+        _tool_result("1", is_error=True, content="FAIL"),
+    ])
+    _write_claude_session(claude_root, other, "issue-2", [
+        _assistant_tool_use("Bash", "2", {"command": "npm test"}),
+    ])
+    _point_roots_at(monkeypatch, tmp_path, claude_root)
+    config = _write_config(tmp_path, [("acme/sample-app", wanted), ("acme/other-app", other)])
+
+    assert cli.main(["churn", "--config", str(config), "--repo", "acme/sample-app"]) == 0
+
+    out = capsys.readouterr().out
+    assert "issue-1" in out
+    assert "issue-2" not in out
+
+
+def test_churn_command_rejects_a_repo_that_is_not_configured(tmp_path, monkeypatch):
+    workdir = tmp_path / "checkouts" / "sample-app"
+    workdir.mkdir(parents=True)
+    _point_roots_at(monkeypatch, tmp_path, tmp_path / "claude-projects")
+    config = _write_config(tmp_path, [("acme/sample-app", workdir)])
+
+    with pytest.raises(SystemExit):
+        cli.main(["churn", "--config", str(config), "--repo", "acme/absent"])
+
+
+def test_churn_command_excerpts_a_session_without_reading_the_configuration(tmp_path, capsys):
+    path = tmp_path / "session.jsonl"
+    path.write_text("\n".join([
+        _assistant_tool_use("Bash", "1", {"command": "false"}),
+        _tool_result("1", is_error=True, content="command failed"),
+    ]) + "\n")
+
+    assert cli.main(["churn", "--excerpt", str(path)]) == 0
+
+    assert "command failed" in capsys.readouterr().out
