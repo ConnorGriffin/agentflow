@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentflow import coordinated_review, github, labels as label_vocab, loop, pipeline
+from agentflow import (coordinated_review, coordinated_revise, github, labels as label_vocab,
+                       loop, pipeline)
+from agentflow.coordinator.store import StoreUnavailable
 from agentflow.gate import respond_reply_disclaimer
 from agentflow.github import pr_number
 from agentflow.intake import (INTAKE_MARK, IntakeRoute, awaiting_recheck, compose_ready_body,
@@ -998,13 +1000,15 @@ def _stub_survivor_router(monkeypatch, *, rebase, profile="reviewed", conflict_r
     survivor's worktree is left where it is."""
     events = {"parked": [], "merged": []}
     monkeypatch.setattr(github, "pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr(loop, "_conflict_revise_owns_head", lambda cfg, n, branch: False)
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: rebase)
     monkeypatch.setattr(loop, "_conflict_revise_survivor",
-                        lambda cfg, pr, n, sl, tool, branch: conflict_revise)
+                        lambda cfg, pr, n, sl, tool, branch, rows: conflict_revise)
     monkeypatch.setattr(loop, "_park_conflicted_survivor",
                         lambda cfg, pr, n: events["parked"].append(pr))
-    monkeypatch.setattr(loop, "_merge_autonomous_survivor",
-                        lambda cfg, pr, n, sl, tool, branch: events["merged"].append(pr) or "merged")
+    monkeypatch.setattr(
+        loop, "_merge_autonomous_survivor",
+        lambda cfg, pr, n, sl, tool, branch, rows: events["merged"].append(pr) or "merged")
     return events
 
 
@@ -1015,7 +1019,7 @@ def test_rebase_survivor_conflict_parks_when_the_conflict_revise_budget_is_spent
     for profile in ("reviewed", "guarded", "autonomous"):
         events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT, profile=profile,
                                        conflict_revise=None)
-        out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", profile)
+        out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", profile, [])
         assert events["parked"] == [8], f"exhausted conflict must ping ({profile})"
         assert events["merged"] == []
         assert "parked" in out
@@ -1026,7 +1030,7 @@ def test_rebase_survivor_conflict_opens_a_revise_before_parking(monkeypatch):
     # _conflict_revise_survivor handles it (returns a status), no park notice is posted.
     events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CONFLICT,
                                    conflict_revise="#8: conflict — revise round 1 opened")
-    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed", [])
     assert events["parked"] == [], "an opened conflict Revise must not also park"
     assert out == "#8: conflict — revise round 1 opened"
 
@@ -1039,7 +1043,7 @@ def test_conflict_rebase_disposes_only_after_the_notice_is_durable(monkeypatch):
     monkeypatch.setattr(loop, "remove_worktree_if_safe",
                         lambda workdir, wt: removed.append(str(wt)) or True)
 
-    _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed")
+    _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed", [])
 
     assert removed == ["/tmp/.agentflow/worktrees/claude/issue-4-x"]
 
@@ -1048,14 +1052,14 @@ def test_rebase_survivor_reviewed_clean_never_merges(monkeypatch):
     # A clean re-rebase on a reviewed repo just keeps the PR mergeable for the human — the
     # pass must never merge on reviewed/guarded.
     events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CLEAN, profile="reviewed")
-    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/claude/issue-4-x", "reviewed", [])
     assert events["merged"] == [], "reviewed repo must never auto-merge a survivor"
     assert "mergeable for the human" in out
 
 
 def test_rebase_survivor_autonomous_clean_reruns_the_merge_gate(monkeypatch):
     events = _stub_survivor_router(monkeypatch, rebase=RebaseResult.CLEAN, profile="autonomous")
-    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/codex/issue-4-x", "autonomous")
+    out = _rebase_survivor(RepoConfig("o/r", "/tmp"), 8, "agentflow/codex/issue-4-x", "autonomous", [])
     assert events["merged"] == [8]
     assert out.endswith(": merged")
 
@@ -1080,7 +1084,7 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
 
     result = loop._merge_autonomous_survivor(
         RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude",
-        "agentflow/claude/issue-7-fix")
+        "agentflow/claude/issue-7-fix", [])
 
     assert result == "review submitted"
     assert submitted == [submission] and reconciled == [coord]
@@ -1109,7 +1113,7 @@ def test_autonomous_survivor_waits_instead_of_falling_back_to_same_tool(monkeypa
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda current: None)
 
     result = loop._merge_autonomous_survivor(
-        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", [])
 
     assert result == "no reviewer pool available — deferring"
     assert captured == {}
@@ -1219,7 +1223,7 @@ def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch)
     monkeypatch.setattr(loop, "claim", lambda repo, number, _label: claimed.append(number) or True)
 
     result = loop._merge_autonomous_survivor(
-        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", [])
 
     assert result == "no reviewer pool available — deferring"
     assert submitted == [] and claimed == []
@@ -1227,10 +1231,11 @@ def test_survivor_review_defers_when_no_reviewer_pool_can_launch_it(monkeypatch)
 
 # --- issue #212: a survivor's conflict opens a conflict Revise, not a park (ADR 0038) --------
 
-def _conflict_revise(conflict_round, target, *, repo="o/r", subject="4"):
+def _conflict_revise(conflict_round, target, *, repo="o/r", subject="4",
+                     retired=False, claim="agentflow:building"):
     """A durable conflict-Revise record stand-in (the fields the budget/idempotency helpers read)."""
     return SimpleNamespace(stage="revise", conflict_round=conflict_round, repo=repo,
-                           subject=subject, target=target)
+                           subject=subject, target=target, retired=retired, claim=claim)
 
 
 def _stub_conflict_env(monkeypatch, *, priors, head="sha-conf", claim=True):
@@ -1243,7 +1248,6 @@ def _stub_conflict_env(monkeypatch, *, priors, head="sha-conf", claim=True):
 
     monkeypatch.setattr(loop, "_run",
                         lambda argv: _FakeRun(head + "\n") if "rev-parse" in argv else _FakeRun(""))
-    monkeypatch.setattr(github, "pr_comments", lambda repo, pr: [])
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: list(priors))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claim)
     submitted = []
@@ -1264,7 +1268,7 @@ def test_survivor_conflict_opens_a_conflict_revise_on_the_builder_lineage(monkey
     monkeypatch.setattr(loop, "_park_conflicted_survivor", lambda cfg, pr, n: parked.append(pr))
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
 
-    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed", [])
 
     assert parked == [], "opening a conflict Revise must not also park the PR"
     assert len(submitted) == 1 and reconciled
@@ -1284,7 +1288,7 @@ def test_second_survivor_conflict_opens_a_distinct_second_round_idempotently(mon
     submitted, _ = _stub_conflict_env(monkeypatch, priors=[first], head="sha-new")
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
 
-    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed", [])
     assert submitted[0].conflict_round == 2 and submitted[0].target == "sha-new"
     assert "revise round 2 opened" in out
 
@@ -1292,7 +1296,7 @@ def test_second_survivor_conflict_opens_a_distinct_second_round_idempotently(mon
     second = _conflict_revise(2, "sha-new")
     submitted2, _ = _stub_conflict_env(monkeypatch, priors=[first, second], head="sha-new")
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
-    out2 = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    out2 = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed", [])
     assert submitted2 == [] and "already open" in out2
 
 
@@ -1306,37 +1310,46 @@ def test_third_survivor_conflict_opens_another_bounded_revise(monkeypatch):
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [])   # notice not yet durable
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
 
-    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed", [])
 
     assert len(submitted) == 1
     assert submitted[0].conflict_round == 3 and submitted[0].target == "sha-3"
     assert parked == [] and "revise round 3 opened" in out
 
 
-def _clean_summary_pr(monkeypatch):
-    """A PR the engine already handed to the maintainer: one current clean-review summary,
-    editable in place. Returns the live comment list so a test can read what it became."""
+def _clean_summary_pr(monkeypatch, *, edits_fail=False):
+    """A PR the engine already handed to the maintainer: one current clean-review summary, as the
+    comment rows the recheck cycle already holds. Returns those rows (edited in place, so a test
+    reads what the summary became) — ``edits_fail`` models GitHub refusing the edit."""
     marker = "<!-- agentflow-clean-review-summary -->"
-    comments = [github.Comment(body=f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->",
-                               created_at="", id="clean")]
-    monkeypatch.setattr(github, "pr_comments", lambda repo, pr: list(comments))
-    monkeypatch.setattr(github, "edit_comment", lambda comment_id, body:
-                        comments.__setitem__(0, github.Comment(body, "", id=comment_id)) or True)
-    return comments
+    rows = [{"id": "clean", "createdAt": "2026-08-01T09:00:00Z",
+             "body": f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->"}]
+
+    def edit(comment_id, body):
+        if edits_fail:
+            return False
+        for row in rows:
+            if row["id"] == comment_id:
+                row["body"] = body
+        return True
+
+    monkeypatch.setattr(github, "edit_comment", edit)
+    return rows
 
 
 def test_opening_a_conflict_revise_takes_the_pr_back_from_the_maintainer(monkeypatch):
     """A clean-reviewed PR that conflicts against main is being resolved by the engine, not
     waiting on a merge — so the hand-off it carries is retired when the Revise opens."""
     _stub_conflict_env(monkeypatch, priors=[], head="sha-conf")
-    comments = _clean_summary_pr(monkeypatch)
+    rows = _clean_summary_pr(monkeypatch)
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
 
-    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed",
+                           rows)
 
     assert "revise round 1 opened" in out
-    assert "agentflow-superseded-review-summary" in comments[0].body
-    assert "sha-a" in comments[0].body, "the evidence the summary recorded survives"
+    assert "agentflow-superseded-review-summary" in rows[0]["body"]
+    assert "sha-a" in rows[0]["body"], "the evidence the summary recorded survives"
 
 
 def test_an_autonomous_re_review_takes_the_pr_back_from_the_maintainer(monkeypatch):
@@ -1351,13 +1364,13 @@ def test_an_autonomous_re_review_takes_the_pr_back_from_the_maintainer(monkeypat
     monkeypatch.setattr(pipeline, "build_coordinator",
                         lambda: SimpleNamespace(submit_stage=lambda s: None))
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda current: None)
-    comments = _clean_summary_pr(monkeypatch)
+    rows = _clean_summary_pr(monkeypatch)
 
     result = loop._merge_autonomous_survivor(
-        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix", rows)
 
     assert result == "review submitted"
-    assert "agentflow-superseded-review-summary" in comments[0].body
+    assert "agentflow-superseded-review-summary" in rows[0]["body"]
 
 
 def test_conflict_revise_defers_without_parking_when_the_head_is_unreadable(monkeypatch):
@@ -1369,7 +1382,7 @@ def test_conflict_revise_defers_without_parking_when_the_head_is_unreadable(monk
     monkeypatch.setattr(loop, "_park_conflicted_survivor", lambda cfg, pr, n: parked.append(pr))
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
 
-    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed", [])
 
     assert parked == [] and "retry next cycle" in out
 
@@ -1383,7 +1396,7 @@ def _stub_recheck(monkeypatch, prs, *, advanced, profile, comments=None):
     monkeypatch.setattr(loop, "_base_advanced_for", lambda wd, branch: advanced.get(branch))
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: (comments or {}).get(pr, []))
 
-    def fake_router(cfg, pr, branch, prof):
+    def fake_router(cfg, pr, branch, prof, rows):
         routed.append(pr)
         # first PR merges (autonomous), rest would too if reached
         return f"#{pr}: merged" if prof == "autonomous" else f"#{pr}: re-rebased clean"
@@ -1431,6 +1444,201 @@ def test_recheck_defers_when_pr_listing_fails(monkeypatch):
     # Unknown is not empty: a gh blip must defer, not read as 'no survivors'.
     monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: None)
     assert "deferring" in recheck_once(RepoConfig("o/r", "/tmp"))
+
+
+# --- issue #487: a merge hand-off the engine could not retire is retried or said out loud ------
+
+_SURVIVOR_BRANCH = "agentflow/claude/issue-4-fix"
+_HAND_OFF = ("> *agentflow: clean review.*\n<!-- agentflow-clean-review-summary -->\n"
+             "<!-- agentflow-clean-review-head:sha-a -->\n\nOutcome: clean.")
+
+
+def _survivor_world(monkeypatch, *, head="sha-conf", records=(), profile="reviewed",
+                    rebase=RebaseResult.CONFLICT, head_readable=True, store_readable=True):
+    """One clean-reviewed survivor driven through real `recheck_once` cycles.
+
+    Only the world outside the engine is faked — the PR thread (rows edited in place), the branch
+    head, the durable coordinator store and the rebase verdict. Everything a test asserts about
+    ordering, comment reads and retirement is the real code path. The returned dict is mutable, so
+    a test can advance the world between cycles the way a real cycle would."""
+    world = {"rows": [{"id": "clean", "createdAt": "2026-08-01T09:00:00Z", "body": _HAND_OFF}],
+             "records": list(records), "reads": 0, "rebased": [], "submitted": [],
+             "edits_fail": False, "head": head}
+
+    def comment_rows(_repo, _pr):
+        world["reads"] += 1
+        return world["rows"]
+
+    def edit(comment_id, body):
+        if world["edits_fail"]:
+            return False
+        for row in world["rows"]:
+            if row["id"] == comment_id:
+                row["body"] = body
+        return True
+
+    def run(argv):
+        if "rev-parse" in argv:
+            return _FakeRun(world["head"] + "\n") if head_readable else _FakeRun(returncode=1)
+        return _FakeRun("")
+
+    def load_records():
+        if not store_readable:
+            raise StoreUnavailable("coordinator store unreadable")
+        return list(world["records"])
+
+    def rebase_branch(_cfg, branch, _wt):
+        world["rebased"].append(branch)
+        return rebase
+
+    monkeypatch.setattr(loop, "_open_agentflow_prs", lambda cfg: [(8, _SURVIVOR_BRANCH)])
+    monkeypatch.setattr(loop, "repo_profile", lambda wd: profile)
+    monkeypatch.setattr(loop, "_base_advanced_for", lambda wd, branch: True)
+    monkeypatch.setattr(loop, "_run", run)
+    monkeypatch.setattr(loop, "_rebase_branch", rebase_branch)
+    monkeypatch.setattr(loop, "remove_worktree_if_safe", lambda workdir, wt: True)
+    monkeypatch.setattr(loop, "claim", lambda repo, n, _label: True)
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
+    monkeypatch.setattr(pipeline.tracer, "load_records", load_records)
+    monkeypatch.setattr(pipeline, "build_coordinator",
+                        lambda: SimpleNamespace(submit_stage=world["submitted"].append))
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda coord: None)
+    monkeypatch.setattr(coordinated_revise, "survivor_conflict_revise_submission",
+                        lambda cfg, **kwargs: SimpleNamespace(stage="revise", **kwargs))
+    monkeypatch.setattr(coordinated_review, "survivor_review_submission",
+                        lambda cfg, **kwargs: SimpleNamespace(stage="review", transfer_from=None))
+    monkeypatch.setattr(github, "pr_comment_rows", comment_rows)
+    monkeypatch.setattr(github, "edit_comment", edit)
+    monkeypatch.setattr(github, "pr_comments",
+                        lambda *_a: pytest.fail("the cycle already holds this PR's comments"))
+    return world
+
+
+def _awaiting_merge_rows(world):
+    """The operator's merge-queue rows this PR's thread would produce right now."""
+    from agentflow import dashboard_data, operator_projection
+
+    view = {"repo": "o/r", "profile": "reviewed", "parked": [],
+            "in_flight": [{"number": 8, "title": "a survivor",
+                           "handed_off_at": dashboard_data._handed_off_at(world["rows"])}]}
+    return [row for row in operator_projection.attention([view], [])["rows"]
+            if row["kind"] == "Merge"]
+
+
+def test_a_conflict_retirement_that_failed_is_retried_on_the_next_cycle(monkeypatch):
+    """Cycle one opens the conflict Revise even though retiring the merge hand-off fails. Cycle two
+    recognizes that same Revise before touching the worktree it has adopted, retries the retirement,
+    and the PR stops prompting a merge. Fails first against the old code, which re-entered the
+    Revise-owned worktree on cycle two and never reached the retirement again."""
+    world = _survivor_world(monkeypatch, head="sha-conf", records=[])
+    world["edits_fail"] = True
+
+    first = recheck_once(RepoConfig("o/r", "/w"))
+
+    assert first == "#8: conflict — revise round 1 opened"
+    assert len(world["submitted"]) == 1, "the Revise opens whatever the retirement did"
+    assert _awaiting_merge_rows(world), "the hand-off is still live — the edit failed"
+
+    # The Revise it just opened is now durable, unretired, and holds the claim.
+    world["records"] = [_conflict_revise(1, "sha-conf")]
+    world["edits_fail"] = False
+    world["rebased"] = []
+
+    second = recheck_once(RepoConfig("o/r", "/w"))
+
+    assert second == "#8: conflict — revise already open"
+    assert world["rebased"] == [], "the Revise owns that worktree — never re-enter it"
+    assert world["submitted"] == world["submitted"][:1], "no second Revise for the same head"
+    from agentflow import dashboard_data
+    assert dashboard_data._handed_off_at(world["rows"]) is None
+    assert _awaiting_merge_rows(world) == []
+
+
+def test_a_conflict_retirement_that_keeps_failing_is_said_out_loud(monkeypatch):
+    """When the retry fails too, the cycle says both things: the Revise is already open, and the
+    merge hand-off is still standing."""
+    world = _survivor_world(monkeypatch, head="sha-conf",
+                            records=[_conflict_revise(1, "sha-conf")])
+    world["edits_fail"] = True
+
+    out = recheck_once(RepoConfig("o/r", "/w"))
+
+    assert out == "#8: conflict — revise already open, merge hand-off could not be retired"
+    assert world["rebased"] == []
+    assert _awaiting_merge_rows(world), "nothing was retired, so the queue still shows it"
+
+
+def test_a_successful_conflict_retry_adds_no_noise_to_the_cycle_status(monkeypatch):
+    _survivor_world(monkeypatch, head="sha-conf", records=[_conflict_revise(1, "sha-conf")])
+    assert recheck_once(RepoConfig("o/r", "/w")) == "#8: conflict — revise already open"
+
+
+def test_a_moved_head_still_takes_the_ordinary_rebase_path(monkeypatch):
+    """The open Revise targets an older head, so this PR genuinely needs rebasing again."""
+    world = _survivor_world(monkeypatch, head="sha-new", records=[_conflict_revise(1, "sha-old")],
+                            rebase=RebaseResult.NOOP)
+
+    assert recheck_once(RepoConfig("o/r", "/w")) == "#8: nothing to replay"
+    assert world["rebased"] == [_SURVIVOR_BRANCH]
+
+
+def test_a_relinquished_same_head_revise_never_blocks_a_fresh_rebase(monkeypatch):
+    """A PR head can sit still while `main` moves again. A conflict Revise that retired, or let go
+    of its claim, no longer owns the worktree — the rebase that would now apply must still run,
+    or that PR could never be rebased again."""
+    for spent in (_conflict_revise(1, "sha-conf", retired=True),
+                  _conflict_revise(1, "sha-conf", claim=None)):
+        world = _survivor_world(monkeypatch, head="sha-conf", records=[spent],
+                               rebase=RebaseResult.NOOP)
+        assert recheck_once(RepoConfig("o/r", "/w")) == "#8: nothing to replay"
+        assert world["rebased"] == [_SURVIVOR_BRANCH]
+
+
+def test_an_unproved_revise_never_bypasses_the_rebase(monkeypatch):
+    """An unreadable branch head or coordinator store proves nothing about who owns the work, so
+    the ordinary rebase path is taken rather than skipped on a guess."""
+    for kwargs in ({"head_readable": False}, {"store_readable": False}):
+        world = _survivor_world(monkeypatch, head="sha-conf",
+                                records=[_conflict_revise(1, "sha-conf")],
+                                rebase=RebaseResult.NOOP, **kwargs)
+        recheck_once(RepoConfig("o/r", "/w"))
+        assert world["rebased"] == [_SURVIVOR_BRANCH], f"must not bypass on {kwargs}"
+
+
+def test_an_autonomous_retirement_failure_is_visible_in_the_cycle_status(monkeypatch):
+    """A clean re-rebase force-pushes the branch, so this PR normally is not visited again — a
+    retirement that failed has no later cycle to be retried on and must be reported now. Fails
+    first against the old code, which discarded the result and reported a plain success."""
+    world = _survivor_world(monkeypatch, head="sha-new", records=[], profile="autonomous",
+                            rebase=RebaseResult.CLEAN)
+    world["edits_fail"] = True
+
+    out = recheck_once(RepoConfig("o/r", "/w"))
+
+    assert out == "#8: review submitted, but its merge hand-off could not be retired"
+    assert _awaiting_merge_rows(world), "the stale hand-off is exactly what the status warns about"
+
+    world["edits_fail"] = False
+    assert recheck_once(RepoConfig("o/r", "/w")) == "#8: review submitted"
+
+
+def test_taking_a_survivor_back_costs_one_read_of_its_comment_thread(monkeypatch):
+    """Both take-back paths retire from the rows the cycle already fetched — one read per survivor,
+    down from two."""
+    conflict = _survivor_world(monkeypatch, head="sha-conf", records=[])
+    recheck_once(RepoConfig("o/r", "/w"))
+    assert conflict["reads"] == 1
+
+    retry = _survivor_world(monkeypatch, head="sha-conf",
+                            records=[_conflict_revise(1, "sha-conf")])
+    recheck_once(RepoConfig("o/r", "/w"))
+    assert retry["reads"] == 1
+
+    autonomous = _survivor_world(monkeypatch, head="sha-new", records=[], profile="autonomous",
+                                 rebase=RebaseResult.CLEAN)
+    recheck_once(RepoConfig("o/r", "/w"))
+    assert autonomous["reads"] == 1
 
 
 def test_waiting_intake_record_omitted_from_live_projection():

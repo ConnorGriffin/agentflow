@@ -604,12 +604,15 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
 
 
 def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
-                               branch_tool: str, branch: str) -> str:
+                               branch_tool: str, branch: str, comments: list[dict]) -> str:
     """Submit the rebased exact head as a fresh durable Review; never launch one directly.
 
     Submitting one takes the PR back from the maintainer, so the summary the earlier — now
     tainted — review left behind is retired with it: an unmergeable PR under active re-review
-    must not keep sitting at the top of the operator's merge queue."""
+    must not keep sitting at the top of the operator's merge queue. A successful re-rebase
+    force-pushes the branch onto current `main`, so the PR normally stops being eligible next
+    cycle and there is no later retry — a retirement that failed is said out loud in this
+    cycle's status instead of leaving a stale hand-off nobody can see."""
     head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
     if head.returncode != 0 or not head.stdout.strip():
         return "review head unreadable"
@@ -632,12 +635,34 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     coordinator = pipeline.build_coordinator()
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
-    supersede_clean_review(cfg.repo, pr)
+    if not supersede_clean_review(comments):
+        return "review submitted, but its merge hand-off could not be retired"
     return "review submitted"
 
 
+def _conflict_revise_owns_head(cfg: RepoConfig, n: int, branch: str) -> bool:
+    """Is a conflict Revise already resolving this branch's exact current head?
+
+    Ownership is what the coordinator itself means by it: a conflict Revise record targeting the
+    head we can read *right now*, not retired, and still holding its claim. Retired or claimless
+    records are deliberately excluded — a PR head can sit still while `main` moves again, and a
+    Revise that has let go of the work must not block the fresh rebase that would now apply.
+    An unreadable head or coordinator store proves nothing, so it answers ``False`` and the caller
+    takes the ordinary rebase path rather than skipping it on a guess."""
+    head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
+    if head.returncode != 0 or not head.stdout.strip():
+        return False
+    head_sha = head.stdout.strip()
+    try:
+        records = pipeline.tracer.load_records()
+    except StoreUnavailable:
+        return False
+    return any(r.target == head_sha and not r.retired and r.claim
+               for r in conflict_revises_used(records, cfg.repo, n))
+
+
 def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: str,
-                              branch: str) -> str | None:
+                              branch: str, comments: list[dict]) -> str | None:
     """A survivor's re-rebase no longer applies: open a conflict Revise on the builder's own lineage
     to resolve it (ADR 0038) instead of parking. The Revise adopts the retained PR-branch worktree,
     is bound to the conflicting head SHA it must supersede, and is admitted ahead of cold build work.
@@ -670,24 +695,34 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
     coordinator = pipeline.build_coordinator()
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
-    supersede_clean_review(cfg.repo, pr)
+    supersede_clean_review(comments)   # the Revise is durably open either way; retried next cycle
     return f"#{pr}: conflict — revise round {conflict_round} opened"
 
 
-def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str:
+def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str,
+                     comments: list[dict]) -> str:
     """Re-rebase one survivor and route the outcome by the repo's profile. On conflict, open a
     conflict Revise to resolve it (ADR 0038); park only when that stage cannot be reconstructed or
     genuinely fails its bounded attempts. On a clean re-rebase: `autonomous` reruns the merge gate
     and lands one; `reviewed`/`guarded` just leave the PR mergeable again for the human — never a
-    merge (ADR 0002)."""
+    merge (ADR 0002).
+
+    A conflict Revise that is already resolving this exact head has adopted the PR-branch worktree,
+    so re-entering it would only fail plumbing. That case is recognized *before* any checkout, and
+    the one thing still worth doing there is retrying the merge hand-off's retirement — the durable
+    same-head Revise is itself the proof the engine already took this PR back."""
     m = BUILD_BRANCH_RE.match(branch)
     if not m:
         return f"#{pr}: unrecognized branch {branch}"
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
+    if _conflict_revise_owns_head(cfg, n, branch):
+        if not supersede_clean_review(comments):
+            return f"#{pr}: conflict — revise already open, merge hand-off could not be retired"
+        return f"#{pr}: conflict — revise already open"
     wt = Path(WorktreeRef.for_build(cfg.workdir, tool, n, sl).path)
     result = _rebase_branch(cfg, branch, wt)
     if result is RebaseResult.CONFLICT:
-        revised = _conflict_revise_survivor(cfg, pr, n, sl, tool, branch)
+        revised = _conflict_revise_survivor(cfg, pr, n, sl, tool, branch, comments)
         if revised is not None:
             return revised
         _park_conflicted_survivor(cfg, pr, n)
@@ -703,7 +738,7 @@ def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str) -> str
     remove_worktree_if_safe(cfg.workdir, wt)
     if profile != "autonomous":
         return f"#{pr}: re-rebased clean — mergeable for the human"
-    return f"#{pr}: {_merge_autonomous_survivor(cfg, pr, n, sl, tool, branch)}"
+    return f"#{pr}: {_merge_autonomous_survivor(cfg, pr, n, sl, tool, branch, comments)}"
 
 
 def recheck_once(cfg: RepoConfig) -> str:
@@ -728,7 +763,7 @@ def recheck_once(cfg: RepoConfig) -> str:
             continue
         if conflict_already_flagged(comments) or reply_pending(comments):
             continue   # already pinged, or a maintainer question the responder owns
-        out = _rebase_survivor(cfg, pr, branch, profile)
+        out = _rebase_survivor(cfg, pr, branch, profile, comments)
         results.append(out)
         if out.endswith(": merged"):
             break   # one merge per cycle — survivors re-rebase against the new main first
