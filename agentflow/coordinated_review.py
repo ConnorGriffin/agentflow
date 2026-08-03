@@ -567,7 +567,7 @@ def _review_worktree_reset(record):
     and the bounded fixes live on the stranded ref rather than in the checkout — the accepted
     trade for a registration count that stays survivable.
     """
-    from agentflow.runner import ClaudeRunner, CodexRunner
+    from agentflow.runner import CheckoutRefused, ClaudeRunner, CodexRunner
     facts = review_source_facts(record)
     if facts is None:
         return unprepared("source-unreadable",
@@ -595,6 +595,10 @@ def _review_worktree_reset(record):
         wt.parent.mkdir(parents=True, exist_ok=True)
         runner.prepare_worktree_detached(workdir, record.target, wt)
         runner.provision(wt)
+    except CheckoutRefused as refused:
+        # The checkout typed its own state — a sibling still holding it, or a human's lock over
+        # work that cannot be archived. Only the second is worth anyone's attention (#406).
+        return refused.refusal
     except subprocess.CalledProcessError as e:
         if _commit_is_gone(workdir, record.target):
             # The reviewed head was rebased or amended away. The record is not stuck on its

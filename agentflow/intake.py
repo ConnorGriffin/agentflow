@@ -185,6 +185,30 @@ def _provider_failed(detail: str, reason: str = "unspecified") -> IntakeResult:
                         parsed=False, detail=detail, infra_failed=True)
 
 
+def _refused_before_start(detail: str, blocker: str) -> IntakeResult:
+    """Triage never ran at all, so the handoff must claim nothing about this issue (#406).
+
+    Every other hold here describes a session that happened and fell short — grounding that
+    stayed ambiguous, a provider that died, a budget that ran out. This one describes a session
+    that was never started, because the private working copy triage needs is pinned open on the
+    machine and agentflow will not disturb something a human deliberately locked. There is no
+    scope question waiting, nothing was spent, and the fix is on the machine rather than in the
+    issue — so the body says exactly that and asks for exactly that. The route stays ``GRILL``
+    so the held state label and the durable-handoff marker machinery are unchanged; ``blocker``
+    comes from the persisted hold reason, so a restarted daemon composes the same words."""
+    body = (f"{_DISCLAIMER}\n\nI haven't started triaging this yet, and I can't until someone "
+            "clears something on the machine I run on.\n\nBefore reading an issue I make a "
+            "private, throwaway copy of the repository to work in. That copy is currently "
+            "pinned open and holding changes, and I won't touch a working copy somebody "
+            "deliberately pinned, so I've been waiting instead.\n\nNothing has been spent on "
+            "this issue: no session ran, no attempt was used, and no budget was drawn down. "
+            "There's no half-finished triage to read and no decision waiting on you here — "
+            f"only this:\n\n> {blocker}\n\nRelease that working copy (or save whatever it's "
+            "holding and delete it), then reply here or run `/agentflow pickup` and I'll pick "
+            "this up with a full set of attempts, exactly as if nothing had happened.")
+    return IntakeResult(IntakeRoute.GRILL, body, parsed=False, detail=detail)
+
+
 def _infra_failed(detail: str) -> IntakeResult:
     """An *infrastructure* failure — the worktree, provision, or launch fell over before
     the model ever weighed in. Unlike a model-level hold this is not the issue's fault, so

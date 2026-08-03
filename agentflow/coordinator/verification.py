@@ -15,10 +15,14 @@ The same type now answers the *preparation* question a stage's ``prepare`` asks 
 provider ever runs (#405). A preparation refusal costs no permit and no attempt, so it used to be
 invisible: a review checkout refused every cycle for half an hour over one untracked scratch file
 and the daemon could only say admission was stuck (#397/#399). The typed answer carries the same
-check id and live detail, plus one preparation-only fact — :attr:`Verification.expected`, set by
-a refusal that is ordinary contention (a live sibling still holding a checkout) rather than
-something a human should chase. An expected refusal is still published; it simply does not count
-toward the repeat-breadcrumb cadence.
+check id and live detail, plus two preparation-only facts — its **disposition**.
+:attr:`Verification.expected` marks ordinary contention (a live sibling still holding a checkout)
+rather than something a human should chase: it is still published, it simply does not count
+toward the repeat-breadcrumb cadence. :attr:`Verification.stall` marks the opposite extreme — a
+refusal the fleet has locally *proved* it cannot clear itself, so waiting longer can only waste
+wall time (#406). Only that disposition starts the coordinator's preparation-refusal clock, and
+only a check standing beside the evidence may set it: a network failure, a busy checkout, or an
+unclassified error stays undisposed and escalates to nobody, however long it lasts.
 
 Legacy collaborators (and test fakes) that still return plain bools stay valid: they simply carry
 no miss, and :func:`miss_summary` reads them as untyped.
@@ -40,13 +44,15 @@ class Verification:
     ``"branch-mismatch"``); ``detail`` is one sentence of live values — what was actually read
     from GitHub, git, or the payload — so the refusal is diagnosable without the transcript.
     ``expected`` marks a refusal the fleet is *supposed* to produce sometimes, so the repeat
-    breadcrumb stays quiet for it.
+    breadcrumb stays quiet for it. ``stall`` marks one the fleet has proved it cannot clear
+    itself, so it is worth a human's attention once it persists (#406).
     """
 
     ok: bool
     check: str = ""
     detail: str = ""
     expected: bool = False
+    stall: bool = False
 
     def __bool__(self) -> bool:
         return self.ok
@@ -68,9 +74,13 @@ def unverified(check: str, detail: str = "") -> Verification:
     return Verification(False, check, detail)
 
 
-def unprepared(check: str, detail: str = "", *, expected: bool = False) -> Verification:
-    """The falsy preparation answer for one named refusing check (#405)."""
-    return Verification(False, check, detail, expected)
+def unprepared(check: str, detail: str = "", *, expected: bool = False,
+               stall: bool = False) -> Verification:
+    """The falsy preparation answer for one named refusing check (#405).
+
+    ``stall`` is the caller's assertion that it read local evidence proving no amount of
+    retrying will clear this — only a check standing beside that evidence may set it (#406)."""
+    return Verification(False, check, detail, expected, stall)
 
 
 def miss_summary(result) -> str:
@@ -82,6 +92,12 @@ def refusal_expected(result) -> bool:
     """Whether a refusal is ordinary contention rather than something to chase. Untyped and
     passing answers are never expected, so a legacy bool keeps the loud cadence it has today."""
     return isinstance(result, Verification) and not result.ok and result.expected
+
+
+def refusal_stalls(result) -> bool:
+    """Whether a refusal proved a human has to clear it (#406). Untyped and passing answers never
+    do, so nothing escalates on an answer that stated no disposition at all."""
+    return isinstance(result, Verification) and not result.ok and result.stall
 
 
 def payload_preview(field: str, value) -> str:

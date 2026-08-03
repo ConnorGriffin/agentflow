@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agentflow.coordinator.record import RUNNING, Record
+from agentflow.coordinator.record import RUNNING, STALL_STALLED_AFTER, Record, stalled_for
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.worktree_ref import WorktreeRef
 
@@ -145,6 +145,31 @@ def refusal_projection(records) -> list[dict]:
         }
         for record in records
         if record.refusal and not record.retired
+    ]
+
+
+def stalled_projection(records, *, now: int) -> list[dict]:
+    """Render every record stuck long enough on a refusal only a human can clear (#406).
+
+    A third key of its own, beside the refusals and well away from the running rows. A stalled
+    record has started nothing and reserves nothing, so putting it anywhere near ``running``
+    would report an active session that does not exist and inflate its pool's count; and it is
+    not merely *being refused*, which is the ordinary condition half the fleet is in at any
+    moment. What separates it is elapsed time on a refusal that has been proved human-clearable,
+    so each row carries when the clock started and lets whoever reads it do that arithmetic.
+    """
+    return [
+        {
+            "repo": record.repo,
+            "subject": record.subject,
+            "stage": record.stage,
+            "pool": record.pool,
+            "refusal_id": record.stall_refusal_id,
+            "refusal": record.refusal,
+            "stall_started_at": record.stall_started_at,
+        }
+        for record in records
+        if not record.retired and stalled_for(record, now) >= STALL_STALLED_AFTER
     ]
 
 
