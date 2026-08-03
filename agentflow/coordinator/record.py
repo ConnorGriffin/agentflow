@@ -89,6 +89,8 @@ class Record:
     builder_lineage: str | None = None   # original builder; current exact-head author is separate
     builder_complexity: str | None = None  # the original builder complexity, carried so a later
                                            # Revise never re-reads a mutable issue label (ADR 0018)
+    builder_effort: str | None = None    # the original builder effort, carried separately so Review
+                                         # keeps provider-default reasoning while Revise inherits it
     round: int = 0                       # completed auto-revise rounds behind this stage; part of
                                          # the identity so an evidence-only revision's re-review at
                                          # the same head SHA is still a fresh stage

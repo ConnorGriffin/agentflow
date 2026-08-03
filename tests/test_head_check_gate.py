@@ -12,7 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentflow import coordinated_review, github, pipeline
+from agentflow import coordinated_review, coordinated_revise, github, pipeline
+from agentflow.coordinator.profiles import profile_for
 from agentflow.coordinator.record import Record
 from agentflow.github import HeadChecks, head_checks_from_rollup
 from agentflow.reviewer import Verdict
@@ -291,10 +292,12 @@ def _wire_opener(monkeypatch, review, *, head_checks, pr_state="OPEN", pr_head="
     monkeypatch.setattr("agentflow.coordinated_revise._revise_builder_source",
                         lambda _r: builder_source)
     captured = {}
+    real_submission = coordinated_revise.revise_submission
 
     def _submission(review_record, complexity, findings, *, target_sha=""):
         captured.update(complexity=complexity, findings=findings, target_sha=target_sha)
-        return SimpleNamespace(identity="revise-sub")
+        return real_submission(
+            review_record, complexity, findings, target_sha=target_sha)
 
     monkeypatch.setattr("agentflow.coordinated_revise.revise_submission", _submission)
     return SimpleNamespace(coord=coord, submitted=submitted, parked=parked, captured=captured)
@@ -303,6 +306,7 @@ def _wire_opener(monkeypatch, review, *, head_checks, pr_state="OPEN", pr_head="
 def _reviewed_record_for_opener(**kwargs):
     record = _completed_review_record(**kwargs)
     record.builder_complexity = "standard"
+    record.builder_effort = "extra"
     return record
 
 
@@ -315,6 +319,9 @@ def test_a_caught_red_check_opens_a_revise_round_named_check_and_sha_only(monkey
     assert len(world.submitted) == 1
     assert world.captured["target_sha"] == "sha-a"
     assert world.captured["complexity"] == "standard"
+    revise = world.submitted[0]
+    assert revise.effort == "extra" and revise.builder_effort == "extra"
+    assert profile_for(revise).reasoning_effort == "xhigh"
     assert "`python`" in world.captured["findings"] and "sha-a" in world.captured["findings"]
     assert "log" in world.captured["findings"].lower()  # the no-CI-log instruction rides along
 

@@ -81,8 +81,8 @@ def _revise_builder_source(review_record):
 def revise_submission(review_record, complexity, findings="", *, surfaces="", target_sha=""):
     """Translate a blocking Review into one Revise stage submission — the minimal facts the
     coordinator needs (ADR 0030). The revise adopts the original builder's retained PR branch and
-    worktree, stays pinned to the builder's tool lineage and its original complexity, is bound to
-    the reviewed head SHA it must supersede (its immutable target, together with the review's
+    worktree, stays pinned to the builder's tool lineage and its original complexity and effort,
+    is bound to the reviewed head SHA it must supersede (its immutable target, together with the review's
     revise round — so a later blocking review, even one re-reviewing an unchanged head SHA, is a
     genuinely fresh revise stage), and assumes the Review's change claim. Pure: the mapping is the
     test surface (ADR 0020). Returns ``None`` if the builder worktree cannot be reconstructed or
@@ -99,8 +99,9 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
         target=reviewed_head, pool=review_record.builder_lineage, complexity=complexity,
-        source=build_worktree, claim=True, input_ptr=brief,
+        effort=review_record.builder_effort, source=build_worktree, claim=True, input_ptr=brief,
         builder_lineage=review_record.builder_lineage, builder_complexity=complexity,
+        builder_effort=review_record.builder_effort,
         round=review_record.round, transfer_from=review_record.identity)
 
 
@@ -133,9 +134,11 @@ def conflict_decision_revise_submission(review_record, verdict):
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
         target=review_record.target, pool=review_record.builder_lineage,
-        complexity=review_record.builder_complexity or "deep", source=build_worktree,
+        complexity=review_record.builder_complexity or "deep",
+        effort=review_record.builder_effort, source=build_worktree,
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
         builder_complexity=review_record.builder_complexity or "deep",
+        builder_effort=review_record.builder_effort,
         round=review_record.round, conflict_round=review_record.conflict_round,
         transfer_from=review_record.identity, continuation=True,
         review=review)
