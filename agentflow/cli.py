@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -59,6 +60,22 @@ def main(argv: list[str] | None = None) -> int | None:
         choices=("autonomous", "reviewed", "guarded"),
         default="reviewed",
     )
+    churn_command = commands.add_parser(
+        "churn", help="rank fleet transcripts by token-burning churn"
+    )
+    churn_command.add_argument("--config", help="path to config.toml")
+    churn_command.add_argument("--repo", dest="repo_filter",
+                                help="only this configured owner/name repository")
+    churn_command.add_argument("--top", type=int, default=25)
+    churn_command.add_argument("--json", dest="json_path",
+                                help="also write full per-session metrics to this file")
+    churn_command.add_argument("--include-manual", action="store_true",
+                                help="also include manual (non-fleet-spawned) worktree sessions")
+    churn_command.add_argument("--excerpt", dest="excerpt_path",
+                                help="print the error windows of one Claude session JSONL "
+                                     "instead of the ranking")
+    churn_command.add_argument("--max-chars", type=int, default=9000)
+    churn_command.add_argument("--window", type=int, default=1)
     daemon_command = commands.add_parser("daemon", help="run the fleet daemon")
     daemon_command.add_argument("--config", help="path to config.toml")
     daemon_command.add_argument(
@@ -104,6 +121,30 @@ def main(argv: list[str] | None = None) -> int | None:
         report = doctor(args.repo_path or args.path or ".")
         print_doctor(report, json_output=args.json_output)
         return 0 if report.ready else 1
+    elif args.command == "churn":
+        from agentflow.churn import collect_sessions, format_excerpt, format_report
+
+        if args.excerpt_path:
+            print(format_excerpt(args.excerpt_path, max_chars=args.max_chars,
+                                  window=args.window))
+            return 0
+        try:
+            config = load_config(args.config)
+        except ConfigurationError as exc:
+            parser.error(str(exc))
+        repos = [
+            cfg for cfg in config.repositories
+            if not args.repo_filter or cfg.repo == args.repo_filter
+        ]
+        if not repos:
+            parser.error(f"no configured repository matches {args.repo_filter!r}")
+        sessions = collect_sessions(repos, include_manual=args.include_manual)
+        print(format_report(sessions, top=args.top))
+        if args.json_path:
+            with open(args.json_path, "w") as fh:
+                json.dump(sessions, fh, indent=1)
+            print(f"wrote {args.json_path}")
+        return 0
     elif args.command == "enroll":
         from agentflow.enroll import enroll_repository
 
