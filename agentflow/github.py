@@ -841,8 +841,7 @@ _MAPS_QUERY = (
     "}}"
     "}}"
     "}}"
-    "}}"
-    "}")
+    "}}")
 
 
 def _handoff_candidate_row(node: dict, repo: str) -> HandoffCandidateRow:
