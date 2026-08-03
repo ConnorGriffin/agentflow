@@ -20,7 +20,7 @@ from conftest import FakeSession
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import ProviderCause, classify_claude, classify_codex
 from agentflow.coordinator.telemetry import (
-    AttemptTelemetry, AttemptUsage, claude_usage, codex_usage, project,
+    AttemptTelemetry, AttemptUsage, ModelCost, claude_usage, codex_usage, project,
     read_attempts, record_attempt, telemetry_dir)
 
 # --- representative provider usage streams -------------------------------------------------
@@ -57,6 +57,7 @@ def test_claude_usage_normalizes_the_terminal_result():
     assert usage.turns == 7
     assert usage.duration_ms == 91234
     assert usage.model == "claude-opus-4"
+    assert usage.model_costs == (ModelCost(model="claude-opus-4", cost_usd=0.42),)
     assert "service_tier" in usage.unrecognized       # unmodeled field preserved, not dropped
 
 
@@ -73,6 +74,57 @@ def test_codex_usage_sums_turns_and_nets_out_cached_input():
     assert usage.cost_usd is None                     # Codex reports no provider dollar cost
     assert usage.turns == 2
     assert "tool_tokens" in usage.unrecognized
+    assert usage.model_costs == ()
+
+
+def test_claude_usage_keeps_every_valid_provider_model_cost():
+    result = {
+        "type": "result", "usage": {"input_tokens": 1},
+        "modelUsage": {
+            "claude-opus-4": {"costUSD": 0.2},
+            "claude-sonnet-4": {"costUSD": 0.1},
+        },
+    }
+
+    usage = claude_usage([result])
+
+    assert usage.model is None
+    assert usage.model_costs == (
+        ModelCost(model="claude-opus-4", cost_usd=0.2),
+        ModelCost(model="claude-sonnet-4", cost_usd=0.1),
+    )
+
+
+def test_claude_usage_keeps_three_valid_provider_model_costs():
+    usage = claude_usage([{
+        "type": "result", "usage": {"input_tokens": 1},
+        "modelUsage": {
+            "claude-opus-4": {"costUSD": 0.2},
+            "claude-sonnet-4": {"costUSD": 0.1},
+            "claude-haiku-4": {"costUSD": 0.05},
+        },
+    }])
+
+    assert usage.model_costs == (
+        ModelCost(model="claude-opus-4", cost_usd=0.2),
+        ModelCost(model="claude-sonnet-4", cost_usd=0.1),
+        ModelCost(model="claude-haiku-4", cost_usd=0.05),
+    )
+
+
+def test_claude_usage_omits_malformed_provider_model_costs_without_losing_siblings():
+    result = {
+        "type": "result", "usage": {"input_tokens": 1},
+        "modelUsage": {
+            "missing": {}, "string": {"costUSD": "0.1"}, "boolean": {"costUSD": True},
+            "bad": None, 9: {"costUSD": 0.1}, "claude-good": {"costUSD": 0.2},
+        },
+    }
+
+    usage = claude_usage([result])
+
+    assert usage.model is None
+    assert usage.model_costs == (ModelCost(model="claude-good", cost_usd=0.2),)
 
 
 def test_missing_usage_stays_explicit_never_zero():
@@ -116,6 +168,48 @@ def test_record_attempt_is_idempotent_by_launch_token(tmp_path):
     assert only.usage.cost_usd == 0.42 and only.outcome == "pr opened"
 
 
+def test_model_costs_round_trip_as_typed_provider_attribution(tmp_path):
+    store = tmp_path / "records.db"
+    usage = AttemptUsage(
+        cost_usd=0.3,
+        model_costs=(ModelCost("claude-opus-4", 0.2), ModelCost("claude-sonnet-4", 0.1)),
+    )
+    record_attempt(store, _entry(token="mixed", usage=usage))
+
+    (loaded,) = [entry for entry in read_attempts(store) if entry.token == "mixed"]
+
+    assert loaded.usage.model_costs == (
+        ModelCost("claude-opus-4", 0.2), ModelCost("claude-sonnet-4", 0.1))
+
+
+def test_legacy_and_malformed_model_costs_preserve_other_usage(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(token="legacy", usage=AttemptUsage(input_tokens=12, cost_usd=0.4)))
+    written = json.loads((telemetry_dir(store) / "legacy.json").read_text())
+    del written["usage"]["model_costs"]                # a record written before the breakdown existed
+    (telemetry_dir(store) / "legacy.json").write_text(json.dumps(written))
+    malformed = json.loads((telemetry_dir(store) / "legacy.json").read_text())
+    malformed["token"] = "malformed"
+    malformed["usage"]["model_costs"] = [
+        None, {"model": "claude-good", "cost_usd": 0.2}, {"model": 3, "cost_usd": 0.1},
+        {"model": "boolean", "cost_usd": True},
+    ]
+    (telemetry_dir(store) / "malformed.json").write_text(json.dumps(malformed))
+    non_list = json.loads((telemetry_dir(store) / "legacy.json").read_text())
+    non_list["token"] = "non-list"
+    non_list["usage"]["model_costs"] = {"claude-good": 0.2}
+    (telemetry_dir(store) / "non-list.json").write_text(json.dumps(non_list))
+
+    entries = {entry.token: entry for entry in read_attempts(store)}
+
+    assert entries["legacy"].usage.model_costs == ()  # unavailable historical attribution
+    assert entries["legacy"].usage.input_tokens == 12 and entries["legacy"].usage.cost_usd == 0.4
+    assert entries["malformed"].usage.model_costs == (ModelCost("claude-good", 0.2),)
+    assert entries["malformed"].usage.input_tokens == 12 and entries["malformed"].usage.cost_usd == 0.4
+    assert entries["non-list"].usage.model_costs == ()
+    assert entries["non-list"].usage.input_tokens == 12 and entries["non-list"].usage.cost_usd == 0.4
+
+
 def test_no_prompt_or_message_content_is_ever_persisted(tmp_path):
     store = tmp_path / "records.db"
     record_attempt(store, _entry(usage=AttemptUsage(output_tokens=10)))
@@ -125,7 +219,8 @@ def test_no_prompt_or_message_content_is_ever_persisted(tmp_path):
     assert "final_message" not in raw and "partial_output" not in raw and "events" not in raw
     assert set(data["usage"]) <= {
         "input_tokens", "cached_input_tokens", "cache_creation_tokens", "output_tokens",
-        "reasoning_output_tokens", "cost_usd", "turns", "duration_ms", "model", "unrecognized"}
+        "reasoning_output_tokens", "cost_usd", "turns", "duration_ms", "model", "model_costs",
+        "unrecognized"}
 
 
 def test_projection_totals_and_missing_counts_by_stage_model_outcome(tmp_path):

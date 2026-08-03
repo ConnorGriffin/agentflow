@@ -37,6 +37,14 @@ _CODEX_USAGE_KEYS = {
 
 
 @dataclass(frozen=True)
+class ModelCost:
+    """One provider-reported model's dollar cost within an attempt."""
+
+    model: str
+    cost_usd: float
+
+
+@dataclass(frozen=True)
 class AttemptUsage:
     """One attempt's normalized spend, pool-agnostic in shape and faithful per pool.
 
@@ -56,6 +64,7 @@ class AttemptUsage:
     turns: int | None = None
     duration_ms: int | None = None
     model: str | None = None                    # provider-reported model, when the stream carries it
+    model_costs: tuple[ModelCost, ...] = ()     # provider-model attribution, when reported
     unrecognized: tuple = ()                    # unmodeled usage sub-fields, preserved verbatim
 
     @property
@@ -107,6 +116,13 @@ def claude_usage(events) -> AttemptUsage:
     model = None
     if isinstance(model_usage, dict) and len(model_usage) == 1:
         model = next(iter(model_usage))
+    model_costs = ()
+    if isinstance(model_usage, dict):
+        model_costs = tuple(
+            ModelCost(model=model_id, cost_usd=cost)
+            for model_id, details in model_usage.items()
+            if isinstance(model_id, str) and isinstance(details, dict)
+            if (cost := _float(details.get("costUSD"))) is not None)
     return AttemptUsage(
         input_tokens=_int(usage.get("input_tokens")),
         cached_input_tokens=_int(usage.get("cache_read_input_tokens")),
@@ -117,6 +133,7 @@ def claude_usage(events) -> AttemptUsage:
         turns=_int(result.get("num_turns")),
         duration_ms=_int(result.get("duration_ms")),
         model=model,
+        model_costs=model_costs,
         unrecognized=_extra(usage, _CLAUDE_USAGE_KEYS))
 
 
@@ -282,6 +299,15 @@ def _decode_usage(data: dict) -> AttemptUsage:
     picked = {k: v for k, v in data.items() if k in known}
     if isinstance(picked.get("unrecognized"), list):
         picked["unrecognized"] = tuple(picked["unrecognized"])
+    model_costs = picked.get("model_costs")
+    if isinstance(model_costs, list):
+        picked["model_costs"] = tuple(
+            ModelCost(model=item["model"], cost_usd=cost)
+            for item in model_costs
+            if isinstance(item, dict) and isinstance(item.get("model"), str)
+            if (cost := _float(item.get("cost_usd"))) is not None)
+    elif "model_costs" in picked:
+        picked["model_costs"] = ()
     try:
         return AttemptUsage(**picked)
     except TypeError:
