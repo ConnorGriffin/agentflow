@@ -179,12 +179,14 @@ def _next_untriaged_issue(cfg: RepoConfig, reserved: set[int] = frozenset()) -> 
     return min(untriaged, key=lambda i: i["number"]) if untriaged else None
 
 
-def build_issue(cfg: RepoConfig, n: int) -> str:
+def build_issue(cfg: RepoConfig, n: int, *, floodgates: bool = False) -> str:
     """By-hand build of a *specific* ready issue (ADR 0022's `build <N>`). Fetches issue N,
     **refuses and redirects** anything that isn't `ready-for-agent` (a held issue → `pickup`;
     an un-triaged one → `triage`/`scope`), refuses one already claimed or in flight, then
     submits the same durable Build record as the daemon. Provider launch, review, continuation,
-    and permits remain behind the coordinator."""
+    and permits remain behind the coordinator. ``floodgates=True`` passes an operator's
+    per-dispatch floodgates override (ADR 0025 amendment) through to both the pool pick and the
+    submitted record, so a later admission recheck still honors it."""
     # By-hand, one issue at a time: the whole-issue read is affordable here (the queue pass uses
     # the lean discovery listing), and it answers the state and the build fields together.
     view = github.issue_view(cfg.repo, n)
@@ -205,10 +207,10 @@ def build_issue(cfg: RepoConfig, n: int) -> str:
         return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"
     if not _free_to_dispatch(cfg, issue, in_flight):
         return f"#{n}: not dispatchable — already claimed, in flight, or waiting on a blocker"
-    builder, _reviewer, block_msg = pick_pair(operator=True)
+    builder, _reviewer, block_msg = pick_pair(operator=True, floodgates=floodgates)
     if builder is None:
         return f"#{n}: no pool has headroom ({block_msg}) — deferring"
-    submission = coordinated_build.build_submission(cfg, issue, builder.tool)
+    submission = coordinated_build.build_submission(cfg, issue, builder.tool, floodgates=floodgates)
     if submission is None:
         return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
     # A `build <N>` on an issue whose latest Build exhausted its budget and `held` is the explicit,

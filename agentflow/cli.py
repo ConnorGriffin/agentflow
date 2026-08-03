@@ -76,6 +76,15 @@ def main(argv: list[str] | None = None) -> int | None:
                                      "instead of the ranking")
     churn_command.add_argument("--max-chars", type=int, default=9000)
     churn_command.add_argument("--window", type=int, default=1)
+    floodgates_command = commands.add_parser(
+        "floodgates", help="fleet-wide headroom override (ADR 0025 amendment)"
+    )
+    floodgates_commands = floodgates_command.add_subparsers(
+        dest="floodgates_command", required=True
+    )
+    floodgates_commands.add_parser("open", help="lift the weekly allowance and spend ceiling")
+    floodgates_commands.add_parser("close", help="restore the ordinary headroom policy")
+    floodgates_commands.add_parser("status", help="show whether floodgates is open")
     daemon_command = commands.add_parser("daemon", help="run the fleet daemon")
     daemon_command.add_argument("--config", help="path to config.toml")
     daemon_command.add_argument(
@@ -199,6 +208,27 @@ def main(argv: list[str] | None = None) -> int | None:
 
         remove()
         print("daemon service removed")
+    elif args.command == "floodgates":
+        import time
+
+        from agentflow.balancer import floodgates_active
+        from agentflow.state import state_path
+
+        flag = state_path("floodgates")
+        if args.floodgates_command == "open":
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text(f"{int(time.time())}\n")
+            print("floodgates OPEN")
+        elif args.floodgates_command == "close":
+            flag.unlink(missing_ok=True)
+            print("floodgates CLOSED")
+        elif args.floodgates_command == "status":
+            env = os.environ.get("AGENTFLOW_FLOODGATES", "").strip().lower() in (
+                "1", "true", "yes")
+            if not floodgates_active():
+                print("floodgates CLOSED")
+            else:
+                print(f"floodgates OPEN (source: {'env' if env else 'file'})")
     elif args.command == "capacity" and args.capacity_command == "calibrate":
         from agentflow.capacity_helper import main as capacity_main
 

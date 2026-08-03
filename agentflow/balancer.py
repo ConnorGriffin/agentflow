@@ -43,6 +43,12 @@ operator.
 
 `pick_pair` is the public dispatch test surface; `choose_pair` and `parse_pct`
 remain pure compatibility interfaces.
+
+**Floodgates (ADR 0025 amendment).** An operator emergency valve that lifts the paced weekly
+allowance and raises the spend ceiling to 100 for both pools, fleet-wide (`floodgates_active`,
+env `AGENTFLOW_FLOODGATES` or the flag file) or per-dispatch (the `floodgates` parameter threaded
+through `pick_pair`/`_query_pool`/the dispatch-status wrappers, and the coordinator's per-record
+flag). It never touches the hard five-permit ledger, which stays the real concurrency cap.
 """
 
 from __future__ import annotations
@@ -58,6 +64,7 @@ from dataclasses import dataclass
 from agentflow.coordinator import quota
 from agentflow.coordinator.store import default_store_path
 from agentflow.runner import ClaudeRunner, CodexRunner, _WorktreeRunner
+from agentflow.state import state_path
 
 # The two pools this module balances between — the tools a build, review or revise may run on.
 BUILD_POOLS = ("claude", "codex")
@@ -92,9 +99,26 @@ ACTIVE_PACE = int(os.environ.get("AGENTFLOW_ACTIVE_PACE", "1"))
 CLAUDE_INFLIGHT_RESERVE_PCT = float(
     os.environ.get("AGENTFLOW_CLAUDE_INFLIGHT_RESERVE_PCT", "15"))
 
-def ceiling_for(active: bool) -> float:
+_TRUTHY = ("1", "true", "yes")
+
+
+def floodgates_active() -> bool:
+    """Whether the fleet-wide floodgates override is open right now (ADR 0025 amendment).
+    True when env ``AGENTFLOW_FLOODGATES`` is truthy or the flag file
+    ``state_path("floodgates")`` exists. Evaluated fresh on every call — never cached — so
+    toggling either source takes effect on the very next dispatch decision, with no daemon
+    restart. An operator emergency valve, not a policy a cold pool should linger under."""
+    if os.environ.get("AGENTFLOW_FLOODGATES", "").strip().lower() in _TRUTHY:
+        return True
+    return state_path("floodgates").exists()
+
+
+def ceiling_for(active: bool, floodgates: bool = False) -> float:
     """The spend ceiling a pool dispatches under, given whether the operator is active on
-    it (ADR 0025). Pure — the one place the idle/active policy lives."""
+    it (ADR 0025). Pure — the one place the idle/active policy lives. Floodgates (global or
+    per-dispatch) lifts the ceiling to 100 — the hard permit ledger remains the real cap."""
+    if floodgates:
+        return 100.0
     return ACTIVE_CEILING_PCT if active else IDLE_CEILING_PCT
 
 
@@ -211,9 +235,14 @@ def _normalize_short_window(window: RateLimitWindow, now: float) -> float | None
     return window.used_percent
 
 
-def _codex_pacing(windows: tuple[RateLimitWindow, ...], now: float) -> tuple[bool, str]:
+def _codex_pacing(windows: tuple[RateLimitWindow, ...], now: float,
+                   floodgates: bool = False) -> tuple[bool, str]:
     for window in windows:
         if window.window_minutes == _WEEKLY_WINDOW_MIN:
+            # Floodgates lifts the paced weekly allowance outright (ADR 0025 amendment) — the
+            # short-window staleness check below still applies.
+            if floodgates:
+                continue
             # The seven-day window's staleness/roll-forward is owned entirely by
             # `_weekly_over_pace` (#322), so an expired-but-reset weekly window rolls forward here
             # for Codex the same as for Claude.
@@ -238,10 +267,11 @@ def _codex_spent_pct(windows: tuple[RateLimitWindow, ...], now: float) -> float:
     return effective if effective is not None else 100.0
 
 
-def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
+def _codex_dispatch_status(status: PoolStatus, now: float, floodgates: bool = False) -> PoolStatus:
     if status.windows is None:
         return PoolStatus(status.tool, False, 100.0, "limit facts unavailable", None)
-    paced, pace_reason = _codex_pacing(status.windows, now)
+    fg = floodgates or floodgates_active()
+    paced, pace_reason = _codex_pacing(status.windows, now, floodgates=fg)
     spent_pct = _codex_spent_pct(status.windows, now)
     # Prefer the pacing reason when it fires; fall back to the existing reason only when
     # pacing is fine or when it has no reason to offer.
@@ -260,7 +290,7 @@ def _codex_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
     )
 
 
-def _claude_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
+def _claude_dispatch_status(status: PoolStatus, now: float, floodgates: bool = False) -> PoolStatus:
     """Layer Claude's paced weekly allowance onto a five-hour `PoolStatus` (#315), the way
     `_codex_dispatch_status` does for Codex. The five-hour decision already in `status` sizes
     headroom and load-balances the pool; this ANDs in the independent seven-day constraint so a
@@ -270,7 +300,12 @@ def _claude_dispatch_status(status: PoolStatus, now: float) -> PoolStatus:
     closed here, independent of any five-hour bootstrap estimate — matching the fail-closed
     contract when a required window is unavailable or stale. A five-hour block keeps its own
     reason; only a pool that clears the five-hour gate surfaces the weekly reason, so a deferral
-    line distinguishes a headroom block from a pacing block."""
+    line distinguishes a headroom block from a pacing block.
+
+    Floodgates (global or per-dispatch) lifts the paced weekly allowance outright — the
+    five-hour `status` is returned unchanged, so the weekly fact is not even required."""
+    if floodgates or floodgates_active():
+        return status
     weekly = next((w for w in (status.windows or ())
                    if w.window_minutes == _WEEKLY_WINDOW_MIN), None)
     if weekly is None:
@@ -366,8 +401,10 @@ def _gate_facts(env: dict, operator: bool) -> tuple[bool, bool, str, str]:
 
 
 def _query_pool(tool: str, operator: bool = False, *,
-                reserved_pct: float = 0.0, now: float | None = None) -> PoolStatus:
+                reserved_pct: float = 0.0, now: float | None = None,
+                floodgates: bool = False) -> PoolStatus:
     now = time.time() if now is None else now
+    fg = floodgates or floodgates_active()
     env = {**os.environ, "TRIAGE_AGENT": tool}
     if operator:
         env["TRIAGE_SKIP_ACTIVITY"] = "1"
@@ -386,7 +423,7 @@ def _query_pool(tool: str, operator: bool = False, *,
             blocked, active, block_reason, _ck_stdout = _gate_facts(env, operator)
         except (OSError, subprocess.TimeoutExpired):
             return PoolStatus(tool, False, 100.0, "capacity helper unavailable")
-    ceiling = ceiling_for(active)
+    ceiling = ceiling_for(active, fg)
     yield_reason = f"yielding to operator · ceiling {ceiling:.0f}%"
     # Known legacy spend/check text remains compatible. Structured Codex facts are
     # mandatory for unattended dispatch; an older adapter therefore fails closed.
@@ -463,21 +500,25 @@ def _query_pool(tool: str, operator: bool = False, *,
 
 def pick_pair(claude: _WorktreeRunner | None = None,
               codex: _WorktreeRunner | None = None,
-              operator: bool = False) -> tuple:
+              operator: bool = False,
+              floodgates: bool = False) -> tuple:
     """Live: query both pools and choose the pair. See `choose_pair`. `operator=True`
     marks an explicit by-hand dispatch, which skips the pools' recent-activity guard
     while still honoring their spend ceiling — the pair-vs-single decision is unchanged.
+    `floodgates=True` is the per-dispatch override (scoped to this one call) — it has the
+    same effect as the fleet-wide toggle (`floodgates_active`, ADR 0025 amendment), OR'd
+    with it, so either source lifts the weekly allowance and ceiling for this pick.
 
     Returns (builder, reviewer, block_msg). block_msg is "" when builder is not None;
     when both pools are blocked it names each pool and its gate reason."""
     claude = claude or ClaudeRunner()
     codex = codex or CodexRunner()
-    cs = _query_pool("claude", operator)
-    xs = _query_pool("codex", operator)
+    cs = _query_pool("claude", operator, floodgates=floodgates)
+    xs = _query_pool("codex", operator, floodgates=floodgates)
     if not operator:
         now = time.time()
-        cs = _claude_dispatch_status(cs, now)
-        xs = _codex_dispatch_status(xs, now)
+        cs = _claude_dispatch_status(cs, now, floodgates=floodgates)
+        xs = _codex_dispatch_status(xs, now, floodgates=floodgates)
     builder, reviewer = choose_pair(cs, xs, {"claude": claude, "codex": codex})
     if builder is not None:
         return builder, reviewer, ""

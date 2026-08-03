@@ -3,6 +3,8 @@
 - Status: Accepted
 - Date: 2026-07-13
 - Amended: 2026-07-16 — this ceiling paces autonomous **background** work only; interactive conversation turns (Ask/grilling) are exempt and admitted in real-time ([ADR 0034](0034-methodology-session-orchestration.md), [#161](https://github.com/ConnorGriffin/agentflow/issues/161))
+- Amended: 2026-08-03 — **floodgates**, an operator emergency override that lifts the paced
+  weekly allowance and raises the spend ceiling to 100 (see "Floodgates" below)
 
 ## Context
 
@@ -98,3 +100,34 @@ The gate's existing exclusion of agentflow's own sessions from the activity chec
   touches, so this rides that slice rather than adding a new one.
 - Supersedes the earlier informal intent to simply "drop the recent-activity
   guard": yield, don't stop.
+
+## Amendment: Floodgates (2026-08-03)
+
+This ceiling is a policy for the ordinary case. It has no escape hatch for the case an
+operator actually wants: burn through a window on purpose — a launch, an incident, a
+backlog the operator has decided is worth the spend. **Floodgates** is that escape hatch,
+named and durable rather than an ad-hoc env var nobody remembers the shape of next time.
+
+**Fleet-wide.** `agentflow.balancer.floodgates_active()` is true when env
+`AGENTFLOW_FLOODGATES` is truthy (`1`/`true`/`yes`, case-insensitive) or the flag file
+`~/.agentflow/floodgates` exists (`agentflow floodgates open`/`close`/`status`). It is
+evaluated fresh on every dispatch decision — never cached — so toggling either source takes
+effect on the very next admission check, with no daemon restart. While active, for **both**
+pools: `_weekly_over_pace` never blocks (the paced weekly allowance from #315 is lifted),
+and the idle/active spend ceiling (`ceiling_for`) becomes 100 instead of 85/50. The per-cycle
+active-pacing budget (`ACTIVE_PACE`) is also lifted in `_ProductionGate`.
+
+**Per-dispatch.** A `floodgates: bool` parameter threads from `pick_pair` through
+`_query_pool` and the `_claude_dispatch_status`/`_codex_dispatch_status` wrappers, scoping the
+same effect to one dispatch decision without touching the global toggle. The coordinator
+carries the same bit as a per-record `Record.floodgates` field (set from `Submission.floodgates`
+at submission), so a later admission recheck at launch still honors what the record was
+submitted with. An interactive (Ask) turn already returns `True` unconditionally in
+`_ProductionGate.__call__` before floodgates is even consulted — that exemption is unchanged.
+
+**What floodgates does not touch.** The hard five-permit concurrency ledger (`_begin_start`'s
+reservation) is untouched by design: floodgates is about *how much of the window* a pool may
+spend, never about how many sessions may run at once. The gate's own recent-activity block
+(the personal-tooling `blocked:` signal) is also untouched — floodgates lifts the weekly/
+ceiling/pacing policy this ADR owns, not the operator-active detection a different mechanism
+owns. This keeps floodgates a narrow, named override rather than a second admission policy.

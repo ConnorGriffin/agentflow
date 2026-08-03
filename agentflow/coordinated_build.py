@@ -32,13 +32,14 @@ from agentflow.runner import _run
 from agentflow.worktree_ref import WorktreeRef, source_facts
 
 
-def build_submission(cfg, issue: dict, tool: str):
+def build_submission(cfg, issue: dict, tool: str, *, floodgates: bool = False):
     """Translate one ready issue and its chosen tool into a single Build stage submission — the
     minimal facts the coordinator needs (ADR 0030). The durable input pointer is the full build
     brief the provider session runs, so a recovered attempt rebuilds the same prompt. Pure: the
     issue→submission mapping is the test surface. Returns ``None`` when the issue lacks the
     complexity gate a build requires (ADR 0018), so a mis-labelled issue never becomes an
-    attempt."""
+    attempt. ``floodgates`` carries a by-hand dispatch's per-record floodgates override (ADR
+    0025 amendment) onto the record, so a later admission recheck still honors it."""
     from agentflow.coordinator import Submission
     n = issue["number"]
     labels = [lbl["name"] for lbl in issue.get("labels", [])]
@@ -53,7 +54,8 @@ def build_submission(cfg, issue: dict, tool: str):
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool=tool,
         complexity=complexity.value, effort=effort_from_labels(labels).value,
-        source=WorktreeRef.for_build(cfg.workdir, tool, n, sl).path, claim=True, input_ptr=brief)
+        source=WorktreeRef.for_build(cfg.workdir, tool, n, sl).path, claim=True, input_ptr=brief,
+        floodgates=floodgates)
 
 
 def resume_if_held(submission, records):
