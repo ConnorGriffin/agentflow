@@ -61,16 +61,20 @@ after three attempts (the fix-axis parks of late July, e.g. PR #346).
     it through exactly as they pass a verify answer, and composed preparations (`rebuild the
     checkout` *and* `prove the claim`) rely on Python's `and` yielding the first falsy operand,
     so the half that refused survives instead of collapsing to a bare `False`.
-  - `Verification` gained exactly one field, `expected`. A verification miss is always something
-    to look at; a preparation refusal is not — a checkout held by a live sibling session is the
-    fleet working as intended. The collaborator marks its own benign refusals, so the coordinator
-    never keeps a list of blessed check ids. An expected refusal is still published; it only
-    stops the repeat breadcrumb.
+  - `Verification` gained a **disposition**: `expected` here, and `stall` in issue #406
+    ([ADR 406](adr-406-preparation-refusal-clock.md)). A verification miss is always something to
+    look at; a preparation refusal may be either the fleet working as intended (a checkout held
+    by a live sibling session) or something no amount of retrying will fix. The collaborator
+    marks its own, so the coordinator never keeps a list of blessed check ids. Both dispositions
+    are opt-in: a refusal that states neither is published, counted, and escalated to nobody.
   - A miss is a fact about a finished attempt, so `verify_miss` is written once and read later.
     A refusal is a fact about *now*, so the record carries at most one and the coordinator clears
     it the instant preparation succeeds — before the capacity gate runs, which may then put its
-    own reason in the cleared slot. It is written only when it changes, so a stage refusing
-    identically every cycle costs one durable write, not one per tick.
+    own reason in the cleared slot. #405 wrote it only when it changed, so an unchanging refusal
+    cost one durable write rather than one per tick; **issue #406 supersedes that**, because a
+    refusal's *age* is the thing worth knowing and age is only observable if every observation is
+    recorded. A refusal now costs one write per cycle it is observed, carrying its consecutive
+    count and clock together.
   - Refusals publish on their own snapshot key. The live board is a projection of *running*
     records and the pool counts derive from it, so a waiting-and-refused record must never
     appear there.

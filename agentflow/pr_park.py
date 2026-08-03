@@ -151,9 +151,17 @@ def review_park_missing(record) -> str:
     inventing a product choice here is what made a parked review unanswerable (#344). *Which*
     execution failure matters too: a review whose session was cut off at the per-stage turn
     ceiling never got to finish thinking, and wants a different answer from one that thought and
-    ran out of room (#411). The park's own headline stays fixed either way — its post-once proof
-    keys on that. Pure (test surface)."""
-    from agentflow.coordinator.coordinator import ended_at_turn_cap
+    ran out of room (#411). A review that never ran at all is not an execution failure in the
+    first place, and must not be reported as one (#406). The park's own headline stays fixed
+    either way — its post-once proof keys on that. Pure (test surface)."""
+    from agentflow.coordinator.coordinator import ended_at_turn_cap, refused_before_start
+    hold_reason = getattr(record, "hold_reason", None)
+    if refused_before_start(hold_reason):
+        return ("No review verdict was recorded for this exact head, and no session ran at all: "
+                "the private working copy the review needs is pinned open on the machine "
+                "agentflow runs on, so nothing was ever checked out. No attempt was used and no "
+                "budget was drawn down. Do not treat this as a clean review — nothing has looked "
+                "at this change at all.")
     if ended_at_turn_cap(getattr(record, "hold_reason", None)):
         return ("No review verdict was recorded for this exact head: the last review session was "
                 "cut off at its per-stage turn ceiling before it could reach one — it was stopped "
@@ -178,6 +186,8 @@ def park_pr(record) -> str | None:
     crash falls between the two (ADR 0042 Consequences). A Review parks against its whole exact-head chain: any decision that chain recorded and
     no maintainer answered is the decision this park asks about, whichever axis stopped last (#344).
     Live orchestration; exercised with faked GitHub reads in ``tests/test_revise_tracer.py``."""
+    from agentflow.coordinator.coordinator import (refused_before_start,
+                                                   refused_before_start_detail)
     from agentflow.gate import park
     from agentflow.handoff import DurableHandoff, Notification, Subject
     pr = park_pr_number(record)
@@ -185,8 +195,29 @@ def park_pr(record) -> str | None:
         return None
     uncertainty = chain_uncertainty(record)
     wording = None
-    if record.stage == "review" and (uncertainty is not None
-                                     or record.review_axis == "decision"):
+    checks = None
+    if record.stage == "review" and refused_before_start(record.hold_reason):
+        # Checked before the decision branch on purpose: a review that never ran recorded no
+        # decision and reached no verdict, so every other branch's words — a spent budget, a
+        # competing product behavior — would describe work that does not exist (#406).
+        blocker = refused_before_start_detail(record.hold_reason)
+        reason = "has not been looked at at all — the review could not be started"
+        missing = review_park_missing(record)
+        checks = (f"No checks ran, and no review session was started. What is in the way: "
+                  f"{blocker}",)
+        wording = ParkCopy(
+            options=(f"Release the pinned working copy on the machine agentflow runs on, then "
+                     f"resume: `/agentflow review {pr}`.",
+                     "Review this change by hand and decide the PR yourself."),
+            consequences=("Releasing it lets the review this change has never had actually run; "
+                          "judging it by hand leaves this head with no agentflow review at all."),
+            recommendation=("Release the working copy and resume — nothing has judged this "
+                            "change yet, and no attempts were spent finding that out."),
+            next_action=(f"Clear what is named above on the machine agentflow runs on, then run "
+                         f"`/agentflow review {pr}` to review this exact head."))
+        notice = "review could not start — needs your action"
+    elif record.stage == "review" and (uncertainty is not None
+                                       or record.review_axis == "decision"):
         reason = "needs the maintainer to choose between competing product behaviors"
         # A recorded decision prints its own exact wording; this line is what remains when the
         # axis asked for a decision the durable chain no longer holds.
@@ -225,7 +256,7 @@ def park_pr(record) -> str | None:
         action=lambda: park(
             record.repo, pr, None, reason=reason, missing_outcome=missing,
             context=park_context(record, None, reason=reason, missing=missing,
-                                  uncertainty=uncertainty, wording=wording),
+                                  uncertainty=uncertainty, wording=wording, checks=checks),
             proof_marker=marker),
         notification=Notification(
             "agentflow needs you", f"{record.repo} PR #{pr}: {notice}"))

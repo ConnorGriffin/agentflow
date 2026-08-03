@@ -23,6 +23,25 @@ HELD = "held"
 STARTED = "started"
 NOT_STARTED = "not_started"
 
+# --- the preparation-refusal clock (#406) -------------------------------------------------
+# A stage refused *before* launch reserves nothing and consumes no attempt, so exhaustion never
+# calls anyone: one scratch file stalled a review for half an hour with the operator none the
+# wiser (#399). These bounds are how long a refusal a human must clear may go unremarked, and
+# then unactioned. They live beside the fields they read — like the launcher-handshake results
+# above — so the published projection can honor them without importing the coordinator.
+
+#: Two observations further apart than this are not one continuous refusal, so the clock restarts.
+#: Head-of-line ordering can leave a record unoffered for a long while, and unobserved wall time
+#: must never count toward escalating something nobody was watching.
+STALL_OBSERVATION_MAX_GAP = 600
+#: How long a continuously observed, human-clearable refusal runs before it is called stalled —
+#: logged periodically and published — while still costing nothing and retrying every cycle.
+STALL_STALLED_AFTER = 600
+#: And how long before the stage gives up waiting and hands the work to a human.
+STALL_PARK_AFTER = 3600
+#: How often the stalled line reprints while the refusal persists.
+STALL_LOG_EVERY = 600
+
 
 @dataclass
 class Record:
@@ -87,6 +106,18 @@ class Record:
                                          # cause that has since gone away (#405)
     refusal_expected: bool = False       # that refusal is ordinary contention (a live sibling still
                                          # holding a checkout), not something a human should chase
+    refusals: int = 0                    # consecutive cycles something has refused to prepare this
+                                         # record, durable so the periodic breadcrumb survives a
+                                         # daemon restart instead of re-arming at zero (#406);
+                                         # zeroed the moment preparation succeeds
+    stall_refusal_id: str = ""           # the stable typed check id of the human-clearable refusal
+                                         # currently being clocked — the *identifier*, never the
+                                         # mutable detail, so continuity survives a checkout whose
+                                         # live values change under an unchanged cause
+    stall_started_at: int = 0            # when that refusal was first observed continuously
+    stall_last_observed_at: int = 0      # and when it was last observed, so a long gap in
+                                         # observation restarts the clock rather than crediting
+                                         # elapsed time nobody was watching
     verify_miss: str = ""                # the last attempt's first failed verification conjunct
                                          # ("check: live detail") — named in recovery envelopes,
                                          # hold reasons, telemetry, and the park comment, so a
@@ -142,3 +173,16 @@ class Record:
                                          # same effect as the fleet-wide toggle — weekly allowance
                                          # lifted, ceiling raised to 100, pacing cap lifted — but
                                          # scoped to this one record; the permit ledger is untouched
+
+
+def stalled_for(record: Record, now: int) -> int:
+    """How long this record's current human-clearable refusal has been running, in seconds.
+
+    ``0`` when no clock is set — a record nothing is refusing, one whose refusal declared no
+    disposition, or one whose clock the coordinator cleared. Every escalation bound above is
+    read off this one number, so the daemon line, the published projection, and the park can
+    never disagree about how long something has been stuck.
+    """
+    if not record.stall_refusal_id:
+        return 0
+    return max(0, now - record.stall_started_at)

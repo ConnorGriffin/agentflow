@@ -412,10 +412,11 @@ def _refusing_coord(make_coord, answer, *, gate=None, log=None):
                       launcher=NeverStartsLauncher(), log=log or (lambda line: None))
 
 
-def test_an_identical_preparation_refusal_is_written_once_not_every_cycle(make_coord):
+def test_every_observed_refusal_is_recorded_once_counting_how_long_it_has_gone_on(make_coord):
     """A stage that refuses the same way every cycle is the common case — a checkout that will
-    not come up until somebody clears it. Recording that costs one durable write, not one per
-    tick: the second cycle observes nothing new, so it must not advance the record at all."""
+    not come up until somebody clears it. #405 wrote that reason once and then went quiet, which
+    is why nothing could say how long it had been going on across a restart. Each cycle now
+    records the observation itself, exactly once: same reason, one more consecutive refusal."""
     answer = [unprepared("checkout-failed", "git worktree add exited 128")]
     coord = _refusing_coord(make_coord, answer)
     ident = coord.submit_stage(_cold_build())
@@ -424,10 +425,13 @@ def test_an_identical_preparation_refusal_is_written_once_not_every_cycle(make_c
     coord.cycle("claude")
     after_first = record_of(coord, ident)
     assert after_first.refusal == "checkout-failed: git worktree add exited 128"
+    assert after_first.refusals == 1
     assert after_first.revision == submitted + 1
 
     coord.cycle("claude")
-    assert record_of(coord, ident).revision == submitted + 1
+    after_second = record_of(coord, ident)
+    assert after_second.refusals == 2                       # one more observation...
+    assert after_second.revision == submitted + 2           # ...and exactly one more write
 
 
 def test_a_refusal_that_stops_refusing_clears_from_the_record_and_the_board(make_coord):
@@ -613,11 +617,15 @@ def test_the_refusal_fields_default_so_records_written_before_this_change_still_
     assert restored.refusal == "" and restored.refusal_expected is False
 
 
-def test_verification_gained_exactly_one_field():
-    """One result type for both sides of the provider (ADR 0052). Preparation needed one fact
-    verification did not have — whether a refusal is ordinary contention — and nothing else."""
-    assert [f.name for f in fields(Verification)] == ["ok", "check", "detail", "expected"]
+def test_verification_carries_only_the_two_facts_preparation_added():
+    """One result type for both sides of the provider (ADR 0052). Preparation needed two facts
+    verification did not have, both about a refusal's disposition — whether it is ordinary
+    contention, and whether it is one only a human can clear — and nothing else. Neither is set
+    unless a check says so, so an unclassified refusal escalates to nobody."""
+    assert [f.name for f in fields(Verification)] == ["ok", "check", "detail", "expected",
+                                                     "stall"]
     assert Verification(False, "x", "y").expected is False
+    assert Verification(False, "x", "y").stall is False
 
 
 def test_publishing_refusals_leaves_the_running_board_and_pool_counts_untouched(

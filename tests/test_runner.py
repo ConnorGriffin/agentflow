@@ -440,8 +440,12 @@ def test_reuse_refuses_recoverable_work_and_github_uncertainty(tmp_path):
     (detached / "in-progress.txt").write_text("still being written")
 
     with worktree_session(detached):
-        with pytest.raises(subprocess.CalledProcessError):
+        # A live sibling still holds it — refused, and refused *by name*, so the engine can tell
+        # this from a lock nobody but a human will lift (#406).
+        with pytest.raises(runner_mod.CheckoutRefused) as busy:
             runner.prepare_worktree_detached(str(repo), "origin/main", detached)
+    assert busy.value.refusal.check == "checkout-busy"
+    assert busy.value.refusal.expected and not busy.value.refusal.stall
     assert _git(detached, "rev-parse", "HEAD") == detached_head
     assert (detached / "in-progress.txt").read_text() == "still being written"
 
@@ -529,8 +533,13 @@ def test_a_locked_review_checkout_still_refuses_and_is_left_alone(tmp_path):
     _git(repo, "worktree", "lock", str(review))
 
     for _ in range(2):
-        with pytest.raises(subprocess.CalledProcessError):
+        with pytest.raises(runner_mod.CheckoutRefused) as pinned:
             runner.prepare_worktree_detached(str(repo), f"origin/{branch}", review)
+        # Named, and declared human-clearable: this is the one preparation refusal nothing in
+        # the fleet can resolve on its own, which is what earns it an escalation clock (#406).
+        assert pinned.value.refusal.check == "checkout-locked"
+        assert pinned.value.refusal.stall and not pinned.value.refusal.expected
+        assert str(review) in pinned.value.refusal.detail
     assert _git(review, "rev-parse", "HEAD") == parked
     assert (review / "operator-notes.md").read_text() == "why I pinned this"
     assert _git(repo, "for-each-ref", "--format=%(refname)",

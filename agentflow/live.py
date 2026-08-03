@@ -21,6 +21,7 @@ from agentflow.state import state_dir
 STATE_DIR = state_dir()
 LIVE_FILE = STATE_DIR / "live-sessions.json"
 REFUSALS_FILE = STATE_DIR / "refusals.json"
+STALLED_FILE = STATE_DIR / "stalled.json"
 DAEMON_FILE = STATE_DIR / "daemon-status.json"
 SNAPSHOT_FILE = STATE_DIR / "snapshot.json"
 
@@ -77,6 +78,22 @@ def replace_refusals(entries: list[dict]) -> None:
     running, so it must never reach the running rows the pool counts are derived from.
     """
     _write_atomic(REFUSALS_FILE, list(entries))
+
+
+def stalled() -> list[dict]:
+    """Every record stuck long enough on a refusal only a human can clear. `[]` on a missing /
+    partial / corrupt file — nothing stalled reads the same as nothing recorded."""
+    data = _read(STALLED_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def replace_stalled(entries: list[dict]) -> None:
+    """Publish the coordinator's stalled records as the whole stalled projection (#406).
+
+    Its own file for the same reason the refusals have one: these records started nothing and
+    reserve nothing, so they must never reach the running rows the pool counts derive from.
+    """
+    _write_atomic(STALLED_FILE, list(entries))
 
 
 def mark_cycle(poll_seconds: int) -> None:

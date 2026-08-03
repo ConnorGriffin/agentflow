@@ -31,12 +31,15 @@ from agentflow.coordinator.admission import (
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import EndingReason, ProviderCause
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
-from agentflow.coordinator.record import COMPLETED, HELD, RUNNING, WAITING, Record
+from agentflow.coordinator.record import (
+    COMPLETED, HELD, RUNNING, STALL_LOG_EVERY, STALL_OBSERVATION_MAX_GAP, STALL_PARK_AFTER,
+    STALL_STALLED_AFTER, WAITING, Record, stalled_for)
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
-from agentflow.coordinator.verification import VERIFIED, miss_summary, refusal_expected
+from agentflow.coordinator.verification import (
+    VERIFIED, miss_summary, refusal_expected, refusal_stalls)
 from agentflow.review_policy import ReviewState
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
@@ -79,6 +82,38 @@ def parse_permanent_hold_reason(hold_reason: str) -> EndingReason:
         return EndingReason(inner)
     except ValueError:
         return EndingReason.UNSPECIFIED
+
+
+# The durable ``hold_reason`` prefix a stage stamps when it is handed to a human without ever
+# having run (#406). Every other hold describes a session that happened — a spent budget, a
+# failed verification, a permanent provider condition — so a stage handoff that read one of those
+# reasons and composed its usual copy would tell the maintainer about work nobody did. Stage
+# handoffs read this prefix to pick copy that claims nothing.
+REFUSED_BEFORE_START_HOLD_REASON = "refused before start"
+
+
+def refused_before_start_hold_reason(refusal: str) -> str:
+    """The durable ``hold_reason`` for a stage parked on a refusal that never let it start,
+    naming the typed refusal that did it. Stamped before the handoff runs, so a crash-resumed
+    handoff reads the same reason and composes byte-identical copy."""
+    return f"{REFUSED_BEFORE_START_HOLD_REASON} — {refusal}"
+
+
+def refused_before_start(hold_reason: str | None) -> bool:
+    """Whether a durable hold reason says the stage never started at all."""
+    return (hold_reason or "").startswith(REFUSED_BEFORE_START_HOLD_REASON)
+
+
+def refused_before_start_detail(hold_reason: str | None) -> str:
+    """The live values behind a refused-before-start hold, with the check id stripped off.
+
+    The id is for the daemon log and the fleet snapshot; the park comment is for whoever has to
+    go and clear the thing, and a kebab-case check name in front of a plain-English sentence is
+    exactly the jargon that makes a park unreadable at a glance (ADR 0018). A refusal that
+    carried no detail falls back to the whole reason rather than to nothing."""
+    refusal = (hold_reason or "").partition(" — ")[2].strip()
+    _check, separator, detail = refusal.partition(": ")
+    return detail.strip() if separator and detail.strip() else refusal
 
 
 # The durable ``hold_reason`` clause a stage stamps when the attempt that spent its last try was
@@ -203,11 +238,10 @@ class Coordinator:
         # launch — i.e. one found alive after a fresh coordinator reloaded the durable store.
         self._started_here: set[str] = set()
         self._recovered_logged: set[str] = set()
-        # Consecutive unexpected preparation refusals per record identity, so a genuinely stuck
-        # stage (one whose checkout never comes up) keeps a periodic breadcrumb instead of
-        # silently no-op'ing admission every cycle (#399/#405). Process-local, like the rest of
-        # this bookkeeping — a daemon restart re-arms it, and the durable refusal survives anyway.
-        self._prepare_misses: dict[str, int] = {}
+        # When each stalled record last printed its line. Only the *cadence* is process-local —
+        # the elapsed time it reports is durable (#406) — so a restart costs one extra line, not
+        # a lost clock, which is the right side of that trade for something a human must act on.
+        self._stall_logged: dict[str, int] = {}
 
     # --- public interface ---------------------------------------------------------------
 
@@ -581,46 +615,127 @@ class Coordinator:
         record.refusal = summary
         record.refusal_expected = expected
 
-    def _breadcrumb_refusal(self, record: Record, prepared) -> None:
+    @staticmethod
+    def _observe_refusal(record: Record, prepared, now: int) -> None:
+        """Record this cycle's observation of what is refusing ``record`` (#406).
+
+        Two facts advance together, because they answer the same question — how long has this
+        been going on — and splitting them across two durable writes is how they would drift:
+        the consecutive-refusal count behind the periodic breadcrumb, and the clock behind
+        escalation. Both are durable now, so neither re-arms at zero when the daemon restarts.
+
+        The clock only runs for a refusal that declared itself human-clearable *and* names a
+        subject a handoff could actually be posted on. It restarts whenever continuity breaks:
+        a different typed check is a different problem and inherits none of the first one's age,
+        and so is a gap longer than :data:`STALL_OBSERVATION_MAX_GAP`, since head-of-line
+        ordering can leave a record unoffered for an hour and unwatched time is not stuck time.
+        An *expected* refusal (a live sibling still holding a checkout) is the fleet working as
+        intended: it counts toward nothing and clocks nothing. Which refusals are benign, and
+        which are worth a human, is the collaborator's call — never a list of check ids kept here.
+        """
+        if not miss_summary(prepared) or refusal_expected(prepared):
+            record.refusals = 0
+            Coordinator._clear_stall(record)
+            return
+        record.refusals += 1
+        if not refusal_stalls(prepared) or _handoff_subject(record) is None:
+            Coordinator._clear_stall(record)
+            return
+        if (record.stall_refusal_id != prepared.check
+                or now - record.stall_last_observed_at > STALL_OBSERVATION_MAX_GAP):
+            record.stall_refusal_id = prepared.check
+            record.stall_started_at = now
+        record.stall_last_observed_at = now
+
+    @staticmethod
+    def _clear_stall(record: Record) -> None:
+        """Forget the clock entirely. A refusal that changed, cleared, or turned out not to be
+        one a human must clear leaves no elapsed time behind for the next one to inherit."""
+        record.stall_refusal_id = ""
+        record.stall_started_at = 0
+        record.stall_last_observed_at = 0
+
+    def _breadcrumb_refusal(self, record: Record) -> None:
         """Print a stuck preparation periodically — quiet on the first miss, once on the second,
         then every tenth. That cadence is Review's, generalized: a refusal that clears next cycle
         should page nobody, and one that never clears should not print 20 lines a minute either.
+        The count is the record's own, so the cadence survives a restart instead of starting over
+        and re-printing the second line for a refusal that is already hours old (#406)."""
+        if record.refusals >= 2 and (record.refusals - 2) % 10 == 0:
+            self._emit(record, f"unprepared for {record.refusals} consecutive cycles — "
+                               f"{record.refusal}; no permit or attempt consumed; claim retained")
 
-        An *expected* refusal (a live sibling still holding a checkout) neither counts nor prints:
-        it is the fleet working as intended, and the record still publishes it. Which refusals are
-        benign is the collaborator's call, never a list of check ids kept here."""
-        summary = miss_summary(prepared)
-        if not summary or refusal_expected(prepared):
-            self._prepare_misses.pop(record.identity, None)
+    def _log_stalled(self, record: Record, now: int) -> None:
+        """Say, periodically, that a refusal has gone on long enough to want a human — naming the
+        check and the live values it read this cycle. Below the bound this says nothing at all: a
+        checkout that comes back on its own inside ten minutes is not news."""
+        elapsed = stalled_for(record, now)
+        if elapsed < STALL_STALLED_AFTER:
+            self._stall_logged.pop(record.identity, None)
             return
-        misses = self._prepare_misses[record.identity] = \
-            self._prepare_misses.get(record.identity, 0) + 1
-        if misses >= 2 and (misses - 2) % 10 == 0:
-            self._emit(record, f"unprepared for {misses} consecutive cycles — {summary}; "
-                               "no permit or attempt consumed; claim retained")
+        printed = self._stall_logged.get(record.identity)
+        if printed is not None and now - printed < STALL_LOG_EVERY:
+            return
+        self._stall_logged[record.identity] = now
+        self._emit(record, f"stalled for {elapsed // 60} minutes — {record.refusal}; nothing "
+                           f"here clears without a human; no permit, attempt, or budget spent; "
+                           f"handing it over at {STALL_PARK_AFTER // 60} minutes")
 
-    def _admit(self, record: Record, now: int) -> str:
+    def _park_refused(self, record: Record, now: int) -> bool:
+        """Hand a stage that has been refused past every bound to a human, and say so.
+
+        This is the whole point of the clock: to a maintainer, "the machine cannot start this and
+        will not be able to" is the same event as an exhausted budget, and it deserves the same
+        park and the same ping. What it must *not* borrow is the copy — no attempt was made, no
+        permit reserved, no budget drawn — so the durable reason says the stage never started and
+        the stage-native handoff picks its words from that (#406). Returns whether it parked;
+        the record is left ``waiting`` and claim-holding until the handoff proves itself, exactly
+        like every other hold."""
+        elapsed = stalled_for(record, now)
+        if elapsed < STALL_PARK_AFTER:
+            return False
+        record.hold_reason = refused_before_start_hold_reason(record.refusal)
+        if not self._hold(record):
+            return False
+        self._stall_logged.pop(record.identity, None)
+        self._emit(record, f"refused before start for {elapsed // 60} minutes — "
+                           f"{record.refusal}; parking for human; no attempt, permit, or budget "
+                           "spent; claim retained pending durable handoff")
+        return True
+
+    def _admit(self, record: Record, now: int, *, observed: bool = True) -> str:
         """Try to start one attempt. Returns ``unprepared`` (the stage adapter refused before
         admission — no permit, no attempt), ``deferred`` (an issue-bound stage yielded the pool to
         a waiting PR-bound stage — no permit, non-blocking, #293), ``blocked`` (admission/permits
         refused), ``started`` (a provider family exists and an attempt was consumed), or
-        ``not_started`` (admitted but no provider came into existence — no attempt consumed)."""
+        ``not_started`` (admitted but no provider came into existence — no attempt consumed).
+
+        ``observed=False`` marks a *probe* rather than a real turn at the pool — the destination
+        trial a pool move runs, which reverts everything it touched when it does not start. A
+        probe's refusal is nobody's evidence of anything: it must not count toward the breadcrumb
+        or advance a clock, or a stage would escalate on how often it was speculatively tried
+        somewhere it does not live (#406)."""
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
-        # The refusal this cycle observes is compared against the durable one at the end, so a
-        # stage that refuses identically every tick costs one write, not one per cycle (#405).
-        was_refused = (record.refusal, record.refusal_expected)
+        # The state this cycle observes is compared against the durable one at the end, so a
+        # refusal that genuinely changes nothing costs no write (#405).
+        was_refused = _refusal_state(record)
         prepared = self._adapter.prepare(record)
         if not prepared:
             self._note_refusal(record, miss_summary(prepared), refusal_expected(prepared))
-            self._breadcrumb_refusal(record, prepared)
+            if observed:
+                self._observe_refusal(record, prepared, now)
+                self._breadcrumb_refusal(record)
+                if self._park_refused(record, now):
+                    return "unprepared"       # `_hold` already wrote it; nothing more to persist
+                self._log_stalled(record, now)
             # Do not let an unpreparable PR-bound record keep the pool's issue work behind the
             # PR-priority barrier. It owns no permit and gets another preparation attempt next
             # cycle; until then, other useful work may use the idle pool.
             if record.stage in PR_BOUND:
                 record.eligible_at = max(record.eligible_at, now + 1)
                 self._persist(record)
-            elif (record.refusal, record.refusal_expected) != was_refused:
+            elif _refusal_state(record) != was_refused:
                 self._persist(record)
             return "unprepared"
         # Preparation answered yes, so whatever refused it earlier is over — clear it before the
@@ -628,9 +743,12 @@ class Coordinator:
         # publishing the checkout that used to refuse it while capacity is what actually holds it.
         # `_begin_start` may then put its own capacity reason in the cleared slot.
         self._note_refusal(record, "", False)
-        self._prepare_misses.pop(record.identity, None)
+        if observed:
+            record.refusals = 0
+            self._clear_stall(record)
+            self._stall_logged.pop(record.identity, None)
         if not self._begin_start(record, now):
-            if (record.refusal, record.refusal_expected) != was_refused:
+            if _refusal_state(record) != was_refused:
                 self._persist(record)
             # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
             # deliberate yield, not a capacity refusal: it must not block the pool head-of-line, or
@@ -691,7 +809,9 @@ class Coordinator:
         record and it never admits (#273). A move that does not start reverts every moved field, so
         a record that could not reserve is never stranded off its home pool — the refusal included,
         or a failed probe of the destination would leave the home record publishing a
-        destination-specific reason for a move that never happened (#405)."""
+        destination-specific reason for a move that never happened (#405). The probe is admitted
+        unobserved: a speculative trial the record did not ask for is no evidence of it being
+        stuck, so it neither counts toward the breadcrumb nor advances a clock (#406)."""
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
                 record.lineage, record.source, record.refusal, record.refusal_expected)
         record.pool = dest_pool
@@ -704,7 +824,7 @@ class Coordinator:
         if record.stage in LINEAGE_PINNED:
             record.lineage = dest_pool
             record.source = _repool_source(record.source, dest_pool)
-        if self._admit(record, now) != STARTED:
+        if self._admit(record, now, observed=False) != STARTED:
             (record.pool, record.model, record.demand, record.auto_merge_allowed,
              record.lineage, record.source, record.refusal, record.refusal_expected) = home
             record.state = WAITING
@@ -1156,6 +1276,30 @@ def _identity(repo: str, subject: str, stage: str, target: str | None, round: in
     if uncertainty_handoffs:
         parts.append(f"u{uncertainty_handoffs}")
     return "|".join(parts)
+
+
+def _refusal_state(record: Record):
+    """Everything a cycle's observation of a refusal can change on the record. Compared before
+    and after so an observation that genuinely changes nothing costs no durable write, and one
+    that changes anything — the reason, the count, the clock — costs exactly one (#405/#406)."""
+    return (record.refusal, record.refusal_expected, record.refusals,
+            record.stall_refusal_id, record.stall_started_at, record.stall_last_observed_at)
+
+
+def _handoff_subject(record: Record) -> int | None:
+    """The issue or PR number a handoff for this record would be posted on, or ``None``.
+
+    Every stage-native handoff resolves its subject from these two durable fields, and a park
+    that cannot resolve one posts no comment, proves nothing, and leaves the record pending
+    forever with its work invisible. So a record whose subject does not resolve is never clocked
+    toward a park at all: it stays waiting, keeps its claim, and retries, which is the outcome it
+    already had before the clock existed (#406)."""
+    if not record.repo:
+        return None
+    try:
+        return int(record.subject)
+    except (TypeError, ValueError):
+        return None
 
 
 _WORKTREES_MARKER = "/.agentflow/worktrees/"
