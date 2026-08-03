@@ -167,3 +167,165 @@ def test_fleet_recent_landed_merges_sorts_and_bounds():
     result = operator_projection.fleet_recent_landed(repo_views, limit=1)
     assert result == {"recent_landed": [{"repo": "o/b", "number": 2,
                                          "merged_at": "2026-07-15T00:00:00Z"}]}
+
+
+# --- the attention queue (#373) -----------------------------------------------------------
+# The five ruled conditions, decided daemon-side. Every fixture below is shaped exactly like
+# what `dashboard_data.repo_view` and `project()` publish, so these exercise the same rows the
+# console renders.
+
+def _view(repo="o/r", *, profile="reviewed", in_flight=(), held=(), parked=(), ratchet=None):
+    return {"repo": repo, "profile": profile, "in_flight": list(in_flight),
+            "held": list(held), "parked": list(parked),
+            "ratchet": ratchet or {"samples": 0, "correction_rate": 0.0,
+                                   "ready_to_loosen": False}}
+
+
+def _pr(number, title="a change", handed_off_at="2026-07-30T09:00:00Z"):
+    return {"number": number, "title": title, "builder": "claude",
+            "handed_off_at": handed_off_at}
+
+
+def _held(number, state="needs-grilling", since="2026-07-29T09:00:00Z"):
+    return {"number": number, "title": "a fork", "state": state,
+            "reason": "a real fork the pipeline couldn't settle", "since": since}
+
+
+def _parked(number, reason="drop-to-reviewed", since="2026-07-28T09:00:00Z"):
+    return {"number": number, "title": "a stopped build", "reason": reason,
+            "builder": "claude", "reviewer": "codex", "since": since}
+
+
+def _repository(repo="o/r", status="fresh", error=None):
+    return {"name_with_owner": repo, "url": f"https://github.com/{repo}",
+            "github": {"status": status, "error": error}}
+
+
+def test_attention_orders_the_five_conditions_by_their_ruled_priority():
+    result = operator_projection.attention(
+        [_view(in_flight=[_pr(20)], held=[_held(10)], parked=[_parked(30)],
+               ratchet={"samples": 12, "correction_rate": 0.05, "ready_to_loosen": True})],
+        [_repository(status="stale")])
+    assert [row["condition"] for row in result["rows"]] == [
+        "awaiting-merge", "waiting-on-reply", "parked-build", "ready-to-loosen", "stale-data"]
+    assert [row["kind"] for row in result["rows"]] == [
+        "Merge", "Held", "Parked", "Trust", "Projection"]
+    assert result["total"] == 5
+
+
+def test_awaiting_merge_ranks_by_repository_profile_alone_then_by_the_longest_wait():
+    """A same-tool summary reading 'maintainer merge required' is the ordinary fallback when the
+    cross-tool pool has no headroom, so it never discriminates a condition — the profile does,
+    and an `autonomous` hand-off still earns its row, ranked last of the three."""
+    result = operator_projection.attention([
+        _view("o/auto", profile="autonomous", in_flight=[_pr(1)]),
+        _view("o/rev", profile="reviewed",
+              in_flight=[_pr(2, handed_off_at="2026-07-30T11:00:00Z"),
+                         _pr(3, handed_off_at="2026-07-30T08:00:00Z")]),
+        _view("o/guard", profile="guarded", in_flight=[_pr(4)]),
+    ], [])
+    assert [(row["repo"], row["number"]) for row in result["rows"]] == [
+        ("o/guard", 4), ("o/rev", 3), ("o/rev", 2), ("o/auto", 1)]
+
+
+def test_normal_in_flight_work_the_engine_still_holds_never_reaches_the_queue():
+    result = operator_projection.attention(
+        [_view(profile="autonomous", in_flight=[_pr(20, handed_off_at=None)]),
+         _view("o/other", in_flight=[_pr(21, handed_off_at=None)])], [])
+    assert result == {"rows": [], "total": 0}
+
+
+def test_a_rebased_ready_pr_keeps_its_awaiting_merge_row():
+    """The daemon re-rebases and force-pushes open PRs when main advances, moving the head off
+    the commit the summary recorded. The PR is still the operator's to merge."""
+    result = operator_projection.attention([_view(in_flight=[_pr(20)])], [])
+    assert [row["number"] for row in result["rows"]] == [20]
+
+
+def test_a_parked_pr_carrying_a_live_summary_collapses_to_the_parked_row_alone():
+    """Both reachable duplicates: an unanswered maintainer comment on a merge-ready PR, and a
+    conflict park posted over a summary nothing retired. One operator action per thing."""
+    question = operator_projection.attention(
+        [_view(in_flight=[_pr(20)], parked=[_parked(20, reason="open-question")])], [])
+    assert [(r["condition"], r["number"]) for r in question["rows"]] == [("parked-build", 20)]
+    assert question["total"] == 1
+    conflict = operator_projection.attention(
+        [_view(in_flight=[_pr(21)], parked=[_parked(21, reason="failed-merge")])], [])
+    assert [(r["condition"], r["number"]) for r in conflict["rows"]] == [("parked-build", 21)]
+
+
+def test_park_reasons_say_what_is_true_of_the_pr_not_what_the_bucket_is_named():
+    result = operator_projection.attention([
+        _view(parked=[_parked(30, reason="open-question"),
+                      _parked(31, reason="drop-to-reviewed")])], [])
+    reasons = {row["number"]: row["detail"] for row in result["rows"]}
+    assert reasons[30] == "r · your comment on this PR has not been answered"
+    assert "stopped the build" not in reasons[30]
+    assert reasons[31] == "r · the pipeline stopped and left a decision on the PR"
+    assert "drop autonomy" not in reasons[31]
+
+
+def test_held_issues_rank_needs_grilling_before_needs_mockup():
+    result = operator_projection.attention([
+        _view(held=[_held(11, state="needs-mockup", since="2026-07-01T00:00:00Z"),
+                    _held(10, state="needs-grilling", since="2026-07-29T00:00:00Z")])], [])
+    assert [row["number"] for row in result["rows"]] == [10, 11]
+
+
+def test_a_repository_already_at_the_top_of_the_ladder_never_prompts_a_loosen():
+    ready = {"samples": 20, "correction_rate": 0.02, "ready_to_loosen": True}
+    result = operator_projection.attention([
+        _view("o/auto", profile="autonomous", ratchet=ready),
+        _view("o/rev", profile="reviewed", ratchet=ready)], [])
+    assert [(row["repo"], row["kind"]) for row in result["rows"]] == [("o/rev", "Trust")]
+    assert result["rows"][0]["detail"] == "20 decisions · 2% corrected"
+
+
+def test_stale_and_never_loaded_repositories_each_earn_one_row_and_a_fresh_one_none():
+    result = operator_projection.attention([], [
+        _repository("o/alpha", status="unavailable"),
+        _repository("o/beta", status="fresh"),
+        _repository("o/gamma", status="stale"),
+    ])
+    assert [(row["repo"], row["title"]) for row in result["rows"]] == [
+        ("o/alpha", "alpha briefing data has never loaded"),
+        ("o/gamma", "gamma briefing data is stale")]
+
+
+def test_a_repository_the_daemons_own_refresh_skipped_names_the_daemon_not_github():
+    result = operator_projection.attention([], [
+        _repository(status="stale", error="point budget reached this heartbeat")])
+    assert result["rows"][0]["detail"] == (
+        "the daemon's own bounded refresh did not reach this repository this cycle")
+    failed = operator_projection.attention([], [
+        _repository(status="stale", error="the map read failed")])
+    assert failed["rows"][0]["detail"] == "the last read of this repository failed"
+
+
+def test_every_row_carries_an_authoritative_github_url_for_acting_on_it():
+    result = operator_projection.attention(
+        [_view(in_flight=[_pr(20)], held=[_held(10)], parked=[_parked(30)],
+               ratchet={"samples": 12, "correction_rate": 0.05, "ready_to_loosen": True})],
+        [_repository("o/s", status="stale")])
+    assert [row["url"] for row in result["rows"]] == [
+        "https://github.com/o/r/pull/20",
+        "https://github.com/o/r/issues/10",
+        "https://github.com/o/r/pull/30",
+        "https://github.com/o/r",
+        "https://github.com/o/s"]
+
+
+def test_the_queue_is_bounded_fleet_wide_and_still_reports_its_true_total():
+    views = [_view(f"o/r{index:02d}", held=[_held(index)]) for index in range(30)]
+    result = operator_projection.attention(views, [])
+    assert len(result["rows"]) == operator_projection.ATTENTION_LIMIT == 25
+    assert result["total"] == 30
+
+
+def test_the_order_never_depends_on_the_order_repositories_were_walked():
+    views = [_view("o/b", held=[_held(2, since="2026-07-29T00:00:00Z")]),
+             _view("o/a", held=[_held(1, since="2026-07-29T00:00:00Z")])]
+    forward = operator_projection.attention(views, [])
+    backward = operator_projection.attention(list(reversed(views)), [])
+    assert forward == backward
+    assert [row["repo"] for row in forward["rows"]] == ["o/a", "o/b"]

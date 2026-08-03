@@ -583,6 +583,36 @@ def test_clean_summary_at_a_new_head_preserves_and_retires_the_old_evidence(monk
     assert len(posts) == 1 and "sha-b" in posts[0]
 
 
+def test_live_clean_review_reads_the_hand_off_and_stops_reading_it_once_retired():
+    """"Finished, it's yours" is the current summary and nothing else: a retired one is rewritten
+    in place, so it stops counting without a second fact to keep in step."""
+    marker = "<!-- agentflow-clean-review-summary -->"
+    retired = "<!-- agentflow-superseded-review-summary -->"
+    live = [{"body": "a build note", "createdAt": "2026-07-30T08:00:00Z"},
+            {"body": f"> *agentflow: clean review.*\n{marker}\n\nOutcome: clean.",
+             "createdAt": "2026-07-30T09:00:00Z"}]
+    assert gate.live_clean_review(live)["createdAt"] == "2026-07-30T09:00:00Z"
+    taken_back = [{"body": f"{retired}\n\nOutcome: clean.", "createdAt": "2026-07-30T09:00:00Z"}]
+    assert gate.live_clean_review(taken_back) is None
+    assert gate.live_clean_review([]) is None
+
+
+def test_supersede_clean_review_retires_the_hand_off_and_keeps_its_evidence(monkeypatch):
+    marker = "<!-- agentflow-clean-review-summary -->"
+    comments = [github.Comment(body=f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->",
+                               created_at="", id="clean")]
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr(gate.github, "edit_comment", lambda comment_id, body:
+                        comments.__setitem__(0, github.Comment(body, "", id=comment_id)) or True)
+    monkeypatch.setattr(gate.github, "pr_comment",
+                        lambda *_args: pytest.fail("retiring a summary posts nothing"))
+
+    assert gate.supersede_clean_review("o/r", 9) is True
+    assert "agentflow-superseded-review-summary" in comments[0].body
+    assert "sha-a" in comments[0].body
+    assert gate.live_clean_review([{"body": comments[0].body}]) is None
+
+
 def test_park_retires_the_current_clean_summary_before_posting(monkeypatch):
     marker = "<!-- agentflow-clean-review-summary -->"
     comments = [github.Comment(body=f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->",

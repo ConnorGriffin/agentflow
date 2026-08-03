@@ -41,6 +41,14 @@ const SNAP = {
     },
   ],
   fleet: { recent_landed: [] },
+  attention: {
+    rows: [
+      { condition: 'awaiting-merge', kind: 'Merge', repo: 'o/r', number: 20,
+        title: '#20 awaiting merge', detail: 'r · reviewed · the review finished — yours to merge',
+        url: 'https://github.com/o/r/pull/20' },
+    ],
+    total: 1,
+  },
 };
 
 beforeEach(() => vi.useFakeTimers({ now: new Date('2026-07-30T12:00:00Z') }));
@@ -73,6 +81,35 @@ describe('Briefing.svelte — typical state', () => {
   });
 });
 
+describe('Briefing.svelte — the attention queue', () => {
+  const row = (over) => ({ condition: 'parked-build', kind: 'Parked', repo: 'o/r', number: 30,
+    title: '#30 a stopped build', detail: 'r · a reason', url: 'https://github.com/o/r/pull/30',
+    ...over });
+
+  it('renders every published row in the published order, ranking nothing itself', () => {
+    const rows = [row({ kind: 'Merge', number: 20 }), row({ number: 30 }),
+                  row({ kind: 'Projection', number: null, title: 'r briefing data is stale' })];
+    const { container } = render(Briefing, { snap: { ...SNAP, attention: { rows, total: 3 } } });
+    const kinds = [...container.querySelectorAll('.attention .kind')].map((k) => k.textContent);
+    expect(kinds).toEqual(['Merge', 'Parked', 'Projection']);
+  });
+
+  it('reports the daemon\'s true total when the queue truncated, never the rows on the page', () => {
+    const rows = Array.from({ length: 25 }, (_, i) => row({ number: i + 1 }));
+    const { container } = render(Briefing, { snap: { ...SNAP, attention: { rows, total: 31 } } });
+    expect(container.querySelector('.count').textContent).toBe('31 items');
+    expect(screen.getByText('6 more operator actions not shown')).toBeTruthy();
+    /* One final ruled row in the section's own treatment — not a new element. */
+    expect(container.querySelectorAll('.rows .attention')).toHaveLength(26);
+  });
+
+  it('shows no overflow row when the whole queue fits', () => {
+    const { container } = render(Briefing, { snap: SNAP });
+    expect(container.querySelector('.count').textContent).toBe('1 item');
+    expect(screen.queryByText(/more operator actions not shown/)).toBeNull();
+  });
+});
+
 describe('Briefing.svelte — stale state', () => {
   it('renders the honest stale banner and withholds the frontier claim', () => {
     const stale = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
@@ -80,6 +117,23 @@ describe('Briefing.svelte — stale state', () => {
     const { container } = render(Briefing, { snap: stale });
     expect(screen.getByRole('status').textContent).toMatch(/not refreshed/);
     expect(container.querySelector('.frontier').textContent).toContain('Not verified');
+  });
+
+  it('keeps the fleet-wide banner alongside the per-repository row that names it', () => {
+    /* The banner is posture; the row is the action, with a link. They pair, never collapse. */
+    const stale = {
+      ...SNAP,
+      repositories: [{ ...SNAP.repositories[0], github: { status: 'stale' } }],
+      attention: { rows: [{ condition: 'stale-data', kind: 'Projection', repo: 'o/r',
+        number: null, title: 'r briefing data is stale',
+        detail: 'the last read of this repository failed',
+        url: 'https://github.com/o/r' }], total: 1 },
+    };
+    render(Briefing, { snap: stale });
+    expect(screen.getByRole('status')).toBeTruthy();
+    expect(screen.getByText('r briefing data is stale')).toBeTruthy();
+    expect(screen.getByRole('link', { name: /Open in GitHub/ }).getAttribute('href'))
+      .toBe('https://github.com/o/r');
   });
 });
 

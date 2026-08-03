@@ -162,7 +162,10 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
     Composes the existing v1 snapshot with the additive schema-v2 Decision Map projection
     (ADR 0036) — the map read runs every tick, including dormant, since it is not gated by
     dispatch. `previous_snapshot` lets the projection preserve last-verified per-repository
-    map data across a failed or budget-skipped read rather than inventing an empty one."""
+    map data across a failed or budget-skipped read rather than inventing an empty one.
+
+    The attention queue composes here because it needs facts from both halves — the open PRs,
+    held issues and trust ratchets from v1, each repository's freshness stamp from v2."""
     try:
         from agentflow import operator_projection
         v1 = produce(repos, dispatch_enabled=ENABLE_FLAG.exists())
@@ -170,7 +173,9 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
         v2 = operator_projection.project(
             repos, previous_snapshot=previous, heartbeat_seconds=FULL_PASS_SECONDS)
         merged = {**v1, **v2,
-                  "fleet": operator_projection.fleet_recent_landed(v1.get("repos") or [])}
+                  "fleet": operator_projection.fleet_recent_landed(v1.get("repos") or []),
+                  "attention": operator_projection.attention(
+                      v1.get("repos") or [], v2.get("repositories") or [])}
         live.write_snapshot(merged)
     except Exception as e:  # noqa: BLE001 — a bad publish must not kill the daemon
         _log(f"snapshot publish error: {type(e).__name__}: {e}")

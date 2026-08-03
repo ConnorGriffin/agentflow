@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from agentflow import github, live, ratchet
 from agentflow.balancer import _claude_dispatch_status, _codex_dispatch_status, _query_pool
-from agentflow.gate import reply_pending
+from agentflow.gate import live_clean_review, reply_pending
 from agentflow.labels import HELD_LABELS
 from agentflow.loop import _CONFLICT_MARK, RepoConfig
 from agentflow.prompts import UI_GAP_REASON
@@ -232,6 +232,15 @@ def _park_since(comments: list[dict]) -> str | None:
     return None
 
 
+def _handed_off_at(comments: list[dict]) -> str | None:
+    """When the engine finished with this PR and handed it to you — the timestamp of the
+    clean-review summary it has not retired, or ``None`` when it carries no live one. Unlike
+    the two `since` clocks, this one is a true wait-start: nothing resets it but the engine
+    taking the PR back."""
+    summary = live_clean_review(comments)
+    return summary.get("createdAt") if summary is not None else None
+
+
 def _held_issues(repo: str) -> list[dict]:
     """Open issues the pipeline is holding for you — labeled needs-grilling / needs-mockup
     (no builder touches a held issue). `since` is the issue's last activity."""
@@ -247,34 +256,40 @@ def _held_issues(repo: str) -> list[dict]:
     return out
 
 
-def _parked_prs(repo: str) -> list[dict]:
-    """Open agentflow PRs parked for a human — found by the park markers the pipeline
-    already posted, then classified into one reason (never by re-running the pipeline)."""
+def _open_prs(repo: str) -> list[dict]:
+    """Every open agentflow PR, with the two facts one read of its comments settles: whether the
+    pipeline parked it for a human (and since when), and — when the engine posted a clean-review
+    summary it has not retired — when it handed the PR over as finished.
+
+    Both are read off the markers the pipeline already posted, never by re-running it. A `gh` blip
+    reads as 'unknown' for both: such a PR is never classified not-parked, and never prompts a
+    merge nobody can vouch for."""
     out = []
     for p in _prs(repo, "open"):
         comments = github.pr_comment_rows(repo, p.number)
-        if comments is None:  # a `gh` blip reads as 'unknown', not 'not parked'
-            continue
-        reason = park_reason(comments)
-        if reason is None:
-            continue
         builder = pr_stage(p.head_ref_name)
-        out.append({"number": p.number, "title": p.title, "reason": reason,
+        out.append({"number": p.number, "title": p.title,
                     "builder": builder, "reviewer": _reviewer_of(builder),
-                    "since": _park_since(comments)})
+                    "reason": None if comments is None else park_reason(comments),
+                    "since": None if comments is None else _park_since(comments),
+                    "handed_off_at": (None if comments is None
+                                      else _handed_off_at(comments))})
     return out
 
 
 def repo_view(cfg: RepoConfig) -> dict:
+    open_prs = _open_prs(cfg.repo)
     return {
         "repo": cfg.repo,
         "profile": repo_profile(cfg.workdir),
         "ready": _ready_issues(cfg.repo),
         "held": _held_issues(cfg.repo),
-        "in_flight": [{"number": p.number, "title": p.title,
-                       "builder": pr_stage(p.head_ref_name)}
-                      for p in _prs(cfg.repo, "open")],
-        "parked": _parked_prs(cfg.repo),
+        "in_flight": [{"number": p["number"], "title": p["title"], "builder": p["builder"],
+                       "handed_off_at": p["handed_off_at"]}
+                      for p in open_prs],
+        "parked": [{"number": p["number"], "title": p["title"], "reason": p["reason"],
+                    "builder": p["builder"], "reviewer": p["reviewer"], "since": p["since"]}
+                   for p in open_prs if p["reason"] is not None],
         "recent_merges": [{"number": p.number, "title": p.title,
                            "merged_at": p.merged_at,
                            "url": github.pr_url(cfg.repo, p.number)}

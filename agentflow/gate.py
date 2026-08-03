@@ -412,6 +412,31 @@ def _supersede_summary(comment: github.Comment) -> bool:
         comment.body.replace(_CLEAN_REVIEW_MARKER, _SUPERSEDED_REVIEW_MARKER, 1))
 
 
+def live_clean_review(comments: list[dict]) -> dict | None:
+    """This PR's current clean-review summary — the engine's own "finished, it's yours" hand-off
+    — or ``None`` when it carries none. Pure (test surface).
+
+    Retiring a summary rewrites its marker in place (:func:`_supersede_summary`), so a PR the
+    engine has taken back stops reading as handed off with no second fact to keep in step. Takes
+    GitHub's own comment rows, the shape the snapshot's park classifier already holds; the caller
+    reads whatever it needs off the row it gets back."""
+    return next((comment for comment in comments
+                 if _CLEAN_REVIEW_MARKER in comment.get("body", "")), None)
+
+
+def supersede_clean_review(repo: str, pr_number: int) -> bool:
+    """Retire this PR's current clean-review summary because the engine is taking the PR back.
+
+    The same in-place rewrite :func:`park` already performs — evidence preserved, the hand-off
+    retired — so a PR under a freshly opened conflict Revise or re-review stops reading as
+    finished and yours to merge."""
+    comments = github.pr_comments(repo, pr_number)
+    if comments is None:
+        return False
+    return all(_supersede_summary(comment) for comment in comments
+               if _CLEAN_REVIEW_MARKER in comment.body)
+
+
 def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict,
                               reviewed_head: str) -> bool:
     """Publish and prove exactly one current final summary after a clean review chain."""

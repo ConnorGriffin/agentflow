@@ -653,7 +653,11 @@ def test_publish_snapshot_composes_v1_and_schema_v2(tmp_path, monkeypatch):
     monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
 
     v1 = {"dispatch": {"enabled": True}, "daemon": {"gh_fresh_at": "2026-07-30T00:00:00+00:00"},
-          "pools": [], "running": [], "repos": [{"repo": "owner/a", "recent_merges": []}]}
+          "pools": [], "running": [], "repos": [
+              {"repo": "owner/a", "profile": "reviewed", "recent_merges": [], "held": [],
+               "parked": [], "ratchet": {"ready_to_loosen": False},
+               "in_flight": [{"number": 7, "title": "a change", "builder": "claude",
+                              "handed_off_at": "2026-07-29T00:00:00Z"}]}]}
     daemon.publish_snapshot([A], produce=lambda repos, dispatch_enabled: v1)
 
     published = live.read_snapshot()
@@ -661,6 +665,10 @@ def test_publish_snapshot_composes_v1_and_schema_v2(tmp_path, monkeypatch):
     assert published["schema_version"] == 2
     assert [r["name_with_owner"] for r in published["repositories"]] == ["owner/a"]
     assert published["fleet"] == {"recent_landed": []}
+    # The attention queue needs facts from both halves — the open PR from v1, each
+    # repository's freshness stamp from v2 — so it composes here (#373).
+    assert published["attention"]["total"] == 1
+    assert published["attention"]["rows"][0]["url"] == "https://github.com/owner/a/pull/7"
 
 
 def test_publish_snapshot_skips_the_whole_publish_on_error(tmp_path, monkeypatch, capsys):

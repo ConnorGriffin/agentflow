@@ -53,6 +53,20 @@ const SNAP = {
     },
   ],
   fleet: { recent_landed: [] },
+  /* The daemon decides the whole attention queue (#373): the five ruled conditions, already
+     ordered, already worded, already bounded, with the true total the bound was taken from. */
+  attention: {
+    rows: [
+      { condition: 'awaiting-merge', kind: 'Merge', repo: 'o/r', number: 20,
+        title: '#20 awaiting merge', detail: 'r · reviewed · the review finished — yours to merge',
+        url: 'https://github.com/o/r/pull/20' },
+      { condition: 'waiting-on-reply', kind: 'Held', repo: 'o/r', number: 10,
+        title: '#10 needs a call',
+        detail: 'r · needs grilling · a real fork the pipeline could not settle',
+        url: 'https://github.com/o/r/issues/10' },
+    ],
+    total: 2,
+  },
 };
 
 beforeEach(() => vi.useFakeTimers({ now: new Date('2026-07-30T12:00:00Z') }));
@@ -81,16 +95,32 @@ describe('deriveFreshness', () => {
 });
 
 describe('deriveAttention', () => {
-  const items = deriveAttention(SNAP);
-
-  it('ranks the held issue and in-flight merge, each with a real GitHub link', () => {
-    expect(items.map((i) => i.kind)).toEqual(['Merge', 'Held']);
-    expect(items[0].url).toBe('https://github.com/o/r/pull/20');
-    expect(items[1].url).toBe('https://github.com/o/r/issues/10');
+  it('renders the daemon-published rows as given, with its pre-bound total', () => {
+    const attention = deriveAttention(SNAP);
+    expect(attention.rows).toBe(SNAP.attention.rows);
+    expect(attention.total).toBe(2);
+    expect(attention.overflow).toBe(0);
   });
 
-  it('never invents an attention item beyond what v1 already computed', () => {
-    expect(deriveAttention({ repos: [] })).toEqual([]);
+  it('never re-ranks, re-filters or re-collapses what the daemon decided', () => {
+    /* Deliberately out of priority order and holding a PR the browser used to list as
+       awaiting merge: whatever the daemon published is what the page shows. */
+    const published = {
+      ...SNAP,
+      repos: [{ ...SNAP.repos[0], in_flight: [{ number: 99, title: 'still building' }] }],
+      attention: { rows: [SNAP.attention.rows[1], SNAP.attention.rows[0]], total: 2 },
+    };
+    expect(deriveAttention(published).rows.map((r) => r.number)).toEqual([10, 20]);
+  });
+
+  it('reads the overflow as the difference between the true total and what it was handed', () => {
+    const truncated = { ...SNAP, attention: { rows: SNAP.attention.rows, total: 31 } };
+    expect(deriveAttention(truncated).overflow).toBe(29);
+    expect(deriveAttention(truncated).total).toBe(31);
+  });
+
+  it('reads a snapshot with no attention queue at all as honestly empty', () => {
+    expect(deriveAttention({ repos: [] })).toEqual({ rows: [], total: 0, overflow: 0 });
   });
 });
 
@@ -227,6 +257,7 @@ describe('deriveBriefing — the whole shape', () => {
     expect(Object.keys(b).sort()).toEqual(
       ['attention', 'capacity', 'fleet', 'freshness', 'maps'].sort());
     expect(b.maps).toHaveLength(1);
-    expect(b.attention).toHaveLength(2);
+    expect(b.attention.rows).toHaveLength(2);
+    expect(b.attention.total).toBe(2);
   });
 });

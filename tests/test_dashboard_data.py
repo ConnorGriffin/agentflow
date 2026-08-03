@@ -135,6 +135,37 @@ def test_repo_view_derives_held_and_parked(monkeypatch):
     assert parked[23]["since"] == "2026-07-13T06:00:00Z"
 
 
+_CLEAN_SUMMARY = ("> *agentflow: clean review.*\n<!-- agentflow-clean-review-summary -->\n\n"
+                  "Outcome: clean.")
+
+
+def test_repo_view_stamps_when_the_engine_handed_each_pr_over(monkeypatch):
+    """The engine's own "finished, it's yours" marker and its timestamp, off the one comment read
+    that already classifies parks. A PR still being built carries no stamp."""
+    _patch(monkeypatch)
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, n: {
+        24: [{"body": _CLEAN_SUMMARY, "createdAt": "2026-07-13T05:00:00Z"}],
+    }.get(n, _COMMENTS.get(n, [])))
+    from types import SimpleNamespace
+    view = dd.repo_view(SimpleNamespace(repo="o/app", workdir="/tmp/app"))
+
+    stamps = {p["number"]: p["handed_off_at"] for p in view["in_flight"]}
+    assert stamps[24] == "2026-07-13T05:00:00Z"
+    assert stamps[20] is None and stamps[22] is None
+
+
+def test_a_pr_whose_comments_could_not_be_read_never_reads_as_handed_over(monkeypatch):
+    """A `gh` blip reads as 'unknown' for both facts: the PR is not classified not-parked, and it
+    never prompts a merge nobody can vouch for."""
+    _patch(monkeypatch)
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, n: None)
+    from types import SimpleNamespace
+    view = dd.repo_view(SimpleNamespace(repo="o/app", workdir="/tmp/app"))
+
+    assert view["parked"] == []
+    assert all(p["handed_off_at"] is None for p in view["in_flight"])
+
+
 def test_held_and_parked_leave_when_resolved(monkeypatch):
     # Label removed → no held issues; every PR merged/closed → nothing open to park.
     _patch(monkeypatch, held={})

@@ -22,6 +22,8 @@ WORKFLOW_FLOOR = 1000
 
 FLEET_RECENT_LANDED_LIMIT = 20
 
+ATTENTION_LIMIT = 25
+
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
@@ -170,3 +172,125 @@ def fleet_recent_landed(repo_views: list[dict], *, limit: int = FLEET_RECENT_LAN
     ]
     merged.sort(key=lambda row: row.get("merged_at") or "", reverse=True)
     return {"recent_landed": merged[:limit]}
+
+
+# --- the operator's attention queue (#373) -------------------------------------------------
+# The five ruled conditions, in their contract priority order. The kind label on each row is the
+# locked surface's own; `Projection` is the kind its locked incomplete state already uses.
+_CONDITIONS = ("awaiting-merge", "waiting-on-reply", "parked-build", "ready-to-loosen",
+               "stale-data")
+
+# Condition 1's sub-kind is the repository profile alone — the same-tool summary that reads
+# "maintainer merge required" is the ordinary fallback when the cross-tool pool has no headroom,
+# so its wording never discriminates a condition; the profile does.
+_PROFILE_ORDER = {"guarded": 0, "reviewed": 1, "autonomous": 2}
+_HELD_ORDER = {"needs-grilling": 0, "needs-mockup": 1}
+
+# Why a parked build is waiting, in the operator's own terms. `open-question` is a comment
+# classification, not a pipeline park — an unanswered comment of yours on an otherwise
+# merge-ready PR lands here, and saying a question "stopped the build" would be false.
+# `drop-to-reviewed` is the catch-all that also receives unresolved review actions, non-clean
+# verdicts, red checks and budget exhaustion, so it names the stop, not a wish to drop autonomy;
+# the park comment on the PR states the specific reason.
+_PARK_REASON = {
+    "open-question": "your comment on this PR has not been answered",
+    "failed-merge": "the merge failed — it needs a retry or a fix",
+    "ui-evidence": "a UI change with no screenshot evidence",
+    "drop-to-reviewed": "the pipeline stopped and left a decision on the PR",
+}
+
+# Why a repository's briefing data is not current — the cause the freshness stamp already
+# recorded, so a row never implies GitHub is at fault when the daemon's own bounded refresh is.
+_FRESHNESS_REASON = {
+    "point budget reached this heartbeat":
+        "the daemon's own bounded refresh did not reach this repository this cycle",
+    "the map read failed": "the last read of this repository failed",
+}
+_FRESHNESS_FALLBACK = {
+    "stale": "this repository has not refreshed within two heartbeats",
+    "unavailable": "no read of this repository has ever completed",
+}
+
+
+def _short(repo: str) -> str:
+    return repo.rsplit("/", 1)[-1]
+
+
+def attention(repo_views: list[dict], repositories: list[dict], *,
+              limit: int = ATTENTION_LIMIT) -> dict:
+    """The whole operator attention queue: the five ruled conditions, each underlying thing
+    exactly once, in one total order, bounded — plus the true total the bound was taken from.
+
+    Pure, and the only place the queue is decided (#373). Every fact is one the daemon has
+    already read: the v1 repository views carry each open PR's hand-off stamp and park
+    classification, the held issues and the trust ratchet; the schema-v2 entries carry the
+    freshness stamp. The page renders these rows as given — it ranks, filters and collapses
+    nothing, and shows the overflow as the difference between the total and what it was handed.
+
+    A row's clock is least-recently-touched-first where one exists (the hand-off stamp for a
+    merge, the existing ``since`` for a held issue or a park); conditions with no clock fall
+    straight through to repository name. Repository name then item number is the tiebreak
+    throughout, so the order never depends on which order repositories happened to be walked."""
+    rows: list[tuple[tuple, dict]] = []
+
+    def add(priority: int, sub: int, clock: str | None, repo: str, number: int | None,
+            *, kind: str, title: str, detail: str, url: str) -> None:
+        rows.append(((priority, sub, clock or "", repo.lower(), repo, number or 0),
+                     {"condition": _CONDITIONS[priority], "kind": kind, "repo": repo,
+                      "number": number, "title": title, "detail": detail, "url": url}))
+
+    for view in repo_views or []:
+        repo = view.get("repo") or ""
+        profile = view.get("profile") or ""
+        # One operator action per underlying thing: a parked PR is a parked build, never also
+        # an awaiting-merge row, however finished the engine's own summary says it is.
+        parked_numbers = {p.get("number") for p in view.get("parked") or []}
+
+        for pr in view.get("in_flight") or []:
+            handed_off_at = pr.get("handed_off_at")
+            if handed_off_at is None or pr.get("number") in parked_numbers:
+                continue
+            add(0, _PROFILE_ORDER.get(profile, len(_PROFILE_ORDER)), handed_off_at,
+                repo, pr.get("number"), kind="Merge",
+                title=f"#{pr.get('number')} {pr.get('title')}",
+                detail=f"{_short(repo)} · {profile} · the review finished — yours to merge",
+                url=github.pr_url(repo, pr.get("number")))
+
+        for held in view.get("held") or []:
+            state = held.get("state") or ""
+            add(1, _HELD_ORDER.get(state, len(_HELD_ORDER)), held.get("since"),
+                repo, held.get("number"), kind="Held",
+                title=f"#{held.get('number')} {held.get('title')}",
+                detail=f"{_short(repo)} · {state.replace('-', ' ')} · {held.get('reason') or ''}",
+                url=f"https://github.com/{repo}/issues/{held.get('number')}")
+
+        for park in view.get("parked") or []:
+            reason = park.get("reason") or ""
+            add(2, 0, park.get("since"), repo, park.get("number"), kind="Parked",
+                title=f"#{park.get('number')} {park.get('title')}",
+                detail=f"{_short(repo)} · {_PARK_REASON.get(reason, reason)}",
+                url=github.pr_url(repo, park.get("number")))
+
+        ratchet = view.get("ratchet") or {}
+        # A repository at the top of the ladder has nothing left to loosen, so it never prompts.
+        if ratchet.get("ready_to_loosen") and profile != "autonomous":
+            samples = ratchet.get("samples") or 0
+            rate = round((ratchet.get("correction_rate") or 0) * 100)
+            add(3, 0, None, repo, None, kind="Trust",
+                title=f"{_short(repo)} is ready to loosen",
+                detail=f"{samples} decisions · {rate}% corrected", url=_repo_url(repo))
+
+    for entry in repositories or []:
+        status = (entry.get("github") or {}).get("status")
+        if status not in _FRESHNESS_FALLBACK:
+            continue
+        repo = entry.get("name_with_owner") or ""
+        error = (entry.get("github") or {}).get("error")
+        add(4, 0, None, repo, None, kind="Projection",
+            title=(f"{_short(repo)} briefing data is stale" if status == "stale"
+                   else f"{_short(repo)} briefing data has never loaded"),
+            detail=_FRESHNESS_REASON.get(error) or _FRESHNESS_FALLBACK[status],
+            url=_repo_url(repo))
+
+    rows.sort(key=lambda row: row[0])
+    return {"rows": [row for _key, row in rows[:limit]], "total": len(rows)}
