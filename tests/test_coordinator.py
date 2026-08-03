@@ -33,6 +33,48 @@ def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):
         ADMISSION_MATRIX[("review", "claude", "opus", "deep", None)] = 0
 
 
+@pytest.mark.parametrize("stage,pool,model,complexity,demand", (
+    ("intake", "claude", "opus", "deep", 1),
+    ("intake", "codex", "sol", "deep", 1),
+    ("attack", "claude", "opus", "deep", 1),
+    ("attack", "claude", "sonnet", "standard", 1),
+    ("attack", "codex", "sol", "deep", 1),
+    ("attack", "codex", "terra", "standard", 1),
+    ("review", "claude", "opus", "deep", 1),
+    ("review", "codex", "sol", "deep", 2),
+    ("revise", "claude", "sonnet", "standard", 3),
+    ("revise", "claude", "opus", "deep", 3),
+    ("revise", "codex", "terra", "standard", 4),
+    ("revise", "codex", "sol", "deep", 4),
+    ("respond", "claude", "opus", "deep", 3),
+    ("respond", "codex", "sol", "deep", 5),
+    ("mockup", "claude", "opus", "deep", 5),
+    ("mockup", "codex", "sol", "deep", 5),
+    ("converse", "claude", "opus", "deep", 2),
+    ("converse", "codex", "sol", "deep", 2),
+    ("research", "claude", "opus", "deep", 2),
+    ("research", "codex", "sol", "deep", 2),
+))
+def test_effort_blind_admission_rows_discard_every_supplied_effort(
+        stage, pool, model, complexity, demand):
+    for effort in ("low", "medium", "high", "extra"):
+        assert admission_demand(stage, pool, model, complexity, effort) == demand
+
+
+@pytest.mark.parametrize("pool,model,complexity,demands", (
+    ("claude", "sonnet", "standard", (3, 4, 5, 5)),
+    ("claude", "opus", "deep", (4, 4, 5, 5)),
+    ("codex", "terra", "standard", (4, 5, 5, 5)),
+    ("codex", "sol", "deep", (5, 5, 5, 5)),
+))
+def test_build_admission_keeps_its_effort_rows_and_missing_effort_fallback(
+        pool, model, complexity, demands):
+    for effort, demand in zip(("low", "medium", "high", "extra"), demands, strict=True):
+        assert admission_demand("build", pool, model, complexity, effort) == demand
+        assert admission_demand("building", pool, model, complexity, effort) == demand
+    assert admission_demand("build", pool, model, complexity) == PERMIT_BUDGET
+
+
 def test_submit_stage_is_idempotent_on_the_logical_stage_identity(make_coord):
     coord = make_coord(FakeSession())
     first = coord.submit_stage(Submission(repo="o/r", subject="5", stage="review"))

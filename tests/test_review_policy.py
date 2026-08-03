@@ -197,7 +197,7 @@ def test_reviewer_push_opens_an_exact_head_pass_for_the_other_tool():
         identity="o/r|7|review|start", stage="review", pool="codex", demand=2,
         repo="o/r", subject="7", target="start", change_author_tool="claude",
         review_depth="targeted", depth_reason="one journey", review_axis="combined",
-        builder_lineage="claude", builder_complexity="deep",
+        builder_lineage="claude", builder_complexity="deep", builder_effort="extra",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
     verdict = Verdict(
         clean=True, reviewed_sha="start", final_sha="fixed", pushed_sha="fixed",
@@ -208,6 +208,8 @@ def test_reviewer_push_opens_an_exact_head_pass_for_the_other_tool():
     assert successor is not None and successor.pool == "claude"
     assert successor.target == "fixed" and successor.review.change_author_tool == "codex"
     assert successor.review.passes == 1 and successor.transfer_from == review.identity
+    assert successor.builder_complexity == "deep" and successor.builder_effort == "extra"
+    assert successor.effort is None
 
 
 def test_reviewed_reviewer_fix_uses_immediate_same_tool_fallback_without_forced_taint(
@@ -278,7 +280,7 @@ def test_full_product_pass_opens_a_separate_read_only_standards_pass():
         identity="o/r|7|review|head|aproduct", stage="review", pool="codex", demand=2,
         repo="o/r", subject="7", target="head", change_author_tool="claude",
         review_depth="full", depth_reason="shared permission", review_axis="product",
-        builder_lineage="claude", builder_complexity="deep",
+        builder_lineage="claude", builder_complexity="deep", builder_effort="high",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
     verdict = Verdict(
         clean=True, reviewed_sha="head", final_sha="head", change_author_tool="claude",
@@ -288,6 +290,8 @@ def test_full_product_pass_opens_a_separate_read_only_standards_pass():
 
     assert successor is not None and successor.review.assignment.axis is ReviewAxis.STANDARDS
     assert successor.target == "head" and successor.pool == "codex"
+    assert successor.builder_complexity == "deep" and successor.builder_effort == "high"
+    assert successor.effort is None
     assert "Do not edit during this axis pass" in successor.input_ptr
 
 
@@ -523,6 +527,7 @@ def test_tainted_same_tool_review_reopens_on_the_other_tool_at_the_same_head():
         identity="o/r|7|review|head", stage="review", pool="claude", demand=1,
         repo="o/r", subject="7", target="head", change_author_tool="claude",
         review_tainted=True, review_sequence=0, builder_lineage="claude",
+        builder_complexity="standard", builder_effort="medium",
         source="/work/.agentflow/worktrees/claude-review/pr-42-fix",
         input_ptr="Review head as claude")
 
@@ -532,6 +537,8 @@ def test_tainted_same_tool_review_reopens_on_the_other_tool_at_the_same_head():
     assert successor.review.assignment.axis is ReviewAxis.COMBINED
     assert successor.review.tainted is True and successor.review.taint_cleared is False
     assert successor.review.sequence == 1
+    assert successor.builder_complexity == "standard" and successor.builder_effort == "medium"
+    assert successor.effort is None
     assert successor.transfer_from is None
 
 
@@ -782,7 +789,7 @@ def _chain_record(identity, *, sequence, created, axis, uncertainty=None, checks
         identity=identity, stage="review", pool="codex", demand=2, repo="o/r", subject="479",
         target="c626f21bae01970c38b14711da5b38117c9f6872", created_at=created,
         state="held" if held else "completed", retired=not held, claim=False,
-        builder_lineage="claude", builder_complexity="deep",
+        builder_lineage="claude", builder_complexity="deep", builder_effort="extra",
         source="/work/.agentflow/worktrees/codex-review/pr-479-rescue-log",
         **review.record_fields())
 
@@ -898,6 +905,8 @@ def test_a_resumed_review_keeps_the_head_lineage_and_ledger_and_settles_the_deci
 
     assert submission.target == parked.target            # the immutable exact head
     assert submission.builder_lineage == "claude" and submission.review.change_author_tool == "claude"
+    assert submission.builder_complexity == "deep" and submission.builder_effort == "extra"
+    assert submission.effort is None
     assert submission.review.sequence == 4               # monotone in the same-head chain
     assert submission.review.checks == ("standards axis reviewed",)
     assert submission.review.uncertainty is None

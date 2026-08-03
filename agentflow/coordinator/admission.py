@@ -159,8 +159,12 @@ def normalize_stage(stage: str) -> str:
 def admission_demand(stage, pool, model, complexity, effort=None):
     """The permits one attempt reserves on ``pool``. ``None`` means the pool itself is
     unknown, so there is no budget to charge and the attempt is inadmissible. A known pool
-    with no exact row reserves all five (exclusive fallback)."""
+    with no exact row reserves all five (exclusive fallback). Effort affects Build only;
+    effort-blind stages discard any supplied value before exact matching."""
     if pool not in {"claude", "codex"}:
         return None
+    stage = normalize_stage(stage)
+    if stage != "build":
+        effort = None
     return ADMISSION_MATRIX.get(
-        (normalize_stage(stage), pool, model, complexity, effort), PERMIT_BUDGET)
+        (stage, pool, model, complexity, effort), PERMIT_BUDGET)

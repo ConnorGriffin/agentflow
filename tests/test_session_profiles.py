@@ -119,16 +119,27 @@ def test_review_keeps_the_full_edit_surface_for_bounded_fixes(tmp_path):
 
 
 def test_revise_inherits_the_original_builders_build_ceiling(tmp_path):
-    """Revise carries the builder's Build ceiling via ``builder_complexity`` (ADR 0041), not a
-    read-only stage's, so a deep builder's revise gets the deep Build turn ceiling."""
-    deep = provider_command(_record(
-        "revise", str(tmp_path), builder_complexity="deep", effort="extra"))
-    assert _flag(deep, "--max-turns") == "300"        # = Build deep/extra
-    assert "--tools" not in deep                       # code-writing surface, not read-only
+    """Revise carries the builder's exact Build ceiling through both retained dials."""
+    from agentflow.coordinator.profiles import profile_for
 
-    standard = provider_command(_record(
-        "revise", str(tmp_path), builder_complexity="standard", effort="low"))
-    assert _flag(standard, "--max-turns") == "160"    # = Build standard/low
+    expected = {
+        ("deep", "low"): (45 * 60, 200),
+        ("deep", "medium"): (45 * 60, 200),
+        ("deep", "high"): (45 * 60, 200),
+        ("deep", "extra"): (60 * 60, 300),
+        ("standard", "low"): (45 * 60, 160),
+        ("standard", "medium"): (45 * 60, 160),
+        ("standard", "high"): (45 * 60, 160),
+        ("standard", "extra"): (45 * 60, 160),
+    }
+    for (complexity, effort), ceiling in expected.items():
+        record = _record(
+            "revise", str(tmp_path), builder_complexity=complexity, effort=effort)
+        profile = profile_for(record)
+        assert (profile.wall_ceiling_s, profile.turn_ceiling) == ceiling
+        command = provider_command(record)
+        assert _flag(command, "--max-turns") == str(ceiling[1])
+        assert "--tools" not in command               # code-writing surface, not read-only
 
 
 def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):

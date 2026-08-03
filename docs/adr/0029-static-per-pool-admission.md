@@ -2,6 +2,10 @@
 
 - Status: Accepted
 - Date: 2026-07-15
+- Amended: 2026-08-03 — inherited Revise effort leaves its admission demand on the existing
+  `n/a` row ([#473](https://github.com/ConnorGriffin/agentflow/issues/473))
+- Amended: 2026-08-03 — effort-blind stages normalize supplied effort to `n/a` before exact
+  admission matching ([#473](https://github.com/ConnorGriffin/agentflow/issues/473))
 
 ## Context
 
@@ -35,6 +39,8 @@ The current concrete model names validate that the runner selected the model imp
 complexity dial; they are not a second sizing dial. Effort affects builds only. Intake,
 review, mockup, and respond always use the deep model; revise retains the originating
 build's complexity and has no independent effort input.
+*(Amended 2026-08-03: Revise now durably inherits the original builder's effort for reasoning,
+but admission remains effort-blind and continues to use the single `n/a` demand row.)*
 
 The matrix uses ADR 0028's logical stage names. Existing orchestration labels normalize
 before lookup: `triage` and `triaging` mean Intake; `review` and `reviewing` mean Review;
@@ -80,6 +86,8 @@ to the root reservation.
 - A build without effort keeps the existing `medium` default and uses that cell.
 - Effort attached to a non-build stage does not select a lighter demand; the stage uses its
   `n/a` row.
+  *(Amended 2026-08-03: the admission lookup normalizes every effort-blind logical stage to
+  `n/a` before exact matching, so inherited Revise effort cannot select exclusive fallback.)*
 - If the pool is known but the stage, model, complexity, effort, or combination has no exact
   row, it reserves all five permits and logs that it used exclusive fallback admission.
 - If the pool itself is unknown, the session is not admitted because there is no budget to

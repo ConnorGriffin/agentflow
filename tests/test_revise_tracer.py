@@ -16,7 +16,10 @@ the coordinator's public seam behind the same stage router that runs all three l
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
+
+import pytest
 
 from conftest import FakeSession, permits, record_of
 
@@ -26,6 +29,7 @@ from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, Revise
                                     StageRouter, Submission, tracer)
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import Record
+from agentflow.coordinator.telemetry import read_attempts
 from agentflow.gate import MAX_REVISES
 from agentflow.reviewer import Finding, Verdict
 from agentflow.worktree_ref import WorktreeRef
@@ -247,13 +251,15 @@ def test_reconcile_parks_a_blocking_review_once_the_revise_round_is_spent(make_c
     assert tracer.owned_issues(_records(coord), "o/r") == set()
 
 
-# --- Review → Revise carries the original builder complexity, never a mutable label reread --
+# --- Review → Revise carries the original builder dials, never a mutable label reread -------
 
-def test_review_to_revise_keeps_the_builder_complexity_when_the_issue_label_changes(make_coord,
-                                                                                    monkeypatch):
-    """Review→Revise must run at the *original builder* complexity, carried durably on the record
-    since the Build opened the Review — never re-read from the issue's live label. A label changed
-    (or removed) after the build cannot alter or block the Revise (ADR 0018)."""
+@pytest.mark.parametrize("effort, reasoning", (
+    ("low", "low"), ("medium", "medium"), ("high", "high"), ("extra", "xhigh")))
+def test_review_to_revise_keeps_the_original_builder_dials_when_the_issue_label_changes(
+        make_coord, monkeypatch, effort, reasoning):
+    """Review→Revise must run at the *original builder* complexity and effort, carried durably
+    since the Build opened the Review — never re-read from the issue's live label. Review keeps no
+    effort dial of its own; the launched Revise records the builder's mapped reasoning rung."""
     fake = FakeSession()
     pr, verdict, revision = [True], [True], [False]
     coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
@@ -261,22 +267,58 @@ def test_review_to_revise_keeps_the_builder_complexity_when_the_issue_label_chan
     live = _Live(coord, fake, monkeypatch, head="sha-a")
 
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
-                                          complexity="standard", effort="high", source=BUILD_WT))
+                                          complexity="standard", effort=effort, source=BUILD_WT))
     assert live.run_stage(build) == ["build"]             # Build(standard) completes → Review(sha-a)
     review = _ident("7", "review", "sha-a")
-    assert record_of(coord, review).builder_complexity == "standard"  # carried onto the review
+    review_record = record_of(coord, review)
+    assert review_record.builder_complexity == "standard"  # carried onto the review
+    assert review_record.builder_effort == effort
+    assert review_record.effort is None                      # Review keeps provider-default reasoning
 
     # The issue label is CHANGED before the blocking review opens the revise. The old behavior
     # re-read it and would revise at "deep"; the durable builder complexity must win instead.
     live.labels = ["agentflow:complexity:deep"]
     assert live.run_stage(review) == ["review"]           # Review blocks → reconcile opens Revise
+    review_attempt = next(entry for entry in read_attempts(coord._store.path)
+                          if entry.identity == review)
+    assert review_attempt.effort is None and review_attempt.reasoning_effort is None
     revise = record_of(coord, _ident("7", "revise", "sha-a"))
     assert revise.claim is True and revise.complexity == "standard"   # the original builder value
     assert revise.builder_complexity == "standard"        # still durable for the next hop
+    assert revise.effort == effort and revise.builder_effort == effort
+
+    live.run_stage(revise.identity)
+    attempt = next(entry for entry in read_attempts(coord._store.path)
+                   if entry.identity == revise.identity)
+    assert attempt.effort == effort and attempt.reasoning_effort == reasoning
+
+
+def test_review_to_revise_preserves_missing_historical_builder_effort(make_coord, monkeypatch):
+    fake = FakeSession()
+    pr, verdict, revision = [True], [True], [False]
+    coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
+                       gate=tracer.build_review_revise_gate)
+    live = _Live(coord, fake, monkeypatch, head="sha-a")
+
+    build = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="build", pool="claude",
+        complexity="deep", source=BUILD_WT))
+    assert live.run_stage(build) == ["build"]
+    review = record_of(coord, _ident("7", "review", "sha-a"))
+    assert review.builder_effort is None and review.effort is None
+
+    assert live.run_stage(review.identity) == ["review"]
+    revise = record_of(coord, _ident("7", "revise", "sha-a"))
+    assert revise.builder_effort is None and revise.effort is None
+
+    live.run_stage(revise.identity)
+    attempt = next(entry for entry in read_attempts(coord._store.path)
+                   if entry.identity == revise.identity)
+    assert attempt.effort is None and attempt.reasoning_effort is None
 
 
 def test_review_without_durable_builder_complexity_parks_instead_of_stranding(make_coord,
-                                                                              monkeypatch):
+                                                                               monkeypatch):
     """Issue #105 (spec): a blocking review carrying no durable builder complexity (a record from
     before that lineage fact existed) can never open a revise — a permanent condition. It must
     create exactly one parked-PR handoff and release the claim, not silently strand the PR."""
@@ -911,11 +953,14 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
 def test_review_submission_from_a_completed_revise_binds_the_new_head_and_keeps_lineage():
     revise = Record(identity="o/r|7|revise|sha-a", stage="revise", pool="claude", demand=3,
                     repo="o/r", subject="7", builder_lineage="claude", lineage="claude",
+                    effort="high", builder_effort="high",
                     source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing")
     sub = coordinated_review.review_submission(revise, "sha-b-new", "codex", 42)
     assert sub is not None
     assert sub.stage == "review" and sub.target == "sha-b-new"       # bound to the changed head SHA
     assert sub.pool == "codex" and sub.builder_lineage == "claude"   # original builder still recorded
+    assert sub.builder_complexity == "deep" and sub.builder_effort == "high"
+    assert sub.effort is None
     assert sub.round == revise.round + 1                             # the revise round it follows
     assert sub.transfer_from == "o/r|7|revise|sha-a"                 # assumes the revise's claim
     assert "pr-42-fix-thing" in sub.source
@@ -990,6 +1035,7 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert sub is not None
     assert sub.stage == "revise" and sub.pool == "claude" and sub.builder_lineage == "claude"
     assert sub.target == "sha-conf" and sub.conflict_round == 1 and sub.continuation is True
+    assert sub.effort is None and sub.builder_effort is None
     assert sub.transfer_from is None                      # a survivor owns the claim directly
     assert sub.source == "/w/.agentflow/worktrees/claude/issue-7-fix"
     assert "resolve the merge conflicts" in sub.input_ptr and "Preserve both sides" in sub.input_ptr
@@ -1014,7 +1060,8 @@ def test_conflict_uncertainty_opens_one_full_decision_pass_on_the_other_tool():
     revise = Record(
         identity="o/r|7|revise|head|c1", stage="revise", pool="claude", demand=3,
         repo="o/r", subject="7", target="head", conflict_round=1,
-        builder_lineage="claude", builder_complexity="deep",
+        effort="extra", builder_lineage="claude", builder_complexity="deep",
+        builder_effort="extra",
         source="/work/.agentflow/worktrees/claude/issue-7-fix",
         outcome=('conflict-uncertainty:{"options":["keep main","keep PR"],'
                  '"missing_guidance":"tie owner","recommendation":"keep main"}'))
@@ -1025,14 +1072,18 @@ def test_conflict_uncertainty_opens_one_full_decision_pass_on_the_other_tool():
     assert sub is not None and sub.pool == "codex"
     assert sub.review.assignment.axis.value == "decision"
     assert sub.review.assignment.depth.value == "full" and sub.review.uncertainty_handoffs == 1
+    assert sub.builder_complexity == "deep" and sub.builder_effort == "extra"
+    assert sub.effort is None
     assert "keep main" in sub.input_ptr and sub.transfer_from == revise.identity
 
 
-def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineage():
+@pytest.mark.parametrize("effort, reasoning", (("extra", "xhigh"), (None, None)))
+def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineage(
+        make_coord, effort, reasoning):
     review = Record(
         identity="o/r|7|review|head|adecision|u1", stage="review", pool="codex", demand=2,
         repo="o/r", subject="7", target="head", conflict_round=1,
-        builder_lineage="claude", builder_complexity="deep",
+        builder_lineage="claude", builder_complexity="deep", builder_effort=effort,
         review_depth="full", review_axis="decision",
         uncertainty_handoffs=1,
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
@@ -1043,7 +1094,20 @@ def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineag
 
     assert sub is not None and sub.pool == "claude" and sub.conflict_round == 1
     assert sub.review.uncertainty_handoffs == 1 and sub.transfer_from == review.identity
+    assert sub.effort == effort and sub.builder_effort == effort
     assert "shared rule owns ties" in sub.input_ptr
+
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(replace(sub, transfer_from=None))
+    coord.cycle("claude")
+    fake.end(identity, cause=ProviderCause.PROCESS)
+    coord.cycle("claude")
+    record = record_of(coord, identity)
+    assert record.effort == effort and record.builder_effort == effort
+    attempt = next(entry for entry in read_attempts(coord._store.path)
+                   if entry.identity == identity)
+    assert attempt.effort == effort and attempt.reasoning_effort == reasoning
 
 
 def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypatch):

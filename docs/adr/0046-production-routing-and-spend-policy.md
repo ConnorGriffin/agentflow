@@ -2,6 +2,8 @@
 
 - Status: Accepted
 - Date: 2026-07-19
+- Amended: 2026-08-03 — deep/`extra` Revise inherits the deep/`extra` Build ceiling of
+  300 turns / 60 minutes ([#473](https://github.com/ConnorGriffin/agentflow/issues/473))
 - Builds on: [ADR 0040](0040-spend-per-success-measurement-contract.md) (measurement
   contract), [ADR 0041](0041-stage-model-reasoning-matrix.md) (model matrix),
   [ADR 0042](0042-codegraph-okf-complementary-layer.md) (context backend),
@@ -40,6 +42,9 @@ was never wired; the dial only ever reached the brief as prose.
    unset tunable cells. The missing wiring (launch flag on both providers +
    recording `reasoning_effort` in per-attempt telemetry at launch) is a
    defect, filed as its own build issue.
+   *(Amended 2026-08-03: inherited effort also selects the corresponding Build session
+   ceiling; deep/`extra` Revise therefore receives 300 turns / 60 minutes, while the other
+   deep and standard ceilings remain unchanged.)*
 3. **Intake coaching is an anchored rubric, not machinery.** A 74-issue
    backtest showed the current one-line-of-prompt dial is already
    well-calibrated: median diff 71 → 183 → 389 → 1823 lines across the four

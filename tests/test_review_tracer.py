@@ -1420,7 +1420,8 @@ def _diverged_review(*, target, subject="7", pool="codex", builder_lineage="clau
     the shape ``reconcile_and_project`` needs to recover the PR number for its live-head read."""
     return Submission(
         repo="o/r", subject=subject, stage="review", pool=pool, complexity="deep", target=target,
-        builder_lineage=builder_lineage, round=round, input_ptr="Review PR #26",
+        builder_lineage=builder_lineage, builder_complexity="deep", builder_effort="high",
+        round=round, input_ptr="Review PR #26",
         source="/work/.agentflow/worktrees/codex-review/pr-26-home-depot-probe")
 
 
@@ -1483,6 +1484,8 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     assert successor.state == "waiting" and successor.claim is True
     assert successor.target == "live-sha" and successor.round == 0
     assert successor.builder_lineage == "claude"        # lineage carried forward
+    assert successor.builder_complexity == "deep" and successor.builder_effort == "high"
+    assert successor.effort is None
     assert successor.handoffs == 0                      # no human park
     assert choices == [("claude", {"allow_same_tool": False})]
 

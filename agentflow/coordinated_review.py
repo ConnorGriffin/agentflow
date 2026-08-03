@@ -71,8 +71,9 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
     submission — the minimal facts the coordinator needs (ADR 0030). The review is bound to the
     *exact* head SHA (its immutable target, so a new head SHA starts a fresh review stage), assumes
     the prior stage's change claim, records the builder's lineage so a same-tool review can finish
-    but never auto-merges, and carries the *original builder complexity* forward so a later Revise
-    reads it from the durable record instead of a mutable issue label (ADR 0018). A review that
+    but never auto-merges, and carries the *original builder complexity and effort* forward so a
+    later Revise reads both from the durable record while Review keeps no effort dial of its own
+    (ADR 0018/0046). A review that
     follows a Revise carries that revise round in its identity, so an evidence-only revision — same
     head SHA, new durable proof — still opens a genuinely new review with a fresh budget, never the
     retired prior review's record. It points at a detached writable review worktree starting at
@@ -117,7 +118,8 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         target=head_sha, pool=reviewer_tool, complexity="deep",
         source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=brief, builder_lineage=build_record.pool,
-        builder_complexity=build_record.complexity, round=completed_rounds,
+        builder_complexity=build_record.complexity, builder_effort=build_record.effort,
+        round=completed_rounds,
         conflict_round=build_record.conflict_round,
         review=state,
         transfer_from=build_record.identity)
@@ -229,7 +231,8 @@ def review_successor_submission(review_record, verdict):
         target=verdict.final_sha, pool=next_tool, complexity="deep",
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
-        builder_complexity=review_record.builder_complexity, round=review_record.round,
+        builder_complexity=review_record.builder_complexity,
+        builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state)
 
 
@@ -299,7 +302,8 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         target=review_record.target, pool=next_tool, complexity="deep",
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
-        builder_complexity=review_record.builder_complexity, round=review_record.round,
+        builder_complexity=review_record.builder_complexity,
+        builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state)
 
 
@@ -340,7 +344,8 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         target=review_record.target, pool=reviewer_tool, complexity="deep",
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
-        builder_complexity=review_record.builder_complexity, round=review_record.round,
+        builder_complexity=review_record.builder_complexity,
+        builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state)
 
 
@@ -385,7 +390,8 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
         target=review_record.target, pool=reviewer_tool, complexity="deep",
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
-        builder_complexity=review_record.builder_complexity, round=review_record.round,
+        builder_complexity=review_record.builder_complexity,
+        builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state)
 
 
@@ -1138,7 +1144,8 @@ def _moved_head_review_submission(record, head_sha: str):
         pool=reviewer_tool, complexity="deep",
         source=str(review_worktree(workdir, reviewer_tool, pr, slug)),
         claim=True, input_ptr=prompt, builder_lineage=record.builder_lineage,
-        builder_complexity=record.builder_complexity, round=record.round,
+        builder_complexity=record.builder_complexity, builder_effort=record.builder_effort,
+        round=record.round,
         review=review,
         transfer_from=record.identity, supersede=True)
 

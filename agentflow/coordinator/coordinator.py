@@ -122,6 +122,7 @@ class Submission:
     input_ptr: str | None = None
     builder_lineage: str | None = None
     builder_complexity: str | None = None  # the original builder complexity, carried to a Revise
+    builder_effort: str | None = None      # the original builder effort, carried to a Revise
     round: int = 0                  # completed auto-revise rounds behind this stage — part of the
                                     # identity, so a re-review at an unchanged head SHA is still a
                                     # genuinely new stage with a fresh budget
@@ -233,7 +234,8 @@ class Coordinator:
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
-            builder_complexity=submission.builder_complexity, round=submission.round,
+            builder_complexity=submission.builder_complexity,
+            builder_effort=submission.builder_effort, round=submission.round,
             conflict_round=submission.conflict_round, resume=submission.resume,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
