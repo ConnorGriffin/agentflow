@@ -54,6 +54,17 @@ in [the supporting research](../research/bounded-repository-map-projection.md).
 - **Fetch every map and all history.** Rejected: GitHub is already the comprehensive browser;
   the console is an operational projection.
 
+## Amendment (2026-08-03)
+
+Reads were walking repositories in config order every heartbeat; once the shared point budget
+stopped partway through, the same leading repositories refreshed and the tail never did (#492).
+The read order now walks least-recently-fresh first, taken from the previous snapshot's
+per-repository `fresh_at`: never-loaded repositories first, then ascending `fresh_at`, ties
+broken by config order for a deterministic walk. This guarantees every repository reaches fresh
+within `ceil(repository count / repositories read per heartbeat)` heartbeats. The published
+`repositories` list is unaffected — it stays in config order, since that is the order the console
+renders.
+
 ## Consequences
 
 - The handoff workflow gains one body marker and one truthful native dependency edge.

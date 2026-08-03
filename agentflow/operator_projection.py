@@ -144,20 +144,43 @@ def repository_maps(
     return {**identity, "github": fresh, "maps": component}
 
 
+def _walk_order(repos: list[RepoConfig], *, previous_snapshot: dict | None) -> list[RepoConfig]:
+    """The order the fleet is *read* in, least-recently-fresh first, so a shared per-heartbeat
+    budget stop (ADR 0036) never starves the same tail of the config list forever: a repository
+    that has never loaded sorts before one that has, and among those that have, the oldest
+    ``fresh_at`` sorts first. Ties — including every never-loaded repository — keep the config's
+    own order, so the walk is deterministic run to run. This governs only the read order; the
+    published ``repositories`` list stays in config order regardless (:func:`project`)."""
+    def key(indexed: tuple[int, RepoConfig]) -> tuple[bool, str, int]:
+        index, cfg = indexed
+        prev_github = (_previous_component(previous_snapshot, cfg.repo) or {}).get("github") or {}
+        fresh_at = prev_github.get("fresh_at")
+        return (fresh_at is not None, fresh_at or "", index)
+
+    ordered = sorted(enumerate(repos), key=key)
+    return [cfg for _index, cfg in ordered]
+
+
 def project(
     repos: list[RepoConfig], *, previous_snapshot: dict | None, heartbeat_seconds: int,
     now: datetime | None = None,
 ) -> dict:
     """The schema-version-2 fields this publish cycle contributes, additive alongside the
     existing v1 snapshot (ADR 0036): repository identity and bounded Decision Maps. Composed
-    once per publish, daemon-side only — the browser never queries GitHub."""
+    once per publish, daemon-side only — the browser never queries GitHub.
+
+    Reads walk least-recently-fresh first (:func:`_walk_order`) so a shared point budget that
+    stops partway through never starves the same repositories every heartbeat; the published
+    ``repositories`` list is re-sorted back to config order, since that is the order the console
+    renders (#492)."""
     now = now or datetime.now(timezone.utc)
     budget = {"spent": 0, "stopped": False}
-    repositories = [
-        repository_maps(cfg, previous_snapshot=previous_snapshot, now=now,
-                        heartbeat_seconds=heartbeat_seconds, budget=budget)
-        for cfg in repos
-    ]
+    by_repo = {
+        cfg.repo: repository_maps(cfg, previous_snapshot=previous_snapshot, now=now,
+                                  heartbeat_seconds=heartbeat_seconds, budget=budget)
+        for cfg in _walk_order(repos, previous_snapshot=previous_snapshot)
+    }
+    repositories = [by_repo[cfg.repo] for cfg in repos]
     return {"schema_version": SCHEMA_VERSION, "generated_at": _iso(now),
             "repositories": repositories}
 

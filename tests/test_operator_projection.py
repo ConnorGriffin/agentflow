@@ -159,6 +159,53 @@ def test_build_composes_schema_version_and_repositories(monkeypatch):
     assert all(r["github"]["status"] == "fresh" for r in result["repositories"])
 
 
+def test_starvation_every_repository_reaches_fresh_within_ceil_n_over_k_heartbeats(monkeypatch):
+    # Five repositories, a budget that stops after 2 reads (cost 30 each against a 60 ceiling).
+    # With the naive top-of-list walk order this never recovers — the same two repos win every
+    # heartbeat and the rest stay unavailable forever. With least-recently-fresh-first, every
+    # repository must be fresh within ceil(5/2) = 3 heartbeats.
+    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
+    monkeypatch.setattr(github, "decision_maps", lambda repo, **kw: _maps_read(cost=30, remaining=4990))
+
+    repos = [_cfg(f"o/r{i}") for i in range(5)]
+    snapshot = None
+    for heartbeat in range(3):
+        snapshot = operator_projection.project(
+            repos, previous_snapshot=snapshot, heartbeat_seconds=300,
+            now=NOW + timedelta(seconds=300 * heartbeat))
+    statuses = {r["name_with_owner"]: r["github"]["status"] for r in snapshot["repositories"]}
+    assert all(status == "fresh" for status in statuses.values()), statuses
+
+
+def test_never_loaded_repositories_are_read_before_stale_but_once_fresh_ones():
+    previous_snapshot = {"repositories": [
+        {"name_with_owner": "o/a", "github": {"status": "fresh",
+                                              "fresh_at": (NOW - timedelta(seconds=10)).isoformat(),
+                                              "attempted_at": (NOW - timedelta(seconds=10)).isoformat(),
+                                              "error": None}, "maps": {"active": [], "active_total": 0}},
+    ]}
+    repos = [_cfg("o/a"), _cfg("o/b")]
+    order = operator_projection._walk_order(repos, previous_snapshot=previous_snapshot)
+    assert [cfg.repo for cfg in order] == ["o/b", "o/a"], "never-loaded o/b must be read first"
+
+
+def test_project_output_order_stays_config_order_regardless_of_walk_order(monkeypatch):
+    monkeypatch.setattr(github, "decision_maps", lambda repo, **kw: _maps_read())
+    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
+    previous_snapshot = {"repositories": [
+        {"name_with_owner": "o/a", "github": {"status": "fresh",
+                                              "fresh_at": (NOW - timedelta(seconds=10)).isoformat(),
+                                              "attempted_at": (NOW - timedelta(seconds=10)).isoformat(),
+                                              "error": None}, "maps": {"active": [], "active_total": 0}},
+    ]}
+    result = operator_projection.project(
+        [_cfg("o/a"), _cfg("o/b")], previous_snapshot=previous_snapshot, heartbeat_seconds=300,
+        now=NOW)
+    assert [r["name_with_owner"] for r in result["repositories"]] == ["o/a", "o/b"]
+
+
 def test_fleet_recent_landed_merges_sorts_and_bounds():
     repo_views = [
         {"repo": "o/a", "recent_merges": [{"number": 1, "merged_at": "2026-07-01T00:00:00Z"}]},
