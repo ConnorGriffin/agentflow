@@ -35,10 +35,10 @@
   <section aria-labelledby="attention-title">
     <div class="section-head">
       <h2 id="attention-title">Attention</h2>
-      <span class="count">{briefing.attention.length} {briefing.attention.length === 1 ? 'item' : 'items'}</span>
+      <span class="count">{briefing.attention.total} {briefing.attention.total === 1 ? 'item' : 'items'}</span>
     </div>
     <div class="rows">
-      {#each briefing.attention as item}
+      {#each briefing.attention.rows as item}
         <article class="attention">
           <span class="kind">{item.kind}</span>
           <div><h3>{item.title}</h3><p>{item.detail}</p></div>
@@ -47,6 +47,17 @@
       {:else}
         <div class="empty">No operator actions in this projection.</div>
       {/each}
+      <!-- The queue is bounded daemon-side; when it truncates the count above still reports the
+           true total, and this final ruled row says how much of it is not on the page. -->
+      {#if briefing.attention.overflow > 0}
+        <article class="attention">
+          <span class="kind">More</span>
+          <div>
+            <h3>{briefing.attention.overflow} more operator actions not shown</h3>
+            <p>This projection is bounded. Open GitHub for the rest.</p>
+          </div>
+        </article>
+      {/if}
     </div>
   </section>
 

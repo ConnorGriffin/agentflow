@@ -33,7 +33,7 @@
     if (key === 'inbox') return items.length;
     if (key === 'live') return (snap?.running || []).length;
     if (key === 'fleet') return (snap?.repos || []).length;
-    if (key === 'briefing') return snap ? deriveBriefing(snap).attention.length : 0;
+    if (key === 'briefing') return snap ? deriveBriefing(snap).attention.total : 0;
     return historyCount;
   }
 

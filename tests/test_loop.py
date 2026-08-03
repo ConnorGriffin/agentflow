@@ -1067,6 +1067,7 @@ def test_autonomous_survivor_review_is_a_cold_coordinator_submission(monkeypatch
     monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
     monkeypatch.setattr(loop, "claim", lambda repo, number, _label: True)
     monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
+    monkeypatch.setattr(github, "pr_comments", lambda repo, pr: [])
     submission = SimpleNamespace(stage="review", transfer_from=None)
     monkeypatch.setattr(coordinated_review, "survivor_review_submission",
                         lambda *args, **kwargs: submission)
@@ -1234,11 +1235,15 @@ def _conflict_revise(conflict_round, target, *, repo="o/r", subject="4"):
 
 def _stub_conflict_env(monkeypatch, *, priors, head="sha-conf", claim=True):
     """Fake the git head read and coordinator store for _conflict_revise_survivor; capture every
-    submission handed to the coordinator. No real process is ever launched."""
+    submission handed to the coordinator. No real process is ever launched.
+
+    The PR carries no clean-review summary here, so opening the Revise has nothing to retire —
+    the retirement itself is exercised on its own fixture below."""
     from agentflow import coordinated_build
 
     monkeypatch.setattr(loop, "_run",
                         lambda argv: _FakeRun(head + "\n") if "rev-parse" in argv else _FakeRun(""))
+    monkeypatch.setattr(github, "pr_comments", lambda repo, pr: [])
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: list(priors))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claim)
     submitted = []
@@ -1306,6 +1311,53 @@ def test_third_survivor_conflict_opens_another_bounded_revise(monkeypatch):
     assert len(submitted) == 1
     assert submitted[0].conflict_round == 3 and submitted[0].target == "sha-3"
     assert parked == [] and "revise round 3 opened" in out
+
+
+def _clean_summary_pr(monkeypatch):
+    """A PR the engine already handed to the maintainer: one current clean-review summary,
+    editable in place. Returns the live comment list so a test can read what it became."""
+    marker = "<!-- agentflow-clean-review-summary -->"
+    comments = [github.Comment(body=f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->",
+                               created_at="", id="clean")]
+    monkeypatch.setattr(github, "pr_comments", lambda repo, pr: list(comments))
+    monkeypatch.setattr(github, "edit_comment", lambda comment_id, body:
+                        comments.__setitem__(0, github.Comment(body, "", id=comment_id)) or True)
+    return comments
+
+
+def test_opening_a_conflict_revise_takes_the_pr_back_from_the_maintainer(monkeypatch):
+    """A clean-reviewed PR that conflicts against main is being resolved by the engine, not
+    waiting on a merge — so the hand-off it carries is retired when the Revise opens."""
+    _stub_conflict_env(monkeypatch, priors=[], head="sha-conf")
+    comments = _clean_summary_pr(monkeypatch)
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
+
+    out = _rebase_survivor(RepoConfig("o/r", "/w"), 8, "agentflow/claude/issue-4-fix", "reviewed")
+
+    assert "revise round 1 opened" in out
+    assert "agentflow-superseded-review-summary" in comments[0].body
+    assert "sha-a" in comments[0].body, "the evidence the summary recorded survives"
+
+
+def test_an_autonomous_re_review_takes_the_pr_back_from_the_maintainer(monkeypatch):
+    """The same on the autonomous path: a fresh Review over a stale tainted summary means the
+    engine owns the PR again, so the old summary stops reading as a merge prompt."""
+    monkeypatch.setattr(loop, "_run", lambda argv: _FakeRun("head-a\n"))
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "Issue acceptance")
+    monkeypatch.setattr(loop, "claim", lambda repo, number, _label: True)
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
+    monkeypatch.setattr(coordinated_review, "survivor_review_submission",
+                        lambda *args, **kwargs: SimpleNamespace(stage="review", transfer_from=None))
+    monkeypatch.setattr(pipeline, "build_coordinator",
+                        lambda: SimpleNamespace(submit_stage=lambda s: None))
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda current: None)
+    comments = _clean_summary_pr(monkeypatch)
+
+    result = loop._merge_autonomous_survivor(
+        RepoConfig("o/r", "/tmp"), 42, 7, "fix", "claude", "agentflow/claude/issue-7-fix")
+
+    assert result == "review submitted"
+    assert "agentflow-superseded-review-summary" in comments[0].body
 
 
 def test_conflict_revise_defers_without_parking_when_the_head_is_unreadable(monkeypatch):

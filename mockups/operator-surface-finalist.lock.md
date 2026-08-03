@@ -1,4 +1,4 @@
-# Lock manifest — operator-surface-finalist (issue #183, extended by #375)
+# Lock manifest — operator-surface-finalist (issue #183, extended by #375, #373)
 
 Backfilled for the charter's now-mandatory lock-manifest gate (`standards/CHARTER.md`):
 `operator-surface-finalist.html` shipped as `★ LOCKED` under #183 with no manifest of
@@ -50,11 +50,53 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
     many items need the operator, and — only when that repository's map read is not
     fresh — appends `map data stale` or `map data unverified`. Never colour-only.
 
+## Gate terms added by #373 (Attention section: which conditions, in what order)
+
+12. **The five conditions** — the Attention section shows exactly these, and nothing
+    else: an open PR awaiting the operator's merge; a held issue waiting on their
+    reply; a parked build; a repository whose trust dial is ready to loosen; a
+    repository whose briefing data is stale or has never loaded. Normal in-flight
+    work the engine is still handling never appears; neither does a capacity/idle-pool
+    row nor a blocked-ticket row (both re-settled out — see below).
+13. **Priority order** — rows appear in exactly that condition order. Within a
+    condition the sub-kind ranks first — condition 1 by repository profile alone
+    (`guarded`, then `reviewed`, then `autonomous`), condition 2 needs-grilling before
+    needs-mockup — then least-recently-touched first where a clock exists, then
+    repository name, then item number. The order is total and never depends on the
+    order repositories happen to be walked.
+14. **Row kind labels** — the four the surface already ships (`Merge`, `Held`,
+    `Parked`, `Trust`) keep their wording; the stale/never-loaded condition uses the
+    locked incomplete state's own `Projection` kind and its row shape (a short
+    statement as the title, the cause as the detail). The overflow row's kind reads
+    `More`.
+15. **One action per underlying thing** — a parked PR is a parked build and never
+    also an awaiting-merge row, however finished the engine's own summary says it is.
+    The fleet-wide freshness banner is unaffected: it is posture, term 5's honest
+    stale/incomplete banner, and the per-repository row is the action with a link.
+16. **Reason wording** — a parked build's reason says what is actually true of it.
+    `open-question` reads `your comment on this PR has not been answered` — never that
+    a question stopped the build, since it fires on a merge-ready PR the operator
+    commented on. `drop-to-reviewed` reads `the pipeline stopped and left a decision
+    on the PR` — never that a builder wants to drop autonomy, which is false for the
+    unresolved-review, red-check and budget-exhaustion parks that share that bucket.
+17. **Bound and overflow** — the collection is bounded fleet-wide at 25 rows. When it
+    truncates, one final ruled row in the section's existing row treatment reads
+    `<n> more operator actions not shown`, and both the section count and the tab
+    badge report the true total, never the truncated length. Empty attention reads
+    `No operator actions in this projection.`
+
 ## Fixture obligations
 
 - Fixtures must join the two source lists the daemon actually publishes (`repos[]`
   keyed by `repo`, `repositories[]` keyed by `name_with_owner`) — never assume same
   order or length.
+- The `typical` fixture keeps term 3's first-viewport shape of three attention rows.
+  A separate non-locked `full-queue` fixture, captured at the same viewports and
+  attached as evidence only, must exercise all five conditions and the overflow row.
+- At least one fixture must carry a PR holding both a live clean-review summary and a
+  park classification, to prove term 15 collapses it to the parked row alone.
+- At least one fixture must carry a repository already at `autonomous` whose trust
+  ratchet is ready, to prove term 12 emits no loosen row for it.
 - At least one fixture must carry two repositories with equal landing counts and
   different newest-landing ages (term 8).
 - At least one fixture must carry a paused pool whose `reason` names a materially
@@ -63,8 +105,26 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
   names, and at least one fixture must have every repository unobserved, to prove
   term 10's grouping and case-insensitive sort independently.
 
+## Declared deviations (re-settled by #373)
+
+- The `Blocked` row in the mockup's typical state — **removed**. Decision Maps shows
+  blocked tickets on its own frontier, so a second copy in Attention was a duplicate
+  action, not a condition.
+- The `Capacity` row in the typical state — **removed**. Fleet health shows the pools,
+  and a paused pool names nothing the operator acts on.
+- The overflow row — **new**, because the bound is new. Rendered inside the section's
+  existing ruled-row treatment rather than as a new element, so term 4's ruled-row rule
+  still holds.
+- The `stale` state's empty Attention section — **re-settled**. The locked stale
+  fixture showed the banner with zero attention rows; condition 5 makes that
+  combination unreachable, so that state now carries its stale-repository rows.
+
 ## Verbatim strings
 
+- `No operator actions in this projection.`
+- `more operator actions not shown`
+- `your comment on this PR has not been answered`
+- `the pipeline stopped and left a decision on the PR`
 - `no landings yet`
 - `taking work, `
 - `paused, `

@@ -143,35 +143,14 @@ export const STAGES = [
    bounds, and freshness (ADR 0036: "the browser derives presentation only") — every
    function below only flattens, formats, and ranks what the daemon already decided. */
 
-const ATTENTION_KIND = { merge: 'Merge', held: 'Held', parked: 'Parked', loosen: 'Trust' };
-
-function attentionDetail(item) {
-  if (item.kind === 'merge') return `${short(item.repo)} · ${item.profile} · reviewer ${item.reviewer}`;
-  if (item.kind === 'held') return `${short(item.repo)} · ${(HELD[item.state] || {}).label || item.state}`;
-  if (item.kind === 'parked') return `${short(item.repo)} · ${(PARKED[item.reason] || {}).why || item.reason}`;
-  return short(item.repo);
-}
-
-/* Reuses `deriveInbox`'s exact ranking (guarded merge > reviewed merge > held > parked >
-   loosen, oldest-first within a weight) rather than re-deriving it — this section and the
-   v1 Inbox tab answer the same question ("what needs you") from the same source fields. */
+/* The attention queue is decided by the daemon (#373): the five ruled conditions, each
+   underlying thing once, in one total order, already bounded and already worded. Nothing is
+   ranked, filtered or collapsed here — the section renders the rows as published, reports the
+   daemon's own pre-bound total, and shows the overflow as the difference between the two. */
 export function deriveAttention(snap) {
-  return deriveInbox(snap).map((item) => {
-    if (item.kind === 'loosen') {
-      return {
-        kind: ATTENTION_KIND.loosen, title: `${short(item.repo)} ready to loosen`,
-        detail: `${item.samples} decisions · ${Math.round((item.rate || 0) * 100)}% corrected`,
-        url: `https://github.com/${item.repo}`,
-      };
-    }
-    const path = item.kind === 'held' ? 'issues' : 'pull';
-    return {
-      kind: ATTENTION_KIND[item.kind] || item.kind,
-      title: `#${item.number} ${item.title}`,
-      detail: attentionDetail(item),
-      url: `https://github.com/${item.repo}/${path}/${item.number}`,
-    };
-  });
+  const rows = snap?.attention?.rows || [];
+  const total = snap?.attention?.total ?? rows.length;
+  return { rows, total, overflow: Math.max(0, total - rows.length) };
 }
 
 function handoffLabel(handoff) {

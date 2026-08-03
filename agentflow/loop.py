@@ -21,7 +21,7 @@ from agentflow.balancer import pick_pair, pick_reviewer
 from agentflow.coordinator.record import WAITING
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.gate import (conflict_revises_used, maintainer_comment, maintainer_comment_id,
-                            park, reply_pending)
+                            park, reply_pending, supersede_clean_review)
 from agentflow.intake import (INTAKE_MARK, _strip_quoted_lines, awaiting_recheck,
                               replies_since_intake)
 from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS,
@@ -603,7 +603,11 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
 
 def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
                                branch_tool: str, branch: str) -> str:
-    """Submit the rebased exact head as a fresh durable Review; never launch one directly."""
+    """Submit the rebased exact head as a fresh durable Review; never launch one directly.
+
+    Submitting one takes the PR back from the maintainer, so the summary the earlier — now
+    tainted — review left behind is retired with it: an unmergeable PR under active re-review
+    must not keep sitting at the top of the operator's merge queue."""
     head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
     if head.returncode != 0 or not head.stdout.strip():
         return "review head unreadable"
@@ -626,6 +630,7 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
     coordinator = pipeline.build_coordinator()
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
+    supersede_clean_review(cfg.repo, pr)
     return "review submitted"
 
 
@@ -637,7 +642,10 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
     Returns a status string once a conflict Revise is opened (or is already open for this head).
     There is no PR-lifetime conflict cap: each genuinely new conflicting head gets its own bounded
     stage attempts. ``None`` is reserved for an unreconstructable submission, where the caller uses
-    the human fallback. Never parks or force-merges here."""
+    the human fallback. Never parks or force-merges here.
+
+    Opening one takes the PR back from the maintainer, so any clean-review summary it carries is
+    retired with it — a conflicting PR being resolved is not the maintainer's to merge."""
     head = _run(["git", "-C", cfg.workdir, "rev-parse", f"origin/{branch}"])
     if head.returncode != 0 or not head.stdout.strip():
         return f"#{pr}: conflict — head unreadable, retry next cycle"
@@ -660,6 +668,7 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
     coordinator = pipeline.build_coordinator()
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
+    supersede_clean_review(cfg.repo, pr)
     return f"#{pr}: conflict — revise round {conflict_round} opened"
 
 

@@ -34,6 +34,9 @@ def test_never_ran_daemon_reads_as_an_empty_fleet():
     assert body["schema_version"] == 2
     assert body["repositories"] == []
     assert body["fleet"] == {"recent_landed": []}
+    # The operator queue is decided daemon-side (#373): no rows and a zero total, so the
+    # briefing renders its honest-empty state rather than a count the browser made up.
+    assert body["attention"] == {"rows": [], "total": 0}
 
 
 def test_a_published_schema_v2_snapshot_passes_through_verbatim():
