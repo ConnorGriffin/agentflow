@@ -773,4 +773,5 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     records = tracer.load_records()
     live.replace_projection(tracer.live_projection(records))
     live.replace_refusals(tracer.refusal_projection(records))
+    live.replace_stalled(tracer.stalled_projection(records, now=now))
     return outcomes

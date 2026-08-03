@@ -111,6 +111,7 @@ def _isolated_agentflow_state(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "STATE_DIR", tmp_path)
     monkeypatch.setattr(live, "LIVE_FILE", tmp_path / "live-sessions.json")
     monkeypatch.setattr(live, "REFUSALS_FILE", tmp_path / "refusals.json")
+    monkeypatch.setattr(live, "STALLED_FILE", tmp_path / "stalled.json")
     monkeypatch.setattr(live, "DAEMON_FILE", tmp_path / "daemon-status.json")
     monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
 

@@ -52,7 +52,7 @@ def reset_worktree(record):
     Every refusal is named (#405). ``input_ptr`` is durable external text a crash or a hand edit
     can corrupt, so an unreadable one is quoted through the bounded, single-line preview rather
     than copied into the record, the log, and the snapshot."""
-    from agentflow.runner import ClaudeRunner, CodexRunner
+    from agentflow.runner import CheckoutRefused, ClaudeRunner, CodexRunner
     if not record.source or not record.input_ptr:
         return unprepared("source-missing",
                           "the record carries no checkout pointer and provider payload to "
@@ -79,6 +79,11 @@ def reset_worktree(record):
     try:
         runner.prepare_worktree_detached(workdir, source_ref, wt)
         runner.provision(wt)
+    except CheckoutRefused as refused:
+        # The checkout itself said no, and said which state it was in — a live sibling holding
+        # it, or a human's lock over work that cannot be archived. Carried through untouched so
+        # the engine can tell the one that clears itself from the one that never will (#406).
+        return refused.refusal
     except subprocess.CalledProcessError as e:
         return unprepared("checkout-failed",
                           f"preparing the read-only checkout at {wt} from {source_ref[:12]} "
@@ -257,7 +262,10 @@ def hold_intake(record) -> str | None:
     ``action``; releasing the triaging claim is stage bookkeeping that runs once the handoff
     confirms the marker landed.
 
-    The durable hold reason picks the comment: a permanent provider condition stopped the
+    The durable hold reason picks the comment: a triage that was never started at all — because
+    the working copy it needs is pinned open on the machine — describes that and asks for the
+    machine to be cleared, rather than telling the maintainer about grounding nobody attempted
+    (#406). A permanent provider condition stopped the
     session before the model read anything, so that handoff names the provider failure and its
     remediation instead of the generic "I couldn't ground this" ask, which would send the
     maintainer hunting for a decision that was never made (issue #328). The reason also says
@@ -271,14 +279,18 @@ def hold_intake(record) -> str | None:
     from dataclasses import replace as replace_result
 
     from agentflow.coordinator.coordinator import (PERMANENT_HOLD_REASON,
-                                                   parse_permanent_hold_reason)
+                                                   parse_permanent_hold_reason,
+                                                   refused_before_start,
+                                                   refused_before_start_detail)
     from agentflow.handoff import (DurableHandoff, Notification, Subject, marked_body,
                                    proof_marker)
-    from agentflow.intake import _held, _provider_failed
+    from agentflow.intake import _held, _provider_failed, _refused_before_start
     number = int(record.subject)
     reason = record.hold_reason or "continuation budget exhausted"
     if reason.startswith(PERMANENT_HOLD_REASON):
         result = _provider_failed(reason, parse_permanent_hold_reason(reason).value)
+    elif refused_before_start(reason):
+        result = _refused_before_start(reason, refused_before_start_detail(reason))
     else:
         result = _held(reason)
     # A hold posted before this record carried its own marker is still proof of itself, so an

@@ -184,7 +184,7 @@ def reset_worktree(record):
     Every refusal is named (#405), and an unreadable chain payload is quoted only through the
     bounded single-line preview — the draft under attack rides in that payload, so it must never
     be copied into the record, the daemon log, or the published snapshot."""
-    from agentflow.runner import ClaudeRunner, CodexRunner
+    from agentflow.runner import CheckoutRefused, ClaudeRunner, CodexRunner
     if not record.source or not record.input_ptr:
         return unprepared("source-missing",
                           "the round carries no checkout pointer and chain payload to rebuild "
@@ -208,6 +208,10 @@ def reset_worktree(record):
     try:
         runner.prepare_worktree_detached(ref.workdir, source_ref, wt)
         runner.provision(wt)
+    except CheckoutRefused as refused:
+        # Carried through untouched: the checkout named which state it is in, and only it can
+        # tell a sibling that will finish from a lock only a human will lift (#406).
+        return refused.refusal
     except subprocess.CalledProcessError as e:
         return unprepared("checkout-failed",
                           f"preparing the read-only checkout at {wt} from {source_ref[:12]} "
@@ -419,7 +423,11 @@ def hold_contested(record, draft: IntakeResult, result: AttackResult) -> str | N
 def hold_attack(record) -> str | None:
     """Create the attack's single exhaustion handoff and notification.
 
-    An attacker that ran out of room never read the draft, so it has nothing to say about it —
+    Two ways a round ends with the draft still unargued, and they owe the maintainer different
+    accounts. A round that was never started — because the working copy it needs is pinned open
+    on the machine — says so and asks for the machine to be cleared, claiming no spend and no
+    attempt (#406). Otherwise: an attacker that ran out of room never read the draft, so it has
+    nothing to say about it —
     and publishing an unattacked draft on the strength of our own spend cap is the one thing this
     whole design refuses to do. So the issue is handed to the maintainer instead, through
     intake's grilling route, carrying the draft that was never argued with: the plan is worth
@@ -432,6 +440,8 @@ def hold_attack(record) -> str | None:
     and does not re-hold; the reason comes from the persisted record, never a fresh observation,
     so a restart recomposes the same marker.
     """
+    from agentflow.coordinator.coordinator import (refused_before_start,
+                                                   refused_before_start_detail)
     from agentflow.handoff import (DurableHandoff, Notification, Subject, marked_body,
                                    proof_marker)
     from agentflow.intake import _DISCLAIMER
@@ -440,11 +450,28 @@ def hold_attack(record) -> str | None:
     payload = _chain(record)
     draft = _draft(payload) if payload is not None else None
     plan = draft.body.strip() if draft is not None and draft.body.strip() else "(nothing usable)"
-    body = (f"{_DISCLAIMER}\n\nI drafted a plan for this and then ran out of room having it "
-            "picked apart, so nobody has actually argued with it — I'd rather show it to you "
-            "than post it as ready on my own say-so.\n\nHere's the draft as it stood:\n\n"
-            f"{plan}\n\nTell me what's wrong with it (or run `/agentflow pickup "
-            f"{number}` to drive it live) and I'll take it from there.")
+    if refused_before_start(reason):
+        # The round never started, so "ran out of room" would be a lie about work nobody did —
+        # and so would any hint that the draft below has been tested. Same route, same draft,
+        # honest account of why it is still unargued (#406).
+        body = (f"{_DISCLAIMER}\n\nI have a draft plan for this and nobody has argued with it "
+                "yet. The round that was meant to pick it apart never started, so I'd rather "
+                "show you the draft than post it as ready on my own say-so.\n\nIt hasn't "
+                "started because the private, throwaway copy of the repository I work in is "
+                "pinned open on the machine I run on and holding changes, and I won't touch a "
+                "working copy somebody deliberately pinned. Nothing was spent getting here: no "
+                "session ran, no attempt was used, and no budget was drawn down. What's in the "
+                f"way is only this:\n\n> {refused_before_start_detail(reason)}\n\nHere's the "
+                f"draft as it stands, untested:\n\n{plan}\n\nRelease that working copy and I'll "
+                "run the argument this draft is still owed. Or tell me what's wrong with it "
+                f"here (or run `/agentflow pickup {number}` to drive it live) and I'll take it "
+                "from there.")
+    else:
+        body = (f"{_DISCLAIMER}\n\nI drafted a plan for this and then ran out of room having it "
+                "picked apart, so nobody has actually argued with it — I'd rather show it to you "
+                "than post it as ready on my own say-so.\n\nHere's the draft as it stood:\n\n"
+                f"{plan}\n\nTell me what's wrong with it (or run `/agentflow pickup "
+                f"{number}` to drive it live) and I'll take it from there.")
     marker = proof_marker(record.identity, reason, tag="attack-hold")
     result = IntakeResult(IntakeRoute.GRILL, marked_body(body, marker))
 

@@ -272,6 +272,55 @@ def _worktree_is_locked(wt: Path) -> bool:
     return (lock if lock.is_absolute() else wt / lock).exists()
 
 
+class CheckoutRefused(Exception):
+    """A checkout whose *local* state preparation may not disturb, carrying the typed refusal.
+
+    Every other preparation failure is a subprocess exit code: git could not reach the remote,
+    ``uv`` could not build the environment, ``worktree add`` fell over. Those are undiagnosed by
+    design — retrying is the right answer and the exit code is all anyone has. These two are
+    different in kind, and the difference is provable from the checkout alone without a network:
+    a live sibling still holds it (ordinary contention that clears itself), or a human pinned it
+    with ``git worktree lock`` over state that cannot be archived (nothing clears until they act).
+    Classification stays here, beside the predicates that read the evidence, so the coordinator
+    consumes one typed answer rather than keeping its own table of git conditions (#406).
+    """
+
+    def __init__(self, refusal) -> None:
+        super().__init__(refusal.summary())
+        self.refusal = refusal
+
+
+def refuse_unusable_checkout(workdir: str, wt: Path) -> None:
+    """Refuse, by name, a registered checkout whose local state preparation cannot clear itself.
+
+    Deliberately runs *before* any fetch or provisioning: both conditions are read from the
+    checkout with no network at all, and a daemon that cannot reach its remote would otherwise
+    report the fetch failure forever while the real, human-clearable cause sat underneath it.
+
+    Only the two states :func:`archive_stranded_worktree` and the rebuild below genuinely cannot
+    get past. A worktree that is absent, orphaned (registered nowhere), or clean and idle is
+    rebuilt or reused as it always was — a lock over a *clean* checkout is no obstacle, since
+    reuse only resets and cleans it, so refusing there would stall stages this has never stalled.
+    """
+    # Imported here, not at module scope: the coordinator package reaches back into this module
+    # for its git plumbing, so a top-level import closes a cycle at interpreter start.
+    from agentflow.coordinator.verification import unprepared
+
+    if not wt.exists() or not _worktree_is_registered(workdir, wt):
+        return
+    if _worktree_is_active(wt):
+        raise CheckoutRefused(unprepared(
+            "checkout-busy",
+            f"a live sibling session still holds {wt}; waiting for it to finish before taking "
+            f"the checkout", expected=True))
+    if not _worktree_head(workdir, wt) and _worktree_is_locked(wt):
+        raise CheckoutRefused(unprepared(
+            "checkout-locked",
+            f"{wt} is pinned open by `git worktree lock` and holds uncommitted work that cannot "
+            f"be archived while it is pinned; agentflow will not disturb a checkout a human "
+            f"deliberately locked", stall=True))
+
+
 def _pid_is_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -714,7 +763,12 @@ class _WorktreeRunner:
         deletes the directory. Its entire state is archived to a recovery ref
         (:func:`archive_stranded_worktree`, ADR 0050) and the checkout rebuilt, so
         nothing is lost and the stage proceeds.
+
+        The two states that *cannot* be got past are read first, off the network
+        (:func:`refuse_unusable_checkout`), so which one it is survives to the caller
+        as a typed refusal instead of an anonymous exit code (#406).
         """
+        refuse_unusable_checkout(workdir, wt)
         _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).check_returncode()
         if wt.exists():
             if not _worktree_is_registered(workdir, wt):

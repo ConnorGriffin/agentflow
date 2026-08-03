@@ -301,10 +301,10 @@ def repo_view(cfg: RepoConfig) -> dict:
 def snapshot(repos: list[RepoConfig], *, dispatch_enabled: bool) -> dict:
     """The whole operator view: whether the daemon may claim new work, the sessions running
     right now (from the daemon's live-session file), what is currently being refused a start,
-    and a daemon status block. Per-pool running counts are DERIVED from `running[]` so a pool's
-    count always equals its sessions in the list — refusals ride in their own top-level key and
-    never touch those counts (#405). A missing/corrupt live file reads as fleet idle, never an
-    error."""
+    what has been refused long enough that only a human can move it, and a daemon status block.
+    Per-pool running counts are DERIVED from `running[]` so a pool's count always equals its
+    sessions in the list — refusals (#405) and stalls (#406) ride in their own top-level keys and
+    never touch those counts. A missing/corrupt live file reads as fleet idle, never an error."""
     running = live.running()
     per_pool = Counter(s.get("tool") for s in running)
     pool_list = pools()
@@ -324,5 +324,6 @@ def snapshot(repos: list[RepoConfig], *, dispatch_enabled: bool) -> dict:
         "pools": pool_list,
         "running": running,
         "refusals": live.refusals(),
+        "stalled": live.stalled(),
         "repos": [repo_view(c) for c in repos],
     }
