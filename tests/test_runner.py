@@ -1100,3 +1100,21 @@ def test_the_dispatch_ceiling_refuses_below_the_registration_count_that_killed_s
     logs = []
     assert not runner_mod.dispatch_preflight("owner/repo", "/w", set(), _log=logs.append)
     assert "REFUSING" in logs[-1]
+
+
+def test_dispatch_preflight_reserves_the_slot_for_the_worktree_it_admits(monkeypatch):
+    """Fails on today's `<=` boundary: at exactly WORKTREE_DISPATCH_CEILING registrations a cold
+    submission is admitted, and the session it admits opens registration ceiling+1 — back inside
+    the range #442 measured dead shells in. The ceiling is the count that may still exist *after*
+    the admitted worktree appears, so admission reserves that slot: refuse at the ceiling, admit
+    one below it."""
+    ceiling = runner_mod.WORKTREE_DISPATCH_CEILING
+    at_ceiling = [(f"/w/issue-{n}", None) for n in range(ceiling)]
+    monkeypatch.setattr(runner_mod, "_registered_worktrees", lambda workdir: at_ceiling)
+    logs = []
+    assert not runner_mod.dispatch_preflight("owner/repo", "/w", set(), _log=logs.append)
+    assert "REFUSING" in logs[-1]
+
+    one_below = [(f"/w/issue-{n}", None) for n in range(ceiling - 1)]
+    monkeypatch.setattr(runner_mod, "_registered_worktrees", lambda workdir: one_below)
+    assert runner_mod.dispatch_preflight("owner/repo", "/w", set())
