@@ -129,3 +129,7 @@ class Record:
                                          # of the queue and is exempt from the headroom/pacing/
                                          # ceiling gate (ADR 0034/0025 as amended by #162) — only a
                                          # true-zero-capacity permit reservation may still defer it
+    floodgates: bool = False             # per-record floodgates override (ADR 0025 amendment):
+                                         # same effect as the fleet-wide toggle — weekly allowance
+                                         # lifted, ceiling raised to 100, pacing cap lifted — but
+                                         # scoped to this one record; the permit ledger is untouched

@@ -536,10 +536,10 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
-                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: True)
     submission = SimpleNamespace(resume=0, pool="claude")
-    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
+    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_, **__: submission)
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(coordinated_build, "resume_if_held", lambda sub, records: sub)
     submitted = []
@@ -574,12 +574,12 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     # pick_pair offers codex, but the held Build was built by claude — the resume must pin back.
     monkeypatch.setattr(loop, "pick_pair",
-                        lambda operator=False: (SimpleNamespace(tool="codex"), None, ""))
+                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="codex"), None, ""))
     claimed = []
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claimed.append(n) or True)
     base = Submission(repo="o/r", subject="5", stage="build", pool="codex",
                       complexity="standard", source="/w/.agentflow/worktrees/codex/issue-5-t")
-    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: base)
+    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_, **__: base)
     held = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
                   repo="o/r", subject="5", state=HELD, claim=False,
                   source="/w/.agentflow/worktrees/claude/issue-5-t", input_ptr="the original brief")
@@ -617,10 +617,10 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
-                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: False)   # the race is lost
     submission = SimpleNamespace(resume=0, pool="claude")
-    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
+    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_, **__: submission)
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(coordinated_build, "resume_if_held", lambda sub, records: sub)
     waiting = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
@@ -652,11 +652,11 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
-                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim",
                         lambda repo, n, _label: pytest.fail("must not claim a held record"))
     submission = SimpleNamespace(repo="o/r", subject="5", resume=0, pool="claude")
-    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_: submission)
+    monkeypatch.setattr(coordinated_build, "build_submission", lambda *_, **__: submission)
     # The held original at resume 0 plus a live resume successor already running at resume 1.
     held = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
                   repo="o/r", subject="5", state=HELD, resume=0)
@@ -689,9 +689,9 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_pair",
-                        lambda operator=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_build, "build_submission",
-                        lambda *_: Submission(repo="o/r", subject="5", stage="build",
+                        lambda *_, **__: Submission(repo="o/r", subject="5", stage="build",
                                               pool="claude", complexity="deep"))
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda c: None)
     claim = {"ok": False}

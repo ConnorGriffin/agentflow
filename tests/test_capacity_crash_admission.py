@@ -23,7 +23,7 @@ def _crashing_query(monkeypatch):
     ``_query_pool`` already converts its own ``OSError``/timeout into the named "capacity
     helper unavailable" refusal; the gate's outer catch exists for everything *else*, so the
     crash here must be one of those — a bad output shape reading a quota field."""
-    def _boom(_pool):
+    def _boom(_pool, *_args, **_kwargs):
         raise KeyError("used_percent")
     monkeypatch.setattr(balancer, "_query_pool", _boom)
 

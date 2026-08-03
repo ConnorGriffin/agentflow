@@ -249,6 +249,12 @@ class _ProductionGate:
         # capacity — may still defer it. Background stages keep the full clear + pacing gate.
         if record.interactive:
             return True
+        # Effective floodgates for this admission check: this record's own flag (ADR 0025
+        # amendment) or the fleet-wide toggle. Either way its status is never written to the
+        # per-pool cache (below) — a plain record sharing the pool this cycle, or the same
+        # record on a later poll after the operator closes the global flag mid-cycle, must
+        # still see a fresh, unlifted status rather than one cached while floodgates was open.
+        fg = record.floodgates or balancer.floodgates_active()
         try:
             # Claude admission reserves conservative five-hour headroom for work already running on
             # the pool before another session starts (#305): its provider quota fact only updates
@@ -258,9 +264,10 @@ class _ProductionGate:
             # balancer.CLAUDE_INFLIGHT_RESERVE_PCT for the intent and calibration. Codex reports live
             # per-window facts, so it needs no such reservation.
             status = self._status.get(record.pool)
-            if status is None:
-                status = balancer._query_pool(record.pool)
-                self._status[record.pool] = status
+            if status is None or fg:
+                status = balancer._query_pool(record.pool, floodgates=fg)
+                if not fg:
+                    self._status[record.pool] = status
             if record.pool == "claude" and status.clear:
                 reserved_pct = (
                     self._running_permits(record.pool) * balancer.CLAUDE_INFLIGHT_RESERVE_PCT)
@@ -275,9 +282,9 @@ class _ProductionGate:
             # is exhausted. Both pools now carry a paced weekly allowance (#315), so each recheck is
             # pool-specific — Codex via `_codex_dispatch_status`, Claude via `_claude_dispatch_status`.
             if status is not None and record.pool == "codex":
-                status = balancer._codex_dispatch_status(status, time.time())
+                status = balancer._codex_dispatch_status(status, time.time(), floodgates=fg)
             elif status is not None and record.pool == "claude":
-                status = balancer._claude_dispatch_status(status, time.time())
+                status = balancer._claude_dispatch_status(status, time.time(), floodgates=fg)
         except Exception as e:
             # Still refuse — a crashed check must never admit — but not in silence: with no
             # status object there is no reason for the deferral line to surface, so name the
@@ -292,6 +299,11 @@ class _ProductionGate:
             return False
         self._deferred.pop(record.pool, None)
         self._active[record.pool] = status.active
+        # Floodgates (this record's own flag or the fleet-wide toggle) also lifts the per-cycle
+        # active-pacing budget — the ordinary ceiling/weekly checks above already cleared, so this
+        # is the last gate standing between it and admission.
+        if fg:
+            return True
         return not (status.active and self._paced[record.pool] >= balancer.ACTIVE_PACE)
 
     def deferral_reason(self, record) -> str | None:

@@ -255,6 +255,12 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   maximally utilized in parallel: builder → the pool with more headroom, reviewer →
   the other tool/pool. Never leaves a prepaid plan idle while work is queued.
 
+- **Floodgates** — an operator emergency override (ADR 0025 amendment) that lifts the
+  paced weekly allowance and raises the spend ceiling to 100 for a pool, fleet-wide (env
+  `AGENTFLOW_FLOODGATES` or the `agentflow floodgates open`/`close` flag file) or scoped to
+  one dispatch/record. Never touches the hard permit ledger — it widens *how much of the
+  window* may be spent, not how many sessions may run at once.
+
 - **Machine ceiling / per-stage caps** — the fleet runs many sessions at once, but bounded:
   the *machine ceiling* is the most agent sessions that may run concurrently (of any kind),
   and each kind has its own *cap* — triage is allowed more parallelism than builds, since

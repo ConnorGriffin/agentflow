@@ -138,6 +138,45 @@ def test_resume_status_and_pause_control_cold_submission(tmp_path):
     assert not (tmp_path / "state" / "enabled").exists()
 
 
+def test_floodgates_open_close_status_round_trip(tmp_path):
+    env = os.environ | {"AGENTFLOW_STATE": str(tmp_path / "state")}
+    run = lambda *args: subprocess.run(
+        ["uv", "run", "agentflow", "floodgates", *args],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30)
+
+    flag = tmp_path / "state" / "floodgates"
+
+    closed = run("status")
+    opened = run("open")
+    status_open = run("status")
+    still_there = flag.exists()
+    contents = flag.read_text().strip() if still_there else ""
+    reclosed = run("close")
+    gone = flag.exists()
+    status_closed = run("status")
+
+    assert closed.returncode == opened.returncode == 0
+    assert closed.stdout.strip() == "floodgates CLOSED"
+    assert opened.stdout.strip() == "floodgates OPEN"
+    assert still_there
+    assert contents.isdigit()
+    assert status_open.stdout.strip() == "floodgates OPEN (source: file)"
+    assert reclosed.stdout.strip() == "floodgates CLOSED"
+    assert not gone
+    assert status_closed.stdout.strip() == "floodgates CLOSED"
+
+
+def test_floodgates_status_reports_env_source(tmp_path):
+    env = os.environ | {
+        "AGENTFLOW_STATE": str(tmp_path / "state"),
+        "AGENTFLOW_FLOODGATES": "1",
+    }
+    result = subprocess.run(
+        ["uv", "run", "agentflow", "floodgates", "status"],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30)
+    assert result.stdout.strip() == "floodgates OPEN (source: env)"
+
+
 def test_console_starts_from_the_same_public_command():
     with mock.patch("agentflow.webapp.main") as start_console:
         cli.main(["console"])

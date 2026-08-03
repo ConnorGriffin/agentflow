@@ -138,6 +138,8 @@ class Submission:
                                       # stranded at a moved head (#208), not a completed stage
     interactive: bool = False         # operator-present (Ask) turn: admission priority over
                                       # background pipeline work (ADR 0034)
+    floodgates: bool = False          # per-record floodgates override (ADR 0025 amendment) —
+                                      # see `Record.floodgates`
     continuation: bool = False        # admit ahead of cold work — a conflict Revise is a
                                       # continuation of nearly-merged work, not new build (ADR 0038)
     review: ReviewState | None = None
@@ -236,6 +238,7 @@ class Coordinator:
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
+            floodgates=submission.floodgates,
             **review.record_fields(),
             created_at=int(time.time()))
         with self._lock:
