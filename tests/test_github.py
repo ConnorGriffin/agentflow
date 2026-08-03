@@ -359,3 +359,11 @@ def test_api_reports_failure_as_none(monkeypatch):
     _stub(monkeypatch, returncode=1)
     assert github.api(["auth", "token"]) is None
     assert github.api(["api", "x"], parse_json=True) is None
+
+
+# --- GraphQL query constants -----------------------------------------------------
+
+@pytest.mark.parametrize("query", [github._ROLLUP_QUERY, github._MAPS_QUERY],
+                          ids=["_ROLLUP_QUERY", "_MAPS_QUERY"])
+def test_graphql_query_constants_have_balanced_braces(query):
+    assert query.count("{") == query.count("}")
