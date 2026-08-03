@@ -88,7 +88,7 @@ class IssueView:
 
 @dataclass(frozen=True)
 class ClaimedIssue:
-    """One open issue carrying a claim label, with the last-touched time reconciliation needs."""
+    """One issue carrying a claim label, with the last-touched time reconciliation needs."""
     number: int
     updated_at: str
 
@@ -579,8 +579,8 @@ def list_pipeline_prs(repo: str, state: str, *, limit: int = 50) -> list[Pipelin
 
 
 def claimed_issues(repo: str, label: str) -> list[ClaimedIssue] | None:
-    """Open issues carrying ``label``, with the last-touched time claim reconciliation needs,
-    or ``None`` when the listing could not be read. No claims returns an empty list.
+    """Issues in any state carrying ``label``, with the last-touched time claim reconciliation
+    needs, or ``None`` when the listing could not be read. No claims returns an empty list.
 
     This is a REST read on purpose. The equivalent ``gh issue list --label`` is answered by
     GitHub's *search*, whose ceiling is about 30 requests a minute — far below what one
@@ -590,7 +590,7 @@ def claimed_issues(repo: str, label: str) -> list[ClaimedIssue] | None:
     same sequence as issues, so those are dropped — a PR must never be read as an issue's claim.
     """
     listed = _read_json(
-        ["api", f"repos/{repo}/issues?state=open&labels={quote(label)}&per_page=100"])
+        ["api", f"repos/{repo}/issues?state=all&labels={quote(label)}&per_page=100"])
     if not isinstance(listed, list):
         return None
     return [

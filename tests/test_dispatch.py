@@ -175,6 +175,74 @@ def test_orphaned_claim_is_cleared_only_after_durable_reconciliation(monkeypatch
     assert removed == [(7, "agentflow:building")]
 
 
+def test_closed_claim_waits_through_its_grace_then_reconciles_after_merge(monkeypatch):
+    """A human merge updates the closing issue at t=675; its stale claim clears only after grace."""
+    from agentflow import github
+
+    merge_at = 675
+    closed_claim = github.ClaimedIssue(384, "1970-01-01T00:11:15Z")
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(github, "claimed_issues",
+                        lambda _repo, label: [closed_claim] if label == "agentflow:building" else [])
+    removed = []
+    monkeypatch.setattr(github, "remove_label",
+                        lambda _repo, issue, label: removed.append((issue, label)) or True)
+    monkeypatch.setattr(github, "issue_labels", lambda _repo, _issue: frozenset())
+
+    monkeypatch.setattr(pipeline.time, "time", lambda: merge_at + 3599)
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
+    assert removed == []
+
+    monkeypatch.setattr(pipeline.time, "time", lambda: merge_at + 3601)
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 1
+    assert removed == [(384, "agentflow:building")]
+
+
+def test_closed_claim_with_a_live_unretired_record_stays_owned_after_grace(monkeypatch):
+    from agentflow import github
+    from agentflow.coordinator.record import Record, WAITING
+
+    live = Record(identity="o/r|384|build|-", stage="build", pool="claude", demand=5,
+                  repo="o/r", subject="384", state=WAITING, claim=True)
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [live])
+    monkeypatch.setattr(github, "claimed_issues", lambda _repo, label: (
+        [github.ClaimedIssue(384, "1970-01-01T00:11:15Z")]
+        if label == "agentflow:building" else []))
+    monkeypatch.setattr(pipeline.time, "time", lambda: 675 + 3601)
+    monkeypatch.setattr(github, "remove_label", lambda *args: pytest.fail("live claim retained"))
+
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
+
+
+def test_closed_claim_listing_failure_defers_without_removal(monkeypatch):
+    from agentflow import github
+
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(github, "claimed_issues", lambda _repo, _label: None)
+    monkeypatch.setattr(github, "remove_label", lambda *args: pytest.fail("unreadable listing"))
+    logs = []
+
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp"), _log=logs.append) == 0
+    assert any("building claim reconciliation deferred" in line for line in logs)
+
+
+def test_closed_claim_removal_or_verification_failure_is_not_reclaimed(monkeypatch):
+    from agentflow import github
+
+    claim = github.ClaimedIssue(384, "1970-01-01T00:11:15Z")
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
+    monkeypatch.setattr(github, "claimed_issues",
+                        lambda _repo, label: [claim] if label == "agentflow:building" else [])
+    monkeypatch.setattr(pipeline.time, "time", lambda: 675 + 3601)
+    monkeypatch.setattr(github, "remove_label", lambda *args: False)
+    monkeypatch.setattr(github, "issue_labels", lambda *args: pytest.fail("failed removal is final"))
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
+
+    monkeypatch.setattr(github, "remove_label", lambda *args: True)
+    monkeypatch.setattr(github, "issue_labels", lambda *args: None)
+    assert pipeline.reconcile_orphaned_claims(RepoConfig("o/r", "/tmp")) == 0
+
+
 def test_claim_reconciliation_reads_labels_off_the_hourly_budget_not_search(monkeypatch):
     """Reconciliation runs four lanes per repo every cycle. Asking GitHub's search for each one
     exceeds its ~30/minute ceiling across a fleet and starves the lane permanently, so the listing

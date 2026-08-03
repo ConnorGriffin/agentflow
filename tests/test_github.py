@@ -196,6 +196,7 @@ def test_claimed_issues_asks_the_rest_endpoint_and_never_the_search_api(monkeypa
     assert len(asked) == 1
     assert asked[0][:2] == ["gh", "api"]
     assert asked[0][2].startswith(f"repos/{REPO}/issues?")
+    assert "state=all" in asked[0][2]
     assert "labels=agentflow%3Abuilding" in asked[0][2]
     assert asked[0][1:3] != ["issue", "list"]   # never the search-backed listing
     assert "search" not in asked[0]
