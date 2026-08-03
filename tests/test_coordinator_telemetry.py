@@ -184,8 +184,10 @@ def test_model_costs_round_trip_as_typed_provider_attribution(tmp_path):
 
 def test_legacy_and_malformed_model_costs_preserve_other_usage(tmp_path):
     store = tmp_path / "records.db"
-    legacy = _entry(token="legacy", usage=AttemptUsage(input_tokens=12, cost_usd=0.4))
-    record_attempt(store, legacy)
+    record_attempt(store, _entry(token="legacy", usage=AttemptUsage(input_tokens=12, cost_usd=0.4)))
+    written = json.loads((telemetry_dir(store) / "legacy.json").read_text())
+    del written["usage"]["model_costs"]                # a record written before the breakdown existed
+    (telemetry_dir(store) / "legacy.json").write_text(json.dumps(written))
     malformed = json.loads((telemetry_dir(store) / "legacy.json").read_text())
     malformed["token"] = "malformed"
     malformed["usage"]["model_costs"] = [
