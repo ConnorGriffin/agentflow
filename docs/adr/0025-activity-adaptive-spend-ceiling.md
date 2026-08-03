@@ -115,7 +115,9 @@ evaluated fresh on every dispatch decision — never cached — so toggling eith
 effect on the very next admission check, with no daemon restart. While active, for **both**
 pools: `_weekly_over_pace` never blocks (the paced weekly allowance from #315 is lifted),
 and the idle/active spend ceiling (`ceiling_for`) becomes 100 instead of 85/50. The per-cycle
-active-pacing budget (`ACTIVE_PACE`) is also lifted in `_ProductionGate`.
+active-pacing budget (`ACTIVE_PACE`) is also lifted in `_ProductionGate`, as is the Claude
+in-flight reservation (`CLAUDE_INFLIGHT_RESERVE_PCT` × running permits) applied there — the
+hard permit ledger below is the only concurrency brake floodgates leaves standing.
 
 **Per-dispatch.** A `floodgates: bool` parameter threads from `pick_pair` through
 `_query_pool` and the `_claude_dispatch_status`/`_codex_dispatch_status` wrappers, scoping the

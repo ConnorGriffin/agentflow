@@ -178,3 +178,33 @@ def test_global_floodgates_opening_mid_cycle_lifts_a_plain_records_cached_block(
 
     second = _Record(pool="claude")  # a second plain record, same pool, same cycle
     assert gate(second) is True
+
+
+# --- _ProductionGate: floodgates also skips the Claude in-flight reservation ---------------
+
+def test_floodgates_skips_claude_inflight_reservation(monkeypatch):
+    """3 permits in flight on Claude at 61% five-hour utilization reserve
+    3 * CLAUDE_INFLIGHT_RESERVE_PCT (15%) = 45% of projected headroom, pushing the effective
+    read to 106% against a 100% ceiling — blocked under the ordinary policy even though the
+    raw status is clear. Floodgates must skip this reservation adjustment entirely, leaving
+    only the hard permit ledger as a concurrency brake (ADR 0025 amendment)."""
+    from agentflow.pipeline import _ProductionGate
+
+    clear_but_tight = balancer.PoolStatus(tool="claude", clear=True, spent_pct=61.0,
+                                           active=False, ceiling=100.0)
+
+    monkeypatch.setattr(balancer, "_query_pool",
+                         lambda tool, *, floodgates=False, **kwargs: clear_but_tight)
+    monkeypatch.setattr(balancer, "_claude_dispatch_status",
+                         lambda status, now, floodgates=False: status)
+    monkeypatch.setattr(balancer, "floodgates_active", lambda: False)
+
+    gate = _ProductionGate()
+    gate._running_permits = lambda pool: 3
+
+    plain = _Record(pool="claude")
+    assert gate(plain) is False  # blocked: reservation pushes projected usage past ceiling
+
+    gate.begin_cycle("claude")
+    floodgated = _Record(pool="claude", floodgates=True)
+    assert gate(floodgated) is True  # floodgates skips the reservation adjustment

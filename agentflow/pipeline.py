@@ -268,7 +268,7 @@ class _ProductionGate:
                 status = balancer._query_pool(record.pool, floodgates=fg)
                 if not fg:
                     self._status[record.pool] = status
-            if record.pool == "claude" and status.clear:
+            if record.pool == "claude" and status.clear and not fg:
                 reserved_pct = (
                     self._running_permits(record.pool) * balancer.CLAUDE_INFLIGHT_RESERVE_PCT)
                 if status.spent_pct + max(0.0, reserved_pct) >= status.ceiling:
