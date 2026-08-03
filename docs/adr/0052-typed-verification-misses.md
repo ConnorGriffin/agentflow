@@ -53,5 +53,24 @@ after three attempts (the fix-axis parks of late July, e.g. PR #346).
 - The repair envelope tells the next session exactly which proof to produce, so a repair can
   actually repair instead of re-verifying blindly and burning the budget.
 - Verifiers not yet converted (build, intake, mockup, research) keep bool answers and simply
-  carry no miss; they can adopt the type when their park classes warrant it. Admission-side
-  refusals (#365, #399) are the same disease in a different organ and are not covered here.
+  carry no miss; they can adopt the type when their park classes warrant it.
+- Admission-side refusals (#365, #399) were named here as the same disease in a different organ.
+  **Issue #405 shipped that half against this same contract**, and it is worth stating what the
+  preparation side needed that the verification side did not:
+  - Every stage's `prepare` now answers with a `Verification`. The adapters and the router pass
+    it through exactly as they pass a verify answer, and composed preparations (`rebuild the
+    checkout` *and* `prove the claim`) rely on Python's `and` yielding the first falsy operand,
+    so the half that refused survives instead of collapsing to a bare `False`.
+  - `Verification` gained exactly one field, `expected`. A verification miss is always something
+    to look at; a preparation refusal is not — a checkout held by a live sibling session is the
+    fleet working as intended. The collaborator marks its own benign refusals, so the coordinator
+    never keeps a list of blessed check ids. An expected refusal is still published; it only
+    stops the repeat breadcrumb.
+  - A miss is a fact about a finished attempt, so `verify_miss` is written once and read later.
+    A refusal is a fact about *now*, so the record carries at most one and the coordinator clears
+    it the instant preparation succeeds — before the capacity gate runs, which may then put its
+    own reason in the cleared slot. It is written only when it changes, so a stage refusing
+    identically every cycle costs one durable write, not one per tick.
+  - Refusals publish on their own snapshot key. The live board is a projection of *running*
+    records and the pool counts derive from it, so a waiting-and-refused record must never
+    appear there.

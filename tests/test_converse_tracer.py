@@ -293,7 +293,7 @@ def test_a_converse_turn_provisions_its_worktree_before_admission(tmp_path):
     Fails before the fix: the default ``worktree_ready`` only truthy-checks the path string and
     creates nothing, so the session would launch into a directory that does not exist."""
     sub = _submission(_repo_with_origin_main(tmp_path))
-    assert _provisioning_adapter().prepare(sub) is True
+    assert _provisioning_adapter().prepare(sub)
     wt = Path(sub.source)
     assert (wt / ".git").exists()                         # a real git worktree, not an empty dir
     assert (wt / "README.md").read_text() == "the repo"   # origin/main is checked out to read
@@ -305,9 +305,9 @@ def test_a_resumed_converse_turn_keeps_the_reply_it_already_wrote(tmp_path):
     in the worktree (ADR 0034 resume)."""
     sub = _submission(_repo_with_origin_main(tmp_path))
     adapter = _provisioning_adapter()
-    assert adapter.prepare(sub) is True
+    assert adapter.prepare(sub)
     _write_reply(sub, "half-written answer")              # the interrupted session's local work
-    assert adapter.prepare(sub) is True                   # resume
+    assert adapter.prepare(sub)                   # resume
     assert coordinated_converse.read_reply(sub) == "half-written answer"
 
 
@@ -316,4 +316,4 @@ def test_a_converse_turn_defers_when_its_worktree_cannot_be_provisioned(tmp_path
     permit and no attempt consumed and the turn retries next cycle — never launching a session
     into a missing checkout."""
     sub = _submission(tmp_path / "not-a-repo")
-    assert _provisioning_adapter().prepare(sub) is False
+    assert not _provisioning_adapter().prepare(sub)

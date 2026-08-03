@@ -20,6 +20,7 @@ from agentflow.state import state_dir
 
 STATE_DIR = state_dir()
 LIVE_FILE = STATE_DIR / "live-sessions.json"
+REFUSALS_FILE = STATE_DIR / "refusals.json"
 DAEMON_FILE = STATE_DIR / "daemon-status.json"
 SNAPSHOT_FILE = STATE_DIR / "snapshot.json"
 
@@ -59,6 +60,23 @@ def replace_projection(entries: list[dict]) -> None:
     attempts, claims, and permits never read it (issue #109).
     """
     _write_atomic(LIVE_FILE, list(entries))
+
+
+def refusals() -> list[dict]:
+    """Every record something is currently refusing, and why. `[]` on a missing / partial /
+    corrupt file — nothing refused reads the same as nothing recorded, which is the honest
+    fail-soft answer for derived state the console only displays."""
+    data = _read(REFUSALS_FILE, [])
+    return data if isinstance(data, list) else []
+
+
+def replace_refusals(entries: list[dict]) -> None:
+    """Publish the coordinator's current refusals as the whole refusal projection (#405).
+
+    Kept apart from the live board on purpose: a refused record reserves nothing and is not
+    running, so it must never reach the running rows the pool counts are derived from.
+    """
+    _write_atomic(REFUSALS_FILE, list(entries))
 
 
 def mark_cycle(poll_seconds: int) -> None:

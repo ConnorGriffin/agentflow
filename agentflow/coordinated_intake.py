@@ -9,6 +9,7 @@ from pathlib import Path
 from agentflow import github
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import PROVIDER_INPUT_V1
+from agentflow.coordinator.verification import PREPARED, payload_preview, unprepared
 from agentflow.intake import (IntakeResult, IntakeRoute, apply_intake, intake_prompt,
                               intake_result_is_durable)
 from agentflow.labels import TRIAGING, release
@@ -45,22 +46,31 @@ def intake_submission(cfg, issue: dict, extra: str, comments: str, tool: str) ->
                                            sort_keys=True))
 
 
-def reset_worktree(record) -> bool:
-    """Discard and rebuild Intake's read-only checkout from its durable source pointer."""
+def reset_worktree(record):
+    """Discard and rebuild Intake's read-only checkout from its durable source pointer.
+
+    Every refusal is named (#405). ``input_ptr`` is durable external text a crash or a hand edit
+    can corrupt, so an unreadable one is quoted through the bounded, single-line preview rather
+    than copied into the record, the log, and the snapshot."""
     from agentflow.runner import ClaudeRunner, CodexRunner
     if not record.source or not record.input_ptr:
-        return False
+        return unprepared("source-missing",
+                          "the record carries no checkout pointer and provider payload to "
+                          "rebuild triage from")
     try:
         payload = json.loads(record.input_ptr)
         snapshot = payload["snapshot"]
         source_ref = payload["source_ref"]
     except (ValueError, KeyError, TypeError):
-        return False
+        return unprepared("input-unreadable", payload_preview("input_ptr", record.input_ptr))
     if not isinstance(source_ref, str) or not source_ref:
-        return False
+        return unprepared("source-ref-invalid",
+                          f"the payload's frozen commit is not a usable ref: {source_ref!r}")
     ref = _intake_ref(record)
     if ref is None:
-        return False
+        return unprepared("worktree-ref-unreadable",
+                          f"the record's checkout pointer does not parse as this issue's own "
+                          f"intake worktree: {record.source!r}")
     workdir = ref.workdir
     wt = Path(ref.path)
     if wt.exists():
@@ -69,8 +79,10 @@ def reset_worktree(record) -> bool:
     try:
         runner.prepare_worktree_detached(workdir, source_ref, wt)
         runner.provision(wt)
-    except subprocess.CalledProcessError:
-        return False
+    except subprocess.CalledProcessError as e:
+        return unprepared("checkout-failed",
+                          f"preparing the read-only checkout at {wt} from {source_ref[:12]} "
+                          f"exited {e.returncode}")
     # Fetch any issue-body screenshots into the read-only worktree so the vision-capable
     # model can Read them (issue #191). Fail closed: a fetch failure leaves no image and
     # intake falls back to text-only routing — it never wedges preparation.
@@ -79,7 +91,7 @@ def reset_worktree(record) -> bool:
         stage_attachments(snapshot.get("body", ""), wt / ATTACHMENTS_DIRNAME)
     except Exception:  # noqa: BLE001 — image ingestion is best-effort, never fatal to intake
         pass
-    return True
+    return PREPARED
 
 
 def dispose_worktree(record) -> bool:
@@ -112,15 +124,24 @@ def _intake_ref(record) -> WorktreeRef | None:
     return ref
 
 
-def intake_claim_ready(record) -> bool:
+def intake_claim_ready(record):
     """Prove the durable Intake record still owns GitHub's triaging claim before admission —
     on an issue that is still open. Closing an issue does not strip its labels, so the label
     alone would admit a session to triage a closed issue (#438); refusing here keeps the
     session unspent while :func:`_retire_dead_intakes` retires the record."""
     standing = github.issue_standing(record.repo, int(record.subject))
     if standing is None:   # fail closed: a read that couldn't reach GitHub stays unknown
-        return False
-    return TRIAGING in standing.labels and standing.state != "CLOSED"
+        return unprepared("claim-unreadable",
+                          f"GitHub did not answer for {record.repo}#{record.subject}, so the "
+                          f"triaging claim cannot be proved")
+    if TRIAGING not in standing.labels:
+        return unprepared("claim-released",
+                          f"{record.repo}#{record.subject} no longer carries the triaging claim; "
+                          f"something else has taken the issue over")
+    if standing.state == "CLOSED":
+        return unprepared("subject-closed",
+                          f"{record.repo}#{record.subject} was closed while its triage waited")
+    return PREPARED
 
 
 def _retire_dead_intakes(coord) -> None:

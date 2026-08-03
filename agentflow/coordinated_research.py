@@ -28,6 +28,7 @@ from pathlib import Path
 
 from agentflow import github
 from agentflow.coordinator import Submission
+from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.handoff import DurableHandoff, Notification, Subject
 from agentflow.labels import (AWAITING_DISPOSITION, RESEARCH_PARKED, RESOLVING,
                               release as release_claim)
@@ -328,27 +329,38 @@ def _findings_ready(record, obs) -> bool:
     return findings is not None and parse_disposition(findings) is not None
 
 
-def _research_worktree_ready(record) -> bool:
+def _research_worktree_ready(record):
     """Provision the run's isolated worktree before admission (ADR 0030): a detached checkout of
     ``origin/main`` the bounded session reads to investigate, and into which it writes its findings.
 
     An existing worktree is reused *exactly as it is* — a resumed run keeps the partial findings it
     already wrote — so it is never reset or cleaned. A research run owns no branch and pushes nothing,
-    so the checkout is detached. Any git failure returns False, so admission is skipped with no permit
-    and no attempt consumed — the run simply retries next cycle."""
+    so the checkout is detached. Any git failure refuses by name (#405), so admission is skipped with
+    no permit and no attempt consumed — the run simply retries next cycle, and the operator can see
+    which step it is retrying."""
     from agentflow.runner import _worktree_is_registered
     ref = WorktreeRef.parse(record.source)
     if ref is None or ref.kind is not WorktreeKind.RESEARCH or ref.tool != record.pool:
-        return False
+        return unprepared("source-unreadable",
+                          f"the run's checkout pointer does not parse as this pool's own "
+                          f"research worktree: {record.source!r}")
     workdir = ref.workdir
     wt = Path(ref.path)
     if wt.exists():
-        return _worktree_is_registered(workdir, wt)  # reuse as-is; never rebuild a resumed run
+        if not _worktree_is_registered(workdir, wt):  # reuse as-is; never rebuild a resumed run
+            return unprepared("worktree-unregistered",
+                              f"{wt} exists on disk but {workdir} does not list it as a worktree")
+        return PREPARED
     wt.parent.mkdir(parents=True, exist_ok=True)
-    if _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).returncode != 0:
-        return False
-    return _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt),
-                 "origin/main"]).returncode == 0
+    fetch = _run(["git", "-C", workdir, "fetch", "origin", "--quiet"])
+    if fetch.returncode != 0:
+        return unprepared("fetch-failed",
+                          f"`git -C {workdir} fetch origin` exited {fetch.returncode}")
+    added = _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), "origin/main"])
+    if added.returncode != 0:
+        return unprepared("worktree-add-failed",
+                          f"`git worktree add --detach` at {wt} exited {added.returncode}")
+    return PREPARED
 
 
 # --- parent map + 'Decisions so far' breadcrumb (pure helpers + one GitHub read) ---------

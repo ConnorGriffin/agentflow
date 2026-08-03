@@ -678,7 +678,7 @@ def test_attack_claim_proof_refuses_a_closed_issue_still_carrying_the_label(monk
     monkeypatch.setattr(coordinated_attack.github, "issue_standing",
                         lambda repo, n: coordinated_attack.github.IssueStanding(
                             labels=frozenset({TRIAGING}), state="CLOSED"))
-    assert coordinated_attack.attack_claim_ready(_attack_record()) is False
+    assert not coordinated_attack.attack_claim_ready(_attack_record())
 
 
 def test_attack_claim_proof_admits_an_open_issue_with_the_label_and_fails_closed(monkeypatch):
@@ -686,6 +686,6 @@ def test_attack_claim_proof_admits_an_open_issue_with_the_label_and_fails_closed
     monkeypatch.setattr(coordinated_attack.github, "issue_standing",
                         lambda repo, n: coordinated_attack.github.IssueStanding(
                             labels=frozenset({TRIAGING}), state="OPEN"))
-    assert coordinated_attack.attack_claim_ready(_attack_record()) is True
+    assert coordinated_attack.attack_claim_ready(_attack_record())
     monkeypatch.setattr(coordinated_attack.github, "issue_standing", lambda repo, n: None)
-    assert coordinated_attack.attack_claim_ready(_attack_record()) is False
+    assert not coordinated_attack.attack_claim_ready(_attack_record())

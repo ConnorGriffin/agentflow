@@ -262,8 +262,8 @@ def test_a_checkout_whose_hooks_cannot_be_installed_still_runs_its_stage(tmp_pat
     capsys.readouterr()
 
     try:
-        assert stage_worktree.worktree_ready(_record(wt)) is True
-        assert stage_worktree.worktree_ready(_record(wt)) is True
+        assert stage_worktree.worktree_ready(_record(wt))
+        assert stage_worktree.worktree_ready(_record(wt))
     finally:
         git_dir.chmod(0o755)
     _commit(wt, "unenforced\n", "-m", "AgentFlow change")

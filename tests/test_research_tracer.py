@@ -892,11 +892,11 @@ def test_a_research_run_provisions_a_detached_worktree_and_reuses_it_on_resume(t
     adapter = ResearchStageAdapter(
         findings_ready=coordinated_research._findings_ready,
         worktree_ready=coordinated_research._research_worktree_ready)
-    assert adapter.prepare(sub) is True
+    assert adapter.prepare(sub)
     wt = Path(sub.source)
     assert (wt / ".git").exists() and (wt / "README.md").read_text() == "the repo"
     _write_findings(sub, "partial findings")
-    assert adapter.prepare(sub) is True                                # resume reuses as-is
+    assert adapter.prepare(sub)                                # resume reuses as-is
     assert coordinated_research.read_findings(sub) == "partial findings"
 
 
@@ -906,7 +906,7 @@ def test_a_research_run_defers_when_its_worktree_cannot_be_provisioned(tmp_path)
     adapter = ResearchStageAdapter(
         findings_ready=coordinated_research._findings_ready,
         worktree_ready=coordinated_research._research_worktree_ready)
-    assert adapter.prepare(sub) is False
+    assert not adapter.prepare(sub)
 
 
 def test_research_dispatch_withdraws_the_submission_when_the_claim_cannot_be_set(monkeypatch):

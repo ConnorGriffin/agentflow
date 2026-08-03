@@ -33,6 +33,7 @@ from agentflow import github
 from agentflow.balancer import BUILD_POOLS, pick_reviewer
 from agentflow.coordinator import Coordinator, tracer
 from agentflow.coordinator.store import StoreUnavailable
+from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
 from agentflow.labels import BUILDING, claim, release
 from agentflow.pr_park import (chain_uncertainty, exact_head_review_chain, park_context,
@@ -540,12 +541,6 @@ def _review_follow_ups_valid(record, verdict) -> bool:
         issue_url=lambda number: github.issue_url(record.repo, number),
         issue_search=lambda query: github.find_issues(record.repo, query, limit=100))
 
-# Consecutive review-prepare failures per source path, so a genuinely stuck
-# review (one that never checks out) is surfaced periodically instead of silently
-# no-op'ing admission every cycle. Process-local — a daemon restart re-arms it.
-_REVIEW_PREPARE_FAILURES: dict[str, int] = {}
-
-
 def _commit_is_gone(workdir: str, sha: str) -> bool:
     """Whether ``sha`` is absent from the repository — the branch was rebased or amended past it
     and it survives on no ref. Absence is only claimed on a definite answer, so an unreadable
@@ -555,13 +550,16 @@ def _commit_is_gone(workdir: str, sha: str) -> bool:
     return _run(["git", "-C", workdir, "cat-file", "-e", f"{sha}^{{commit}}"]).returncode != 0
 
 
-def _review_worktree_reset(record, _log=None) -> bool:
+def _review_worktree_reset(record):
     """Prepare Review's detached, writable exact-head checkout (ADR 0030, amended).
 
     The first attempt starts at the immutable target. A continuation reuses the registered
     checkout exactly as it is so an interrupted review keeps its fixes; it is never reset or
     cleaned. A fresh logical review may reuse a clean prior checkout and reset it to its own
-    target. Any git failure skips admission without consuming a permit or attempt.
+    target. Any git failure skips admission without consuming a permit or attempt, and names
+    which of the five refusals it was (#405) — the coordinator owns the periodic breadcrumb and
+    prints that name, so a stuck review reads as the checkout and path that refused rather than
+    the old bare "admission is stuck".
 
     A *parked* review's checkout is no longer kept indefinitely: once the record is held it stops
     being protected from reclamation, so a long-idle one may have been archived to a recovery ref
@@ -571,8 +569,13 @@ def _review_worktree_reset(record, _log=None) -> bool:
     """
     from agentflow.runner import ClaudeRunner, CodexRunner
     facts = review_source_facts(record)
-    if facts is None or not record.target:
-        return False
+    if facts is None:
+        return unprepared("source-unreadable",
+                          f"the record's checkout pointer does not parse as a review worktree "
+                          f"for an open PR: {record.source!r}")
+    if not record.target:
+        return unprepared("target-empty",
+                          "the record names no reviewed head SHA to check out")
     workdir, _pr = facts
     wt = Path(record.source)
     from agentflow.runner import _worktree_is_active, _worktree_is_registered
@@ -580,37 +583,31 @@ def _review_worktree_reset(record, _log=None) -> bool:
     if _worktree_is_active(wt):
         # A live sibling session still holds this checkout — the ordinary overlap while a
         # superseded review finishes and its successor waits its turn. Contention, not a
-        # failing checkout: skip admission without charging the stuck counter, so the
-        # operator is not paged over a worktree that is working exactly as intended.
-        _REVIEW_PREPARE_FAILURES.pop(record.source, None)
-        return False
+        # failing checkout: marked expected, so it stays visible to the operator without
+        # charging the repeat breadcrumb — nobody is paged over a worktree working as intended.
+        return unprepared("sibling-active",
+                          f"a live sibling review session still holds {wt}; waiting for it to "
+                          f"finish before taking the checkout", expected=True)
     try:
         if wt.exists() and _worktree_is_registered(workdir, wt) and getattr(record, "attempts", 0):
             runner.provision(wt)
-            _REVIEW_PREPARE_FAILURES.pop(record.source, None)
-            return True  # continuation: preserve committed, dirty, and untracked review work
+            return PREPARED  # continuation: preserve committed, dirty, and untracked review work
         wt.parent.mkdir(parents=True, exist_ok=True)
         runner.prepare_worktree_detached(workdir, record.target, wt)
         runner.provision(wt)
-    except subprocess.CalledProcessError:
-        fails = _REVIEW_PREPARE_FAILURES[record.source] = \
-            _REVIEW_PREPARE_FAILURES.get(record.source, 0) + 1
-        # Surface on the 2nd consecutive failure, then re-remind every 10th, so a
-        # long-stuck review keeps a periodic breadcrumb instead of a single line.
-        if _log is not None and fails >= 2 and (fails - 2) % 10 == 0:
-            if _commit_is_gone(workdir, record.target):
-                # The reviewed head was rebased or amended away. The record is not stuck on its
-                # checkout and no human can clear it: the diverged-review reconciler supersedes it
-                # with one at the live head as soon as a reviewer pool has headroom. Say that,
-                # rather than sending someone after a checkout that is fine.
-                _log(f"{record.repo}: review target {record.target[:12]} no longer exists — "
-                     "awaiting retarget to the live PR head (needs reviewer headroom)")
-            else:
-                _log(f"{record.repo}: review checkout keeps failing at {record.source} — "
-                     "admission is stuck; the PR will not be reviewed until it is cleared")
-        return False
-    _REVIEW_PREPARE_FAILURES.pop(record.source, None)
-    return True
+    except subprocess.CalledProcessError as e:
+        if _commit_is_gone(workdir, record.target):
+            # The reviewed head was rebased or amended away. The record is not stuck on its
+            # checkout and no human can clear it: the diverged-review reconciler supersedes it
+            # with one at the live head as soon as a reviewer pool has headroom. Say that,
+            # rather than sending someone after a checkout that is fine.
+            return unprepared("reviewed-head-gone",
+                              f"review target {record.target[:12]} no longer exists — awaiting "
+                              f"retarget to the live PR head (needs reviewer headroom)")
+        return unprepared("checkout-failed",
+                          f"review checkout keeps failing at {record.source} (exit "
+                          f"{e.returncode}); the PR will not be reviewed until it is cleared")
+    return PREPARED
 
 
 def _review_slug(record) -> str:

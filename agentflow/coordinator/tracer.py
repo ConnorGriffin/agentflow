@@ -126,6 +126,28 @@ def live_projection(records) -> list[dict]:
     return entries
 
 
+def refusal_projection(records) -> list[dict]:
+    """Render every record that is currently being refused as a board row (#405).
+
+    Deliberately *not* part of :func:`live_projection`: a refused record reserves nothing and is
+    not running, so folding it into the running rows would inflate every pool's running count for
+    work that has not started. One row per record whose latest cycle found something refusing it —
+    the preparation check that said no, or the pool capacity that did — carrying ``expected`` so
+    ordinary contention reads differently from a stage nobody can un-stick."""
+    return [
+        {
+            "repo": record.repo,
+            "subject": record.subject,
+            "stage": record.stage,
+            "pool": record.pool,
+            "refusal": record.refusal,
+            "expected": bool(record.refusal_expected),
+        }
+        for record in records
+        if record.refusal and not record.retired
+    ]
+
+
 def load_records(store_path=None) -> list[Record]:
     """The durable continuation records — the production reader behind the pure functions
     above. Reads the coordinator's private store directly; a fail-closed store surfaces its

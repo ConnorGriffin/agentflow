@@ -80,6 +80,13 @@ class Record:
     handoff_proof: str | None = None     # proof the stage-native human handoff exists (crash-safe)
     hold_pending: bool = False           # classified as a hold, awaiting its durable handoff
     hold_reason: str | None = None       # exhaustion, permanent cause, or no-successor boundary
+    refusal: str = ""                    # why this record is still waiting, as of the latest cycle
+                                         # ("check: live detail") — the preparation collaborator or
+                                         # the admission gate that refused it. Cleared the moment
+                                         # nothing refuses, so it always describes now, never a
+                                         # cause that has since gone away (#405)
+    refusal_expected: bool = False       # that refusal is ordinary contention (a live sibling still
+                                         # holding a checkout), not something a human should chase
     verify_miss: str = ""                # the last attempt's first failed verification conjunct
                                          # ("check: live detail") — named in recovery envelopes,
                                          # hold reasons, telemetry, and the park comment, so a

@@ -164,7 +164,7 @@ def build_coordinator(_log=None) -> Coordinator:
         main_head=coordinated_build._main_head)
     review = ReviewStageAdapter(
         verdict_ready=coordinated_review._verdict_ready,
-        worktree_reset=lambda record: coordinated_review._review_worktree_reset(record, _log=_log),
+        worktree_reset=coordinated_review._review_worktree_reset,
         handoff=park_pr,
         settle=coordinated_review._settle_review,
         prepare_settle=coordinated_review._prepare_review_settlement)
@@ -220,10 +220,12 @@ class _ProductionGate:
         self._deferred: dict[str, str] = {}
         # A capacity observation that *raised* left no status object at all, so no reason string
         # exists for the deferral line to name (#365). The crash is recorded here against the
-        # record's own pool and reported once per pool per cycle — a raising check raises for
-        # every record on that pool, so one line is honest and N would be spam. ``None`` marks
-        # an already-reported crash, keeping the rest of the cycle silent.
-        self._crashed: dict[str, str | None] = {}
+        # record's own pool and stays readable for the rest of the cycle: every record the crash
+        # refuses persists and publishes it (#405). Which pools have already *printed* it is
+        # tracked separately below, because a raising check raises for every record on that pool
+        # — one line is honest and N would be spam.
+        self._crashed: dict[str, str] = {}
+        self._crash_reported: set[str] = set()
         # Capacity facts are one observation per pool per coordinator cycle. The gate is evaluated
         # once for every waiting record; re-running the external helper for each one can serialize
         # its 30-second timeout across the whole queue and hold the daemon pass for minutes.
@@ -238,6 +240,7 @@ class _ProductionGate:
         self._paced.pop(pool, None)
         self._deferred.pop(pool, None)
         self._crashed.pop(pool, None)
+        self._crash_reported.discard(pool)
 
     def __call__(self, record) -> bool:
         from agentflow import balancer
@@ -293,6 +296,11 @@ class _ProductionGate:
             self._crashed.setdefault(
                 record.pool, f"capacity check failed: {type(e).__name__}: {e}")
             return False
+        # The check ran to completion, so any earlier crash on this pool is over: an exception
+        # leaves the status cache empty and the very next record retries the query. Drop the stale
+        # crash before any clear/pacing decision, or a record this cycle refused for ordinary
+        # pacing would publish a capacity-check failure that has already recovered (#405).
+        self._crashed.pop(record.pool, None)
         if not status or not status.clear:
             if status is not None and status.reason:
                 self._deferred[record.pool] = status.reason
@@ -309,13 +317,28 @@ class _ProductionGate:
     def deferral_reason(self, record) -> str | None:
         """Why the last admission check refused this record's pool — the headroom/pacing reason
         the coordinator's per-record deferral line names (#436), or the capacity-check crash
-        that refused with no status at all (#365, reported once per pool per cycle) — or
-        ``None`` for a refusal with nothing durable to report (the per-cycle pace budget)."""
+        that refused with no status at all (#365) — or ``None`` for a refusal with nothing
+        durable to report (the per-cycle pace budget).
+
+        A pure read: every record the same crash refuses gets the same answer, so all of them can
+        record and publish why they are waiting. Whether the *line* is printed is
+        :meth:`should_emit_deferral`'s separate question (#405)."""
         crash = self._crashed.get(record.pool)
         if crash is not None:
-            self._crashed[record.pool] = None  # one line per pool per cycle, never per record
             return crash
         return self._deferred.get(record.pool)
+
+    def should_emit_deferral(self, record) -> bool:
+        """Whether this refusal is worth a daemon line. A headroom or pacing reason is per-record
+        by design. A capacity-check *crash* is not: it raises identically for every record on the
+        pool, so it is printed once per pool per cycle and stays quiet after that — while every
+        refused record still keeps the crash as its durable reason."""
+        if record.pool not in self._crashed:
+            return True
+        if record.pool in self._crash_reported:
+            return False
+        self._crash_reported.add(record.pool)
+        return True
 
     @staticmethod
     def reservation_limits(record) -> ReservationLimits:
@@ -749,4 +772,5 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
                     continue
     records = tracer.load_records()
     live.replace_projection(tracer.live_projection(records))
+    live.replace_refusals(tracer.refusal_projection(records))
     return outcomes

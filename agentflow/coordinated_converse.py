@@ -31,6 +31,7 @@ from pathlib import Path
 
 from agentflow import live
 from agentflow.coordinator import Submission
+from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.workspace import channel, publish
@@ -179,29 +180,40 @@ def _reply_ready(record, obs):
     return VERIFIED
 
 
-def _ask_worktree_ready(record) -> bool:
+def _ask_worktree_ready(record):
     """Provision the turn's isolated worktree before admission (ADR 0030/0034): a detached checkout
     of ``origin/main`` the bounded session reads to answer, and into which it writes its reply.
 
     An existing worktree is reused *exactly as it is* — a resumed turn keeps the partial reply it
     already wrote in the worktree, so it is never reset or cleaned (that is why this cannot reuse
     the review stage's freshening ``prepare_worktree_detached``). An Ask owns no branch and pushes
-    nothing, so the checkout is detached. Any git failure returns False, so admission is skipped
-    with no permit and no attempt consumed — the turn simply retries next cycle."""
+    nothing, so the checkout is detached. Any git failure refuses by name (#405), so admission is
+    skipped with no permit and no attempt consumed — the turn simply retries next cycle, and the
+    operator can see which step it is retrying."""
     from agentflow.runner import _worktree_is_registered
     src = record.source or ""
     ref = WorktreeRef.parse(src)
     if ref is None or ref.kind is not WorktreeKind.CONVERSE or ref.tool != record.pool:
-        return False
+        return unprepared("source-unreadable",
+                          f"the turn's checkout pointer does not parse as this pool's own "
+                          f"conversation worktree: {src!r}")
     workdir = ref.workdir
     wt = Path(src)
     if wt.exists():
-        return _worktree_is_registered(workdir, wt)  # reuse as-is; never rebuild a resumed turn
+        if not _worktree_is_registered(workdir, wt):  # reuse as-is; never rebuild a resumed turn
+            return unprepared("worktree-unregistered",
+                              f"{wt} exists on disk but {workdir} does not list it as a worktree")
+        return PREPARED
     wt.parent.mkdir(parents=True, exist_ok=True)
-    if _run(["git", "-C", workdir, "fetch", "origin", "--quiet"]).returncode != 0:
-        return False
-    return _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt),
-                 "origin/main"]).returncode == 0
+    fetch = _run(["git", "-C", workdir, "fetch", "origin", "--quiet"])
+    if fetch.returncode != 0:
+        return unprepared("fetch-failed",
+                          f"`git -C {workdir} fetch origin` exited {fetch.returncode}")
+    added = _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), "origin/main"])
+    if added.returncode != 0:
+        return unprepared("worktree-add-failed",
+                          f"`git worktree add --detach` at {wt} exited {added.returncode}")
+    return PREPARED
 
 
 def _adopt_turn(record) -> str | None:

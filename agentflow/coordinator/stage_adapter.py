@@ -41,12 +41,17 @@ class StageAdapter:
         self._observer = observer or ProviderObserver()
         self._handoff = handoff
 
-    def prepare(self, record) -> bool:
-        """Reuse the retained branch and worktree before admission (ADR 0030). Returns whether the
+    def prepare(self, record):
+        """Reuse the retained branch and worktree before admission (ADR 0030). Answers whether the
         owned worktree is present and checked out; a miss consumes no permit and no attempt, and
         the record simply waits and retries — its claim, lineage, branch, worktree, and local
-        changes are untouched, so an interrupted stage resumes exactly where it left off."""
-        return bool(self._worktree_ready(record))
+        changes are untouched, so an interrupted stage resumes exactly where it left off.
+
+        Returns the collaborator's answer as-is, exactly as ``verify`` does: a typed
+        :class:`~agentflow.coordinator.verification.Verification` names the check that refused and
+        the live values behind it, so the coordinator can persist and publish why the record is
+        still waiting; a legacy bool stays valid and simply carries no detail (#405)."""
+        return self._worktree_ready(record)
 
     def observe(self, record):
         """Reconstruct the provider observation from the attempt's durable session artifacts.
