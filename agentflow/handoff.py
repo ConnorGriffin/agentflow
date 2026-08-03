@@ -34,9 +34,10 @@ itself after the call confirms (returns non-``None``).
 
 Every handoff that hands a GitHub issue or PR to a human now runs through here: the review
 and respond parks, the intake hold, the intake grill/mockup routes, and the build and mockup
-holds. What stays outside is what is not a handoff — resolving a research ticket writes no
-marker for a human to answer and pings no one, and a parked conversation turn lives in the
-workspace store rather than on an issue or PR.
+holds, plus Research's findings-awaiting-disposition and parked-run handoffs. Research carries
+the stable ``agentflow-research-findings`` and ``agentflow-research-park`` markers respectively;
+its closing dispositions are not handoffs and still ping no one. A parked conversation turn also
+stays outside because it lives in the workspace store rather than on an issue or PR.
 """
 
 from __future__ import annotations

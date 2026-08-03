@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from agentflow import coordinated_research, loop
+from agentflow.coordinator import ResearchStageAdapter
 from agentflow.labels import AWAITING_DISPOSITION, RESEARCH_PARKED, RESEARCH_TICKET, RESOLVING
 
 
@@ -30,7 +31,8 @@ def _record(tmp_path, number=7, hold_reason="continuation budget exhausted"):
     reason is the record's own durable field — it is what the park's comment is chosen from."""
     wt = tmp_path / ".agentflow" / "worktrees" / "claude" / f"research-{number}"
     wt.mkdir(parents=True)
-    return SimpleNamespace(repo="o/r", subject=str(number), pool="claude", source=str(wt),
+    return SimpleNamespace(identity=f"o/r:{number}:research", repo="o/r", subject=str(number),
+                           pool="claude", source=str(wt),
                            hold_reason=hold_reason)
 
 
@@ -44,6 +46,30 @@ def _plant(record, text):
 # An artifact that reads like real research but carries no ruling at all — the ordinary exhaustion
 # shape: the session wrote up what it found and never produced the machine-checkable section.
 _NO_DISPOSITION = "## Findings\n\nThe widget path is reached from three call sites.\n"
+
+_PARK_HEADER = (
+    "> *agentflow research — parked by an unattended session (AI).*\n"
+    "<!-- agentflow-research-park:#7 -->\n\n"
+)
+_ORDINARY_OPENING = (
+    "An unattended research session ended without producing a ruling the daemon is allowed "
+    "to record, so the ticket is parked for you.\n\n"
+)
+_ORDINARY_NEXT_STEP = (
+    "This says nothing about whether the question is a good one — only that the machine could "
+    "not answer it in the shape the decision map requires. Unattended research will not try this "
+    "ticket again. Rewrite the question so a bounded session can answer it, or answer it yourself "
+    "in a wayfinder session."
+)
+_PROVIDER_OPENING = (
+    "An unattended research session could not get far enough to rule on this ticket, so the "
+    "ticket is parked for you.\n\n"
+)
+_PROVIDER_NEXT_STEP = (
+    "Nothing here says anything about the question itself — the session never got to read it. "
+    "Unattended research will not try this ticket again: once the coding agent is healthy, file "
+    "a fresh research ticket for the same question, or answer it in a wayfinder session."
+)
 
 
 class _FakeTicket:
@@ -69,6 +95,10 @@ class _FakeTicket:
             url=f"https://github.com/o/r/issues/{self.number}",
             labels=frozenset(self.labels),
             comments=[github.Comment(body=b, created_at="") for b in self.comments])
+
+    def issue_comments(self, repo, number):
+        from agentflow import github
+        return [github.Comment(body=b, created_at="") for b in self.comments]
 
     def comment(self, repo, number, body):
         if self.fail_comment:
@@ -112,6 +142,7 @@ class _FakeTicket:
     def install(self, monkeypatch):
         from agentflow import github
         monkeypatch.setattr(github, "issue_view", self.issue_view)
+        monkeypatch.setattr(github, "issue_comments", self.issue_comments)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "create_label", self.create_label)
         monkeypatch.setattr(github, "add_label", self.add_label)
@@ -138,6 +169,28 @@ def test_exhausted_research_parks_the_ticket_visibly(tmp_path, monkeypatch):
     assert len(ticket.park_comments) == 1
 
 
+def test_research_adapter_park_notifies_the_operator_once(tmp_path, monkeypatch):
+    record = _record(tmp_path)
+    _plant(record, _NO_DISPOSITION)
+    ticket = _FakeTicket()
+    ticket.install(monkeypatch)
+    pings = []
+    from agentflow import notify
+    monkeypatch.setattr(notify, "notify", lambda *args: pings.append(args) or True)
+    adapter = ResearchStageAdapter(
+        findings_ready=coordinated_research._findings_ready,
+        park=coordinated_research.park,
+    )
+
+    assert adapter.finalize_hold(record) == "https://github.com/o/r/issues/7"
+    assert len(pings) == 1
+    title, message, url, sequence_id = pings[0]
+    assert title == "agentflow needs you"
+    assert message.startswith("o/r #7: Research parked")
+    assert url == "https://github.com/o/r/issues/7"
+    assert sequence_id
+
+
 def test_the_park_comment_says_what_it_is_and_what_happens_next(tmp_path, monkeypatch):
     record = _record(tmp_path)
     _plant(record, _NO_DISPOSITION)
@@ -145,13 +198,14 @@ def test_the_park_comment_says_what_it_is_and_what_happens_next(tmp_path, monkey
     ticket.install(monkeypatch)
 
     coordinated_research.park(record)
-    body = ticket.park_comments[0]
-
-    assert "unattended session (AI)" in body, "the research disclaimer must front the comment"
-    assert "<!-- agentflow-research-park:#7 -->" in body, "the dedup marker must be present"
-    assert "will not try this ticket again" in body, "the comment must say there is no retry"
-    assert "The widget path is reached from three call sites." in body, \
-        "the recorded findings must be carried over so the evidence is not lost"
+    assert ticket.park_comments[0] == (
+        _PARK_HEADER
+        + _ORDINARY_OPENING
+        + "**Why the ruling was refused:** the findings carried no `## Disposition` section.\n\n"
+        + _ORDINARY_NEXT_STEP
+        + "\n\nWhat the run did record, so the work is not lost:\n\n---\n\n"
+        + _NO_DISPOSITION.strip()
+    )
 
 
 @pytest.mark.parametrize("artifact,expected", [
@@ -200,7 +254,12 @@ def test_a_run_that_recorded_nothing_is_parked_too(tmp_path, monkeypatch):
     proof = coordinated_research.park(record)
 
     assert proof is not None
-    assert "recorded no findings at all" in ticket.park_comments[0]
+    assert ticket.park_comments[0] == (
+        _PARK_HEADER
+        + _ORDINARY_OPENING
+        + "**Why the ruling was refused:** the run recorded no findings at all.\n\n"
+        + _ORDINARY_NEXT_STEP
+    )
     assert RESEARCH_PARKED in ticket.labels
 
 
@@ -209,29 +268,43 @@ def test_a_usable_ruling_reaching_the_park_says_the_run_was_held_first(tmp_path,
     held before it could be recorded. The comment must say that, not invent a rejected check —
     and it must not open by asserting no ruling was produced, which its own reason line denies."""
     record = _record(tmp_path)
-    _plant(record, "## Disposition\n\n```json\n{\"disposition\":\"no_build\","
-                   "\"summary\":\"The widget path already routes through the shared router.\"}\n```\n")
+    artifact = ("## Disposition\n\n```json\n{\"disposition\":\"no_build\","
+                "\"summary\":\"The widget path already routes through the shared router.\"}\n```\n")
+    _plant(record, artifact)
     ticket = _FakeTicket()
     ticket.install(monkeypatch)
 
     assert coordinated_research.park(record) is not None
-    body = ticket.park_comments[0]
-    assert "held before the daemon could record the ruling" in body
-    assert "without producing a ruling" not in body, \
-        "the opening must not contradict the reason line by denying the ruling exists"
-    assert "Why the ruling was refused" not in body, "no check refused this artifact"
+    assert ticket.park_comments[0] == (
+        _PARK_HEADER
+        + "An unattended research session wrote a ruling for this ticket but was held before the "
+          "daemon could record it, so the ticket is parked for you.\n\n"
+        + "**Why it was not recorded:** the run was held before the daemon could record the ruling "
+          "it wrote.\n\n"
+        + "The ruling it wrote is below, unrecorded — the decision map does not carry it. "
+          "Unattended research will not try this ticket again: settle it in a wayfinder session, "
+          "or file a fresh research ticket."
+        + "\n\nWhat the run did record, so the work is not lost:\n\n---\n\n"
+        + artifact.strip()
+    )
 
 
 # --- a provider condition parks the same ticket, but never blames the question ----------
 
-@pytest.mark.parametrize("which,expected", [
-    ("access", "Re-authenticate the coding agent"),
-    ("rejected-request", "rejected the request itself"),
-    ("spend", "configured spending cap"),
-    ("unspecified", "without saying which condition it was"),
+@pytest.mark.parametrize("which,reason", [
+    ("access", "the coding agent refused the session outright — an expired sign-in, a billing or "
+               "plan limit, or a permission problem. Re-authenticate the coding agent, or check "
+               "its billing, plan, and permissions"),
+    ("rejected-request", "the coding agent rejected the request itself — too large for the model, "
+                         "an unrecognized model, or a request it would not accept. The coding "
+                         "agent's sign-in is fine; what it was asked to send is what needs a look"),
+    ("spend", "the coding agent stopped the run at its configured spending cap. The coding "
+              "agent's sign-in is fine; raise or reset the cap for this work"),
+    ("unspecified", "the coding agent ended the session permanently without saying which condition "
+                    "it was. The coding agent's health needs a look before it can run anything again"),
 ])
 def test_a_provider_killed_run_names_the_provider_not_the_question(tmp_path, monkeypatch,
-                                                                   which, expected):
+                                                                   which, reason):
     """Every hold reaches the park, not only exhaustion. A permanent provider condition stops the
     session before it reads the question, so the comment must name that condition and its
     remediation — telling the maintainer the machine spent a budget failing to answer, and to go
@@ -241,13 +314,12 @@ def test_a_provider_killed_run_names_the_provider_not_the_question(tmp_path, mon
     ticket.install(monkeypatch)
 
     assert coordinated_research.park(record) is not None
-    body = ticket.park_comments[0]
-    assert expected in body
-    assert "Rewrite the question" not in body, \
-        "the session never read the question, so it must not be blamed"
-    assert "recorded no findings at all" not in body, \
-        "an empty artifact is not the reason — the provider is"
-    assert "will not try this ticket again" in body, "the park is terminal either way"
+    assert ticket.park_comments[0] == (
+        _PARK_HEADER
+        + _PROVIDER_OPENING
+        + f"**Why there is no ruling:** {reason}.\n\n"
+        + _PROVIDER_NEXT_STEP
+    )
     # Parked exactly as any other hold is: the record is terminal, so leaving it unlabelled would
     # restore the very invisibility this park exists to end.
     assert RESEARCH_PARKED in ticket.labels
