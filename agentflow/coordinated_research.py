@@ -28,6 +28,7 @@ from pathlib import Path
 
 from agentflow import github
 from agentflow.coordinator import Submission
+from agentflow.handoff import DurableHandoff, Notification, Subject
 from agentflow.labels import (AWAITING_DISPOSITION, RESEARCH_PARKED, RESOLVING,
                               release as release_claim)
 from agentflow.runner import _run
@@ -599,13 +600,21 @@ def resolve(record) -> str | None:
         return None
     marker = _findings_marker(number)
     marker_present = any(marker in comment.body for comment in issue.comments)
-    if not marker_present:
-        body = f"{_RESEARCH_DISCLAIMER}\n{marker}\n\n{findings}"
-        if not github.comment(repo, number, body):
-            return None
-    elif not _findings_comment_present(issue.comments, marker, findings):
+    if marker_present and not _findings_comment_present(issue.comments, marker, findings):
         return None
+    body = f"{_RESEARCH_DISCLAIMER}\n{marker}\n\n{findings}"
     if disposition.kind == "handoff_required":
+        url = DurableHandoff().hand_off(
+            Subject(repo=repo, number=number, kind="issue"),
+            identity=record.identity, stage="research-findings",
+            marker=marker,
+            action=lambda: github.comment(repo, number, body),
+            notification=Notification(
+                "agentflow needs you",
+                f"{repo} #{number}: Research findings await disposition"),
+        )
+        if url is None:
+            return None
         if not _append_map_awaiting(repo, number, issue.title):
             return None
         if not _await_disposition(repo, number):
@@ -626,7 +635,9 @@ def resolve(record) -> str | None:
                 or AWAITING_DISPOSITION not in final.labels or RESOLVING in final.labels):
             return None
         _cleanup_worktree(record)
-        return final.url or f"https://github.com/{repo}/issues/{number}"
+        return final.url or url
+    if not marker_present and not github.comment(repo, number, body):
+        return None
     if not _append_map_decision(repo, number, issue.title, disposition):
         return None
     if issue.state != "CLOSED":
@@ -746,13 +757,17 @@ def park(record) -> str | None:
     repo = record.repo
     findings = read_findings(record)
     story = _park_story(record, findings)
-    issue = github.issue_view(repo, number)
-    if issue is None:
-        return None
     marker = _park_marker(number)
-    if not any(marker in comment.body for comment in issue.comments):
-        if not github.comment(repo, number, _park_comment(number, story, findings)):
-            return None
+    url = DurableHandoff().hand_off(
+        Subject(repo=repo, number=number, kind="issue"),
+        identity=record.identity, stage="research-park",
+        marker=marker,
+        action=lambda: github.comment(repo, number, _park_comment(number, story, findings)),
+        notification=Notification(
+            "agentflow needs you", f"{repo} #{number}: Research parked — {story[2]}"),
+    )
+    if url is None:
+        return None
     if not _mark_state(repo, number, RESEARCH_PARKED):
         return None
     if not release_claim(repo, number, RESOLVING):
@@ -767,4 +782,4 @@ def park(record) -> str | None:
         return None
     # Nothing will ever resume this run, so the worktree it would have reused is just a leak.
     _cleanup_worktree(record)
-    return final.url or f"https://github.com/{repo}/issues/{number}"
+    return final.url or url

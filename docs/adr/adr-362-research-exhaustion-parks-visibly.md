@@ -55,6 +55,7 @@ session can answer it, or answers it in a human wayfinder session.
 **The park withholds its proof** until comment, label, and released claim can all be re-read
 as durable, exactly as durable resolution does, so an interrupted park replays rather than
 being recorded as done. Running it twice produces one comment and one label.
+Its bookkeeping follows [ADR 0042's convergent write-placement rule](0042-durable-handoff-envelope.md#consequences).
 
 **The comment's story comes from the run's durable hold reason.** Exhaustion is the ordinary
 way a research run ends up here, but it is not the only one: a permanent provider condition —

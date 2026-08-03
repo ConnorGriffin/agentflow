@@ -80,6 +80,10 @@ class FakeGitHub:
             labels=frozenset(self.labels),
             comments=[github.Comment(body=c["body"], created_at="") for c in self.comments])
 
+    def issue_comments(self, repo, number):
+        from agentflow import github
+        return [github.Comment(body=c["body"], created_at="") for c in self.comments]
+
     def issue_url(self, repo, number):             # the release's durable proof-of-release
         return f"https://github.com/{REPO}/issues/{number}"
 
@@ -126,6 +130,7 @@ class FakeGitHub:
         from agentflow import github
         monkeypatch.setattr(github, "api", self.api)
         monkeypatch.setattr(github, "issue_view", self.issue_view)
+        monkeypatch.setattr(github, "issue_comments", self.issue_comments)
         monkeypatch.setattr(github, "issue_url", self.issue_url)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
@@ -331,7 +336,11 @@ def test_no_build_fails_closed_when_its_existing_comment_does_not_carry_the_ruli
         "body": coordinated_research._findings_marker(5) + "\n\nOlder findings without the ruling.",
     })
     gh.install(monkeypatch)
-    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    pings = []
+    from agentflow import notify
+    monkeypatch.setattr(notify, "notify", lambda *args: pings.append(args) or True)
     _write_findings(record, _artifact(
         "no_build",
         "The existing router already covers the widget path, so no implementation is warranted.",
@@ -340,6 +349,37 @@ def test_no_build_fails_closed_when_its_existing_comment_does_not_carry_the_ruli
     assert coordinated_research.resolve(record) is None
     assert gh.state == "OPEN"
     assert not coordinated_research.decision_present(gh.map_body, 5)
+    assert gh.mutations == []
+    assert pings == []
+
+
+def test_handoff_required_fails_closed_when_its_existing_comment_has_different_findings(
+        tmp_path, monkeypatch):
+    gh = FakeGitHub()
+    gh.comments.append({
+        "body": coordinated_research._findings_marker(5) + "\n\nOlder, different findings.",
+    })
+    gh.install(monkeypatch)
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    pings = []
+    from agentflow import notify
+    monkeypatch.setattr(notify, "notify", lambda *args: pings.append(args) or True)
+    _write_findings(record, _artifact(
+        "handoff_required",
+        "The widget path exposes one independently shippable build.",
+        candidates=[{
+            "title": "Route widgets through the shared router",
+            "build": "Replace the widget-only dispatch path with the shared router.",
+        }],
+    ))
+
+    assert coordinated_research.resolve(record) is None
+    assert gh.state == "OPEN"
+    assert "wayfinder:awaiting-disposition" not in gh.labels
+    assert "wayfinder:resolving" in gh.labels
+    assert gh.mutations == []
+    assert pings == []
 
 
 def test_no_build_fails_closed_when_the_map_contains_a_different_ruling(
@@ -349,7 +389,8 @@ def test_no_build_fails_closed_when_the_map_contains_a_different_ruling(
         "- **Audit the widget path** — no build: An older, different ruling. (#5).\n"
     ))
     gh.install(monkeypatch)
-    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
     _write_findings(record, _artifact(
         "no_build",
         "The existing router already covers the widget path, so no implementation is warranted.",
@@ -466,7 +507,8 @@ def test_ciq_autotune_469_through_472_keep_build_findings_open_and_close_the_evi
         gh = FakeGitHub(title=f"ciq-autotune research {number}")
         gh.install(monkeypatch)
         record = SimpleNamespace(
-            repo=REPO, subject=str(number), source=str(tmp_path / f"wt-{number}"))
+            identity=f"{REPO}:{number}:research", repo=REPO, subject=str(number),
+            source=str(tmp_path / f"wt-{number}"))
         _write_findings(record, artifact)
 
         assert coordinated_research.resolve(record) is not None
@@ -524,7 +566,11 @@ def test_resolution_replays_without_a_duplicate_comment_or_map_line(tmp_path, mo
     double-write: replaying the finalizer over the already-closed ticket is a no-op."""
     gh = FakeGitHub()
     gh.install(monkeypatch)
-    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    pings = []
+    from agentflow import notify
+    monkeypatch.setattr(notify, "notify", lambda *args: pings.append(args) or True)
     _write_findings(record, _artifact(
         "no_build",
         "The existing router already covers the widget path, so no implementation is warranted.",
@@ -538,13 +584,15 @@ def test_resolution_replays_without_a_duplicate_comment_or_map_line(tmp_path, mo
     assert len([c for c in gh.comments if "research-findings" in c["body"]]) == 1
     assert gh.map_body.count("(#5)") == 1
     assert "wayfinder:resolving" not in gh.labels
+    assert pings == []
 
 
 @pytest.mark.parametrize("boundary", ["comment", "map", "close", "release"])
 def test_no_build_replay_converges_after_each_durable_write(boundary, tmp_path, monkeypatch):
     gh = FakeGitHub(fail_once_at=boundary)
     gh.install(monkeypatch)
-    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
     _write_findings(record, _artifact(
         "no_build",
         "The existing router already covers the widget path, so no implementation is warranted.",
@@ -565,7 +613,8 @@ def test_no_build_replay_converges_after_each_durable_write(boundary, tmp_path, 
 def test_pending_replay_converges_after_each_durable_write(boundary, tmp_path, monkeypatch):
     gh = FakeGitHub(fail_once_at=boundary)
     gh.install(monkeypatch)
-    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
     _write_findings(record, _artifact(
         "handoff_required",
         "The widget path exposes one independently shippable build.",
@@ -575,7 +624,11 @@ def test_pending_replay_converges_after_each_durable_write(boundary, tmp_path, m
         }],
     ))
 
-    assert coordinated_research.resolve(record) is None
+    first = coordinated_research.resolve(record)
+    if boundary == "comment":
+        assert first is not None, "the envelope re-read proves that the reported-failed write landed"
+    else:
+        assert first is None
     assert coordinated_research.resolve(record) is not None
 
     assert gh.state == "OPEN"
@@ -588,6 +641,42 @@ def test_pending_replay_converges_after_each_durable_write(boundary, tmp_path, m
     assert "wayfinder:resolving" not in gh.labels
 
 
+def test_handoff_required_resolution_notifies_with_stable_ticket_context(tmp_path, monkeypatch):
+    gh = FakeGitHub()
+    gh.install(monkeypatch)
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    _write_findings(record, _artifact(
+        "handoff_required",
+        "The widget path exposes one independently shippable build.",
+        candidates=[{
+            "title": "Route widgets through the shared router",
+            "build": "Replace the widget-only dispatch path with the shared router.",
+        }],
+    ))
+    pings = []
+    from agentflow import notify
+    monkeypatch.setattr(notify, "notify", lambda *args: pings.append(args) or True)
+    adapter = ResearchStageAdapter(
+        findings_ready=coordinated_research._findings_ready,
+        resolve=coordinated_research.resolve,
+    )
+
+    assert adapter.finalize_completed(record) == "https://github.com/o/r/issues/5"
+    assert len(pings) == 1
+    assert pings[0][:3] == (
+        "agentflow needs you",
+        "o/r #5: Research findings await disposition",
+        "https://github.com/o/r/issues/5",
+    )
+    assert pings[0][3]
+
+    assert adapter.finalize_completed(record) == "https://github.com/o/r/issues/5"
+    assert len([c for c in gh.comments if "agentflow-research-findings" in c["body"]]) == 1
+    assert len(pings) == 2
+    assert pings[1] == pings[0]
+
+
 def test_pending_resolution_replaces_a_stale_untitled_map_entry(tmp_path, monkeypatch):
     gh = FakeGitHub(map_body=(
         "# Map\n\n## Awaiting disposition\n\n"
@@ -595,7 +684,8 @@ def test_pending_resolution_replaces_a_stale_untitled_map_entry(tmp_path, monkey
         "- **Audit the widget path** — awaiting operator disposition (#5).\n"
     ))
     gh.install(monkeypatch)
-    record = SimpleNamespace(repo=REPO, subject="5", source=str(tmp_path / "wt"))
+    record = SimpleNamespace(
+        identity=f"{REPO}:5:research", repo=REPO, subject="5", source=str(tmp_path / "wt"))
     _write_findings(record, _artifact(
         "handoff_required",
         "The widget path exposes one independently shippable build.",

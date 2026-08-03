@@ -102,5 +102,17 @@ implements [ADR 0028](0028-stage-scoped-continuations.md)'s exhaustion-handoff c
   no one. The envelope derives markers from the record identity plus the reason for the handoff —
   the shape the PR park already used — and accepts a second "also proves this" string so a hold
   posted under an older marker format is not commented on twice after a deploy.
+- **Durable writes alongside an envelope action must converge after the marker suppresses replay.**
+  The envelope's `action` runs only on cycles where the marker is absent, so once the comment
+  exists it never runs again. Any other durable write the action performs — a route's labels and
+  title, or a state label — is therefore never retried by the envelope, and a stage that gates its
+  own proof on such a write must be able to converge without a second envelope-run action. Two
+  placements do that. The write may live outside the action and run after `hand_off` returns
+  non-`None`, unconditionally, when it is cheap and idempotent, as with Research's state and claim
+  bookkeeping. Or it may live inside the action and be repaired once after the call, guarded by a
+  read, when unconditional replay could revert a maintainer's edit, as with the Build hold and
+  Intake route projection. What is not allowed is proof gated on a write that exists only inside
+  the action: after a crash between the comment landing and that write, the marker suppresses the
+  action forever and the proof cannot converge.
 - Ordered after the `github` module; additive keystone. Its migrations (holds, parks, settles,
   intake holds) serialize with the other candidates on shared files.

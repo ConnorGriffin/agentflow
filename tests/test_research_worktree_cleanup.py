@@ -23,6 +23,7 @@ def _make_record(tmp_path, number=7):
     wt = tmp_path / ".agentflow" / "worktrees" / "claude" / f"research-{number}"
     wt.mkdir(parents=True)
     return SimpleNamespace(
+        identity=f"o/r:{number}:research",
         repo="o/r",
         subject=str(number),
         pool="claude",
@@ -90,6 +91,10 @@ class _FakeGitHub:
             labels=frozenset(self.labels),
             comments=[github.Comment(body=c["body"], created_at="") for c in self.comments])
 
+    def issue_comments(self, repo, number):
+        from agentflow import github
+        return [github.Comment(body=c["body"], created_at="") for c in self.comments]
+
     def issue_url(self, repo, number):             # the release's durable proof-of-release
         return f"https://github.com/o/r/issues/{number}"
 
@@ -136,6 +141,7 @@ class _FakeGitHub:
         from agentflow import github, loop
         monkeypatch.setattr(github, "api", self.api)
         monkeypatch.setattr(github, "issue_view", self.issue_view)
+        monkeypatch.setattr(github, "issue_comments", self.issue_comments)
         monkeypatch.setattr(github, "issue_url", self.issue_url)
         monkeypatch.setattr(github, "comment", self.comment)
         monkeypatch.setattr(github, "close", self.close)
