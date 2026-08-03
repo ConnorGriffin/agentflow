@@ -1,8 +1,12 @@
 """Build the issue-373 screenshot config: the locked mockup's five states, and the built
 console rendering fixtures whose attention rows come from the real daemon reducer.
 
-    .venv/bin/python docs/screenshots/issue-373/shotgen.py <out-dir>
-    node scripts/screenshots.mjs <out-dir>/shots.json
+    .venv/bin/python docs/screenshots/issue-373/shotgen.py
+    node scripts/screenshots.mjs docs/screenshots/issue-373/<ROUND>/shots.json
+
+Each capture round writes into its own directory named for the branch head it was taken
+at, so a later round can never repaint the images an earlier PR comment points at. Bump
+``ROUND`` below when re-capturing.
 
 The console fixtures are published snapshots — v1 repository views plus the schema-v2
 repository entries — run through `operator_projection.attention` exactly as the daemon's
@@ -20,6 +24,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 from agentflow import operator_projection  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[3]
+ROUND = "9f601fd"
+OUT = pathlib.Path(__file__).resolve().parent / ROUND
 CONSOLE = (ROOT / "agentflow" / "webui" / "dist" / "index.html").as_uri()
 MOCKUP = (ROOT / "mockups" / "operator-surface-finalist.html").as_uri()
 BRIEFING_TAB = "nav .tab:nth-child(5)"
@@ -191,27 +197,30 @@ def console(name, snap, *, theme="light", viewport=None):
             "fetchStub": {"api/snapshot": snap}}
 
 
-def main(out_dir: str) -> None:
-    out = pathlib.Path(out_dir)
-    out.mkdir(parents=True, exist_ok=True)
+def main() -> None:
+    OUT.mkdir(parents=True, exist_ok=True)
     mock_cfg = json.loads((ROOT / "mockups" / "operator-surface.screenshots.json").read_text())
     shots = []
+    # Each console shot pairs with the locked mockup shot of the same state, so it is taken in
+    # that state's own locked theme — otherwise a theme difference reads as a fidelity gap.
+    mock_theme = {}
     for shot in mock_cfg["shots"]:
         name = pathlib.Path(shot["out"]).stem.replace("operator-surface-finalist-", "")
+        mock_theme[name] = shot.get("theme", "light")
         shots.append({**shot, "url": MOCKUP, "out": f"mock-{name}.png"})
     shots += [
         console("typical-light", TYPICAL),
         console("typical-dark", TYPICAL, theme="dark"),
-        console("stale", STALE),
-        console("incomplete", INCOMPLETE),
-        console("empty", EMPTY),
-        console("narrow", TYPICAL, viewport=NARROW),
+        console("stale", STALE, theme=mock_theme["stale"]),
+        console("incomplete", INCOMPLETE, theme=mock_theme["incomplete"]),
+        console("empty", EMPTY, theme=mock_theme["empty"]),
+        console("narrow", TYPICAL, theme=mock_theme["narrow"], viewport=NARROW),
         console("full-queue", FULL_QUEUE, viewport=TALL),
         console("full-queue-narrow", FULL_QUEUE, viewport=TALL_NARROW),
     ]
     for shot in shots:
-        shot["out"] = str(out / shot["out"])
-    (out / "shots.json").write_text(json.dumps({"shots": shots}, ensure_ascii=False, indent=1))
+        shot["out"] = str(OUT / shot["out"])
+    (OUT / "shots.json").write_text(json.dumps({"shots": shots}, ensure_ascii=False, indent=1))
     print(f"attention totals: typical={TYPICAL['attention']['total']} "
           f"stale={STALE['attention']['total']} incomplete={INCOMPLETE['attention']['total']} "
           f"empty={EMPTY['attention']['total']} full={FULL_QUEUE['attention']['total']} "
@@ -219,4 +228,4 @@ def main(out_dir: str) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main()
