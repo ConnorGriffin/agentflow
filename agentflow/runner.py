@@ -1215,20 +1215,27 @@ def dispatch_preflight(repo: str, workdir: str, protected: set[str], _log=None) 
 
     A `git` we cannot read fails **open**. A broken git in the daemon is its own outage; freezing
     the whole fleet on it would trade a repository-scoped failure for a fleet-wide one.
+
+    The ceiling is the maximum registration count that may still exist *after* the session this
+    admits opens its worktree. A cold submission adds exactly one registration, so admission
+    reserves that slot: it holds only while the current count is strictly below the ceiling. At
+    the ceiling, admitting would push the repository to ceiling+1 — the range #442 measured dead
+    shells in — so it refuses.
     """
     _log = _log or (lambda _line: None)
     registered = _registered_worktrees(workdir)
     if registered is None:
         _log(f"{repo}: worktree preflight could not read the registry — dispatching anyway")
         return True
-    if len(registered) <= WORKTREE_DISPATCH_CEILING:
+    if len(registered) < WORKTREE_DISPATCH_CEILING:
         return True
     owned = sum(1 for path, branch in registered
                 if WorktreeRef.parse(os.path.realpath(path)) is not None
                 or _legacy_session_tool(os.path.realpath(path), branch) is not None)
     held_by_store = sum(1 for path, _ in registered if os.path.realpath(path) in protected)
-    _log(f"{repo}: REFUSING to dispatch — {len(registered)} registered worktrees exceeds the "
-         f"{WORKTREE_DISPATCH_CEILING} ceiling ({owned} agentflow-owned, "
+    _log(f"{repo}: REFUSING to dispatch — {len(registered)} registered worktrees reaches the "
+         f"{WORKTREE_DISPATCH_CEILING} ceiling, leaving no slot for this session's worktree "
+         f"({owned} agentflow-owned, "
          f"{len(registered) - owned} foreign, {held_by_store} protected by live records). "
          "Sessions in this repository would lose their shell before running a command. "
          "Reclamation only reaches agentflow-owned sessions; prune foreign worktrees by hand.")
