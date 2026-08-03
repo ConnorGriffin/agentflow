@@ -599,18 +599,44 @@ def test_live_clean_review_reads_the_hand_off_and_stops_reading_it_once_retired(
 
 def test_supersede_clean_review_retires_the_hand_off_and_keeps_its_evidence(monkeypatch):
     marker = "<!-- agentflow-clean-review-summary -->"
-    comments = [github.Comment(body=f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->",
-                               created_at="", id="clean")]
-    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    rows = [{"id": "clean", "createdAt": "",
+             "body": f"{marker}\n<!-- agentflow-clean-review-head:sha-a -->"}]
+    monkeypatch.setattr(gate.github, "pr_comments",
+                        lambda *_args: pytest.fail("the caller already holds the comments"))
     monkeypatch.setattr(gate.github, "edit_comment", lambda comment_id, body:
-                        comments.__setitem__(0, github.Comment(body, "", id=comment_id)) or True)
+                        rows[0].__setitem__("body", body) or True)
     monkeypatch.setattr(gate.github, "pr_comment",
                         lambda *_args: pytest.fail("retiring a summary posts nothing"))
 
-    assert gate.supersede_clean_review("o/r", 9) is True
-    assert "agentflow-superseded-review-summary" in comments[0].body
-    assert "sha-a" in comments[0].body
-    assert gate.live_clean_review([{"body": comments[0].body}]) is None
+    assert gate.supersede_clean_review(rows) is True
+    assert "agentflow-superseded-review-summary" in rows[0]["body"]
+    assert "sha-a" in rows[0]["body"]
+    assert gate.live_clean_review(rows) is None
+
+
+def test_supersede_clean_review_attempts_every_live_summary_even_after_a_failed_edit(monkeypatch):
+    """Two hand-off summaries, the first un-editable: the second must still be retired, and the
+    whole retirement must report failure so the caller can say so or retry. Fails first against a
+    short-circuiting retirement, which never reaches the second summary."""
+    marker = "<!-- agentflow-clean-review-summary -->"
+    rows = [{"id": "first", "body": f"{marker}\nhead one"},
+            {"id": "second", "body": f"{marker}\nhead two"},
+            {"id": "chatter", "body": "just a build note"}]
+    attempted = []
+
+    def edit(comment_id, body):
+        attempted.append(comment_id)
+        if comment_id == "first":
+            return False
+        rows[1]["body"] = body
+        return True
+
+    monkeypatch.setattr(gate.github, "edit_comment", edit)
+
+    assert gate.supersede_clean_review(rows) is False
+    assert attempted == ["first", "second"]
+    assert "agentflow-superseded-review-summary" in rows[1]["body"]
+    assert rows[0]["body"].count(marker) == 1, "the un-edited summary is still live"
 
 
 def test_park_retires_the_current_clean_summary_before_posting(monkeypatch):

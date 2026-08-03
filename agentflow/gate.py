@@ -403,13 +403,12 @@ def _reviewed_head(comment: github.Comment) -> str | None:
     return comment.body[start:end] if end >= start else None
 
 
-def _supersede_summary(comment: github.Comment) -> bool:
+def _supersede_summary(comment_id: str, body: str) -> bool:
     """Retire a current summary without losing the evidence it recorded."""
-    if not comment.id:
+    if not comment_id:
         return False
     return github.edit_comment(
-        comment.id,
-        comment.body.replace(_CLEAN_REVIEW_MARKER, _SUPERSEDED_REVIEW_MARKER, 1))
+        comment_id, body.replace(_CLEAN_REVIEW_MARKER, _SUPERSEDED_REVIEW_MARKER, 1))
 
 
 def live_clean_review(comments: list[dict]) -> dict | None:
@@ -424,17 +423,18 @@ def live_clean_review(comments: list[dict]) -> dict | None:
                  if _CLEAN_REVIEW_MARKER in comment.get("body", "")), None)
 
 
-def supersede_clean_review(repo: str, pr_number: int) -> bool:
-    """Retire this PR's current clean-review summary because the engine is taking the PR back.
+def supersede_clean_review(comments: list[dict]) -> bool:
+    """Retire this PR's merge hand-off because the engine is taking the PR back.
 
     The same in-place rewrite :func:`park` already performs — evidence preserved, the hand-off
     retired — so a PR under a freshly opened conflict Revise or re-review stops reading as
-    finished and yours to merge."""
-    comments = github.pr_comments(repo, pr_number)
-    if comments is None:
-        return False
-    return all(_supersede_summary(comment) for comment in comments
-               if _CLEAN_REVIEW_MARKER in comment.body)
+    finished and yours to merge. Takes GitHub's own comment rows the caller already holds, so
+    taking a PR back costs no second read of the thread. Every live summary is attempted even
+    when an earlier edit fails, and the answer is ``False`` unless all of them were retired —
+    a caller that reports the failure can then retry from rows it re-reads on a later cycle."""
+    retired = [_supersede_summary(row.get("id", ""), row.get("body", ""))
+               for row in comments if _CLEAN_REVIEW_MARKER in row.get("body", "")]
+    return all(retired)
 
 
 def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict,
@@ -466,7 +466,7 @@ def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict,
     for comment in marked:
         if comment is canonical:
             continue
-        if not _supersede_summary(comment):
+        if not _supersede_summary(comment.id, comment.body):
             return False
     if canonical is not None:
         if canonical.body != body and (not canonical.id or not github.edit_comment(canonical.id, body)):
@@ -493,7 +493,7 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
     if comments is None:
         return
     for summary in (comment for comment in comments if _CLEAN_REVIEW_MARKER in comment.body):
-        if not _supersede_summary(summary):
+        if not _supersede_summary(summary.id, summary.body):
             return
     if context is None:
         context = ParkContext(
