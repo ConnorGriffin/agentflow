@@ -139,21 +139,14 @@ def repository_maps(
         handoff_numbers.update(h.number for h in verified)
 
     links_read = read_links(cfg.repo, sorted(handoff_numbers))
-    if isinstance(links_read, github.HandoffLinksRead):
-        if links_read.cost is not None:
-            budget["spent"] += links_read.cost
-        if (budget["spent"] >= POINT_CEILING
-                or (links_read.remaining is not None
-                    and links_read.remaining < WORKFLOW_FLOOR)):
-            budget["stopped"] = True
-        if links_read.error:
-            fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
-                              attempted=True, success=False, error=links_read.error)
-            return {**identity, "github": fresh, "maps": prev_maps}
-        links = links_read.links
-    else:
-        # Test and alternate adapters may provide the legacy typed mapping directly.
-        links = links_read
+    if links_read.cost is not None:
+        budget["spent"] += links_read.cost
+    if (budget["spent"] >= POINT_CEILING
+            or (links_read.remaining is not None and links_read.remaining < WORKFLOW_FLOOR)):
+        budget["stopped"] = True
+    # A failed join costs its points like any other read, but it never fails the map read that
+    # already succeeded — it comes back with no links, and each handoff falls back to `building`.
+    links = links_read.links
     # The pipeline PR listings are read per map, so a repository with none has nothing to
     # spend them on — the shaping step below would discard both lists unlooked-at (#497).
     open_prs = read_prs(cfg.repo, "open") if maps_read.maps else []

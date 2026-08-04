@@ -1084,13 +1084,6 @@ def handoff_pr_links_read(repo: str, numbers: list[int]) -> HandoffLinksRead:
     return HandoffLinksRead(links=out, cost=response.cost, remaining=response.remaining)
 
 
-def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow] | None:
-    """The handoff-link join for callers that only need typed rows; map projection uses the
-    diagnostic-carrying read so failures remain distinguishable from an empty successful join."""
-    read = handoff_pr_links_read(repo, numbers)
-    return None if read.error else read.links
-
-
 # --- escape hatch --------------------------------------------------------------
 
 def api(args: list[str], *, parse_json: bool = False) -> Any | None:

@@ -346,9 +346,10 @@ def test_a_silent_failure_still_carries_a_reason(monkeypatch):
 
 def test_handoff_links_type_the_closing_pull_requests_from_the_wire(monkeypatch):
     calls = _wire(monkeypatch)
-    links = github.handoff_pr_links("o/r", [505])
-    assert links == {505: github.HandoffLinkRow(number=505, pr_numbers=(358, 361),
-                                                attempt_count=2)}
+    read = github.handoff_pr_links_read("o/r", [505])
+    assert read.links == {505: github.HandoffLinkRow(number=505, pr_numbers=(358, 361),
+                                                     attempt_count=2)}
+    assert read.error is None
     query = next(a for a in calls[0] if a.startswith("query="))
     assert "i505:issue(number:505)" in query
 
@@ -356,12 +357,15 @@ def test_handoff_links_type_the_closing_pull_requests_from_the_wire(monkeypatch)
 def test_a_failed_handoff_link_read_is_unknown(monkeypatch):
     _wire(monkeypatch, returncode=1,
           links={"errors": [{"message": "Something went wrong while executing your query."}]})
-    assert github.handoff_pr_links("o/r", [505]) is None
+    read = github.handoff_pr_links_read("o/r", [505])
+    assert read.links == {}, "a failed join knows nothing, rather than claiming no links exist"
+    assert "Something went wrong" in read.error
 
 
 def test_no_handoffs_asks_github_nothing(monkeypatch):
     calls = _wire(monkeypatch)
-    assert github.handoff_pr_links("o/r", []) == {}
+    read = github.handoff_pr_links_read("o/r", [])
+    assert read.links == {} and read.error is None
     assert calls == []
 
 
