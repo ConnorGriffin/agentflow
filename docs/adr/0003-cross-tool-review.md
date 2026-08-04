@@ -1,6 +1,9 @@
 # ADR 0003 — Cross-tool review is the independence gate
 
-- Status: Accepted
+- Status: Accepted — weakened by
+  [ADR 498](adr-498-tiered-parent-independent-review.md): independence is measured against the
+  accountable session lead, so a change a delegated worker of the reviewing tool wrote may still
+  be reviewed by that tool
 - Date: 2026-07-09
 
 ## Context

@@ -12,7 +12,7 @@ import threading
 
 from agentflow import (coordinated_build, coordinated_respond, coordinated_review, github, loop,
                        pipeline)
-from agentflow.balancer import pick_pair
+from agentflow.balancer import pick_pair, pick_session_lead
 from agentflow.intake import replies_since_intake
 from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
 from agentflow.repo_facts import intake_allowlist
@@ -57,10 +57,10 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
             return _report("no further runnable ready-for-agent issues") if skipped \
                 else "no ready-for-agent issues"
         number = issue["number"]
-        builder, _reviewer, block_msg = pick_pair()
+        builder, _reviewer, block_msg = pick_session_lead()
         if builder is None:
             return _report(f"#{number}: no pool has headroom ({block_msg}) — deferring")
-        submission = coordinated_build.build_submission(cfg, issue, builder.tool)
+        submission = coordinated_build.build_submission(cfg, issue)
         if submission is None:
             # A definite fact, not an unreadable answer: this candidate's labels came off the
             # ready listing itself, and they carry no complexity dial. Such an issue looks

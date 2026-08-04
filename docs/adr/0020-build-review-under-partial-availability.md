@@ -1,6 +1,8 @@
 # ADR 0020 — Running the build/review half under partial tool availability
 
-- Status: Accepted
+- Status: Accepted — narrowed for build/revise by
+  [ADR 498](adr-498-headroom-is-a-launch-gate.md): while the session lead has one implementation,
+  those stages wait for its pool instead of running on whichever pool is clear
 - Date: 2026-07-09
 
 ## Context

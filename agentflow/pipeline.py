@@ -634,8 +634,8 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
             revise.repo, pr.number, conflict_resolution=conflict_resolution, profile=profile)
         review = ReviewState(assignment=assignment, change_author_tool=revise.pool,
                              reviewed_from_sha=revise.target)
-    reviewer_tool = (pick_reviewer(revise.builder_lineage, allow_same_tool=False)
-                     if profile == "autonomous" else pick_reviewer(revise.builder_lineage))
+    reviewer_tool = (pick_reviewer(revise.pool, allow_same_tool=False)
+                     if profile == "autonomous" else pick_reviewer(revise.pool))
     if reviewer_tool is None:
         return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
                 # revise keeps its claim and this opener re-drives next cycle.

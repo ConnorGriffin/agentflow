@@ -38,6 +38,7 @@ from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
+from agentflow.routing import routing
 from agentflow.coordinator.verification import (
     VERIFIED, miss_summary, refusal_expected, refusal_stalls)
 from agentflow.review_policy import ReviewState
@@ -156,6 +157,7 @@ class Submission:
     pool: str = "claude"            # allowed pool or pinned lineage
     input_ptr: str | None = None
     builder_lineage: str | None = None
+    branch_lineage: str | None = None   # retained PR checkout owner; may differ from session lead
     builder_complexity: str | None = None  # the original builder complexity, carried to a Revise
     builder_effort: str | None = None      # the original builder effort, carried to a Revise
     round: int = 0                  # completed auto-revise rounds behind this stage — part of the
@@ -250,7 +252,11 @@ class Coordinator:
         stage = normalize_stage(submission.stage)
         review = submission.review or ReviewState(
             change_author_tool=submission.builder_lineage)
-        model = MODEL_FOR.get((submission.pool, submission.complexity), "opus")
+        model = (
+            routing.model_for_stage(
+                stage, submission.pool, submission.complexity, submission.builder_complexity)
+            or MODEL_FOR.get((submission.pool, submission.complexity), "opus")
+        )
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
@@ -272,6 +278,7 @@ class Coordinator:
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
+            branch_lineage=submission.branch_lineage,
             builder_complexity=submission.builder_complexity,
             builder_effort=submission.builder_effort, round=submission.round,
             conflict_round=submission.conflict_round, resume=submission.resume,
@@ -774,7 +781,7 @@ class Coordinator:
             r for r in self._records.values()
             if r.state == WAITING and not r.hold_pending and r.root is None
             and r.eligible_at <= now
-            and r.pool != pool and self._may_migrate(r)
+            and r.pool != pool and self._may_migrate(r, pool)
             and self._pool_cannot_fit(r)]
         return sorted(candidates, key=lambda r: (r.eligible_at, r.created_at, r.identity))
 
@@ -789,15 +796,22 @@ class Coordinator:
         return not self._gate(record)
 
     @staticmethod
-    def _may_migrate(record: Record) -> bool:
-        """Whether a stage is safe to move off its home pool. Review never moves: its selected tool
-        is part of the cross-tool independence policy, not only worktree placement. A *never-started*
-        Build (``attempts=0``) has no branch/worktree/PR, so its
+    def _may_migrate(record: Record, dest_pool: str) -> bool:
+        """Whether a stage is safe to move off its home pool onto ``dest_pool``. Review never moves:
+        its selected tool is part of the cross-tool independence policy, not only worktree
+        placement. A *never-started* Build (``attempts=0``) has no branch/worktree/PR, so its
         lineage pin is vacuous and the move is safe (#273): once it launches, the pin is
         re-established on the destination pool. A Build that already made a real attempt, and
         ``revise``/``respond`` continuations bound to an existing PR on a specific lineage, stay
-        pinned; only a genuinely fresh Build moves."""
-        return record.stage == "build" and record.attempts == 0
+        pinned; only a genuinely fresh Build moves.
+
+        Build is session-led, and only one pool can run that lead (ADR 498), so the move is
+        one-directional: a durable pre-#498 Build stranded on the other pool may still be re-placed
+        onto the lead's pool, but a Build already there *waits* when that pool is blocked. Adopting
+        it elsewhere would launch a single agent of the wrong tool under instructions written for
+        the accountable lead."""
+        return (record.stage == "build" and record.attempts == 0
+                and dest_pool == routing.LEAD_POOL)
 
     def _admit_migration(self, record: Record, dest_pool: str, now: int) -> None:
         """Move a migratable stage to ``dest_pool``, recomputing its admission demand and model
@@ -814,7 +828,11 @@ class Coordinator:
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
                 record.lineage, record.source, record.refusal, record.refusal_expected)
         record.pool = dest_pool
-        record.model = MODEL_FOR.get((dest_pool, record.complexity), "opus")
+        record.model = (
+            routing.model_for_stage(
+                record.stage, dest_pool, record.complexity, record.builder_complexity)
+            or MODEL_FOR.get((dest_pool, record.complexity), "opus")
+        )
         demand = admission_demand(
             record.stage, dest_pool, record.model, record.complexity, record.effort)
         record.demand = demand if demand is not None else PERMIT_BUDGET
