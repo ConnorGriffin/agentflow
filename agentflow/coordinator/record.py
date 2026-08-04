@@ -136,10 +136,9 @@ class Record:
                                          # 0038); >0 marks a survivor conflict resolution, budgeted
                                          # separately from the finding-driven `round` and joined to
                                          # the identity so each conflict is a genuinely fresh stage
-    resume: int = 0                      # which deliberate maintainer resume of an exhausted Build
-                                         # this is (#245); >0 joins the identity so a resume opens a
-                                         # genuinely fresh bounded execution rather than colliding
-                                         # with the terminal `held` record whose identity stays live
+    resume: int = 0                      # deliberate maintainer resume identity: an exhausted Build
+                                         # (#245), or a manual Review kept distinct from an automatic
+                                         # moved-head retarget (#501)
     auto_merge_allowed: bool = True
     review_depth: str = "targeted"       # focused | targeted | full (ADR 0047)
     depth_reason: str = ""

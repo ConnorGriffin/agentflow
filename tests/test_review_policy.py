@@ -5,6 +5,8 @@ import inspect
 from dataclasses import fields
 from types import SimpleNamespace
 
+import pytest
+
 from agentflow.review_policy import (
     FollowUp,
     ReviewAssignment,
@@ -776,7 +778,8 @@ _RESCUE_DECISION = Uncertainty(
 
 
 def _chain_record(identity, *, sequence, created, axis, uncertainty=None, checks=(),
-                  handoff=None, held=False):
+                  handoff=None, held=False, passes=0, outcome=None, prior_push=None,
+                  hold_reason=None):
     """One durable Review record in a single PR exact head's chain. A parked pass is `held`,
     deliberately left unretired, and claimless — exactly what the coordinator's hold writes."""
     from agentflow.coordinator.record import Record
@@ -784,12 +787,13 @@ def _chain_record(identity, *, sequence, created, axis, uncertainty=None, checks
     review = ReviewState(
         assignment=ReviewAssignment(ReviewDepth.FULL, "shared behavior", ReviewAxis(axis)),
         change_author_tool="claude", sequence=sequence, uncertainty=uncertainty,
-        checks=checks, handoff=handoff)
+        checks=checks, handoff=handoff, passes=passes)
     return Record(
         identity=identity, stage="review", pool="codex", demand=2, repo="o/r", subject="479",
         target="c626f21bae01970c38b14711da5b38117c9f6872", created_at=created,
         state="held" if held else "completed", retired=not held, claim=False,
         builder_lineage="claude", builder_complexity="deep", builder_effort="extra",
+        outcome=outcome, review_prior_push=prior_push, hold_reason=hold_reason,
         source="/work/.agentflow/worktrees/codex-review/pr-479-rescue-log",
         **review.record_fields())
 
@@ -892,6 +896,106 @@ def test_a_review_that_recorded_no_decision_parks_as_an_execution_failure(monkey
     assert "named uncertainty" not in body
     assert "closing preserves" not in body
     assert "Recommendation: Resume the review — nothing has judged this change yet." in body
+
+
+def _parked_review_outcome(*, verdict="PASS", final=None, pushed="", findings=()):
+    target = "c626f21bae01970c38b14711da5b38117c9f6872"
+    return json.dumps({
+        "verdict": verdict, "depth": "full", "depth_reason": "shared behavior",
+        "axis": "fix", "change_author_tool": "claude", "reviewed_sha": target,
+        "final_sha": final or target, "pushed_sha": pushed,
+        "fixes": (["repaired it"] if pushed else []), "follow_ups": [],
+        "checks": ["reviewed"], "findings": list(findings),
+        "uncertainty": None, "decision": "",
+    })
+
+
+@pytest.mark.parametrize("hold_reason", [
+    "completed stage has no successor",
+    "PR head moved off the reviewed SHA and revise rounds are spent",
+])
+def test_a_three_pass_park_uses_its_ledger_in_every_exhaustion_branch(
+        monkeypatch, hold_reason):
+    pushed = "33549ff7bae01970c38b14711da5b38117c9f6872"
+    record = _chain_record(
+        "fix", sequence=3, created=300, axis="fix", held=True, passes=2,
+        outcome=_parked_review_outcome(final=pushed, pushed=pushed),
+        hold_reason=hold_reason)
+
+    body = _park_body(monkeypatch, record)
+
+    assert "Affected behavior: The requested PR behavior reached a human hand-off after 3 " \
+        "verdict-recording review passes." in body
+    assert "3 review passes recorded a verdict" in body
+    assert "2 earlier passes pushed a repair at their own head" in body
+    for false_claim in (
+        "No review verdict was recorded for this exact head",
+        "the review executions failed", "nothing has judged this change yet",
+        "the review this change never got", "nothing has looked at this change at all",
+        "no budget was drawn down",
+    ):
+        assert false_claim not in body
+
+
+@pytest.mark.parametrize("hold_reason", [
+    "completed stage has no successor",
+    "PR head moved off the reviewed SHA and revise rounds are spent",
+])
+def test_a_zero_pass_park_keeps_the_existing_execution_failure_words(monkeypatch, hold_reason):
+    record = _chain_record(
+        "empty", sequence=0, created=100, axis="combined", held=True,
+        hold_reason=hold_reason)
+
+    body = _park_body(monkeypatch, record)
+
+    assert "No review verdict was recorded for this exact head" in body
+    assert "the review executions failed rather than judging the change" in body
+    assert "Recommendation: Resume the review — nothing has judged this change yet." in body
+
+
+@pytest.mark.parametrize("outcome,prior_push", [
+    (_parked_review_outcome(
+        verdict="BLOCK", findings=({
+            "action": "fix_before_completion", "summary": "still blocked",
+            "grounding": "the requested behavior is absent", "file": "agentflow/x.py", "line": 1,
+        },)), None),
+    (_parked_review_outcome(
+        final="33549ff7bae01970c38b14711da5b38117c9f6872", pushed=""),
+     "33549ff7bae01970c38b14711da5b38117c9f6872"),
+])
+def test_a_park_counts_any_stored_parsed_verdict_including_prior_push_provenance(
+        monkeypatch, outcome, prior_push):
+    record = _chain_record(
+        "parsed", sequence=1, created=100, axis="fix", held=True,
+        outcome=outcome, prior_push=prior_push,
+        hold_reason="completed stage has no successor")
+
+    body = _park_body(monkeypatch, record)
+
+    assert "1 review pass recorded a verdict" in body
+    assert "No review verdict was recorded for this exact head" not in body
+    assert "the review executions failed" not in body
+
+
+@pytest.mark.parametrize("hold_reason,cause", [
+    ("refused before start — checkout-locked: review checkout pinned open",
+     "latest review session did not run at all"),
+    ("continuation budget exhausted — the last attempt was cut off at its turn cap",
+     "last review session was cut off at its per-stage turn ceiling"),
+])
+def test_a_cause_specific_park_replaces_only_unsupported_zero_pass_claims(
+        monkeypatch, hold_reason, cause):
+    record = _chain_record(
+        "caused", sequence=1, created=100, axis="combined", held=True, passes=1,
+        hold_reason=hold_reason)
+
+    body = _park_body(monkeypatch, record)
+
+    assert cause in body
+    assert "1 review pass recorded a verdict" in body
+    assert "nothing has looked at this change at all" not in body
+    assert "no budget was drawn down" not in body
+    assert "nothing has judged this change yet" not in body
 
 
 def test_a_resumed_review_keeps_the_head_lineage_and_ledger_and_settles_the_decision():

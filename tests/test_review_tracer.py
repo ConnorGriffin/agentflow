@@ -1833,6 +1833,135 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
     assert len([r for r in _records(coord) if r.stage == "review"]) == 2
 
 
+def test_manual_review_resume_keeps_the_three_pass_ceiling_and_park_truth(
+        make_coord, monkeypatch):
+    """Replay the PR #538 boundary through the durable coordinator and manual review command.
+
+    Two earlier reviewer pushes are carried on the parked record, whose own parsed PASS pushed the
+    third repair. The park must describe those three judgments, and a manual resume at that moved
+    head may buy a fresh judgment but not another repair push.
+    """
+    from agentflow import loop
+    from agentflow.loop import RepoConfig
+    from agentflow.review_policy import ReviewAssignment
+
+    payload = json.dumps({
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "sha-a",
+        "final_sha": "sha-b", "pushed_sha": "sha-b", "fixes": ["repaired the review flow"],
+        "follow_ups": [], "checks": ["review tracer passed"], "findings": [],
+        "uncertainty": None, "decision": "",
+    })
+
+    class CompletedArtifact:
+        def observe(self, _record):
+            return ProviderObservation(
+                final_message=payload, cause=ProviderCause.NONE, has_end_fact=True)
+
+    posted = []
+    monkeypatch.setattr(
+        github, "pr_comments",
+        lambda _repo, _pr: [github.Comment(body=body, created_at="") for body in posted])
+    monkeypatch.setattr(
+        github, "pr_comment",
+        lambda _repo, _pr, body: bool(posted.append(body)) or True)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *_args, **_kwargs: True)
+
+    fake = FakeSession()
+    adapter = ReviewStageAdapter(
+        verdict_ready=coordinated_review._verdict_ready,
+        worktree_reset=lambda _record: True,
+        observer=CompletedArtifact(),
+        handoff=pr_park.park_pr)
+    coord = make_coord(fake, adapter=adapter)
+    parked_id = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="review", pool="codex", complexity="deep",
+        target="sha-a", builder_lineage="claude",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        input_ptr="Review PR #42",
+        review=ReviewState(
+            assignment=ReviewAssignment(reason="one journey"),
+            change_author_tool="claude", passes=2)))
+    coord.cycle("codex")
+    fake.end(parked_id, success=True, cause=ProviderCause.NONE)
+    assert [outcome.status for outcome in coord.cycle("codex")] == ["completed"]
+    assert coord.park_completed(parked_id) is not None
+
+    monkeypatch.setattr(loop.github, "pr_facts", lambda _repo, _pr: loop.github.PrFacts(
+        head_ref_name="agentflow/claude/issue-7-fix", head_ref_oid="sha-b",
+        state="OPEN", closing_issues=(7,)))
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda _cfg, _issue: "acceptance")
+    monkeypatch.setattr(loop, "repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr(
+        coordinated_review, "_review_assignment_facts",
+        lambda *_args, **_kwargs: (ReviewAssignment(reason="one journey"), ()))
+    monkeypatch.setattr(loop, "pick_reviewer", lambda _author, **_kwargs: "codex")
+    monkeypatch.setattr(loop, "claim", lambda *_args: True)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
+
+    assert loop.review_pr(RepoConfig("o/r", "/work"), 42) == "review submitted"
+
+    resumed = next(record for record in _records(coord) if record.target == "sha-b")
+    assert resumed.review_passes == 3 and resumed.resume == 1
+    assert resumed.identity != parked_id and resumed.claim is True
+    body = posted[0]
+    assert "3 review passes recorded a verdict" in body
+    for false_claim in (
+        "No review verdict was recorded for this exact head",
+        "the review executions failed",
+        "nothing has judged this change yet",
+        "the review this change never got",
+    ):
+        assert false_claim not in body
+
+
+def test_manual_resume_identity_never_reuses_a_daemon_retarget_record(make_coord, monkeypatch):
+    """A manual and daemon resume can race toward the same new head with the same pass ledger.
+
+    The daemon keeps resume zero; the maintainer command carries its own positive resume dimension,
+    so submitting it after the daemon record retired cannot revive that record or take its claim.
+    """
+    from agentflow.loop import RepoConfig
+    from agentflow.review_policy import ReviewAssignment
+
+    monkeypatch.setattr(coordinated_review, "repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr(
+        coordinated_review, "pick_reviewer", lambda _author, **_kwargs: "claude")
+    coord = make_coord()
+    stranded_id = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="review", pool="codex", target="sha-a",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        builder_lineage="claude", input_ptr="Review sha-a",
+        review=ReviewState(
+            assignment=ReviewAssignment(reason="one journey"),
+            change_author_tool="claude", passes=2)))
+    stranded = record_of(coord, stranded_id)
+    daemon = coordinated_review._moved_head_review_submission(stranded, "sha-b")
+    assert daemon is not None and daemon.resume == 0 and daemon.review.passes == 2
+    manual = coordinated_review.survivor_review_submission(
+        RepoConfig("o/r", "/work"), issue=7, slug="fix", builder_tool="claude",
+        head_sha="sha-b", reviewer_tool="codex", pr_number=42, acceptance="acceptance",
+        review=ReviewState(
+            assignment=ReviewAssignment(reason="one journey"),
+            change_author_tool="claude", reviewed_from_sha="sha-b", passes=2),
+        resume=1)
+    assert manual is not None
+
+    daemon_id = coord.submit_stage(daemon)
+    later = replace(daemon, target="sha-c", transfer_from=daemon_id, supersede=True)
+    coord.submit_stage(later)
+    assert record_of(coord, daemon_id).retired is True
+    assert record_of(coord, daemon_id).claim is False
+
+    manual_id = coord.submit_stage(manual)
+
+    assert manual_id != daemon_id
+    assert record_of(coord, daemon_id).retired is True
+    assert record_of(coord, daemon_id).claim is False
+    assert record_of(coord, manual_id).claim is True
+
+
 # --- a prior attempt's pushed fix must not park the continuation review (#346 class) ------
 
 def test_a_continuation_verdict_over_a_prior_attempts_pushed_fix_verifies(monkeypatch):

@@ -4,7 +4,9 @@ The one thing that must never happen: MERGE without independent review + green C
 + clean verdict.
 """
 
+import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,8 +16,9 @@ from agentflow import github
 from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                             has_committed_evidence, has_image_evidence,
                             maintainer_comment, maintainer_comment_id, reply_pending,
-                            respond_reply_disclaimer, squash_merge,
+                            respond_reply_disclaimer, review_resume_passes, squash_merge,
                             touches_ui_surface, ui_evidence_gap)
+from agentflow.coordinator.record import Record
 from agentflow.reviewer import Finding, Verdict
 from agentflow.review_policy import ReviewAction, ReviewFinding
 
@@ -69,6 +72,60 @@ def test_unusable_review_parks_never_revises():
     # re-running the builder can't help, so park (don't waste a revise).
     unparsed = Verdict(clean=False, parsed=False, findings=(Finding("blocking", "no verdict"),))
     assert d(verdict=unparsed, revises_used=0) is MergeDecision.PARK
+
+
+def _review_result(*, target="sha-a", final="sha-b", pushed="sha-b"):
+    return json.dumps({
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": target,
+        "final_sha": final, "pushed_sha": pushed,
+        "fixes": (["repaired it"] if pushed else []), "follow_ups": [],
+        "checks": ["reviewed"], "findings": [], "uncertainty": None, "decision": "",
+    })
+
+
+def _review_record(identity, *, created, passes, outcome=None, sequence=0):
+    return Record(
+        identity=identity, stage="review", pool="codex", demand=1, repo="o/r", subject="7",
+        target="sha-a", created_at=created, review_passes=passes, review_sequence=sequence,
+        review_depth="targeted", depth_reason="one journey", review_axis="combined",
+        change_author_tool="claude", outcome=outcome)
+
+
+def test_manual_review_ledger_counts_only_a_newest_records_own_repair_push():
+    pushed = _review_record("pushed", created=200, passes=2, outcome=_review_result())
+    unchanged = replace(
+        pushed, identity="unchanged", outcome=_review_result(final="sha-a", pushed=""))
+
+    assert review_resume_passes([pushed], "o/r", 7) == 3
+    assert review_resume_passes([unchanged], "o/r", 7) == 2
+
+
+def test_manual_review_ledger_uses_recency_instead_of_the_highest_sequence():
+    high_sequence = _review_record("older", created=100, passes=2, sequence=99)
+    recent = _review_record("newer", created=200, passes=1, sequence=0)
+
+    assert review_resume_passes([recent, high_sequence], "o/r", 7) == 1
+
+
+@pytest.mark.parametrize("state", ["waiting", "running", "held"])
+def test_an_uncompleted_revise_does_not_reset_the_manual_review_ledger(state):
+    review = _review_record("review", created=100, passes=2)
+    revise = Record(
+        identity="revise", stage="revise", pool="claude", demand=1, repo="o/r", subject="7",
+        created_at=200, state=state, review_passes=0)
+
+    assert review_resume_passes([review, revise], "o/r", 7) == 2
+
+
+@pytest.mark.parametrize("carried", [0, 2])
+def test_a_completed_revise_starts_the_manual_review_ledger_from_its_carried_count(carried):
+    old_review = _review_record("old-review", created=100, passes=2)
+    boundary = Record(
+        identity="boundary", stage="revise", pool="claude", demand=1,
+        repo="o/r", subject="7", created_at=200, state="completed", review_passes=carried)
+
+    assert review_resume_passes([old_review, boundary], "o/r", 7) == carried
 
 
 class _FakeGitHub:

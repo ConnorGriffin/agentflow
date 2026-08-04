@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from agentflow import github
-from agentflow.reviewer import Verdict
+from agentflow.reviewer import Verdict, parse_verdict
 
 # Merges stay serialized even as builds run concurrently (ADR 0009 collision floor): two
 # PRs never squash-merge at the same instant. Concurrent dispatch (ADR 0023) multiplies
@@ -48,6 +48,37 @@ def revise_round_budget_remains(records, repo, subject) -> bool:
                  if r.stage == "revise" and not r.conflict_round
                  and r.repo == repo and str(r.subject) == str(subject))
     return rounds < MAX_REVISES
+
+
+def review_resume_passes(records, repo, subject) -> int:
+    """The cumulative mutating-review ledger a manual Review resumes for this PR.
+
+    A completed Revise starts a new review budget boundary. Reviews opened after the newest such
+    boundary carry the ledger forward across heads; a submitted but unfinished Revise moves
+    nothing. When the boundary has no later Review yet, its own carried ledger is authoritative —
+    normally zero, but non-zero for a conflict-decision Revise. A completed Review record counts
+    its own push exactly as the automatic successor path does. Pure (test surface, #501).
+    """
+    matching = [r for r in records
+                if r.repo == repo and str(r.subject) == str(subject)]
+    boundary = max(
+        (r for r in matching if r.stage == "revise" and r.state == "completed"),
+        key=lambda r: (r.created_at, r.identity), default=None)
+    reviews = [
+        r for r in matching
+        if r.stage == "review" and (boundary is None or r.created_at > boundary.created_at)
+    ]
+    newest = max(reviews, key=lambda r: (r.created_at, r.identity), default=None)
+    if newest is None:
+        return boundary.review_passes if boundary is not None else 0
+    if not newest.outcome:
+        return newest.review_passes
+    verdict = parse_verdict(
+        newest.outcome, expected_sha=newest.target,
+        expected_depth=newest.review_depth, expected_axis=newest.review_axis,
+        expected_author=newest.change_author_tool,
+        owned_heads=((newest.review_prior_push,) if newest.review_prior_push else ()))
+    return newest.review_passes + int(verdict.parsed and bool(verdict.pushed_sha))
 
 
 def conflict_revises_used(records, repo, subject) -> list:
