@@ -431,3 +431,75 @@ def test_the_order_never_depends_on_the_order_repositories_were_walked():
     backward = operator_projection.attention(list(reversed(views)), [])
     assert forward == backward
     assert [row["repo"] for row in forward["rows"]] == ["o/a", "o/b"]
+
+
+# --- the stage-drought condition (#430) ---------------------------------------------------
+# A stage that spent sessions and produced nothing across a whole window of finished attempts.
+# Fixtures are shaped exactly like what `stage_health.stage_health()` publishes.
+
+def _stage(stage="pre-publish attack", *, produces="published a hardened brief",
+           check="held drafts and ready-for-agent holdbacks", attempts=10, produced=0,
+           sessions_spent=37):
+    return {"stage": stage, "produces": produces, "check": check, "window": 10,
+            "attempts": attempts, "produced": produced, "sessions_spent": sessions_spent}
+
+
+def test_a_stage_that_produced_nothing_all_window_raises_one_row_ahead_of_everything_else():
+    """The regression this condition exists to prevent: a silently broken stage outranks any
+    single item it starves, because none of those items can show that it is broken."""
+    result = operator_projection.attention(
+        [_view(in_flight=[_pr(20)], held=[_held(10)], parked=[_parked(30)],
+               ratchet={"samples": 12, "correction_rate": 0.05, "ready_to_loosen": True})],
+        [_repository(status="stale")], stage_health=[_stage()])
+    assert [row["condition"] for row in result["rows"]] == [
+        "stage-drought", "awaiting-merge", "waiting-on-reply", "parked-build",
+        "ready-to-loosen", "stale-data"]
+    row = result["rows"][0]
+    assert row["kind"] == "stage drought"
+    assert row["title"] == "pre-publish attack"
+    assert row["detail"] == ("0 of its last 10 finished attempts published a hardened brief "
+                             "· 37 sessions spent")
+
+
+def test_a_drought_row_says_where_to_look_instead_of_offering_an_action():
+    """A stage is not something you can open on GitHub, so the third column is plain text."""
+    result = operator_projection.attention([], [], stage_health=[_stage()])
+    assert result["rows"][0]["url"] is None
+    assert result["rows"][0]["note"] == (
+        "What to check: held drafts and ready-for-agent holdbacks")
+
+
+def test_a_stage_inside_its_first_window_leaves_the_queue_exactly_as_it_was():
+    """Absence is load-bearing: a quiet fleet has to be provably quiet, so a stage that has not
+    yet finished a whole window contributes nothing at all."""
+    views, repositories = [_view(in_flight=[_pr(20)])], [_repository()]
+    shipped = operator_projection.attention(views, repositories)
+    assert operator_projection.attention(
+        views, repositories, stage_health=[_stage(attempts=9, sessions_spent=12)]) == shipped
+
+
+def test_a_stage_that_produced_anything_at_all_leaves_the_queue_exactly_as_it_was():
+    views, repositories = [_view(in_flight=[_pr(20)])], [_repository()]
+    shipped = operator_projection.attention(views, repositories)
+    assert operator_projection.attention(
+        views, repositories, stage_health=[_stage(produced=1)]) == shipped
+
+
+def test_two_stages_in_drought_stack_as_two_rows():
+    result = operator_projection.attention([], [], stage_health=[
+        _stage(),
+        _stage("review", produces="recorded a review verdict",
+               check="open PRs waiting on a verdict", sessions_spent=41)])
+    assert [row["title"] for row in result["rows"]] == ["pre-publish attack", "review"]
+    assert result["rows"][1]["detail"] == ("0 of its last 10 finished attempts recorded a "
+                                           "review verdict · 41 sessions spent")
+    assert result["rows"][1]["note"] == "What to check: open PRs waiting on a verdict"
+    assert result["total"] == 2
+
+
+def test_a_drought_row_counts_against_the_fleet_wide_bound_like_any_other_row():
+    views = [_view(f"o/r{index:02d}", held=[_held(index)]) for index in range(25)]
+    result = operator_projection.attention(views, [], stage_health=[_stage()])
+    assert len(result["rows"]) == operator_projection.ATTENTION_LIMIT == 25
+    assert result["total"] == 26
+    assert result["rows"][0]["condition"] == "stage-drought"
