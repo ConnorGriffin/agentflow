@@ -241,8 +241,9 @@
       "fetchStub": {
         "operator-surface.capture.json": {
           "freshness": {
-            "state": "fresh",
-            "label": "Verified just now"
+            "state": "incomplete",
+            "label": "Projection unavailable",
+            "message": "The operator projection could not be read. Open GitHub for authoritative state."
           },
           "attention": [],
           "maps": [],

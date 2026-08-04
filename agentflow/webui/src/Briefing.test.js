@@ -4,11 +4,13 @@ import Briefing from './Briefing.svelte';
 import STATES from './fixtures/operator-briefing-states.json';
 
 /* Daemon projection → endpoint → rendered briefing, exercised through the real component
-   (ADR 0036, #183). The fixture is the schema-v2 + v1 shape `operator_projection.project()`
-   and `dashboard_data.snapshot()` actually publish — the same one briefing.test.js's derive
-   coverage uses, so both layers are proven against one shared contract. */
+   (ADR 0036, #183, ADR 376). The fixture is the shape `GET /api/snapshot` serves — what the
+   daemon published, plus the freshness the server stamps at read time — the same one
+   briefing.test.js's derive coverage uses, so both layers are proven against one contract. */
 const SNAP = {
   generated_at: '2026-07-30T12:00:00+00:00',
+  freshness: { state: 'fresh', label_prefix: 'Verified', message: null,
+               verified_at: '2026-07-30T11:56:00+00:00' },
   pools: [{ tool: 'claude', clear: true, spent_pct: 20, headroom_pct: 80, running: 1 }],
   repos: [
     { repo: 'o/r', profile: 'reviewed', ready: [], held: [], parked: [],
@@ -80,7 +82,7 @@ describe('Briefing.svelte — typical state', () => {
 
   it('renders the fresh masthead with no stale/incomplete banner', () => {
     render(Briefing, { snap: SNAP });
-    expect(screen.getByText(/Updated/)).toBeTruthy();
+    expect(screen.getByText('Verified 4m ago')).toBeTruthy();
     expect(screen.queryByRole('status')).toBeNull();
   });
 });
@@ -258,36 +260,62 @@ describe('Briefing.svelte — bounded overflow and landed evidence', () => {
   });
 });
 
+/* Served-stale: the server aged the repository's map read down and stamped the posture. The
+   page renders exactly what it was handed — and withholds every frontier under it. */
+const STALE_STAMP = { state: 'stale', label_prefix: 'Last verified',
+  message: 'This projection is stale. Open GitHub before acting on a frontier.',
+  verified_at: '2026-07-30T11:31:00+00:00' };
+
 describe('Briefing.svelte — stale state', () => {
+  const stale = { ...SNAP, freshness: STALE_STAMP,
+    repositories: [{ ...SNAP.repositories[0], github: { status: 'stale' } }] };
+
   it('renders the honest stale banner and withholds the frontier claim', () => {
-    const stale = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
-      github: { status: 'stale' } }] };
     const { container } = render(Briefing, { snap: stale });
-    expect(screen.getByRole('status').textContent).toMatch(/not refreshed/);
+    expect(screen.getByRole('status').textContent)
+      .toBe('This projection is stale. Open GitHub before acting on a frontier.');
+    expect(screen.getByText('Last verified 29m ago')).toBeTruthy();
     expect(container.querySelector('.frontier').textContent).toContain('Not verified');
   });
 
   it('keeps the fleet-wide banner alongside the per-repository row that names it', () => {
     /* The banner is posture; the row is the action, with a link. They pair, never collapse. */
-    const stale = {
-      ...SNAP,
-      repositories: [{ ...SNAP.repositories[0], github: { status: 'stale' } }],
+    render(Briefing, { snap: { ...stale,
       attention: { rows: [{ condition: 'stale-data', kind: 'Projection', repo: 'o/r',
         number: null, title: 'r briefing data is stale',
         detail: 'the last read of this repository failed',
-        url: 'https://github.com/o/r' }], total: 1 },
-    };
-    render(Briefing, { snap: stale });
+        url: 'https://github.com/o/r' }], total: 1 } } });
     expect(screen.getByRole('status')).toBeTruthy();
     expect(screen.getByText('r briefing data is stale')).toBeTruthy();
     expect(screen.getByRole('link', { name: /Open in GitHub/ }).getAttribute('href'))
       .toBe('https://github.com/o/r');
   });
+
+  it('paints the two banner variants the surface has, and no third', () => {
+    const variant = (snap) =>
+      [...render(Briefing, { snap }).container.querySelector('.banner').classList]
+        .filter((c) => !c.startsWith('svelte-'));
+    expect(variant(stale)).toEqual(['banner', 'stale']);
+    expect(variant({ ...SNAP, freshness: { ...STALE_STAMP, state: 'incomplete' } }))
+      .toEqual(['banner', 'incomplete']);
+  });
+
+  it('announces the banner and lets the keyboard reach it', () => {
+    const { container } = render(Briefing, { snap: stale });
+    const banner = container.querySelector('.banner');
+    expect(banner.getAttribute('role')).toBe('status');
+    expect(banner.getAttribute('tabindex')).toBe('0');
+    banner.focus();
+    expect(document.activeElement).toBe(banner);
+  });
 });
 
 describe('Briefing.svelte — empty state', () => {
-  it('renders the honest empty rows, never a blank section', () => {
-    render(Briefing, { snap: { repositories: [], repos: [], pools: [], fleet: { recent_landed: [] } } });
+  it('renders a zero-repository projection as unavailable, never as a fresh empty fleet', () => {
+    /* The very body the endpoint serves for a projection with no repositories in it. */
+    render(Briefing, { snap: STATES.empty });
+    expect(screen.getByText('Projection unavailable')).toBeTruthy();
+    expect(screen.getByRole('status').textContent).toMatch(/could not be read/);
     expect(screen.getByText('No operator actions in this projection.')).toBeTruthy();
     expect(screen.getByText('No active Decision Maps in this bounded projection.')).toBeTruthy();
     expect(screen.getByText('No repositories were included in this projection.')).toBeTruthy();

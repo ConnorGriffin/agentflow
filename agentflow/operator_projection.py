@@ -1,10 +1,12 @@
 """Schema-version-2 operator projection (ADR 0036) — the daemon-owned bounded Decision Map read,
 composed additively alongside the existing v1 snapshot :func:`agentflow.dashboard_data.snapshot`
-already produces. The freshness bookkeeping, fleet-wide point-budget stop, and stale-preserve-on-
-failure logic below are the pure test surface; :func:`project` is the one impure entry point that
-walks the fleet and calls :mod:`agentflow.github`. :func:`decision_map_probe` runs that same set
-of reads once, for one repository, and prints what GitHub answered — the read-only evidence
-behind a claim about what the refresh costs (ADR 374).
+already produces. The fleet-wide point-budget stop and stale-preserve-on-failure logic below are
+the pure test surface; :func:`project` is the one impure entry point that walks the fleet and
+calls :mod:`agentflow.github`. The freshness rule itself lives in
+:mod:`agentflow.operator_freshness`, which the console server also reads through — it has no
+GitHub-facing imports. :func:`decision_map_probe` runs that same set of reads once, for one
+repository, and prints what GitHub answered — the read-only evidence behind a claim about what
+the refresh costs (ADR 374).
 """
 
 from __future__ import annotations
@@ -12,11 +14,10 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
-from agentflow import decision_maps, github
+from agentflow import decision_maps, github, operator_freshness
 from agentflow.loop import RepoConfig
+from agentflow.operator_freshness import SCHEMA_VERSION
 from agentflow.repo_facts import repo_profile
-
-SCHEMA_VERSION = 2
 
 # Per ADR 374 (raising ADR 0036's original 60): at most 250 GraphQL points spent on this refresh
 # per heartbeat — enough for all nine enrolled repositories to refresh in one heartbeat, which is
@@ -34,44 +35,6 @@ ATTENTION_LIMIT = 25
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
-
-
-def _parse(iso: str | None) -> datetime | None:
-    if not iso:
-        return None
-    try:
-        return datetime.fromisoformat(iso)
-    except ValueError:
-        return None
-
-
-def freshness(
-    *, previous: dict | None, now: datetime, heartbeat_seconds: int,
-    attempted: bool, success: bool, error: str | None,
-) -> dict:
-    """One repository's maps-component freshness stamp (ADR 0036): ``fresh`` only when the
-    latest attempt succeeded and the verified read is no older than two heartbeats; ``stale``
-    when the latest attempt failed or that window has passed; ``unavailable`` when no read has
-    ever succeeded. Always preserves the last verified ``fresh_at`` — a failure never invents
-    one, and it never discards a still-honest earlier success."""
-    prev = previous or {}
-    if success:
-        return {"status": "fresh", "attempted_at": _iso(now), "fresh_at": _iso(now),
-                "error": None}
-    fresh_at = prev.get("fresh_at")
-    attempted_at = _iso(now) if attempted else prev.get("attempted_at")
-    if fresh_at is None:
-        return {"status": "unavailable", "attempted_at": attempted_at, "fresh_at": None,
-                "error": error}
-    if attempted:  # the latest attempt ran this cycle and failed
-        return {"status": "stale", "attempted_at": attempted_at, "fresh_at": fresh_at,
-                "error": error}
-    parsed = _parse(fresh_at)
-    age = (now - parsed).total_seconds() if parsed else float("inf")
-    if age <= 2 * heartbeat_seconds:  # not attempted this cycle, but still within the window
-        return {"status": "fresh", "attempted_at": attempted_at, "fresh_at": fresh_at,
-                "error": None}
-    return {"status": "stale", "attempted_at": attempted_at, "fresh_at": fresh_at, "error": error}
 
 
 def _repo_url(repo: str) -> str:
@@ -115,9 +78,9 @@ def repository_maps(
                 "profile": repo_profile(cfg.workdir)}
 
     if budget.get("stopped"):
-        fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
-                          attempted=False, success=False,
-                          error="point budget reached this heartbeat")
+        fresh = operator_freshness.component(
+            previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
+            attempted=False, success=False, error="point budget reached this heartbeat")
         return {**identity, "github": fresh, "maps": prev_maps}
 
     maps_read = read_maps(cfg.repo, limit=decision_maps.ACTIVE_MAP_LIMIT,
@@ -129,8 +92,9 @@ def repository_maps(
             or (maps_read.remaining is not None and maps_read.remaining < WORKFLOW_FLOOR)):
         budget["stopped"] = True
     if maps_read.error:
-        fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
-                          attempted=True, success=False, error=maps_read.error)
+        fresh = operator_freshness.component(
+            previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
+            attempted=True, success=False, error=maps_read.error)
         return {**identity, "github": fresh, "maps": prev_maps}
 
     handoff_numbers: set[int] = set()
@@ -154,8 +118,9 @@ def repository_maps(
     component = decision_maps.maps_component(
         maps_read, repo=cfg.repo, handoff_links=links_read,
         open_prs=open_prs or [], merged_prs=merged_prs or [])
-    fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
-                      attempted=True, success=True, error=None)
+    fresh = operator_freshness.component(
+        previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
+        attempted=True, success=True, error=None)
     return {**identity, "github": fresh, "maps": component}
 
 
@@ -187,7 +152,10 @@ def project(
     Reads walk least-recently-fresh first (:func:`_walk_order`) so a shared point budget that
     stops partway through never starves the same repositories every heartbeat; the published
     ``repositories`` list is re-sorted back to config order, since that is the order the console
-    renders (#492)."""
+    renders (#492).
+
+    The heartbeat this publish stamped travels *in* the body, because whoever reads it later
+    is a separately launched process that may be running different code (ADR 376)."""
     now = now or datetime.now(timezone.utc)
     budget = {"spent": 0, "stopped": False}
     by_repo = {
@@ -197,6 +165,7 @@ def project(
     }
     repositories = [by_repo[cfg.repo] for cfg in repos]
     return {"schema_version": SCHEMA_VERSION, "generated_at": _iso(now),
+            operator_freshness.HEARTBEAT_FIELD: heartbeat_seconds,
             "repositories": repositories}
 
 

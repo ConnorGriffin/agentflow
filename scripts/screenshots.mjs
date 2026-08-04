@@ -17,7 +17,15 @@
  *         "viewport":  { "width": N, "height": N },           // optional; defaults to 1280x900
  *         "settle":    number,              // optional extra ms wait before the shot
  *         "clicks":    [ "<css-selector>", ... ],             // optional: click each in order after load
- *         "fetchStub": { "<url-substr>": <json-value>, ... }  // optional per-shot stubs
+ *         "fetchStub": { "<url-substr>": <json-value>, ... }, // optional per-shot stubs
+ *         "clock":     "<ISO-8601>",        // optional: pin Date.now() so relative ages don't move
+ *         "assert": {                       // optional: checked after clicks/theme, fails the run
+ *           "theme": { "selector": "<css>", "value": "<data-theme>",
+ *                      "backgroundColor": "rgb(r, g, b)" },   // backgroundColor optional
+ *           "noConsoleErrors": true,
+ *           "ignoreConsole": [ "<substr>", ... ],   // optional: known-irrelevant console noise
+ *           "noHorizontalOverflow": true | "<css-selector>"  // whole page, or one surface
+ *         }
  *       }
  *     ]
  *   }
@@ -95,9 +103,19 @@ function buildFetchInitScript(shots) {
   const stubMap = Object.fromEntries(
     shots.map((s, i) => [String(i), s.fetchStub || {}])
   );
+  // Optional pinned clock, same index keying. An app that words ages relative to Date.now()
+  // otherwise renders a different string every run, so two captures of one state differ
+  // where nothing changed. Only Date.now() is pinned — Date.parse and explicit timestamps
+  // still work normally, which is all the relative-time helpers need.
+  const clockMap = Object.fromEntries(
+    shots.map((s, i) => [String(i), s.clock ? Date.parse(s.clock) : null])
+  );
   return `(function () {
-  var map = ${JSON.stringify(stubMap)};
   var idx = new URLSearchParams(location.search).get('shot') || '0';
+  var clocks = ${JSON.stringify(clockMap)};
+  var pinned = clocks[idx];
+  if (pinned !== null && pinned !== undefined) Date.now = function () { return pinned; };
+  var map = ${JSON.stringify(stubMap)};
   var stubs = map[idx] || {};
   var keys = Object.keys(stubs);
   if (!keys.length) return;
@@ -127,6 +145,58 @@ function withShotParam(url, idx) {
   return url.includes('?') ? url + '&shot=' + idx : url + '?shot=' + idx;
 }
 
+/**
+ * Opt-in per-shot checks, run after the clicks and the theme so they see the state the PNG
+ * shows. A shot with no "assert" block is unchanged. Returns a list of failure strings.
+ */
+async function checkShot(page, shot, consoleErrors) {
+  const want = shot.assert;
+  if (!want) return [];
+  const failures = [];
+
+  if (want.theme) {
+    const { selector, value, backgroundColor } = want.theme;
+    const got = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      return { theme: el.getAttribute('data-theme'),
+               background: getComputedStyle(el).backgroundColor };
+    }, selector);
+    if (!got) failures.push('theme: no element matched ' + selector);
+    else if (got.theme !== value) {
+      failures.push('theme: ' + selector + ' is ' + got.theme + ', wanted ' + value);
+    } else if (backgroundColor && got.background !== backgroundColor) {
+      failures.push('theme: ' + selector + ' painted ' + got.background +
+                    ', wanted ' + backgroundColor);
+    }
+  }
+
+  if (want.noConsoleErrors) {
+    const ignore = want.ignoreConsole || [];
+    const real = consoleErrors.filter((e) => !ignore.some((skip) => e.includes(skip)));
+    if (real.length) failures.push('console: ' + real.join(' | '));
+  }
+
+  if (want.noHorizontalOverflow) {
+    // `true` measures the whole page; a selector measures one surface, for a page whose
+    // surrounding chrome has its own (out-of-scope) width floor.
+    const selector = typeof want.noHorizontalOverflow === 'string'
+      ? want.noHorizontalOverflow : null;
+    const overflow = await page.evaluate((sel) => {
+      const el = sel ? document.querySelector(sel) : document.documentElement;
+      return el ? el.scrollWidth - el.clientWidth : null;
+    }, selector);
+    if (overflow === null) {
+      failures.push('overflow: no element matched ' + selector);
+    } else if (overflow > 0) {
+      failures.push('overflow: ' + (selector || 'the page') + ' scrolls ' + overflow +
+                    'px horizontally');
+    }
+  }
+
+  return failures;
+}
+
 async function captureShots(shots) {
   const pw = await loadPlaywright();
 
@@ -141,6 +211,20 @@ async function captureShots(shots) {
   await context.addInitScript(buildFetchInitScript(shots));
   const page = await context.newPage();
 
+  // Collected per shot (cleared at each navigation) for the opt-in noConsoleErrors check.
+  let consoleErrors = [];
+  page.on('console', (msg) => {
+    // A failed subresource reports only "Failed to load resource: ..." as its text; the URL
+    // that failed is in the location, so record both or an ignore list has nothing to match.
+    if (msg.type() === 'error') {
+      const where = (msg.location() && msg.location().url) || '';
+      consoleErrors.push(where ? msg.text() + ' [' + where + ']' : msg.text());
+    }
+  });
+  page.on('pageerror', (e) => consoleErrors.push(String(e)));
+
+  const violations = [];
+
   for (let i = 0; i < shots.length; i++) {
     const { url, theme, out, viewport } = shots[i];
 
@@ -149,6 +233,7 @@ async function captureShots(shots) {
     if (viewport) await page.setViewportSize(viewport);
 
     // Append the shot index so the init script selects the right fetch stub.
+    consoleErrors = [];
     await page.goto(withShotParam(url, i), { waitUntil: 'networkidle' });
 
     // Optional interaction steps for screens that are only reached by clicking
@@ -177,14 +262,28 @@ async function captureShots(shots) {
     // networkidle). Defaults to none, so existing configs are unaffected.
     if (shots[i].settle) await page.waitForTimeout(shots[i].settle);
 
+    // A click scrolls its target into view; on a narrow viewport that can leave the page
+    // scrolled sideways, so the shot would frame the wrong part of it. Always shoot from
+    // the top-left.
+    await page.evaluate(() => window.scrollTo(0, 0));
+
     const outPath = resolve(out);
     mkdirSync(dirname(outPath), { recursive: true });
     await page.screenshot({ path: outPath });
     console.log('[screenshots] wrote ' + outPath + (theme ? ' (' + theme + ')' : ''));
+
+    for (const failure of await checkShot(page, shots[i], consoleErrors)) {
+      violations.push(out + ': ' + failure);
+      console.error('[screenshots] FAIL ' + out + ': ' + failure);
+    }
   }
 
   // Close the browser (not the context) — context.close() kills --single-process browsers.
   await browser.close();
+
+  // Every PNG is written before anything fails, so the shots stay inspectable — but a run
+  // whose assertions failed exits nonzero rather than handing back evidence that lies.
+  if (violations.length) die(violations.length + ' assertion(s) failed');
 }
 
 async function selfCheck(outDir) {

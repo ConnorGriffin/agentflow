@@ -23,7 +23,11 @@
   </header>
 
   {#if briefing.freshness.state === 'stale' || briefing.freshness.state === 'incomplete'}
-    <div class="banner {briefing.freshness.state}" role="status">{briefing.freshness.message}</div>
+    <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+    <!-- Announced when it appears, and deliberately focusable: a keyboard reader on the way
+         down the page must be able to land on the sentence saying the rest of it may be
+         wrong, not only hear it go by once. -->
+    <div class="banner {briefing.freshness.state}" role="status" tabindex="0">{briefing.freshness.message}</div>
   {/if}
 
   <section aria-labelledby="briefing-title">
@@ -142,11 +146,16 @@
   .briefing button, .briefing a { font: inherit; }
   .briefing a { color: var(--link); text-underline-offset: 3px; }
   .briefing button { color: inherit; background: transparent; }
-  .briefing button:focus-visible, .briefing a:focus-visible, .briefing summary:focus-visible {
+  .briefing button:focus-visible, .briefing a:focus-visible, .briefing summary:focus-visible,
+  .banner:focus-visible {
     outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 2px;
   }
   .mast {
     display: flex; align-items: center; gap: 16px; min-height: 84px; border-bottom: 1px solid var(--line);
+    /* This masthead is a <header>, and the surrounding console paints every <header> with its
+       own dark shell colour — which landed the wordmark and the projection age as dark ink on
+       a dark band. The surface's own paper shows through instead. */
+    background: transparent;
   }
   .wordmark { font-size: 19px; font-weight: 700; letter-spacing: -.04em; }
   .wordmark span { color: var(--accent); }

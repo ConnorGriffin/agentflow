@@ -266,28 +266,30 @@ export function deriveCapacity(snap) {
   });
 }
 
-/* The masthead/banner state: worst-case across every repository's Decision Map freshness
-   (ADR 0036's three states). No repository read yet at all reads as `incomplete`, the same
-   honest-empty contract the endpoint itself returns before any daemon has published. */
+/* The masthead/banner state, as the server stamped it (ADR 376). The freshness *rule* — which
+   repository counts as verified, and how old the projection is allowed to claim it is — lives
+   server-side, so the daemon's publish and the browser's read can never word it differently.
+   All that happens here is the age: the server hands over a machine-readable `verified_at` and
+   the label's opening words, and this appends the surface's own relative-time vocabulary.
+
+   A response with no stamp at all is a server that could not say — read as unavailable rather
+   than as a briefing with a missing banner. */
+const UNREADABLE = {
+  state: 'incomplete',
+  label: 'Projection unavailable',
+  message: 'The operator projection could not be read. Open GitHub for authoritative state.',
+};
+
 export function deriveFreshness(snap) {
-  const repos = snap?.repositories || [];
-  if (!repos.length) {
-    return { state: 'incomplete', label: 'Projection unavailable',
-            message: 'No daemon-published projection yet. Open GitHub for authoritative state.' };
-  }
-  const statuses = repos.map((r) => r.github?.status || 'unavailable');
-  if (statuses.every((s) => s === 'fresh')) {
-    return { state: 'fresh',
-            label: snap.generated_at ? `Updated ${rel(snap.generated_at, Date.now())}` : 'Updated' };
-  }
-  if (statuses.includes('unavailable')) {
-    return { state: 'incomplete', label: 'Projection incomplete',
-            message: 'One or more repositories have never published a verified Decision Map '
-              + 'read. Open GitHub for authoritative state.' };
-  }
-  return { state: 'stale', label: 'Some repositories are stale',
-          message: 'One or more repositories have not refreshed within two heartbeats. '
-            + 'Frontier and map data may be out of date.' };
+  const stamp = snap?.freshness;
+  if (!stamp || !stamp.state || !stamp.label_prefix) return UNREADABLE;
+  return {
+    state: stamp.state,
+    label: stamp.verified_at
+      ? `${stamp.label_prefix} ${rel(stamp.verified_at, Date.now())}`
+      : stamp.label_prefix,
+    message: stamp.message || undefined,
+  };
 }
 
 export function deriveBriefing(snap) {

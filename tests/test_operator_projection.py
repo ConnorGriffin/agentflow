@@ -1,5 +1,6 @@
-"""Schema-version-2 operator projection (ADR 0036) — freshness bookkeeping, the fleet-wide
-point-budget stop, and stale-preserve-on-failure, exercised through the public entry points."""
+"""Schema-version-2 operator projection (ADR 0036) — the fleet-wide point-budget stop and
+stale-preserve-on-failure, exercised through the public entry points. The freshness rule the
+projection stamps with is pinned in `test_operator_freshness.py`, where it now lives."""
 
 from __future__ import annotations
 
@@ -53,53 +54,6 @@ def _handed_off_map(number=1, *, handoff=900, repo="o/agentflow") -> github.MapR
                          url=f"https://github.com/{repo}/issues/{number}",
                          updated_at="2026-08-03T00:00:00Z", body="", children=(child,),
                          children_total=1)
-
-
-# --- freshness ---------------------------------------------------------------------------
-
-def test_a_successful_attempt_is_fresh():
-    result = operator_projection.freshness(
-        previous=None, now=NOW, heartbeat_seconds=300, attempted=True, success=True, error=None)
-    assert result == {"status": "fresh", "attempted_at": NOW.isoformat(),
-                      "fresh_at": NOW.isoformat(), "error": None}
-
-
-def test_a_failed_attempt_is_stale_even_when_recently_fresh():
-    previous = {"status": "fresh", "fresh_at": (NOW - timedelta(seconds=30)).isoformat(),
-                "attempted_at": (NOW - timedelta(seconds=30)).isoformat(), "error": None}
-    result = operator_projection.freshness(
-        previous=previous, now=NOW, heartbeat_seconds=300, attempted=True, success=False,
-        error="the map read failed")
-    assert result["status"] == "stale"
-    assert result["fresh_at"] == previous["fresh_at"], "a failure never discards the last verified read"
-    assert result["error"] == "the map read failed"
-
-
-def test_never_succeeded_is_unavailable():
-    result = operator_projection.freshness(
-        previous=None, now=NOW, heartbeat_seconds=300, attempted=True, success=False,
-        error="boom")
-    assert result["status"] == "unavailable"
-    assert result["fresh_at"] is None
-
-
-def test_a_skip_within_two_heartbeats_stays_fresh():
-    previous = {"status": "fresh", "fresh_at": (NOW - timedelta(seconds=400)).isoformat(),
-                "attempted_at": (NOW - timedelta(seconds=400)).isoformat(), "error": None}
-    result = operator_projection.freshness(
-        previous=previous, now=NOW, heartbeat_seconds=300, attempted=False, success=False,
-        error=None)
-    assert result["status"] == "fresh"  # 400s old, under the 2*300s=600s window
-    assert result["attempted_at"] == previous["attempted_at"], "a skip is not a new attempt"
-
-
-def test_a_skip_beyond_two_heartbeats_goes_stale():
-    previous = {"status": "fresh", "fresh_at": (NOW - timedelta(seconds=700)).isoformat(),
-                "attempted_at": (NOW - timedelta(seconds=700)).isoformat(), "error": None}
-    result = operator_projection.freshness(
-        previous=previous, now=NOW, heartbeat_seconds=300, attempted=False, success=False,
-        error=None)
-    assert result["status"] == "stale"
 
 
 # --- repository_maps ---------------------------------------------------------------------

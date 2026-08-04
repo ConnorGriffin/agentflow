@@ -1,11 +1,15 @@
 """The console server, exercised through its public surface (ADR 0026).
 
 The server is a pure reader of the daemon-published snapshot: `/api/snapshot`
-serves exactly what the daemon last wrote, never queries GitHub, and renders a
-daemon that has never run as an empty fleet — not an error.
+serves what the daemon last wrote, never queries GitHub, and renders a daemon
+that has never run as an empty fleet — not an error. The one thing it computes
+is how old that body is allowed to say it is (ADR 376); the aging rule itself is
+pinned in `test_operator_freshness.py`.
 """
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,16 +17,38 @@ from fastapi.testclient import TestClient
 from agentflow import live, webapp
 from agentflow.workspace import channel
 
+NOW = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+
 
 def _client(read):
-    return TestClient(webapp.create_app(read))
+    return TestClient(webapp.create_app(read, now=lambda: NOW))
+
+
+def _v2(**over) -> dict:
+    """A whole published body, as the daemon writes it: the v1 fleet facts plus the schema-v2
+    projection and the heartbeat the reader ages it against."""
+    body = {"dispatch": {"enabled": True},
+            "daemon": {"gh_fresh_at": "2026-07-30T12:00:00+00:00"},
+            "pools": [], "running": [], "repos": [{"repo": "o/r"}],
+            "schema_version": 2, "generated_at": "2026-07-30T12:00:00+00:00",
+            "heartbeat_seconds": 300,
+            "repositories": [{"name_with_owner": "o/r",
+                              "github": {"status": "fresh", "attempted_at": None,
+                                         "fresh_at": "2026-07-30T12:00:00+00:00",
+                                         "error": None},
+                              "maps": {"active": [], "active_total": 0}}],
+            "fleet": {"recent_landed": []},
+            "attention": {"rows": [], "total": 0}}
+    body.update(over)
+    return body
 
 
 def test_serves_the_daemon_published_snapshot():
-    published = {"dispatch": {"enabled": True}, "daemon": {"gh_fresh_at": "2026-07-13T00:00:00+00:00"},
-                 "pools": [], "running": [], "repos": [{"repo": "o/r"}]}
+    published = _v2()
     body = _client(lambda: published).get("/api/snapshot").json()
-    assert body == published, "the endpoint is the file's contents, verbatim"
+    for field in ("dispatch", "daemon", "pools", "running", "repos", "repositories",
+                  "fleet", "attention", "generated_at"):
+        assert body[field] == published[field], f"{field} is the file's own contents"
 
 
 def test_never_ran_daemon_reads_as_an_empty_fleet():
@@ -37,17 +63,19 @@ def test_never_ran_daemon_reads_as_an_empty_fleet():
     # The operator queue is decided daemon-side (#373): no rows and a zero total, so the
     # briefing renders its honest-empty state rather than a count the browser made up.
     assert body["attention"] == {"rows": [], "total": 0}
+    # And the briefing says which absence this is, rather than drawing an empty-but-fresh page.
+    assert body["freshness"]["state"] == "incomplete"
+    assert body["freshness"]["label_prefix"] == "Projection unavailable"
 
 
-def test_a_published_schema_v2_snapshot_passes_through_verbatim():
-    published = {"dispatch": {"enabled": True}, "daemon": {"gh_fresh_at": "2026-07-30T00:00:00+00:00"},
-                 "pools": [], "running": [], "repos": [], "schema_version": 2,
-                 "generated_at": "2026-07-30T00:00:00+00:00",
-                 "repositories": [{"name_with_owner": "o/r",
-                                   "github": {"status": "fresh"}, "maps": {"active": [], "active_total": 0}}],
-                 "fleet": {"recent_landed": []}}
+def test_a_published_schema_v2_snapshot_keeps_its_map_contract():
+    published = _v2()
     body = _client(lambda: published).get("/api/snapshot").json()
-    assert body == published
+    assert body["repositories"] == published["repositories"], (
+        "a map read still inside its window is served exactly as published")
+    assert body["freshness"]["state"] == "fresh"
+    assert body["freshness"]["verified_at"] == "2026-07-30T12:00:00+00:00"
+    assert body["freshness"]["label_prefix"] == "Verified", "the browser adds only the age"
 
 
 def test_endpoint_reads_fresh_every_poll(tmp_path, monkeypatch):
@@ -57,9 +85,9 @@ def test_endpoint_reads_fresh_every_poll(tmp_path, monkeypatch):
     client = _client(live.read_snapshot)
 
     assert client.get("/api/snapshot").json()["repos"] == [], "missing file = empty fleet"
-    live.write_snapshot({"dispatch": {"enabled": True}, "repos": [{"repo": "o/r"}]})
+    live.write_snapshot(_v2(dispatch={"enabled": True}))
     assert client.get("/api/snapshot").json()["dispatch"] == {"enabled": True}
-    live.write_snapshot({"dispatch": {"enabled": False}, "repos": []})
+    live.write_snapshot(_v2(dispatch={"enabled": False}, repos=[]))
     assert client.get("/api/snapshot").json()["dispatch"] == {"enabled": False}
 
 

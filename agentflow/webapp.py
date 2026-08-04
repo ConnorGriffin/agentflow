@@ -17,9 +17,10 @@ the daemon is down the command fails *unavailable*; there is no direct-write fal
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 
-from agentflow import live
+from agentflow import live, operator_freshness
 from agentflow.coordinated_converse import read_projection
 from agentflow.workspace import channel
 
@@ -40,11 +41,9 @@ EMPTY_WORKSPACE = {"workspace": {"read_model_at": None, "revision": 0, "availabl
                    "projects": []}
 
 # What the console sees before any daemon has ever published: an empty fleet with no
-# freshness stamp — the same contract shape, never an error (ADR 0026). `repositories`/
-# `fleet` are the additive schema-v2 fields (ADR 0036): empty arrays, no `github.status`
-# claiming freshness that was never verified. `attention` is the daemon-decided operator
-# queue (#373): no rows and a zero total, so the briefing renders its honest-empty state
-# rather than a count the browser made up.
+# freshness stamp — the same contract shape, never an error (ADR 0026). The schema-v2 half is
+# the projection's own unavailable shape (ADR 376), so "no daemon has published" and "the
+# published body could not be trusted" reach the browser as the same absence of a briefing.
 NEVER_RAN = {
     "dispatch": {"enabled": False},
     "daemon": {"enabled": False, "last_cycle_at": None,
@@ -52,12 +51,12 @@ NEVER_RAN = {
     "pools": [],
     "running": [],
     "repos": [],
-    "schema_version": 2,
-    "generated_at": None,
-    "repositories": [],
-    "fleet": {"recent_landed": []},
-    "attention": {"rows": [], "total": 0},
+    **operator_freshness.UNAVAILABLE_V2,
 }
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def create_app(
@@ -67,6 +66,7 @@ def create_app(
     read_workspace: Callable[[], dict | None] = read_projection,
     available: Callable[[], bool] = channel.daemon_available,
     enqueue: Callable[[dict], None] = channel.enqueue,
+    now: Callable[[], datetime] = _utcnow,
 ):
     """Build the FastAPI app: the daemon-published projections, the command transport, and the
     built console."""
@@ -78,8 +78,13 @@ def create_app(
 
     @app.get("/api/snapshot")
     def api_snapshot():
-        snap = read()
-        return NEVER_RAN if snap is None else snap
+        """The daemon-published fleet snapshot, aged against this request's clock (ADR 376).
+
+        Still file-only: nothing here queries GitHub or rebuilds anything. It re-reads each
+        repository's map-read freshness downward from the timestamps already in the body, and
+        stamps how the briefing may describe itself — so a body that stopped being republished
+        stops claiming a verified decision frontier, instead of ageing invisibly in a tab."""
+        return operator_freshness.serve(read(), now=now(), never_ran=NEVER_RAN)
 
     @app.get("/api/workspace")
     def api_workspace():

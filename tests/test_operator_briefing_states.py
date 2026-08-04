@@ -1,17 +1,20 @@
-"""The two locked Decision Map states (`mockups/operator-surface-finalist.lock.md`, terms
-18–23), carried the whole way a real one travels: typed GitHub rows → the daemon's own shaping
-→ the published snapshot → `GET /api/snapshot`.
+"""Every locked state of the operator briefing (`mockups/operator-surface-finalist.lock.md`,
+terms 6 and 18–23), carried the whole way a real one travels: typed GitHub rows → the daemon's
+own shaping → the published snapshot → `GET /api/snapshot` at a fixed reading clock.
 
-Both states are checked in as one fixture the console's own tests render from, so the backend
-contract, the served snapshot, and the rendered copy are all pinned against the same bytes.
-The fixture is *built* here rather than hand-written: a hand-written one can picture a map the
-daemon would never produce, and then prove nothing at all.
+Each state is checked in as one fixture the console's own tests render from, so the backend
+contract, the served snapshot, and the rendered copy are all pinned against the same bytes. The
+fixture is *built* here rather than hand-written: a hand-written one can picture a briefing the
+daemon would never produce, and then prove nothing at all. The screenshot capture matrix for
+the built console is built from the very same bytes, so a shot can never picture data the
+endpoint would not serve.
 """
 
 from __future__ import annotations
 
 import json
 import pathlib
+from datetime import datetime
 
 from fastapi.testclient import TestClient
 
@@ -19,6 +22,8 @@ from agentflow import decision_maps, github, live, operator_projection, webapp
 
 FIXTURE = (pathlib.Path(__file__).resolve().parents[1]
            / "agentflow/webui/src/fixtures/operator-briefing-states.json")
+SHOTS = (pathlib.Path(__file__).resolve().parents[1]
+         / "mockups/operator-surface-build.screenshots.json")
 
 AGENTFLOW = "ConnorGriffin/agentflow"
 WAYFINDER = "ConnorGriffin/wayfinder"
@@ -173,30 +178,68 @@ def _unreadable_evidence_component() -> dict:
         open_prs=[], merged_prs=[])
 
 
+# --- the typical fleet, freshly read (term 6's `typical` / `narrow`) -----------------------
+
+def _typical_component() -> dict:
+    """One map naming its frontier, with a settled decision that handed off and landed."""
+    named = _map(
+        343, "Make the Decision Map reads trustworthy",
+        body=_decisions(ADR_36, ADR_374),
+        children=[
+            _child(372, "Classify decisions and verify handoffs", state="CLOSED",
+                   candidates=[_handoff(500, "Project verified frontiers", map_number=343)]),
+            _child(376, "Fail closed for stale and unavailable data", closed_blockers=3),
+            _child(377, "Retire the browser's own freshness rule", assigned=True),
+        ])
+    landed = github.HandoffLinkRow(
+        number=500, attempt_count=1,
+        attempts=(_attempt(508, state="MERGED", merged_at="2026-07-30T08:12:00Z"),))
+    return decision_maps.maps_component(
+        github.MapsRead(maps=(named,), total_count=1, cost=14, remaining=4900),
+        repo=AGENTFLOW, handoff_links=_links({500: landed}), open_prs=[], merged_prs=[])
+
+
+def _wayfinder_component() -> dict:
+    """A second repository's map, read cleanly, so the fleet section has more than one row."""
+    surface = _map(
+        500, "Wayfinder map surface", repo=WAYFINDER, body=_decisions(ADR_36),
+        children=[_child(501, "Settle the map schema", state="CLOSED", repo=WAYFINDER),
+                  _child(502, "Render the map surface", repo=WAYFINDER)])
+    return decision_maps.maps_component(
+        github.MapsRead(maps=(surface,), total_count=1, cost=11, remaining=4890),
+        repo=WAYFINDER, handoff_links=_links({}), open_prs=[], merged_prs=[])
+
+
 # --- the published snapshot each state travels in ------------------------------------------
 
-# Both states are captured as screenshot evidence, and the surface words landing ages and
+# Every state is captured as screenshot evidence, and the surface words landing ages and
 # projection age relative to now. Every clock-driven cell is pinned to a value that does not
-# move — no landings at all, and one fixed publish stamp — so two captures of the same state
-# differ only where the code differs.
+# move — one fixed publish stamp, and one fixed reading clock four minutes later — so two
+# captures of the same state differ only where the code differs.
 PUBLISHED_AT = "2026-07-30T12:00:00+00:00"
+READ_AT = "2026-07-30T12:04:00+00:00"
+# The daemon's heartbeat, stamped into every body it publishes: the reader's freshness window
+# is two of these, so a component verified four minutes ago is still comfortably fresh.
+HEARTBEAT_SECONDS = 300
 
 
-def _repo_view(repo: str) -> dict:
+def _repo_view(repo: str, **over) -> dict:
     return {"repo": repo, "profile": "reviewed",
             "ready": [], "held": [], "parked": [], "in_flight": [], "recent_merges": [],
-            "ratchet": {"samples": 12, "correction_rate": 0.04, "ready_to_loosen": False}}
+            "ratchet": {"samples": 12, "correction_rate": 0.04, "ready_to_loosen": False},
+            **over}
 
 
-def _entry(repo: str, component: dict) -> dict:
+def _entry(repo: str, component: dict, *, status: str = "fresh",
+           fresh_at: str | None = PUBLISHED_AT, error: str | None = None) -> dict:
     return {"name_with_owner": repo, "url": f"https://github.com/{repo}", "profile": "reviewed",
-            "github": {"status": "fresh", "attempted_at": PUBLISHED_AT,
-                       "fresh_at": PUBLISHED_AT, "error": None},
+            "github": {"status": status, "attempted_at": PUBLISHED_AT,
+                       "fresh_at": fresh_at, "error": error},
             "maps": component}
 
 
-def _snapshot(entries: list[dict]) -> dict:
-    views = [_repo_view(e["name_with_owner"]) for e in entries]
+def _snapshot(entries: list[dict], views: list[dict] | None = None) -> dict:
+    views = views if views is not None else [_repo_view(e["name_with_owner"]) for e in entries]
     return {
         "dispatch": {"enabled": True},
         "daemon": {"enabled": True, "last_cycle_at": PUBLISHED_AT,
@@ -208,24 +251,162 @@ def _snapshot(entries: list[dict]) -> dict:
         "running": [], "repos": views,
         "schema_version": operator_projection.SCHEMA_VERSION,
         "generated_at": PUBLISHED_AT,
+        "heartbeat_seconds": HEARTBEAT_SECONDS,
         "repositories": entries,
         "fleet": operator_projection.fleet_recent_landed(views),
         "attention": operator_projection.attention(views, entries),
     }
 
 
-def build_states() -> dict:
-    """The checked-in fixture, rebuilt from the typed rows above. When the published map
-    contract changes, regenerate the file rather than editing it:
+def _busy_views() -> list[dict]:
+    """The two fleet rows the typical state reads from: one repository with three things
+    waiting on the operator, one with none."""
+    return [
+        _repo_view(AGENTFLOW,
+                   ready=[{"number": 379, "title": "ready one"}],
+                   held=[{"number": 381, "title": "Which surface owns the age?",
+                          "state": "needs-grilling",
+                          "reason": "a real fork the pipeline could not settle",
+                          "since": "2026-07-29T09:00:00+00:00"}],
+                   in_flight=[{"number": 374, "title": "Say what the projection verified",
+                               "builder": "codex",
+                               "handed_off_at": "2026-07-30T10:40:00+00:00"}],
+                   parked=[{"number": 372, "title": "Classify decisions and verify handoffs",
+                            "reason": "ui-evidence", "builder": "claude",
+                            "since": "2026-07-30T07:15:00+00:00"}],
+                   recent_merges=[
+                       {"number": 508, "title": "Project verified frontiers",
+                        "merged_at": "2026-07-30T08:12:00+00:00"},
+                       {"number": 506, "title": "Show a broken stage",
+                        "merged_at": "2026-07-29T12:00:00+00:00"}]),
+        _repo_view(WAYFINDER, recent_merges=[
+            {"number": 42, "title": "Settle the map schema",
+             "merged_at": "2026-07-28T12:00:00+00:00"}]),
+    ]
 
-        python tests/test_operator_briefing_states.py
-    """
+
+def _served(snapshot: dict | None) -> dict:
+    """One published body as `GET /api/snapshot` answers it at the fixed reading clock — the
+    read-time aging and the stamped freshness copy included. This is what the browser sees, so
+    it is what the fixtures and the screenshot stubs are made of."""
+    reading_clock = datetime.fromisoformat(READ_AT)
+    client = TestClient(webapp.create_app(lambda: snapshot, now=lambda: reading_clock))
+    return client.get("/api/snapshot").json()
+
+
+def build_published() -> dict:
+    """What the daemon writes to the state file for each state, before anyone reads it."""
+    typical = _snapshot([_entry(AGENTFLOW, _typical_component()),
+                         _entry(WAYFINDER, _wayfinder_component())], views=_busy_views())
+    # One repository's last read failed; its previous map data is preserved with the stamp the
+    # publisher gave it, so the whole projection reads stale rather than partly fresh.
+    stale = _snapshot(
+        [_entry(AGENTFLOW, _typical_component(), status="stale",
+                fresh_at="2026-07-30T11:31:00+00:00",
+                error="point budget reached this heartbeat"),
+         _entry(WAYFINDER, _wayfinder_component())], views=_busy_views())
+    # One repository has never completed a read at all: verified elsewhere, unavailable here,
+    # so no frontier under it may be presented.
+    incomplete = _snapshot(
+        [_entry(AGENTFLOW, _typical_component()),
+         _entry(WAYFINDER, {"active": [], "active_total": 0}, status="unavailable",
+                fresh_at=None, error="Something went wrong while executing your query.")],
+        views=_busy_views())
+    # Zero repositories cannot be published: the configuration requires at least one. A body
+    # that says otherwise has been perturbed, so the surface says so instead of drawing an
+    # empty-but-fresh fleet (term 6, re-settled by #376).
+    empty = _snapshot([], views=[])
     return {
+        "typical": typical,
+        "stale": stale,
+        "incomplete": incomplete,
+        "empty": empty,
         "map-frontier-matrix": _snapshot([_entry(AGENTFLOW, _frontier_matrix_component())]),
         "map-overflow-evidence": _snapshot([
             _entry(AGENTFLOW, _overflow_component()),
             _entry(WAYFINDER, _unreadable_evidence_component())]),
     }
+
+
+def build_states() -> dict:
+    """The checked-in fixture: each published state as the endpoint answers it at the fixed
+    reading clock. When the published contract changes, regenerate the file rather than
+    editing it:
+
+        python tests/test_operator_briefing_states.py
+    """
+    return {name: _served(body) for name, body in build_published().items()}
+
+
+# --- the capture matrix for the built console ------------------------------------------------
+
+# The console's own tab strip, then the briefing's own theme control. `#theme` belongs to the
+# mockup page and does not exist in the build.
+_BRIEFING_TAB = '[role="tablist"] button:has-text("Briefing")'
+_THEME_TOGGLE = ".briefing button.theme"
+
+# The two painted backgrounds of the briefing's scoped token set, so a shot proves the theme
+# actually took rather than merely that a button was clicked.
+_PAPER = {"light": "rgb(247, 247, 245)", "dark": "rgb(24, 26, 25)"}
+
+_CONSOLE = "http://127.0.0.1:8788/"
+
+
+def _shot(state: str, body: dict, *, theme: str, out: str, width: int, height: int) -> dict:
+    clicks = [_BRIEFING_TAB] + ([_THEME_TOGGLE] if theme == "dark" else [])
+    return {
+        "url": _CONSOLE,
+        "theme": theme,
+        "clicks": clicks,
+        "clock": READ_AT,
+        "out": out,
+        "viewport": {"width": width, "height": height},
+        "settle": 250,
+        "fetchStub": {"/api/snapshot": body},
+        "assert": {
+            "theme": {"selector": ".briefing", "value": theme,
+                      "backgroundColor": _PAPER[theme]},
+            "noConsoleErrors": True,
+            # The console asks Google for its two web fonts. A capture host with no route to
+            # them is not the page misbehaving, and the surface renders from its own fallback
+            # stack either way — so that one failure is named rather than left to mask a real
+            # scripting error.
+            "ignoreConsole": ["fonts.googleapis.com", "fonts.gstatic.com"],
+            # Measured on the briefing itself: the surrounding v1 console chrome is a
+            # desktop control plane with its own width floor, which this slice does not touch.
+            "noHorizontalOverflow": ".briefing",
+        },
+        "state": state,
+    }
+
+
+def build_shots() -> dict:
+    """The committed capture matrix for the built console. Every stub body is the endpoint's
+    own answer for that state at the fixed reading clock, so a screenshot cannot show data the
+    server would not serve — and the page's clock is pinned to the same instant, so the ages it
+    words do not move between runs.
+
+    Capture it with `npm run build` in `agentflow/webui`, `uv run agentflow-web`, then
+    `node scripts/screenshots.mjs mockups/operator-surface-build.screenshots.json`. Where the
+    host cannot bind a local port (an agent sandbox, typically), copy the matrix and point
+    every `url` at `agentflow/webui/dist/index.html` as a `file://` URL instead: the build uses
+    relative asset paths, the snapshot fetch is stubbed either way, and the rendered bytes are
+    the same ones the server would hand over."""
+    served = build_states()
+    return {"shots": [
+        _shot("typical", served["typical"], theme="light",
+              out="mockups/screenshots/issue-376/typical.png", width=1280, height=1360),
+        _shot("typical", served["typical"], theme="light",
+              out="mockups/operator-surface-build-typical.png", width=1280, height=1360),
+        _shot("stale", served["stale"], theme="dark",
+              out="mockups/screenshots/issue-376/stale.png", width=1280, height=1360),
+        _shot("incomplete", served["incomplete"], theme="light",
+              out="mockups/screenshots/issue-376/incomplete.png", width=1280, height=1360),
+        _shot("empty", served["empty"], theme="dark",
+              out="mockups/screenshots/issue-376/empty.png", width=1280, height=900),
+        _shot("narrow", served["typical"], theme="light",
+              out="mockups/screenshots/issue-376/narrow.png", width=375, height=2100),
+    ]}
 
 
 def _states() -> dict:
@@ -311,18 +492,51 @@ def test_a_failed_evidence_read_is_published_as_unavailable_not_as_building():
 
 # --- daemon publish → live snapshot → the endpoint -------------------------------------------
 
-def test_both_states_survive_the_publish_and_read_path_intact(tmp_path, monkeypatch):
+def test_every_state_survives_the_publish_and_read_path_intact(tmp_path, monkeypatch):
     """The whole public path: the daemon writes the snapshot, the server reads the file it
-    wrote, and the map contract arrives at the browser byte for byte."""
+    wrote at the fixed reading clock, and what arrives at the browser is exactly the fixture
+    every rendering test renders from."""
     monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
-    client = TestClient(webapp.create_app(live.read_snapshot))
-    for name, snapshot in _states().items():
-        live.write_snapshot(snapshot)
+    reading_clock = datetime.fromisoformat(READ_AT)
+    client = TestClient(webapp.create_app(live.read_snapshot, now=lambda: reading_clock))
+    for name, published in build_published().items():
+        live.write_snapshot(published)
         served = client.get("/api/snapshot").json()
-        assert served == snapshot, f"{name} did not survive the publish and read path"
+        assert served == _states()[name], f"{name} did not survive the publish and read path"
 
 
-if __name__ == "__main__":  # regenerate the fixture the tests above pin
+# --- the states the built console is photographed in (term 6) --------------------------------
+
+def test_every_committed_shot_stubs_exactly_what_the_endpoint_would_serve():
+    """The screenshot evidence is only evidence if the browser was handed the server's own
+    answer. Every committed shot's stub, and the whole capture matrix around it, is rebuilt
+    here from the endpoint and compared byte for byte."""
+    assert SHOTS.read_text() == _shots_text(), (
+        "the committed capture matrix has drifted from what GET /api/snapshot serves — "
+        "regenerate it: python tests/test_operator_briefing_states.py")
+
+
+def test_the_five_locked_states_are_all_captured_in_both_themes():
+    shots = json.loads(SHOTS.read_text())["shots"]
+    assert {s["state"] for s in shots} == {"typical", "stale", "incomplete", "empty", "narrow"}
+    assert {s["theme"] for s in shots} == {"light", "dark"}
+    assert [s["viewport"]["width"] for s in shots if s["state"] == "narrow"] == [375]
+    for shot in shots:
+        assert shot["clicks"][0].endswith('button:has-text("Briefing")')
+        if shot["theme"] == "dark":
+            assert shot["clicks"][1] == ".briefing button.theme"
+
+
+def _fixture_text() -> str:
+    return json.dumps(build_states(), ensure_ascii=False, indent=1) + "\n"
+
+
+def _shots_text() -> str:
+    return json.dumps(build_shots(), ensure_ascii=False, indent=1) + "\n"
+
+
+if __name__ == "__main__":  # regenerate the fixture and capture matrix the tests above pin
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    FIXTURE.write_text(json.dumps(build_states(), ensure_ascii=False, indent=1) + "\n")
-    print(f"wrote {FIXTURE}")
+    FIXTURE.write_text(_fixture_text())
+    SHOTS.write_text(_shots_text())
+    print(f"wrote {FIXTURE}\nwrote {SHOTS}")
