@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "drive-local-webapp": {
+      "source": "/var/folders/gt/90sngsj52js71wmfhqhrr0mw0000gn/T/agentflow-skills-qa_58ci1/source",
+      "sourceType": "local",
+      "computedHash": "3f3a8cd47f3d6b60a4460f7aa9b11f6667eb53d8abd1d393e42b56d86b7c56f9"
+    },
+    "ui-craft": {
+      "source": "/var/folders/gt/90sngsj52js71wmfhqhrr0mw0000gn/T/agentflow-skills-qa_58ci1/source",
+      "sourceType": "local",
+      "computedHash": "003ddfc4a331d540781f99f0ce4148321148ce0db3cb2a213b258465ca5677b0"
+    }
+  }
+}
