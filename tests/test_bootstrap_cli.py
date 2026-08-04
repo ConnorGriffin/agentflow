@@ -399,7 +399,7 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
         check=True,
     )
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path.parent / "config.toml"))
-    monkeypatch.setattr("agentflow.enroll._skills_problem", lambda root, surfaces: None)
+    monkeypatch.setattr("agentflow.enroll._skills_problem", lambda root, surfaces, **_: None)
 
     def install_skills(root):
         for agent_root in (".agents/skills", ".claude/skills"):
@@ -512,7 +512,7 @@ def test_enroll_apply_uses_an_explicit_nonheuristic_ui_declaration(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
     )
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
-    monkeypatch.setattr("agentflow.enroll._skills_problem", lambda root, surfaces: None)
+    monkeypatch.setattr("agentflow.enroll._skills_problem", lambda root, surfaces, **_: None)
     installed = []
     monkeypatch.setattr(
         "agentflow.enroll._install_connor_skills",
@@ -1110,7 +1110,7 @@ def test_enroll_rollback_restores_a_symlinked_config_target(
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
     monkeypatch.setattr("agentflow.enroll._checkout_problem", lambda root: None)
 
-    def fail_after_config_write(root, profile, surfaces):
+    def fail_after_config_write(root, profile, surfaces, **_):
         with config.open("a") as stream:
             stream.write("\n# partial write\n")
         return ["WARN: simulated external command failure"]

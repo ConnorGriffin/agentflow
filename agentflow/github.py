@@ -705,6 +705,16 @@ def create_issue(repo: str, title: str, body: str) -> IssueCreation:
     return IssueCreation(url=(r.stdout or "").strip().splitlines()[-1].strip() if r.stdout else "")
 
 
+def create_pr(repo: str, *, head: str, title: str, body: str) -> IssueCreation:
+    """Open a pull request from `head` against the repo's default branch, reporting what the
+    command did — the new PR's URL, or `gh`'s failure text. Same write contract as
+    `create_issue`: it reports the command's result, it never re-reads to prove the PR landed."""
+    r = _gh(["pr", "create", "--repo", repo, "--head", head, "--title", title, "--body", body])
+    if r.returncode != 0:
+        return IssueCreation(error=getattr(r, "stderr", "") or "")
+    return IssueCreation(url=(r.stdout or "").strip().splitlines()[-1].strip() if r.stdout else "")
+
+
 def add_label(repo: str, issue: int, label: str) -> bool:
     """Add ``label`` to the issue. Returns whether the command succeeded."""
     return _gh(["issue", "edit", str(issue), "--repo", repo,

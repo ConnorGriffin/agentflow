@@ -8,13 +8,37 @@ from types import SimpleNamespace
 import pytest
 
 from agentflow import github
-from agentflow.enroll import (audit_lines, checkout_repo, declaration_line, main,
-                              newly_gated_prs, propose_surfaces, write_declaration)
+from agentflow.enroll import (_audit_command, _converge_and_ship, _install_file,
+                              _skills_problem, audit_lines, checkout_repo,
+                              configured_repositories, declaration_line, enroll_repository,
+                              main, newly_gated_prs, propose_surfaces, sync_fleet,
+                              write_declaration)
 from agentflow.repo_facts import surface_declaration
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "enroll-standards.sh"
 CHARTER = Path(__file__).parents[1] / "standards" / "CHARTER.md"
+ROOT = Path(__file__).parents[1]
+
+
+def _git_init(repo: Path, *, origin: str | None = None) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "tester@example.com"],
+                    cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Tester"],
+                    cwd=repo, check=True, capture_output=True)
+    if origin:
+        subprocess.run(["git", "remote", "add", "origin", origin],
+                        cwd=repo, check=True, capture_output=True)
+    (repo / ".gitkeep").write_text("")
+    _git_commit_all(repo, "init")
+
+
+def _git_commit_all(repo: Path, message: str = "commit") -> None:
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True,
+                    capture_output=True)
 
 
 def _enroll(repo: Path, *, apply: bool) -> subprocess.CompletedProcess:
@@ -364,3 +388,256 @@ class TestSurfacesCommand:
 
         assert agents.read_text() == "# repo\n\nui-surfaces: none\n"
         assert "already declares none" in capsys.readouterr().out
+
+
+class TestFleetEnumerator:
+    """4.1 — one shared enumerator, and the dead `REPOS` import is gone."""
+
+    def test_configured_repositories_reads_the_same_source_the_daemon_uses(
+            self, tmp_path, monkeypatch):
+        checkout = tmp_path / "project"
+        checkout.mkdir()
+        config = tmp_path / "config.toml"
+        config.write_text(f'[[repositories]]\nrepo = "o/project"\nworkdir = "{checkout}"\n')
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+
+        repos = configured_repositories()
+
+        assert [r.repo for r in repos] == ["o/project"]
+
+    def test_audit_command_no_longer_imports_the_dead_daemon_repos(
+            self, tmp_path, monkeypatch, capsys):
+        # Regression for the live ImportError: `_audit_command` used to do
+        # `from agentflow.daemon import REPOS`, which no longer exists.
+        checkout = tmp_path / "project"
+        checkout.mkdir()
+        (checkout / "AGENTS.md").write_text("ui-surfaces: none\n")
+        config = tmp_path / "config.toml"
+        config.write_text(f'[[repositories]]\nrepo = "o/project"\nworkdir = "{checkout}"\n')
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+
+        _audit_command()
+
+        out = capsys.readouterr().out
+        assert "o/project: none" in out
+
+
+class TestConvergeMode:
+    """4.2 — converge rewrites the two bundled `_asset_text` targets and nothing else."""
+
+    def _drifted_repo(self, tmp_path, monkeypatch) -> Path:
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path / "missing-config.toml"))
+        repo = tmp_path / "repo"
+        _git_init(repo, origin="git@github.com:o/repo.git")
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("stale content, not the pinned bytes\n")
+        claude_skill = repo / ".claude" / "skills"
+        claude_skill.mkdir(parents=True)
+        (claude_skill / "agentflow").symlink_to(Path("../../.agents/skills/agentflow"))
+        _git_commit_all(repo, "drift")
+        return repo
+
+    def test_plain_apply_refuses_a_drifted_bundled_skill(self, tmp_path, monkeypatch):
+        repo = self._drifted_repo(tmp_path, monkeypatch)
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        before = skill.read_text()
+
+        report = enroll_repository(str(repo), apply=True)
+
+        assert skill.read_text() == before
+        assert report.ready is False
+
+    def test_converge_rewrites_the_drifted_bundled_skill(self, tmp_path, monkeypatch, capsys):
+        repo = self._drifted_repo(tmp_path, monkeypatch)
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        pinned = (ROOT / "skills" / "agentflow" / "SKILL.md").read_text()
+
+        enroll_repository(str(repo), apply=True, converge=True)
+
+        out = capsys.readouterr().out
+        assert skill.read_text() == pinned
+        assert "DO:   rewrote" in out
+        assert "managed AgentFlow skill is drifted" not in out
+        assert "rolled back" not in out
+
+    def test_install_file_overwrite_rewrites_drifted_content(self, tmp_path):
+        path = tmp_path / "file.txt"
+        path.write_text("old")
+
+        result = _install_file(path, "new", overwrite=True)
+
+        assert result == f"DO:   rewrote {path} to the pinned content"
+        assert path.read_text() == "new"
+
+    def test_install_file_overwrite_still_refuses_a_non_regular_file_path(self, tmp_path):
+        occupied = tmp_path / "occupied"
+        occupied.mkdir()
+
+        result = _install_file(occupied, "content", overwrite=True)
+
+        assert result.startswith("WARN:")
+        assert occupied.is_dir()
+
+    def test_no_other_call_site_passes_overwrite_true(self):
+        source = (ROOT / "agentflow" / "enroll.py").read_text()
+        # The plan's fixed pair: the bundled SKILL.md and the screenshot harness.
+        assert source.count("overwrite=converge") == 2
+        assert "overwrite=True" not in source
+
+    def test_a_fully_drifted_vendored_skill_pack_is_reported_not_converged(self, tmp_path, monkeypatch):
+        # Decision 3 in 4.2: converge has no reproducible content for connor_skills
+        # (ui-craft, drive-local-webapp) — a drifted destination there is never a
+        # blocking precondition under converge, and it is never rewritten either.
+        monkeypatch.setattr(
+            "agentflow.enroll._resolved_skill_release",
+            lambda manifest: (manifest["connor_skills"]["commit"], None),
+        )
+        monkeypatch.setattr(
+            "agentflow.enroll._public_skill_destination_states",
+            lambda root, manifest: {
+                (".agents/skills", "ui-craft"): "drifted",
+                (".claude/skills", "ui-craft"): "drifted",
+                (".agents/skills", "drive-local-webapp"): "ok",
+                (".claude/skills", "drive-local-webapp"): "ok",
+            },
+        )
+
+        assert _skills_problem(tmp_path, ("frontend/",), converge=True) is None
+        assert _skills_problem(tmp_path, ("frontend/",), converge=False) is not None
+
+    def test_a_partially_installed_vendored_pack_still_refuses_under_converge(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "agentflow.enroll._resolved_skill_release",
+            lambda manifest: (manifest["connor_skills"]["commit"], None),
+        )
+        monkeypatch.setattr(
+            "agentflow.enroll._public_skill_destination_states",
+            lambda root, manifest: {
+                (".agents/skills", "ui-craft"): "drifted",
+                (".claude/skills", "ui-craft"): "absent",
+                (".agents/skills", "drive-local-webapp"): "ok",
+                (".claude/skills", "drive-local-webapp"): "ok",
+            },
+        )
+
+        assert _skills_problem(tmp_path, ("frontend/",), converge=True) is not None
+
+
+class TestEnrollSync:
+    """4.3 — the fleet-wide converge sweep and its exit-code contract."""
+
+    def test_dry_run_reports_the_plan_and_always_exits_zero(self, tmp_path, capsys):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        cfg = SimpleNamespace(repo="o/repo", workdir=str(repo))
+
+        exit_code = sync_fleet([cfg], apply=False)
+
+        out = capsys.readouterr().out
+        assert "PLAN: converge o/repo" in out
+        assert "1 converged / 0 already current / 0 failed / 0 skipped (dirty)" in out
+        assert exit_code == 0
+
+    def test_a_dirty_checkout_is_skipped_not_failed(self, tmp_path, capsys):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        (repo / "untracked.txt").write_text("x")
+        cfg = SimpleNamespace(repo="o/dirty", workdir=str(repo))
+
+        exit_code = sync_fleet([cfg], apply=True)
+
+        out = capsys.readouterr().out
+        assert "SKIP: o/dirty — checkout is dirty" in out
+        assert "0 converged / 0 already current / 0 failed / 1 skipped (dirty)" in out
+        assert exit_code == 0
+
+    def test_a_failing_pr_create_is_a_convergence_failure_and_drives_exit_one(
+            self, tmp_path, monkeypatch, capsys):
+        # Exercises `sync_fleet`'s own bucketing/exit-code logic; the git-level detail of
+        # *why* a repo fails to converge (unsigned commit, failed push, failed `gh pr
+        # create`) is covered directly against `_converge_and_ship` below.
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        cfg = SimpleNamespace(repo="o/repo", workdir=str(repo))
+        monkeypatch.setattr("agentflow.enroll._repo_drift",
+                            lambda root: ["agentflow-skill: drifted"])
+        monkeypatch.setattr(
+            "agentflow.enroll._converge_and_ship",
+            lambda root, repo: (False, "gh pr create failed — authentication required"),
+        )
+
+        exit_code = sync_fleet([cfg], apply=True)
+
+        out = capsys.readouterr().out
+        assert "WARN: o/repo failed to converge — gh pr create failed" in out
+        assert "0 converged / 0 already current / 1 failed / 0 skipped (dirty)" in out
+        assert exit_code == 1
+
+
+class TestConvergeAndShip:
+    """The per-repo apply/commit/push/PR sequence 4.3 point 4 describes."""
+
+    def test_the_commit_is_dco_signed_and_a_push_failure_is_reported(
+            self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill_dir = repo / ".agents" / "skills" / "agentflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("content")
+        monkeypatch.setattr("agentflow.enroll.enroll_repository",
+                            lambda *a, **k: SimpleNamespace(ready=True))
+        monkeypatch.setattr(
+            "agentflow.enroll._run_command",
+            lambda command, **kw: subprocess.run(command, capture_output=True, text=True),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is False
+        assert "git push failed" in detail
+        log = subprocess.run(["git", "-C", str(repo), "log", "-1", "--format=%B"],
+                              check=True, capture_output=True, text=True).stdout
+        assert "Signed-off-by: Tester <tester@example.com>" in log
+
+    def test_a_failing_gh_pr_create_is_reported_as_a_failure(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill_dir = repo / ".agents" / "skills" / "agentflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("content")
+        monkeypatch.setattr("agentflow.enroll.enroll_repository",
+                            lambda *a, **k: SimpleNamespace(ready=True))
+
+        def fake_run(command, **kw):
+            if "push" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda repo, **kw: github.IssueCreation(error="authentication required"),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is False
+        assert "gh pr create failed" in detail
+        assert "authentication required" in detail
+
+
+class TestSweepEnumerationExitCodes:
+    """4.1's exit-code table for `--audit` / `--sync`, at the enumerator boundary."""
+
+    def test_a_bad_config_raises_configuration_error_before_any_repo_is_touched(
+            self, tmp_path, monkeypatch):
+        from agentflow.config import ConfigurationError
+
+        config = tmp_path / "config.toml"
+        config.write_text('[[repositories]]\nrepo = "o/missing"\nworkdir = "/does/not/exist"\n')
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+
+        with pytest.raises(ConfigurationError):
+            configured_repositories()

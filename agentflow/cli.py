@@ -60,6 +60,14 @@ def main(argv: list[str] | None = None) -> int | None:
         choices=("autonomous", "reviewed", "guarded"),
         default="reviewed",
     )
+    enroll_command.add_argument(
+        "--audit", action="store_true",
+        help="print the fleet-wide UI-surface declaration census and exit",
+    )
+    enroll_command.add_argument(
+        "--sync", action="store_true",
+        help="sweep the configured fleet, converging drift (pass --apply to write and PR it)",
+    )
     churn_command = commands.add_parser(
         "churn", help="rank fleet transcripts by token-burning churn"
     )
@@ -160,8 +168,20 @@ def main(argv: list[str] | None = None) -> int | None:
             print(f"wrote {args.json_path}")
         return 0
     elif args.command == "enroll":
-        from agentflow.enroll import enroll_repository
+        from agentflow.enroll import _audit_command, configured_repositories, enroll_repository, sync_fleet
 
+        if args.audit:
+            try:
+                _audit_command()
+            except ConfigurationError as exc:
+                parser.error(str(exc))
+            return 0
+        if args.sync:
+            try:
+                repos = configured_repositories()
+            except ConfigurationError as exc:
+                parser.error(str(exc))
+            return sync_fleet(repos, apply=args.apply)
         try:
             report = enroll_repository(
                 args.path, apply=args.apply, profile=args.profile

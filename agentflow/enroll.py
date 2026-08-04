@@ -196,7 +196,9 @@ def _public_skill_destination_states(root: Path, manifest: dict) -> dict:
     }
 
 
-def _skills_problem(root: Path, surfaces: tuple[str, ...]) -> str | None:
+def _skills_problem(
+    root: Path, surfaces: tuple[str, ...], *, converge: bool = False
+) -> str | None:
     if not surfaces:
         return None
     manifest = _manifest()
@@ -208,6 +210,13 @@ def _skills_problem(root: Path, surfaces: tuple[str, ...]) -> str | None:
         return f"public skill release tag resolved to {resolved}, expected {expected}"
     destinations = _public_skill_destination_states(root, manifest)
     if all(state == "ok" for state in destinations.values()):
+        return None
+    # Converge never rewrites the vendored skill pack (no reproducible content to write —
+    # it comes from a temp clone the installer owns, not `_asset_text`), but a repo that was
+    # already fully installed and has since drifted is not a blocking precondition either;
+    # doctor() keeps reporting it. A partially-installed or otherwise-occupied destination
+    # still refuses, converge or not.
+    if converge and all(state in ("ok", "drifted") for state in destinations.values()):
         return None
     if any(state != "absent" for state in destinations.values()):
         rendered = ", ".join(
@@ -519,7 +528,9 @@ def _tooling_problem(surfaces: tuple[str, ...]) -> str | None:
     return None
 
 
-def _managed_files_problem(root: Path, surfaces: tuple[str, ...]) -> str | None:
+def _managed_files_problem(
+    root: Path, surfaces: tuple[str, ...], *, converge: bool = False
+) -> str | None:
     manifest = _manifest()
     agentflow = next(
         item for item in manifest["capabilities"] if item["id"] == "agentflow-skill"
@@ -527,8 +538,18 @@ def _managed_files_problem(root: Path, surfaces: tuple[str, ...]) -> str | None:
     for location in (".agents/skills", ".claude/skills"):
         directory = root / location / "agentflow"
         status = _skill_destination_status(directory, agentflow["files"])
-        if status != "ok" and (directory.exists() or directory.is_symlink()):
-            return f"managed AgentFlow skill is {status} at {directory}"
+        if status == "ok" or not (directory.exists() or directory.is_symlink()):
+            continue
+        if (
+            converge
+            and status == "drifted"
+            and directory.is_dir()
+            and all(
+                (directory / item["path"]).is_file() for item in agentflow["files"]
+            )
+        ):
+            continue  # convergeable: every expected path is a plain file we can overwrite
+        return f"managed AgentFlow skill is {status} at {directory}"
     if surfaces:
         harness = root / "scripts" / "screenshots.mjs"
         spec = next(
@@ -538,14 +559,20 @@ def _managed_files_problem(root: Path, surfaces: tuple[str, ...]) -> str | None:
         )
         status = _file_status(harness, spec["sha256"])
         if status != "ok" and (harness.exists() or harness.is_symlink()):
-            return f"managed screenshot harness is {status} at {harness}"
+            if converge and status == "drifted" and harness.is_file():
+                pass  # convergeable
+            else:
+                return f"managed screenshot harness is {status} at {harness}"
     return None
 
 
-def _install_file(path: Path, content: str) -> str:
+def _install_file(path: Path, content: str, *, overwrite: bool = False) -> str:
     if path.is_file():
         if path.read_text() == content:
             return f"ok:   {path} already matches"
+        if overwrite:
+            path.write_text(content)
+            return f"DO:   rewrote {path} to the pinned content"
         return f"WARN: {path} already exists and differs — left unchanged"
     if path.exists() or path.is_symlink():
         return f"WARN: {path} already exists — left unchanged"
@@ -771,7 +798,9 @@ def _enrollment_journal(root: Path) -> _EnrollmentJournal:
     )
 
 
-def _apply_enrollment(root: Path, profile: str, surfaces: tuple[str, ...]) -> list[str]:
+def _apply_enrollment(
+    root: Path, profile: str, surfaces: tuple[str, ...], *, converge: bool = False
+) -> list[str]:
     outcomes: list[str] = []
     _append_once(root / ".gitignore", ".agentflow/")
     if surfaces:
@@ -818,14 +847,20 @@ def _apply_enrollment(root: Path, profile: str, surfaces: tuple[str, ...]) -> li
         outcomes.append(f"DO:   linked {claude} to AGENTS.md")
 
     skill = root / ".agents" / "skills" / "agentflow" / "SKILL.md"
-    outcomes.append(_install_file(skill, _asset_text("skills/agentflow/SKILL.md")))
+    outcomes.append(
+        _install_file(
+            skill, _asset_text("skills/agentflow/SKILL.md"), overwrite=converge
+        )
+    )
     outcomes.append(_wire_claude_skill(root, "agentflow"))
     outcomes.append(_ensure_fleet_config(root))
 
     if surfaces:
         harness = root / "scripts" / "screenshots.mjs"
         outcomes.append(
-            _install_file(harness, _asset_text("scripts/screenshots.mjs"))
+            _install_file(
+                harness, _asset_text("scripts/screenshots.mjs"), overwrite=converge
+            )
         )
         outcomes.append(_install_connor_skills(root))
         outcomes.append(_install_ui_runtime(root))
@@ -833,7 +868,11 @@ def _apply_enrollment(root: Path, profile: str, surfaces: tuple[str, ...]) -> li
 
 
 def enroll_repository(
-    workdir: str, *, apply: bool = False, profile: str = "reviewed"
+    workdir: str,
+    *,
+    apply: bool = False,
+    profile: str = "reviewed",
+    converge: bool = False,
 ) -> CapabilityReport:
     """Plan or apply the reproducible, repo-local AgentFlow enrollment."""
     root = Path(workdir).expanduser().resolve()
@@ -854,15 +893,15 @@ def enroll_repository(
             or _instructions_problem(root)
             or _config_problem()
             or _tooling_problem(surfaces)
-            or _managed_files_problem(root, surfaces)
-            or _skills_problem(root, surfaces)
+            or _managed_files_problem(root, surfaces, converge=converge)
+            or _skills_problem(root, surfaces, converge=converge)
         )
         if problem:
             print(f"  WARN: {problem} — repository left unchanged")
             return replace(doctor(str(root)), ready=False)
         journal = _enrollment_journal(root)
         try:
-            outcomes = _apply_enrollment(root, profile, surfaces)
+            outcomes = _apply_enrollment(root, profile, surfaces, converge=converge)
             if any(outcome.startswith("WARN:") for outcome in outcomes):
                 journal.restore()
                 outcomes.append("WARN: enrollment failed and all managed changes were rolled back")
@@ -895,6 +934,132 @@ def enroll_repository(
     if not apply:
         print("  (dry run — nothing changed; pass --apply to write repository files)")
     return report
+
+
+_SYNC_BRANCH = "agentflow/enroll-sync"
+
+
+def _repo_drift(root: Path) -> list[str]:
+    """The `drifted`/`missing` capability rows plus the `repository-instructions` row,
+    verbatim — what a converge would fix, or what is still wrong after it ran."""
+    report = doctor(str(root))
+    return [
+        f"{item.id}: {item.status}"
+        for item in report.capabilities
+        if item.status in ("drifted", "missing") or item.id == "repository-instructions"
+    ]
+
+
+def _converge_paths(root: Path) -> list[Path]:
+    """The fixed pair of `_asset_text` targets converge may have rewritten — nothing else
+    is ever in the overwrite set, so this is also everything the sweep commit stages."""
+    return [
+        path
+        for path in (
+            root / ".agents" / "skills" / "agentflow" / "SKILL.md",
+            root / "scripts" / "screenshots.mjs",
+        )
+        if path.is_file()
+    ]
+
+
+def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
+    """Converge one repo and open its PR. Any step failing — the converge apply itself,
+    the commit, the push, or `gh pr create` — is a convergence failure."""
+    branch = _run_command(
+        ["git", "-C", str(root), "checkout", "-B", _SYNC_BRANCH], timeout=30
+    )
+    if branch.returncode:
+        return False, f"could not create branch {_SYNC_BRANCH}"
+    report = enroll_repository(str(root), apply=True, converge=True)
+    if not report.ready:
+        return False, "enrollment did not converge cleanly"
+    paths = _converge_paths(root)
+    if not paths:
+        return True, "nothing to commit"
+    add = _run_command(
+        ["git", "-C", str(root), "add", *[str(p) for p in paths]], timeout=30
+    )
+    if add.returncode:
+        return False, "git add failed"
+    status = _run_command(["git", "-C", str(root), "status", "--porcelain"], timeout=30)
+    if not (status.stdout or "").strip():
+        return True, "already current after converge"
+    commit = _run_command(
+        [
+            "git", "-C", str(root), "commit", "-s", "-m",
+            "agentflow: converge bundled skill assets to the pinned content",
+        ],
+        timeout=30,
+    )
+    if commit.returncode:
+        reason = (commit.stderr or commit.stdout or "").strip()
+        return False, f"git commit failed — {reason}"
+    push = _run_command(
+        ["git", "-C", str(root), "push", "-u", "origin", _SYNC_BRANCH], timeout=60
+    )
+    if push.returncode:
+        reason = (push.stderr or push.stdout or "").strip()
+        return False, f"git push failed — {reason}"
+    from agentflow import github
+
+    pr = github.create_pr(
+        repo,
+        head=_SYNC_BRANCH,
+        title="agentflow: converge enrollment to pinned bundled assets",
+        body=(
+            "Automated by `agentflow enroll --sync --apply`: rewrites this repo's bundled "
+            "AgentFlow skill and/or screenshot harness to match the pinned content recorded "
+            "in capabilities.toml. A drifted vendored skill pack (ui-craft, drive-local-webapp) "
+            "is reported by `agentflow doctor`, not rewritten here."
+        ),
+    )
+    if pr.url is None:
+        return False, f"gh pr create failed — {pr.error}"
+    return True, pr.url
+
+
+def sync_fleet(repos, *, apply: bool) -> int:
+    """`agentflow enroll --sync [--apply]` — the fleet-wide converge sweep.
+
+    Dry run reports the plan and always exits 0 (a drifted fleet is what a dry run is
+    for). With `--apply`, a dirty checkout is skipped — never a failure — and any other
+    convergence failure drives exit 1.
+    """
+    converged = current = failed = skipped = 0
+    for cfg in repos:
+        root = Path(cfg.workdir).expanduser().resolve()
+        print(f"{cfg.repo}")
+        if _checkout_problem(root) == "checkout is dirty":
+            print(f"  SKIP: {cfg.repo} — checkout is dirty")
+            skipped += 1
+            continue
+        drift = _repo_drift(root)
+        outdated = [line for line in drift if not line.endswith(": ok")]
+        if not outdated:
+            print(f"  ok:   {cfg.repo} is already current")
+            current += 1
+            continue
+        for line in outdated:
+            print(f"  drifted: {line}")
+        if not apply:
+            print(f"  PLAN: converge {cfg.repo}")
+            converged += 1
+            continue
+        ok, detail = _converge_and_ship(root, cfg.repo)
+        if ok:
+            print(f"  DO:   converged {cfg.repo} — {detail}")
+            converged += 1
+        else:
+            print(f"  WARN: {cfg.repo} failed to converge — {detail}")
+            failed += 1
+    print(
+        f"{converged} converged / {current} already current / "
+        f"{failed} failed / {skipped} skipped (dirty)"
+    )
+    if not apply:
+        return 0
+    return 1 if failed else 0
 
 
 def propose_surfaces(workdir: str) -> tuple[str, ...]:
@@ -1080,19 +1245,36 @@ def _surfaces_command(workdir: str, apply: bool) -> None:
         print("  (dry run — nothing changed; pass --apply to write it)")
 
 
+def configured_repositories():
+    """The fleet enumerator — the same source `daemon.run()` reads.
+
+    A configured `workdir` that is not a directory is a config error (`load_config`
+    raises `ConfigurationError`), not a per-repo report state, so there is nothing here
+    to filter: every repository this returns is a real checkout on disk.
+    """
+    from agentflow.config import default_config_path, load_config
+
+    return load_config(default_config_path()).repositories
+
+
 def _audit_command() -> None:
-    from agentflow.daemon import REPOS
     print("UI-surface declarations across the enrolled fleet")
-    for line in audit_lines(REPOS):
+    for line in audit_lines(configured_repositories()):
         print(line)
 
 
 def main(argv: list[str] | None = None) -> None:
+    from agentflow.config import ConfigurationError
+
     args = list(sys.argv[1:] if argv is None else argv)
     apply = "--apply" in args
     positional = [a for a in args if a != "--apply"]
     if positional[:1] == ["audit"] and len(positional) == 1:
-        _audit_command()
+        try:
+            _audit_command()
+        except ConfigurationError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(2)
         return
     if positional[:1] == ["surfaces"] and len(positional) == 2:
         _surfaces_command(positional[1], apply)
