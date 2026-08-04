@@ -1,4 +1,4 @@
-# Lock manifest — operator-surface-finalist (issue #183, extended by #375, #373)
+# Lock manifest — operator-surface-finalist (issue #183, extended by #375, #373, #374)
 
 Backfilled for the charter's now-mandatory lock-manifest gate (`standards/CHARTER.md`):
 `operator-surface-finalist.html` shipped as `★ LOCKED` under #183 with no manifest of
@@ -85,6 +85,33 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
     badge report the true total, never the truncated length. Empty attention reads
     `No operator actions in this projection.`
 
+## Gate terms added by #374 (Decision Maps: frontier trust, evidence, overflow)
+
+18. **Frontier copy** — a map's frontier line renders exactly one of: the named
+    frontier as `#<number> <title>`; the verbatim `No open decision remains` when
+    every child is closed; `blocked` when open children exist but none is
+    unclaimed-with-all-blockers-closed; `Not verified` when the frontier cannot be
+    computed. No other frontier wording exists.
+19. **Incomplete frontier fails closed** — partial, truncated, or unreadable
+    dependency data never produces a claimed frontier: the map renders `Not
+    verified` and its supporting records carry an `incomplete` qualifier naming
+    the truncated collection. Distinct from term 5's whole-surface banners, which
+    keep their own wording.
+20. **Landed evidence unavailable** — a handoff whose closing-PR evidence read
+    failed renders the verbatim `landed evidence unavailable` with a link to the
+    handoff issue — never an optimistic in-progress word for a read failure.
+21. **Overflow counts in supporting records** — every non-zero truncation
+    (handoffs, ADR links, children) appears as a supporting-record link whose
+    label carries the explicit numeric overflow count and whose URL lands on
+    GitHub. A truncation with no count-bearing link is a gate failure.
+22. **Attempt count** — when more than one closing PR attempted a handoff, the
+    landed-evidence label includes the attempt count; a single-attempt handoff
+    shows no count.
+23. **Screenshot states** — two captured states beyond term 6's five:
+    `map-frontier-matrix` (one render exercising all three term-18 non-named
+    states plus a named frontier) and `map-overflow-evidence` (overflow counts,
+    attempt count > 1, and the `landed evidence unavailable` case in one render).
+
 ## Fixture obligations
 
 - Fixtures must join the two source lists the daemon actually publishes (`repos[]`
@@ -104,6 +131,14 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
 - At least one fixture must mix `Brewgen`-style mixed-case names among lowercase
   names, and at least one fixture must have every repository unobserved, to prove
   term 10's grouping and case-insensitive sort independently.
+- The `map-frontier-matrix` fixture must carry four maps in one render: one with a
+  named frontier, one all-children-closed (`No open decision remains`), one
+  `blocked`, and one `Not verified` whose dependency data is truncated and whose
+  supporting records carry the `incomplete` qualifier (terms 18–19).
+- The `map-overflow-evidence` fixture must carry a handoff-overflow count link, an
+  ADR-overflow count link, a handoff with two merged closing-PR attempts (its
+  label showing the attempt count), and a handoff whose evidence read failed
+  rendering `landed evidence unavailable` (terms 20–22).
 
 ## Declared deviations (re-settled by #373)
 
@@ -131,3 +166,7 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
 - `nothing running`
 - `map data stale`
 - `map data unverified`
+- `No open decision remains`
+- `Not verified`
+- `incomplete`
+- `landed evidence unavailable`
