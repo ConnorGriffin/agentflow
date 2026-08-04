@@ -23,7 +23,7 @@ import { fileURLToPath, pathToFileURL } from 'url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, '../../..');
-const ROUND = process.env.ROUND || 'round';
+const ROUND = 'e7cd3c4';
 const OUT = join(HERE, ROUND);
 
 const CONSOLE_URL = pathToFileURL(join(ROOT, 'agentflow/webui/dist/index.html')).href;
@@ -34,7 +34,7 @@ const THEME_TOGGLE = '.briefing button';
 /* Tall enough for all four maps with their supporting records disclosed — the overflow
    counts and the landed-evidence wording are the whole point of these two states, and a
    shot that crops them proves nothing. */
-const VIEWPORT = { width: 1280, height: 2200 };
+const VIEWPORT = { width: 1280, height: 1320 };
 
 const STATES = ['map-frontier-matrix', 'map-overflow-evidence'];
 
