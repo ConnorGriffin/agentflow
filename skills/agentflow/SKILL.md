@@ -51,8 +51,11 @@ can't make for you.
    `ok`, not `missing` or `drifted`.
 5. **Do the one thing enrollment refuses to do:** harden pull-request CI on public repos —
    apply prints a warning that it doesn't touch this, and it's the only manual GitHub
-   follow-up. Queue labels need **no** manual step (intake creates them on demand), and the
-   fleet's `config.toml` entry is already written by `--apply` — don't duplicate either.
+   follow-up. Run `/ci-design` to shape it — it owns the vocabulary for what belongs on a
+   PR trigger vs. a deploy trigger, and the noise/cost tradeoffs. A hand-rolled `ci.yml`
+   here becomes the merge gate for every future build in this repo. Queue labels need **no** manual step
+   (intake creates them on demand), and the fleet's `config.toml` entry is already written by
+   `--apply` — don't duplicate either.
 6. **Review and commit** the files enrollment generated inside the target repo (repository
    instructions, the bundled skill, the screenshot harness if UI-enabled) — apply writes
    them to disk but doesn't commit.
@@ -86,7 +89,7 @@ For an issue at `agentflow:needs-grilling` or `agentflow:needs-mockup`:
 2. Read the issue, its intake comment (the questions/kickoff), and any replies.
 3. **Ground** first if it helps — read the code; if the repo declares a read-only data
    pull (ciq's `ciq-pull-db` → `ciq.readonly.db`), run it and check real numbers.
-4. **needs-grilling →** run `/grilling` and grill the user *live* — it owns the cadence
+4. **needs-grilling →** run `/scope` in its interview mode and grill the user *live* — it owns the cadence
    (the whole answerable frontier per numbered round) and the voice rules. Non-negotiable
    here: speak in **their voice** — the app's behavior and their real numbers, never code
    symbols / ADR numbers / file paths — and every question carries symptom + concrete
@@ -95,7 +98,7 @@ For an issue at `agentflow:needs-grilling` or `agentflow:needs-mockup`:
 5. **needs-mockup →** decide the scope first (ADR 0048): `local` (an addition inside a
    shipping surface — inherit `agentflow/webui/`'s identity, vary only the addition) or
    `surface` (a whole-surface replacement — the open 3-4 concept tournament). Run
-   `/ui-mockups` to a *locked* visual spec (charter gate); each variant carries a ≤150-word
+   `/ui-craft` in its `lock` mode to a *locked* visual spec (charter gate); each variant carries a ≤150-word
    `LOCKED` contract (thesis, user path, first viewport, visual rules, required
    interactions/states, states to screenshot, out-of-scope). Land it as ready with the
    `★ LOCKED visual spec` handoff — the chosen variant's committed mockup path AND its
@@ -140,6 +143,10 @@ flight is left alone. Only a ready, free issue builds — `build` adds convenien
 authority (the skip invariant holds).
 
 ### `review <PR>` — submit or explicitly force an exact-head review
+
+Agentflow's own reviewer (`reviewer.py`) — exact-head, cross-tool, policy-gated — is the
+fleet's review; `/review`'s two-sub-agent Standards+Spec pass is the by-hand tool for work
+that never entered the pipeline, not a substitute for this.
 
 Resolve `<PR>` to its repository and local enrolled checkout, then call the durable review entry
 point. The default follows the repo profile and never weakens autonomous independence:
