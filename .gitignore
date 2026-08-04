@@ -11,3 +11,4 @@ agentflow/webui/node_modules/
 
 # ui-mockups captures (illustrative/real payloads — not committed)
 mockups/*.capture.json
+.agents/skills/**/node_modules/
