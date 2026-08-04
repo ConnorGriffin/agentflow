@@ -141,7 +141,6 @@ for _complexity, _demands in (
 ):
     for _effort, _demand in zip(("low", "medium", "high", "extra"), _demands, strict=True):
         _ADMISSION_ROWS[("build", "claude", "fable", _complexity, _effort)] = _demand
-    _ADMISSION_ROWS[("build", "claude", "fable", _complexity, None)] = PERMIT_BUDGET
     _ADMISSION_ROWS[("revise", "claude", "fable", _complexity, None)] = 3
 ADMISSION_MATRIX = MappingProxyType(_ADMISSION_ROWS)
 

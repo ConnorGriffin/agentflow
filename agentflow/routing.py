@@ -1,8 +1,9 @@
 """Benchmarked capability routing behind one resolver interface (#498).
 
-Callers ask :data:`routing` for a route, a stage model, a launchable provider model,
-or the rendered session-lead contract. The provenance-stamped artifact is private to
-this module: dispatch, admission, prompts, and runners never parse or mirror it.
+Callers ask :data:`routing` for a stage model, a launchable provider model, or the rendered
+session-lead contract — the routes, their bans, and the ladders reach a session only through
+that contract. The provenance-stamped artifact is private to this module: dispatch, admission,
+prompts, and runners never parse or mirror it.
 """
 
 from __future__ import annotations
@@ -26,10 +27,21 @@ class Provenance:
 
 @dataclass(frozen=True, slots=True)
 class Route:
-    """One area's escalation ladder. Bans are enforced when the table loads, so a route that
-    exists can only name models the area allows."""
+    """One entry into an area's escalation ladder. ``when`` is the condition the lead is told
+    to pick it under, empty for an area with a single route. Bans are enforced when the table
+    loads, so a route that exists can only name models the area allows."""
 
+    when: str
     ladder: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Area:
+    """One area of delegated work: how the lead names it, its routes, and its bans."""
+
+    title: str
+    routes: tuple[Route, ...]
+    banned: tuple[str, ...]
 
 
 class CapabilityRouting:
@@ -58,7 +70,7 @@ class CapabilityRouting:
             raise RoutingConfigError(f"routing areas mismatch; unknown={unknown}, missing={missing}")
         self._models = self._validate_models(models)
         self._reasoning = self._validate_reasoning(reasoning)
-        self._routes = self._validate_routes(areas)
+        self._areas = self._validate_areas(areas)
 
     @classmethod
     def from_path(cls, path: Path | str) -> "CapabilityRouting":
@@ -95,19 +107,22 @@ class CapabilityRouting:
             raise RoutingConfigError("worker reasoning must name all four effort rungs")
         return dict(reasoning)
 
-    def _validate_routes(self, areas) -> dict[tuple[str, str], Route]:
-        routes = {}
+    def _validate_areas(self, areas) -> dict[str, Area]:
+        checked = {}
         for area, facts in areas.items():
-            if not isinstance(facts, dict) or not isinstance(facts.get("routes"), dict):
-                raise RoutingConfigError(f"area {area!r} has no routes")
+            if not isinstance(facts, dict) or not isinstance(facts.get("routes"), list) \
+                    or not facts["routes"] or not facts.get("title"):
+                raise RoutingConfigError(f"area {area!r} needs a title and at least one route")
             banned = tuple(facts.get("banned") or ())
             for model in banned:
                 if model not in self._models:
                     raise RoutingConfigError(f"area {area!r} bans unknown model {model!r}")
-            for variant, ladder_value in facts["routes"].items():
-                ladder = tuple(ladder_value) if isinstance(ladder_value, list) else ()
+            routes = []
+            for entry in facts["routes"]:
+                ladder = tuple(entry.get("ladder") or ()) if isinstance(entry, dict) else ()
+                when = str(entry.get("when") or "") if isinstance(entry, dict) else ""
                 if not ladder:
-                    raise RoutingConfigError(f"area {area!r} variant {variant!r} has an empty ladder")
+                    raise RoutingConfigError(f"area {area!r} route {when!r} has an empty ladder")
                 for model in ladder:
                     if model not in self._models:
                         raise RoutingConfigError(f"area {area!r} names unknown model {model!r}")
@@ -115,18 +130,9 @@ class CapabilityRouting:
                         raise RoutingConfigError("fable is never a delegate target")
                     if model in banned:
                         raise RoutingConfigError(f"area {area!r} routes banned model {model!r}")
-                routes[(area, variant)] = Route(ladder)
-            if (area, "default") not in routes:
-                raise RoutingConfigError(f"area {area!r} needs a default route")
-        return routes
-
-    def route(self, area: str, *, variant: str = "default") -> Route:
-        if area not in self._AREAS:
-            raise RoutingConfigError(f"unknown routing area {area!r}")
-        try:
-            return self._routes[(area, variant)]
-        except KeyError as exc:
-            raise RoutingConfigError(f"unknown {area!r} route variant {variant!r}") from exc
+                routes.append(Route(when, ladder))
+            checked[area] = Area(str(facts["title"]), tuple(routes), banned)
+        return checked
 
     def cli_identifier(self, provider: str, model: str) -> str:
         """Resolve an internal model name (or already-resolved id) for one provider."""
@@ -139,27 +145,22 @@ class CapabilityRouting:
         return facts["cli_id"]
 
     def model_for_stage(self, stage: str, pool: str, complexity: str,
-                        builder_complexity: str | None = None) -> str:
-        """Resolve the accountable parent/reviewer while leaving other stages unchanged."""
+                        builder_complexity: str | None = None) -> str | None:
+        """The accountable parent or reviewer capability routing chooses, or ``None`` when it
+        has no opinion and the caller's established per-pool model table still applies.
+
+        A session-led stage on the lead pool is the fixed parent. A durable pre-#498 record
+        pinned to the other pool has no routed parent, so it keeps its own lineage's model and
+        an upgrade cannot strand in-flight work."""
         if stage in self._SESSION_LED and pool == self.LEAD_POOL:
-            # Public submission mappings choose Claude/Fable. A durable pre-#498 Codex record
-            # keeps its pinned attempt lineage so an upgrade cannot strand in-flight work.
             return "fable"
-        tier = builder_complexity or complexity
         if stage == "review":
+            tier = builder_complexity or complexity
             if tier == "standard":
                 return "luna" if pool == "codex" else "sonnet"
             if tier == "deep":
                 return "sol" if pool == "codex" else "opus"
-        legacy = {
-            ("claude", "standard"): "sonnet", ("claude", "deep"): "opus",
-            ("codex", "standard"): "terra", ("codex", "deep"): "sol",
-        }
-        try:
-            return legacy[(pool, complexity)]
-        except KeyError as exc:
-            raise RoutingConfigError(
-                f"no model for stage={stage!r}, pool={pool!r}, complexity={complexity!r}") from exc
+        return None
 
     def review_complexity(self, builder_complexity: str | None,
                           fallback: str | None) -> str:
@@ -171,15 +172,19 @@ class CapabilityRouting:
     def worker_reasoning(self, effort: str | None) -> str:
         return self._reasoning.get(effort or "medium", "medium")
 
+    @staticmethod
+    def _area_line(area: Area) -> str:
+        """One rendered table row: every route the area allows, then the models it bans."""
+        routes = "; ".join(
+            f"{route.when} {' → '.join(model.title() for model in route.ladder)}".strip()
+            for route in area.routes)
+        bans = "; never " + ", ".join(model.title() for model in area.banned) if area.banned else ""
+        return f"- {area.title}: {routes}{bans}"
+
     def session_lead_instructions(self, stage: str, effort: str | None) -> str:
         if stage not in {"build", "revise"}:
             raise RoutingConfigError(f"stage {stage!r} has no session lead")
-        arrows = {
-            area: " → ".join(self.route(area).ladder)
-            for area in ("exploration", "implementation", "plan", "prototype",
-                         "brainstorm", "documentation", "review")
-        }
-        arrows = {area: value.title() for area, value in arrows.items()}
+        table = "\n".join(self._area_line(area) for area in self._areas.values())
         launch_ids = "; ".join(
             f"{name.title()} ({facts['provider']}): {facts['cli_id']}"
             for name, facts in self._models.items()
@@ -197,14 +202,8 @@ worker reasoning rung: {rung}. Give that rung in every worker prompt. Claude wor
 sub-agents. Reach Codex workers by shelling out to `codex exec` with the CLI id named below; do not
 consult pool headroom from inside this running session.
 
-Routes (workers enter at the first rung):
-- exploration: bounded Luna / full-system Sonnet; ladder {arrows['exploration']}; Haiku banned
-- hermetic implementation: {arrows['implementation']}
-- plan/spec: {arrows['plan']}
-- prototyping/UI mockups: {arrows['prototype']}; Luna banned
-- brainstorming: {arrows['brainstorm']}
-- documentation: {arrows['documentation']}
-- code review: routine {arrows['review']}; load-bearing Opus only; Haiku never reviews
+Routes (workers enter at the first rung; a banned model never takes that area's work):
+{table}
 
 Provider launch identifiers: {launch_ids}
 

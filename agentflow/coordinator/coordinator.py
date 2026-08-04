@@ -255,8 +255,7 @@ class Coordinator:
         model = (
             routing.model_for_stage(
                 stage, submission.pool, submission.complexity, submission.builder_complexity)
-            if stage in {"build", "revise", "review"}
-            else MODEL_FOR.get((submission.pool, submission.complexity), "opus")
+            or MODEL_FOR.get((submission.pool, submission.complexity), "opus")
         )
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
@@ -832,8 +831,7 @@ class Coordinator:
         record.model = (
             routing.model_for_stage(
                 record.stage, dest_pool, record.complexity, record.builder_complexity)
-            if record.stage in {"build", "revise", "review"}
-            else MODEL_FOR.get((dest_pool, record.complexity), "opus")
+            or MODEL_FOR.get((dest_pool, record.complexity), "opus")
         )
         demand = admission_demand(
             record.stage, dest_pool, record.model, record.complexity, record.effort)

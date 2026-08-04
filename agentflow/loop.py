@@ -17,7 +17,7 @@ from pathlib import Path
 
 from agentflow import (coordinated_build, coordinated_review, coordinated_revise, github,
                        pipeline, ratchet)
-from agentflow.balancer import pick_pair, pick_reviewer, pick_session_lead
+from agentflow.balancer import pick_reviewer, pick_session_lead
 from agentflow.coordinator.record import WAITING
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.gate import (conflict_revises_used, maintainer_comment, maintainer_comment_id,

@@ -49,20 +49,53 @@ def test_build_submission_launches_a_low_effort_fable_session_lead(make_coord, t
     assert "worker reasoning rung: high" in prompt
     assert "run the repository test gate" in prompt
     assert "second failure" in prompt and "ladder top" in prompt
+    # The bans and the named routes are the table's, not prose: an unverified explorer, an
+    # inventive prototyper, and an unbenchmarked reviewer are all named as refusals.
+    assert "- exploration: bounded Luna → Sonnet → Opus; full-system Sonnet → Opus; never Haiku" \
+        in prompt
+    assert "- prototyping/UI mockups: Sol → Opus; never Luna" in prompt
+    assert "- code review: routine Luna → Sonnet → Opus; load-bearing Opus; never Haiku" in prompt
 
 
-def test_routing_config_is_validated_and_resolves_every_named_model():
+def test_the_lead_brief_follows_the_shipped_table_rather_than_prose(tmp_path):
+    """Editing the table moves what the lead is told — the config is the only source."""
+    import agentflow.routing as routing_module
+    from agentflow.routing import CapabilityRouting
+
+    source = Path(routing_module.__file__).with_name("model-routing.json")
+    data = json.loads(source.read_text())
+    data["areas"]["review"]["routes"][1]["ladder"] = ["sonnet"]
+    data["areas"]["exploration"]["banned"] = ["haiku", "terra"]
+    edited = tmp_path / "routing.json"
+    edited.write_text(json.dumps(data))
+
+    brief = CapabilityRouting.from_path(edited).session_lead_instructions("build", "medium")
+
+    assert "load-bearing Sonnet" in brief and "load-bearing Opus" not in brief
+    assert "- exploration: bounded Luna → Sonnet → Opus; full-system Sonnet → Opus; " \
+        "never Haiku, Terra" in brief
+
+
+def test_routing_config_is_validated_and_resolves_every_named_model(tmp_path):
     assert routing.provenance.benchmark_date == "2026-08-03"
-    assert routing.route("implementation").ladder == ("terra", "sonnet", "opus")
-    assert routing.route("exploration", variant="full-system").ladder[0] == "sonnet"
-    assert routing.route("review", variant="load-bearing").ladder == ("opus",)
     assert routing.cli_identifier("claude", "haiku") == "haiku"
     assert routing.cli_identifier("codex", "luna") == "gpt-5.6-luna"
     assert routing.cli_identifier("claude", "fable") == "fable"
-    with pytest.raises(RoutingConfigError, match="unknown routing area"):
-        routing.route("not-an-area")
     with pytest.raises(RoutingConfigError, match="cannot launch"):
         routing.cli_identifier("claude", "luna")
+
+    # An area nobody benchmarked is refused at load rather than reaching a session lead.
+    import agentflow.routing as routing_module
+    from agentflow.routing import CapabilityRouting
+
+    source = Path(routing_module.__file__).with_name("model-routing.json")
+    data = json.loads(source.read_text())
+    data["areas"]["telepathy"] = {"title": "telepathy", "routes": [{"ladder": ["opus"]}],
+                                  "banned": []}
+    unknown_area = tmp_path / "routing.json"
+    unknown_area.write_text(json.dumps(data))
+    with pytest.raises(RoutingConfigError, match="routing areas mismatch"):
+        CapabilityRouting.from_path(unknown_area)
 
 
 def test_review_tier_uses_builder_complexity_and_pool_specific_models():
@@ -114,7 +147,7 @@ def test_loader_rejects_unknown_models(tmp_path):
     bad = tmp_path / "routing.json"
     source = Path(routing_module.__file__).with_name("model-routing.json")
     data = json.loads(source.read_text())
-    data["areas"]["implementation"]["routes"]["default"] = ["missing"]
+    data["areas"]["implementation"]["routes"][0]["ladder"] = ["missing"]
     bad.write_text(json.dumps(data))
     from agentflow.routing import CapabilityRouting
 

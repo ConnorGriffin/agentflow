@@ -22,31 +22,44 @@
   },
   "areas": {
     "exploration": {
-      "routes": {"default": ["luna", "sonnet", "opus"], "bounded": ["luna", "sonnet", "opus"], "full-system": ["sonnet", "opus"]},
+      "title": "exploration",
+      "routes": [
+        {"when": "bounded", "ladder": ["luna", "sonnet", "opus"]},
+        {"when": "full-system", "ladder": ["sonnet", "opus"]}
+      ],
       "banned": ["haiku"]
     },
     "implementation": {
-      "routes": {"default": ["terra", "sonnet", "opus"]},
+      "title": "hermetic implementation",
+      "routes": [{"ladder": ["terra", "sonnet", "opus"]}],
       "banned": []
     },
     "plan": {
-      "routes": {"default": ["terra", "sol"]},
+      "title": "plan/spec",
+      "routes": [{"ladder": ["terra", "sol"]}],
       "banned": []
     },
     "prototype": {
-      "routes": {"default": ["sol", "opus"]},
+      "title": "prototyping/UI mockups",
+      "routes": [{"ladder": ["sol", "opus"]}],
       "banned": ["luna"]
     },
     "brainstorm": {
-      "routes": {"default": ["terra", "opus"]},
+      "title": "brainstorming",
+      "routes": [{"ladder": ["terra", "opus"]}],
       "banned": []
     },
     "documentation": {
-      "routes": {"default": ["haiku", "opus", "sol"]},
+      "title": "documentation",
+      "routes": [{"ladder": ["haiku", "opus", "sol"]}],
       "banned": []
     },
     "review": {
-      "routes": {"default": ["luna", "sonnet", "opus"], "routine": ["luna", "sonnet", "opus"], "load-bearing": ["opus"]},
+      "title": "code review",
+      "routes": [
+        {"when": "routine", "ladder": ["luna", "sonnet", "opus"]},
+        {"when": "load-bearing", "ladder": ["opus"]}
+      ],
       "banned": ["haiku"]
     }
   }
