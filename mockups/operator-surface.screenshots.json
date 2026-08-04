@@ -356,6 +356,427 @@
           ]
         }
       }
+    },
+    {
+      "url": "http://127.0.0.1:8766/operator-surface-finalist.html",
+      "theme": "light",
+      "out": "mockups/operator-surface-finalist-map-frontier-matrix.png",
+      "viewport": {
+        "width": 1280,
+        "height": 1320
+      },
+      "settle": 150,
+      "fetchStub": {
+        "operator-surface.capture.json": {
+          "freshness": {
+            "state": "fresh",
+            "label": "Verified 4 minutes ago"
+          },
+          "attention": [],
+          "maps": [
+            {
+              "title": "Make the Decision Map reads trustworthy",
+              "repository": "agentflow",
+              "progress": "1 of 3 decided",
+              "status": "bounded",
+              "frontier": "#374 Say what the projection could not verify",
+              "tickets": [
+                "#372 Classify decisions and verify handoffs — done",
+                "#374 Say what the projection could not verify — frontier",
+                "#375 Report what the refresh costs — claimed"
+              ],
+              "support": [
+                {
+                  "label": "ADR 0036 — bounded projection",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 374 — heartbeat budget",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#500 Project verified frontiers — PR #508 merged",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "Map on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                }
+              ]
+            },
+            {
+              "title": "Unified read-only operator console",
+              "repository": "agentflow",
+              "progress": "4 of 4 decided",
+              "status": "bounded",
+              "frontier": "No open decision remains",
+              "tickets": [
+                "#180 Bound the projection — done",
+                "#183 Lock the operator surface — done",
+                "#184 Settle terminal slicing — done",
+                "#185 Build the successor console — done"
+              ],
+              "support": [
+                {
+                  "label": "ADR 0035 — read-only console",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "Map on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                }
+              ]
+            },
+            {
+              "title": "Publish nothing a builder would waste a session on",
+              "repository": "agentflow",
+              "progress": "1 of 3 decided",
+              "status": "bounded",
+              "frontier": "blocked",
+              "tickets": [
+                "#430 Show a silently broken stage — done",
+                "#472 Record per-attempt telemetry — blocked",
+                "#497 Pay for the briefing by what a repository has — claimed"
+              ],
+              "support": [
+                {
+                  "label": "ADR 0048 — publishable drafts",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "Map on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                }
+              ]
+            },
+            {
+              "title": "Terminal slicing for the operator briefing",
+              "repository": "agentflow",
+              "progress": "1 of 3 decided",
+              "status": "incomplete",
+              "frontier": "Not verified",
+              "tickets": [
+                "#183 Lock the interface — done",
+                "#185 Slice the terminal decision — unknown",
+                "#186 Publish schema-v2 projection — frontier"
+              ],
+              "support": [
+                {
+                  "label": "ADR 0036 — bounded projection",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "incomplete — blocker data on 1 decision",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "Map on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                }
+              ]
+            }
+          ],
+          "capacity": [
+            {
+              "name": "claude",
+              "detail": "taking work, 3 running, 38% used"
+            },
+            {
+              "name": "codex",
+              "detail": "taking work, 1 running, 12% used"
+            }
+          ],
+          "fleet": [
+            {
+              "name": "agentflow",
+              "profile": "reviewed",
+              "work": "0 in flight · 0 ready",
+              "landings": "no landings yet",
+              "health": "healthy",
+              "healthy": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "url": "http://127.0.0.1:8766/operator-surface-finalist.html",
+      "theme": "light",
+      "out": "mockups/operator-surface-finalist-map-overflow-evidence.png",
+      "viewport": {
+        "width": 1280,
+        "height": 1320
+      },
+      "settle": 150,
+      "fetchStub": {
+        "operator-surface.capture.json": {
+          "freshness": {
+            "state": "fresh",
+            "label": "Verified 4 minutes ago"
+          },
+          "attention": [],
+          "maps": [
+            {
+              "title": "Make the Decision Map reads trustworthy",
+              "repository": "agentflow",
+              "progress": "49 of 52 decided",
+              "status": "incomplete",
+              "frontier": "#374 Say what the projection could not verify",
+              "tickets": [
+                "#400 Settled decision 1 — done",
+                "#401 Settled decision 2 — done",
+                "#402 Settled decision 3 — done",
+                "#403 Settled decision 4 — done",
+                "#404 Settled decision 5 — done",
+                "#405 Settled decision 6 — done",
+                "#406 Settled decision 7 — done",
+                "#407 Settled decision 8 — done",
+                "#408 Settled decision 9 — done",
+                "#409 Settled decision 10 — done",
+                "#410 Settled decision 11 — done",
+                "#411 Settled decision 12 — done",
+                "#412 Settled decision 13 — done",
+                "#413 Settled decision 14 — done",
+                "#414 Settled decision 15 — done",
+                "#415 Settled decision 16 — done",
+                "#416 Settled decision 17 — done",
+                "#417 Settled decision 18 — done",
+                "#418 Settled decision 19 — done",
+                "#419 Settled decision 20 — done",
+                "#420 Settled decision 21 — done",
+                "#300 Settled decision 22 — done",
+                "#301 Settled decision 23 — done",
+                "#302 Settled decision 24 — done",
+                "#303 Settled decision 25 — done",
+                "#304 Settled decision 26 — done",
+                "#305 Settled decision 27 — done",
+                "#306 Settled decision 28 — done",
+                "#307 Settled decision 29 — done",
+                "#308 Settled decision 30 — done",
+                "#309 Settled decision 31 — done",
+                "#310 Settled decision 32 — done",
+                "#311 Settled decision 33 — done",
+                "#312 Settled decision 34 — done",
+                "#313 Settled decision 35 — done",
+                "#314 Settled decision 36 — done",
+                "#315 Settled decision 37 — done",
+                "#316 Settled decision 38 — done",
+                "#317 Settled decision 39 — done",
+                "#318 Settled decision 40 — done",
+                "#319 Settled decision 41 — done",
+                "#320 Settled decision 42 — done",
+                "#321 Settled decision 43 — done",
+                "#322 Settled decision 44 — done",
+                "#323 Settled decision 45 — done",
+                "#324 Settled decision 46 — done",
+                "#325 Settled decision 47 — done",
+                "#326 Settled decision 48 — done",
+                "#327 Settled decision 49 — done",
+                "#374 Say what the projection could not verify — frontier"
+              ],
+              "support": [
+                {
+                  "label": "ADR 0001 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0002 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0003 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0004 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0005 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0006 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0007 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0008 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0009 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0010 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0011 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "ADR 0012 — a settled record",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "incomplete — 2 more decisions on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "1 more handoff on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "2 more decision records on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#420 Build 420 — PR #361 merged · 2 attempts",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#419 Build 419 — PR #55 merged",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#418 Build 418 — PR #507 open",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#417 Build 417 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#416 Build 416 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#415 Build 415 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#414 Build 414 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#413 Build 413 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#412 Build 412 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#411 Build 411 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#410 Build 410 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#409 Build 409 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#408 Build 408 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#407 Build 407 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#406 Build 406 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#405 Build 405 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#404 Build 404 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#403 Build 403 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#402 Build 402 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "#401 Build 401 — building",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                },
+                {
+                  "label": "Map on GitHub",
+                  "url": "https://github.com/ConnorGriffin/agentflow"
+                }
+              ]
+            },
+            {
+              "title": "Wayfinder map surface",
+              "repository": "wayfinder",
+              "progress": "1 of 2 decided",
+              "status": "bounded",
+              "frontier": "#502 Render the map surface",
+              "tickets": [
+                "#501 Settle the map schema — done",
+                "#502 Render the map surface — frontier"
+              ],
+              "support": [
+                {
+                  "label": "ADR 0036 — bounded projection",
+                  "url": "https://github.com/ConnorGriffin/wayfinder"
+                },
+                {
+                  "label": "#601 Build the map schema — landed evidence unavailable",
+                  "url": "https://github.com/ConnorGriffin/wayfinder/issues/601"
+                },
+                {
+                  "label": "Map on GitHub",
+                  "url": "https://github.com/ConnorGriffin/wayfinder"
+                }
+              ]
+            }
+          ],
+          "capacity": [
+            {
+              "name": "claude",
+              "detail": "taking work, 3 running, 38% used"
+            },
+            {
+              "name": "codex",
+              "detail": "taking work, 1 running, 12% used"
+            }
+          ],
+          "fleet": [
+            {
+              "name": "agentflow",
+              "profile": "reviewed",
+              "work": "0 in flight · 0 ready",
+              "landings": "no landings yet",
+              "health": "healthy",
+              "healthy": true
+            },
+            {
+              "name": "wayfinder",
+              "profile": "reviewed",
+              "work": "0 in flight · 0 ready",
+              "landings": "no landings yet",
+              "health": "healthy",
+              "healthy": true
+            }
+          ]
+        }
+      }
     }
   ]
 }

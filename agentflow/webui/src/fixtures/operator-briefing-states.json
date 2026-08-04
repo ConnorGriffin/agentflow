@@ -1,0 +1,1134 @@
+{
+ "map-frontier-matrix": {
+  "dispatch": {
+   "enabled": true
+  },
+  "daemon": {
+   "enabled": true,
+   "last_cycle_at": "2026-07-30T12:00:00+00:00",
+   "poll_seconds": 300,
+   "gh_fresh_at": "2026-07-30T12:00:00+00:00"
+  },
+  "pools": [
+   {
+    "tool": "claude",
+    "clear": true,
+    "spent_pct": 38,
+    "headroom_pct": 62,
+    "running": 3,
+    "reason": null
+   },
+   {
+    "tool": "codex",
+    "clear": true,
+    "spent_pct": 12,
+    "headroom_pct": 88,
+    "running": 1,
+    "reason": null
+   }
+  ],
+  "running": [],
+  "repos": [
+   {
+    "repo": "ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "ready": [],
+    "held": [],
+    "parked": [],
+    "in_flight": [],
+    "recent_merges": [],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   }
+  ],
+  "schema_version": 2,
+  "generated_at": "2026-07-30T12:00:00+00:00",
+  "repositories": [
+   {
+    "name_with_owner": "ConnorGriffin/agentflow",
+    "url": "https://github.com/ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "github": {
+     "status": "fresh",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T12:00:00+00:00",
+     "error": null
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 343,
+       "title": "Make the Decision Map reads trustworthy",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/343",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 3,
+        "closed": 1
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 374,
+         "title": "Say what the projection could not verify",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/374",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 372,
+         "title": "Classify decisions and verify handoffs",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/372",
+         "status": "done"
+        },
+        {
+         "number": 374,
+         "title": "Say what the projection could not verify",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/374",
+         "status": "frontier"
+        },
+        {
+         "number": 375,
+         "title": "Report what the refresh costs",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/375",
+         "status": "claimed"
+        }
+       ],
+       "handoffs": [
+        {
+         "number": 500,
+         "title": "Project verified frontiers",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/500",
+         "pipeline": {
+          "state": "merged",
+          "pr_number": 508,
+          "pr_url": "https://github.com/ConnorGriffin/agentflow/pull/508",
+          "merged_at": "2026-08-04T08:12:00Z",
+          "merge_commit": null,
+          "review": null,
+          "ci": null
+         },
+         "attempt_count": 1
+        }
+       ],
+       "totals": {
+        "children": {
+         "shown": 3,
+         "total": 3
+        },
+        "handoffs": {
+         "shown": 1,
+         "total": 1
+        },
+        "adrs": {
+         "shown": 2,
+         "total": 2
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        },
+        {
+         "label": "ADR 374 — heartbeat budget",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/adr-374-graphql-heartbeat-budget.md"
+        }
+       ]
+      },
+      {
+       "number": 179,
+       "title": "Unified read-only operator console",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/179",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 4,
+        "closed": 4
+       },
+       "frontier_state": "none_open",
+       "frontier": [],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 180,
+         "title": "Bound the projection",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/180",
+         "status": "done"
+        },
+        {
+         "number": 183,
+         "title": "Lock the operator surface",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/183",
+         "status": "done"
+        },
+        {
+         "number": 184,
+         "title": "Settle terminal slicing",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/184",
+         "status": "done"
+        },
+        {
+         "number": 185,
+         "title": "Build the successor console",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/185",
+         "status": "done"
+        }
+       ],
+       "handoffs": [],
+       "totals": {
+        "children": {
+         "shown": 4,
+         "total": 4
+        },
+        "handoffs": {
+         "shown": 0,
+         "total": 0
+        },
+        "adrs": {
+         "shown": 1,
+         "total": 1
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0035 — read-only console",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0035-workflow-engine-read-only-operator-console.md"
+        }
+       ]
+      },
+      {
+       "number": 418,
+       "title": "Publish nothing a builder would waste a session on",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 3,
+        "closed": 1
+       },
+       "frontier_state": "blocked",
+       "frontier": [],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 430,
+         "title": "Show a silently broken stage",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/430",
+         "status": "done"
+        },
+        {
+         "number": 472,
+         "title": "Record per-attempt telemetry",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/472",
+         "status": "blocked"
+        },
+        {
+         "number": 497,
+         "title": "Pay for the briefing by what a repository has",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/497",
+         "status": "claimed"
+        }
+       ],
+       "handoffs": [],
+       "totals": {
+        "children": {
+         "shown": 3,
+         "total": 3
+        },
+        "handoffs": {
+         "shown": 0,
+         "total": 0
+        },
+        "adrs": {
+         "shown": 1,
+         "total": 1
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0048 — publishable drafts",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0048-publishable-drafts.md"
+        }
+       ]
+      },
+      {
+       "number": 184,
+       "title": "Terminal slicing for the operator briefing",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/184",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 3,
+        "closed": 1
+       },
+       "frontier_state": "unverified",
+       "frontier": [],
+       "frontier_incomplete": true,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 183,
+         "title": "Lock the interface",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/183",
+         "status": "done"
+        },
+        {
+         "number": 185,
+         "title": "Slice the terminal decision",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/185",
+         "status": "unknown"
+        },
+        {
+         "number": 186,
+         "title": "Publish schema-v2 projection",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/186",
+         "status": "frontier"
+        }
+       ],
+       "handoffs": [],
+       "totals": {
+        "children": {
+         "shown": 3,
+         "total": 3
+        },
+        "handoffs": {
+         "shown": 0,
+         "total": 0
+        },
+        "adrs": {
+         "shown": 1,
+         "total": 1
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        },
+        {
+         "label": "incomplete — blocker data on 1 decision",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/184"
+        }
+       ]
+      }
+     ],
+     "active_total": 4
+    }
+   }
+  ],
+  "fleet": {
+   "recent_landed": []
+  },
+  "attention": {
+   "rows": [],
+   "total": 0
+  }
+ },
+ "map-overflow-evidence": {
+  "dispatch": {
+   "enabled": true
+  },
+  "daemon": {
+   "enabled": true,
+   "last_cycle_at": "2026-07-30T12:00:00+00:00",
+   "poll_seconds": 300,
+   "gh_fresh_at": "2026-07-30T12:00:00+00:00"
+  },
+  "pools": [
+   {
+    "tool": "claude",
+    "clear": true,
+    "spent_pct": 38,
+    "headroom_pct": 62,
+    "running": 3,
+    "reason": null
+   },
+   {
+    "tool": "codex",
+    "clear": true,
+    "spent_pct": 12,
+    "headroom_pct": 88,
+    "running": 1,
+    "reason": null
+   }
+  ],
+  "running": [],
+  "repos": [
+   {
+    "repo": "ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "ready": [],
+    "held": [],
+    "parked": [],
+    "in_flight": [],
+    "recent_merges": [],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   },
+   {
+    "repo": "ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "ready": [],
+    "held": [],
+    "parked": [],
+    "in_flight": [],
+    "recent_merges": [],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   }
+  ],
+  "schema_version": 2,
+  "generated_at": "2026-07-30T12:00:00+00:00",
+  "repositories": [
+   {
+    "name_with_owner": "ConnorGriffin/agentflow",
+    "url": "https://github.com/ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "github": {
+     "status": "fresh",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T12:00:00+00:00",
+     "error": null
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 343,
+       "title": "Make the Decision Map reads trustworthy",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/343",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 52,
+        "closed": 49
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 374,
+         "title": "Say what the projection could not verify",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/374",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": true,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 400,
+         "title": "Settled decision 1",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/400",
+         "status": "done"
+        },
+        {
+         "number": 401,
+         "title": "Settled decision 2",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/401",
+         "status": "done"
+        },
+        {
+         "number": 402,
+         "title": "Settled decision 3",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/402",
+         "status": "done"
+        },
+        {
+         "number": 403,
+         "title": "Settled decision 4",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/403",
+         "status": "done"
+        },
+        {
+         "number": 404,
+         "title": "Settled decision 5",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/404",
+         "status": "done"
+        },
+        {
+         "number": 405,
+         "title": "Settled decision 6",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/405",
+         "status": "done"
+        },
+        {
+         "number": 406,
+         "title": "Settled decision 7",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/406",
+         "status": "done"
+        },
+        {
+         "number": 407,
+         "title": "Settled decision 8",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/407",
+         "status": "done"
+        },
+        {
+         "number": 408,
+         "title": "Settled decision 9",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/408",
+         "status": "done"
+        },
+        {
+         "number": 409,
+         "title": "Settled decision 10",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/409",
+         "status": "done"
+        },
+        {
+         "number": 410,
+         "title": "Settled decision 11",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/410",
+         "status": "done"
+        },
+        {
+         "number": 411,
+         "title": "Settled decision 12",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/411",
+         "status": "done"
+        },
+        {
+         "number": 412,
+         "title": "Settled decision 13",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/412",
+         "status": "done"
+        },
+        {
+         "number": 413,
+         "title": "Settled decision 14",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/413",
+         "status": "done"
+        },
+        {
+         "number": 414,
+         "title": "Settled decision 15",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/414",
+         "status": "done"
+        },
+        {
+         "number": 415,
+         "title": "Settled decision 16",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/415",
+         "status": "done"
+        },
+        {
+         "number": 416,
+         "title": "Settled decision 17",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/416",
+         "status": "done"
+        },
+        {
+         "number": 417,
+         "title": "Settled decision 18",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/417",
+         "status": "done"
+        },
+        {
+         "number": 418,
+         "title": "Settled decision 19",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+         "status": "done"
+        },
+        {
+         "number": 419,
+         "title": "Settled decision 20",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/419",
+         "status": "done"
+        },
+        {
+         "number": 420,
+         "title": "Settled decision 21",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/420",
+         "status": "done"
+        },
+        {
+         "number": 300,
+         "title": "Settled decision 22",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/300",
+         "status": "done"
+        },
+        {
+         "number": 301,
+         "title": "Settled decision 23",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/301",
+         "status": "done"
+        },
+        {
+         "number": 302,
+         "title": "Settled decision 24",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/302",
+         "status": "done"
+        },
+        {
+         "number": 303,
+         "title": "Settled decision 25",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/303",
+         "status": "done"
+        },
+        {
+         "number": 304,
+         "title": "Settled decision 26",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/304",
+         "status": "done"
+        },
+        {
+         "number": 305,
+         "title": "Settled decision 27",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/305",
+         "status": "done"
+        },
+        {
+         "number": 306,
+         "title": "Settled decision 28",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/306",
+         "status": "done"
+        },
+        {
+         "number": 307,
+         "title": "Settled decision 29",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/307",
+         "status": "done"
+        },
+        {
+         "number": 308,
+         "title": "Settled decision 30",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/308",
+         "status": "done"
+        },
+        {
+         "number": 309,
+         "title": "Settled decision 31",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/309",
+         "status": "done"
+        },
+        {
+         "number": 310,
+         "title": "Settled decision 32",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/310",
+         "status": "done"
+        },
+        {
+         "number": 311,
+         "title": "Settled decision 33",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/311",
+         "status": "done"
+        },
+        {
+         "number": 312,
+         "title": "Settled decision 34",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/312",
+         "status": "done"
+        },
+        {
+         "number": 313,
+         "title": "Settled decision 35",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/313",
+         "status": "done"
+        },
+        {
+         "number": 314,
+         "title": "Settled decision 36",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/314",
+         "status": "done"
+        },
+        {
+         "number": 315,
+         "title": "Settled decision 37",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/315",
+         "status": "done"
+        },
+        {
+         "number": 316,
+         "title": "Settled decision 38",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/316",
+         "status": "done"
+        },
+        {
+         "number": 317,
+         "title": "Settled decision 39",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/317",
+         "status": "done"
+        },
+        {
+         "number": 318,
+         "title": "Settled decision 40",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/318",
+         "status": "done"
+        },
+        {
+         "number": 319,
+         "title": "Settled decision 41",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/319",
+         "status": "done"
+        },
+        {
+         "number": 320,
+         "title": "Settled decision 42",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/320",
+         "status": "done"
+        },
+        {
+         "number": 321,
+         "title": "Settled decision 43",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/321",
+         "status": "done"
+        },
+        {
+         "number": 322,
+         "title": "Settled decision 44",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/322",
+         "status": "done"
+        },
+        {
+         "number": 323,
+         "title": "Settled decision 45",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/323",
+         "status": "done"
+        },
+        {
+         "number": 324,
+         "title": "Settled decision 46",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/324",
+         "status": "done"
+        },
+        {
+         "number": 325,
+         "title": "Settled decision 47",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/325",
+         "status": "done"
+        },
+        {
+         "number": 326,
+         "title": "Settled decision 48",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/326",
+         "status": "done"
+        },
+        {
+         "number": 327,
+         "title": "Settled decision 49",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/327",
+         "status": "done"
+        },
+        {
+         "number": 374,
+         "title": "Say what the projection could not verify",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/374",
+         "status": "frontier"
+        }
+       ],
+       "handoffs": [
+        {
+         "number": 420,
+         "title": "Build 420",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/420",
+         "pipeline": {
+          "state": "merged",
+          "pr_number": 361,
+          "pr_url": "https://github.com/ConnorGriffin/agentflow/pull/361",
+          "merged_at": "2026-07-30T17:12:56Z",
+          "merge_commit": null,
+          "review": null,
+          "ci": null
+         },
+         "attempt_count": 2
+        },
+        {
+         "number": 419,
+         "title": "Build 419",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/419",
+         "pipeline": {
+          "state": "merged",
+          "pr_number": 55,
+          "pr_url": "https://github.com/ConnorGriffin/agentflow/pull/55",
+          "merged_at": "2026-01-14T11:03:00Z",
+          "merge_commit": null,
+          "review": null,
+          "ci": null
+         },
+         "attempt_count": 1
+        },
+        {
+         "number": 418,
+         "title": "Build 418",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+         "pipeline": {
+          "state": "pr_open",
+          "pr_number": 507,
+          "pr_url": "https://github.com/ConnorGriffin/agentflow/pull/507",
+          "review": null,
+          "ci": null
+         },
+         "attempt_count": 1
+        },
+        {
+         "number": 417,
+         "title": "Build 417",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/417",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 416,
+         "title": "Build 416",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/416",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 415,
+         "title": "Build 415",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/415",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 414,
+         "title": "Build 414",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/414",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 413,
+         "title": "Build 413",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/413",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 412,
+         "title": "Build 412",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/412",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 411,
+         "title": "Build 411",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/411",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 410,
+         "title": "Build 410",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/410",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 409,
+         "title": "Build 409",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/409",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 408,
+         "title": "Build 408",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/408",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 407,
+         "title": "Build 407",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/407",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 406,
+         "title": "Build 406",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/406",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 405,
+         "title": "Build 405",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/405",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 404,
+         "title": "Build 404",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/404",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 403,
+         "title": "Build 403",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/403",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 402,
+         "title": "Build 402",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/402",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        },
+        {
+         "number": 401,
+         "title": "Build 401",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/401",
+         "pipeline": {
+          "state": "building",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        }
+       ],
+       "totals": {
+        "children": {
+         "shown": 50,
+         "total": 52
+        },
+        "handoffs": {
+         "shown": 20,
+         "total": 21
+        },
+        "adrs": {
+         "shown": 12,
+         "total": 14
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0001 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0001-settled.md"
+        },
+        {
+         "label": "ADR 0002 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0002-settled.md"
+        },
+        {
+         "label": "ADR 0003 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0003-settled.md"
+        },
+        {
+         "label": "ADR 0004 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0004-settled.md"
+        },
+        {
+         "label": "ADR 0005 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0005-settled.md"
+        },
+        {
+         "label": "ADR 0006 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0006-settled.md"
+        },
+        {
+         "label": "ADR 0007 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0007-settled.md"
+        },
+        {
+         "label": "ADR 0008 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0008-settled.md"
+        },
+        {
+         "label": "ADR 0009 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0009-settled.md"
+        },
+        {
+         "label": "ADR 0010 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0010-settled.md"
+        },
+        {
+         "label": "ADR 0011 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0011-settled.md"
+        },
+        {
+         "label": "ADR 0012 — a settled record",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0012-settled.md"
+        },
+        {
+         "label": "incomplete — 2 more decisions on GitHub",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/343"
+        },
+        {
+         "label": "1 more handoff on GitHub",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/343"
+        },
+        {
+         "label": "2 more decision records on GitHub",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/343"
+        }
+       ]
+      }
+     ],
+     "active_total": 1
+    }
+   },
+   {
+    "name_with_owner": "ConnorGriffin/wayfinder",
+    "url": "https://github.com/ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "github": {
+     "status": "fresh",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T12:00:00+00:00",
+     "error": null
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 500,
+       "title": "Wayfinder map surface",
+       "url": "https://github.com/ConnorGriffin/wayfinder/issues/500",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 2,
+        "closed": 1
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 502,
+         "title": "Render the map surface",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/502",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 501,
+         "title": "Settle the map schema",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/501",
+         "status": "done"
+        },
+        {
+         "number": 502,
+         "title": "Render the map surface",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/502",
+         "status": "frontier"
+        }
+       ],
+       "handoffs": [
+        {
+         "number": 601,
+         "title": "Build the map schema",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/601",
+         "pipeline": {
+          "state": "unavailable",
+          "pr_number": null,
+          "pr_url": null
+         },
+         "attempt_count": 0
+        }
+       ],
+       "totals": {
+        "children": {
+         "shown": 2,
+         "total": 2
+        },
+        "handoffs": {
+         "shown": 1,
+         "total": 1
+        },
+        "adrs": {
+         "shown": 1,
+         "total": 1
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/wayfinder/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        }
+       ]
+      }
+     ],
+     "active_total": 1
+    }
+   }
+  ],
+  "fleet": {
+   "recent_landed": []
+  },
+  "attention": {
+   "rows": [],
+   "total": 0
+  }
+ }
+}

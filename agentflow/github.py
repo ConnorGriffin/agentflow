@@ -154,7 +154,11 @@ class PipelinePrRow:
 @dataclass(frozen=True)
 class HandoffCandidateRow:
     """One issue a Decision Map child ``blocking``-links to — a handed-off Build Issue
-    candidate until its marker, label namespace, and repository are verified (ADR 0036)."""
+    candidate until its marker, label namespace, and repository are verified (ADR 0036).
+    ``id`` is GitHub's own node ID: the only identifier that is unique across repositories,
+    and so the only safe key to deduplicate accepted candidates by. A candidate that arrives
+    without one is never typed at all — an unidentifiable edge cannot be verified."""
+    id: str
     number: int
     title: str
     url: str
@@ -176,6 +180,10 @@ class MapChildRow:
     blocked_by_closed: int
     blocked_by_total: int
     handoff_candidates: tuple[HandoffCandidateRow, ...]
+    # GitHub's own count of this child's outgoing `blocking` edges. More than were returned
+    # means a handoff could be hiding behind the bound — handoff completeness only, never
+    # frontier verification, which reads `blockedBy` (ADR 0036).
+    handoff_edges_total: int
 
 
 @dataclass(frozen=True)
@@ -229,11 +237,24 @@ class HandoffLinksRead:
 
 
 @dataclass(frozen=True)
-class HandoffLinkRow:
-    """A verified handoff Build Issue's native closing-PR references — just the join key;
-    the console resolves full pipeline evidence from the PR listings it already reads."""
+class HandoffAttemptRow:
+    """One pull request that closed — or tried to close — a handed-off Build Issue, as its own
+    native closing reference reports it. Carries landed state itself rather than only a join
+    key, so a pull request that merged before the console's PR listing window still reads as
+    landed (ADR 0036: closing references are the authority, never branch names)."""
     number: int
-    pr_numbers: tuple[int, ...]
+    url: str
+    state: str
+    merged_at: str | None
+
+
+@dataclass(frozen=True)
+class HandoffLinkRow:
+    """A verified handoff Build Issue's native closing-PR references: every attempt GitHub
+    returned within the bound, plus its own total so a repeated hand-off says how many times
+    it was attempted."""
+    number: int
+    attempts: tuple[HandoffAttemptRow, ...]
     attempt_count: int
 
 
@@ -889,8 +910,8 @@ _MAPS_QUERY = (
     "number title url state "
     "assignees(first:1){totalCount} "
     "blockedBy(first:$edgesFirst){totalCount nodes{number state}} "
-    "blocking(first:$edgesFirst){nodes{"
-    "number title url body labels(first:20){nodes{name}} repository{nameWithOwner}"
+    "blocking(first:$edgesFirst){totalCount nodes{"
+    "id number title url body labels(first:20){nodes{name}} repository{nameWithOwner}"
     "}}"
     "}}"
     "}}"
@@ -900,6 +921,7 @@ _MAPS_QUERY = (
 def _handoff_candidate_row(node: dict, repo: str) -> HandoffCandidateRow:
     # Labels arrive as a connection here — this is the only read that asks for them that way.
     return HandoffCandidateRow(
+        id=node["id"],
         number=node["number"], title=node.get("title", "") or "", url=node.get("url", "") or "",
         body=node.get("body", "") or "", labels=_connected_labels_of(node),
         repo=((node.get("repository") or {}).get("nameWithOwner")) or repo)
@@ -911,9 +933,9 @@ def _map_child_row(node: dict, repo: str) -> MapChildRow:
     open_count = sum(1 for n in blocked_nodes if (n.get("state") or "").upper() != "CLOSED")
     closed_count = len(blocked_nodes) - open_count
     blocking = node.get("blocking") or {}
-    candidates = tuple(
-        _handoff_candidate_row(n, repo) for n in (blocking.get("nodes") or [])
-        if isinstance(n, dict) and isinstance(n.get("number"), int))
+    blocking_nodes = [n for n in (blocking.get("nodes") or [])
+                      if isinstance(n, dict) and isinstance(n.get("number"), int) and n.get("id")]
+    candidates = tuple(_handoff_candidate_row(n, repo) for n in blocking_nodes)
     return MapChildRow(
         number=node["number"], title=node.get("title", "") or "", url=node.get("url", "") or "",
         state=node.get("state", "") or "",
@@ -921,7 +943,9 @@ def _map_child_row(node: dict, repo: str) -> MapChildRow:
         blocked_by_open=open_count, blocked_by_closed=closed_count,
         blocked_by_total=blocked.get("totalCount") if isinstance(blocked.get("totalCount"), int)
         else len(blocked_nodes),
-        handoff_candidates=candidates)
+        handoff_candidates=candidates,
+        handoff_edges_total=blocking.get("totalCount")
+        if isinstance(blocking.get("totalCount"), int) else len(blocking_nodes))
 
 
 def _map_row(node: dict, repo: str) -> MapRow:
@@ -990,7 +1014,7 @@ def _handoff_links_argv(repo: str, numbers: list[int]) -> list[str]:
     owner, _, name = repo.partition("/")
     fields = "".join(
         f'i{n}:issue(number:{n}){{closedByPullRequestsReferences'
-        f'(first:5,includeClosedPrs:true){{totalCount nodes{{number}}}}}}'
+        f'(first:5,includeClosedPrs:true){{totalCount nodes{{number url state mergedAt}}}}}}'
         for n in _handoff_numbers(numbers))
     query = (f"query($owner:String!,$name:String!){{rateLimit{{cost remaining}} "
              f"repository(owner:$owner,name:$name){{{fields}}}}}")
@@ -1075,12 +1099,16 @@ def handoff_pr_links_read(repo: str, numbers: list[int]) -> HandoffLinksRead:
     for n in wanted:
         node = repo_node.get(f"i{n}") or {}
         refs = node.get("closedByPullRequestsReferences") or {}
-        pr_nodes = [p for p in (refs.get("nodes") or []) if isinstance(p, dict)]
-        pr_numbers = tuple(p["number"] for p in pr_nodes if isinstance(p.get("number"), int))
+        pr_nodes = [p for p in (refs.get("nodes") or [])
+                    if isinstance(p, dict) and isinstance(p.get("number"), int)]
+        attempts = tuple(
+            HandoffAttemptRow(number=p["number"], url=p.get("url", "") or "",
+                              state=p.get("state", "") or "", merged_at=p.get("mergedAt"))
+            for p in pr_nodes)
         out[n] = HandoffLinkRow(
-            number=n, pr_numbers=pr_numbers,
+            number=n, attempts=attempts,
             attempt_count=refs.get("totalCount") if isinstance(refs.get("totalCount"), int)
-            else len(pr_numbers))
+            else len(attempts))
     return HandoffLinksRead(links=out, cost=response.cost, remaining=response.remaining)
 
 

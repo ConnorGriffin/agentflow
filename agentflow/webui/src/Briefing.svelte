@@ -70,9 +70,11 @@
   <section aria-labelledby="maps-title">
     <div class="section-head">
       <h2 id="maps-title">Decision Maps</h2>
-      <span class="count">{briefing.maps.length} {briefing.maps.length === 1 ? 'active map' : 'active maps'}</span>
+      <!-- The daemon's own total, not the length of the bounded list — a truncated projection
+           still says how many active maps the fleet actually has. -->
+      <span class="count">{briefing.maps.total} {briefing.maps.total === 1 ? 'active map' : 'active maps'}</span>
     </div>
-    {#each briefing.maps as map}
+    {#each briefing.maps.rows as map}
       <article class="map">
         <div class="map-top">
           <div><h3>{map.title}</h3><p class="meta">{map.repository} · {map.progress}</p></div>
@@ -86,7 +88,9 @@
         <details>
           <summary>Supporting records</summary>
           <div class="support">
-            {#each map.support as s}<a href={s.url} target="_blank" rel="noreferrer">{s.label}</a>{/each}
+            <!-- Every supporting record opens its GitHub authority, so every one carries the
+                 locked surface's external-link affordance. -->
+            {#each map.support as s}<a href={s.url} target="_blank" rel="noreferrer">{s.label} ↗</a>{/each}
           </div>
         </details>
       </article>

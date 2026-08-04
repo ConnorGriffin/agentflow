@@ -15,25 +15,45 @@ from agentflow import cli, decision_maps, github
 
 
 def _child(number=1, *, state="OPEN", assigned=False, blocked_by_open=0, blocked_by_closed=0,
-          blocked_by_total=None, handoff_candidates=()) -> github.MapChildRow:
+          blocked_by_total=None, handoff_candidates=(),
+          handoff_edges_total=None) -> github.MapChildRow:
     total = blocked_by_total if blocked_by_total is not None else blocked_by_open + blocked_by_closed
     return github.MapChildRow(
         number=number, title=f"child {number}", url=f"https://github.com/o/r/issues/{number}",
         state=state, assigned=assigned, blocked_by_open=blocked_by_open,
         blocked_by_closed=blocked_by_closed, blocked_by_total=total,
-        handoff_candidates=tuple(handoff_candidates))
+        handoff_candidates=tuple(handoff_candidates),
+        handoff_edges_total=(len(handoff_candidates) if handoff_edges_total is None
+                             else handoff_edges_total))
 
 
-def _candidate(number=100, *, repo="o/r", labels=(), body="") -> github.HandoffCandidateRow:
+def _candidate(number=100, *, repo="o/r", labels=(), body="",
+               node_id=None) -> github.HandoffCandidateRow:
     return github.HandoffCandidateRow(
+        id=node_id or f"I_{repo}#{number}",
         number=number, title=f"handoff {number}", url=f"https://github.com/{repo}/issues/{number}",
         body=body, labels=frozenset(labels), repo=repo)
 
 
-def _map(number=179, *, body="", children=()) -> github.MapRow:
+def _map(number=179, *, body="", children=(), children_total=None) -> github.MapRow:
     return github.MapRow(number=number, title="Map: x", url=f"https://github.com/o/r/issues/{number}",
                          updated_at="2026-07-30T00:00:00Z", body=body, children=tuple(children),
-                         children_total=len(children))
+                         children_total=(len(children) if children_total is None
+                                         else children_total))
+
+
+def _links(*rows, error=None) -> github.HandoffLinksRead:
+    return github.HandoffLinksRead(links={r.number: r for r in rows}, cost=1, remaining=4990,
+                                   error=error)
+
+
+def _attempt(number, *, state="OPEN", merged_at=None) -> github.HandoffAttemptRow:
+    return github.HandoffAttemptRow(number=number, url=f"https://github.com/o/r/pull/{number}",
+                                    state=state, merged_at=merged_at)
+
+
+def _merged(number, at) -> github.HandoffAttemptRow:
+    return _attempt(number, state="MERGED", merged_at=at)
 
 
 # --- classify_child ---------------------------------------------------------------------
@@ -71,7 +91,7 @@ def test_handoff_verified_from_a_closed_terminal_child():
     terminal = _child(1, state="CLOSED", handoff_candidates=[candidate])
     handoffs, overflow = decision_maps.verified_handoffs(_map(179, children=[terminal]), repo="o/r")
     assert [h.number for h in handoffs] == [candidate.number]
-    assert overflow is False
+    assert overflow == 0
 
 
 def test_candidate_from_an_open_child_is_not_a_handoff():
@@ -108,14 +128,144 @@ def test_candidate_from_a_different_repository_is_rejected():
 def test_handoffs_are_deduplicated_and_bounded_with_overflow():
     marker = decision_maps.handoff_marker(179)
     candidates = [_candidate(number=100 + i, body=marker) for i in range(25)]
-    dup = _candidate(number=100, body=marker)  # same number, reached via a second closed child
+    dup = _candidate(number=100, body=marker)  # the same issue, via a second closed child
     terminal_a = _child(1, state="CLOSED", handoff_candidates=candidates)
     terminal_b = _child(2, state="CLOSED", handoff_candidates=[dup])
     handoffs, overflow = decision_maps.verified_handoffs(
         _map(179, children=[terminal_a, terminal_b]), repo="o/r", limit=20)
     assert len(handoffs) == 20
-    assert overflow is True
+    assert overflow == 5, "25 verified, 20 shown — the count that did not fit"
     assert len({h.number for h in handoffs}) == 20  # deduplicated, not 26 raw candidates
+
+
+def test_a_foreign_issue_sharing_a_number_never_displaces_the_real_handoff():
+    # Issue numbers are unique only inside one repository. A dependency edge can point at
+    # another repository's #505, and if that arrives first and deduplication keys on the
+    # number, the real handoff is silently dropped as a duplicate of something rejected.
+    marker = decision_maps.handoff_marker(179)
+    foreign = _candidate(number=505, repo="o/elsewhere", body=marker)
+    real = _candidate(number=505, repo="o/r", body=marker)
+    terminal = _child(1, state="CLOSED", handoff_candidates=[foreign, real])
+    handoffs, _ = decision_maps.verified_handoffs(_map(179, children=[terminal]), repo="o/r")
+    assert [h.url for h in handoffs] == ["https://github.com/o/r/issues/505"]
+
+
+def _edge_bounded_view(*children):
+    return decision_maps.map_view(_map(179, children=children), repo="o/r",
+                                  handoff_links=_links(), open_prs=[], merged_prs=[])
+
+
+def test_a_full_but_untruncated_edge_page_is_complete():
+    # Exactly the bound returned, and GitHub says that is all there is (ADR 0036's 10 edges).
+    terminal = _child(1, state="CLOSED", handoff_edges_total=10,
+                      handoff_candidates=[_candidate(number=200 + i) for i in range(10)])
+    assert _edge_bounded_view(terminal)["handoffs_incomplete"] is False
+
+
+def test_an_eleventh_edge_behind_the_bound_marks_handoffs_incomplete():
+    terminal = _child(1, state="CLOSED", handoff_edges_total=11,
+                      handoff_candidates=[_candidate(number=200 + i) for i in range(10)])
+    view = _edge_bounded_view(terminal)
+    assert view["handoffs_incomplete"] is True
+    assert view["frontier_incomplete"] is False, (
+        "a handoff that might be hiding says nothing about which decision is takeable")
+
+
+def test_a_truncated_edge_page_on_an_open_child_is_not_a_handoff_gap():
+    # Handoffs are only read off settled decisions, so an open child's truncated links hide
+    # nothing — and they say nothing about the frontier either, which reads the other edge.
+    open_child = _child(1, handoff_edges_total=99, handoff_candidates=[_candidate()])
+    assert _edge_bounded_view(open_child)["handoffs_incomplete"] is False
+
+
+# --- frontier_state ----------------------------------------------------------------------
+
+def test_an_unclaimed_unblocked_child_names_the_frontier():
+    assert decision_maps.frontier_state(["done", "frontier", "claimed"],
+                                        children_truncated=False) == "named"
+
+
+def test_every_child_settled_means_no_open_decision_remains():
+    assert decision_maps.frontier_state(["done", "done"], children_truncated=False) == "none_open"
+
+
+def test_open_children_with_nothing_takeable_are_blocked():
+    assert decision_maps.frontier_state(["done", "blocked", "claimed"],
+                                        children_truncated=False) == "blocked"
+
+
+def test_one_childs_unreadable_blockers_leaves_the_whole_map_unverified():
+    # Fails closed even beside a perfectly clean frontier child: the unread blockers could
+    # belong to a decision that outranks it.
+    assert decision_maps.frontier_state(["frontier", "unknown"],
+                                        children_truncated=False) == "unverified"
+
+
+def test_a_truncated_child_list_can_name_a_frontier_but_never_claim_none_is_open():
+    assert decision_maps.frontier_state(["frontier", "done"], children_truncated=True) == "named"
+    assert decision_maps.frontier_state(["done", "done"], children_truncated=True) == "unverified"
+    assert decision_maps.frontier_state(["blocked"], children_truncated=True) == "unverified"
+
+
+# --- landed evidence ---------------------------------------------------------------------
+
+def _evidence(*attempts, count=None, error=None, open_prs=(), merged_prs=()):
+    """One handoff's published landed evidence, taken the whole way through `map_view` so the
+    contract under test is the one the snapshot actually carries."""
+    marker = decision_maps.handoff_marker(179)
+    candidate = _candidate(number=343, body=marker)
+    terminal = _child(1, state="CLOSED", handoff_candidates=[candidate])
+    link = github.HandoffLinkRow(number=343, attempts=tuple(attempts),
+                                 attempt_count=count if count is not None else len(attempts))
+    view = decision_maps.map_view(
+        _map(179, children=[terminal]), repo="o/r",
+        handoff_links=_links(link, error=error) if not error else _links(error=error),
+        open_prs=list(open_prs), merged_prs=list(merged_prs))
+    return view["handoffs"][0]
+
+
+def test_the_newest_merged_closing_pull_request_is_the_landed_evidence():
+    # #343 was closed twice: an earlier merge and a later one. The later one is what landed.
+    handoff = _evidence(_merged(358, "2026-07-29T08:25:41Z"), _merged(361, "2026-07-30T17:12:56Z"))
+    assert handoff["pipeline"]["state"] == "merged"
+    assert handoff["pipeline"]["pr_number"] == 361
+    assert handoff["attempt_count"] == 2
+
+
+def test_a_merged_attempt_beats_a_newer_open_one():
+    handoff = _evidence(_merged(358, "2026-07-29T08:25:41Z"), _attempt(400))
+    assert handoff["pipeline"]["pr_number"] == 358
+
+
+def test_with_nothing_merged_the_newest_open_attempt_speaks():
+    handoff = _evidence(_attempt(358), _attempt(400))
+    assert (handoff["pipeline"]["state"], handoff["pipeline"]["pr_number"]) == ("pr_open", 400)
+
+
+def test_with_nothing_open_the_newest_attempt_still_says_something_was_tried():
+    handoff = _evidence(_attempt(358, state="CLOSED"), _attempt(400, state="CLOSED"))
+    assert (handoff["pipeline"]["state"], handoff["pipeline"]["pr_number"]) == ("pr_closed", 400)
+
+
+def test_a_landing_older_than_the_pull_request_window_still_reads_as_landed():
+    # The console's PR listings are bounded; the closing reference is not. Evidence that
+    # depended on the listing would silently downgrade an old landing to "still building".
+    handoff = _evidence(_merged(55, "2026-01-02T00:00:00Z"))
+    assert handoff["pipeline"]["state"] == "merged"
+    assert handoff["pipeline"]["pr_url"] == "https://github.com/o/r/pull/55"
+    assert handoff["pipeline"]["merge_commit"] is None, "no listing row, so no commit to claim"
+
+
+def test_a_handoff_with_no_closing_reference_is_still_building():
+    assert _evidence()["pipeline"]["state"] == "building"
+
+
+def test_a_failed_closing_reference_read_says_the_evidence_is_unavailable():
+    handoff = _evidence(_merged(361, "2026-07-30T17:12:56Z"),
+                        error="Something went wrong while executing your query.")
+    assert handoff["pipeline"]["state"] == "unavailable", (
+        "a read that failed knows nothing — least of all that the build is still running")
+    assert handoff["url"] == "https://github.com/o/r/issues/343", "the handoff stays reachable"
 
 
 # --- adr_links ------------------------------------------------------------------------
@@ -148,24 +298,83 @@ def test_no_decisions_section_yields_no_links():
 def test_map_view_reports_frontier_tickets_and_progress():
     children = [_child(1, state="CLOSED"), _child(2), _child(3, assigned=True)]
     view = decision_maps.map_view(
-        _map(179, children=children), repo="o/r", handoff_links={}, open_prs=[], merged_prs=[])
+        _map(179, children=children), repo="o/r", handoff_links=_links(), open_prs=[],
+        merged_prs=[])
     assert view["progress"] == {"total": 3, "closed": 1}
     assert [t["status"] for t in view["tickets"]] == ["done", "frontier", "claimed"]
+    assert view["frontier_state"] == "named"
     assert [f["number"] for f in view["frontier"]] == [2]
-    assert view["complete"] is True
+    assert view["frontier_incomplete"] is False
+    assert view["totals"]["children"] == {"shown": 3, "total": 3}
+
+
+def test_an_unverified_map_publishes_no_frontier_for_anyone_to_claim():
+    # One child's blockers were truncated; another is clean. The clean one is still listed in
+    # the outline, but the map hands the console nothing to present as the frontier.
+    children = [_child(1, blocked_by_closed=1, blocked_by_total=6), _child(2)]
+    view = decision_maps.map_view(
+        _map(179, children=children), repo="o/r", handoff_links=_links(), open_prs=[],
+        merged_prs=[])
+    assert view["frontier_state"] == "unverified"
+    assert view["frontier"] == []
+    assert view["frontier_incomplete"] is True
+    assert [t["status"] for t in view["tickets"]] == ["unknown", "frontier"]
+    assert {"label": "incomplete — blocker data on 1 decision",
+            "url": "https://github.com/o/r/issues/179"} in view["support"]
+
+
+def test_every_truncation_becomes_a_counted_link_onto_github():
+    marker = decision_maps.handoff_marker(179)
+    terminals = [
+        _child(i, state="CLOSED", handoff_edges_total=11,
+               handoff_candidates=[_candidate(number=400 + i, body=marker)])
+        for i in range(21)
+    ]
+    body = "## Decisions so far\n" + "\n".join(
+        f"- [ADR {i}](docs/adr/{i:04d}-x.md)" for i in range(14))
+    view = decision_maps.map_view(
+        _map(179, body=body, children=terminals, children_total=23), repo="o/r",
+        handoff_links=_links(), open_prs=[], merged_prs=[])
+    assert view["totals"] == {"children": {"shown": 21, "total": 23},
+                              "handoffs": {"shown": 20, "total": 21},
+                              "adrs": {"shown": 12, "total": 14}}
+    labels = [s["label"] for s in view["support"]]
+    assert "incomplete — 2 more decisions on GitHub" in labels
+    assert "incomplete — handoff links on 21 settled decisions" in labels
+    assert "1 more handoff on GitHub" in labels
+    assert "2 more decision records on GitHub" in labels
+    assert all(s["url"].startswith("https://github.com/") for s in view["support"]), (
+        "an overflow the operator cannot open is not an explicit overflow")
+    assert view["handoffs_incomplete"] is True
+
+
+def test_a_relative_adr_link_is_resolved_against_the_repository():
+    body = "## Decisions so far\n- [ADR 36](docs/adr/0036-bounded.md)\n"
+    view = decision_maps.map_view(_map(179, body=body), repo="o/r", handoff_links=_links(),
+                                  open_prs=[], merged_prs=[])
+    assert view["support"][0] == {
+        "label": "ADR 36", "url": "https://github.com/o/r/blob/HEAD/docs/adr/0036-bounded.md"}
+
+
+def test_an_absolute_adr_link_is_left_exactly_as_the_map_wrote_it():
+    url = "https://github.com/o/r/blob/main/docs/adr/0036-bounded.md#decision"
+    view = decision_maps.map_view(_map(179, body=f"## Decisions so far\n- [ADR 36]({url})\n"),
+                                  repo="o/r", handoff_links=_links(), open_prs=[], merged_prs=[])
+    assert view["support"][0]["url"] == url
 
 
 def test_map_view_joins_handoff_pipeline_evidence():
     marker = decision_maps.handoff_marker(179)
     candidate = _candidate(number=200, body=marker)
     terminal = _child(1, state="CLOSED", handoff_candidates=[candidate])
-    link = github.HandoffLinkRow(number=200, pr_numbers=(55,), attempt_count=1)
+    link = github.HandoffLinkRow(
+        number=200, attempts=(_merged(55, "2026-07-30T00:00:00Z"),), attempt_count=1)
     merged_pr = github.PipelinePrRow(
         number=55, title="Build #200", head_ref_name="agentflow/claude/issue-200-x",
         url="https://github.com/o/r/pull/55", merged_at="2026-07-30T00:00:00Z",
         merge_commit_oid="deadbeef", review_decision="APPROVED", ci_rollup=[])
     view = decision_maps.map_view(
-        _map(179, children=[terminal]), repo="o/r", handoff_links={200: link},
+        _map(179, children=[terminal]), repo="o/r", handoff_links=_links(link),
         open_prs=[], merged_prs=[merged_pr])
     assert view["handoffs"][0]["pipeline"] == {
         "state": "merged", "pr_number": 55, "pr_url": "https://github.com/o/r/pull/55",
@@ -176,7 +385,7 @@ def test_map_view_joins_handoff_pipeline_evidence():
 def test_maps_component_carries_githubs_total_for_overflow():
     read = github.MapsRead(maps=(_map(1),), total_count=7, cost=3, remaining=4990)
     component = decision_maps.maps_component(
-        read, repo="o/r", handoff_links={}, open_prs=[], merged_prs=[])
+        read, repo="o/r", handoff_links=_links(), open_prs=[], merged_prs=[])
     assert component["active_total"] == 7
     assert len(component["active"]) == 1
 
@@ -191,14 +400,14 @@ def test_maps_component_carries_githubs_total_for_overflow():
 MARKER = decision_maps.handoff_marker(179)
 
 _CANDIDATE_BUILD = {
-    "number": 505, "title": "Make the map reads trustworthy",
+    "id": "I_kwDOB505", "number": 505, "title": "Make the map reads trustworthy",
     "url": "https://github.com/o/r/issues/505",
     "body": f"Some brief text.\n\n{MARKER}\n",
     "labels": {"nodes": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}]},
     "repository": {"nameWithOwner": "o/r"},
 }
 _CANDIDATE_MAP_ARTIFACT = {
-    "number": 374, "title": "Wayfinder research on the same map",
+    "id": "I_kwDOB374", "number": 374, "title": "Wayfinder research on the same map",
     "url": "https://github.com/o/r/issues/374",
     "body": f"Grounding for the map.\n\n{MARKER}\n",
     "labels": {"nodes": [{"name": "wayfinder:research"}]},
@@ -223,12 +432,13 @@ _MAPS_RESPONSE = {
                          "assignees": {"totalCount": 0},
                          "blockedBy": {"totalCount": 1,
                                        "nodes": [{"number": 183, "state": "CLOSED"}]},
-                         "blocking": {"nodes": [_CANDIDATE_BUILD, _CANDIDATE_MAP_ARTIFACT]}},
+                         "blocking": {"totalCount": 2,
+                                      "nodes": [_CANDIDATE_BUILD, _CANDIDATE_MAP_ARTIFACT]}},
                         {"number": 405, "title": "The next decision",
                          "url": "https://github.com/o/r/issues/405", "state": "OPEN",
                          "assignees": {"totalCount": 0},
                          "blockedBy": {"totalCount": 0, "nodes": []},
-                         "blocking": {"nodes": []}},
+                         "blocking": {"totalCount": 0, "nodes": []}},
                     ],
                 },
             }],
@@ -240,7 +450,11 @@ _LINKS_RESPONSE = {
     "data": {
         "rateLimit": {"cost": 1, "remaining": 4989},
         "repository": {"i505": {"closedByPullRequestsReferences": {
-            "totalCount": 2, "nodes": [{"number": 358}, {"number": 361}]}}},
+            "totalCount": 2,
+            "nodes": [{"number": 358, "url": "https://github.com/o/r/pull/358",
+                       "state": "MERGED", "mergedAt": "2026-07-29T08:25:41Z"},
+                      {"number": 361, "url": "https://github.com/o/r/pull/361",
+                       "state": "MERGED", "mergedAt": "2026-07-30T17:12:56Z"}]}}},
     },
 }
 
@@ -300,7 +514,7 @@ def test_a_map_artifact_never_reaches_the_verified_handoffs_from_the_wire(monkey
     read = github.decision_maps("o/r")
     handoffs, overflow = decision_maps.verified_handoffs(read.maps[0], repo="o/r")
     assert [h.number for h in handoffs] == [505]
-    assert overflow is False
+    assert overflow == 0
 
 
 def test_a_live_shaped_response_types_the_whole_map(monkeypatch):
@@ -347,11 +561,22 @@ def test_a_silent_failure_still_carries_a_reason(monkeypatch):
 def test_handoff_links_type_the_closing_pull_requests_from_the_wire(monkeypatch):
     calls = _wire(monkeypatch)
     read = github.handoff_pr_links_read("o/r", [505])
-    assert read.links == {505: github.HandoffLinkRow(number=505, pr_numbers=(358, 361),
-                                                     attempt_count=2)}
+    assert read.links == {505: github.HandoffLinkRow(
+        number=505, attempt_count=2,
+        attempts=(github.HandoffAttemptRow(number=358, url="https://github.com/o/r/pull/358",
+                                           state="MERGED", merged_at="2026-07-29T08:25:41Z"),
+                  github.HandoffAttemptRow(number=361, url="https://github.com/o/r/pull/361",
+                                           state="MERGED", merged_at="2026-07-30T17:12:56Z")))}
     assert read.error is None
     query = next(a for a in calls[0] if a.startswith("query="))
     assert "i505:issue(number:505)" in query
+
+
+def test_the_wire_carries_the_node_ids_deduplication_depends_on(monkeypatch):
+    _wire(monkeypatch)
+    read = github.decision_maps("o/r")
+    candidates = read.maps[0].children[0].handoff_candidates
+    assert [c.id for c in candidates] == ["I_kwDOB505", "I_kwDOB374"]
 
 
 def test_a_failed_handoff_link_read_is_unknown(monkeypatch):

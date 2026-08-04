@@ -41,13 +41,14 @@ def _handed_off_map(number=1, *, handoff=900, repo="o/agentflow") -> github.MapR
     """A map whose closed decision child handed off a Build Issue — the shape that makes the
     daemon issue its third query, the closing-PR join."""
     candidate = github.HandoffCandidateRow(
+        id=f"I_{repo}#{handoff}",
         number=handoff, title="Build it", url=f"https://github.com/{repo}/issues/{handoff}",
         body=f"Wayfinder handoff: #{number}", labels=frozenset(), repo=repo)
     child = github.MapChildRow(
         number=number * 100, title="a settled decision",
         url=f"https://github.com/{repo}/issues/{number * 100}", state="CLOSED", assigned=False,
         blocked_by_open=0, blocked_by_closed=0, blocked_by_total=0,
-        handoff_candidates=(candidate,))
+        handoff_candidates=(candidate,), handoff_edges_total=1)
     return github.MapRow(number=number, title=f"Map {number}",
                          url=f"https://github.com/{repo}/issues/{number}",
                          updated_at="2026-08-03T00:00:00Z", body="", children=(child,),

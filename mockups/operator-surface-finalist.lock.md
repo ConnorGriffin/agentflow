@@ -117,6 +117,10 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
     `map-frontier-matrix` (one render exercising all three term-18 non-named
     states plus a named frontier) and `map-overflow-evidence` (overflow counts,
     attempt count > 1, and the `landed evidence unavailable` case in one render).
+    Both are declared in this surface's capture matrix,
+    `mockups/operator-surface.screenshots.json`, whose payloads are authored from
+    these terms rather than derived from the build — that is what makes the
+    mock-vs-build pair a check on the wording and not just on the pixels.
 
 ## Fixture obligations
 

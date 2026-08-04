@@ -35,8 +35,9 @@ const SNAP = {
         active_total: 1,
         active: [{
           number: 179, title: 'Map: operator briefing', url: 'https://github.com/o/r/issues/179',
-          updated_at: '2026-07-30T00:00:00Z', complete: true,
+          updated_at: '2026-07-30T00:00:00Z',
           progress: { total: 2, closed: 1 },
+          frontier_state: 'named', frontier_incomplete: false, handoffs_incomplete: false,
           frontier: [{ number: 183, title: 'Lock the visual spec', url: 'https://github.com/o/r/issues/183' }],
           tickets: [
             { number: 180, title: 'Bound the projection', url: 'https://github.com/o/r/issues/180', status: 'done' },
@@ -45,9 +46,10 @@ const SNAP = {
           handoffs: [{ number: 372, title: 'Ship the typical state', url: 'https://github.com/o/r/issues/372',
                       pipeline: { state: 'pr_open', pr_number: 400, pr_url: 'https://github.com/o/r/pull/400' },
                       attempt_count: 1 }],
-          handoffs_overflow: false,
-          adrs: [{ label: 'ADR 36', url: 'docs/adr/0036-bounded-repository-map-projection.md' }],
-          adrs_overflow: 0,
+          totals: { children: { shown: 2, total: 2 }, handoffs: { shown: 1, total: 1 },
+                   adrs: { shown: 1, total: 1 } },
+          support: [{ label: 'ADR 36',
+                     url: 'https://github.com/o/r/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md' }],
         }],
       },
     },
@@ -128,23 +130,66 @@ describe('deriveMaps', () => {
   const maps = deriveMaps(SNAP);
 
   it('flattens the one active map with its frontier, tickets, and support links', () => {
-    expect(maps).toHaveLength(1);
-    expect(maps[0].repository).toBe('r');
-    expect(maps[0].progress).toBe('1 of 2 decided');
-    expect(maps[0].frontier).toBe('#183 Lock the visual spec');
-    expect(maps[0].tickets).toEqual([
+    expect(maps.rows).toHaveLength(1);
+    expect(maps.rows[0].repository).toBe('r');
+    expect(maps.rows[0].progress).toBe('1 of 2 decided');
+    expect(maps.rows[0].frontier).toBe('#183 Lock the visual spec');
+    expect(maps.rows[0].tickets).toEqual([
       '#180 Bound the projection — done',
       '#183 Lock the visual spec — frontier',
     ]);
-    expect(maps[0].support).toContainEqual(
-      { url: 'docs/adr/0036-bounded-repository-map-projection.md', label: 'ADR 36' });
-    expect(maps[0].support.some((s) => s.label.includes('PR #400 open'))).toBe(true);
+    expect(maps.rows[0].support).toContainEqual({ label: 'ADR 36',
+      url: 'https://github.com/o/r/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md' });
+    expect(maps.rows[0].support.some((s) => s.label.includes('PR #400 open'))).toBe(true);
   });
 
   it('never claims a verified frontier when the repository read is not fresh', () => {
     const stale = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
       github: { status: 'stale' } }] };
-    expect(deriveMaps(stale)[0].frontier).toBe('Not verified');
+    expect(deriveMaps(stale).rows[0].frontier).toBe('Not verified');
+  });
+
+  /* The four frontier words, and no fifth. Each comes from the daemon's own classification —
+     the browser picks the wording, never the verdict. */
+  it.each([
+    ['none_open', 'No open decision remains'],
+    ['blocked', 'blocked'],
+    ['unverified', 'Not verified'],
+  ])('reads a %s frontier as "%s"', (state, copy) => {
+    const snap = { ...SNAP, repositories: [{ ...SNAP.repositories[0], maps: {
+      active_total: 1,
+      active: [{ ...SNAP.repositories[0].maps.active[0], frontier_state: state, frontier: [] }] } }] };
+    expect(deriveMaps(snap).rows[0].frontier).toBe(copy);
+  });
+
+  it('reports the daemon total for active maps, not the length of the bounded list', () => {
+    const truncated = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
+      maps: { ...SNAP.repositories[0].maps, active_total: 7 } }] };
+    expect(deriveMaps(truncated).total).toBe(7);
+    expect(deriveMaps(truncated).rows).toHaveLength(1);
+  });
+
+  it('marks a map whose data was cut short as incomplete', () => {
+    const cut = { ...SNAP, repositories: [{ ...SNAP.repositories[0], maps: {
+      active_total: 1,
+      active: [{ ...SNAP.repositories[0].maps.active[0], frontier_incomplete: true }] } }] };
+    expect(deriveMaps(cut).rows[0].status).toBe('incomplete');
+    expect(maps.rows[0].status).toBe('bounded');
+  });
+
+  /* Landed evidence wording. A read that failed says so; an unrepeated handoff shows no
+     attempt count, because a count of one is noise. */
+  it.each([
+    [{ state: 'merged', pr_number: 361 }, 1, '#372 Ship the typical state — PR #361 merged'],
+    [{ state: 'merged', pr_number: 361 }, 2, '#372 Ship the typical state — PR #361 merged · 2 attempts'],
+    [{ state: 'building' }, 0, '#372 Ship the typical state — building'],
+    [{ state: 'unavailable' }, 0, '#372 Ship the typical state — landed evidence unavailable'],
+  ])('labels %o as its own evidence', (pipeline, attempt_count, label) => {
+    const handoff = { ...SNAP.repositories[0].maps.active[0].handoffs[0], pipeline, attempt_count };
+    const snap = { ...SNAP, repositories: [{ ...SNAP.repositories[0], maps: {
+      active_total: 1,
+      active: [{ ...SNAP.repositories[0].maps.active[0], handoffs: [handoff] }] } }] };
+    expect(deriveMaps(snap).rows[0].support.map((s) => s.label)).toContain(label);
   });
 });
 
@@ -256,7 +301,7 @@ describe('deriveBriefing — the whole shape', () => {
     const b = deriveBriefing(SNAP);
     expect(Object.keys(b).sort()).toEqual(
       ['attention', 'capacity', 'fleet', 'freshness', 'maps'].sort());
-    expect(b.maps).toHaveLength(1);
+    expect(b.maps.rows).toHaveLength(1);
     expect(b.attention.rows).toHaveLength(2);
     expect(b.attention.total).toBe(2);
   });
