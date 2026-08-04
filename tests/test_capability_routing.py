@@ -143,6 +143,65 @@ def test_revise_and_re_review_keep_the_parent_and_original_tier(make_coord):
     assert coord.stage_record(re_review_record).model == "luna"
 
 
+def test_rate_card_estimates_from_the_price_snapshot_and_resolves_both_name_forms():
+    # Terra: $2.50/$15 per million input/output (provenance.price_snapshot).
+    estimate = routing.estimate_cost_usd("terra", input_tokens=300, output_tokens=60)
+    assert estimate == pytest.approx(300 * 2.5 / 1_000_000 + 60 * 15 / 1_000_000)
+    # The provider/CLI id resolves to the same card entry as the internal name.
+    assert routing.estimate_cost_usd("gpt-5.6-terra", input_tokens=300, output_tokens=60) \
+        == estimate
+    # Codex reports reasoning tokens as a subset of the blended output total, not additive —
+    # with output_tokens present, adding reasoning tokens must not change the estimate.
+    with_reasoning = routing.estimate_cost_usd(
+        "terra", input_tokens=300, output_tokens=60, reasoning_output_tokens=40)
+    assert with_reasoning == pytest.approx(estimate)
+    # With no output_tokens fact at all, reasoning_output_tokens is the fallback output figure.
+    reasoning_only = routing.estimate_cost_usd(
+        "terra", input_tokens=300, reasoning_output_tokens=40)
+    assert reasoning_only == pytest.approx(300 * 2.5 / 1_000_000 + 40 * 15 / 1_000_000)
+
+
+def test_rate_card_never_guesses_an_unknown_model_or_a_fully_absent_fact():
+    assert routing.estimate_cost_usd("nonexistent-model", input_tokens=100) is None
+    assert routing.provider_for("nonexistent-model") is None
+    # fable (session-lead) has no rate-card entry — no price snapshot names one.
+    assert routing.estimate_cost_usd("fable", input_tokens=100) is None
+    # No token fact at all is not the same as zero tokens: it must not be guessed either.
+    assert routing.estimate_cost_usd("terra") is None
+
+
+def test_provider_for_resolves_internal_and_cli_names():
+    assert routing.provider_for("terra") == "codex"
+    assert routing.provider_for("gpt-5.6-terra") == "codex"
+    assert routing.provider_for("opus") == "claude"
+
+
+def test_rate_card_rejects_a_price_for_an_unknown_model(tmp_path):
+    import agentflow.routing as routing_module
+    from agentflow.routing import CapabilityRouting, RoutingConfigError
+
+    source = Path(routing_module.__file__).with_name("model-routing.json")
+    data = json.loads(source.read_text())
+    data["rate_card"]["ghost"] = {"input": 1, "output": 2}
+    bad = tmp_path / "routing.json"
+    bad.write_text(json.dumps(data))
+    with pytest.raises(RoutingConfigError, match="unknown model"):
+        CapabilityRouting.from_path(bad)
+
+
+def test_rate_card_rejects_a_malformed_rate(tmp_path):
+    import agentflow.routing as routing_module
+    from agentflow.routing import CapabilityRouting, RoutingConfigError
+
+    source = Path(routing_module.__file__).with_name("model-routing.json")
+    data = json.loads(source.read_text())
+    data["rate_card"]["terra"] = {"input": "cheap", "output": 15}
+    bad = tmp_path / "routing.json"
+    bad.write_text(json.dumps(data))
+    with pytest.raises(RoutingConfigError, match="malformed rate"):
+        CapabilityRouting.from_path(bad)
+
+
 def test_loader_rejects_unknown_models(tmp_path):
     import agentflow.routing as routing_module
 

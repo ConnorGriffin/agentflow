@@ -226,6 +226,131 @@ def codex_usage(events) -> AttemptUsage:
         unrecognized=tuple(sorted(extra)))
 
 
+def _codex_sessions_root() -> Path:
+    """Where Codex rollout ``.jsonl`` files live — overridable so a test never touches a real
+    home directory (``AGENTFLOW_CODEX_SESSIONS``, issue #516 slice 2)."""
+    override = os.environ.get("AGENTFLOW_CODEX_SESSIONS")
+    return Path(override).expanduser() if override else Path.home() / ".codex" / "sessions"
+
+
+def _rollout_records(path: Path) -> list[dict]:
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    records = []
+    for line in lines:
+        try:
+            record = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(record, dict):
+            records.append(record)
+    return records
+
+
+def _rollout_cwd(records: list[dict]) -> str | None:
+    for record in records:
+        if record.get("type") == "session_meta":
+            payload = record.get("payload")
+            if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
+                return payload["cwd"]
+    return None
+
+
+def _rollout_worker_usage(records: list[dict]) -> tuple[str, dict] | None:
+    """The last ``token_count`` event's cumulative totals and the model that ran, from one
+    Codex rollout. ``None`` when the rollout carries no token fact at all."""
+    last_totals: dict | None = None
+    model: str | None = None
+    session_meta_model: str | None = None
+    for record in records:
+        rtype = record.get("type")
+        payload = record.get("payload")
+        if rtype == "event_msg" and isinstance(payload, dict) and payload.get("type") == "token_count":
+            info = payload.get("info")
+            totals = info.get("total_token_usage") if isinstance(info, dict) else None
+            if isinstance(totals, dict):
+                last_totals = totals
+        elif rtype == "turn_context" and isinstance(payload, dict) \
+                and isinstance(payload.get("model"), str):
+            model = payload["model"]              # the latest one wins
+        elif rtype == "session_meta" and isinstance(payload, dict) \
+                and isinstance(payload.get("model"), str) and session_meta_model is None:
+            session_meta_model = payload["model"]
+    if last_totals is None:
+        return None
+    return (model or session_meta_model or "codex"), last_totals
+
+
+# The mtime slack around an attempt's `started_at` a candidate rollout is admitted within — a
+# worker's rollout file can be flushed a little after the turn that produced it started.
+_ROLLOUT_MTIME_SLACK_SECONDS = 300
+
+
+def lead_codex_worker_usage(record, *, sessions_root: Path | str | None = None) -> tuple:
+    """Codex worker spend a lead (Claude ``fable``) build/revise attempt delegated to
+    ``codex exec --cd <worktree>``, observed from the workers' own rollout files rather than
+    self-reported by the lead (frozen decision 2, issue #516 slice 2).
+
+    Every rollout under the sessions root whose ``session_meta.cwd`` realpath-matches the
+    record's workspace, and whose mtime is at/after the attempt's ``started_at`` minus a small
+    slack, contributes its last cumulative ``token_count`` totals, summed per attributed model
+    (falling back to the literal ``"codex"`` identity when no model fact is found). Failure
+    anywhere — an unreadable sessions root, a malformed rollout, a bad path — degrades to no
+    worker entries; this must never fail the caller's observation.
+    """
+    try:
+        if record.stage not in {"build", "revise"} or record.model != "fable" or not record.source:
+            return ()
+        root = Path(sessions_root) if sessions_root is not None else _codex_sessions_root()
+        workspace = os.path.realpath(record.source)
+        cutoff = (record.started_at - _ROLLOUT_MTIME_SLACK_SECONDS) if record.started_at else None
+        try:
+            paths = list(root.rglob("*.jsonl"))
+        except OSError:
+            return ()
+        totals_by_model: dict[str, dict[str, int]] = {}
+        for path in paths:
+            try:
+                if cutoff is not None and path.stat().st_mtime < cutoff:
+                    continue
+            except OSError:
+                continue
+            records = _rollout_records(path)
+            cwd = _rollout_cwd(records)
+            if cwd is None:
+                continue
+            try:
+                if os.path.realpath(cwd) != workspace:
+                    continue
+            except OSError:
+                continue
+            found = _rollout_worker_usage(records)
+            if found is None:
+                continue
+            model, usage = found
+            acc = totals_by_model.setdefault(model, {
+                "input_tokens": 0, "cached_input_tokens": 0,
+                "output_tokens": 0, "reasoning_output_tokens": 0})
+            gross_input = _int(usage.get("input_tokens")) or 0
+            cached = _int(usage.get("cached_input_tokens")) or 0
+            acc["input_tokens"] += max(0, gross_input - cached)   # net cached out, like codex_usage
+            acc["cached_input_tokens"] += cached
+            acc["output_tokens"] += _int(usage.get("output_tokens")) or 0
+            acc["reasoning_output_tokens"] += _int(usage.get("reasoning_output_tokens")) or 0
+        return tuple(
+            ModelCost(model=name, cost_usd=None,
+                      input_tokens=totals["input_tokens"] or None,
+                      cached_input_tokens=totals["cached_input_tokens"] or None,
+                      output_tokens=totals["output_tokens"] or None,
+                      reasoning_output_tokens=totals["reasoning_output_tokens"] or None)
+            for name, totals in totals_by_model.items())
+    except Exception:
+        # A worker-capture scan must never fail the observation it rides on — degrade quietly.
+        return ()
+
+
 @dataclass(frozen=True)
 class AttemptTelemetry:
     """One ended attempt's durable telemetry entry, keyed by its launch token.
@@ -395,13 +520,23 @@ class TelemetryProjection:
 
 @dataclass(frozen=True)
 class ModelSpendRow:
-    """Spend attributed to one model for one stage inside a requested date window."""
+    """Spend attributed to one model for one stage inside a requested date window.
+
+    ``estimated`` is true when any dollar figure folded into ``cost_usd`` was priced from the
+    routing rate card rather than provider-billed — a total mixing billed and estimated
+    dollars is itself estimated (issue #516). ``delegate_uncaptured_attempts`` counts, among
+    the attempts aggregated into this row, how many are lead-run build/revise attempts whose
+    delegated Codex worker spend has not been captured into their usage — the row is real but
+    known-incomplete, so an aggregate reading it never silently treats it as fully measured.
+    """
 
     stage: str
     model: str
     attempts: int
     tokens: int | None
     cost_usd: float | None
+    estimated: bool = False
+    delegate_uncaptured_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -412,12 +547,25 @@ class SpendReport:
 
 
 def format_spend_report(report: SpendReport) -> str:
-    """Render the small operator report without hiding unavailable token or dollar facts."""
-    lines = ["stage\tmodel\tattempts\ttokens\tdollars"]
+    """Render the small operator report without hiding unavailable token or dollar facts.
+
+    An estimated dollar figure renders flagged (``~1.234567 est``) rather than indistinguishably
+    from a provider-billed one; a row with no dollar fact at all renders ``—``, never
+    ``0.000000`` — unknown is never zero. A row aggregating lead-run attempts whose delegate
+    spend was not captured carries a trailing note so the gap is visible, not silent.
+    """
+    lines = ["stage\tmodel\tattempts\ttokens\tdollars\tnote"]
     for row in report.rows:
         tokens = str(row.tokens) if row.tokens is not None else "—"
-        dollars = f"{row.cost_usd:.6f}" if row.cost_usd is not None else "—"
-        lines.append(f"{row.stage}\t{row.model}\t{row.attempts}\t{tokens}\t{dollars}")
+        if row.cost_usd is None:
+            dollars = "—"
+        elif row.estimated:
+            dollars = f"~{row.cost_usd:.6f} est"
+        else:
+            dollars = f"{row.cost_usd:.6f}"
+        note = (f"delegate spend not counted ({row.delegate_uncaptured_attempts})"
+               if row.delegate_uncaptured_attempts else "")
+        lines.append(f"{row.stage}\t{row.model}\t{row.attempts}\t{tokens}\t{dollars}\t{note}")
     return "\n".join(lines)
 
 
@@ -458,6 +606,41 @@ def _usage_token_total(usage: AttemptUsage) -> int | None:
         if any(value is not None for value in values) else None
 
 
+_LEAD_LED_STAGES = frozenset({"build", "revise"})
+
+
+def _codex_priced(model: str) -> bool:
+    """Whether ``model`` names a Codex worker's spend: a routing-known Codex model, or the
+    ``"codex"`` fallback identity a merged worker entry carries when no model fact was found
+    (issue #516 slice 2). Never a guess — only these two typed shapes count."""
+    if model == "codex":
+        return True
+    from agentflow.routing import routing
+    return routing.provider_for(model) == "codex"
+
+
+def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
+    """Whether ``entry`` is a lead-run build/revise attempt whose delegated Codex worker spend
+    has not been merged into its usage yet (issue #516, frozen decision 1). Once a worker-capture
+    merge (slice 2) adds a Codex-priced model-cost entry, this returns false for that attempt."""
+    if entry.stage not in _LEAD_LED_STAGES or entry.model != "fable":
+        return False
+    return not any(_codex_priced(cost.model) for cost in entry.usage.model_costs)
+
+
+def _priced_dollars(model: str, tokens_in, tokens_out, tokens_reasoning, billed):
+    """The dollar figure and whether it is provider-billed, estimated from the rate card, or
+    unknown. Billed always wins; an estimate is only produced when a real token fact exists and
+    the model prices from the routing table's rate card — never a guess past that."""
+    if billed is not None:
+        return billed, False
+    from agentflow.routing import routing
+    estimate = routing.estimate_cost_usd(
+        model, input_tokens=tokens_in, output_tokens=tokens_out,
+        reasoning_output_tokens=tokens_reasoning)
+    return (estimate, True) if estimate is not None else (None, False)
+
+
 def spend_report(store_path: Path | str, *, start: int | float | date | datetime,
                  end: int | float | date | datetime) -> SpendReport:
     """Group persisted spend by stage and attributed model over ``[start, end)``.
@@ -465,23 +648,35 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
     Provider model attribution wins over the dispatched record model. An attempt with no
     per-model attribution (including Codex) falls back to its reported model and then its
     dispatched model, keeping token-only rows even when no dollar equivalent exists.
+
+    A row whose dollars are not provider-billed is priced at report time from the routing rate
+    card (fresh input + output/reasoning-output tokens; cached reads excluded) and flagged
+    ``estimated`` — a total mixing billed and estimated figures is itself estimated. Stored
+    telemetry entries are only read here, never rewritten (frozen decision 4).
     """
     start_epoch, end_epoch = _window_epoch(start), _window_epoch(end)
     if end_epoch <= start_epoch:
         raise ValueError("spend report end must be after start")
-    # value = [attempts, tokens, token_seen, dollars, dollar_seen]
+    # value = [attempts, tokens, token_seen, dollars, dollar_seen, estimated_seen, uncounted]
     cells: dict[tuple[str, str], list[int | float | bool]] = {}
     for entry in read_attempts(store_path):
         if not start_epoch <= entry.started_at < end_epoch:
             continue
         attributed = entry.usage.model_costs
-        rows = (
-            tuple((cost.model, cost.tokens, cost.cost_usd) for cost in attributed)
-            if attributed else ((entry.usage.model or entry.model,
-                                 _usage_token_total(entry.usage), entry.usage.cost_usd),)
-        )
-        for model, tokens, dollars in rows:
-            cell = cells.setdefault((entry.stage, model), [0, 0, False, 0.0, False])
+        uncounted = _delegate_spend_uncaptured(entry)
+        if attributed:
+            rows = tuple(
+                (cost.model, cost.tokens,
+                 _priced_dollars(cost.model, cost.input_tokens, cost.output_tokens,
+                                 cost.reasoning_output_tokens, cost.cost_usd))
+                for cost in attributed)
+        else:
+            model = entry.usage.model or entry.model
+            rows = ((model, _usage_token_total(entry.usage),
+                     _priced_dollars(model, entry.usage.input_tokens, entry.usage.output_tokens,
+                                     entry.usage.reasoning_output_tokens, entry.usage.cost_usd)),)
+        for model, tokens, (dollars, estimated) in rows:
+            cell = cells.setdefault((entry.stage, model), [0, 0, False, 0.0, False, False, 0])
             cell[0] += 1
             if tokens is not None:
                 cell[1] += tokens
@@ -489,13 +684,19 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
             if dollars is not None:
                 cell[3] += dollars
                 cell[4] = True
+                if estimated:
+                    cell[5] = True
+            if uncounted:
+                cell[6] += 1
     return SpendReport(
         start_epoch,
         end_epoch,
         tuple(
             ModelSpendRow(stage, model, int(values[0]),
                           int(values[1]) if values[2] else None,
-                          float(values[3]) if values[4] else None)
+                          float(values[3]) if values[4] else None,
+                          estimated=bool(values[5]),
+                          delegate_uncaptured_attempts=int(values[6]))
             for (stage, model), values in sorted(cells.items())
         ),
     )
