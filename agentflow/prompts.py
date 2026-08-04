@@ -25,6 +25,11 @@ UI_GAP_REASON = ("touches a user-facing surface but has no before/after screensh
                  "charter requires visual proof it matches the locked design, so it can't "
                  "merge unseen (ADR 0018)")
 
+# The one PR-body sentence BUILD and REVISE genuinely share (audit 1.4). RESPOND scopes a
+# reply comment, not a PR body, and is deliberately not folded in here.
+PLAIN_LANGUAGE_RULE = ("Keep the PR body in plain app language for the human who merges — no "
+                       "file/function/test names or CSS/API specifics.")
+
 
 BUILD_PROMPT = """Implement {repo} issue #{n}: {title}
 
@@ -36,7 +41,9 @@ issue or under-invest a high-effort one.
 You are in a fresh worktree on a new branch off origin/main. Implement the change and
 commit your work. Cover the new behavior with a test that **exercises it through the
 public interface** — and, where it fits, one that **failed first for the right reason**
-(the charter test standard) — then make the suite green.
+(the charter test standard) — then make the suite green. Run the `/tdd` skill for the
+test cycle — it owns the vertical-slice cadence and the public-interface test rules; the
+sentence above is its summary, not its replacement.
 
 Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
 `git commit -s` for new commits and `git commit --amend -s` for amendments. Each
@@ -45,7 +52,8 @@ the existing work and history first; repair an unsigned existing commit with an 
 where appropriate, never a separate sign-off-only or duplicate-work commit.
 
 Before opening the PR, check any module you introduced against the charter's deletion
-test and interface-depth rule, and deepen or inline whatever fails.
+test and interface-depth rule, and deepen or inline whatever fails. Run `/codebase-design`
+for the vocabulary and the depth checks.
 
 Before opening the PR, `git fetch origin` and rebase once onto `origin/main`, then
 rerun the tests. If the rebase conflicts (or tests fail post-rebase for a reason not
@@ -53,8 +61,8 @@ your own), stop and post a comment prefixed `INTEGRATION-COLLISION:` instead of
 forcing it. Otherwise push the branch and open a PR with `Closes #{n}` in the body.
 
 Write the PR body for the human who merges it — plain language: what changed, why, and
-what to check, in the app's own domain terms. No jargon: no file/function/test names or
-CSS/API specifics (ADR 0018). End it with `Review depth: Focused|Targeted|Full — <one short
+what to check, in the app's own domain terms (ADR 0018). """ + PLAIN_LANGUAGE_RULE + """ End it
+with `Review depth: Focused|Targeted|Full — <one short
 reason>`: Focused for exact housekeeping/evidence, Targeted for one contained behavior or
 journey, Full for connected behavior, sensitive information, permissions, safety, or competing
 product decisions. Small safety/permission changes are Full. If the change touches a user-facing surface (this repo's are:
@@ -62,7 +70,10 @@ product decisions. Small safety/permission changes are Full. If the change touch
 both light and dark themes where the app has them. If this brief carries a `## LOCKED visual
 contract`, that contract is the spec you build and screenshot against: satisfy every visual rule
 and interaction it states, and ship a screenshot of EVERY state it names must be screenshotted
-(the reviewer compares your screenshots to those exact contract lines). """ + SCREENSHOT_HARNESS + """
+(the reviewer compares your screenshots to those exact contract lines). Run the `/ui-craft`
+skill in its `build` mode against that contract, following it headless: the contract is the
+manifest and you ship its fidelity ledger — every contract line walked to met / re-settle /
+blocked. Deviations go through `resettle`, never a quiet diff. """ + SCREENSHOT_HARNESS + """
 
 Attach the PNGs the committed way — no browser is involved and none may be used: save them under
 `docs/screenshots/issue-{n}/<short-sha>/` (namespace each round by the branch's current short
@@ -115,8 +126,7 @@ Do not degrade the two charter gates while revising (ADR 0018):
   so a later push repaints every historical screenshot to the new files or 404s. NEVER try to
   upload images through a web browser or GitHub's drag-drop attachments — this host cannot do
   that; the committed files are the evidence.
-- Keep the PR body in plain app language for the human who merges — no file/function/test
-  names or CSS/API specifics.
+- """ + PLAIN_LANGUAGE_RULE + """
 
 Blocking findings:
 {findings}""" + SHELL_CRIB
