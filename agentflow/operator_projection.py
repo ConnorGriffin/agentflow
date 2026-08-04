@@ -134,8 +134,10 @@ def repository_maps(
         handoff_numbers.update(h.number for h in verified)
 
     links = read_links(cfg.repo, sorted(handoff_numbers))
-    open_prs = read_prs(cfg.repo, "open")
-    merged_prs = read_prs(cfg.repo, "merged")
+    # The pipeline PR listings are read per map, so a repository with none has nothing to
+    # spend them on — the shaping step below would discard both lists unlooked-at (#497).
+    open_prs = read_prs(cfg.repo, "open") if maps_read.maps else []
+    merged_prs = read_prs(cfg.repo, "merged") if maps_read.maps else []
     component = decision_maps.maps_component(
         maps_read, repo=cfg.repo, handoff_links=links or {},
         open_prs=open_prs or [], merged_prs=merged_prs or [])

@@ -812,17 +812,27 @@ def merge_pr(repo: str, pr: int) -> bool:
 
 # --- Decision Map projection (ADR 0036) -----------------------------------------
 #
-# Two raw GraphQL calls, kept inside the seam like the check-rollup escape hatch above: `gh`'s
-# porcelain has no notion of sub-issues or dependency edges. Discovery and per-map detail are
-# combined into one nested query rather than the five separate detail calls ADR 0036 budgets
-# for — GraphQL's nesting answers "give me each active map's children and their blockers" in
-# one round trip, which is fewer requests than the ceiling allows, never more. The second call
-# is exactly the ADR's "one handoff/pipeline batch query": it asks only for each verified
-# handoff's closing-PR numbers, aliased per issue number since there is no batch-by-number
-# porcelain; full pipeline evidence (title, merge commit, review, CI) is then resolved from the
-# PR listings the daemon already reads (:func:`list_pipeline_prs`), not re-fetched here.
+# Raw GraphQL, kept inside the seam like the check-rollup escape hatch above: `gh`'s porcelain
+# has no notion of sub-issues or dependency edges. The map read asks a cheap counting question
+# first and only pays for detail where maps exist — GitHub bills GraphQL on the page sizes a
+# query *requests*, not on what comes back, so one fixed-size query charged a repository with no
+# maps the same as one with three (#497). Per-map detail is still a single nested call rather
+# than the five separate ones ADR 0036 budgets for. The handoff read is exactly the ADR's "one
+# handoff/pipeline batch query": it asks only for each verified handoff's closing-PR numbers,
+# aliased per issue number since there is no batch-by-number porcelain; full pipeline evidence
+# (title, merge commit, review, CI) is then resolved from the PR listings the daemon already
+# reads (:func:`list_pipeline_prs`), not re-fetched here.
 
 _MAP_LABEL = "wayfinder:map"
+
+# Discovery: how many active maps does this repository have? Selects no issue fields at all
+# beyond the count, so it requests no child or edge pages and costs a single point.
+_MAPS_DISCOVERY_QUERY = (
+    "query($owner:String!,$name:String!,$label:[String!]){"
+    "rateLimit{cost remaining}"
+    "repository(owner:$owner,name:$name){"
+    "issues(states:[OPEN],labels:$label,first:1){totalCount}"
+    "}}")
 
 _MAPS_QUERY = (
     "query($owner:String!,$name:String!,$label:[String!],$mapsFirst:Int!,"
@@ -882,36 +892,64 @@ def _map_row(node: dict, repo: str) -> MapRow:
         else len(children))
 
 
+def _rate_of(payload: dict) -> tuple[int | None, int | None]:
+    rate = payload.get("rateLimit") or {}
+    cost = rate.get("cost") if isinstance(rate.get("cost"), int) else None
+    remaining = rate.get("remaining") if isinstance(rate.get("remaining"), int) else None
+    return cost, remaining
+
+
+def _graphql_payload(args: list[str]) -> dict | None:
+    data = api(["api", "graphql"] + args, parse_json=True)
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data")
+    return payload if isinstance(payload, dict) else None
+
+
 def decision_maps(repo: str, *, limit: int = 5, children_limit: int = 50,
                   edges_limit: int = 10) -> MapsRead | None:
     """The repository's active Decision Maps (open issues labeled ``wayfinder:map``), newest
     first, each with its bounded decision-child set and just enough dependency-graph data to
     classify the frontier and discover handoff candidates — or ``None`` when the read failed.
-    An enrolled repository with no maps returns an empty read, not ``None`` (ADR 0036)."""
+    An enrolled repository with no maps returns an empty read, not ``None`` (ADR 0036).
+
+    Asks how many maps the repository has before asking what is in them, and pays for detail
+    only up to that count (#497) — a repository with none is completely answered by the count.
+    Both phases are one read behind one front door: either the caller gets the whole answer
+    with both phases' costs summed, or — if *either* call fails — nothing at all, since an
+    empty map set published for a repository that has three would be a confident falsehood."""
     owner, _, name = repo.partition("/")
-    data = api(["api", "graphql", "-f", f"query={_MAPS_QUERY}",
-               "-f", f"owner={owner}", "-f", f"name={name}",
-               "-f", f"label[]={_MAP_LABEL}",
-               "-F", f"mapsFirst={limit}", "-F", f"childrenFirst={children_limit}",
-               "-F", f"edgesFirst={edges_limit}"],
-              parse_json=True)
-    if not isinstance(data, dict):
+    identity = ["-f", f"owner={owner}", "-f", f"name={name}", "-f", f"label[]={_MAP_LABEL}"]
+
+    discovered = _graphql_payload(["-f", f"query={_MAPS_DISCOVERY_QUERY}"] + identity)
+    if discovered is None:
         return None
-    payload = data.get("data")
-    if not isinstance(payload, dict):
+    counted = ((discovered.get("repository") or {}).get("issues") or {}).get("totalCount")
+    if not isinstance(counted, int):
         return None
-    rate = payload.get("rateLimit") or {}
+    cost, remaining = _rate_of(discovered)
+    if counted <= 0:
+        return MapsRead(maps=(), total_count=0, cost=cost, remaining=remaining)
+
+    payload = _graphql_payload(
+        ["-f", f"query={_MAPS_QUERY}"] + identity
+        + ["-F", f"mapsFirst={min(counted, limit)}", "-F", f"childrenFirst={children_limit}",
+           "-F", f"edgesFirst={edges_limit}"])
+    if payload is None:
+        return None
     issues = ((payload.get("repository") or {}).get("issues")) or {}
     nodes = issues.get("nodes")
     if not isinstance(nodes, list):
         return None
     maps = tuple(_map_row(n, repo) for n in nodes if isinstance(n, dict))
+    detail_cost, remaining = _rate_of(payload)
     return MapsRead(
         maps=maps,
         total_count=issues.get("totalCount") if isinstance(issues.get("totalCount"), int)
         else len(maps),
-        cost=rate.get("cost") if isinstance(rate.get("cost"), int) else None,
-        remaining=rate.get("remaining") if isinstance(rate.get("remaining"), int) else None)
+        cost=None if cost is None and detail_cost is None else (cost or 0) + (detail_cost or 0),
+        remaining=remaining)
 
 
 def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow] | None:
