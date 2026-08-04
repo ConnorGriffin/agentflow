@@ -165,17 +165,23 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
     map data across a failed or budget-skipped read rather than inventing an empty one.
 
     The attention queue composes here because it needs facts from both halves — the open PRs,
-    held issues and trust ratchets from v1, each repository's freshness stamp from v2."""
+    held issues and trust ratchets from v1, each repository's freshness stamp from v2, and each
+    pipeline stage's production over its last window of finished attempts (#430). That last one
+    is published in its own right as well: the queue shows only the stages that read as broken,
+    while the snapshot carries the count every stage was judged on."""
     try:
         from agentflow import operator_projection
+        from agentflow.stage_health import stage_health
         v1 = produce(repos, dispatch_enabled=ENABLE_FLAG.exists())
         previous = live.read_snapshot()
         v2 = operator_projection.project(
             repos, previous_snapshot=previous, heartbeat_seconds=FULL_PASS_SECONDS)
-        merged = {**v1, **v2,
+        health = stage_health()
+        merged = {**v1, **v2, "stage_health": health,
                   "fleet": operator_projection.fleet_recent_landed(v1.get("repos") or []),
                   "attention": operator_projection.attention(
-                      v1.get("repos") or [], v2.get("repositories") or [])}
+                      v1.get("repos") or [], v2.get("repositories") or [],
+                      stage_health=health)}
         live.write_snapshot(merged)
     except Exception as e:  # noqa: BLE001 — a bad publish must not kill the daemon
         _log(f"snapshot publish error: {type(e).__name__}: {e}")

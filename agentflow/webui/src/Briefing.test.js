@@ -110,6 +110,69 @@ describe('Briefing.svelte — the attention queue', () => {
   });
 });
 
+/* A stage that spent sessions and produced nothing across a whole window of finished attempts
+   (#430). The daemon decides which stages these are; the page only renders them — including
+   the one thing that makes them different, a third column with nowhere to go. */
+describe('Briefing.svelte — a stage in drought', () => {
+  const drought = (over) => ({ condition: 'stage-drought', kind: 'stage drought', repo: '',
+    number: null, title: 'pre-publish attack',
+    detail: '0 of its last 10 finished attempts published a hardened brief · 37 sessions spent',
+    url: null, note: 'What to check: held drafts and ready-for-agent holdbacks', ...over });
+
+  const withRows = (rows) => ({ ...SNAP, attention: { rows, total: rows.length } });
+
+  it('names the stage and states the drought and what it cost', () => {
+    const { container } = render(Briefing, { snap: withRows([drought()]) });
+    const row = container.querySelector('.attention');
+    expect(row.querySelector('.kind').textContent).toBe('stage drought');
+    expect(row.querySelector('h3').textContent).toBe('pre-publish attack');
+    expect(row.querySelector('p').textContent).toBe(
+      '0 of its last 10 finished attempts published a hardened brief · 37 sessions spent');
+  });
+
+  it('says where to look as plain text, never as an action that goes nowhere', () => {
+    const { container } = render(Briefing, { snap: withRows([drought()]) });
+    expect(screen.queryByRole('link', { name: /Open in GitHub/ })).toBeNull();
+    const note = container.querySelector('.attention .action-note');
+    expect(note.tagName).toBe('SPAN');
+    expect(note.textContent).toBe('What to check: held drafts and ready-for-agent holdbacks');
+  });
+
+  it('stacks two simultaneous droughts as two rows in the same ruled treatment', () => {
+    const { container } = render(Briefing, { snap: withRows([
+      drought(),
+      drought({ title: 'review',
+        detail: '0 of its last 10 finished attempts recorded a review verdict · 41 sessions spent',
+        note: 'What to check: open PRs waiting on a verdict' }),
+    ]) });
+    const rows = container.querySelectorAll('.rows .attention');
+    expect(rows).toHaveLength(2);
+    expect([...rows].map((r) => r.querySelector('h3').textContent))
+      .toEqual(['pre-publish attack', 'review']);
+    expect([...rows].map((r) => r.querySelector('.action-note').textContent)).toEqual([
+      'What to check: held drafts and ready-for-agent holdbacks',
+      'What to check: open PRs waiting on a verdict']);
+    expect(container.querySelector('.count').textContent).toBe('2 items');
+  });
+
+  it('counts toward the section count and the bound exactly like any other row', () => {
+    const rows = [drought(), ...Array.from({ length: 24 }, (_, i) => ({
+      condition: 'parked-build', kind: 'Parked', repo: 'o/r', number: i + 1,
+      title: `#${i + 1} a stopped build`, detail: 'r · a reason',
+      url: `https://github.com/o/r/pull/${i + 1}`, note: null }))];
+    const { container } = render(Briefing, { snap: { ...SNAP,
+      attention: { rows, total: 26 } } });
+    expect(container.querySelector('.count').textContent).toBe('26 items');
+    expect(screen.getByText('1 more operator actions not shown')).toBeTruthy();
+  });
+
+  it('renders the shipped reading path untouched when no stage is in drought', () => {
+    const { container } = render(Briefing, { snap: SNAP });
+    expect(container.querySelector('.action-note')).toBeNull();
+    expect(screen.getByRole('link', { name: /Open in GitHub/ })).toBeTruthy();
+  });
+});
+
 describe('Briefing.svelte — stale state', () => {
   it('renders the honest stale banner and withholds the frontier claim', () => {
     const stale = { ...SNAP, repositories: [{ ...SNAP.repositories[0],

@@ -42,7 +42,13 @@
         <article class="attention">
           <span class="kind">{item.kind}</span>
           <div><h3>{item.title}</h3><p>{item.detail}</p></div>
-          <a class="action" href={item.url} target="_blank" rel="noreferrer">Open in GitHub ↗</a>
+          <!-- A stage in drought has no GitHub object to open, so its third column says where
+               the missing output pools instead of offering an action that goes nowhere. -->
+          {#if item.url}
+            <a class="action" href={item.url} target="_blank" rel="noreferrer">Open in GitHub ↗</a>
+          {:else}
+            <span class="action-note">{item.note}</span>
+          {/if}
         </article>
       {:else}
         <div class="empty">No operator actions in this projection.</div>
@@ -171,6 +177,8 @@
     text-decoration: none; color: var(--ink);
   }
   .action:hover { border-color: var(--accent); color: var(--accent); }
+  .action-note { color: var(--muted); font-size: 13px; }
+  .action-note:hover { color: var(--ink); }
   .map { border-top: 1px solid var(--line); padding: 10px 0; }
   .map:last-child { border-bottom: 1px solid var(--line); }
   .map-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 20px; align-items: start; }

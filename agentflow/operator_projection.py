@@ -200,10 +200,12 @@ def fleet_recent_landed(repo_views: list[dict], *, limit: int = FLEET_RECENT_LAN
 
 
 # --- the operator's attention queue (#373) -------------------------------------------------
-# The five ruled conditions, in their contract priority order. The kind label on each row is the
+# The ruled conditions, in their contract priority order. The kind label on each row is the
 # locked surface's own; `Projection` is the kind its locked incomplete state already uses.
-_CONDITIONS = ("awaiting-merge", "waiting-on-reply", "parked-build", "ready-to-loosen",
-               "stale-data")
+# A stage in drought leads (#430): a stage that has silently stopped producing anything is
+# broken in a way none of the individual items it starves can show, so it outranks all of them.
+_CONDITIONS = ("stage-drought", "awaiting-merge", "waiting-on-reply", "parked-build",
+               "ready-to-loosen", "stale-data")
 
 # Condition 1's sub-kind is the repository profile alone — the same-tool summary that reads
 # "maintainer merge required" is the ordinary fallback when the cross-tool pool has no headroom,
@@ -242,15 +244,17 @@ def _short(repo: str) -> str:
 
 
 def attention(repo_views: list[dict], repositories: list[dict], *,
-              limit: int = ATTENTION_LIMIT) -> dict:
-    """The whole operator attention queue: the five ruled conditions, each underlying thing
+              stage_health: list[dict] | None = None, limit: int = ATTENTION_LIMIT) -> dict:
+    """The whole operator attention queue: the six ruled conditions, each underlying thing
     exactly once, in one total order, bounded — plus the true total the bound was taken from.
 
     Pure, and the only place the queue is decided (#373). Every fact is one the daemon has
     already read: the v1 repository views carry each open PR's hand-off stamp and park
     classification, the held issues and the trust ratchet; the schema-v2 entries carry the
-    freshness stamp. The page renders these rows as given — it ranks, filters and collapses
-    nothing, and shows the overflow as the difference between the total and what it was handed.
+    freshness stamp; ``stage_health`` carries each pipeline stage's production over its last
+    window of finished attempts. The page renders these rows as given — it ranks, filters and
+    collapses nothing, and shows the overflow as the difference between the total and what it
+    was handed.
 
     A row's clock is least-recently-touched-first where one exists (the hand-off stamp for a
     merge, the existing ``since`` for a held issue or a park); conditions with no clock fall
@@ -259,10 +263,25 @@ def attention(repo_views: list[dict], repositories: list[dict], *,
     rows: list[tuple[tuple, dict]] = []
 
     def add(priority: int, sub: int, clock: str | None, repo: str, number: int | None,
-            *, kind: str, title: str, detail: str, url: str) -> None:
+            *, kind: str, title: str, detail: str, url: str | None,
+            note: str | None = None) -> None:
         rows.append(((priority, sub, clock or "", repo.lower(), repo, number or 0),
                      {"condition": _CONDITIONS[priority], "kind": kind, "repo": repo,
-                      "number": number, "title": title, "detail": detail, "url": url}))
+                      "number": number, "title": title, "detail": detail, "url": url,
+                      "note": note}))
+
+    # A stage that spent sessions and produced nothing across a whole window of finished
+    # attempts (#430). It is the only condition with no GitHub object behind it — a stage is
+    # not a thing you can open — so it carries a plain `note` saying where to look instead of
+    # a URL, and the page renders that as text rather than as an action. A stage still inside
+    # its first window raises nothing: absence is the signal, so it has to be provable.
+    for stage in stage_health or []:
+        if stage["attempts"] < stage["window"] or stage["produced"]:
+            continue
+        add(0, 0, None, "", None, kind="stage drought", title=stage["stage"],
+            detail=(f"0 of its last {stage['window']} finished attempts "
+                    f"{stage['produces']} · {stage['sessions_spent']} sessions spent"),
+            url=None, note=f"What to check: {stage['check']}")
 
     for view in repo_views or []:
         repo = view.get("repo") or ""
@@ -275,7 +294,7 @@ def attention(repo_views: list[dict], repositories: list[dict], *,
             handed_off_at = pr.get("handed_off_at")
             if handed_off_at is None or pr.get("number") in parked_numbers:
                 continue
-            add(0, _PROFILE_ORDER.get(profile, len(_PROFILE_ORDER)), handed_off_at,
+            add(1, _PROFILE_ORDER.get(profile, len(_PROFILE_ORDER)), handed_off_at,
                 repo, pr.get("number"), kind="Merge",
                 title=f"#{pr.get('number')} {pr.get('title')}",
                 detail=f"{_short(repo)} · {profile} · the review finished — yours to merge",
@@ -283,7 +302,7 @@ def attention(repo_views: list[dict], repositories: list[dict], *,
 
         for held in view.get("held") or []:
             state = held.get("state") or ""
-            add(1, _HELD_ORDER.get(state, len(_HELD_ORDER)), held.get("since"),
+            add(2, _HELD_ORDER.get(state, len(_HELD_ORDER)), held.get("since"),
                 repo, held.get("number"), kind="Held",
                 title=f"#{held.get('number')} {held.get('title')}",
                 detail=f"{_short(repo)} · {state.replace('-', ' ')} · {held.get('reason') or ''}",
@@ -291,7 +310,7 @@ def attention(repo_views: list[dict], repositories: list[dict], *,
 
         for park in view.get("parked") or []:
             reason = park.get("reason") or ""
-            add(2, 0, park.get("since"), repo, park.get("number"), kind="Parked",
+            add(3, 0, park.get("since"), repo, park.get("number"), kind="Parked",
                 title=f"#{park.get('number')} {park.get('title')}",
                 detail=f"{_short(repo)} · {_PARK_REASON.get(reason, reason)}",
                 url=github.pr_url(repo, park.get("number")))
@@ -301,7 +320,7 @@ def attention(repo_views: list[dict], repositories: list[dict], *,
         if ratchet.get("ready_to_loosen") and profile != "autonomous":
             samples = ratchet.get("samples") or 0
             rate = round((ratchet.get("correction_rate") or 0) * 100)
-            add(3, 0, None, repo, None, kind="Trust",
+            add(4, 0, None, repo, None, kind="Trust",
                 title=f"{_short(repo)} is ready to loosen",
                 detail=f"{samples} decisions · {rate}% corrected", url=_repo_url(repo))
 
@@ -311,7 +330,7 @@ def attention(repo_views: list[dict], repositories: list[dict], *,
             continue
         repo = entry.get("name_with_owner") or ""
         error = (entry.get("github") or {}).get("error")
-        add(4, 0, None, repo, None, kind="Projection",
+        add(5, 0, None, repo, None, kind="Projection",
             title=(f"{_short(repo)} briefing data is stale" if status == "stale"
                    else f"{_short(repo)} briefing data has never loaded"),
             detail=_FRESHNESS_REASON.get(error) or _FRESHNESS_FALLBACK[status],
