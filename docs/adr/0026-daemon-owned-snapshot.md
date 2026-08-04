@@ -38,6 +38,12 @@ writes it atomically to a state file next to `live-sessions.json`.
 file's contents verbatim; it never runs `gh`. The response contract is
 unchanged — same body the cache used to serve, including `gh_fresh_at`.
 
+> Amended by [ADR 376](adr-376-read-time-freshness-at-the-serving-boundary.md):
+> still file-only, but no longer verbatim. The endpoint re-ages each repository's
+> Decision Map read downward against the reader's clock and stamps the briefing's
+> own state, label prefix, banner sentence and verified timestamp. Every other
+> field is passed through untouched, and nothing is queried.
+
 Freshness is honest, not enforced: with the daemon down, the console serves the
 last snapshot and the existing footer "updated" stamp shows the data's real age
 (from `gh_fresh_at`). No fallback to live GitHub queries — that would resurrect

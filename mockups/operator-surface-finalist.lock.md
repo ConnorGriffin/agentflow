@@ -164,6 +164,23 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
   fixture showed the banner with zero attention rows; condition 5 makes that
   combination unreachable, so that state now carries its stale-repository rows.
 
+## Declared deviations (re-settled by #376)
+
+- Term 6's `empty` state — **re-settled**. The locked capture showed a fresh,
+  bannerless projection carrying no repositories. The configuration rejects a
+  fleet with no repositories at all, so the daemon cannot publish that body: a
+  projection that says it has none has been perturbed — hand-edited, partly
+  written, or truncated. The state is therefore recaptured as the honest
+  unavailable rendering: masthead `Projection unavailable`, no verified age, and
+  the incomplete banner reading `The operator projection could not be read. Open
+  GitHub for authoritative state.` Nothing else about the state changes; it
+  remains one of term 6's five, in the dark theme, at the same viewport.
+- Term 3's masthead age — **re-settled**. The locked fixtures word the projection
+  age in long form (`Verified 4 minutes ago`); the shipping surface words it in the
+  compact relative-time vocabulary it already uses everywhere else (`Verified 4m
+  ago`, `Last verified 33m ago`). The server owns the state, the banner sentence
+  and the opening words; the browser appends the age.
+
 ## Verbatim strings
 
 - `No operator actions in this projection.`
@@ -180,3 +197,10 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
 - `Not verified`
 - `incomplete`
 - `landed evidence unavailable`
+- `Projection unavailable`
+- `The operator projection could not be read. Open GitHub for authoritative state.`
+- `This projection is stale. Open GitHub before acting on a frontier.`
+- `Dependency data is incomplete. A decision frontier is not verified.`
+- `No daemon-published projection yet. Open GitHub for authoritative state.`
+- `One or more repositories have never published a verified Decision Map read. Open
+  GitHub for authoritative state.`

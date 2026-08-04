@@ -1,14 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { deriveAttention, deriveMaps, deriveFleet, deriveCapacity, deriveFreshness,
          deriveBriefing } from './derive.js';
+import STATES from '../fixtures/operator-briefing-states.json';
 
-/* A snapshot shaped exactly like what `operator_projection.project()` + `dashboard_data.
-   snapshot()` publish (ADR 0036) — the same schema-v2 + v1 fields the real daemon composes,
-   not an ad hoc shape. This is the "rendered briefing" test's input; Briefing.test.js renders
+/* A snapshot shaped exactly like what `GET /api/snapshot` serves (ADR 0036, ADR 376) — the
+   schema-v2 + v1 fields the real daemon composes, plus the freshness the server stamps onto
+   them at read time. This is the "rendered briefing" test's input; Briefing.test.js renders
    the component from the same fixture. */
 const SNAP = {
   generated_at: '2026-07-30T12:00:00+00:00',
   schema_version: 2,
+  /* Server-stamped: the state, the banner sentence, the opening words of the masthead label,
+     and the machine-readable instant the browser words an age from. */
+  freshness: { state: 'fresh', label_prefix: 'Verified', message: null,
+               verified_at: '2026-07-30T11:56:00+00:00' },
   pools: [
     { tool: 'claude', clear: true, spent_pct: 20, headroom_pct: 80, running: 1, reason: null },
     { tool: 'codex', clear: false, spent_pct: 90, headroom_pct: 0, running: 0, reason: 'weekly pace' },
@@ -74,25 +79,53 @@ const SNAP = {
 beforeEach(() => vi.useFakeTimers({ now: new Date('2026-07-30T12:00:00Z') }));
 afterEach(() => vi.useRealTimers());
 
+/* The rule — which repository counts as verified, and how old the projection may claim to be —
+   is the server's (ADR 376). All the browser owns is the age, in the surface's own compact
+   vocabulary; these cases pin that boundary from both sides. */
 describe('deriveFreshness', () => {
-  it('reads a fully fresh fleet as fresh, labelled by generated_at', () => {
+  it('words the server\'s fresh stamp with the surface\'s own compact age', () => {
     const f = deriveFreshness(SNAP);
     expect(f.state).toBe('fresh');
-    expect(f.label).toMatch(/Updated/);
+    expect(f.label).toBe('Verified 4m ago');
+    expect(f.message).toBeUndefined();
+  });
+
+  it('carries a stale or partial stamp through verbatim, adding only the age', () => {
+    const stale = { ...SNAP, freshness: { state: 'stale', label_prefix: 'Last verified',
+      message: 'This projection is stale. Open GitHub before acting on a frontier.',
+      verified_at: '2026-07-30T10:00:00+00:00' } };
+    expect(deriveFreshness(stale).state).toBe('stale');
+    expect(deriveFreshness(stale).label).toBe('Last verified 2h ago');
+    expect(deriveFreshness(stale).message).toMatch(/^This projection is stale\./);
+
+    const partial = { ...SNAP, freshness: { state: 'incomplete',
+      label_prefix: 'Partial projection · verified',
+      message: 'Dependency data is incomplete. A decision frontier is not verified.',
+      verified_at: '2026-07-30T11:59:30+00:00' } };
+    expect(deriveFreshness(partial).label).toBe('Partial projection · verified just now');
+  });
+
+  it('shows the prefix alone when the server verified nothing to date', () => {
+    const none = { ...SNAP, freshness: { state: 'incomplete',
+      label_prefix: 'Projection unavailable',
+      message: 'No daemon-published projection yet. Open GitHub for authoritative state.',
+      verified_at: null } };
+    expect(deriveFreshness(none).label).toBe('Projection unavailable');
   });
 
   it('reads no repositories at all as incomplete, never fresh', () => {
-    expect(deriveFreshness({ repositories: [] }).state).toBe('incomplete');
-    expect(deriveFreshness({}).state).toBe('incomplete');
+    /* The served zero-repository body, exactly as the endpoint stamps it: the configuration
+       requires at least one repository, so this is a perturbed file, not an empty fleet. */
+    const empty = deriveFreshness(STATES.empty);
+    expect(empty.state).toBe('incomplete');
+    expect(empty.label).toBe('Projection unavailable');
+    expect(empty.message).toMatch(/could not be read/);
   });
 
-  it('reads a stale repository as stale, an unavailable one as incomplete', () => {
-    const stale = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
-      github: { status: 'stale' } }] };
-    expect(deriveFreshness(stale).state).toBe('stale');
-    const unavailable = { ...SNAP, repositories: [{ ...SNAP.repositories[0],
-      github: { status: 'unavailable' } }] };
-    expect(deriveFreshness(unavailable).state).toBe('incomplete');
+  it('reads a response carrying no stamp at all as unavailable, never as a briefing', () => {
+    expect(deriveFreshness({ repositories: [] }).state).toBe('incomplete');
+    expect(deriveFreshness({}).state).toBe('incomplete');
+    expect(deriveFreshness({}).label).toBe('Projection unavailable');
   });
 });
 

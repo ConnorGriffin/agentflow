@@ -1,4 +1,1044 @@
 {
+ "typical": {
+  "dispatch": {
+   "enabled": true
+  },
+  "daemon": {
+   "enabled": true,
+   "last_cycle_at": "2026-07-30T12:00:00+00:00",
+   "poll_seconds": 300,
+   "gh_fresh_at": "2026-07-30T12:00:00+00:00"
+  },
+  "pools": [
+   {
+    "tool": "claude",
+    "clear": true,
+    "spent_pct": 38,
+    "headroom_pct": 62,
+    "running": 3,
+    "reason": null
+   },
+   {
+    "tool": "codex",
+    "clear": true,
+    "spent_pct": 12,
+    "headroom_pct": 88,
+    "running": 1,
+    "reason": null
+   }
+  ],
+  "running": [],
+  "repos": [
+   {
+    "repo": "ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "ready": [
+     {
+      "number": 379,
+      "title": "ready one"
+     }
+    ],
+    "held": [
+     {
+      "number": 381,
+      "title": "Which surface owns the age?",
+      "state": "needs-grilling",
+      "reason": "a real fork the pipeline could not settle",
+      "since": "2026-07-29T09:00:00+00:00"
+     }
+    ],
+    "parked": [
+     {
+      "number": 372,
+      "title": "Classify decisions and verify handoffs",
+      "reason": "ui-evidence",
+      "builder": "claude",
+      "since": "2026-07-30T07:15:00+00:00"
+     }
+    ],
+    "in_flight": [
+     {
+      "number": 374,
+      "title": "Say what the projection verified",
+      "builder": "codex",
+      "handed_off_at": "2026-07-30T10:40:00+00:00"
+     }
+    ],
+    "recent_merges": [
+     {
+      "number": 508,
+      "title": "Project verified frontiers",
+      "merged_at": "2026-07-30T08:12:00+00:00"
+     },
+     {
+      "number": 506,
+      "title": "Show a broken stage",
+      "merged_at": "2026-07-29T12:00:00+00:00"
+     }
+    ],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   },
+   {
+    "repo": "ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "ready": [],
+    "held": [],
+    "parked": [],
+    "in_flight": [],
+    "recent_merges": [
+     {
+      "number": 42,
+      "title": "Settle the map schema",
+      "merged_at": "2026-07-28T12:00:00+00:00"
+     }
+    ],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   }
+  ],
+  "schema_version": 2,
+  "generated_at": "2026-07-30T12:00:00+00:00",
+  "heartbeat_seconds": 300,
+  "repositories": [
+   {
+    "name_with_owner": "ConnorGriffin/agentflow",
+    "url": "https://github.com/ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "github": {
+     "status": "fresh",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T12:00:00+00:00",
+     "error": null
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 343,
+       "title": "Make the Decision Map reads trustworthy",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/343",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 3,
+        "closed": 1
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 376,
+         "title": "Fail closed for stale and unavailable data",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/376",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 372,
+         "title": "Classify decisions and verify handoffs",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/372",
+         "status": "done"
+        },
+        {
+         "number": 376,
+         "title": "Fail closed for stale and unavailable data",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/376",
+         "status": "frontier"
+        },
+        {
+         "number": 377,
+         "title": "Retire the browser's own freshness rule",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/377",
+         "status": "claimed"
+        }
+       ],
+       "handoffs": [
+        {
+         "number": 500,
+         "title": "Project verified frontiers",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/500",
+         "pipeline": {
+          "state": "merged",
+          "pr_number": 508,
+          "pr_url": "https://github.com/ConnorGriffin/agentflow/pull/508",
+          "merged_at": "2026-07-30T08:12:00Z",
+          "merge_commit": null,
+          "review": null,
+          "ci": null
+         },
+         "attempt_count": 1
+        }
+       ],
+       "totals": {
+        "children": {
+         "shown": 3,
+         "total": 3
+        },
+        "handoffs": {
+         "shown": 1,
+         "total": 1
+        },
+        "adrs": {
+         "shown": 2,
+         "total": 2
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        },
+        {
+         "label": "ADR 374 — heartbeat budget",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/adr-374-graphql-heartbeat-budget.md"
+        }
+       ]
+      }
+     ],
+     "active_total": 1
+    }
+   },
+   {
+    "name_with_owner": "ConnorGriffin/wayfinder",
+    "url": "https://github.com/ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "github": {
+     "status": "fresh",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T12:00:00+00:00",
+     "error": null
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 500,
+       "title": "Wayfinder map surface",
+       "url": "https://github.com/ConnorGriffin/wayfinder/issues/500",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 2,
+        "closed": 1
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 502,
+         "title": "Render the map surface",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/502",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 501,
+         "title": "Settle the map schema",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/501",
+         "status": "done"
+        },
+        {
+         "number": 502,
+         "title": "Render the map surface",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/502",
+         "status": "frontier"
+        }
+       ],
+       "handoffs": [],
+       "totals": {
+        "children": {
+         "shown": 2,
+         "total": 2
+        },
+        "handoffs": {
+         "shown": 0,
+         "total": 0
+        },
+        "adrs": {
+         "shown": 1,
+         "total": 1
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/wayfinder/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        }
+       ]
+      }
+     ],
+     "active_total": 1
+    }
+   }
+  ],
+  "fleet": {
+   "recent_landed": [
+    {
+     "repo": "ConnorGriffin/agentflow",
+     "number": 508,
+     "title": "Project verified frontiers",
+     "merged_at": "2026-07-30T08:12:00+00:00"
+    },
+    {
+     "repo": "ConnorGriffin/agentflow",
+     "number": 506,
+     "title": "Show a broken stage",
+     "merged_at": "2026-07-29T12:00:00+00:00"
+    },
+    {
+     "repo": "ConnorGriffin/wayfinder",
+     "number": 42,
+     "title": "Settle the map schema",
+     "merged_at": "2026-07-28T12:00:00+00:00"
+    }
+   ]
+  },
+  "attention": {
+   "rows": [
+    {
+     "condition": "awaiting-merge",
+     "kind": "Merge",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 374,
+     "title": "#374 Say what the projection verified",
+     "detail": "agentflow · reviewed · the review finished — yours to merge",
+     "url": "https://github.com/ConnorGriffin/agentflow/pull/374",
+     "note": null
+    },
+    {
+     "condition": "waiting-on-reply",
+     "kind": "Held",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 381,
+     "title": "#381 Which surface owns the age?",
+     "detail": "agentflow · needs grilling · a real fork the pipeline could not settle",
+     "url": "https://github.com/ConnorGriffin/agentflow/issues/381",
+     "note": null
+    },
+    {
+     "condition": "parked-build",
+     "kind": "Parked",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 372,
+     "title": "#372 Classify decisions and verify handoffs",
+     "detail": "agentflow · a UI change with no screenshot evidence",
+     "url": "https://github.com/ConnorGriffin/agentflow/pull/372",
+     "note": null
+    }
+   ],
+   "total": 3
+  },
+  "freshness": {
+   "state": "fresh",
+   "label_prefix": "Verified",
+   "message": null,
+   "verified_at": "2026-07-30T12:00:00+00:00"
+  }
+ },
+ "stale": {
+  "dispatch": {
+   "enabled": true
+  },
+  "daemon": {
+   "enabled": true,
+   "last_cycle_at": "2026-07-30T12:00:00+00:00",
+   "poll_seconds": 300,
+   "gh_fresh_at": "2026-07-30T12:00:00+00:00"
+  },
+  "pools": [
+   {
+    "tool": "claude",
+    "clear": true,
+    "spent_pct": 38,
+    "headroom_pct": 62,
+    "running": 3,
+    "reason": null
+   },
+   {
+    "tool": "codex",
+    "clear": true,
+    "spent_pct": 12,
+    "headroom_pct": 88,
+    "running": 1,
+    "reason": null
+   }
+  ],
+  "running": [],
+  "repos": [
+   {
+    "repo": "ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "ready": [
+     {
+      "number": 379,
+      "title": "ready one"
+     }
+    ],
+    "held": [
+     {
+      "number": 381,
+      "title": "Which surface owns the age?",
+      "state": "needs-grilling",
+      "reason": "a real fork the pipeline could not settle",
+      "since": "2026-07-29T09:00:00+00:00"
+     }
+    ],
+    "parked": [
+     {
+      "number": 372,
+      "title": "Classify decisions and verify handoffs",
+      "reason": "ui-evidence",
+      "builder": "claude",
+      "since": "2026-07-30T07:15:00+00:00"
+     }
+    ],
+    "in_flight": [
+     {
+      "number": 374,
+      "title": "Say what the projection verified",
+      "builder": "codex",
+      "handed_off_at": "2026-07-30T10:40:00+00:00"
+     }
+    ],
+    "recent_merges": [
+     {
+      "number": 508,
+      "title": "Project verified frontiers",
+      "merged_at": "2026-07-30T08:12:00+00:00"
+     },
+     {
+      "number": 506,
+      "title": "Show a broken stage",
+      "merged_at": "2026-07-29T12:00:00+00:00"
+     }
+    ],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   },
+   {
+    "repo": "ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "ready": [],
+    "held": [],
+    "parked": [],
+    "in_flight": [],
+    "recent_merges": [
+     {
+      "number": 42,
+      "title": "Settle the map schema",
+      "merged_at": "2026-07-28T12:00:00+00:00"
+     }
+    ],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   }
+  ],
+  "schema_version": 2,
+  "generated_at": "2026-07-30T12:00:00+00:00",
+  "heartbeat_seconds": 300,
+  "repositories": [
+   {
+    "name_with_owner": "ConnorGriffin/agentflow",
+    "url": "https://github.com/ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "github": {
+     "status": "stale",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T11:31:00+00:00",
+     "error": "point budget reached this heartbeat"
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 343,
+       "title": "Make the Decision Map reads trustworthy",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/343",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 3,
+        "closed": 1
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 376,
+         "title": "Fail closed for stale and unavailable data",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/376",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 372,
+         "title": "Classify decisions and verify handoffs",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/372",
+         "status": "done"
+        },
+        {
+         "number": 376,
+         "title": "Fail closed for stale and unavailable data",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/376",
+         "status": "frontier"
+        },
+        {
+         "number": 377,
+         "title": "Retire the browser's own freshness rule",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/377",
+         "status": "claimed"
+        }
+       ],
+       "handoffs": [
+        {
+         "number": 500,
+         "title": "Project verified frontiers",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/500",
+         "pipeline": {
+          "state": "merged",
+          "pr_number": 508,
+          "pr_url": "https://github.com/ConnorGriffin/agentflow/pull/508",
+          "merged_at": "2026-07-30T08:12:00Z",
+          "merge_commit": null,
+          "review": null,
+          "ci": null
+         },
+         "attempt_count": 1
+        }
+       ],
+       "totals": {
+        "children": {
+         "shown": 3,
+         "total": 3
+        },
+        "handoffs": {
+         "shown": 1,
+         "total": 1
+        },
+        "adrs": {
+         "shown": 2,
+         "total": 2
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        },
+        {
+         "label": "ADR 374 — heartbeat budget",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/adr-374-graphql-heartbeat-budget.md"
+        }
+       ]
+      }
+     ],
+     "active_total": 1
+    }
+   },
+   {
+    "name_with_owner": "ConnorGriffin/wayfinder",
+    "url": "https://github.com/ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "github": {
+     "status": "fresh",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T12:00:00+00:00",
+     "error": null
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 500,
+       "title": "Wayfinder map surface",
+       "url": "https://github.com/ConnorGriffin/wayfinder/issues/500",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 2,
+        "closed": 1
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 502,
+         "title": "Render the map surface",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/502",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 501,
+         "title": "Settle the map schema",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/501",
+         "status": "done"
+        },
+        {
+         "number": 502,
+         "title": "Render the map surface",
+         "url": "https://github.com/ConnorGriffin/wayfinder/issues/502",
+         "status": "frontier"
+        }
+       ],
+       "handoffs": [],
+       "totals": {
+        "children": {
+         "shown": 2,
+         "total": 2
+        },
+        "handoffs": {
+         "shown": 0,
+         "total": 0
+        },
+        "adrs": {
+         "shown": 1,
+         "total": 1
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/wayfinder/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        }
+       ]
+      }
+     ],
+     "active_total": 1
+    }
+   }
+  ],
+  "fleet": {
+   "recent_landed": [
+    {
+     "repo": "ConnorGriffin/agentflow",
+     "number": 508,
+     "title": "Project verified frontiers",
+     "merged_at": "2026-07-30T08:12:00+00:00"
+    },
+    {
+     "repo": "ConnorGriffin/agentflow",
+     "number": 506,
+     "title": "Show a broken stage",
+     "merged_at": "2026-07-29T12:00:00+00:00"
+    },
+    {
+     "repo": "ConnorGriffin/wayfinder",
+     "number": 42,
+     "title": "Settle the map schema",
+     "merged_at": "2026-07-28T12:00:00+00:00"
+    }
+   ]
+  },
+  "attention": {
+   "rows": [
+    {
+     "condition": "awaiting-merge",
+     "kind": "Merge",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 374,
+     "title": "#374 Say what the projection verified",
+     "detail": "agentflow · reviewed · the review finished — yours to merge",
+     "url": "https://github.com/ConnorGriffin/agentflow/pull/374",
+     "note": null
+    },
+    {
+     "condition": "waiting-on-reply",
+     "kind": "Held",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 381,
+     "title": "#381 Which surface owns the age?",
+     "detail": "agentflow · needs grilling · a real fork the pipeline could not settle",
+     "url": "https://github.com/ConnorGriffin/agentflow/issues/381",
+     "note": null
+    },
+    {
+     "condition": "parked-build",
+     "kind": "Parked",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 372,
+     "title": "#372 Classify decisions and verify handoffs",
+     "detail": "agentflow · a UI change with no screenshot evidence",
+     "url": "https://github.com/ConnorGriffin/agentflow/pull/372",
+     "note": null
+    },
+    {
+     "condition": "stale-data",
+     "kind": "Projection",
+     "repo": "ConnorGriffin/agentflow",
+     "number": null,
+     "title": "agentflow briefing data is stale",
+     "detail": "the daemon's own bounded refresh did not reach this repository this cycle",
+     "url": "https://github.com/ConnorGriffin/agentflow",
+     "note": null
+    }
+   ],
+   "total": 4
+  },
+  "freshness": {
+   "state": "stale",
+   "label_prefix": "Last verified",
+   "message": "This projection is stale. Open GitHub before acting on a frontier.",
+   "verified_at": "2026-07-30T11:31:00+00:00"
+  }
+ },
+ "incomplete": {
+  "dispatch": {
+   "enabled": true
+  },
+  "daemon": {
+   "enabled": true,
+   "last_cycle_at": "2026-07-30T12:00:00+00:00",
+   "poll_seconds": 300,
+   "gh_fresh_at": "2026-07-30T12:00:00+00:00"
+  },
+  "pools": [
+   {
+    "tool": "claude",
+    "clear": true,
+    "spent_pct": 38,
+    "headroom_pct": 62,
+    "running": 3,
+    "reason": null
+   },
+   {
+    "tool": "codex",
+    "clear": true,
+    "spent_pct": 12,
+    "headroom_pct": 88,
+    "running": 1,
+    "reason": null
+   }
+  ],
+  "running": [],
+  "repos": [
+   {
+    "repo": "ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "ready": [
+     {
+      "number": 379,
+      "title": "ready one"
+     }
+    ],
+    "held": [
+     {
+      "number": 381,
+      "title": "Which surface owns the age?",
+      "state": "needs-grilling",
+      "reason": "a real fork the pipeline could not settle",
+      "since": "2026-07-29T09:00:00+00:00"
+     }
+    ],
+    "parked": [
+     {
+      "number": 372,
+      "title": "Classify decisions and verify handoffs",
+      "reason": "ui-evidence",
+      "builder": "claude",
+      "since": "2026-07-30T07:15:00+00:00"
+     }
+    ],
+    "in_flight": [
+     {
+      "number": 374,
+      "title": "Say what the projection verified",
+      "builder": "codex",
+      "handed_off_at": "2026-07-30T10:40:00+00:00"
+     }
+    ],
+    "recent_merges": [
+     {
+      "number": 508,
+      "title": "Project verified frontiers",
+      "merged_at": "2026-07-30T08:12:00+00:00"
+     },
+     {
+      "number": 506,
+      "title": "Show a broken stage",
+      "merged_at": "2026-07-29T12:00:00+00:00"
+     }
+    ],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   },
+   {
+    "repo": "ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "ready": [],
+    "held": [],
+    "parked": [],
+    "in_flight": [],
+    "recent_merges": [
+     {
+      "number": 42,
+      "title": "Settle the map schema",
+      "merged_at": "2026-07-28T12:00:00+00:00"
+     }
+    ],
+    "ratchet": {
+     "samples": 12,
+     "correction_rate": 0.04,
+     "ready_to_loosen": false
+    }
+   }
+  ],
+  "schema_version": 2,
+  "generated_at": "2026-07-30T12:00:00+00:00",
+  "heartbeat_seconds": 300,
+  "repositories": [
+   {
+    "name_with_owner": "ConnorGriffin/agentflow",
+    "url": "https://github.com/ConnorGriffin/agentflow",
+    "profile": "reviewed",
+    "github": {
+     "status": "fresh",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": "2026-07-30T12:00:00+00:00",
+     "error": null
+    },
+    "maps": {
+     "active": [
+      {
+       "number": 343,
+       "title": "Make the Decision Map reads trustworthy",
+       "url": "https://github.com/ConnorGriffin/agentflow/issues/343",
+       "updated_at": "2026-08-04T09:00:00Z",
+       "progress": {
+        "total": 3,
+        "closed": 1
+       },
+       "frontier_state": "named",
+       "frontier": [
+        {
+         "number": 376,
+         "title": "Fail closed for stale and unavailable data",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/376",
+         "status": "frontier"
+        }
+       ],
+       "frontier_incomplete": false,
+       "handoffs_incomplete": false,
+       "tickets": [
+        {
+         "number": 372,
+         "title": "Classify decisions and verify handoffs",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/372",
+         "status": "done"
+        },
+        {
+         "number": 376,
+         "title": "Fail closed for stale and unavailable data",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/376",
+         "status": "frontier"
+        },
+        {
+         "number": 377,
+         "title": "Retire the browser's own freshness rule",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/377",
+         "status": "claimed"
+        }
+       ],
+       "handoffs": [
+        {
+         "number": 500,
+         "title": "Project verified frontiers",
+         "url": "https://github.com/ConnorGriffin/agentflow/issues/500",
+         "pipeline": {
+          "state": "merged",
+          "pr_number": 508,
+          "pr_url": "https://github.com/ConnorGriffin/agentflow/pull/508",
+          "merged_at": "2026-07-30T08:12:00Z",
+          "merge_commit": null,
+          "review": null,
+          "ci": null
+         },
+         "attempt_count": 1
+        }
+       ],
+       "totals": {
+        "children": {
+         "shown": 3,
+         "total": 3
+        },
+        "handoffs": {
+         "shown": 1,
+         "total": 1
+        },
+        "adrs": {
+         "shown": 2,
+         "total": 2
+        }
+       },
+       "support": [
+        {
+         "label": "ADR 0036 — bounded projection",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md"
+        },
+        {
+         "label": "ADR 374 — heartbeat budget",
+         "url": "https://github.com/ConnorGriffin/agentflow/blob/HEAD/docs/adr/adr-374-graphql-heartbeat-budget.md"
+        }
+       ]
+      }
+     ],
+     "active_total": 1
+    }
+   },
+   {
+    "name_with_owner": "ConnorGriffin/wayfinder",
+    "url": "https://github.com/ConnorGriffin/wayfinder",
+    "profile": "reviewed",
+    "github": {
+     "status": "unavailable",
+     "attempted_at": "2026-07-30T12:00:00+00:00",
+     "fresh_at": null,
+     "error": "Something went wrong while executing your query."
+    },
+    "maps": {
+     "active": [],
+     "active_total": 0
+    }
+   }
+  ],
+  "fleet": {
+   "recent_landed": [
+    {
+     "repo": "ConnorGriffin/agentflow",
+     "number": 508,
+     "title": "Project verified frontiers",
+     "merged_at": "2026-07-30T08:12:00+00:00"
+    },
+    {
+     "repo": "ConnorGriffin/agentflow",
+     "number": 506,
+     "title": "Show a broken stage",
+     "merged_at": "2026-07-29T12:00:00+00:00"
+    },
+    {
+     "repo": "ConnorGriffin/wayfinder",
+     "number": 42,
+     "title": "Settle the map schema",
+     "merged_at": "2026-07-28T12:00:00+00:00"
+    }
+   ]
+  },
+  "attention": {
+   "rows": [
+    {
+     "condition": "awaiting-merge",
+     "kind": "Merge",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 374,
+     "title": "#374 Say what the projection verified",
+     "detail": "agentflow · reviewed · the review finished — yours to merge",
+     "url": "https://github.com/ConnorGriffin/agentflow/pull/374",
+     "note": null
+    },
+    {
+     "condition": "waiting-on-reply",
+     "kind": "Held",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 381,
+     "title": "#381 Which surface owns the age?",
+     "detail": "agentflow · needs grilling · a real fork the pipeline could not settle",
+     "url": "https://github.com/ConnorGriffin/agentflow/issues/381",
+     "note": null
+    },
+    {
+     "condition": "parked-build",
+     "kind": "Parked",
+     "repo": "ConnorGriffin/agentflow",
+     "number": 372,
+     "title": "#372 Classify decisions and verify handoffs",
+     "detail": "agentflow · a UI change with no screenshot evidence",
+     "url": "https://github.com/ConnorGriffin/agentflow/pull/372",
+     "note": null
+    },
+    {
+     "condition": "stale-data",
+     "kind": "Projection",
+     "repo": "ConnorGriffin/wayfinder",
+     "number": null,
+     "title": "wayfinder briefing data has never loaded",
+     "detail": "the last read of this repository failed",
+     "url": "https://github.com/ConnorGriffin/wayfinder",
+     "note": null
+    }
+   ],
+   "total": 4
+  },
+  "freshness": {
+   "state": "incomplete",
+   "label_prefix": "Partial projection · verified",
+   "message": "Dependency data is incomplete. A decision frontier is not verified.",
+   "verified_at": "2026-07-30T12:00:00+00:00"
+  }
+ },
+ "empty": {
+  "dispatch": {
+   "enabled": true
+  },
+  "daemon": {
+   "enabled": true,
+   "last_cycle_at": "2026-07-30T12:00:00+00:00",
+   "poll_seconds": 300,
+   "gh_fresh_at": "2026-07-30T12:00:00+00:00"
+  },
+  "pools": [
+   {
+    "tool": "claude",
+    "clear": true,
+    "spent_pct": 38,
+    "headroom_pct": 62,
+    "running": 3,
+    "reason": null
+   },
+   {
+    "tool": "codex",
+    "clear": true,
+    "spent_pct": 12,
+    "headroom_pct": 88,
+    "running": 1,
+    "reason": null
+   }
+  ],
+  "running": [],
+  "repos": [],
+  "schema_version": 2,
+  "generated_at": null,
+  "heartbeat_seconds": 300,
+  "repositories": [],
+  "fleet": {
+   "recent_landed": []
+  },
+  "attention": {
+   "rows": [],
+   "total": 0
+  },
+  "freshness": {
+   "state": "incomplete",
+   "label_prefix": "Projection unavailable",
+   "message": "The operator projection could not be read. Open GitHub for authoritative state.",
+   "verified_at": null
+  }
+ },
  "map-frontier-matrix": {
   "dispatch": {
    "enabled": true
@@ -46,6 +1086,7 @@
   ],
   "schema_version": 2,
   "generated_at": "2026-07-30T12:00:00+00:00",
+  "heartbeat_seconds": 300,
   "repositories": [
    {
     "name_with_owner": "ConnorGriffin/agentflow",
@@ -327,6 +1368,12 @@
   "attention": {
    "rows": [],
    "total": 0
+  },
+  "freshness": {
+   "state": "fresh",
+   "label_prefix": "Verified",
+   "message": null,
+   "verified_at": "2026-07-30T12:00:00+00:00"
   }
  },
  "map-overflow-evidence": {
@@ -390,6 +1437,7 @@
   ],
   "schema_version": 2,
   "generated_at": "2026-07-30T12:00:00+00:00",
+  "heartbeat_seconds": 300,
   "repositories": [
    {
     "name_with_owner": "ConnorGriffin/agentflow",
@@ -1129,6 +2177,12 @@
   "attention": {
    "rows": [],
    "total": 0
+  },
+  "freshness": {
+   "state": "fresh",
+   "label_prefix": "Verified",
+   "message": null,
+   "verified_at": "2026-07-30T12:00:00+00:00"
   }
  }
 }

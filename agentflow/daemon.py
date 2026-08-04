@@ -170,10 +170,13 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
     is published in its own right as well: the queue shows only the stages that read as broken,
     while the snapshot carries the count every stage was judged on."""
     try:
-        from agentflow import operator_projection
+        from agentflow import operator_freshness, operator_projection
         from agentflow.stage_health import stage_health
         v1 = produce(repos, dispatch_enabled=ENABLE_FLAG.exists())
-        previous = live.read_snapshot()
+        # Only a body this projection recognises carries a repository's last verified read
+        # forward. A body that predates the stamped heartbeat window still counts: refusing it
+        # would republish every repository as never-loaded on the first upgraded publish.
+        previous = operator_freshness.carry_forward(live.read_snapshot())
         v2 = operator_projection.project(
             repos, previous_snapshot=previous, heartbeat_seconds=FULL_PASS_SECONDS)
         health = stage_health()
