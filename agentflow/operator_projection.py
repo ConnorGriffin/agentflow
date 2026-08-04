@@ -1,12 +1,15 @@
 """Schema-version-2 operator projection (ADR 0036) — the daemon-owned bounded Decision Map read,
 composed additively alongside the existing v1 snapshot :func:`agentflow.dashboard_data.snapshot`
 already produces. The freshness bookkeeping, fleet-wide point-budget stop, and stale-preserve-on-
-failure logic below are the pure test surface; :func:`build` is the one impure entry point that
-walks the fleet and calls :mod:`agentflow.github`.
+failure logic below are the pure test surface; :func:`project` is the one impure entry point that
+walks the fleet and calls :mod:`agentflow.github`. :func:`decision_map_probe` runs that same set
+of reads once, for one repository, and prints what GitHub answered — the read-only evidence
+behind a claim about what the refresh costs (ADR 374).
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 
 from agentflow import decision_maps, github
@@ -15,9 +18,13 @@ from agentflow.repo_facts import repo_profile
 
 SCHEMA_VERSION = 2
 
-# Per ADR 0036: at most 60 GraphQL points spent on this refresh per heartbeat, and it stops
-# before a query that would leave fewer than 1,000 points for the workflow engine's own reads.
-POINT_CEILING = 60
+# Per ADR 374 (raising ADR 0036's original 60): at most 250 GraphQL points spent on this refresh
+# per heartbeat — enough for all nine enrolled repositories to refresh in one heartbeat, which is
+# what keeps every one of them inside the two-heartbeat freshness window. The refresh also stops
+# once GitHub's own reported remaining falls under the 1,000 points reserved for the workflow
+# engine's reads. That remaining is GitHub's post-spend figure, so it is read as-is: subtracting
+# what this refresh has already spent would count the same points twice and stop the fleet early.
+POINT_CEILING = 250
 WORKFLOW_FLOOR = 1000
 
 FLEET_RECENT_LANDED_LIMIT = 20
@@ -99,7 +106,7 @@ def repository_maps(
     bound as parameter defaults) so a test can monkeypatch the module and have ``build()``'s
     fleet walk pick it up without threading fakes through every layer."""
     read_maps = read_maps or github.decision_maps
-    read_links = read_links or github.handoff_pr_links
+    read_links = read_links or github.handoff_pr_links_read
     read_prs = read_prs or github.list_pipeline_prs
     prev = _previous_component(previous_snapshot, cfg.repo)
     prev_github = (prev or {}).get("github")
@@ -116,24 +123,30 @@ def repository_maps(
     maps_read = read_maps(cfg.repo, limit=decision_maps.ACTIVE_MAP_LIMIT,
                           children_limit=decision_maps.CHILDREN_LIMIT,
                           edges_limit=decision_maps.EDGES_LIMIT)
-    if maps_read is None:
-        fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
-                          attempted=True, success=False, error="the map read failed")
-        return {**identity, "github": fresh, "maps": prev_maps}
-
     if maps_read.cost is not None:
         budget["spent"] += maps_read.cost
     if (budget["spent"] >= POINT_CEILING
-            or (maps_read.remaining is not None
-                and maps_read.remaining - budget["spent"] < WORKFLOW_FLOOR)):
+            or (maps_read.remaining is not None and maps_read.remaining < WORKFLOW_FLOOR)):
         budget["stopped"] = True
+    if maps_read.error:
+        fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
+                          attempted=True, success=False, error=maps_read.error)
+        return {**identity, "github": fresh, "maps": prev_maps}
 
     handoff_numbers: set[int] = set()
     for m in maps_read.maps:
         verified, _overflow = decision_maps.verified_handoffs(m, repo=cfg.repo)
         handoff_numbers.update(h.number for h in verified)
 
-    links = read_links(cfg.repo, sorted(handoff_numbers))
+    links_read = read_links(cfg.repo, sorted(handoff_numbers))
+    if links_read.cost is not None:
+        budget["spent"] += links_read.cost
+    if (budget["spent"] >= POINT_CEILING
+            or (links_read.remaining is not None and links_read.remaining < WORKFLOW_FLOOR)):
+        budget["stopped"] = True
+    # A failed join costs its points like any other read, but it never fails the map read that
+    # already succeeded — it comes back with no links, and each handoff falls back to `building`.
+    links = links_read.links
     # The pipeline PR listings are read per map, so a repository with none has nothing to
     # spend them on — the shaping step below would discard both lists unlooked-at (#497).
     open_prs = read_prs(cfg.repo, "open") if maps_read.maps else []
@@ -187,6 +200,52 @@ def project(
             "repositories": repositories}
 
 
+def _probe_section(title: str, read: github.MapQueryRead) -> list[str]:
+    reported = "unreported" if read.cost is None else f"{read.cost} points"
+    remaining = "" if read.remaining is None else f", {read.remaining} remaining"
+    lines = [title, f"cost: {reported}{remaining}"]
+    if read.error:
+        lines.append(f"error: {read.error}")
+    lines.append(json.dumps(read.raw, indent=2, sort_keys=True))
+    return lines
+
+
+def decision_map_probe(repo: str) -> str:
+    """The evidence behind ``agentflow decision-map-probe``: the Decision Map reads the daemon
+    makes for one repository every heartbeat, run once against ``repo`` and printed whole —
+    GitHub's raw answers, the points each one reported, and their combined cost.
+
+    Read-only by construction: it issues exactly the queries :mod:`agentflow.github` already
+    builds for the refresh, at the same bounds, and never touches a write command. It also makes
+    the same choices the refresh makes — no map detail for a repository that has no maps, no
+    handoff join where the maps verify no handoff — so what it prints is what a heartbeat costs,
+    not what a heartbeat could cost."""
+    maps_read, evidence = github.decision_maps_with_evidence(
+        repo, limit=decision_maps.ACTIVE_MAP_LIMIT,
+        children_limit=decision_maps.CHILDREN_LIMIT, edges_limit=decision_maps.EDGES_LIMIT)
+    handoffs: set[int] = set()
+    for m in maps_read.maps:
+        verified, _overflow = decision_maps.verified_handoffs(m, repo=repo)
+        handoffs.update(h.number for h in verified)
+
+    reads = [(f"map read {index} of {len(evidence)}", response)
+             for index, response in enumerate(evidence, start=1)]
+    if handoffs:
+        reads.append((f"handoff join — closing pull requests for {sorted(handoffs)}",
+                      github.handoff_pr_links_response(repo, sorted(handoffs))))
+
+    lines = [f"decision map probe — {repo} (read-only)", ""]
+    for title, response in reads:
+        lines += _probe_section(title, response)
+        lines.append("")
+    if not handoffs:
+        lines += ["handoff join — not issued: these maps verify no handoff, so the daemon asks "
+                  "nothing here either", ""]
+    total = sum(response.cost or 0 for _title, response in reads)
+    lines.append(f"combined cost: {total} points across {len(reads)} requests")
+    return "\n".join(lines)
+
+
 def fleet_recent_landed(repo_views: list[dict], *, limit: int = FLEET_RECENT_LANDED_LIMIT) -> dict:
     """The fleet-wide recently-landed list (ADR 0036): each repository's already-bounded
     ``recent_merges`` (v1's existing 10-per-repo cap), merged newest-first and capped fleet-
@@ -228,11 +287,14 @@ _PARK_REASON = {
 
 # Why a repository's briefing data is not current — the cause the freshness stamp already
 # recorded, so a row never implies GitHub is at fault when the daemon's own bounded refresh is.
+_BUDGET_STOP = "point budget reached this heartbeat"
 _FRESHNESS_REASON = {
-    "point budget reached this heartbeat":
-        "the daemon's own bounded refresh did not reach this repository this cycle",
-    "the map read failed": "the last read of this repository failed",
+    _BUDGET_STOP: "the daemon's own bounded refresh did not reach this repository this cycle",
 }
+# Every other recorded cause is a read that failed, and the stamp now carries GitHub's own words
+# for it (ADR 374). Those words are evidence for whoever reads the snapshot, not copy for this
+# row: the queue says the same one sentence it always has, whatever GitHub called the failure.
+_READ_FAILED_REASON = "the last read of this repository failed"
 _FRESHNESS_FALLBACK = {
     "stale": "this repository has not refreshed within two heartbeats",
     "unavailable": "no read of this repository has ever completed",
@@ -333,7 +395,8 @@ def attention(repo_views: list[dict], repositories: list[dict], *,
         add(5, 0, None, repo, None, kind="Projection",
             title=(f"{_short(repo)} briefing data is stale" if status == "stale"
                    else f"{_short(repo)} briefing data has never loaded"),
-            detail=_FRESHNESS_REASON.get(error) or _FRESHNESS_FALLBACK[status],
+            detail=(_FRESHNESS_REASON.get(error)
+                    or (_READ_FAILED_REASON if error else _FRESHNESS_FALLBACK[status])),
             url=_repo_url(repo))
 
     rows.sort(key=lambda row: row[0])

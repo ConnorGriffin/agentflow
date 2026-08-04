@@ -446,12 +446,15 @@ def test_a_repository_with_more_maps_than_the_bound_still_asks_only_for_the_boun
 
 def test_a_failed_detail_read_is_a_read_failure_not_an_empty_repository(monkeypatch):
     _recording_graphql(monkeypatch, [_discovery(3), None])
-    assert github.decision_maps(REPO) is None
+    read = github.decision_maps(REPO)
+    assert read.maps == ()
+    assert read.error == "boom", "the map read carries what GitHub said, not just that it failed"
 
 
 def test_a_failed_discovery_read_is_a_read_failure(monkeypatch):
     _recording_graphql(monkeypatch, [None])
-    assert github.decision_maps(REPO) is None
+    read = github.decision_maps(REPO)
+    assert read.maps == () and read.error == "boom"
 
 
 def test_a_detail_read_that_shrank_publishes_what_it_returned(monkeypatch):

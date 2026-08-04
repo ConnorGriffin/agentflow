@@ -27,6 +27,33 @@ def _map(number=1) -> github.MapRow:
                          children_total=0)
 
 
+def _failed_read(error="the map read failed") -> github.MapsRead:
+    return github.MapsRead(maps=(), total_count=0, cost=None, remaining=None, error=error)
+
+
+def _links_read(links=None, *, cost=0, remaining=None, error=None) -> github.HandoffLinksRead:
+    """What the handoff join hands back — the shape `repository_maps` reads in production, so a
+    stub that answers anything else stops proving what the projection does with it."""
+    return github.HandoffLinksRead(links=links or {}, cost=cost, remaining=remaining, error=error)
+
+
+def _handed_off_map(number=1, *, handoff=900, repo="o/agentflow") -> github.MapRow:
+    """A map whose closed decision child handed off a Build Issue — the shape that makes the
+    daemon issue its third query, the closing-PR join."""
+    candidate = github.HandoffCandidateRow(
+        number=handoff, title="Build it", url=f"https://github.com/{repo}/issues/{handoff}",
+        body=f"Wayfinder handoff: #{number}", labels=frozenset(), repo=repo)
+    child = github.MapChildRow(
+        number=number * 100, title="a settled decision",
+        url=f"https://github.com/{repo}/issues/{number * 100}", state="CLOSED", assigned=False,
+        blocked_by_open=0, blocked_by_closed=0, blocked_by_total=0,
+        handoff_candidates=(candidate,))
+    return github.MapRow(number=number, title=f"Map {number}",
+                         url=f"https://github.com/{repo}/issues/{number}",
+                         updated_at="2026-08-03T00:00:00Z", body="", children=(child,),
+                         children_total=1)
+
+
 # --- freshness ---------------------------------------------------------------------------
 
 def test_a_successful_attempt_is_fresh():
@@ -86,7 +113,7 @@ def test_repository_maps_publishes_the_fresh_read():
     result = operator_projection.repository_maps(
         _cfg(), previous_snapshot=None, now=NOW, heartbeat_seconds=300,
         budget={"spent": 0, "stopped": False}, read_maps=read_maps,
-        read_links=lambda repo, nums: {}, read_prs=lambda repo, state: [])
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
     assert calls == ["o/r"]
     assert result["name_with_owner"] == "o/r"
     assert result["url"] == "https://github.com/o/r"
@@ -101,11 +128,66 @@ def test_repository_maps_preserves_previous_component_on_failed_read():
          "maps": {"active": [{"number": 1}], "active_total": 1}}]}
     result = operator_projection.repository_maps(
         _cfg(), previous_snapshot=previous_snapshot, now=NOW, heartbeat_seconds=300,
-        budget={"spent": 0, "stopped": False}, read_maps=lambda repo, **kw: None,
-        read_links=lambda repo, nums: {}, read_prs=lambda repo, state: [])
+        budget={"spent": 0, "stopped": False}, read_maps=lambda repo, **kw: _failed_read(),
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
     assert result["maps"] == {"active": [{"number": 1}], "active_total": 1}
     assert result["github"]["status"] == "stale"
     assert result["github"]["fresh_at"] == "2026-07-30T11:55:00+00:00"
+
+
+def test_repository_maps_publishes_githubs_own_reason_for_a_failed_read():
+    # What GitHub said is the whole value of a failed read: "rate limit exceeded" and "that
+    # repository does not exist" call for different responses from the operator, and both used
+    # to arrive as the same four words.
+    previous_snapshot = {"repositories": [
+        {"name_with_owner": "o/r",
+         "github": {"status": "fresh", "fresh_at": "2026-07-30T11:55:00+00:00",
+                    "attempted_at": "2026-07-30T11:55:00+00:00", "error": None},
+         "maps": {"active": [{"number": 1}], "active_total": 1}}]}
+    result = operator_projection.repository_maps(
+        _cfg(), previous_snapshot=previous_snapshot, now=NOW, heartbeat_seconds=300,
+        budget={"spent": 0, "stopped": False},
+        read_maps=lambda repo, **kw: _failed_read("API rate limit exceeded for user ID 1."),
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
+    assert result["github"]["error"] == "API rate limit exceeded for user ID 1."
+    assert result["github"]["status"] == "stale"
+    assert result["maps"] == {"active": [{"number": 1}], "active_total": 1}, (
+        "a diagnostic never turns an unknown map into an empty one")
+
+
+def test_a_failed_map_read_still_spends_points_and_enforces_the_reserve():
+    budget = {"spent": 240, "stopped": False}
+    failed = github.MapsRead(maps=(), total_count=0, cost=10, remaining=999,
+                             error="API rate limit exceeded")
+    operator_projection.repository_maps(
+        _cfg(), previous_snapshot=None, now=NOW, heartbeat_seconds=300, budget=budget,
+        read_maps=lambda repo, **kw: failed,
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
+    assert budget == {"spent": 250, "stopped": True}
+
+
+def test_a_failed_handoff_join_still_costs_its_points_without_failing_the_map_read():
+    # The join is the evidence *about* a handoff, not the map itself. Losing it must not throw
+    # away a map set GitHub already answered — but its points were still spent, and the reserve
+    # it reported still governs whether the rest of the fleet may read.
+    previous_snapshot = {"repositories": [
+        {"name_with_owner": "o/r",
+         "github": {"status": "fresh", "fresh_at": "2026-07-30T11:55:00+00:00",
+                    "attempted_at": "2026-07-30T11:55:00+00:00", "error": None},
+         "maps": {"active": [{"number": 9}], "active_total": 1}}]}
+    budget = {"spent": 0, "stopped": False}
+    result = operator_projection.repository_maps(
+        _cfg(), previous_snapshot=previous_snapshot, now=NOW, heartbeat_seconds=300,
+        budget=budget,
+        read_maps=lambda repo, **kw: _maps_read(cost=2, maps=(_map(),), total_count=1),
+        read_links=lambda repo, nums: _links_read(cost=3, remaining=998,
+                                                  error="handoff query failed"),
+        read_prs=lambda repo, state: [])
+    assert result["github"]["status"] == "fresh", "the map read itself succeeded"
+    assert result["github"]["error"] is None
+    assert result["maps"]["active_total"] == 1
+    assert [m["number"] for m in result["maps"]["active"]] == [1], "the map GitHub answered with"
+    assert budget == {"spent": 5, "stopped": True}
 
 
 def test_repository_maps_stopped_budget_never_calls_github_and_preserves_previous():
@@ -130,19 +212,75 @@ def test_repository_maps_stops_the_fleet_budget_once_the_point_ceiling_is_reache
     budget = {"spent": 0, "stopped": False}
     operator_projection.repository_maps(
         _cfg("o/a"), previous_snapshot=None, now=NOW, heartbeat_seconds=300, budget=budget,
-        read_maps=lambda repo, **kw: _maps_read(cost=61, remaining=9000),
-        read_links=lambda repo, nums: {}, read_prs=lambda repo, state: [])
-    assert budget["spent"] == 61
-    assert budget["stopped"] is True, "spending past the 60-point ceiling stops the rest of the fleet"
+        read_maps=lambda repo, **kw: _maps_read(cost=251, remaining=9000),
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
+    assert budget["spent"] == 251
+    assert budget["stopped"] is True, "spending past the 250-point ceiling stops the rest of the fleet"
+
+
+def test_repository_maps_keeps_reading_up_to_the_settled_ceiling():
+    budget = {"spent": 0, "stopped": False}
+    operator_projection.repository_maps(
+        _cfg("o/a"), previous_snapshot=None, now=NOW, heartbeat_seconds=300, budget=budget,
+        read_maps=lambda repo, **kw: _maps_read(cost=249, remaining=9000),
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
+    assert budget["stopped"] is False, "249 points is inside the heartbeat's 250-point budget"
+
+
+def test_a_cost_crossing_the_ceiling_leaves_later_repositories_with_their_previous_maps():
+    stale_fresh_at = (NOW - timedelta(seconds=700)).isoformat()
+    previous_snapshot = {"repositories": [
+        {"name_with_owner": "o/b", "github": {"status": "fresh", "fresh_at": stale_fresh_at,
+                                              "attempted_at": stale_fresh_at, "error": None},
+         "maps": {"active": [{"number": 9}], "active_total": 1}}]}
+    budget = {"spent": 0, "stopped": False}
+    operator_projection.repository_maps(
+        _cfg("o/a"), previous_snapshot=previous_snapshot, now=NOW, heartbeat_seconds=300,
+        budget=budget, read_maps=lambda repo, **kw: _maps_read(cost=250, remaining=9000),
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
+
+    def boom(*a, **k):
+        raise AssertionError("the ceiling was reached — nothing else may read GitHub")
+
+    later = operator_projection.repository_maps(
+        _cfg("o/b"), previous_snapshot=previous_snapshot, now=NOW, heartbeat_seconds=300,
+        budget=budget, read_maps=boom, read_links=boom, read_prs=boom)
+    assert later["maps"] == {"active": [{"number": 9}], "active_total": 1}
+    assert later["github"]["status"] == "stale"
 
 
 def test_repository_maps_stops_the_fleet_budget_below_the_workflow_floor():
     budget = {"spent": 0, "stopped": False}
     operator_projection.repository_maps(
         _cfg("o/a"), previous_snapshot=None, now=NOW, heartbeat_seconds=300, budget=budget,
-        read_maps=lambda repo, **kw: _maps_read(cost=5, remaining=1002),
-        read_links=lambda repo, nums: {}, read_prs=lambda repo, state: [])
-    assert budget["stopped"] is True, "1002 - 5 = 997 remaining dips under the 1000-point floor"
+        read_maps=lambda repo, **kw: _maps_read(cost=5, remaining=999),
+        read_links=lambda repo, nums: _links_read(), read_prs=lambda repo, state: [])
+    assert budget["stopped"] is True, "999 left is under the 1,000 reserved for the engine"
+
+
+def test_the_workflow_reserve_never_double_counts_the_points_already_spent():
+    # GitHub's reported `remaining` is what is left *after* the read that reported it, so every
+    # point this heartbeat has spent is in that number already. Subtracting the running total
+    # from it a second time counts those points twice and stops the fleet while GitHub still has
+    # more headroom than the reserve asks for. Here the hourly budget really has 1,070 left after
+    # the first read and never dips under 1,000 — no repository may be skipped.
+    budget = {"spent": 0, "stopped": False}
+    left = [1100]
+
+    def read_maps(repo, **kw):
+        left[0] -= 30
+        return _maps_read(cost=30, remaining=left[0])
+
+    reads = []
+    for repo in ("o/a", "o/b", "o/c"):
+        result = operator_projection.repository_maps(
+            _cfg(repo), previous_snapshot=None, now=NOW, heartbeat_seconds=300, budget=budget,
+            read_maps=read_maps, read_links=lambda repo, nums: _links_read(),
+            read_prs=lambda repo, state: [])
+        reads.append(result["github"]["status"])
+    assert reads == ["fresh", "fresh", "fresh"]
+    assert budget["spent"] == 90
+    assert budget["stopped"] is False, "1,010 points remain — still above the reserve"
 
 
 def test_repository_maps_degrades_handoff_evidence_without_failing_the_map_read():
@@ -152,7 +290,8 @@ def test_repository_maps_degrades_handoff_evidence_without_failing_the_map_read(
         _cfg(), previous_snapshot=None, now=NOW, heartbeat_seconds=300,
         budget={"spent": 0, "stopped": False},
         read_maps=lambda repo, **kw: _maps_read(maps=(_map(1),), total_count=1),
-        read_links=lambda repo, nums: None, read_prs=lambda repo, state: None)
+        read_links=lambda repo, nums: _links_read(error="handoff query failed"),
+        read_prs=lambda repo, state: None)
     assert result["github"]["status"] == "fresh", "the map read itself succeeded"
     assert result["maps"]["active_total"] == 1
 
@@ -164,7 +303,7 @@ def test_repository_with_no_maps_makes_no_pipeline_pr_call():
     result = operator_projection.repository_maps(
         _cfg(), previous_snapshot=None, now=NOW, heartbeat_seconds=300,
         budget={"spent": 0, "stopped": False}, read_maps=lambda repo, **kw: _maps_read(),
-        read_links=lambda repo, nums: {}, read_prs=boom)
+        read_links=lambda repo, nums: _links_read(), read_prs=boom)
     assert result["github"]["status"] == "fresh"
     assert result["maps"] == {"active": [], "active_total": 0}
 
@@ -173,7 +312,7 @@ def test_repository_with_no_maps_makes_no_pipeline_pr_call():
 
 def test_build_composes_schema_version_and_repositories(monkeypatch):
     monkeypatch.setattr(github, "decision_maps", lambda repo, **kw: _maps_read())
-    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    monkeypatch.setattr(github, "handoff_pr_links_read", lambda repo, nums: _links_read())
     monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
     result = operator_projection.project(
         [_cfg("o/a"), _cfg("o/b")], previous_snapshot=None, heartbeat_seconds=300, now=NOW)
@@ -184,13 +323,13 @@ def test_build_composes_schema_version_and_repositories(monkeypatch):
 
 
 def test_starvation_every_repository_reaches_fresh_within_ceil_n_over_k_heartbeats(monkeypatch):
-    # Five repositories, a budget that stops after 2 reads (cost 30 each against a 60 ceiling).
-    # With the naive top-of-list walk order this never recovers — the same two repos win every
-    # heartbeat and the rest stay unavailable forever. With least-recently-fresh-first, every
-    # repository must be fresh within ceil(5/2) = 3 heartbeats.
-    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    # Five repositories, a budget that stops after 2 reads (cost 125 each against the 250-point
+    # ceiling). With the naive top-of-list walk order this never recovers — the same two repos
+    # win every heartbeat and the rest stay unavailable forever. With least-recently-fresh-first,
+    # every repository must be fresh within ceil(5/2) = 3 heartbeats.
+    monkeypatch.setattr(github, "handoff_pr_links_read", lambda repo, nums: _links_read())
     monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
-    monkeypatch.setattr(github, "decision_maps", lambda repo, **kw: _maps_read(cost=30, remaining=4990))
+    monkeypatch.setattr(github, "decision_maps", lambda repo, **kw: _maps_read(cost=125, remaining=4990))
 
     repos = [_cfg(f"o/r{i}") for i in range(5)]
     snapshot = None
@@ -202,20 +341,42 @@ def test_starvation_every_repository_reaches_fresh_within_ceil_n_over_k_heartbea
     assert all(status == "fresh" for status in statuses.values()), statuses
 
 
-def test_the_whole_real_shaped_fleet_refreshes_in_one_pass_inside_the_point_ceiling(monkeypatch):
-    # The enrolled fleet as measured 2026-08-03: nine repositories, seven with no Decision
-    # Maps at all, one with three and one with two. Priced the way GitHub bills the two-phase
-    # read — 1 point to count, then ~6.6 per map asked for — the whole fleet costs 42 points
-    # against the unchanged 60-point ceiling, so every row is fresh every pass (#497).
-    costs = {"o/agentflow": (21, (_map(1), _map(2), _map(3))), "o/ciq": (14, (_map(4), _map(5)))}
+def test_the_whole_real_shaped_fleet_refreshes_in_one_pass_inside_the_heartbeat_budget(monkeypatch):
+    """ADR 374's budget, stated as the thing it is for: every enrolled repository refreshed in
+    one 300-second heartbeat, inside 63 GitHub requests and 250 points. A repository that sits
+    out a heartbeat drifts past the two-heartbeat freshness window, and the console starts
+    telling the operator its own data cannot be trusted.
+
+    The enrolled fleet as measured: nine repositories, seven with no Decision Maps at all, one
+    with three and one with two, and one of those maps has handed a Build Issue off — so the
+    closing-PR join runs too, and is counted here rather than assumed free. Priced the way GitHub
+    bills the counting read and then the detail read — 1 point to count, then the page sizes the
+    count justifies — the whole pass costs 43 points, well inside both halves of the budget."""
+    costs = {"o/agentflow": (21, (_handed_off_map(1), _map(2), _map(3))),
+             "o/ciq": (14, (_map(4), _map(5)))}
+    tally = {"requests": 0, "points": 0, "joins": 0}
 
     def read_maps(repo, **kw):
         cost, maps = costs.get(repo, (1, ()))
+        tally["requests"] += 2 if maps else 1  # count, then detail only where maps exist
+        tally["points"] += cost
         return _maps_read(cost=cost, remaining=4990, maps=maps, total_count=len(maps))
 
+    def read_links(repo, nums):
+        if not nums:  # no verified handoff, so the daemon asks GitHub nothing here
+            return _links_read(cost=0, remaining=4990)
+        tally["requests"] += 1
+        tally["joins"] += 1
+        tally["points"] += 1
+        return _links_read(cost=1, remaining=4990)
+
+    def read_prs(repo, state):
+        tally["requests"] += 1
+        return []
+
     monkeypatch.setattr(github, "decision_maps", read_maps)
-    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
-    monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
+    monkeypatch.setattr(github, "handoff_pr_links_read", read_links)
+    monkeypatch.setattr(github, "list_pipeline_prs", read_prs)
 
     repos = ([_cfg("o/agentflow"), _cfg("o/ciq")]
              + [_cfg(f"o/quiet{i}") for i in range(7)])
@@ -228,8 +389,12 @@ def test_the_whole_real_shaped_fleet_refreshes_in_one_pass_inside_the_point_ceil
     statuses = {r["name_with_owner"]: r["github"]["status"] for r in snapshot["repositories"]}
     assert all(status == "fresh" for status in statuses.values()), statuses
     assert len({r["github"]["fresh_at"] for r in snapshot["repositories"]}) == 1
-    assert budget["spent"] == 42
-    assert budget["spent"] < operator_projection.POINT_CEILING == 60
+    assert budget["spent"] == 43
+    assert tally["joins"] == 1, "the handoff join is one of the requests being counted"
+    assert tally["points"] == budget["spent"], "every request the fleet made is in the total"
+    assert tally["requests"] <= 63, tally
+    assert operator_projection.POINT_CEILING == 250
+    assert budget["spent"] <= operator_projection.POINT_CEILING
     assert budget["stopped"] is False, "the ceiling stop never fires for today's fleet"
 
 
@@ -247,7 +412,7 @@ def test_never_loaded_repositories_are_read_before_stale_but_once_fresh_ones():
 
 def test_project_output_order_stays_config_order_regardless_of_walk_order(monkeypatch):
     monkeypatch.setattr(github, "decision_maps", lambda repo, **kw: _maps_read())
-    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    monkeypatch.setattr(github, "handoff_pr_links_read", lambda repo, nums: _links_read())
     monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
     previous_snapshot = {"repositories": [
         {"name_with_owner": "o/a", "github": {"status": "fresh",
@@ -402,6 +567,10 @@ def test_a_repository_the_daemons_own_refresh_skipped_names_the_daemon_not_githu
     failed = operator_projection.attention([], [
         _repository(status="stale", error="the map read failed")])
     assert failed["rows"][0]["detail"] == "the last read of this repository failed"
+    # GitHub's own diagnostic is evidence in the snapshot, not new copy for this row.
+    diagnosed = operator_projection.attention([], [
+        _repository(status="stale", error="API rate limit exceeded for user ID 1.")])
+    assert diagnosed["rows"][0]["detail"] == "the last read of this repository failed"
 
 
 def test_every_row_carries_an_authoritative_github_url_for_acting_on_it():

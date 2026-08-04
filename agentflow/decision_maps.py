@@ -3,7 +3,7 @@
 honest snapshot shape the operator briefing renders: frontier classification, verified handoff
 discovery, and contextual ADR-link scraping. Every function here is pure — the GitHub reads that
 feed it are exercised live, through :func:`agentflow.github.decision_maps` and
-:func:`agentflow.github.handoff_pr_links`.
+:func:`agentflow.github.handoff_pr_links_read`.
 """
 
 from __future__ import annotations

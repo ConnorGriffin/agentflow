@@ -649,7 +649,9 @@ def test_publish_snapshot_composes_v1_and_schema_v2(tmp_path, monkeypatch):
     monkeypatch.setattr(github, "decision_maps",
                         lambda repo, **kw: github.MapsRead(maps=(), total_count=0, cost=1,
                                                            remaining=4999))
-    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    monkeypatch.setattr(github, "handoff_pr_links_read",
+                        lambda repo, nums: github.HandoffLinksRead(links={}, cost=0,
+                                                                   remaining=None))
     monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
 
     v1 = {"dispatch": {"enabled": True}, "daemon": {"gh_fresh_at": "2026-07-30T00:00:00+00:00"},

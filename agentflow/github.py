@@ -195,11 +195,37 @@ class MapRow:
 class MapsRead:
     """One repository's bounded Decision Map read: the active maps found, GitHub's own
     ``totalCount`` for overflow, and the point cost/remaining budget the daemon's stop
-    signal reads (ADR 0036)."""
+    signal reads (ADR 0036). ``error`` is set — and ``maps`` empty — exactly when the read
+    failed, carrying GitHub's own diagnostic so the projection can say *why* rather than
+    only *that* (ADR 374)."""
     maps: tuple[MapRow, ...]
     total_count: int
     cost: int | None
     remaining: int | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class MapQueryRead:
+    """One Decision Map GraphQL call exactly as GitHub answered it: the whole parsed response
+    kept for evidence, its ``data`` payload for typing, the point cost/remaining it reported,
+    and a human-safe diagnostic when the call failed (ADR 374). Only the two Decision Map
+    queries are read this way — every other typed read keeps the plain "``None`` means
+    unreadable" contract."""
+    raw: Any | None
+    payload: dict | None
+    cost: int | None
+    remaining: int | None
+    error: str | None
+
+
+@dataclass(frozen=True)
+class HandoffLinksRead:
+    """The typed handoff-link join plus the accounting and diagnostic from its map query."""
+    links: dict[int, HandoffLinkRow]
+    cost: int | None
+    remaining: int | None
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +291,19 @@ def _read_json(args: list[str]) -> Any | None:
 def _labels_of(node: dict) -> frozenset[str]:
     return frozenset(
         lbl["name"] for lbl in node.get("labels", [])
+        if isinstance(lbl, dict) and lbl.get("name")
+    )
+
+
+def _connected_labels_of(node: dict) -> frozenset[str]:
+    """Labels as GraphQL nests them — ``labels(first:N){nodes{name}}`` — rather than the flat
+    list `gh`'s porcelain returns. Kept separate from :func:`_labels_of` on purpose: only the
+    Decision Map query asks for a label *connection*, and one parser guessing which of the two
+    shapes it was handed would silently return an empty set for whichever it guessed wrong."""
+    labels = node.get("labels")
+    nodes = labels.get("nodes") if isinstance(labels, dict) else None
+    return frozenset(
+        lbl["name"] for lbl in (nodes or [])
         if isinstance(lbl, dict) and lbl.get("name")
     )
 
@@ -822,6 +861,10 @@ def merge_pr(repo: str, pr: int) -> bool:
 # aliased per issue number since there is no batch-by-number porcelain; full pipeline evidence
 # (title, merge commit, review, CI) is then resolved from the PR listings the daemon already
 # reads (:func:`list_pipeline_prs`), not re-fetched here.
+#
+# These reads are also the only ones that keep GitHub's own words when they fail (ADR 374): the
+# projection publishes a per-repository reason an operator can act on, so "that repository does
+# not exist" must not arrive as the same four words as "the hourly budget is gone".
 
 _MAP_LABEL = "wayfinder:map"
 
@@ -855,9 +898,10 @@ _MAPS_QUERY = (
 
 
 def _handoff_candidate_row(node: dict, repo: str) -> HandoffCandidateRow:
+    # Labels arrive as a connection here — this is the only read that asks for them that way.
     return HandoffCandidateRow(
         number=node["number"], title=node.get("title", "") or "", url=node.get("url", "") or "",
-        body=node.get("body", "") or "", labels=_labels_of(node),
+        body=node.get("body", "") or "", labels=_connected_labels_of(node),
         repo=((node.get("repository") or {}).get("nameWithOwner")) or repo)
 
 
@@ -892,90 +936,141 @@ def _map_row(node: dict, repo: str) -> MapRow:
         else len(children))
 
 
-def _rate_of(payload: dict) -> tuple[int | None, int | None]:
-    rate = payload.get("rateLimit") or {}
-    cost = rate.get("cost") if isinstance(rate.get("cost"), int) else None
-    remaining = rate.get("remaining") if isinstance(rate.get("remaining"), int) else None
-    return cost, remaining
+_READ_FAILED = "the map read failed"
+_DIAGNOSTIC_CHARS = 300
 
 
-def _graphql_payload(args: list[str]) -> dict | None:
-    data = api(["api", "graphql"] + args, parse_json=True)
-    if not isinstance(data, dict):
-        return None
-    payload = data.get("data")
-    return payload if isinstance(payload, dict) else None
+def _diagnostic(messages: list[str]) -> str:
+    """GitHub's own words about a failed map read, made safe to publish: whitespace collapsed to
+    one line and bounded, since this text lands in the operator's snapshot."""
+    text = " · ".join(" ".join(m.split()) for m in messages if m.strip())
+    if len(text) > _DIAGNOSTIC_CHARS:
+        text = text[:_DIAGNOSTIC_CHARS - 1].rstrip() + "…"
+    return text or _READ_FAILED
+
+
+def _map_query(args: list[str]) -> MapQueryRead:
+    """The read path every Decision Map query shares. Unlike :func:`_read_json`, a failure here
+    keeps GitHub's own explanation — `gh`'s stderr and any GraphQL ``errors[].message`` — rather
+    than flattening everything to ``None`` (ADR 374). Deliberately narrow: the map projection is
+    the only read with somewhere honest to publish a reason, and every other typed read keeps
+    the fail-closed contract :func:`_read_json` owns."""
+    r = _gh(["api", "graphql", *args])
+    try:
+        raw = json.loads(r.stdout or "")
+    except json.JSONDecodeError:
+        raw = None
+    payload = raw.get("data") if isinstance(raw, dict) else None
+    messages = [str(e.get("message")) for e in ((raw or {}).get("errors") or [])
+                if isinstance(raw, dict) and isinstance(e, dict) and e.get("message")]
+    if (r.stderr or "").strip():
+        messages.append(r.stderr)
+    rate = (payload or {}).get("rateLimit") or {}
+    failed = r.returncode != 0 or not isinstance(payload, dict) or bool(messages)
+    return MapQueryRead(
+        raw=raw, payload=payload if isinstance(payload, dict) else None,
+        cost=rate.get("cost") if isinstance(rate.get("cost"), int) else None,
+        remaining=rate.get("remaining") if isinstance(rate.get("remaining"), int) else None,
+        error=_diagnostic(messages) if failed else None)
+
+
+def _summed(*costs: int | None) -> int | None:
+    """What a multi-phase read spent, or ``None`` when GitHub reported nothing at all."""
+    reported = [c for c in costs if c is not None]
+    return sum(reported) if reported else None
+
+
+def _handoff_numbers(numbers: list[int]) -> list[int]:
+    """The issue numbers the closing-PR batch query actually asks about — deduplicated and
+    ordered, so one alias exists per issue and the argv is stable run to run."""
+    return sorted({n for n in numbers if isinstance(n, int)})
+
+
+def _handoff_links_argv(repo: str, numbers: list[int]) -> list[str]:
+    owner, _, name = repo.partition("/")
+    fields = "".join(
+        f'i{n}:issue(number:{n}){{closedByPullRequestsReferences'
+        f'(first:5,includeClosedPrs:true){{totalCount nodes{{number}}}}}}'
+        for n in _handoff_numbers(numbers))
+    query = (f"query($owner:String!,$name:String!){{rateLimit{{cost remaining}} "
+             f"repository(owner:$owner,name:$name){{{fields}}}}}")
+    return ["-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}"]
+
+
+def decision_maps_with_evidence(
+    repo: str, *, limit: int = 5, children_limit: int = 50, edges_limit: int = 10,
+) -> tuple[MapsRead, tuple[MapQueryRead, ...]]:
+    """The map read *and* every raw response it made along the way, for the read-only probe to
+    print as evidence. :func:`decision_maps` is the front door every ordinary caller wants."""
+    owner, _, name = repo.partition("/")
+    identity = ["-f", f"owner={owner}", "-f", f"name={name}", "-f", f"label[]={_MAP_LABEL}"]
+
+    discovery = _map_query(["-f", f"query={_MAPS_DISCOVERY_QUERY}", *identity])
+    counted = (((discovery.payload or {}).get("repository") or {}).get("issues")
+               or {}).get("totalCount")
+    if discovery.error or not isinstance(counted, int):
+        return MapsRead(maps=(), total_count=0, cost=discovery.cost,
+                        remaining=discovery.remaining,
+                        error=discovery.error or _READ_FAILED), (discovery,)
+    if counted <= 0:
+        return MapsRead(maps=(), total_count=0, cost=discovery.cost,
+                        remaining=discovery.remaining), (discovery,)
+
+    detail = _map_query(
+        ["-f", f"query={_MAPS_QUERY}", *identity,
+         "-F", f"mapsFirst={min(counted, limit)}", "-F", f"childrenFirst={children_limit}",
+         "-F", f"edgesFirst={edges_limit}"])
+    issues = ((detail.payload or {}).get("repository") or {}).get("issues") or {}
+    nodes = issues.get("nodes")
+    spent = _summed(discovery.cost, detail.cost)
+    if detail.error or not isinstance(nodes, list):
+        return MapsRead(maps=(), total_count=0, cost=spent, remaining=detail.remaining,
+                        error=detail.error or _READ_FAILED), (discovery, detail)
+    maps = tuple(_map_row(n, repo) for n in nodes if isinstance(n, dict))
+    return MapsRead(
+        maps=maps,
+        total_count=issues.get("totalCount") if isinstance(issues.get("totalCount"), int)
+        else len(maps),
+        cost=spent, remaining=detail.remaining), (discovery, detail)
 
 
 def decision_maps(repo: str, *, limit: int = 5, children_limit: int = 50,
-                  edges_limit: int = 10) -> MapsRead | None:
+                  edges_limit: int = 10) -> MapsRead:
     """The repository's active Decision Maps (open issues labeled ``wayfinder:map``), newest
     first, each with its bounded decision-child set and just enough dependency-graph data to
-    classify the frontier and discover handoff candidates — or ``None`` when the read failed.
-    An enrolled repository with no maps returns an empty read, not ``None`` (ADR 0036).
+    classify the frontier and discover handoff candidates. A failed read comes back with no maps
+    and an ``error`` carrying GitHub's own words; an enrolled repository with no maps comes back
+    empty with no error, which is a different fact (ADR 0036).
 
     Asks how many maps the repository has before asking what is in them, and pays for detail
     only up to that count (#497) — a repository with none is completely answered by the count.
     Both phases are one read behind one front door: either the caller gets the whole answer
     with both phases' costs summed, or — if *either* call fails — nothing at all, since an
     empty map set published for a repository that has three would be a confident falsehood."""
-    owner, _, name = repo.partition("/")
-    identity = ["-f", f"owner={owner}", "-f", f"name={name}", "-f", f"label[]={_MAP_LABEL}"]
-
-    discovered = _graphql_payload(["-f", f"query={_MAPS_DISCOVERY_QUERY}"] + identity)
-    if discovered is None:
-        return None
-    counted = ((discovered.get("repository") or {}).get("issues") or {}).get("totalCount")
-    if not isinstance(counted, int):
-        return None
-    cost, remaining = _rate_of(discovered)
-    if counted <= 0:
-        return MapsRead(maps=(), total_count=0, cost=cost, remaining=remaining)
-
-    payload = _graphql_payload(
-        ["-f", f"query={_MAPS_QUERY}"] + identity
-        + ["-F", f"mapsFirst={min(counted, limit)}", "-F", f"childrenFirst={children_limit}",
-           "-F", f"edgesFirst={edges_limit}"])
-    if payload is None:
-        return None
-    issues = ((payload.get("repository") or {}).get("issues")) or {}
-    nodes = issues.get("nodes")
-    if not isinstance(nodes, list):
-        return None
-    maps = tuple(_map_row(n, repo) for n in nodes if isinstance(n, dict))
-    detail_cost, remaining = _rate_of(payload)
-    return MapsRead(
-        maps=maps,
-        total_count=issues.get("totalCount") if isinstance(issues.get("totalCount"), int)
-        else len(maps),
-        cost=None if cost is None and detail_cost is None else (cost or 0) + (detail_cost or 0),
-        remaining=remaining)
+    read, _evidence = decision_maps_with_evidence(
+        repo, limit=limit, children_limit=children_limit, edges_limit=edges_limit)
+    return read
 
 
-def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow] | None:
+def handoff_pr_links_response(repo: str, numbers: list[int]) -> MapQueryRead:
+    """GitHub's own answer to the handoff closing-PR batch query, before any typing — the last
+    of the map reads, exposed for the same probe evidence."""
+    return _map_query(_handoff_links_argv(repo, numbers))
+
+
+def handoff_pr_links_read(repo: str, numbers: list[int]) -> HandoffLinksRead:
     """The native closing-PR numbers for each verified handoff Build Issue in ``numbers``
-    (ADR 0036's join key), or ``None`` when the read failed. An empty ``numbers`` makes no
-    call and returns ``{}``. Batched as one query with one alias per issue — there is no
-    porcelain for "these N issues' closing PRs" in a single call."""
-    wanted = sorted({n for n in numbers if isinstance(n, int)})
+    (ADR 0036's join key), together with this query's diagnostic and point accounting. An empty
+    ``numbers`` makes no call and returns an empty successful read. Batched as one query with one
+    alias per issue — there is no porcelain for "these N issues' closing PRs" in a single call."""
+    wanted = _handoff_numbers(numbers)
     if not wanted:
-        return {}
-    owner, _, name = repo.partition("/")
-    fields = "".join(
-        f'i{n}:issue(number:{n}){{closedByPullRequestsReferences'
-        f'(first:5,includeClosedPrs:true){{totalCount nodes{{number}}}}}}'
-        for n in wanted)
-    query = f"query($owner:String!,$name:String!){{repository(owner:$owner,name:$name){{{fields}}}}}"
-    data = api(["api", "graphql", "-f", f"query={query}",
-               "-f", f"owner={owner}", "-f", f"name={name}"], parse_json=True)
-    if not isinstance(data, dict):
-        return None
-    payload = data.get("data")
-    if not isinstance(payload, dict):
-        return None
-    repo_node = payload.get("repository")
-    if not isinstance(repo_node, dict):
-        return None
+        return HandoffLinksRead(links={}, cost=0, remaining=None)
+    response = handoff_pr_links_response(repo, wanted)
+    repo_node = (response.payload or {}).get("repository")
+    if response.error or not isinstance(repo_node, dict):
+        return HandoffLinksRead(links={}, cost=response.cost, remaining=response.remaining,
+                                error=response.error or _READ_FAILED)
     out: dict[int, HandoffLinkRow] = {}
     for n in wanted:
         node = repo_node.get(f"i{n}") or {}
@@ -986,18 +1081,19 @@ def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow]
             number=n, pr_numbers=pr_numbers,
             attempt_count=refs.get("totalCount") if isinstance(refs.get("totalCount"), int)
             else len(pr_numbers))
-    return out
+    return HandoffLinksRead(links=out, cost=response.cost, remaining=response.remaining)
 
 
 # --- escape hatch --------------------------------------------------------------
 
 def api(args: list[str], *, parse_json: bool = False) -> Any | None:
     """The one explicitly-marked escape hatch for GitHub calls that don't fit the typed
-    surface — a GraphQL comment edit, a REST blockers read, the auth token. It runs
-    ``gh <args>`` through the same fail-closed handling as every read: ``None`` means the
-    command failed. Otherwise it returns the parsed JSON (when ``parse_json``) or the
-    stripped stdout string. A caller reaching for this owns GitHub's shape for that one
-    call — but nowhere else does anything shell out to `gh`."""
+    surface. Four callers use it, and the census is enforced by test, not trust: the REST
+    blocker read, the auth token, the combined add-and-remove label edit, and the parent-map
+    GraphQL lookup. It runs ``gh <args>`` through the same fail-closed handling as every read:
+    ``None`` means the command failed. Otherwise it returns the parsed JSON (when
+    ``parse_json``) or the stripped stdout string. A caller reaching for this owns GitHub's
+    shape for that one call — but nowhere else does anything shell out to `gh`."""
     if parse_json:
         return _read_json(args)
     r = _gh(args)
