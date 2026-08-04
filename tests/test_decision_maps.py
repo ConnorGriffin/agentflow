@@ -1,9 +1,17 @@
 """Decision Map projection shaping (ADR 0036) — pure classification, handoff verification, and
-ADR-link scraping, exercised through the module's public functions on typed GitHub rows."""
+ADR-link scraping, exercised through the module's public functions on typed GitHub rows.
+
+The last two sections work one layer down, against raw GraphQL responses shaped exactly like the
+live ones (ADR 374). They exist because a typed-row fixture cannot see a wire-shape regression:
+the handoff label filter was proven at the row level for a month while the live read handed it an
+empty label set on every repository in the fleet."""
 
 from __future__ import annotations
 
-from agentflow import decision_maps, github
+import json
+import subprocess
+
+from agentflow import cli, decision_maps, github
 
 
 def _child(number=1, *, state="OPEN", assigned=False, blocked_by_open=0, blocked_by_closed=0,
@@ -171,3 +179,226 @@ def test_maps_component_carries_githubs_total_for_overflow():
         read, repo="o/r", handoff_links={}, open_prs=[], merged_prs=[])
     assert component["active_total"] == 7
     assert len(component["active"]) == 1
+
+
+# --- the wire: what GitHub actually sends back --------------------------------------------
+# One map (#179) with two decision children. The closed child #184 links onward to two issues:
+# an ordinary Build Issue carrying the handoff marker, and a map artifact carrying a
+# `wayfinder:` label that must never be presented as a handoff. Labels arrive nested under
+# `nodes` — the connection shape the query asks for — which is the shape that used to be parsed
+# as a flat list and silently came back empty.
+
+MARKER = decision_maps.handoff_marker(179)
+
+_CANDIDATE_BUILD = {
+    "number": 505, "title": "Make the map reads trustworthy",
+    "url": "https://github.com/o/r/issues/505",
+    "body": f"Some brief text.\n\n{MARKER}\n",
+    "labels": {"nodes": [{"name": "ready-for-agent"}, {"name": "agentflow:building"}]},
+    "repository": {"nameWithOwner": "o/r"},
+}
+_CANDIDATE_MAP_ARTIFACT = {
+    "number": 374, "title": "Wayfinder research on the same map",
+    "url": "https://github.com/o/r/issues/374",
+    "body": f"Grounding for the map.\n\n{MARKER}\n",
+    "labels": {"nodes": [{"name": "wayfinder:research"}]},
+    "repository": {"nameWithOwner": "o/r"},
+}
+
+_MAPS_RESPONSE = {
+    "data": {
+        "rateLimit": {"cost": 5, "remaining": 4990},
+        "repository": {"issues": {
+            "totalCount": 1,
+            "nodes": [{
+                "number": 179, "title": "Map: the operator console",
+                "url": "https://github.com/o/r/issues/179",
+                "updatedAt": "2026-07-30T00:00:00Z",
+                "body": "## Decisions so far\n- [ADR 36](docs/adr/0036-bounded.md)\n",
+                "subIssues": {
+                    "totalCount": 2,
+                    "nodes": [
+                        {"number": 184, "title": "Terminal slicing decision",
+                         "url": "https://github.com/o/r/issues/184", "state": "CLOSED",
+                         "assignees": {"totalCount": 0},
+                         "blockedBy": {"totalCount": 1,
+                                       "nodes": [{"number": 183, "state": "CLOSED"}]},
+                         "blocking": {"nodes": [_CANDIDATE_BUILD, _CANDIDATE_MAP_ARTIFACT]}},
+                        {"number": 405, "title": "The next decision",
+                         "url": "https://github.com/o/r/issues/405", "state": "OPEN",
+                         "assignees": {"totalCount": 0},
+                         "blockedBy": {"totalCount": 0, "nodes": []},
+                         "blocking": {"nodes": []}},
+                    ],
+                },
+            }],
+        }},
+    },
+}
+
+_LINKS_RESPONSE = {
+    "data": {
+        "rateLimit": {"cost": 1, "remaining": 4989},
+        "repository": {"i505": {"closedByPullRequestsReferences": {
+            "totalCount": 2, "nodes": [{"number": 358}, {"number": 361}]}}},
+    },
+}
+
+
+def _counted(maps):
+    """The cheap counting answer that precedes a detail read (#497), derived from the detail
+    response so a fixture states its maps once. A malformed or failed detail response answers
+    the count the same way, so a failure is a failure from the first call."""
+    nodes = None
+    if isinstance(maps, dict):
+        nodes = (((maps.get("data") or {}).get("repository") or {})
+                 .get("issues") or {}).get("nodes")
+    if nodes is None:
+        return maps
+    return {"data": {"rateLimit": {"cost": 1, "remaining": 4991},
+                     "repository": {"issues": {"totalCount": len(nodes)}}}}
+
+
+def _wire(monkeypatch, *, maps=_MAPS_RESPONSE, links=_LINKS_RESPONSE, returncode=0, stderr=""):
+    """Answer every Decision Map read with real-shaped GraphQL responses — the cheap count, the
+    detail read it justifies, and the handoff join — recording each `gh` argument vector the
+    module built so a test can state which query ran."""
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, timeout=None):
+        calls.append(list(cmd))
+        query = next((a for a in cmd if a.startswith("query=")), "")
+        if "closedByPullRequestsReferences" in query:
+            payload = links
+        elif "subIssues" in query:
+            payload = maps
+        else:
+            payload = _counted(maps)
+        stdout = payload if isinstance(payload, str) else json.dumps(payload)
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr(github, "_run", fake_run)
+    return calls
+
+
+def test_candidate_labels_are_read_from_the_label_connection(monkeypatch):
+    # The query asks for `labels(first:20){nodes{name}}`; parsing that as a flat list returns
+    # nothing, which is what made every live candidate look unlabelled.
+    _wire(monkeypatch)
+    read = github.decision_maps("o/r")
+    candidates = read.maps[0].children[0].handoff_candidates
+    assert {c.number: set(c.labels) for c in candidates} == {
+        505: {"ready-for-agent", "agentflow:building"},
+        374: {"wayfinder:research"}}
+
+
+def test_a_map_artifact_never_reaches_the_verified_handoffs_from_the_wire(monkeypatch):
+    # Both linked issues carry the marker and sit in the same repository, so the label
+    # namespace is the only thing keeping the map's own research issue out of the handoff
+    # list — and that filter can only fire if the labels survived the parse.
+    _wire(monkeypatch)
+    read = github.decision_maps("o/r")
+    handoffs, overflow = decision_maps.verified_handoffs(read.maps[0], repo="o/r")
+    assert [h.number for h in handoffs] == [505]
+    assert overflow is False
+
+
+def test_a_live_shaped_response_types_the_whole_map(monkeypatch):
+    _wire(monkeypatch)
+    read = github.decision_maps("o/r")
+    assert read.error is None
+    assert (read.cost, read.remaining, read.total_count) == (6, 4990, 1), (
+        "one point to count the maps, five to read them")
+    map_row = read.maps[0]
+    assert (map_row.number, map_row.updated_at) == (179, "2026-07-30T00:00:00Z")
+    assert map_row.children_total == 2
+    assert [decision_maps.classify_child(c) for c in map_row.children] == ["done", "frontier"]
+
+
+def test_an_enrolled_repository_with_no_maps_reads_empty_not_failed(monkeypatch):
+    _wire(monkeypatch, maps={"data": {"rateLimit": {"cost": 1, "remaining": 4999},
+                                      "repository": {"issues": {"totalCount": 0, "nodes": []}}}})
+    read = github.decision_maps("o/r")
+    assert read.maps == () and read.total_count == 0
+    assert read.error is None, "no maps is a fact about the repository, not a failed read"
+
+
+def test_a_graphql_error_response_keeps_githubs_own_words(monkeypatch):
+    _wire(monkeypatch, returncode=1,
+          maps={"errors": [{"message": "Could not resolve to a Repository with the name 'o/r'."}]})
+    read = github.decision_maps("o/r")
+    assert read.maps == ()
+    assert "Could not resolve to a Repository" in read.error
+
+
+def test_an_unreadable_map_response_reports_the_command_failure(monkeypatch):
+    _wire(monkeypatch, returncode=1, maps="not json at all",
+          stderr="gh: HTTP 502: Bad gateway (api.github.com/graphql)")
+    read = github.decision_maps("o/r")
+    assert read.maps == ()
+    assert "502" in read.error and "\n" not in read.error
+
+
+def test_a_silent_failure_still_carries_a_reason(monkeypatch):
+    _wire(monkeypatch, returncode=1, maps="", stderr="")
+    assert github.decision_maps("o/r").error == "the map read failed"
+
+
+def test_handoff_links_type_the_closing_pull_requests_from_the_wire(monkeypatch):
+    calls = _wire(monkeypatch)
+    links = github.handoff_pr_links("o/r", [505])
+    assert links == {505: github.HandoffLinkRow(number=505, pr_numbers=(358, 361),
+                                                attempt_count=2)}
+    query = next(a for a in calls[0] if a.startswith("query="))
+    assert "i505:issue(number:505)" in query
+
+
+def test_a_failed_handoff_link_read_is_unknown(monkeypatch):
+    _wire(monkeypatch, returncode=1,
+          links={"errors": [{"message": "Something went wrong while executing your query."}]})
+    assert github.handoff_pr_links("o/r", [505]) is None
+
+
+def test_no_handoffs_asks_github_nothing(monkeypatch):
+    calls = _wire(monkeypatch)
+    assert github.handoff_pr_links("o/r", []) == {}
+    assert calls == []
+
+
+# --- the read-only probe (`agentflow decision-map-probe`) ----------------------------------
+
+_WRITE_WORDS = {"edit", "create", "comment", "close", "reopen", "merge", "delete", "review"}
+
+
+def test_the_probe_runs_the_production_queries_and_prints_what_github_answered(
+        monkeypatch, capsys):
+    calls = _wire(monkeypatch)
+    assert cli.main(["decision-map-probe", "--repo", "o/r"]) == 0
+    out = capsys.readouterr().out
+
+    queries = [next(a for a in cmd if a.startswith("query=")) for cmd in calls]
+    assert queries[0] == f"query={github._MAPS_DISCOVERY_QUERY}", "the count comes first"
+    assert queries[1] == f"query={github._MAPS_QUERY}", "then the production detail query"
+    assert "i505:issue(number:505)" in queries[2], "and the handoff the maps verified"
+    assert '"number": 179' in out and '"wayfinder:research"' in out, "raw responses, whole"
+    assert "cost: 1 points, 4991 remaining" in out
+    assert "cost: 5 points, 4990 remaining" in out
+    assert "cost: 1 points, 4989 remaining" in out
+    assert "combined cost: 7 points across 3 requests" in out
+
+
+def test_the_probe_writes_nothing_to_github(monkeypatch):
+    calls = _wire(monkeypatch)
+    cli.main(["decision-map-probe", "--repo", "o/r"])
+    assert [cmd[:3] for cmd in calls] == [["gh", "api", "graphql"]] * 3
+    spoken = {word for cmd in calls for arg in cmd for word in arg.split()}
+    assert not spoken & _WRITE_WORDS, "a probe that could mutate anything is not a probe"
+
+
+def test_the_probe_reports_a_failed_read_instead_of_an_empty_map(monkeypatch, capsys):
+    _wire(monkeypatch, returncode=1,
+          maps={"errors": [{"message": "API rate limit exceeded"}]})
+    cli.main(["decision-map-probe", "--repo", "o/r"])
+    out = capsys.readouterr().out
+    assert "error: API rate limit exceeded" in out
+    assert "not issued" in out, "no maps read means no handoff join to make"

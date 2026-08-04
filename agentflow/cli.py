@@ -85,6 +85,11 @@ def main(argv: list[str] | None = None) -> int | None:
     floodgates_commands.add_parser("open", help="lift the weekly allowance and spend ceiling")
     floodgates_commands.add_parser("close", help="restore the ordinary headroom policy")
     floodgates_commands.add_parser("status", help="show whether floodgates is open")
+    probe_command = commands.add_parser(
+        "decision-map-probe",
+        help="print the two Decision Map reads for one repository, with their point cost",
+    )
+    probe_command.add_argument("--repo", required=True, help="OWNER/REPO to read")
     daemon_command = commands.add_parser("daemon", help="run the fleet daemon")
     daemon_command.add_argument("--config", help="path to config.toml")
     daemon_command.add_argument(
@@ -164,6 +169,11 @@ def main(argv: list[str] | None = None) -> int | None:
         except ValueError as exc:
             parser.error(str(exc))
         return 0 if report.ready else 1
+    elif args.command == "decision-map-probe":
+        from agentflow.operator_projection import decision_map_probe
+
+        print(decision_map_probe(args.repo))
+        return 0
     elif args.command == "daemon":
         from agentflow import daemon
 

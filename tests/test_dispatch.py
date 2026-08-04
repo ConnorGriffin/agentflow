@@ -972,6 +972,50 @@ def test_no_module_outside_the_github_module_shells_out_to_gh():
                     f"GitHub access outside the github module: {path}:{node.lineno}")
 
 
+# The whole census of code that reaches past the typed GitHub surface for a raw `gh` call, with
+# the one reason each is there. ADR 0040 bounds this hatch rather than banning it, and a bound
+# nobody counts is not a bound: a fifth caller is a decision to make, not a diff to wave through.
+_ESCAPE_HATCH_CALLERS = {
+    "loop.py": "the REST blocked-by dependency read, which has no GraphQL equivalent",
+    "intake_attachments.py": "the auth token an attachment download needs",
+    "coordinated_mockup.py": "adding and removing a label in one atomic write",
+    "coordinated_research.py": "the parent-map GraphQL lookup",
+}
+
+
+def _calls_the_escape_hatch(tree: ast.AST) -> bool:
+    """Does this module call ``github.api`` — under that name, or imported bare as ``api``?"""
+    imported = {alias.asname or alias.name
+                for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+                and (node.module or "").endswith("github")
+                for alias in node.names if alias.name == "api"}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "api" and isinstance(
+                func.value, ast.Name) and func.value.id == "github":
+            return True
+        if isinstance(func, ast.Name) and func.id in imported:
+            return True
+    return False
+
+
+def test_the_github_escape_hatch_has_exactly_the_four_declared_callers():
+    """ADR 0040's hatch is deliberately open — a REST-only read, an auth token, an atomic label
+    edit and a GraphQL parent lookup have no typed equivalent. What it is not is unattended.
+
+    The census is checked by call site, not by argument vector: two of the four build no `["api",
+    …]` list at all, so a rule watching argv would report a bounded hatch while half of it went
+    unwatched."""
+    root = Path(__file__).parents[1] / "agentflow"
+    found = {path.name for path in root.rglob("*.py")
+             if path != root / "github.py" and _calls_the_escape_hatch(ast.parse(path.read_text()))}
+    assert found == set(_ESCAPE_HATCH_CALLERS), (
+        "the raw GitHub escape hatch gained or lost a caller — name it and its reason here, "
+        f"or route it through the typed surface: {sorted(found ^ set(_ESCAPE_HATCH_CALLERS))}")
+
+
 # GitHub's own wire field names. Each is now read exclusively inside `github.py` and handed
 # back as a typed row field, so a reappearance anywhere else is a stage re-learning GitHub's
 # schema.
