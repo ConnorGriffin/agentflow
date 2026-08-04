@@ -42,6 +42,29 @@ def classify_child(child: github.MapChildRow) -> str:
     return "frontier"
 
 
+def frontier_state(child_statuses: list[str], *, children_truncated: bool) -> str:
+    """Which of the four mutually exclusive things a map's frontier line may say, from its
+    children's classifications alone (ADR 0036).
+
+    ``unverified`` whenever any child's blocker data was incomplete — a frontier claimed
+    beside data we could not read is the exact falsehood this projection exists to avoid, so
+    that answer wins over every other. Then ``named`` when at least one child is open,
+    unclaimed and provably unblocked. Otherwise ``none_open`` when every child is settled, and
+    ``blocked`` when open children remain but none of them is takeable. A truncated child list
+    can still name a frontier it did return, but can never claim that nothing is open or that
+    everything is blocked — both are statements about children it never saw.
+    """
+    if "unknown" in child_statuses:
+        return "unverified"
+    if "frontier" in child_statuses:
+        return "named"
+    if children_truncated:
+        return "unverified"
+    if all(status == "done" for status in child_statuses):
+        return "none_open"
+    return "blocked"
+
+
 def handoff_marker(map_number: int) -> str:
     """The exact body marker a handoff Build Issue must carry (ADR 0036)."""
     return f"Wayfinder handoff: #{map_number}"
@@ -49,29 +72,31 @@ def handoff_marker(map_number: int) -> str:
 
 def verified_handoffs(
     map_row: github.MapRow, *, repo: str, limit: int = HANDOFF_LIMIT,
-) -> tuple[list[github.HandoffCandidateRow], bool]:
+) -> tuple[list[github.HandoffCandidateRow], int]:
     """Handed-off Build Issues for one map: candidates discovered from a *terminal* (closed)
     decision child's native ``blocking`` edge, kept only when the marker, label namespace, and
     repository all agree (ADR 0036) — the native edge is the machine join, the marker is the
-    human ledger, and both must say the same thing. Deduplicated by issue number, newest-number
-    first, bounded to ``limit`` with an explicit overflow flag."""
+    human ledger, and both must say the same thing.
+
+    Admission runs before deduplication, and deduplication keys on GitHub's node ID: an issue
+    number is only unique inside one repository, so keying on it lets a foreign issue that
+    happens to share a number decide the fate of a real handoff. Newest-number first, bounded
+    to ``limit``, with the count that did not fit."""
     marker = handoff_marker(map_row.number)
-    seen: dict[int, github.HandoffCandidateRow] = {}
+    seen: dict[str, github.HandoffCandidateRow] = {}
     for child in map_row.children:
         if classify_child(child) != "done":
             continue
         for candidate in child.handoff_candidates:
-            if candidate.number in seen:
-                continue
             if candidate.repo != repo:
                 continue
             if any(label.startswith("wayfinder:") for label in candidate.labels):
                 continue
             if marker not in candidate.body:
                 continue
-            seen[candidate.number] = candidate
+            seen.setdefault(candidate.id, candidate)
     ordered = sorted(seen.values(), key=lambda c: c.number, reverse=True)
-    return ordered[:limit], len(ordered) > limit
+    return ordered[:limit], max(0, len(ordered) - limit)
 
 
 def adr_links(body: str, *, limit: int = ADR_LIMIT) -> tuple[list[dict], int]:
@@ -114,29 +139,52 @@ def _ci_verdict(rollup) -> str | None:
     return "passing"
 
 
-def _pipeline_for(
-    pr_numbers: tuple[int, ...],
+def _selected_attempt(
+    attempts: tuple[github.HandoffAttemptRow, ...],
+) -> github.HandoffAttemptRow | None:
+    """Which of a handoff's returned closing-PR attempts speaks for it. Newest *merged* by
+    merge time wins outright, so a handoff that landed on its second try never reads from its
+    abandoned first; otherwise the newest still-open attempt, which is the one in flight; and
+    otherwise the newest attempt there is, which at least says something was tried."""
+    if not attempts:
+        return None
+    merged = [a for a in attempts if a.merged_at]
+    if merged:
+        return max(merged, key=lambda a: (a.merged_at, a.number))
+    still_open = [a for a in attempts if (a.state or "").upper() == "OPEN"]
+    return max(still_open or list(attempts), key=lambda a: a.number)
+
+
+def _landed_evidence(
+    link: github.HandoffLinkRow | None, *, unavailable: bool,
     open_prs: list[github.PipelinePrRow],
     merged_prs: list[github.PipelinePrRow],
 ) -> dict:
-    """The pipeline state for one handoff, from the PR numbers its closing references named —
-    merged wins, else the newest open attempt, else still building. The same merged-wins-over-
-    open rule as `dashboard_data.pipeline_state`, joined by number (ADR 0036's native closing
-    reference) instead of by branch name."""
-    by_number = {p.number: p for p in (*open_prs, *merged_prs)}
-    matches = [by_number[n] for n in pr_numbers if n in by_number]
-    merged = next((p for p in matches if p.merged_at), None)
-    if merged is not None:
-        return {"state": "merged", "pr_number": merged.number, "pr_url": merged.url,
-                "merged_at": merged.merged_at, "merge_commit": merged.merge_commit_oid,
-                "review": _review_verdict(merged.review_decision),
-                "ci": _ci_verdict(merged.ci_rollup)}
-    openpr = max((p for p in matches if not p.merged_at), key=lambda p: p.number, default=None)
-    if openpr is not None:
-        review = _review_verdict(openpr.review_decision)
-        return {"state": "in_review" if review else "pr_open", "pr_number": openpr.number,
-                "pr_url": openpr.url, "review": review, "ci": _ci_verdict(openpr.ci_rollup)}
-    return {"state": "building", "pr_number": None, "pr_url": None}
+    """One handoff's pipeline and landed state, decided by its native closing references
+    (ADR 0036) and never by a branch name. Those references carry landed state themselves, so
+    a pull request that merged before the console's PR listing window still reads as landed;
+    the listings only add the review and check verdicts they alone hold.
+
+    A failed reference read is ``unavailable``, which is a different fact from a handoff with
+    no closing pull request yet — that one is still ``building``."""
+    if unavailable:
+        return {"state": "unavailable", "pr_number": None, "pr_url": None}
+    chosen = _selected_attempt(link.attempts if link else ())
+    if chosen is None:
+        return {"state": "building", "pr_number": None, "pr_url": None}
+    listing = {p.number: p for p in (*open_prs, *merged_prs)}.get(chosen.number)
+    review = _review_verdict(listing.review_decision) if listing else None
+    ci = _ci_verdict(listing.ci_rollup) if listing else None
+    if chosen.merged_at:
+        return {"state": "merged", "pr_number": chosen.number, "pr_url": chosen.url,
+                "merged_at": chosen.merged_at,
+                "merge_commit": listing.merge_commit_oid if listing else None,
+                "review": review, "ci": ci}
+    if (chosen.state or "").upper() == "OPEN":
+        return {"state": "in_review" if review else "pr_open", "pr_number": chosen.number,
+                "pr_url": chosen.url, "review": review, "ci": ci}
+    return {"state": "pr_closed", "pr_number": chosen.number, "pr_url": chosen.url,
+            "review": review, "ci": ci}
 
 
 def _child_view(child: github.MapChildRow) -> dict:
@@ -144,42 +192,97 @@ def _child_view(child: github.MapChildRow) -> dict:
             "status": classify_child(child)}
 
 
+def _adr_url(url: str, repo: str) -> str:
+    """A scraped ADR link made reachable. Map bodies write these both ways — an absolute blob
+    URL, or the repository-relative path a file in the repository would use — and a relative
+    path is not something the console can open, so it is resolved against the repository the
+    map lives in."""
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    return f"https://github.com/{repo}/blob/HEAD/{url[url.index('docs/adr/'):]}"
+
+
+def _counted(n: int, noun: str) -> str:
+    return f"{n} {noun}" if n == 1 else f"{n} {noun}s"
+
+
 def map_view(
     map_row: github.MapRow, *, repo: str,
-    handoff_links: dict[int, github.HandoffLinkRow],
+    handoff_links: github.HandoffLinksRead,
     open_prs: list[github.PipelinePrRow],
     merged_prs: list[github.PipelinePrRow],
 ) -> dict:
-    """One active Decision Map, shaped for the snapshot: bounded children, the current
-    frontier, verified handoffs with pipeline evidence, and contextual ADR links. Pure —
-    every GitHub read has already happened by the time this runs."""
+    """One active Decision Map, shaped for the snapshot: bounded children, which of the four
+    things its frontier line may say, verified handoffs with landed evidence, and its
+    supporting records. Pure — every GitHub read has already happened by the time this runs.
+
+    The frontier list is published only when the frontier is actually named. Every other state
+    hands the console an empty list, so a presentation layer cannot claim a frontier this
+    projection has just refused to claim.
+
+    Supporting records carry every way this projection is smaller than the truth (ADR 0036 —
+    every overflow is explicit and links to GitHub). A record meaning *we could not read this*
+    says ``incomplete`` and names what was cut; one meaning *there is simply more* carries the
+    count that did not fit. All of them land on GitHub, which is where the rest actually is."""
     handoffs, handoffs_overflow = verified_handoffs(map_row, repo=repo)
     adrs, adrs_overflow = adr_links(map_row.body)
     children_view = [_child_view(c) for c in map_row.children]
-    frontier = [c for c in children_view if c["status"] == "frontier"]
+    statuses = [c["status"] for c in children_view]
+    children_overflow = max(0, map_row.children_total - len(children_view))
+    state = frontier_state(statuses, children_truncated=bool(children_overflow))
+    unknown_children = statuses.count("unknown")
+    # Only settled decisions are searched for handoffs, so only their truncated outgoing links
+    # can hide one — and hiding a handoff says nothing about the frontier, which reads the
+    # other edge direction entirely.
+    cut_handoff_edges = sum(1 for c in map_row.children if classify_child(c) == "done"
+                            and c.handoff_edges_total > len(c.handoff_candidates))
     closed = sum(1 for c in map_row.children if (c.state or "").upper() == "CLOSED")
-    handoff_views = []
-    for h in handoffs:
-        link = handoff_links.get(h.number)
-        pipeline = _pipeline_for(link.pr_numbers if link else (), open_prs, merged_prs)
-        handoff_views.append({"number": h.number, "title": h.title, "url": h.url,
-                              "pipeline": pipeline,
-                              "attempt_count": link.attempt_count if link else 0})
+    support = [{"label": a["label"], "url": _adr_url(a["url"], repo)} for a in adrs]
+    for present, label in (
+        (children_overflow,
+         f"incomplete — {_counted(children_overflow, 'more decision')} on GitHub"),
+        (unknown_children,
+         f"incomplete — blocker data on {_counted(unknown_children, 'decision')}"),
+        (cut_handoff_edges,
+         f"incomplete — handoff links on {_counted(cut_handoff_edges, 'settled decision')}"),
+        (handoffs_overflow, f"{_counted(handoffs_overflow, 'more handoff')} on GitHub"),
+        (adrs_overflow, f"{_counted(adrs_overflow, 'more decision record')} on GitHub"),
+    ):
+        if present:
+            support.append({"label": label, "url": map_row.url})
+    handoff_views = [
+        {"number": h.number, "title": h.title, "url": h.url,
+         "pipeline": _landed_evidence(handoff_links.links.get(h.number),
+                                      unavailable=bool(handoff_links.error),
+                                      open_prs=open_prs, merged_prs=merged_prs),
+         "attempt_count": (handoff_links.links.get(h.number).attempt_count
+                           if h.number in handoff_links.links else 0)}
+        for h in handoffs
+    ]
     return {
         "number": map_row.number, "title": map_row.title, "url": map_row.url,
         "updated_at": map_row.updated_at,
-        "complete": map_row.children_total <= len(map_row.children),
         "progress": {"total": map_row.children_total, "closed": closed},
-        "frontier": frontier,
+        "frontier_state": state,
+        "frontier": [c for c in children_view if c["status"] == "frontier"]
+        if state == "named" else [],
+        "frontier_incomplete": bool(children_overflow or unknown_children),
+        "handoffs_incomplete": bool(cut_handoff_edges),
         "tickets": children_view,
-        "handoffs": handoff_views, "handoffs_overflow": handoffs_overflow,
-        "adrs": adrs, "adrs_overflow": adrs_overflow,
+        "handoffs": handoff_views,
+        "totals": {
+            "children": {"shown": len(children_view), "total": map_row.children_total},
+            "handoffs": {"shown": len(handoff_views),
+                         "total": len(handoff_views) + handoffs_overflow},
+            "adrs": {"shown": len(adrs), "total": len(adrs) + adrs_overflow},
+        },
+        "support": support,
     }
 
 
 def maps_component(
     maps_read: github.MapsRead, *, repo: str,
-    handoff_links: dict[int, github.HandoffLinkRow],
+    handoff_links: github.HandoffLinksRead,
     open_prs: list[github.PipelinePrRow],
     merged_prs: list[github.PipelinePrRow],
 ) -> dict:

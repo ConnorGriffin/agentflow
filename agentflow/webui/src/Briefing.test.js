@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen } from '@testing-library/svelte';
 import Briefing from './Briefing.svelte';
+import STATES from './fixtures/operator-briefing-states.json';
 
 /* Daemon projection → endpoint → rendered briefing, exercised through the real component
    (ADR 0036, #183). The fixture is the schema-v2 + v1 shape `operator_projection.project()`
@@ -26,16 +27,19 @@ const SNAP = {
         active_total: 1,
         active: [{
           number: 179, title: 'Map: operator briefing', url: 'https://github.com/o/r/issues/179',
-          updated_at: '2026-07-30T00:00:00Z', complete: true,
+          updated_at: '2026-07-30T00:00:00Z',
           progress: { total: 2, closed: 1 },
+          frontier_state: 'named', frontier_incomplete: false, handoffs_incomplete: false,
           frontier: [{ number: 183, title: 'Lock the visual spec', url: 'https://github.com/o/r/issues/183' }],
           tickets: [
             { number: 180, title: 'Bound the projection', url: 'https://github.com/o/r/issues/180', status: 'done' },
             { number: 183, title: 'Lock the visual spec', url: 'https://github.com/o/r/issues/183', status: 'frontier' },
           ],
-          handoffs: [], handoffs_overflow: false,
-          adrs: [{ label: 'ADR 36', url: 'docs/adr/0036-bounded-repository-map-projection.md' }],
-          adrs_overflow: 0,
+          handoffs: [],
+          totals: { children: { shown: 2, total: 2 }, handoffs: { shown: 0, total: 0 },
+                   adrs: { shown: 1, total: 1 } },
+          support: [{ label: 'ADR 36',
+                     url: 'https://github.com/o/r/blob/HEAD/docs/adr/0036-bounded-repository-map-projection.md' }],
         }],
       },
     },
@@ -170,6 +174,87 @@ describe('Briefing.svelte — a stage in drought', () => {
     const { container } = render(Briefing, { snap: SNAP });
     expect(container.querySelector('.action-note')).toBeNull();
     expect(screen.getByRole('link', { name: /Open in GitHub/ })).toBeTruthy();
+  });
+});
+
+/* The two locked Decision Map states (#374), rendered from the very snapshot the daemon
+   shapes — `tests/test_operator_briefing_states.py` builds this file and pins it against the
+   real projection, so a page that renders it cannot be picturing a map GitHub could not
+   produce. Every string checked below is the daemon's or the manifest's, never invented here. */
+/* Every supporting record renders with the surface's external-link affordance appended; the
+   record's own words are what these assertions are about. */
+const recordText = (a) => a.textContent.replace(/\s*↗\s*$/, '');
+
+describe('Briefing.svelte — the frontier matrix', () => {
+  const frontiers = (container) =>
+    [...container.querySelectorAll('.frontier')].map((f) => f.textContent.replace('Frontier:', '').trim());
+
+  it('says exactly one of the four things about every map, and nothing else', () => {
+    const { container } = render(Briefing, { snap: STATES['map-frontier-matrix'] });
+    expect(frontiers(container)).toEqual([
+      '#374 Say what the projection could not verify',
+      'No open decision remains',
+      'blocked',
+      'Not verified',
+    ]);
+  });
+
+  it('marks the map it could not verify as incomplete and says what it could not read', () => {
+    const { container } = render(Briefing, { snap: STATES['map-frontier-matrix'] });
+    const unverified = [...container.querySelectorAll('.map')].at(-1);
+    expect(unverified.querySelector('.status').textContent).toBe('incomplete');
+    const support = [...unverified.querySelectorAll('.support a')].map(recordText);
+    expect(support).toContain('incomplete — blocker data on 1 decision');
+    expect(support.every((s) => s.length > 0)).toBe(true);
+  });
+
+  it('keeps every map outline and record list a keyboard-reachable native disclosure', () => {
+    const { container } = render(Briefing, { snap: STATES['map-frontier-matrix'] });
+    const disclosures = container.querySelectorAll('.map details');
+    expect(disclosures).toHaveLength(8); // an outline and a record list for each of four maps
+    for (const d of disclosures) {
+      expect(d.tagName).toBe('DETAILS');
+      expect(d.querySelector('summary')).toBeTruthy();
+    }
+  });
+});
+
+describe('Briefing.svelte — bounded overflow and landed evidence', () => {
+  const labels = (container) => [...container.querySelectorAll('.support a')].map(recordText);
+
+  it('shows every truncation as a counted link onto GitHub', () => {
+    const { container } = render(Briefing, { snap: STATES['map-overflow-evidence'] });
+    const shown = labels(container);
+    expect(shown).toContain('incomplete — 2 more decisions on GitHub');
+    expect(shown).toContain('1 more handoff on GitHub');
+    expect(shown).toContain('2 more decision records on GitHub');
+    for (const a of container.querySelectorAll('.support a')) {
+      expect(a.getAttribute('href')).toMatch(/^https:\/\/github\.com\//);
+    }
+  });
+
+  it('says how many times a repeatedly-attempted handoff was tried, and nothing for one try', () => {
+    const { container } = render(Briefing, { snap: STATES['map-overflow-evidence'] });
+    const shown = labels(container);
+    expect(shown).toContain('#420 Build 420 — PR #361 merged · 2 attempts');
+    expect(shown).toContain('#419 Build 419 — PR #55 merged');
+    expect(shown.some((s) => s.includes('#419') && s.includes('attempts'))).toBe(false);
+  });
+
+  it('says a failed evidence read is unavailable, never that the build is still running', () => {
+    const { container } = render(Briefing, { snap: STATES['map-overflow-evidence'] });
+    const unreadable = [...container.querySelectorAll('.map')].at(-1);
+    const shown = [...unreadable.querySelectorAll('.support a')];
+    const evidence = shown.find((a) => a.textContent.includes('#601'));
+    expect(recordText(evidence)).toBe('#601 Build the map schema — landed evidence unavailable');
+    expect(evidence.getAttribute('href'))
+      .toBe('https://github.com/ConnorGriffin/wayfinder/issues/601');
+  });
+
+  it('counts the maps the fleet has, not the maps that fit on the page', () => {
+    const { container } = render(Briefing, { snap: STATES['map-overflow-evidence'] });
+    const counts = [...container.querySelectorAll('.count')].map((c) => c.textContent);
+    expect(counts[1]).toBe('2 active maps');
   });
 });
 

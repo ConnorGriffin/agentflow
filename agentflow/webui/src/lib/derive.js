@@ -153,41 +153,62 @@ export function deriveAttention(snap) {
   return { rows, total, overflow: Math.max(0, total - rows.length) };
 }
 
+/* What a handoff's landed evidence reads as. The daemon decided the state from the Build
+   Issue's own closing pull-request references; this only words it. A read that failed says
+   so outright — an in-progress word for a failed read would be an optimistic guess — and a
+   handoff attempted more than once says how many times, since the count is the difference
+   between "it landed" and "it landed eventually". */
 function handoffLabel(handoff) {
-  const pipe = handoff.pipeline;
-  const state = pipe && (pipe.state === 'merged' ? `PR #${pipe.pr_number} merged`
+  const pipe = handoff.pipeline || {};
+  const state = pipe.state === 'merged' ? `PR #${pipe.pr_number} merged`
     : pipe.state === 'in_review' ? `PR #${pipe.pr_number} in review`
-    : pipe.state === 'pr_open' ? `PR #${pipe.pr_number} open` : 'building');
-  return `#${handoff.number} ${handoff.title} — ${state || 'building'}`;
+    : pipe.state === 'pr_open' ? `PR #${pipe.pr_number} open`
+    : pipe.state === 'pr_closed' ? `PR #${pipe.pr_number} closed`
+    : pipe.state === 'unavailable' ? 'landed evidence unavailable'
+    : 'building';
+  const attempts = handoff.attempt_count > 1 ? ` · ${handoff.attempt_count} attempts` : '';
+  return `#${handoff.number} ${handoff.title} — ${state}${attempts}`;
 }
 
+/* The four things a frontier line may say, and nothing else. The daemon publishes which one
+   holds; these are its words. */
+const FRONTIER_COPY = {
+  none_open: 'No open decision remains',
+  blocked: 'blocked',
+  unverified: 'Not verified',
+};
+
 /* One flat row per active map across every repository, in the order the daemon returned
-   them. `frontier` reads "Not verified" whenever that repository's map read is not fresh
-   (ADR 0036: stale/incomplete data never claims a verified frontier) — never recomputed
-   from the child list, only gated on the freshness the backend already stamped. */
+   them, plus the daemon's own total so a bounded map list reports how many there really are.
+   `frontier` reads "Not verified" whenever that repository's map read is not fresh (ADR 0036:
+   stale data never claims a verified frontier) and otherwise says exactly what the daemon
+   classified — nothing here recomputes membership, verification, or truncation. */
 export function deriveMaps(snap) {
-  const out = [];
+  const rows = [];
+  let total = 0;
   for (const repo of snap?.repositories || []) {
     const verified = repo.github?.status === 'fresh';
+    total += repo.maps?.active_total ?? (repo.maps?.active || []).length;
     for (const m of repo.maps?.active || []) {
-      out.push({
+      rows.push({
         title: m.title,
         repository: short(repo.name_with_owner),
         progress: `${m.progress.closed} of ${m.progress.total} decided`,
-        status: m.complete ? 'bounded' : `truncated · ${m.progress.total} total`,
-        frontier: !verified ? 'Not verified'
-          : m.frontier.length ? m.frontier.map((f) => `#${f.number} ${f.title}`).join(', ')
-          : 'None open',
+        status: m.frontier_incomplete || m.handoffs_incomplete ? 'incomplete' : 'bounded',
+        frontier: !verified ? FRONTIER_COPY.unverified
+          : m.frontier_state === 'named'
+            ? m.frontier.map((f) => `#${f.number} ${f.title}`).join(', ')
+            : FRONTIER_COPY[m.frontier_state] || FRONTIER_COPY.unverified,
         tickets: m.tickets.map((t) => `#${t.number} ${t.title} — ${t.status}`),
         support: [
-          ...(m.adrs || []).map((a) => ({ url: a.url, label: a.label })),
+          ...(m.support || []),
           ...(m.handoffs || []).map((h) => ({ url: h.url, label: handoffLabel(h) })),
-          { url: m.url, label: 'Map on GitHub ↗' },
+          { url: m.url, label: 'Map on GitHub' },
         ],
       });
     }
   }
-  return out;
+  return { rows, total };
 }
 
 /* Joins the v1 `repos[]` list (keyed by `repo`) against the schema-v2 `repositories[]`

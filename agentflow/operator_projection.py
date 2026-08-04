@@ -99,8 +99,8 @@ def repository_maps(
     later repository this cycle preserves its previous component untouched, never an empty one.
 
     A failed handoff-links or pipeline-PR read degrades only the handoff evidence it feeds
-    (each handoff falls back to ``building``); it does not fail the map read that already
-    succeeded, since the map's frontier and tickets are the primary fact this projects.
+    (each handoff's landed evidence reads as unavailable); it does not fail the map read that
+    already succeeded, since the map's frontier and tickets are the primary fact this projects.
 
     ``read_*`` default to the live :mod:`agentflow.github` calls, looked up at call time (not
     bound as parameter defaults) so a test can monkeypatch the module and have ``build()``'s
@@ -145,14 +145,14 @@ def repository_maps(
             or (links_read.remaining is not None and links_read.remaining < WORKFLOW_FLOOR)):
         budget["stopped"] = True
     # A failed join costs its points like any other read, but it never fails the map read that
-    # already succeeded — it comes back with no links, and each handoff falls back to `building`.
-    links = links_read.links
+    # already succeeded — it is passed through as the failure it is, so each handoff says its
+    # landed evidence is unavailable rather than implying it is still building.
     # The pipeline PR listings are read per map, so a repository with none has nothing to
     # spend them on — the shaping step below would discard both lists unlooked-at (#497).
     open_prs = read_prs(cfg.repo, "open") if maps_read.maps else []
     merged_prs = read_prs(cfg.repo, "merged") if maps_read.maps else []
     component = decision_maps.maps_component(
-        maps_read, repo=cfg.repo, handoff_links=links or {},
+        maps_read, repo=cfg.repo, handoff_links=links_read,
         open_prs=open_prs or [], merged_prs=merged_prs or [])
     fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
                       attempted=True, success=True, error=None)
