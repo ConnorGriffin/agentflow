@@ -31,11 +31,6 @@ class Route:
 
     ladder: tuple[str, ...]
 
-    @property
-    def model(self) -> str:
-        """The rung a worker enters at."""
-        return self.ladder[0]
-
 
 class CapabilityRouting:
     """One deep interface over validated routes, launch ids, and lead instructions."""

@@ -54,7 +54,7 @@ def test_build_submission_launches_a_low_effort_fable_session_lead(make_coord, t
 def test_routing_config_is_validated_and_resolves_every_named_model():
     assert routing.provenance.benchmark_date == "2026-08-03"
     assert routing.route("implementation").ladder == ("terra", "sonnet", "opus")
-    assert routing.route("exploration", variant="full-system").model == "sonnet"
+    assert routing.route("exploration", variant="full-system").ladder[0] == "sonnet"
     assert routing.route("review", variant="load-bearing").ladder == ("opus",)
     assert routing.cli_identifier("claude", "haiku") == "haiku"
     assert routing.cli_identifier("codex", "luna") == "gpt-5.6-luna"
