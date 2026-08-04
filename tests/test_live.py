@@ -80,4 +80,4 @@ def test_snapshot_roundtrips_and_fails_soft(state):
     assert live.read_snapshot() == {"dispatch": {"enabled": True}, "repos": []}
 
     live.SNAPSHOT_FILE.write_text("{ this is not json")
-    assert live.read_snapshot() is None                      # corrupt → never an error
+    assert live.read_snapshot() == {}                        # corrupt → unreadable, never an error

@@ -254,15 +254,17 @@ def test_no_daemon_published_projection_says_that_rather_than_could_not_read():
     assert served["repos"] == [] and served["daemon"]["gh_fresh_at"] is None
 
 
-def test_a_corrupt_or_truncated_file_reads_as_unavailable_over_http_200(tmp_path, monkeypatch):
+def test_an_unreadable_file_reads_as_unavailable_over_http_200(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
     client = _client(live.read_snapshot)
-    (tmp_path / "snapshot.json").write_text('{"repositories": [{"name_with_ow')
-    response = client.get("/api/snapshot")
-    assert response.status_code == 200
-    _assert_v2_unavailable(
-        response.json(),
-        "No daemon-published projection yet. Open GitHub for authoritative state.")
+    for contents in ('{"repositories": [{"name_with_ow', "[]", b"\xff"):
+        if isinstance(contents, bytes):
+            live.SNAPSHOT_FILE.write_bytes(contents)
+        else:
+            live.SNAPSHOT_FILE.write_text(contents)
+        response = client.get("/api/snapshot")
+        assert response.status_code == 200
+        _assert_v2_unavailable(response.json(), _UNREADABLE)
 
 
 # --- daemon carry-forward is narrower than the serving guard --------------------------------

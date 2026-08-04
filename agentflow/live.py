@@ -115,7 +115,15 @@ def write_snapshot(snap: dict) -> None:
 
 
 def read_snapshot() -> dict | None:
-    """The last daemon-published snapshot, or None when no daemon has ever published
-    one (missing / partial / corrupt file — the console renders an empty fleet)."""
-    data = _read(SNAPSHOT_FILE, None)
-    return data if isinstance(data, dict) else None
+    """The last daemon-published snapshot, ``None`` when it is absent, or an empty body when
+    an existing file cannot be read.
+
+    The distinction lets the operator briefing say whether the daemon has never published or
+    whether durable state was damaged, while both cases still fail soft instead of raising."""
+    try:
+        data = json.loads(SNAPSHOT_FILE.read_text())
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
