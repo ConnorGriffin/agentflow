@@ -38,6 +38,7 @@ from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
+from agentflow.routing import routing
 from agentflow.coordinator.verification import (
     VERIFIED, miss_summary, refusal_expected, refusal_stalls)
 from agentflow.review_policy import ReviewState
@@ -156,6 +157,7 @@ class Submission:
     pool: str = "claude"            # allowed pool or pinned lineage
     input_ptr: str | None = None
     builder_lineage: str | None = None
+    branch_lineage: str | None = None   # retained PR checkout owner; may differ from session lead
     builder_complexity: str | None = None  # the original builder complexity, carried to a Revise
     builder_effort: str | None = None      # the original builder effort, carried to a Revise
     round: int = 0                  # completed auto-revise rounds behind this stage — part of the
@@ -250,7 +252,12 @@ class Coordinator:
         stage = normalize_stage(submission.stage)
         review = submission.review or ReviewState(
             change_author_tool=submission.builder_lineage)
-        model = MODEL_FOR.get((submission.pool, submission.complexity), "opus")
+        model = (
+            routing.model_for_stage(
+                stage, submission.pool, submission.complexity, submission.builder_complexity)
+            if stage in {"build", "revise", "review"}
+            else MODEL_FOR.get((submission.pool, submission.complexity), "opus")
+        )
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
@@ -272,6 +279,7 @@ class Coordinator:
             demand=demand if demand is not None else PERMIT_BUDGET,
             model=model, complexity=submission.complexity, effort=submission.effort,
             claim=submission.claim, builder_lineage=submission.builder_lineage,
+            branch_lineage=submission.branch_lineage,
             builder_complexity=submission.builder_complexity,
             builder_effort=submission.builder_effort, round=submission.round,
             conflict_round=submission.conflict_round, resume=submission.resume,
@@ -814,7 +822,12 @@ class Coordinator:
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
                 record.lineage, record.source, record.refusal, record.refusal_expected)
         record.pool = dest_pool
-        record.model = MODEL_FOR.get((dest_pool, record.complexity), "opus")
+        record.model = (
+            routing.model_for_stage(
+                record.stage, dest_pool, record.complexity, record.builder_complexity)
+            if record.stage in {"build", "revise", "review"}
+            else MODEL_FOR.get((dest_pool, record.complexity), "opus")
+        )
         demand = admission_demand(
             record.stage, dest_pool, record.model, record.complexity, record.effort)
         record.demand = demand if demand is not None else PERMIT_BUDGET

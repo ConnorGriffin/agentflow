@@ -76,6 +76,12 @@ def main(argv: list[str] | None = None) -> int | None:
                                      "instead of the ranking")
     churn_command.add_argument("--max-chars", type=int, default=9000)
     churn_command.add_argument("--window", type=int, default=1)
+    spend_command = commands.add_parser(
+        "spend", help="report per-stage spend by attributed model")
+    spend_command.add_argument("--from", dest="spend_from", required=True,
+                               help="UTC start date, inclusive (YYYY-MM-DD)")
+    spend_command.add_argument("--to", dest="spend_to", required=True,
+                               help="UTC end date, exclusive (YYYY-MM-DD)")
     floodgates_command = commands.add_parser(
         "floodgates", help="fleet-wide headroom override (ADR 0025 amendment)"
     )
@@ -158,6 +164,20 @@ def main(argv: list[str] | None = None) -> int | None:
             with open(args.json_path, "w") as fh:
                 json.dump(sessions, fh, indent=1)
             print(f"wrote {args.json_path}")
+        return 0
+    elif args.command == "spend":
+        from datetime import date
+
+        from agentflow.coordinator.store import default_store_path
+        from agentflow.coordinator.telemetry import format_spend_report, spend_report
+
+        try:
+            start = date.fromisoformat(args.spend_from)
+            end = date.fromisoformat(args.spend_to)
+            report = spend_report(default_store_path(), start=start, end=end)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(format_spend_report(report))
         return 0
     elif args.command == "enroll":
         from agentflow.enroll import enroll_repository

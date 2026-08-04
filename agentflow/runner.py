@@ -903,15 +903,16 @@ class ClaudeRunner(_WorktreeRunner):
         the same code-graph access Build has — it is the withheld
         *edit* tools, not the local read-only MCP tools, that a read-only stage loses.
 
-        A build/revise profile also carries a reasoning-effort rung (ADR 0046), handed to Claude's
-        first-class ``--effort`` flag; every other stage leaves it ``None`` (provider default). A
+        A build/revise profile carries the session lead's low reasoning effort (ADR 498), handed to
+        Claude's first-class ``--effort`` flag; every other stage leaves it ``None``. A
         rung above Claude's ladder clamps to its top rather than failing the launch.
         """
         from agentflow.coordinator.profiles import WITHHELD_EDIT_TOOLS
 
-        _MODEL_OVERRIDES = {"opus": "claude-opus-5"}
+        from agentflow.routing import routing
         deny: tuple[str, ...] = ()
-        argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model", _MODEL_OVERRIDES.get(model, model),
+        argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model",
+                routing.cli_identifier("claude", model),
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
                 "--strict-mcp-config"]
@@ -940,7 +941,6 @@ class CodexRunner(_WorktreeRunner):
     # TODO(verify): gpt-5.6-sol confirmed working; confirm the terra ID.
     MODELS = {Complexity.STANDARD: "gpt-5.6-terra", Complexity.DEEP: "gpt-5.6-sol"}
 
-    _CLI_MODEL = {"sol": "gpt-5.6-sol", "terra": "gpt-5.6-terra"}
     # Codex's reasoning ladder for ``model_reasoning_effort`` (ascending). ``max`` is manual-only
     # (ADR 0046); the daemon never maps below ``low``, so the sub-``low`` rungs are inert here.
     _REASONING_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
@@ -963,12 +963,14 @@ class CodexRunner(_WorktreeRunner):
         read-only ones. The wall ceiling is applied per-record by the launcher, the same as for
         Claude.
 
-        A build/revise profile also carries a reasoning-effort rung (ADR 0046). Codex has no
+        A legacy Codex build/revise profile carries the session lead's low reasoning effort. Codex has no
         ``--effort`` flag — reasoning effort is a config override — so it is appended as another
         ``-c model_reasoning_effort=<level>`` alongside the existing ``-c`` overrides, before the
         positional prompt. Every other stage leaves it ``None`` (provider default); a rung above
         Codex's ladder clamps to its top rather than failing the launch.
         """
+        from agentflow.routing import routing
+
         codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
         worktree = os.path.realpath(cwd)
         common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
@@ -980,7 +982,7 @@ class CodexRunner(_WorktreeRunner):
         )
         read_only = profile is not None and profile.allowed_tools is not None
         sandbox = "read-only" if read_only else "workspace-write"
-        argv = [codex_bin, "exec", "-m", self._CLI_MODEL.get(model, model), "--json",
+        argv = [codex_bin, "exec", "-m", routing.cli_identifier("codex", model), "--json",
                 "--sandbox", sandbox, "--cd", worktree,
                 "--ignore-user-config", "--ephemeral", "-c", approval_policy,
                 "-c", 'approvals_reviewer="auto_review"',

@@ -1,0 +1,53 @@
+{
+  "provenance": {
+    "source": "ConnorGriffin/skills skills/orchestrate/references/routing-table.md",
+    "benchmark_date": "2026-08-03",
+    "price_snapshot": "Per million input/output tokens: Opus $5/$25; Sonnet $3/$15; Haiku $1/$5; Sol $5/$30; Terra $2.50/$15; Luna $1/$6.",
+    "alias_note": "Claude aliases are unversioned; re-verify this benchmark stamp when Anthropic rolls a snapshot."
+  },
+  "models": {
+    "fable": {"provider": "claude", "cli_id": "fable", "role": "session-lead"},
+    "opus": {"provider": "claude", "cli_id": "claude-opus-5", "role": "worker"},
+    "sonnet": {"provider": "claude", "cli_id": "sonnet", "role": "worker"},
+    "haiku": {"provider": "claude", "cli_id": "haiku", "role": "worker"},
+    "sol": {"provider": "codex", "cli_id": "gpt-5.6-sol", "role": "worker"},
+    "terra": {"provider": "codex", "cli_id": "gpt-5.6-terra", "role": "worker"},
+    "luna": {"provider": "codex", "cli_id": "gpt-5.6-luna", "role": "worker"}
+  },
+  "worker_reasoning": {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "extra": "xhigh"
+  },
+  "areas": {
+    "exploration": {
+      "routes": {"default": ["luna", "sonnet", "opus"], "bounded": ["luna", "sonnet", "opus"], "full-system": ["sonnet", "opus"]},
+      "banned": ["haiku"]
+    },
+    "implementation": {
+      "routes": {"default": ["terra", "sonnet", "opus"]},
+      "banned": []
+    },
+    "plan": {
+      "routes": {"default": ["terra", "sol"]},
+      "banned": []
+    },
+    "prototype": {
+      "routes": {"default": ["sol", "opus"]},
+      "banned": ["luna"]
+    },
+    "brainstorm": {
+      "routes": {"default": ["terra", "opus"]},
+      "banned": []
+    },
+    "documentation": {
+      "routes": {"default": ["haiku", "opus", "sol"]},
+      "banned": []
+    },
+    "review": {
+      "routes": {"default": ["luna", "sonnet", "opus"], "routine": ["luna", "sonnet", "opus"], "load-bearing": ["opus"]},
+      "banned": ["haiku"]
+    }
+  }
+}

@@ -17,7 +17,7 @@ from pathlib import Path
 
 from agentflow import (coordinated_build, coordinated_review, coordinated_revise, github,
                        pipeline, ratchet)
-from agentflow.balancer import pick_pair, pick_reviewer
+from agentflow.balancer import pick_pair, pick_reviewer, pick_session_lead
 from agentflow.coordinator.record import WAITING
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.gate import (conflict_revises_used, maintainer_comment, maintainer_comment_id,
@@ -208,10 +208,11 @@ def build_issue(cfg: RepoConfig, n: int, *, floodgates: bool = False) -> str:
         return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"
     if not _free_to_dispatch(cfg, issue, in_flight):
         return f"#{n}: not dispatchable — already claimed, in flight, or waiting on a blocker"
-    builder, _reviewer, block_msg = pick_pair(operator=True, floodgates=floodgates)
+    builder, _reviewer, block_msg = pick_session_lead(
+        operator=True, floodgates=floodgates)
     if builder is None:
         return f"#{n}: no pool has headroom ({block_msg}) — deferring"
-    submission = coordinated_build.build_submission(cfg, issue, builder.tool, floodgates=floodgates)
+    submission = coordinated_build.build_submission(cfg, issue, floodgates=floodgates)
     if submission is None:
         return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
     # A `build <N>` on an issue whose latest Build exhausted its budget and `held` is the explicit,

@@ -254,12 +254,12 @@ def test_reconcile_parks_a_blocking_review_once_the_revise_round_is_spent(make_c
 # --- Review → Revise carries the original builder dials, never a mutable label reread -------
 
 @pytest.mark.parametrize("effort, reasoning", (
-    ("low", "low"), ("medium", "medium"), ("high", "high"), ("extra", "xhigh")))
+    ("low", "low"), ("medium", "low"), ("high", "low"), ("extra", "low")))
 def test_review_to_revise_keeps_the_original_builder_dials_when_the_issue_label_changes(
         make_coord, monkeypatch, effort, reasoning):
     """Review→Revise must run at the *original builder* complexity and effort, carried durably
     since the Build opened the Review — never re-read from the issue's live label. Review keeps no
-    effort dial of its own; the launched Revise records the builder's mapped reasoning rung."""
+    effort dial of its own; the launched Revise parent stays at low reasoning."""
     fake = FakeSession()
     pr, verdict, revision = [True], [True], [False]
     coord = make_coord(fake, adapter=_router(fake, pr=pr, verdict=verdict, revision=revision),
@@ -314,7 +314,7 @@ def test_review_to_revise_preserves_missing_historical_builder_effort(make_coord
     live.run_stage(revise.identity)
     attempt = next(entry for entry in read_attempts(coord._store.path)
                    if entry.identity == revise.identity)
-    assert attempt.effort is None and attempt.reasoning_effort is None
+    assert attempt.effort is None and attempt.reasoning_effort == "low"
 
 
 def test_review_without_durable_builder_complexity_parks_instead_of_stranding(make_coord,
@@ -966,6 +966,38 @@ def test_review_submission_from_a_completed_revise_binds_the_new_head_and_keeps_
     assert "pr-42-fix-thing" in sub.source
 
 
+def test_claude_led_revise_keeps_a_codex_owned_branch_across_the_next_round():
+    review = Record(
+        identity="o/r|7|review|sha-a", stage="review", pool="claude", demand=2,
+        repo="o/r", subject="7", target="sha-a", builder_lineage="codex",
+        branch_lineage="codex", builder_effort="high",
+        source="/home/w/.agentflow/worktrees/claude-review/pr-42-fix-thing")
+
+    revise = coordinated_revise.revise_submission(review, "deep", "- fix the thing")
+    assert revise is not None
+    assert revise.pool == revise.builder_lineage == "claude"
+    assert revise.branch_lineage == "codex"
+    assert revise.source == WorktreeRef.for_build("/home/w", "codex", 7, "fix-thing").path
+
+    durable_revise = Record(
+        identity="o/r|7|revise|sha-a", stage="revise", pool=revise.pool, demand=3,
+        repo="o/r", subject="7", target="sha-a", source=revise.source,
+        builder_lineage=revise.builder_lineage, branch_lineage=revise.branch_lineage,
+        builder_complexity=revise.builder_complexity, builder_effort=revise.builder_effort)
+    next_review = coordinated_review.review_submission(
+        durable_revise, "sha-b", "codex", 42)
+    assert next_review is not None and next_review.branch_lineage == "codex"
+
+    durable_review = Record(
+        identity="o/r|7|review|sha-b", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="sha-b", source=next_review.source,
+        builder_lineage=next_review.builder_lineage,
+        branch_lineage=next_review.branch_lineage)
+    second_revise = coordinated_revise.revise_submission(durable_review, "deep")
+    assert second_revise is not None
+    assert second_revise.source == revise.source
+
+
 def test_continuation_attempts_do_not_expand_the_auto_revise_round_policy():
     """The per-stage continuation budget is separate from the auto-revise product cap
     (``MAX_REVISES`` rounds, ADR 0004): a logical Revise counts once no matter how many of its
@@ -1044,6 +1076,14 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
         cfg, issue=7, slug="fix", builder_tool="gemini", head_sha="sha-conf", pr_number=42,
         conflict_round=1) is None
 
+    codex_branch = coordinated_revise.survivor_conflict_revise_submission(
+        cfg, issue=7, slug="fix", builder_tool="codex", head_sha="sha-conf", pr_number=42,
+        conflict_round=1)
+    assert codex_branch is not None
+    assert codex_branch.pool == codex_branch.builder_lineage == "claude"
+    assert codex_branch.branch_lineage == "codex"
+    assert codex_branch.source == "/w/.agentflow/worktrees/codex/issue-7-fix"
+
 
 def test_conflict_uncertainty_is_captured_as_a_durable_stage_outcome():
     adapter = ReviseStageAdapter(
@@ -1077,7 +1117,7 @@ def test_conflict_uncertainty_opens_one_full_decision_pass_on_the_other_tool():
     assert "keep main" in sub.input_ptr and sub.transfer_from == revise.identity
 
 
-@pytest.mark.parametrize("effort, reasoning", (("extra", "xhigh"), (None, None)))
+@pytest.mark.parametrize("effort, reasoning", (("extra", "low"), (None, "low")))
 def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineage(
         make_coord, effort, reasoning):
     review = Record(

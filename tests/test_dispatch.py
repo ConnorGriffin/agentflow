@@ -319,7 +319,7 @@ def test_build_submission_enters_the_coordinator_then_claims_runnable_work(monke
     monkeypatch.setattr(loop, "_next_ready_issue",
                         lambda cfg, reserved=frozenset(), _log=None: issue)
     builder = SimpleNamespace(tool="claude")
-    monkeypatch.setattr(dispatch, "pick_pair", lambda: (builder, None, ""))
+    monkeypatch.setattr(dispatch, "pick_session_lead", lambda: (builder, None, ""))
     events = []
     monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: events.append("claim") or True)
     waiting = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
@@ -348,7 +348,8 @@ def test_daemon_does_not_claim_or_launch_when_the_build_stays_held(monkeypatch):
     monkeypatch.setattr(loop, "_next_ready_issue",
                         lambda cfg, reserved=frozenset(), _log=None:
                         None if 7 in reserved else issue)
-    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch, "pick_session_lead",
+                        lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("must not claim a held no-op"))
     held = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
                   state=HELD, claim=False)
@@ -383,7 +384,8 @@ def test_build_pass_skips_a_mislabelled_queue_head_and_submits_the_next_issue(
     from agentflow.coordinator.record import Record, WAITING
 
     _ready_queue(monkeypatch, [(462, ["ready-for-agent"]), (468, _DIALS)])
-    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch, "pick_session_lead",
+                        lambda: (SimpleNamespace(tool="claude"), None, ""))
     stripped = []
     monkeypatch.setattr(dispatch.github, "remove_label",
                         lambda repo, number, label: stripped.append((repo, number, label)) or True)
@@ -410,7 +412,8 @@ def test_a_failed_ready_label_strip_still_reaches_the_work_behind_it(monkeypatch
     from agentflow.coordinator.record import Record, WAITING
 
     _ready_queue(monkeypatch, [(462, ["ready-for-agent"]), (468, _DIALS)])
-    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch, "pick_session_lead",
+                        lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(dispatch.github, "remove_label", lambda repo, number, label: False)
     claimed = []
     monkeypatch.setattr(dispatch, "claim", lambda repo, number, _label: claimed.append(number) or True)
@@ -432,7 +435,8 @@ def test_build_pass_passes_over_an_exhausted_held_head_without_resuming_it(monke
     from agentflow.coordinator.record import HELD, Record, WAITING
 
     _ready_queue(monkeypatch, [(59, _DIALS), (64, _DIALS)])
-    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch, "pick_session_lead",
+                        lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(dispatch.coordinated_build, "resume_if_held",
                         lambda *a: pytest.fail("automatic dispatch must never auto-resume"))
     claimed = []
@@ -473,7 +477,8 @@ def test_build_pass_stops_when_the_ready_queue_cannot_be_read(monkeypatch, tmp_p
 
 def test_build_pass_reports_when_every_ready_candidate_is_undispatchable(monkeypatch, tmp_path):
     _ready_queue(monkeypatch, [(1, ["ready-for-agent"]), (2, ["ready-for-agent"])])
-    monkeypatch.setattr(dispatch, "pick_pair", lambda: (SimpleNamespace(tool="claude"), None, ""))
+    monkeypatch.setattr(dispatch, "pick_session_lead",
+                        lambda: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(dispatch.github, "remove_label", lambda repo, number, label: True)
     monkeypatch.setattr(dispatch, "claim", lambda *a: pytest.fail("nothing runnable to claim"))
     coord = SimpleNamespace(submit_stage=lambda s: "id", stage_record=lambda identity: None)

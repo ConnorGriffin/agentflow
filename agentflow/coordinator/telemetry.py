@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, dataclass, field, fields
+from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -38,10 +39,24 @@ _CODEX_USAGE_KEYS = {
 
 @dataclass(frozen=True)
 class ModelCost:
-    """One provider-reported model's dollar cost within an attempt."""
+    """One provider-reported model's attributed spend within an attempt."""
 
     model: str
-    cost_usd: float
+    cost_usd: float | None
+    input_tokens: int | None = None
+    cached_input_tokens: int | None = None
+    cache_creation_tokens: int | None = None
+    output_tokens: int | None = None
+    reasoning_output_tokens: int | None = None
+
+    @property
+    def tokens(self) -> int | None:
+        values = (
+            self.input_tokens, self.cached_input_tokens, self.cache_creation_tokens,
+            self.output_tokens, self.reasoning_output_tokens,
+        )
+        return sum(value for value in values if value is not None) \
+            if any(value is not None for value in values) else None
 
 
 @dataclass(frozen=True)
@@ -96,6 +111,31 @@ def _extra(usage: dict, known: set) -> tuple:
     return tuple(sorted(k for k in usage if k not in known))
 
 
+def _model_int(details: dict, *keys: str) -> int | None:
+    for key in keys:
+        if key in details:
+            return _int(details[key])
+    return None
+
+
+def _model_cost(model: str, details: dict) -> ModelCost | None:
+    cost = _float(details.get("costUSD", details.get("cost_usd")))
+    attributed = ModelCost(
+        model=model,
+        cost_usd=cost,
+        input_tokens=_model_int(details, "inputTokens", "input_tokens"),
+        cached_input_tokens=_model_int(
+            details, "cacheReadInputTokens", "cache_read_input_tokens", "cached_input_tokens"),
+        cache_creation_tokens=_model_int(
+            details, "cacheCreationInputTokens", "cache_creation_input_tokens",
+            "cache_creation_tokens"),
+        output_tokens=_model_int(details, "outputTokens", "output_tokens"),
+        reasoning_output_tokens=_model_int(
+            details, "reasoningOutputTokens", "reasoning_output_tokens"),
+    )
+    return attributed if cost is not None or attributed.tokens is not None else None
+
+
 def claude_usage(events) -> AttemptUsage:
     """Normalize the usage on Claude's terminal ``result`` stream event (Agent SDK stream-json).
 
@@ -119,10 +159,10 @@ def claude_usage(events) -> AttemptUsage:
     model_costs = ()
     if isinstance(model_usage, dict):
         model_costs = tuple(
-            ModelCost(model=model_id, cost_usd=cost)
+            attributed
             for model_id, details in model_usage.items()
             if isinstance(model_id, str) and isinstance(details, dict)
-            if (cost := _float(details.get("costUSD"))) is not None)
+            if (attributed := _model_cost(model_id, details)) is not None)
     return AttemptUsage(
         input_tokens=_int(usage.get("input_tokens")),
         cached_input_tokens=_int(usage.get("cache_read_input_tokens")),
@@ -302,10 +342,10 @@ def _decode_usage(data: dict) -> AttemptUsage:
     model_costs = picked.get("model_costs")
     if isinstance(model_costs, list):
         picked["model_costs"] = tuple(
-            ModelCost(model=item["model"], cost_usd=cost)
+            attributed
             for item in model_costs
             if isinstance(item, dict) and isinstance(item.get("model"), str)
-            if (cost := _float(item.get("cost_usd"))) is not None)
+            if (attributed := _model_cost(item["model"], item)) is not None)
     elif "model_costs" in picked:
         picked["model_costs"] = ()
     try:
@@ -353,6 +393,34 @@ class TelemetryProjection:
     total: TelemetryTotals = field(default_factory=TelemetryTotals)
 
 
+@dataclass(frozen=True)
+class ModelSpendRow:
+    """Spend attributed to one model for one stage inside a requested date window."""
+
+    stage: str
+    model: str
+    attempts: int
+    tokens: int | None
+    cost_usd: float | None
+
+
+@dataclass(frozen=True)
+class SpendReport:
+    start: int
+    end: int
+    rows: tuple[ModelSpendRow, ...]
+
+
+def format_spend_report(report: SpendReport) -> str:
+    """Render the small operator report without hiding unavailable token or dollar facts."""
+    lines = ["stage\tmodel\tattempts\ttokens\tdollars"]
+    for row in report.rows:
+        tokens = str(row.tokens) if row.tokens is not None else "—"
+        dollars = f"{row.cost_usd:.6f}" if row.cost_usd is not None else "—"
+        lines.append(f"{row.stage}\t{row.model}\t{row.attempts}\t{tokens}\t{dollars}")
+    return "\n".join(lines)
+
+
 def project(store_path: Path | str) -> TelemetryProjection:
     """Aggregate every persisted attempt into the bounded stage/model/outcome projection."""
     return project_attempts(read_attempts(store_path))
@@ -373,6 +441,64 @@ def project_attempts(entries) -> TelemetryProjection:
             TelemetryCell(stage=k[0], model=k[1], outcome=k[2], totals=_freeze(acc))
             for k, acc in ordered),
         total=_freeze(fleet))
+
+
+def _window_epoch(value: int | float | date | datetime) -> int:
+    if isinstance(value, datetime):
+        moment = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+        return int(moment.timestamp())
+    if isinstance(value, date):
+        return int(datetime.combine(value, datetime_time(), tzinfo=timezone.utc).timestamp())
+    return int(value)
+
+
+def _usage_token_total(usage: AttemptUsage) -> int | None:
+    values = tuple(getattr(usage, name) for name in _TOKEN_FIELDS)
+    return sum(value for value in values if value is not None) \
+        if any(value is not None for value in values) else None
+
+
+def spend_report(store_path: Path | str, *, start: int | float | date | datetime,
+                 end: int | float | date | datetime) -> SpendReport:
+    """Group persisted spend by stage and attributed model over ``[start, end)``.
+
+    Provider model attribution wins over the dispatched record model. An attempt with no
+    per-model attribution (including Codex) falls back to its reported model and then its
+    dispatched model, keeping token-only rows even when no dollar equivalent exists.
+    """
+    start_epoch, end_epoch = _window_epoch(start), _window_epoch(end)
+    if end_epoch <= start_epoch:
+        raise ValueError("spend report end must be after start")
+    # value = [attempts, tokens, token_seen, dollars, dollar_seen]
+    cells: dict[tuple[str, str], list[int | float | bool]] = {}
+    for entry in read_attempts(store_path):
+        if not start_epoch <= entry.started_at < end_epoch:
+            continue
+        attributed = entry.usage.model_costs
+        rows = (
+            tuple((cost.model, cost.tokens, cost.cost_usd) for cost in attributed)
+            if attributed else ((entry.usage.model or entry.model,
+                                 _usage_token_total(entry.usage), entry.usage.cost_usd),)
+        )
+        for model, tokens, dollars in rows:
+            cell = cells.setdefault((entry.stage, model), [0, 0, False, 0.0, False])
+            cell[0] += 1
+            if tokens is not None:
+                cell[1] += tokens
+                cell[2] = True
+            if dollars is not None:
+                cell[3] += dollars
+                cell[4] = True
+    return SpendReport(
+        start_epoch,
+        end_epoch,
+        tuple(
+            ModelSpendRow(stage, model, int(values[0]),
+                          int(values[1]) if values[2] else None,
+                          float(values[3]) if values[4] else None)
+            for (stage, model), values in sorted(cells.items())
+        ),
+    )
 
 
 # The accumulator is a plain list indexed by the TelemetryTotals field order, so summing is a

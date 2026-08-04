@@ -125,6 +125,8 @@ class Record:
                                          # exhausted"; cleared whenever an attempt verifies
     retired: bool = False
     builder_lineage: str | None = None   # original builder; current exact-head author is separate
+    branch_lineage: str | None = None    # tool whose retained checkout owns the PR branch; an
+                                         # orchestrated Revise can have a different Claude lead
     builder_complexity: str | None = None  # the original builder complexity, carried so a later
                                            # Revise never re-reads a mutable issue label (ADR 0018)
     builder_effort: str | None = None    # the original builder effort, carried separately so Review
