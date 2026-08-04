@@ -132,6 +132,36 @@ def test_repository_maps_publishes_githubs_own_reason_for_a_failed_read():
         "a diagnostic never turns an unknown map into an empty one")
 
 
+def test_a_failed_map_read_still_spends_points_and_enforces_the_reserve():
+    budget = {"spent": 240, "stopped": False}
+    failed = github.MapsRead(maps=(), total_count=0, cost=10, remaining=999,
+                             error="API rate limit exceeded")
+    operator_projection.repository_maps(
+        _cfg(), previous_snapshot=None, now=NOW, heartbeat_seconds=300, budget=budget,
+        read_maps=lambda repo, **kw: failed,
+        read_links=lambda repo, nums: {}, read_prs=lambda repo, state: [])
+    assert budget == {"spent": 250, "stopped": True}
+
+
+def test_a_failed_handoff_join_preserves_maps_and_publishes_its_reason():
+    previous_snapshot = {"repositories": [
+        {"name_with_owner": "o/r",
+         "github": {"status": "fresh", "fresh_at": "2026-07-30T11:55:00+00:00",
+                    "attempted_at": "2026-07-30T11:55:00+00:00", "error": None},
+         "maps": {"active": [{"number": 9}], "active_total": 1}}]}
+    budget = {"spent": 0, "stopped": False}
+    result = operator_projection.repository_maps(
+        _cfg(), previous_snapshot=previous_snapshot, now=NOW, heartbeat_seconds=300,
+        budget=budget, read_maps=lambda repo, **kw: _maps_read(cost=2, maps=(_map(),)),
+        read_links=lambda repo, nums: github.HandoffLinksRead(
+            links={}, cost=3, remaining=998, error="handoff query failed"),
+        read_prs=lambda repo, state: [])
+    assert result["github"]["error"] == "handoff query failed"
+    assert result["github"]["status"] == "stale"
+    assert result["maps"] == {"active": [{"number": 9}], "active_total": 1}
+    assert budget == {"spent": 5, "stopped": True}
+
+
 def test_repository_maps_stopped_budget_never_calls_github_and_preserves_previous():
     stale_fresh_at = (NOW - timedelta(seconds=700)).isoformat()
     previous_snapshot = {"repositories": [

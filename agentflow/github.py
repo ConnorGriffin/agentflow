@@ -220,6 +220,15 @@ class MapQueryRead:
 
 
 @dataclass(frozen=True)
+class HandoffLinksRead:
+    """The typed handoff-link join plus the accounting and diagnostic from its map query."""
+    links: dict[int, HandoffLinkRow]
+    cost: int | None
+    remaining: int | None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class HandoffLinkRow:
     """A verified handoff Build Issue's native closing-PR references — just the join key;
     the console resolves full pipeline evidence from the PR listings it already reads."""
@@ -1049,18 +1058,19 @@ def handoff_pr_links_response(repo: str, numbers: list[int]) -> MapQueryRead:
     return _map_query(_handoff_links_argv(repo, numbers))
 
 
-def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow] | None:
+def handoff_pr_links_read(repo: str, numbers: list[int]) -> HandoffLinksRead:
     """The native closing-PR numbers for each verified handoff Build Issue in ``numbers``
-    (ADR 0036's join key), or ``None`` when the read failed. An empty ``numbers`` makes no
-    call and returns ``{}``. Batched as one query with one alias per issue — there is no
-    porcelain for "these N issues' closing PRs" in a single call."""
+    (ADR 0036's join key), together with this query's diagnostic and point accounting. An empty
+    ``numbers`` makes no call and returns an empty successful read. Batched as one query with one
+    alias per issue — there is no porcelain for "these N issues' closing PRs" in a single call."""
     wanted = _handoff_numbers(numbers)
     if not wanted:
-        return {}
+        return HandoffLinksRead(links={}, cost=0, remaining=None)
     response = handoff_pr_links_response(repo, wanted)
     repo_node = (response.payload or {}).get("repository")
     if response.error or not isinstance(repo_node, dict):
-        return None
+        return HandoffLinksRead(links={}, cost=response.cost, remaining=response.remaining,
+                                error=response.error or _READ_FAILED)
     out: dict[int, HandoffLinkRow] = {}
     for n in wanted:
         node = repo_node.get(f"i{n}") or {}
@@ -1071,7 +1081,14 @@ def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow]
             number=n, pr_numbers=pr_numbers,
             attempt_count=refs.get("totalCount") if isinstance(refs.get("totalCount"), int)
             else len(pr_numbers))
-    return out
+    return HandoffLinksRead(links=out, cost=response.cost, remaining=response.remaining)
+
+
+def handoff_pr_links(repo: str, numbers: list[int]) -> dict[int, HandoffLinkRow] | None:
+    """The handoff-link join for callers that only need typed rows; map projection uses the
+    diagnostic-carrying read so failures remain distinguishable from an empty successful join."""
+    read = handoff_pr_links_read(repo, numbers)
+    return None if read.error else read.links
 
 
 # --- escape hatch --------------------------------------------------------------

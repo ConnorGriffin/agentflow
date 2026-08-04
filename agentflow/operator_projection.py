@@ -106,7 +106,7 @@ def repository_maps(
     bound as parameter defaults) so a test can monkeypatch the module and have ``build()``'s
     fleet walk pick it up without threading fakes through every layer."""
     read_maps = read_maps or github.decision_maps
-    read_links = read_links or github.handoff_pr_links
+    read_links = read_links or github.handoff_pr_links_read
     read_prs = read_prs or github.list_pipeline_prs
     prev = _previous_component(previous_snapshot, cfg.repo)
     prev_github = (prev or {}).get("github")
@@ -123,23 +123,37 @@ def repository_maps(
     maps_read = read_maps(cfg.repo, limit=decision_maps.ACTIVE_MAP_LIMIT,
                           children_limit=decision_maps.CHILDREN_LIMIT,
                           edges_limit=decision_maps.EDGES_LIMIT)
-    if maps_read.error:
-        fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
-                          attempted=True, success=False, error=maps_read.error)
-        return {**identity, "github": fresh, "maps": prev_maps}
-
     if maps_read.cost is not None:
         budget["spent"] += maps_read.cost
     if (budget["spent"] >= POINT_CEILING
             or (maps_read.remaining is not None and maps_read.remaining < WORKFLOW_FLOOR)):
         budget["stopped"] = True
+    if maps_read.error:
+        fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
+                          attempted=True, success=False, error=maps_read.error)
+        return {**identity, "github": fresh, "maps": prev_maps}
 
     handoff_numbers: set[int] = set()
     for m in maps_read.maps:
         verified, _overflow = decision_maps.verified_handoffs(m, repo=cfg.repo)
         handoff_numbers.update(h.number for h in verified)
 
-    links = read_links(cfg.repo, sorted(handoff_numbers))
+    links_read = read_links(cfg.repo, sorted(handoff_numbers))
+    if isinstance(links_read, github.HandoffLinksRead):
+        if links_read.cost is not None:
+            budget["spent"] += links_read.cost
+        if (budget["spent"] >= POINT_CEILING
+                or (links_read.remaining is not None
+                    and links_read.remaining < WORKFLOW_FLOOR)):
+            budget["stopped"] = True
+        if links_read.error:
+            fresh = freshness(previous=prev_github, now=now, heartbeat_seconds=heartbeat_seconds,
+                              attempted=True, success=False, error=links_read.error)
+            return {**identity, "github": fresh, "maps": prev_maps}
+        links = links_read.links
+    else:
+        # Test and alternate adapters may provide the legacy typed mapping directly.
+        links = links_read
     # The pipeline PR listings are read per map, so a repository with none has nothing to
     # spend them on — the shaping step below would discard both lists unlooked-at (#497).
     open_prs = read_prs(cfg.repo, "open") if maps_read.maps else []
