@@ -50,6 +50,10 @@ _CLAUDE_SANDBOX_SETTINGS = {
                 "registry.npmjs.org",
                 "pypi.org",
                 "files.pythonhosted.org",
+                "chatgpt.com",
+                "*.chatgpt.com",
+                "auth.openai.com",
+                "api.openai.com",
             ],
         },
     },
@@ -1032,6 +1036,16 @@ class CodexRunner(_WorktreeRunner):
         except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError, TypeError, ValueError):
             return None
         return None
+
+
+def codex_spent_at_render() -> bool:
+    """True when :meth:`CodexRunner.account_fact` reports Codex currently rate-limited, for a
+    session-lead brief to state up front at render time. Fails open (False) whenever the
+    capacity seam is missing or unreadable — an absent fact is not evidence Codex is spent
+    (ADR 0030); ``account_fact`` already applies that rule, this only reads its typed result."""
+    fact = CodexRunner().account_fact()
+    return isinstance(fact, dict) and fact.get("kind") == "rate_limited"
+
 
 def _pr_state_for_branch(repo: str, branch: str) -> str | None:
     """The current state of the most recent PR for this branch across all states

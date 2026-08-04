@@ -25,6 +25,17 @@ still required a clear launch gate. [#509](https://github.com/ConnorGriffin/agen
 restores ADR 0020's partial-availability throughput and should revisit ledger accounting with a
 second real adapter.
 
+[#510](https://github.com/ConnorGriffin/agentflow/issues/510) made the worker rungs those nested
+calls need actually reachable: the Claude sandbox's `network.allowedDomains` now allowlists the
+Codex CLI's own API hosts (`chatgpt.com`, `*.chatgpt.com`, `auth.openai.com`, `api.openai.com`),
+so a `codex exec` worker can launch at all instead of failing closed against the sandbox. It also
+gives the parent a fallback for the case this ADR's ledger bypass leaves uncovered: when a Codex
+worker fails to launch or dies on a provider error rather than the work itself, or when the
+render-time capacity facts already show Codex spent, the session lead brief closes that ladder's
+Codex rungs and enters at the first Claude rung instead, recording the substitution in the final
+handoff. The ledger bypass itself is unchanged; this only keeps a spent or unreachable Codex
+account from stalling the session.
+
 ## Consequences
 
 Build throughput is temporarily Claude-gated. The coordinator's attempt-level lineage pinning is

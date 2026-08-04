@@ -29,7 +29,7 @@ from agentflow.labels import BUILDING, complexity_from_labels, effort_from_label
 from agentflow.prompts import BUILD_PROMPT
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
-from agentflow.runner import _run
+from agentflow.runner import _run, codex_spent_at_render
 from agentflow.worktree_ref import WorktreeRef, source_facts
 
 
@@ -53,7 +53,8 @@ def build_submission(cfg, issue: dict, *, floodgates: bool = False):
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort,
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
-    brief += routing.session_lead_instructions("build", effort)
+    brief += routing.session_lead_instructions(
+        "build", effort, codex_spent=codex_spent_at_render())
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool="claude",
         complexity=complexity.value, effort=effort,

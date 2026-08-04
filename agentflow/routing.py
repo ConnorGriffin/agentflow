@@ -181,7 +181,18 @@ class CapabilityRouting:
         bans = "; never " + ", ".join(model.title() for model in area.banned) if area.banned else ""
         return f"- {area.title}: {routes}{bans}"
 
-    def session_lead_instructions(self, stage: str, effort: str | None) -> str:
+    def _has_claude_rung(self, area: Area) -> bool:
+        """Whether any route in the area names a Claude model, so a Codex-closed ladder without
+        one (plan/spec today) can be told apart from an ordinary ladder with a Claude fallback."""
+        return any(self._models[model]["provider"] == "claude"
+                   for route in area.routes for model in route.ladder)
+
+    def session_lead_instructions(self, stage: str, effort: str | None, *,
+                                   codex_spent: bool = False) -> str:
+        """Render the session-lead brief. ``codex_spent`` is the caller's render-time capacity
+        fact (see :func:`agentflow.runner.codex_spent_at_render`) — routing has no seam of its
+        own onto Codex account state, so a caller that knows it passes it in; a caller that
+        doesn't (or the fact was unreadable) gets the ordinary brief."""
         if stage not in {"build", "revise"}:
             raise RoutingConfigError(f"stage {stage!r} has no session lead")
         table = "\n".join(self._area_line(area) for area in self._areas.values())
@@ -190,8 +201,22 @@ class CapabilityRouting:
             for name, facts in self._models.items()
         )
         rung = self.worker_reasoning(effort)
+        preamble = ""
+        if codex_spent:
+            preamble = (
+                "\nCodex is currently unavailable (spent): every Codex rung is closed for this "
+                "session — enter each ladder at its first Claude rung instead.\n"
+            )
+            codex_only = [area.title for area in self._areas.values()
+                         if not self._has_claude_rung(area)]
+            if codex_only:
+                names = ", ".join(codex_only)
+                preamble += (
+                    f"Exception: {names} has no Claude rung to fall back to — with Codex closed, "
+                    "do that area's work yourself rather than delegating off-table.\n"
+                )
         return f"""
-
+{preamble}
 ## Session lead — benchmarked capability routing
 
 You are the accountable Session lead. Do not write the implementation directly. Plan the work,
@@ -212,7 +237,15 @@ Never ship after a failed test gate. On the first failed verification, re-engage
 with the findings when continuation exists, otherwise re-delegate at the same rung with the
 findings. On the second failure, start a fresh worker one rung higher. At the ladder top, stop and
 surface both failed attempts in the final handoff; do not claim success. Verify, do not trust.
+
+If a `codex exec` worker fails to launch or dies on a provider error (rate limit, quota
+exhausted, API unreachable) rather than on the work itself, treat every Codex rung in that
+ladder as unavailable for the rest of this session: re-enter at the first Claude rung of the
+same ladder instead of retrying Codex, and record the substitution in the final handoff. This is
+separate from a failed verification — a provider failure is never a finding to re-delegate
+against.
 """
+
 
 
 routing = CapabilityRouting.from_path(Path(__file__).with_name("model-routing.json"))

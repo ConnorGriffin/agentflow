@@ -28,7 +28,7 @@ from agentflow.balancer import BUILD_POOLS
 from agentflow.prompts import REVISE_PROMPT
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
 from agentflow.routing import routing
-from agentflow.runner import _run
+from agentflow.runner import _run, codex_spent_at_render
 from agentflow.stage_worktree import worktree_owns_head
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef, source_facts
 
@@ -43,7 +43,8 @@ _CONFLICT_REVISE_FINDING = (
 
 
 def _session_lead_prompt(prompt: str, effort: str | None) -> str:
-    return prompt + routing.session_lead_instructions("revise", effort)
+    return prompt + routing.session_lead_instructions(
+        "revise", effort, codex_spent=codex_spent_at_render())
 
 
 def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_tool: str,
