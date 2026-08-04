@@ -3,6 +3,9 @@
 - Status: Accepted
 - Date: 2026-07-17
 - Specializes: [ADR 0035](0035-workflow-engine-read-only-operator-console.md)
+- Amended by: [ADR 374](adr-374-graphql-heartbeat-budget.md) — the 42-request/60-point
+  heartbeat budget below is superseded by 63 requests/250 points for the nine-repository
+  fleet; everything else stands.
 
 ## Context
 
