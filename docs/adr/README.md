@@ -172,6 +172,11 @@ Issue-keyed records:
   ends with no usable ruling parks its ticket visibly (one comment naming the check that
   refused it, one `wayfinder:parked` label) instead of silently releasing the claim, and
   research dispatch stops claiming tickets for runs that will never start.
+- [ADR 374](adr-374-graphql-heartbeat-budget.md) — The Decision Map heartbeat budget rises to
+  63 GraphQL requests and 250 reported points per 300-second heartbeat, sized so all nine
+  enrolled repositories refresh every heartbeat; GitHub charges requested maxima, not returned
+  data, so ADR 0036's 60-point ceiling could never hold at fleet size. Amends 0036 (budget
+  numbers only).
 - [ADR 380](adr-380-pre-publish-hardening.md) — A triage draft is attacked cold, in rounds,
   before it is ever published: a cold session judges the draft on five axes and answers with
   objections or none, objections go to a redraft that is attacked again, and only a survivor is
