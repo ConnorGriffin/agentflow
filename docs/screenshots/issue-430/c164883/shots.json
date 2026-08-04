@@ -1,0 +1,4244 @@
+{
+ "shots": [
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=drought",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-drought-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-drought-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "pre-publish attack",
+       "produces": "published a hardened brief",
+       "check": "held drafts and ready-for-agent holdbacks",
+       "window": 10,
+       "attempts": 10,
+       "produced": 0,
+       "sessions_spent": 37
+      },
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "stage-drought",
+        "kind": "stage drought",
+        "repo": "",
+        "number": null,
+        "title": "pre-publish attack",
+        "detail": "0 of its last 10 finished attempts published a hardened brief · 37 sessions spent",
+        "url": null,
+        "note": "What to check: held drafts and ready-for-agent holdbacks"
+       },
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 4
+     }
+    }
+   }
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=drought",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-drought-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-drought-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)",
+    ".briefing button"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "pre-publish attack",
+       "produces": "published a hardened brief",
+       "check": "held drafts and ready-for-agent holdbacks",
+       "window": 10,
+       "attempts": 10,
+       "produced": 0,
+       "sessions_spent": 37
+      },
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "stage-drought",
+        "kind": "stage drought",
+        "repo": "",
+        "number": null,
+        "title": "pre-publish attack",
+        "detail": "0 of its last 10 finished attempts published a hardened brief · 37 sessions spent",
+        "url": null,
+        "note": "What to check: held drafts and ready-for-agent holdbacks"
+       },
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 4
+     }
+    }
+   }
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=under-window",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-under-window-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-under-window-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "pre-publish attack",
+       "produces": "published a hardened brief",
+       "check": "held drafts and ready-for-agent holdbacks",
+       "window": 10,
+       "attempts": 4,
+       "produced": 0,
+       "sessions_spent": 12
+      },
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 3
+     }
+    }
+   }
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=under-window",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-under-window-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-under-window-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)",
+    ".briefing button"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "pre-publish attack",
+       "produces": "published a hardened brief",
+       "check": "held drafts and ready-for-agent holdbacks",
+       "window": 10,
+       "attempts": 4,
+       "produced": 0,
+       "sessions_spent": 12
+      },
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 3
+     }
+    }
+   }
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=all-healthy",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-all-healthy-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-all-healthy-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 3
+     }
+    }
+   }
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=all-healthy",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-all-healthy-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-all-healthy-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)",
+    ".briefing button"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 3
+     }
+    }
+   }
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=multi-drought",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-multi-drought-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "light",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-multi-drought-light.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "pre-publish attack",
+       "produces": "published a hardened brief",
+       "check": "held drafts and ready-for-agent holdbacks",
+       "window": 10,
+       "attempts": 10,
+       "produced": 0,
+       "sessions_spent": 37
+      },
+      {
+       "stage": "review",
+       "produces": "recorded a review verdict",
+       "check": "open PRs waiting on a verdict",
+       "window": 10,
+       "attempts": 10,
+       "produced": 0,
+       "sessions_spent": 41
+      },
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "stage-drought",
+        "kind": "stage drought",
+        "repo": "",
+        "number": null,
+        "title": "pre-publish attack",
+        "detail": "0 of its last 10 finished attempts published a hardened brief · 37 sessions spent",
+        "url": null,
+        "note": "What to check: held drafts and ready-for-agent holdbacks"
+       },
+       {
+        "condition": "stage-drought",
+        "kind": "stage drought",
+        "repo": "",
+        "number": null,
+        "title": "review",
+        "detail": "0 of its last 10 finished attempts recorded a review verdict · 41 sessions spent",
+        "url": null,
+        "note": "What to check: open PRs waiting on a verdict"
+       },
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 5
+     }
+    }
+   }
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/mockups/operator-briefing-drought.html?fixture=multi-drought",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/mock-multi-drought-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300
+  },
+  {
+   "url": "file:///Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/agentflow/webui/dist/index.html",
+   "theme": "dark",
+   "out": "/Users/connor/Code/ConnorGriffin/agentflow/.agentflow/worktrees/claude/issue-430-operator-briefing-show-a-stage-that-prod/docs/screenshots/issue-430/c164883/build-multi-drought-dark.png",
+   "viewport": {
+    "width": 1280,
+    "height": 1500
+   },
+   "settle": 300,
+   "clicks": [
+    "nav .tab:nth-child(5)",
+    ".briefing button"
+   ],
+   "fetchStub": {
+    "api/snapshot": {
+     "dispatch": {
+      "enabled": true
+     },
+     "daemon": {
+      "enabled": true,
+      "last_cycle_at": "2026-08-04T12:00:00+00:00",
+      "poll_seconds": 300,
+      "gh_fresh_at": "2026-08-04T11:56:00+00:00"
+     },
+     "pools": [
+      {
+       "tool": "claude",
+       "clear": true,
+       "spent_pct": 38,
+       "headroom_pct": 62,
+       "running": 3,
+       "reason": null
+      },
+      {
+       "tool": "codex",
+       "clear": true,
+       "spent_pct": 12,
+       "headroom_pct": 88,
+       "running": 1,
+       "reason": null
+      }
+     ],
+     "running": [],
+     "repos": [
+      {
+       "repo": "ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [
+        {
+         "number": 486,
+         "title": "Which conditions the Attention queue shows",
+         "state": "needs-grilling",
+         "since": "2026-08-02T09:00:00Z",
+         "reason": "a real fork the pipeline couldn't settle — needs your call"
+        }
+       ],
+       "parked": [
+        {
+         "number": 499,
+         "title": "Retire a merge hand-off the engine could not",
+         "reason": "drop-to-reviewed",
+         "builder": "claude",
+         "reviewer": "codex",
+         "since": "2026-08-01T09:00:00Z"
+        }
+       ],
+       "in_flight": [
+        {
+         "number": 503,
+         "title": "Lock the stage-drought Attention row",
+         "builder": "claude",
+         "handed_off_at": "2026-08-03T09:00:00Z"
+        }
+       ],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/dotfiles",
+       "profile": "guarded",
+       "ready": [
+        {
+         "number": 900,
+         "title": "ready"
+        }
+       ],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [
+        {
+         "number": 800,
+         "title": "landed",
+         "merged_at": "2026-08-03T12:00:00Z"
+        },
+        {
+         "number": 801,
+         "title": "landed",
+         "merged_at": "2026-08-02T12:00:00Z"
+        },
+        {
+         "number": 802,
+         "title": "landed",
+         "merged_at": "2026-08-01T12:00:00Z"
+        },
+        {
+         "number": 803,
+         "title": "landed",
+         "merged_at": "2026-08-00T12:00:00Z"
+        },
+        {
+         "number": 804,
+         "title": "landed",
+         "merged_at": "2026-08--1T12:00:00Z"
+        },
+        {
+         "number": 805,
+         "title": "landed",
+         "merged_at": "2026-08--2T12:00:00Z"
+        },
+        {
+         "number": 806,
+         "title": "landed",
+         "merged_at": "2026-08--3T12:00:00Z"
+        }
+       ],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      },
+      {
+       "repo": "ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "ready": [],
+       "held": [],
+       "parked": [],
+       "in_flight": [],
+       "recent_merges": [],
+       "ratchet": {
+        "samples": 8,
+        "correction_rate": 0.05,
+        "ready_to_loosen": false
+       }
+      }
+     ],
+     "schema_version": 2,
+     "generated_at": "2026-08-04T11:56:00+00:00",
+     "repositories": [
+      {
+       "name_with_owner": "ConnorGriffin/agentflow",
+       "url": "https://github.com/ConnorGriffin/agentflow",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/dotfiles",
+       "url": "https://github.com/ConnorGriffin/dotfiles",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      },
+      {
+       "name_with_owner": "ConnorGriffin/wayfinder",
+       "url": "https://github.com/ConnorGriffin/wayfinder",
+       "profile": "reviewed",
+       "github": {
+        "status": "fresh",
+        "error": null
+       },
+       "maps": {
+        "active_total": 1,
+        "active": [
+         {
+          "number": 418,
+          "title": "Publish nothing a builder would waste a session on",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/418",
+          "updated_at": "2026-08-03T00:00:00Z",
+          "complete": true,
+          "progress": {
+           "total": 4,
+           "closed": 3
+          },
+          "frontier": [
+           {
+            "number": 430,
+            "title": "Show a stage that produced nothing as broken",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           }
+          ],
+          "tickets": [
+           {
+            "number": 418,
+            "title": "Let a remedied draft publish",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/418"
+           },
+           {
+            "number": 430,
+            "title": "Show a silently broken stage",
+            "status": "frontier",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/430"
+           },
+           {
+            "number": 472,
+            "title": "Per-attempt telemetry",
+            "status": "done",
+            "url": "https://github.com/ConnorGriffin/agentflow/issues/472"
+           }
+          ],
+          "handoffs": [],
+          "handoffs_overflow": false,
+          "adrs": [
+           {
+            "label": "ADR 0048",
+            "url": "https://github.com/ConnorGriffin/agentflow"
+           }
+          ],
+          "adrs_overflow": 0
+         }
+        ]
+       }
+      }
+     ],
+     "stage_health": [
+      {
+       "stage": "pre-publish attack",
+       "produces": "published a hardened brief",
+       "check": "held drafts and ready-for-agent holdbacks",
+       "window": 10,
+       "attempts": 10,
+       "produced": 0,
+       "sessions_spent": 37
+      },
+      {
+       "stage": "review",
+       "produces": "recorded a review verdict",
+       "check": "open PRs waiting on a verdict",
+       "window": 10,
+       "attempts": 10,
+       "produced": 0,
+       "sessions_spent": 41
+      },
+      {
+       "stage": "build",
+       "produces": "opened a pull request",
+       "check": "issues marked ready-for-agent with no pull request behind them",
+       "window": 10,
+       "attempts": 10,
+       "produced": 9,
+       "sessions_spent": 23
+      },
+      {
+       "stage": "triage",
+       "produces": "routed an issue",
+       "check": "open issues still carrying no state label",
+       "window": 10,
+       "attempts": 10,
+       "produced": 10,
+       "sessions_spent": 14
+      }
+     ],
+     "fleet": {
+      "recent_landed": [
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 800,
+        "title": "landed",
+        "merged_at": "2026-08-03T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 801,
+        "title": "landed",
+        "merged_at": "2026-08-02T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 802,
+        "title": "landed",
+        "merged_at": "2026-08-01T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 803,
+        "title": "landed",
+        "merged_at": "2026-08-00T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 806,
+        "title": "landed",
+        "merged_at": "2026-08--3T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 805,
+        "title": "landed",
+        "merged_at": "2026-08--2T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/agentflow",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       },
+       {
+        "repo": "ConnorGriffin/dotfiles",
+        "number": 804,
+        "title": "landed",
+        "merged_at": "2026-08--1T12:00:00Z"
+       }
+      ]
+     },
+     "attention": {
+      "rows": [
+       {
+        "condition": "stage-drought",
+        "kind": "stage drought",
+        "repo": "",
+        "number": null,
+        "title": "pre-publish attack",
+        "detail": "0 of its last 10 finished attempts published a hardened brief · 37 sessions spent",
+        "url": null,
+        "note": "What to check: held drafts and ready-for-agent holdbacks"
+       },
+       {
+        "condition": "stage-drought",
+        "kind": "stage drought",
+        "repo": "",
+        "number": null,
+        "title": "review",
+        "detail": "0 of its last 10 finished attempts recorded a review verdict · 41 sessions spent",
+        "url": null,
+        "note": "What to check: open PRs waiting on a verdict"
+       },
+       {
+        "condition": "awaiting-merge",
+        "kind": "Merge",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 503,
+        "title": "#503 Lock the stage-drought Attention row",
+        "detail": "agentflow · reviewed · the review finished — yours to merge",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/503",
+        "note": null
+       },
+       {
+        "condition": "waiting-on-reply",
+        "kind": "Held",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 486,
+        "title": "#486 Which conditions the Attention queue shows",
+        "detail": "agentflow · needs grilling · a real fork the pipeline couldn't settle — needs your call",
+        "url": "https://github.com/ConnorGriffin/agentflow/issues/486",
+        "note": null
+       },
+       {
+        "condition": "parked-build",
+        "kind": "Parked",
+        "repo": "ConnorGriffin/agentflow",
+        "number": 499,
+        "title": "#499 Retire a merge hand-off the engine could not",
+        "detail": "agentflow · the pipeline stopped and left a decision on the PR",
+        "url": "https://github.com/ConnorGriffin/agentflow/pull/499",
+        "note": null
+       }
+      ],
+      "total": 5
+     }
+    }
+   }
+  }
+ ]
+}
