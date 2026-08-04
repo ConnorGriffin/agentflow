@@ -59,6 +59,14 @@ can't make for you.
 6. **Review and commit** the files enrollment generated inside the target repo (repository
    instructions, the bundled skill, the screenshot harness if UI-enabled) — apply writes
    them to disk but doesn't commit.
+7. **Re-running is a no-op only when nothing drifted.** A plain `--apply` refuses to fix a
+   bundled skill or screenshot harness that has since drifted from the pinned content — it
+   prints `WARN: … is drifted … — repository left unchanged` and changes nothing. Converging
+   drift is `agentflow enroll --sync` (dry run) and `--sync --apply` (writes, commits,
+   pushes `agentflow/enroll-sync`, and opens a PR per repo) — a fleet-wide sweep, not a
+   per-repo flag. Convergence covers only agentflow's own bundled assets; a drifted vendored
+   skill pack (`ui-craft`, `drive-local-webapp`) is reported by `agentflow doctor`, never
+   rewritten.
 
 ### Claiming — prevent daemon races on manual verbs
 

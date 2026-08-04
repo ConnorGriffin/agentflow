@@ -369,3 +369,71 @@ workdir = "{checkout}"
         f"bootout {domain}/agentflow.daemon",
         f"bootout {domain}/agentflow.console",
     ]
+
+
+def test_enroll_audit_and_sync_exit_two_on_a_bad_config(tmp_path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[[repositories]]\nrepo = "o/missing"\nworkdir = "/does/not/exist"\n'
+    )
+    env = os.environ | {
+        "AGENTFLOW_CONFIG": str(config),
+        "AGENTFLOW_STATE": str(tmp_path / "state"),
+    }
+    run = lambda *args: subprocess.run(
+        ["uv", "run", "agentflow", "enroll", *args],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30,
+    )
+
+    audit = run("--audit")
+    sync = run("--sync")
+
+    assert audit.returncode == 2, audit.stderr
+    assert sync.returncode == 2, sync.stderr
+    assert "workdir is not a directory" in audit.stderr
+    assert "workdir is not a directory" in sync.stderr
+
+
+def test_enroll_module_and_cli_audit_produce_identical_output(tmp_path):
+    checkout = tmp_path / "project"
+    checkout.mkdir()
+    (checkout / "AGENTS.md").write_text("ui-surfaces: none\n")
+    config = tmp_path / "config.toml"
+    config.write_text(f'[[repositories]]\nrepo = "o/project"\nworkdir = "{checkout}"\n')
+    env = os.environ | {
+        "AGENTFLOW_CONFIG": str(config),
+        "AGENTFLOW_STATE": str(tmp_path / "state"),
+    }
+
+    module = subprocess.run(
+        ["uv", "run", "python", "-m", "agentflow.enroll", "audit"],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30,
+    )
+    via_cli = subprocess.run(
+        ["uv", "run", "agentflow", "enroll", "--audit"],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30,
+    )
+
+    assert module.returncode == 0, module.stderr
+    assert via_cli.returncode == 0, via_cli.stderr
+    assert module.stdout == via_cli.stdout
+
+
+def test_enroll_sync_dry_run_exits_zero(tmp_path):
+    checkout = tmp_path / "project"
+    checkout.mkdir()
+    config = tmp_path / "config.toml"
+    config.write_text(f'[[repositories]]\nrepo = "o/project"\nworkdir = "{checkout}"\n')
+    env = os.environ | {
+        "AGENTFLOW_CONFIG": str(config),
+        "AGENTFLOW_STATE": str(tmp_path / "state"),
+    }
+
+    result = subprocess.run(
+        ["uv", "run", "agentflow", "enroll", "--sync"],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "converged / " in result.stdout
+    assert "skipped (dirty)" in result.stdout  # tail line always names the bucket

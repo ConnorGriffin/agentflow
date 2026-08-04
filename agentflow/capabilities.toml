@@ -26,7 +26,7 @@ requirement = "always"
 source = "bundled"
 skill = "agentflow"
 files = [
-  { path = "SKILL.md", sha256 = "7a78b020c2265aae84126ddf2ed25e134c608deda28565a2e1ff37e4365bce0f" },
+  { path = "SKILL.md", sha256 = "b9f32c17efdfff3a0ea0f6c9bd6ba257ec49cdae4f9a2b00a94c7e4d4c8548cc" },
 ]
 
 [[capabilities]]
