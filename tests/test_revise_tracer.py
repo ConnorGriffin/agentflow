@@ -998,6 +998,31 @@ def test_claude_led_revise_keeps_a_codex_owned_branch_across_the_next_round():
     assert second_revise.source == revise.source
 
 
+def test_a_session_led_revise_still_owns_the_codex_checkout_it_inherits(make_coord):
+    """The launched Revise must read as the owner of the retained checkout it adopted. A PR opened
+    before session-led dispatch keeps its branch and worktree in the building tool's lane while the
+    Claude lead runs the session, and a record that does not own its own checkout can neither
+    prepare that worktree nor verify the branch it pushed — the in-flight work would strand."""
+    from agentflow import worktree_ref
+
+    review = Record(
+        identity="o/r|7|review|sha-a", stage="review", pool="claude", demand=2,
+        repo="o/r", subject="7", target="sha-a", builder_lineage="codex",
+        branch_lineage="codex", builder_effort="high",
+        source="/w/.agentflow/worktrees/claude-review/pr-42-x")
+    submission = coordinated_revise.revise_submission(review, "deep", "- fix the thing")
+    assert submission is not None
+    coord = make_coord()
+    record = coord.stage_record(coord.submit_stage(replace(submission, transfer_from=None)))
+
+    assert record.pool == "claude" and record.model == "fable"
+    facts = worktree_ref.source_facts(record)
+    assert facts is not None                              # the lead owns the inherited checkout
+    _workdir, branch, path = facts
+    assert branch == "agentflow/codex/issue-7-x"          # the PR's own branch, not a new lane
+    assert str(path) == "/w/.agentflow/worktrees/codex/issue-7-x"
+
+
 def test_continuation_attempts_do_not_expand_the_auto_revise_round_policy():
     """The per-stage continuation budget is separate from the auto-revise product cap
     (``MAX_REVISES`` rounds, ADR 0004): a logical Revise counts once no matter how many of its

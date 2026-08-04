@@ -45,7 +45,7 @@ def test_mockup_source_reads_back_to_its_own_branch_through_the_layout_owner():
 
     sub = coordinated_mockup.mockup_submission(cfg, issue, "claude")
     record = SimpleNamespace(source=sub.source, pool="claude", lineage="claude",
-                             stage="mockup", subject="11")
+                             branch_lineage=None, stage="mockup", subject="11")
     workdir, branch, path = worktree_ref.source_facts(record)
 
     expected = WorktreeRef.for_mockup("/home/w", "claude", 11, "a-screen")
