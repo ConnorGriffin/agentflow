@@ -19,8 +19,8 @@ from agentflow.loop import (RebaseResult, RepoConfig, _free_to_dispatch, _issues
                             _next_pr_awaiting_reply, _next_ready_issue, _next_resumable_issue,
                             _rebase_survivor, _untriaged, base_advanced, build_issue,
                             conflict_already_flagged, recheck_once)
-from agentflow.prompts import (BUILD_PROMPT, MOCKUP_DISCLAIMER, PRODUCE_PROMPT, RESPOND_PROMPT,
-                               REVISE_PROMPT, SCOPE_GUIDANCE)
+from agentflow.prompts import (BUILD_PROMPT, MOCKUP_DISCLAIMER, PLAIN_LANGUAGE_RULE,
+                               PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, SCOPE_GUIDANCE)
 from agentflow.repo_facts import (SurfaceDeclaration, intake_allowlist, repo_profile,
                                   surface_declaration, surfaces_phrase, ui_surfaces)
 from agentflow.runner import Complexity, Effort, MockupScope
@@ -510,6 +510,45 @@ def test_revise_prompt_carries_both_evidence_gates():
     assert "screenshot" in body.lower()
     assert "agentflow/static/" in body
     assert "plain" in body.lower()
+
+
+def test_build_prompt_invokes_the_skill_graph():
+    # audit 1.1: the charter-prose sentences stay, but each now names the skill that owns
+    # the deeper rule so a session that skips it still sees the rule stand.
+    body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
+                               surfaces="`agentflow/static/`")
+    assert "/tdd" in body
+    assert "/codebase-design" in body
+
+
+def test_build_prompt_renders_ui_craft_build_mode_for_a_locked_contract():
+    # audit 1.2: a brief carrying the intake-authored LOCKED heading gets the ui-craft
+    # build-mode clause; the unconditional screenshot rules are untouched either way.
+    locked_body = BUILD_PROMPT.format(
+        repo="o/r", n=7, title="x", effort="high", surfaces="`frontend/`",
+        body="## LOCKED visual contract\nsome contract text")
+    assert "/ui-craft" in locked_body
+    assert "build" in locked_body
+
+    plain_body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="details",
+                                     effort="high", surfaces="`frontend/`")
+    assert "screenshot" in plain_body.lower()
+
+
+def test_plain_language_rule_is_shared_by_build_and_revise():
+    # audit 1.4: exactly one shared sentence, interpolated rather than duplicated prose.
+    build_body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
+                                     surfaces="`agentflow/static/`")
+    revise_body = REVISE_PROMPT.format(n=5, repo="o/r", findings="- fix it",
+                                       surfaces="`agentflow/static/`")
+    assert PLAIN_LANGUAGE_RULE in build_body
+    assert PLAIN_LANGUAGE_RULE in revise_body
+
+
+def test_respond_prompt_keeps_its_own_plain_language_sentence():
+    # RESPOND scopes a reply comment, not a PR body — 1.4 explicitly leaves it untouched.
+    assert "no code symbols or file paths" in RESPOND_PROMPT
+    assert PLAIN_LANGUAGE_RULE not in RESPOND_PROMPT
 
 
 def test_work_order_helper_is_gone():
