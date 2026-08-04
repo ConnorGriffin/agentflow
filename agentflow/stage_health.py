@@ -21,6 +21,7 @@ has to be provable, which is the whole point of the signal.
 
 from __future__ import annotations
 
+from agentflow.attack import max_rounds
 from agentflow.coordinator.admission import ATTEMPT_BUDGET
 from agentflow.coordinator.attack_stage import decode_result
 from agentflow.coordinator.store import default_store_path
@@ -60,21 +61,27 @@ _STAGES = {
 
 
 def _attack_published(sessions) -> bool:
-    """Whether this attack attempt cleared its draft for publication.
+    """Whether this attack round actually published its draft.
 
     The attack stage is the reason this module exists. Its own verification proves only that
     the round captured a readable answer, which is true of a round that tore the draft apart
     and of one that never published anything — exactly the blindness #418 surfaced. What the
-    stage must actually produce is a published brief, and a brief is published only when the
-    round cleared the draft: no surviving objections, or objections that all carry their own
-    fix and no fork. Anything unreadable stays uncleared, as it does everywhere else.
+    stage must actually produce is a published brief, and only two endings publish one: the
+    round cleared the draft outright, or the argument ran out of rounds on objections that all
+    carry their own fix and none of which is a fork. An all-remedied round with rounds still
+    left publishes nothing — the draft goes back for a redraft — so counting it would let one
+    ordinary mid-argument answer hide a whole window's drought. The cap is the draft's own
+    complexity dial, the same one the round itself ran under. Anything unreadable stays
+    unpublished, as it does everywhere else.
     """
     for session in sessions:
         try:
             result = decode_result(session.outcome)
         except (AttributeError, TypeError, ValueError):
             continue  # an outcome this build cannot read is not one that published anything
-        if result.survived or result.remedied_only:
+        if result.survived:
+            return True
+        if result.remedied_only and session.round >= max_rounds(session.complexity):
             return True
     return False
 

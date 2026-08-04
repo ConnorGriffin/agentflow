@@ -1,4 +1,4 @@
-# Lock manifest — operator-surface-finalist (issue #183, extended by #375, #373, #374)
+# Lock manifest — operator-surface-finalist (issue #183, extended by #375, #373, #374, #430)
 
 Backfilled for the charter's now-mandatory lock-manifest gate (`standards/CHARTER.md`):
 `operator-surface-finalist.html` shipped as `★ LOCKED` under #183 with no manifest of
@@ -58,12 +58,18 @@ surface — `Briefing.svelte` deliberately reopens its own token set scoped to
     repository whose briefing data is stale or has never loaded. Normal in-flight
     work the engine is still handling never appears; neither does a capacity/idle-pool
     row nor a blocked-ticket row (both re-settled out — see below).
+    *Amended by #430 (`operator-briefing-drought.lock.md`): a sixth condition — a
+    pipeline stage that produced no stage outcome across its last 10 finished
+    attempts — is added on that manifest's terms. Nothing else is.*
 13. **Priority order** — rows appear in exactly that condition order. Within a
     condition the sub-kind ranks first — condition 1 by repository profile alone
     (`guarded`, then `reviewed`, then `autonomous`), condition 2 needs-grilling before
     needs-mockup — then least-recently-touched first where a clock exists, then
     repository name, then item number. The order is total and never depends on the
     order repositories happen to be walked.
+    *Amended by #430 (`operator-briefing-drought.lock.md`): stage-drought rows rank
+    ahead of all five conditions above — a silently broken stage outranks any single
+    item it starves. The five keep their order relative to each other.*
 14. **Row kind labels** — the four the surface already ships (`Merge`, `Held`,
     `Parked`, `Trust`) keep their wording; the stale/never-loaded condition uses the
     locked incomplete state's own `Projection` kind and its row shape (a short

@@ -143,7 +143,7 @@ export const STAGES = [
    bounds, and freshness (ADR 0036: "the browser derives presentation only") — every
    function below only flattens, formats, and ranks what the daemon already decided. */
 
-/* The attention queue is decided by the daemon (#373): the five ruled conditions, each
+/* The attention queue is decided by the daemon (#373): the ruled conditions, each
    underlying thing once, in one total order, already bounded and already worded. Nothing is
    ranked, filtered or collapsed here — the section renders the rows as published, reports the
    daemon's own pre-bound total, and shows the overflow as the difference between the two. */
