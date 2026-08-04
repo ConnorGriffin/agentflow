@@ -172,8 +172,9 @@ def review_park_missing(record) -> str:
     pass_sentence = f"{passes} review {noun} recorded a verdict."
     if record.review_passes:
         earlier = "pass" if record.review_passes == 1 else "passes"
+        possessive = "its" if record.review_passes == 1 else "their"
         pass_sentence += (f" The {record.review_passes} earlier {earlier} pushed a repair at "
-                          "their own head.")
+                          f"{possessive} own head.")
     if refused_before_start(hold_reason):
         if passes:
             return ("The latest review session did not run at all: the private working copy the "
@@ -187,8 +188,9 @@ def review_park_missing(record) -> str:
                 "at this change at all.")
     if ended_at_turn_cap(getattr(record, "hold_reason", None)):
         if passes:
-            return ("The last review session was cut off at its per-stage turn ceiling. "
-                    f"{pass_sentence} Do not treat this as a clean review.")
+            return ("The last review session was cut off at its per-stage turn ceiling — it was "
+                    f"stopped mid-review, not left short of an answer. {pass_sentence} Do not "
+                    "treat this as a clean review.")
         return ("No review verdict was recorded for this exact head: the last review session was "
                 "cut off at its per-stage turn ceiling before it could reach one — it was stopped "
                 "mid-review, not left short of an answer. Do not treat this as a clean review.")
@@ -223,10 +225,10 @@ def park_pr(record) -> str | None:
         return None
     uncertainty = chain_uncertainty(record)
     recorded_passes = _recorded_review_passes(record) if record.stage == "review" else 0
+    noun = "pass" if recorded_passes == 1 else "passes"
     pass_reason = ""
     pass_wording = None
     if recorded_passes:
-        noun = "pass" if recorded_passes == 1 else "passes"
         pass_reason = (f"reached a human hand-off after {recorded_passes} verdict-recording "
                        f"review {noun}")
         pass_wording = ParkCopy(
@@ -249,13 +251,23 @@ def park_pr(record) -> str | None:
         missing = review_park_missing(record)
         checks = (f"No checks ran, and no review session was started. What is in the way: "
                   f"{blocker}",)
-        wording = pass_wording or ParkCopy(
+        # Only the unsupported zero-pass claims give way to the ledger: the one instruction that
+        # can unblock this park — release the pinned working copy — is the whole point of the
+        # branch, and a resume that skips it walks straight back into the same refusal.
+        wording = ParkCopy(
             options=(f"Release the pinned working copy on the machine agentflow runs on, then "
                      f"resume: `/agentflow review {pr}`.",
                      "Review this change by hand and decide the PR yourself."),
-            consequences=("Releasing it lets the review this change has never had actually run; "
+            consequences=("Releasing it lets the blocked review actually run; judging it by hand "
+                          "keeps the recorded verdicts as evidence without treating them as a "
+                          "clean final review."
+                          if recorded_passes else
+                          "Releasing it lets the review this change has never had actually run; "
                           "judging it by hand leaves this head with no agentflow review at all."),
-            recommendation=("Release the working copy and resume — nothing has judged this "
+            recommendation=(f"Release the working copy and resume; {recorded_passes} review "
+                            f"{noun} already recorded a verdict."
+                            if recorded_passes else
+                            "Release the working copy and resume — nothing has judged this "
                             "change yet, and no attempts were spent finding that out."),
             next_action=(f"Clear what is named above on the machine agentflow runs on, then run "
                          f"`/agentflow review {pr}` to review this exact head."))
@@ -264,7 +276,7 @@ def park_pr(record) -> str | None:
                                        or record.review_axis == "decision"):
         reason = "needs the maintainer to choose between competing product behaviors"
         if recorded_passes:
-            reason += f" after {recorded_passes} verdict-recording review passes"
+            reason += f" after {recorded_passes} verdict-recording review {noun}"
         # A recorded decision prints its own exact wording; this line is what remains when the
         # axis asked for a decision the durable chain no longer holds.
         missing = "Both tools remain unsure and the private decision record is unavailable."

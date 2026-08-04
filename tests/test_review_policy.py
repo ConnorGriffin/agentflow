@@ -898,15 +898,16 @@ def test_a_review_that_recorded_no_decision_parks_as_an_execution_failure(monkey
     assert "Recommendation: Resume the review — nothing has judged this change yet." in body
 
 
-def _parked_review_outcome(*, verdict="PASS", final=None, pushed="", findings=()):
+def _parked_review_outcome(*, verdict="PASS", final=None, pushed="", findings=(), axis="fix",
+                           decision=""):
     target = "c626f21bae01970c38b14711da5b38117c9f6872"
     return json.dumps({
         "verdict": verdict, "depth": "full", "depth_reason": "shared behavior",
-        "axis": "fix", "change_author_tool": "claude", "reviewed_sha": target,
+        "axis": axis, "change_author_tool": "claude", "reviewed_sha": target,
         "final_sha": final or target, "pushed_sha": pushed,
         "fixes": (["repaired it"] if pushed else []), "follow_ups": [],
         "checks": ["reviewed"], "findings": list(findings),
-        "uncertainty": None, "decision": "",
+        "uncertainty": None, "decision": decision,
     })
 
 
@@ -977,14 +978,19 @@ def test_a_park_counts_any_stored_parsed_verdict_including_prior_push_provenance
     assert "the review executions failed" not in body
 
 
-@pytest.mark.parametrize("hold_reason,cause", [
+@pytest.mark.parametrize("hold_reason,cause,remedy", [
     ("refused before start — checkout-locked: review checkout pinned open",
-     "latest review session did not run at all"),
+     "latest review session did not run at all",
+     "Release the pinned working copy on the machine agentflow runs on"),
     ("continuation budget exhausted — the last attempt was cut off at its turn cap",
-     "last review session was cut off at its per-stage turn ceiling"),
+     "last review session was cut off at its per-stage turn ceiling — it was stopped mid-review, "
+     "not left short of an answer",
+     "`/agentflow review 479`"),
 ])
 def test_a_cause_specific_park_replaces_only_unsupported_zero_pass_claims(
-        monkeypatch, hold_reason, cause):
+        monkeypatch, hold_reason, cause, remedy):
+    """The ledger silences claims the record disproves — never the one instruction that unblocks
+    this park. A resume that skips releasing the pinned working copy walks into the same refusal."""
     record = _chain_record(
         "caused", sequence=1, created=100, axis="combined", held=True, passes=1,
         hold_reason=hold_reason)
@@ -992,10 +998,25 @@ def test_a_cause_specific_park_replaces_only_unsupported_zero_pass_claims(
     body = _park_body(monkeypatch, record)
 
     assert cause in body
+    assert remedy in body
     assert "1 review pass recorded a verdict" in body
+    assert "The 1 earlier pass pushed a repair at its own head" in body
     assert "nothing has looked at this change at all" not in body
     assert "no budget was drawn down" not in body
     assert "nothing has judged this change yet" not in body
+
+
+def test_a_conflict_decision_park_counts_a_single_pass_in_readable_words(monkeypatch):
+    """The park headline is also the proof marker, so its wording is durable, not decorative."""
+    record = _chain_record(
+        "decision", sequence=1, created=100, axis="decision", held=True,
+        outcome=_parked_review_outcome(axis="decision", decision="kept the shipped behavior"),
+        hold_reason="completed stage has no successor")
+
+    body = _park_body(monkeypatch, record)
+
+    assert "competing product behaviors after 1 verdict-recording review pass." in body
+    assert "review passes" not in body
 
 
 def test_a_resumed_review_keeps_the_head_lineage_and_ledger_and_settles_the_decision():
