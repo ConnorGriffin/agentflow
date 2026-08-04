@@ -616,6 +616,25 @@ def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlock
     assert permits(coord, "claude") == moved.demand
 
 
+def test_a_session_led_build_waits_for_claude_rather_than_moving_to_codex(make_coord):
+    """Build launches the Claude session lead (ADR 498), so a blocked Claude launch gate makes the
+    work *wait*: a clear codex pool must never adopt it, which would run a single codex agent under
+    instructions addressed to the accountable Claude parent. Re-placement stays available in the
+    other direction, for the durable pre-#498 codex builds the test above covers."""
+    fake = FakeSession()
+    coord = make_coord(fake, gate=_gate_blocking("claude"),
+                       adapter=_adapter(fake, pr=[False], prep=[True]))
+    ident = coord.submit_stage(
+        _build("7", source="/work/o-r/.agentflow/worktrees/claude/issue-7-fix"))
+    assert record_of(coord, ident).model == "fable"
+    coord.cycle("claude", now=0)                       # claude cannot launch it; ledger untouched
+    coord.cycle("codex", now=0)                        # ... and codex must not adopt it
+    waiting = record_of(coord, ident)
+    assert waiting.pool == "claude" and waiting.model == "fable"
+    assert waiting.state == "waiting" and waiting.attempts == 0
+    assert permits(coord, "codex") == 0
+
+
 def test_a_started_build_never_migrates_off_its_pinned_pool(make_coord):
     """A build that already made a real attempt (branch/worktree/PR may exist) stays pinned to its
     builder lineage even when that pool is later throttled — only a genuinely never-started build

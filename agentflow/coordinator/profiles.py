@@ -4,7 +4,7 @@ Every daemon session used to launch with one full tool surface, personal MCP con
 leaking in, and a single stage-blind two-hour timeout. This table keys a profile on the
 record's ``(stage, complexity, effort)`` — the keys the record already carries — and returns
 the read/search allowlist, the wall-clock ceiling, the turn ceiling, and the provider
-reasoning-effort rung (build/revise only; every other stage stays provider-default) for that cell. The
+session reasoning effort (low for Build/Revise; every other stage stays provider-default) for that cell. The
 allowlists are taken verbatim from the research table
 (``docs/research/session-profiles-and-ceilings-draft.md`` §3a); the ceilings began there too and
 have since been ratcheted onto the fleet's own recorded distribution (§3b′, #410; §3b″ per build
@@ -120,19 +120,8 @@ _OBSERVED_P95: dict[tuple[str, str | None, str | None], tuple[int, int]] = {
     ("revise", "standard", None): (909, 100),
 }
 
-# The reasoning-effort rung each work-effort dial maps to at launch (ADR 0046). Build and revise
-# launch the provider at the mapped rung; every other stage leaves the provider default (``None``).
-# ``extra`` maps to the provider "extra high" rung (``xhigh``). ``max`` is never wired by the
-# daemon (manual-only escape hatch, ADR 0046). The argv builders clamp a rung above a provider's
-# own ladder to its top rung rather than failing the launch — inert for today's models, which all
-# accept these rungs, but kept as defensive design for a future model with a shorter ladder.
-_REASONING_BY_EFFORT: dict[str, str] = {
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "extra": "xhigh",
-}
-
+# ADR 498 pins the Fable Build/Revise parent to low reasoning. The work-effort dial still sizes
+# ceilings below and maps to the worker rung inside the routing module's rendered lead brief.
 # Build ceilings keyed on (complexity, effort) (§3b, ratcheted per cell in §3b″/#416, walls read
 # per cell in §3b‴/#421). A cell the research table does not name falls back to the most
 # conservative ceiling of its complexity.
@@ -196,14 +185,15 @@ def profile_for(record) -> StageProfile:
     Build sizes its ceiling on its own complexity/effort; Revise inherits the original
     builder's Build ceiling through ``builder_complexity`` (ADR 0041); every other stage reads
     the per-stage table. Read-only stages carry a read/search allowlist; the rest keep the full
-    surface (``allowed_tools is None``).
+    surface (``allowed_tools is None``). Both session leads run at low reasoning; their worker
+    reasoning rung is prompt-level routing policy, not a provider flag on the parent.
     """
     stage = record.stage
     if stage == "build":
         wall, turns = _build_ceiling(record.complexity, record.effort)
-        return StageProfile(None, wall, turns, _REASONING_BY_EFFORT.get(record.effort))
+        return StageProfile(None, wall, turns, "low")
     if stage == "revise":
         wall, turns = _build_ceiling(record.builder_complexity or record.complexity, record.effort)
-        return StageProfile(None, wall, turns, _REASONING_BY_EFFORT.get(record.effort))
+        return StageProfile(None, wall, turns, "low")
     wall, turns = _STAGE_CEILINGS.get(stage, _DEFAULT_CEILING)
     return StageProfile(_READ_ONLY_TOOLS.get(stage), wall, turns)

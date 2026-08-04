@@ -224,9 +224,15 @@ def slug(title: str) -> str:
 def source_facts(record):
     """The ``(workdir, branch, path)`` of the branch-owning checkout a Build, Revise, Respond
     or Mockup record owns, or ``None`` when the source is not that record's own checkout —
-    a foreign tool, a lineage the pool no longer matches, or the wrong kind of path."""
+    a foreign tool, a lineage the pool no longer matches, or the wrong kind of path.
+
+    Which lane counts as the record's own is its ``branch_lineage`` when it carries one: a
+    session-led Revise runs on the tool that leads the session, while the PR keeps the branch and
+    retained worktree in the lane of the tool that opened it (ADR 498). Without that fact the lane
+    is the record's own pool, as it was for every single-agent stage."""
     ref = WorktreeRef.parse(record.source)
-    if ref is None or ref.tool != record.pool or record.lineage != record.pool:
+    branch_owner = record.branch_lineage or record.pool
+    if ref is None or ref.tool != branch_owner or record.lineage != record.pool:
         return None
     if record.stage == "mockup":
         if ref.kind is not WorktreeKind.MOCKUP or str(ref.number) != str(record.subject):

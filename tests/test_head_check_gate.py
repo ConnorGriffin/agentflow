@@ -321,7 +321,7 @@ def test_a_caught_red_check_opens_a_revise_round_named_check_and_sha_only(monkey
     assert world.captured["complexity"] == "standard"
     revise = world.submitted[0]
     assert revise.effort == "extra" and revise.builder_effort == "extra"
-    assert profile_for(revise).reasoning_effort == "xhigh"
+    assert profile_for(revise).reasoning_effort == "low"
     assert "`python`" in world.captured["findings"] and "sha-a" in world.captured["findings"]
     assert "log" in world.captured["findings"].lower()  # the no-CI-log instruction rides along
 

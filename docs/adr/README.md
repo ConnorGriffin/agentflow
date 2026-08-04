@@ -240,3 +240,18 @@ Issue-keyed records:
   guardrails at ADR 0040's existing bar: revert on a degraded guardrail or a saving at or below
   zero, tune on a saving under 20% with clean guardrails, and record "extend, do not judge" when
   the cell is too thin. Revert is the ADR 464 switch. Constrains 0043's recovery envelope.
+- [ADR 498](adr-498-capability-routed-session-led-dispatch.md) — Build and Revise launch one
+  Claude/Fable session lead at low session reasoning that delegates every piece of the work to
+  workers chosen from the provenance-stamped capability table, verifies each result against the
+  repository gate, and escalates one rung after a second failure. Complexity stops sizing the
+  builder and effort becomes the worker reasoning instruction. Supersedes 0014, 0018's
+  builder-model selection, and 0029's build/revise model validation.
+- [ADR 498](adr-498-headroom-is-a-launch-gate.md) — Quota headroom gates the launch and nothing
+  after it: Build and Revise wait for a clear Claude pool because that is the only pool with a
+  parent implementation, and no worker delegation inside a running session consults the
+  balancer. Nested `codex exec` workers deliberately bypass the Codex permit ledger. Narrows
+  0020 until ADR 509's second parent restores partial-availability throughput.
+- [ADR 498](adr-498-tiered-parent-independent-review.md) — Review stays one single-model session
+  but its tier follows the builder's complexity dial — cheap for standard, frontier for deep —
+  and independence is measured against the session lead's tool rather than whichever worker
+  wrote the diff. Weakens 0003; supersedes 0018's always-deep reviewer.

@@ -41,6 +41,7 @@ from agentflow.pr_park import (chain_uncertainty, exact_head_review_chain, park_
 from agentflow.prompts import UI_GAP_REASON
 from agentflow.repo_facts import repo_profile, surface_declaration, surfaces_phrase, ui_surfaces
 from agentflow.reviewer import review_worktree
+from agentflow.routing import routing
 from agentflow.runner import _run, remove_worktree_if_safe
 from agentflow.stage_worktree import worktree_owns_head
 from agentflow.worktree_ref import WorktreeRef, review_source_facts
@@ -116,9 +117,12 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         cross_tool_covered=reviewer_tool != author)
     return Submission(
         repo=build_record.repo, subject=build_record.subject, stage="review",
-        target=head_sha, pool=reviewer_tool, complexity="deep",
+        target=head_sha, pool=reviewer_tool,
+        complexity=routing.review_complexity(
+            build_record.builder_complexity, build_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=brief, builder_lineage=build_record.pool,
+        branch_lineage=(build_record.branch_lineage or build_record.pool),
         builder_complexity=build_record.complexity, builder_effort=build_record.effort,
         round=completed_rounds,
         conflict_round=build_record.conflict_round,
@@ -229,9 +233,12 @@ def review_successor_submission(review_record, verdict):
         uncertainty_handoffs=prior.uncertainty_handoffs)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=verdict.final_sha, pool=next_tool, complexity="deep",
+        target=verdict.final_sha, pool=next_tool,
+        complexity=routing.review_complexity(
+            review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state)
@@ -300,9 +307,12 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         uncertainty_handoffs=prior.uncertainty_handoffs + (1 if uncertainty else 0))
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=next_tool, complexity="deep",
+        target=review_record.target, pool=next_tool,
+        complexity=routing.review_complexity(
+            review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state)
@@ -342,9 +352,12 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         cross_tool_covered=True, tainted=True, taint_cleared=False, handoff=handoff)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=reviewer_tool, complexity="deep",
+        target=review_record.target, pool=reviewer_tool,
+        complexity=routing.review_complexity(
+            review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state)
@@ -388,9 +401,12 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
         cross_tool_covered=reviewer_tool != author, handoff=handoff, uncertainty=None)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=reviewer_tool, complexity="deep",
+        target=review_record.target, pool=reviewer_tool,
+        complexity=routing.review_complexity(
+            review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
         claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state)
@@ -431,9 +447,10 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         cross_tool_covered=reviewer_tool != author)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="review", target=head_sha,
-        pool=reviewer_tool, complexity="deep",
+        pool=reviewer_tool, complexity=routing.review_complexity(None, "deep"),
         source=str(review_worktree(cfg.workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=prompt, builder_lineage=builder_tool,
+        branch_lineage=builder_tool,
         review=state, transfer_from=transfer_from, supersede=supersede, resume=resume)
 
 
@@ -1142,9 +1159,12 @@ def _moved_head_review_submission(record, head_sha: str):
     review = replace(review, reviewed_from_sha=record.target)
     return Submission(
         repo=record.repo, subject=record.subject, stage="review", target=head_sha,
-        pool=reviewer_tool, complexity="deep",
+        pool=reviewer_tool,
+        complexity=routing.review_complexity(
+            record.builder_complexity, record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, slug)),
         claim=True, input_ptr=prompt, builder_lineage=record.builder_lineage,
+        branch_lineage=record.branch_lineage,
         builder_complexity=record.builder_complexity, builder_effort=record.builder_effort,
         round=record.round,
         review=review,

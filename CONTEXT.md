@@ -113,26 +113,27 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   sets a repo's position on the autonomy dial. High in safety-critical projects,
   low in a vibe-code project.
 
-- **Complexity** — the per-issue builder model size intake stamps as a hard gate:
-  `standard` (sonnet/Terra) or `deep` (correctness-sensitive — opus/Sol).
-  Tool-agnostic; each runner resolves it to its tool's model. Orthogonal to the pool:
-  pool = *which plan* (by headroom), complexity = *how big a builder model within
-  it*. Reviewers do not inherit this dial; every review uses the deep tier.
-  (Supersedes the earlier single `tier` dial; `light`/haiku dropped — ADR 0018.)
+- **Complexity** — the per-issue review and ceiling dial intake stamps as a hard gate:
+  `standard` (cheap review) or `deep` (frontier review). Build and Revise always launch a
+  Fable session lead; complexity no longer sizes that parent. The dial still selects the
+  established Build/Revise ceiling and travels durably as `builder_complexity` so every
+  review round keeps the original tier (ADR 498).
 
 - **Effort** — the second dial intake stamps alongside complexity: `low | medium |
-  high | extra` — how much work the issue warrants, independent of model size. It
-  also configures the **builder's** provider reasoning effort (`extra` maps to the
-  ladder's Extra High and clamps there; Max/Ultracode stay manual-only — ADR 0046).
-  Revise inherits the original builder's effort. Non-build stages take
-  provider-default reasoning (tunable cells, ADR 0044/0046).
+  high | extra` — how much work the issue warrants. The Fable parent always launches at
+  low reasoning; the dial maps to the worker reasoning rung in its brief (`extra` → `xhigh`)
+  and retains the established ceiling. Revise inherits it; non-build stages use provider
+  defaults (ADR 0044/0046/498).
 
-- **Runner** — the interchangeable executor that performs a pipeline stage:
-  Claude (Opus) or Codex (GPT-5.6 Sol). Chosen per stage by cost / availability /
-  preference, **not** by a capability ceiling — both are full-loop capable.
+- **Session lead** — the fixed parent accountable for a Build or Revise session. It plans,
+  delegates by the benchmarked capability table, verifies results, and ships; it never writes
+  the implementation directly. The current implementation is Claude/Fable at low reasoning.
 
-- **Builder** — the runner that implements an issue and opens the PR. Self-reviews
-  and flags uncertainties, but its own sign-off never gates a merge.
+- **Runner** — the executor of a pipeline stage. Build and Revise use the Claude/Fable
+  session lead; other stages retain their stage-specific Claude or Codex runner.
+
+- **Builder** — the accountable session lead that delegates an issue's implementation,
+  verifies it, and opens the PR. Its own sign-off never gates a merge.
 
 - **Reviewer** — the runner that verifies a PR and may ship clear grounded fixes on its
   branch. A reviewer never approves its own changed head; another tool must inspect that

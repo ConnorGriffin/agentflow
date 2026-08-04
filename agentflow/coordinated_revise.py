@@ -27,7 +27,8 @@ from agentflow import github
 from agentflow.balancer import BUILD_POOLS
 from agentflow.prompts import REVISE_PROMPT
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
-from agentflow.runner import _run
+from agentflow.routing import routing
+from agentflow.runner import _run, codex_spent_at_render
 from agentflow.stage_worktree import worktree_owns_head
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef, source_facts
 
@@ -39,6 +40,11 @@ _CONFLICT_REVISE_FINDING = (
     "keep the full test suite green. Preserve both sides wherever their intended behavior is "
     "compatible; neither side wins merely because it is newer. If they encode incompatible product "
     "intent, return the private two-option conflict uncertainty instead of choosing silently.")
+
+
+def _session_lead_prompt(prompt: str, effort: str | None) -> str:
+    return prompt + routing.session_lead_instructions(
+        "revise", effort, codex_spent=codex_spent_at_render())
 
 
 def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_tool: str,
@@ -55,26 +61,30 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
     from agentflow.coordinator import Submission
     if not head_sha or builder_tool not in BUILD_POOLS:
         return None
-    brief = REVISE_PROMPT.format(
+    brief = _session_lead_prompt(REVISE_PROMPT.format(
         n=pr_number, repo=cfg.repo, findings=f"- {_CONFLICT_REVISE_FINDING}",
-        surfaces="any user-facing surface")
+        surfaces="any user-facing surface"), None)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
-        pool=builder_tool, complexity="deep", conflict_round=conflict_round,
-        source=WorktreeRef.for_build(cfg.workdir, builder_tool, issue, slug).path, claim=True, input_ptr=brief,
-        builder_lineage=builder_tool, builder_complexity="deep", continuation=True)
+        pool="claude", complexity="deep", conflict_round=conflict_round,
+        source=WorktreeRef.for_build(cfg.workdir, builder_tool, issue, slug).path,
+        claim=True, input_ptr=brief,
+        builder_lineage="claude", branch_lineage=builder_tool,
+        builder_complexity="deep", continuation=True)
 
 
 def _revise_builder_source(review_record):
     """The ``(build_worktree, pr_number)`` a Revise adopts from a blocking Review record. The
     revise reuses the *builder's* retained branch/worktree — ``.../<builder_lineage>/issue-<subject>
     -<slug>`` — which the review source (``.../<tool>-review/pr-<pr>-<slug>``) and the record's
-    builder lineage together recover, so no second durable field is needed. ``None`` if unreadable."""
+    retained branch lineage together recover. Older records predate that distinct fact, so their
+    builder lineage remains the migration fallback. ``None`` if unreadable."""
     review = WorktreeRef.parse(review_record.source)
-    if review is None or review.kind is not WorktreeKind.REVIEW or not review_record.builder_lineage:
+    branch_tool = review_record.branch_lineage or review_record.builder_lineage
+    if review is None or review.kind is not WorktreeKind.REVIEW or not branch_tool:
         return None
     build = WorktreeRef.for_build(
-        review.workdir, review_record.builder_lineage, int(review_record.subject), review.slug)
+        review.workdir, branch_tool, int(review_record.subject), review.slug)
     return build.path, review.number
 
 
@@ -93,14 +103,16 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     if facts is None or not reviewed_head:
         return None
     build_worktree, pr_number = facts
-    brief = REVISE_PROMPT.format(
+    brief = _session_lead_prompt(REVISE_PROMPT.format(
         n=pr_number, repo=review_record.repo, findings=findings or "- (see review)",
-        surfaces=surfaces or "any user-facing surface")
+        surfaces=surfaces or "any user-facing surface"), review_record.builder_effort)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=reviewed_head, pool=review_record.builder_lineage, complexity=complexity,
+        target=reviewed_head, pool="claude", complexity=complexity,
         effort=review_record.builder_effort, source=build_worktree, claim=True, input_ptr=brief,
-        builder_lineage=review_record.builder_lineage, builder_complexity=complexity,
+        builder_lineage="claude",
+        branch_lineage=review_record.branch_lineage or review_record.builder_lineage,
+        builder_complexity=complexity,
         builder_effort=review_record.builder_effort,
         round=review_record.round, transfer_from=review_record.identity)
 
@@ -120,9 +132,9 @@ def conflict_decision_revise_submission(review_record, verdict):
         "The other tool resolved the private conflict decision. Apply this choice while preserving "
         f"all compatible behavior: {verdict.decision}"
     )
-    prompt = REVISE_PROMPT.format(
+    prompt = _session_lead_prompt(REVISE_PROMPT.format(
         n=pr_number, repo=review_record.repo, findings=f"- {decision}",
-        surfaces="any user-facing surface")
+        surfaces="any user-facing surface"), review_record.builder_effort)
     prior = ReviewState.from_record(review_record)
     if prior is None:
         return None
@@ -133,10 +145,11 @@ def conflict_decision_revise_submission(review_record, verdict):
         change_author_tool=review_record.builder_lineage, handoff=decision)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=review_record.target, pool=review_record.builder_lineage,
+        target=review_record.target, pool="claude",
         complexity=review_record.builder_complexity or "deep",
         effort=review_record.builder_effort, source=build_worktree,
-        claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        claim=True, input_ptr=prompt, builder_lineage="claude",
+        branch_lineage=review_record.branch_lineage or review_record.builder_lineage,
         builder_complexity=review_record.builder_complexity or "deep",
         builder_effort=review_record.builder_effort,
         round=review_record.round, conflict_round=review_record.conflict_round,

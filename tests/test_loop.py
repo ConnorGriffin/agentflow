@@ -576,7 +576,7 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
                          labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "pick_pair",
+    monkeypatch.setattr(loop, "pick_session_lead",
                         lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: True)
     submission = SimpleNamespace(resume=0, pool="claude")
@@ -603,8 +603,8 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
 def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(monkeypatch):
     # After a maintainer `pickup` returns a budget-exhausted issue to `ready-for-agent`, `build <N>`
     # is the explicit, durable resume: it opens a fresh bounded execution at a new resume identity,
-    # pinned back to the original builder's pool and retained worktree — never the re-picked tool
-    # (#245). resume_if_held runs for real here.
+    # retaining the original worktree while adopting the current fixed session lead (#245/#498).
+    # resume_if_held runs for real here.
     from agentflow import coordinated_build
     from agentflow.coordinator import Submission
     from agentflow.coordinator.record import HELD, WAITING, Record
@@ -613,17 +613,18 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
                          labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    # pick_pair offers codex, but the held Build was built by claude — the resume must pin back.
-    monkeypatch.setattr(loop, "pick_pair",
+    # The held Build predates session-led dispatch and owns a Codex checkout.
+    monkeypatch.setattr(loop, "pick_session_lead",
                         lambda operator=False, floodgates=False: (SimpleNamespace(tool="codex"), None, ""))
     claimed = []
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claimed.append(n) or True)
-    base = Submission(repo="o/r", subject="5", stage="build", pool="codex",
-                      complexity="standard", source="/w/.agentflow/worktrees/codex/issue-5-t")
+    base = Submission(repo="o/r", subject="5", stage="build", pool="claude",
+                      complexity="standard", source="/w/.agentflow/worktrees/claude/issue-5-t",
+                      input_ptr="the new session-lead brief")
     monkeypatch.setattr(coordinated_build, "build_submission", lambda *_, **__: base)
-    held = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
+    held = Record(identity="o/r|5|build|-", stage="build", pool="codex", demand=5,
                   repo="o/r", subject="5", state=HELD, claim=False,
-                  source="/w/.agentflow/worktrees/claude/issue-5-t", input_ptr="the original brief")
+                  source="/w/.agentflow/worktrees/codex/issue-5-t", input_ptr="the original brief")
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [held])
     submitted = []
     resumed_rec = Record(identity="o/r|5|build|-|s1", stage="build", pool="claude", demand=5,
@@ -641,9 +642,10 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     assert len(submitted) == 1
     resumed_sub = submitted[0]
     assert resumed_sub.resume == 1                        # a new bounded execution, not the held one
-    assert resumed_sub.pool == "claude"                  # pinned to the held builder's pool
-    assert resumed_sub.source == "/w/.agentflow/worktrees/claude/issue-5-t"  # retained worktree
-    assert resumed_sub.input_ptr == "the original brief"  # the same durable brief, re-run
+    assert resumed_sub.pool == "claude"                  # the fixed accountable session lead
+    assert resumed_sub.branch_lineage == "codex"         # retained checkout ownership stays true
+    assert resumed_sub.source == "/w/.agentflow/worktrees/codex/issue-5-t"
+    assert resumed_sub.input_ptr == "the new session-lead brief"
 
 
 def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkeypatch):
@@ -657,7 +659,7 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
                          labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "pick_pair",
+    monkeypatch.setattr(loop, "pick_session_lead",
                         lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: False)   # the race is lost
     submission = SimpleNamespace(resume=0, pool="claude")
@@ -692,7 +694,7 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
                          labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "pick_pair",
+    monkeypatch.setattr(loop, "pick_session_lead",
                         lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim",
                         lambda repo, n, _label: pytest.fail("must not claim a held record"))
@@ -729,7 +731,7 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
                          labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
-    monkeypatch.setattr(loop, "pick_pair",
+    monkeypatch.setattr(loop, "pick_session_lead",
                         lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_build, "build_submission",
                         lambda *_, **__: Submission(repo="o/r", subject="5", stage="build",

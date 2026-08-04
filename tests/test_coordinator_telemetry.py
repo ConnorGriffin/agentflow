@@ -21,7 +21,7 @@ from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import ProviderCause, classify_claude, classify_codex
 from agentflow.coordinator.telemetry import (
     AttemptTelemetry, AttemptUsage, ModelCost, claude_usage, codex_usage, project,
-    read_attempts, record_attempt, telemetry_dir)
+    read_attempts, record_attempt, spend_report, telemetry_dir)
 
 # --- representative provider usage streams -------------------------------------------------
 
@@ -257,6 +257,36 @@ def test_projection_ignores_a_corrupt_entry(tmp_path):
     assert project(store).total.attempts == 1         # the corrupt tail is skipped, not fatal
 
 
+def test_spend_report_uses_delegate_models_and_keeps_token_only_codex_rows(tmp_path):
+    store = tmp_path / "records.db"
+    delegated = AttemptUsage(model_costs=(
+        ModelCost("fable", 0.03, input_tokens=100, output_tokens=20),
+        ModelCost("sonnet", 0.12, input_tokens=400, output_tokens=80),
+        ModelCost("gpt-5.6-terra", None, input_tokens=300, output_tokens=60),
+    ))
+    record_attempt(store, _entry(token="delegated", model="fable", usage=delegated))
+    record_attempt(store, _entry(
+        token="codex", stage="review", model="luna",
+        usage=AttemptUsage(input_tokens=200, output_tokens=40)))
+    old = _entry(token="old", model="opus", usage=AttemptUsage(output_tokens=999))
+    object.__setattr__(old, "started_at", 10)
+    record_attempt(store, old)
+
+    report = spend_report(store, start=50, end=150)
+    rows = {(row.stage, row.model): row for row in report.rows}
+
+    assert set(rows) == {
+        ("build", "fable"), ("build", "sonnet"),
+        ("build", "gpt-5.6-terra"), ("review", "luna"),
+    }
+    assert rows[("build", "fable")].tokens == 120
+    assert rows[("build", "sonnet")].cost_usd == pytest.approx(0.12)
+    assert rows[("build", "gpt-5.6-terra")].tokens == 360
+    assert rows[("build", "gpt-5.6-terra")].cost_usd is None
+    assert rows[("review", "luna")].tokens == 240
+    assert rows[("review", "luna")].cost_usd is None
+
+
 # --- through the coordinator's public seam -------------------------------------------------
 
 def test_completed_attempt_persists_its_spend_through_the_seam(make_coord, coord_state):
@@ -271,15 +301,14 @@ def test_completed_attempt_persists_its_spend_through_the_seam(make_coord, coord
     assert [o.status for o in outcomes] == ["completed"]
 
     (entry,) = read_attempts(coord._store.path)
-    assert entry.stage == "build" and entry.model == "opus" and entry.effort == "high"
+    assert entry.stage == "build" and entry.model == "fable" and entry.effort == "high"
     assert entry.verified is True
     assert entry.usage.cost_usd == 0.42 and entry.usage.output_tokens == 1500
     assert entry.attempt == 1
 
 
-def test_attempt_records_the_reasoning_effort_set_at_launch(make_coord, coord_state):
-    """A build attempt's telemetry carries the reasoning effort actually set at launch (ADR 0046):
-    an extra-effort build reasons at ``xhigh``. Fails if the field regresses to always-``None``."""
+def test_attempt_records_the_session_leads_low_reasoning_effort(make_coord, coord_state):
+    """The parent stays low even when the worker instructions carry the extra/xhigh dial."""
     fake = FakeSession()
     coord = make_coord(fake)
     identity = coord.submit_stage(Submission(repo="o/r", subject="5", stage="build",
@@ -289,7 +318,7 @@ def test_attempt_records_the_reasoning_effort_set_at_launch(make_coord, coord_st
     coord.cycle("claude")
 
     (entry,) = read_attempts(coord._store.path)
-    assert entry.reasoning_effort == "xhigh"           # not the old unconditional None
+    assert entry.reasoning_effort == "low"
 
 
 def test_non_build_attempt_records_reasoning_effort_as_explicit_none(make_coord, coord_state):

@@ -28,12 +28,13 @@ from agentflow.intake import held_build_result
 from agentflow.labels import BUILDING, complexity_from_labels, effort_from_labels
 from agentflow.prompts import BUILD_PROMPT
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
-from agentflow.runner import _run
+from agentflow.routing import routing
+from agentflow.runner import _run, codex_spent_at_render
 from agentflow.worktree_ref import WorktreeRef, source_facts
 
 
-def build_submission(cfg, issue: dict, tool: str, *, floodgates: bool = False):
-    """Translate one ready issue and its chosen tool into a single Build stage submission — the
+def build_submission(cfg, issue: dict, *, floodgates: bool = False):
+    """Translate one ready issue into a single session-led Build stage submission — the
     minimal facts the coordinator needs (ADR 0030). The durable input pointer is the full build
     brief the provider session runs, so a recovered attempt rebuilds the same prompt. Pure: the
     issue→submission mapping is the test surface. Returns ``None`` when the issue lacks the
@@ -47,14 +48,17 @@ def build_submission(cfg, issue: dict, tool: str, *, floodgates: bool = False):
     if complexity is None:
         return None
     sl = worktree_ref.slug(issue["title"])
+    effort = effort_from_labels(labels).value
     brief = BUILD_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
-        effort=effort_from_labels(labels).value,
+        effort=effort,
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
+    brief += routing.session_lead_instructions(
+        "build", effort, codex_spent=codex_spent_at_render())
     return Submission(
-        repo=cfg.repo, subject=str(n), stage="build", pool=tool,
-        complexity=complexity.value, effort=effort_from_labels(labels).value,
-        source=WorktreeRef.for_build(cfg.workdir, tool, n, sl).path, claim=True, input_ptr=brief,
+        repo=cfg.repo, subject=str(n), stage="build", pool="claude",
+        complexity=complexity.value, effort=effort,
+        source=WorktreeRef.for_build(cfg.workdir, "claude", n, sl).path, claim=True, input_ptr=brief,
         floodgates=floodgates)
 
 
@@ -66,8 +70,9 @@ def resume_if_held(submission, records):
     stays live: an ordinary resubmission reuses it unwritten and no provider ever launches. When the
     latest Build for this issue is that held record, this bumps the submission to the next resume
     dimension, whose fresh identity opens a genuinely new bounded execution (a fresh
-    ``ATTEMPT_BUDGET``) that still reuses the same issue, brief, builder lineage, and retained
-    worktree ``source``. That source is a path, not a promise the directory is still there: a held
+    ``ATTEMPT_BUDGET``) that reuses the same issue and retained worktree ``source`` while adopting
+    the current session-lead brief. That source is a path, not a promise the directory is still
+    there: a held
     Build is no longer protected from reclamation, so a long-idle one may have been archived to a
     recovery ref and the resume then rebuilds the checkout from the branch tip (ADR 0050).
     Otherwise the submission is returned unchanged, so an ordinary duplicate
@@ -87,12 +92,12 @@ def resume_if_held(submission, records):
     # The next resume dimension is one past *every* Build ever opened for this issue — retired
     # successors included — so a resume can never collide with a prior successor's identity.
     next_resume = max(r.resume for r in builds) + 1
-    # Reuse the held builder's pinned pool, retained worktree, and durable brief so the resume
-    # *recovers* the same branch/worktree the stage adapter left on disk — and re-runs the same
-    # build brief — rather than re-deriving a fresh path from a possibly re-picked tool (#245).
-    return replace(submission, resume=next_resume, pool=latest.pool,
-                   source=latest.source, builder_lineage=latest.builder_lineage,
-                   input_ptr=latest.input_ptr)
+    # Reuse the retained branch/worktree the stage adapter left on disk, but launch the resumed
+    # work under today's fixed Claude session lead and today's lead brief. A pre-#498 held Codex
+    # build therefore keeps its checkout without reviving the retired single-agent dispatch.
+    return replace(
+        submission, resume=next_resume, source=latest.source,
+        branch_lineage=latest.branch_lineage or latest.pool)
 
 
 def resume_in_flight(submission, records) -> bool:

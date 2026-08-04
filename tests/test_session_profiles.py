@@ -159,19 +159,16 @@ def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):
     assert pinned._session_timeout_for(_record("build", str(tmp_path))) == 0.1
 
 
-def test_profile_maps_each_effort_rung_for_build_and_revise_only(tmp_path):
-    """The profile is the one source of truth for the effort→reasoning mapping: each dial rung
-    resolves to its reasoning rung for build and revise, and every other stage stays ``None``
-    (provider default)."""
+def test_profile_pins_session_leads_low_and_other_stages_use_provider_default(tmp_path):
+    """The work dial survives for workers while every build/revise parent stays low."""
     from agentflow.coordinator.profiles import profile_for
 
-    mapping = {"low": "low", "medium": "medium", "high": "high", "extra": "xhigh"}
-    for dial, rung in mapping.items():
+    for dial in ("low", "medium", "high", "extra"):
         assert profile_for(
-            _record("build", str(tmp_path), effort=dial)).reasoning_effort == rung
+            _record("build", str(tmp_path), effort=dial)).reasoning_effort == "low"
         assert profile_for(
             _record("revise", str(tmp_path), builder_complexity="deep", effort=dial)
-        ).reasoning_effort == rung
+        ).reasoning_effort == "low"
     for stage in ("intake", "review", "research", "respond", "converse", "mockup"):
         assert profile_for(_record(stage, str(tmp_path), effort="extra")).reasoning_effort is None
 
@@ -191,32 +188,28 @@ def _codex_record(stage: str, source: str, **kw) -> Record:
                   model="sol", source=source, input_ptr="do the stage", **kw)
 
 
-def test_build_launches_at_the_mapped_reasoning_rung_on_both_providers(tmp_path):
-    """The effort dial reaches each provider's reasoning knob at launch (ADR 0046): extra→xhigh,
-    low→low. Claude via its first-class ``--effort`` flag; Codex via the ``model_reasoning_effort``
-    config override — Codex has no ``--effort`` flag, so it never appears."""
-    for effort, rung in (("extra", "xhigh"), ("low", "low")):
+def test_build_parent_launches_at_low_reasoning_on_both_provider_adapters(tmp_path):
+    """The session-level flag is low; the issue effort is rendered into worker prompts."""
+    for effort in ("extra", "low"):
         claude = provider_command(_record("build", str(tmp_path), complexity="deep", effort=effort))
-        assert _flag(claude, "--effort") == rung
+        assert _flag(claude, "--effort") == "low"
 
         codex = provider_command(
             _codex_record("build", str(tmp_path), complexity="deep", effort=effort))
         codex_config = [codex[i + 1] for i, arg in enumerate(codex[:-1]) if arg == "-c"]
-        assert f"model_reasoning_effort={rung}" in codex_config
+        assert "model_reasoning_effort=low" in codex_config
         assert "--effort" not in codex                 # Codex has no such flag
 
 
-def test_revise_launches_at_the_same_reasoning_rung_as_its_builder(tmp_path):
-    """A Revise carries the same ``effort`` dial as its builder (ADR 0041), so it launches at the
-    same reasoning rung — an extra-effort builder's revise reasons at ``xhigh`` on both providers."""
+def test_revise_parent_launches_low_while_retaining_builder_effort(tmp_path):
     claude = provider_command(
         _record("revise", str(tmp_path), builder_complexity="deep", effort="extra"))
-    assert _flag(claude, "--effort") == "xhigh"
+    assert _flag(claude, "--effort") == "low"
 
     codex = provider_command(
         _codex_record("revise", str(tmp_path), builder_complexity="deep", effort="extra"))
     codex_config = [codex[i + 1] for i, arg in enumerate(codex[:-1]) if arg == "-c"]
-    assert "model_reasoning_effort=xhigh" in codex_config
+    assert "model_reasoning_effort=low" in codex_config
 
 
 def test_non_build_stages_set_no_reasoning_flag(tmp_path):

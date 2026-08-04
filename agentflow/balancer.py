@@ -351,6 +351,16 @@ def choose_pair(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
     return runners[builder.tool], runners[other.tool]
 
 
+def choose_session_lead(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
+    """Choose the fixed Claude session lead; Codex headroom cannot substitute for it.
+
+    ``xs`` remains an input so tests and diagnostics show explicitly that its state has no
+    authority over this launch. Once admitted, workers route by capability inside the session.
+    """
+    del xs
+    return (runners["claude"], None) if cs.clear else (None, None)
+
+
 def choose_reviewer(builder_tool: str, cs: PoolStatus, xs: PoolStatus, *,
                     allow_same_tool: bool = True) -> str | None:
     """Pure (ADR 0020): pick the reviewer for a completed builder's PR.
@@ -528,3 +538,22 @@ def pick_pair(claude: _WorktreeRunner | None = None,
         for s in blocked
     ) or "both at capacity"
     return None, None, block_msg
+
+
+def pick_session_lead(claude: _WorktreeRunner | None = None,
+                      codex: _WorktreeRunner | None = None,
+                      operator: bool = False,
+                      floodgates: bool = False) -> tuple:
+    """Apply the existing launch gates, then choose the Claude-only build/revise parent."""
+    claude = claude or ClaudeRunner()
+    codex = codex or CodexRunner()
+    cs = _query_pool("claude", operator, floodgates=floodgates)
+    if not operator:
+        cs = _claude_dispatch_status(cs, time.time(), floodgates=floodgates)
+    # Codex is deliberately not probed: its headroom neither permits nor refuses the parent.
+    xs = PoolStatus("codex", False, 100.0, "not a session-lead launch gate")
+    lead, reviewer = choose_session_lead(cs, xs, {"claude": claude, "codex": codex})
+    if lead is not None:
+        return lead, reviewer, ""
+    reason = f"claude: {cs.reason}" if cs.reason else "claude"
+    return None, None, reason

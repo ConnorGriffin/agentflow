@@ -355,6 +355,17 @@ def test_codex_account_fact_is_unavailable_without_the_optional_capacity_helper(
     assert CodexRunner().account_fact() is None
 
 
+def test_claude_settings_allow_codex_cli_provider_hosts_so_the_worker_rungs_are_reachable():
+    """A Claude session lead sandboxed with these settings shells out to `codex exec`, so the
+    Codex CLI's own API hosts must be reachable or every Codex rung is unreachable regardless of
+    what routing says (#498/#510)."""
+    settings = json.loads(runner_mod._claude_settings())
+    allowed = settings["sandbox"]["network"]["allowedDomains"]
+
+    for host in ("chatgpt.com", "*.chatgpt.com", "auth.openai.com", "api.openai.com"):
+        assert host in allowed
+
+
 def test_effort_has_four_levels():
     assert [e.value for e in Effort] == ["low", "medium", "high", "extra"]
 

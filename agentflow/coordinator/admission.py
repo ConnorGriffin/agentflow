@@ -99,7 +99,9 @@ _ADMISSION_ROWS = {
     ("attack", "codex", "sol", "deep", None): 1,
     ("attack", "codex", "terra", "standard", None): 1,
     ("review", "claude", "opus", "deep", None): 1,
+    ("review", "claude", "sonnet", "standard", None): 1,
     ("review", "codex", "sol", "deep", None): 2,
+    ("review", "codex", "luna", "standard", None): 1,
     ("revise", "claude", "sonnet", "standard", None): 3,
     ("revise", "claude", "opus", "deep", None): 3,
     ("revise", "codex", "terra", "standard", None): 4,
@@ -127,6 +129,19 @@ for _pool, _model, _complexity, _demands in (
 ):
     for _effort, _demand in zip(("low", "medium", "high", "extra"), _demands, strict=True):
         _ADMISSION_ROWS[("build", _pool, _model, _complexity, _effort)] = _demand
+
+# Build and Revise now launch one Claude/Fable session lead regardless of the complexity dial.
+# The dial still selects the established ceiling/demand cell; it no longer sizes the parent. The
+# parent's demand equals the model it replaces, so a routed session lead never reaches the
+# exclusive unknown-row fallback. Revise stays effort-blind (ADR 0029), so it keeps one row per
+# complexity rather than four unmatchable effort-keyed copies of the same demand.
+for _complexity, _demands in (
+    ("standard", (3, 4, 5, 5)),
+    ("deep", (4, 4, 5, 5)),
+):
+    for _effort, _demand in zip(("low", "medium", "high", "extra"), _demands, strict=True):
+        _ADMISSION_ROWS[("build", "claude", "fable", _complexity, _effort)] = _demand
+    _ADMISSION_ROWS[("revise", "claude", "fable", _complexity, None)] = 3
 ADMISSION_MATRIX = MappingProxyType(_ADMISSION_ROWS)
 
 # The concrete model each pool runs for a given complexity — a validation of the model the
