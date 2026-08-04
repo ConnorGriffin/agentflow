@@ -143,29 +143,59 @@ def park_context(record, verdict, *, reason: str, missing: str, uncertainty=None
             or any(item.action.value == "ask_maintainer" for item in actions)))
 
 
-def review_park_missing(record) -> str:
-    """What a parked review tells the maintainer it is missing, chosen from the persisted hold
-    reason so a crash-resumed handoff composes the same words.
+def _recorded_review_passes(record) -> int:
+    """Count earlier repair-pushing passes and this record's own stored verdict, offline."""
+    from agentflow.reviewer import parse_verdict
 
-    No decision was ever recorded for this head, so the honest fact is an execution failure —
-    inventing a product choice here is what made a parked review unanswerable (#344). *Which*
-    execution failure matters too: a review whose session was cut off at the per-stage turn
-    ceiling never got to finish thinking, and wants a different answer from one that thought and
-    ran out of room (#411). A review that never ran at all is not an execution failure in the
-    first place, and must not be reported as one (#406). The park's own headline stays fixed
-    either way — its post-once proof keys on that. Pure (test surface)."""
+    own_verdict = False
+    if record.outcome:
+        verdict = parse_verdict(
+            record.outcome, expected_sha=record.target,
+            expected_depth=record.review_depth, expected_axis=record.review_axis,
+            expected_author=record.change_author_tool,
+            owned_heads=((record.review_prior_push,) if record.review_prior_push else ()))
+        own_verdict = verdict.parsed
+    return record.review_passes + int(own_verdict)
+
+
+def review_park_missing(record) -> str:
+    """What a parked review tells the maintainer from its durable outcome and hold facts.
+
+    The missing-outcome cause keeps its established precedence: a never-started session, then a
+    turn-capped session, then the generic failure. Once the ledger proves an earlier pass or this
+    record's stored outcome parses to a verdict, unsupported claims that nobody judged the change
+    are replaced by the count those durable facts prove. Pure (test surface, #501)."""
     from agentflow.coordinator.coordinator import ended_at_turn_cap, refused_before_start
     hold_reason = getattr(record, "hold_reason", None)
+    passes = _recorded_review_passes(record)
+    noun = "pass" if passes == 1 else "passes"
+    pass_sentence = f"{passes} review {noun} recorded a verdict."
+    if record.review_passes:
+        earlier = "pass" if record.review_passes == 1 else "passes"
+        possessive = "its" if record.review_passes == 1 else "their"
+        pass_sentence += (f" The {record.review_passes} earlier {earlier} pushed a repair at "
+                          f"{possessive} own head.")
     if refused_before_start(hold_reason):
+        if passes:
+            return ("The latest review session did not run at all: the private working copy the "
+                    "review needs is pinned open on the machine agentflow runs on, so nothing was "
+                    f"checked out. {pass_sentence} Do not treat this as a "
+                    "clean review.")
         return ("No review verdict was recorded for this exact head, and no session ran at all: "
                 "the private working copy the review needs is pinned open on the machine "
                 "agentflow runs on, so nothing was ever checked out. No attempt was used and no "
                 "budget was drawn down. Do not treat this as a clean review — nothing has looked "
                 "at this change at all.")
     if ended_at_turn_cap(getattr(record, "hold_reason", None)):
+        if passes:
+            return ("The last review session was cut off at its per-stage turn ceiling — it was "
+                    f"stopped mid-review, not left short of an answer. {pass_sentence} Do not "
+                    "treat this as a clean review.")
         return ("No review verdict was recorded for this exact head: the last review session was "
                 "cut off at its per-stage turn ceiling before it could reach one — it was stopped "
                 "mid-review, not left short of an answer. Do not treat this as a clean review.")
+    if passes:
+        return f"{pass_sentence} Do not treat this as a clean review."
     return ("No review verdict was recorded for this exact head: the review executions failed "
             "rather than judging the change. Do not treat this as a clean review.")
 
@@ -194,6 +224,22 @@ def park_pr(record) -> str | None:
     if pr is None:
         return None
     uncertainty = chain_uncertainty(record)
+    recorded_passes = _recorded_review_passes(record) if record.stage == "review" else 0
+    noun = "pass" if recorded_passes == 1 else "passes"
+    pass_reason = ""
+    pass_wording = None
+    if recorded_passes:
+        pass_reason = (f"reached a human hand-off after {recorded_passes} verdict-recording "
+                       f"review {noun}")
+        pass_wording = ParkCopy(
+            options=(f"Resume the review on the live head: `/agentflow review {pr}`.",
+                     "Review the retained change by hand and decide this PR yourself."),
+            consequences=("Resuming seeks a fresh judgment while preserving the cumulative "
+                          "repair-pass ceiling; judging it by hand keeps the recorded verdicts "
+                          "as evidence without treating them as a clean final review."),
+            recommendation=(f"Resume for a fresh judgment on the live head; {recorded_passes} "
+                            f"review {noun} already recorded a verdict."),
+            next_action=f"Run `/agentflow review {pr}` to review the live head.")
     wording = None
     checks = None
     if record.stage == "review" and refused_before_start(record.hold_reason):
@@ -201,17 +247,27 @@ def park_pr(record) -> str | None:
         # decision and reached no verdict, so every other branch's words — a spent budget, a
         # competing product behavior — would describe work that does not exist (#406).
         blocker = refused_before_start_detail(record.hold_reason)
-        reason = "has not been looked at at all — the review could not be started"
+        reason = pass_reason or "has not been looked at at all — the review could not be started"
         missing = review_park_missing(record)
         checks = (f"No checks ran, and no review session was started. What is in the way: "
                   f"{blocker}",)
+        # Only the unsupported zero-pass claims give way to the ledger: the one instruction that
+        # can unblock this park — release the pinned working copy — is the whole point of the
+        # branch, and a resume that skips it walks straight back into the same refusal.
         wording = ParkCopy(
             options=(f"Release the pinned working copy on the machine agentflow runs on, then "
                      f"resume: `/agentflow review {pr}`.",
                      "Review this change by hand and decide the PR yourself."),
-            consequences=("Releasing it lets the review this change has never had actually run; "
+            consequences=("Releasing it lets the blocked review actually run; judging it by hand "
+                          "keeps the recorded verdicts as evidence without treating them as a "
+                          "clean final review."
+                          if recorded_passes else
+                          "Releasing it lets the review this change has never had actually run; "
                           "judging it by hand leaves this head with no agentflow review at all."),
-            recommendation=("Release the working copy and resume — nothing has judged this "
+            recommendation=(f"Release the working copy and resume; {recorded_passes} review "
+                            f"{noun} already recorded a verdict."
+                            if recorded_passes else
+                            "Release the working copy and resume — nothing has judged this "
                             "change yet, and no attempts were spent finding that out."),
             next_action=(f"Clear what is named above on the machine agentflow runs on, then run "
                          f"`/agentflow review {pr}` to review this exact head."))
@@ -219,6 +275,8 @@ def park_pr(record) -> str | None:
     elif record.stage == "review" and (uncertainty is not None
                                        or record.review_axis == "decision"):
         reason = "needs the maintainer to choose between competing product behaviors"
+        if recorded_passes:
+            reason += f" after {recorded_passes} verdict-recording review {noun}"
         # A recorded decision prints its own exact wording; this line is what remains when the
         # axis asked for a decision the durable chain no longer holds.
         missing = "Both tools remain unsure and the private decision record is unavailable."
@@ -227,12 +285,12 @@ def park_pr(record) -> str | None:
             "review at this same exact head with your decision."))
         notice = "conflict decision needs your judgment"
     elif record.stage == "review":
-        reason = "exhausted its review budget without a durable verdict"
+        reason = pass_reason or "exhausted its review budget without a durable verdict"
         missing = review_park_missing(record)
         # The options, consequences and recommendation follow the same rule that line does:
         # nothing may name an uncertainty this park deliberately does not have, or an option it
         # does not offer (#344).
-        wording = ParkCopy(
+        wording = pass_wording or ParkCopy(
             options=(f"Resume the review on this exact head: `/agentflow review {pr}`.",
                      "Review the retained change by hand and decide this PR yourself."),
             consequences=("Resuming runs the review this change never got; judging it by hand "
