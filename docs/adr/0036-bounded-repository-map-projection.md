@@ -31,9 +31,9 @@ handoffs, and 12 ADR links per map; 10 dependency edges per child; 5 closing PR 
 20 checks per handoff; 10 recent landings per repository and 20 fleet-wide. Every overflow is
 explicit and links to GitHub; incomplete dependency data never produces a claimed frontier.
 
-Map reads run only on the daemon's 300-second heartbeat, not the 15-second fast tick. For the
-current six repositories they use at most 42 GraphQL requests and 60 reported GraphQL points
-per heartbeat, and stop while at least 1,000 points remain for the workflow engine. Failures
+Map reads run once per full publish pass, and stop while at least 1,000 points remain for the
+workflow engine. They use at most 42 GraphQL requests and 60 reported GraphQL points per pass
+(see the 2026-08-04 amendment for the current fleet's measured spend). Failures
 preserve the last verified per-repository component with honest timestamps. Fresh is at most
 two heartbeats old; older or failed is stale; never-successful is unavailable. There is no live
 query fallback or projection history database.
@@ -67,6 +67,35 @@ broken by config order for a deterministic walk. This guarantees every repositor
 within `ceil(repository count / repositories read per heartbeat)` heartbeats. The published
 `repositories` list is unaffected — it stays in config order, since that is the order the console
 renders.
+
+## Amendment (2026-08-04)
+
+Two corrections and one budget change (#497).
+
+**The trigger.** "Map reads run only on the daemon's 300-second heartbeat" was never true of
+the daemon's own behaviour: a full publish pass starts on the heartbeat *or* a probe-detected
+fleet change *or* a local completion. Observed 2026-08-03: about 20 passes an hour, with 12 an
+hour as the quiet floor. Every budget figure here is therefore stated **per full pass**, not
+per heartbeat.
+
+**The read is now two phases behind the same front door.** GitHub bills GraphQL on the page
+sizes a query *requests*, not on what it returns, so the single fixed-size read cost 33 points
+for a repository with no Decision Maps and 33 for one with three. The read now asks a counting
+question first (1 point) and sends the detail query only when that count is non-zero, sized to
+`min(count, 5 active maps)`. Both phases' reported costs are summed and charged to the shared
+budget; a failure of *either* call is a read failure, because publishing an empty map set for a
+repository that has three would be a confident falsehood. A successful detail read that returns
+fewer maps than the count is honest and is published as-is.
+
+**A repository whose read came back with no maps makes no pipeline-PR call**, since those
+listings are consumed only per map and were otherwise discarded on arrival.
+
+For the nine currently enrolled repositories — seven with no maps, one with three, one with two
+— a full pass now spends 42 reported points (about 48 counting the unmetered pipeline-PR pair)
+across roughly 17 requests, against the unchanged 60-point ceiling and 42-request budget. Every
+repository refreshes every pass, so the ceiling stop no longer fires in steady state; it and the
+1,000-point workflow floor both remain as real guards, and the least-recently-fresh walk order
+above still governs the order when one of them does fire.
 
 ## Consequences
 

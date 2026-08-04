@@ -363,7 +363,101 @@ def test_api_reports_failure_as_none(monkeypatch):
 
 # --- GraphQL query constants -----------------------------------------------------
 
-@pytest.mark.parametrize("query", [github._ROLLUP_QUERY, github._MAPS_QUERY],
-                          ids=["_ROLLUP_QUERY", "_MAPS_QUERY"])
+@pytest.mark.parametrize("query", [github._ROLLUP_QUERY, github._MAPS_QUERY,
+                                   github._MAPS_DISCOVERY_QUERY],
+                          ids=["_ROLLUP_QUERY", "_MAPS_QUERY", "_MAPS_DISCOVERY_QUERY"])
 def test_graphql_query_constants_have_balanced_braces(query):
     assert query.count("{") == query.count("}")
+
+
+# --- the Decision Map read pays for what a repository actually has (#497) ---------
+#
+# The other argv-recording test in this file (`claimed_issues`) states the rule: argv is
+# asserted only where *which* question is asked is the behavior, not an implementation
+# detail. It is here — GitHub bills GraphQL on the page sizes a query requests, so asking a
+# repository with no maps for five maps' worth of children and dependency edges is the whole
+# cost of the briefing for seven of nine enrolled repositories.
+
+def _recording_graphql(monkeypatch, payloads):
+    """Answer successive `gh api graphql` calls from ``payloads``, recording each argv."""
+    asked = []
+
+    def recording_run(cmd, cwd=None, timeout=None):
+        asked.append(list(cmd))
+        payload = payloads[len(asked) - 1]
+        if payload is None:
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="boom")
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(github, "_run", recording_run)
+    return asked
+
+
+def _discovery(count, *, cost=1, remaining=4999):
+    return {"data": {"rateLimit": {"cost": cost, "remaining": remaining},
+                     "repository": {"issues": {"totalCount": count}}}}
+
+
+def _detail(numbers, *, cost=20, remaining=4979, total_count=None):
+    nodes = [{"number": n, "title": f"Map {n}", "url": f"https://github.com/o/r/issues/{n}",
+              "updatedAt": "2026-08-03T00:00:00Z", "body": "",
+              "subIssues": {"totalCount": 0, "nodes": []}} for n in numbers]
+    return {"data": {"rateLimit": {"cost": cost, "remaining": remaining},
+                     "repository": {"issues": {
+                         "totalCount": total_count if total_count is not None else len(nodes),
+                         "nodes": nodes}}}}
+
+
+def test_a_repository_with_no_maps_is_answered_by_one_cheap_question(monkeypatch):
+    asked = _recording_graphql(monkeypatch, [_discovery(0)])
+
+    read = github.decision_maps(REPO, limit=5, children_limit=50, edges_limit=10)
+
+    assert read == github.MapsRead(maps=(), total_count=0, cost=1, remaining=4999)
+    assert len(asked) == 1, "no detail query is sent for a repository with no maps"
+    query = asked[0][asked[0].index("-f") + 1]
+    assert "childrenFirst" not in " ".join(asked[0]), "no child page size is requested"
+    assert "edgesFirst" not in " ".join(asked[0]), "no dependency-edge page size is requested"
+    assert "subIssues" not in query
+    assert "nodes" not in query, "the count is the whole question — no issue fields are selected"
+
+
+def test_a_repository_with_maps_asks_for_exactly_as_many_as_it_has(monkeypatch):
+    asked = _recording_graphql(monkeypatch, [_discovery(3), _detail([1, 2, 3], cost=20)])
+
+    read = github.decision_maps(REPO, limit=5, children_limit=50, edges_limit=10)
+
+    assert len(asked) == 2
+    assert "mapsFirst=3" in asked[1], "the detail page size matches what discovery counted"
+    assert [m.number for m in read.maps] == [1, 2, 3]
+    assert read.cost == 21, "both phases' reported costs are charged to the budget"
+    assert read.remaining == 4979
+
+
+def test_a_repository_with_more_maps_than_the_bound_still_asks_only_for_the_bound(monkeypatch):
+    asked = _recording_graphql(monkeypatch, [_discovery(9), _detail([1, 2, 3, 4, 5],
+                                                                   total_count=9)])
+
+    read = github.decision_maps(REPO, limit=5, children_limit=50, edges_limit=10)
+
+    assert "mapsFirst=5" in asked[1]
+    assert read.total_count == 9, "GitHub's own count still drives overflow reporting"
+
+
+def test_a_failed_detail_read_is_a_read_failure_not_an_empty_repository(monkeypatch):
+    _recording_graphql(monkeypatch, [_discovery(3), None])
+    assert github.decision_maps(REPO) is None
+
+
+def test_a_failed_discovery_read_is_a_read_failure(monkeypatch):
+    _recording_graphql(monkeypatch, [None])
+    assert github.decision_maps(REPO) is None
+
+
+def test_a_detail_read_that_shrank_publishes_what_it_returned(monkeypatch):
+    # The last map can close between the two calls; what came back is the honest answer.
+    _recording_graphql(monkeypatch, [_discovery(2), _detail([], cost=13)])
+    read = github.decision_maps(REPO)
+    assert read.maps == ()
+    assert read.total_count == 0
+    assert read.cost == 14

@@ -15,8 +15,16 @@ def _cfg(repo="o/r") -> RepoConfig:
     return RepoConfig(repo=repo, workdir="/nonexistent/does-not-exist")
 
 
-def _maps_read(cost=5, remaining=4990) -> github.MapsRead:
-    return github.MapsRead(maps=(), total_count=0, cost=cost, remaining=remaining)
+def _maps_read(cost=5, remaining=4990, maps=(), total_count=0) -> github.MapsRead:
+    return github.MapsRead(maps=tuple(maps), total_count=total_count, cost=cost,
+                           remaining=remaining)
+
+
+def _map(number=1) -> github.MapRow:
+    return github.MapRow(number=number, title=f"Map {number}",
+                         url=f"https://github.com/o/r/issues/{number}",
+                         updated_at="2026-08-03T00:00:00Z", body="", children=(),
+                         children_total=0)
 
 
 # --- freshness ---------------------------------------------------------------------------
@@ -138,11 +146,27 @@ def test_repository_maps_stops_the_fleet_budget_below_the_workflow_floor():
 
 
 def test_repository_maps_degrades_handoff_evidence_without_failing_the_map_read():
+    # A one-map read, because a repository with no maps makes no pipeline-PR call at all
+    # (#497) — with an empty read this would pass without ever exercising the degrade path.
+    result = operator_projection.repository_maps(
+        _cfg(), previous_snapshot=None, now=NOW, heartbeat_seconds=300,
+        budget={"spent": 0, "stopped": False},
+        read_maps=lambda repo, **kw: _maps_read(maps=(_map(1),), total_count=1),
+        read_links=lambda repo, nums: None, read_prs=lambda repo, state: None)
+    assert result["github"]["status"] == "fresh", "the map read itself succeeded"
+    assert result["maps"]["active_total"] == 1
+
+
+def test_repository_with_no_maps_makes_no_pipeline_pr_call():
+    def boom(repo, state):
+        raise AssertionError("nothing consumes a PR listing for a repository with no maps")
+
     result = operator_projection.repository_maps(
         _cfg(), previous_snapshot=None, now=NOW, heartbeat_seconds=300,
         budget={"spent": 0, "stopped": False}, read_maps=lambda repo, **kw: _maps_read(),
-        read_links=lambda repo, nums: None, read_prs=lambda repo, state: None)
-    assert result["github"]["status"] == "fresh", "the map read itself succeeded"
+        read_links=lambda repo, nums: {}, read_prs=boom)
+    assert result["github"]["status"] == "fresh"
+    assert result["maps"] == {"active": [], "active_total": 0}
 
 
 # --- build / fleet_recent_landed ----------------------------------------------------------
@@ -176,6 +200,37 @@ def test_starvation_every_repository_reaches_fresh_within_ceil_n_over_k_heartbea
             now=NOW + timedelta(seconds=300 * heartbeat))
     statuses = {r["name_with_owner"]: r["github"]["status"] for r in snapshot["repositories"]}
     assert all(status == "fresh" for status in statuses.values()), statuses
+
+
+def test_the_whole_real_shaped_fleet_refreshes_in_one_pass_inside_the_point_ceiling(monkeypatch):
+    # The enrolled fleet as measured 2026-08-03: nine repositories, seven with no Decision
+    # Maps at all, one with three and one with two. Priced the way GitHub bills the two-phase
+    # read — 1 point to count, then ~6.6 per map asked for — the whole fleet costs 42 points
+    # against the unchanged 60-point ceiling, so every row is fresh every pass (#497).
+    costs = {"o/agentflow": (21, (_map(1), _map(2), _map(3))), "o/ciq": (14, (_map(4), _map(5)))}
+
+    def read_maps(repo, **kw):
+        cost, maps = costs.get(repo, (1, ()))
+        return _maps_read(cost=cost, remaining=4990, maps=maps, total_count=len(maps))
+
+    monkeypatch.setattr(github, "decision_maps", read_maps)
+    monkeypatch.setattr(github, "handoff_pr_links", lambda repo, nums: {})
+    monkeypatch.setattr(github, "list_pipeline_prs", lambda repo, state: [])
+
+    repos = ([_cfg("o/agentflow"), _cfg("o/ciq")]
+             + [_cfg(f"o/quiet{i}") for i in range(7)])
+    budget = {"spent": 0, "stopped": False}
+    snapshot = {"schema_version": 2, "repositories": [
+        operator_projection.repository_maps(cfg, previous_snapshot=None, now=NOW,
+                                            heartbeat_seconds=300, budget=budget)
+        for cfg in repos]}
+
+    statuses = {r["name_with_owner"]: r["github"]["status"] for r in snapshot["repositories"]}
+    assert all(status == "fresh" for status in statuses.values()), statuses
+    assert len({r["github"]["fresh_at"] for r in snapshot["repositories"]}) == 1
+    assert budget["spent"] == 42
+    assert budget["spent"] < operator_projection.POINT_CEILING == 60
+    assert budget["stopped"] is False, "the ceiling stop never fires for today's fleet"
 
 
 def test_never_loaded_repositories_are_read_before_stale_but_once_fresh_ones():
