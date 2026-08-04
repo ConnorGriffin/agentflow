@@ -26,27 +26,27 @@ class Provenance:
 
 @dataclass(frozen=True, slots=True)
 class Route:
-    area: str
-    variant: str
+    """One area's escalation ladder. Bans are enforced when the table loads, so a route that
+    exists can only name models the area allows."""
+
     ladder: tuple[str, ...]
-    banned: tuple[str, ...]
 
     @property
     def model(self) -> str:
+        """The rung a worker enters at."""
         return self.ladder[0]
-
-    def rung(self, index: int) -> str:
-        """Return one ladder rung; a step beyond the top stays at the top."""
-        return self.ladder[min(max(index, 0), len(self.ladder) - 1)]
 
 
 class CapabilityRouting:
     """One deep interface over validated routes, launch ids, and lead instructions."""
 
+    LEAD_POOL = "claude"     # the only pool that can launch the session lead (ADR 498)
+
     _AREAS = frozenset({
         "exploration", "implementation", "plan", "prototype", "brainstorm",
         "documentation", "review",
     })
+    _SESSION_LED = frozenset({"build", "revise"})
 
     def __init__(self, data: dict):
         try:
@@ -120,7 +120,7 @@ class CapabilityRouting:
                         raise RoutingConfigError("fable is never a delegate target")
                     if model in banned:
                         raise RoutingConfigError(f"area {area!r} routes banned model {model!r}")
-                routes[(area, variant)] = Route(area, variant, ladder, banned)
+                routes[(area, variant)] = Route(ladder)
             if (area, "default") not in routes:
                 raise RoutingConfigError(f"area {area!r} needs a default route")
         return routes
@@ -146,7 +146,7 @@ class CapabilityRouting:
     def model_for_stage(self, stage: str, pool: str, complexity: str,
                         builder_complexity: str | None = None) -> str:
         """Resolve the accountable parent/reviewer while leaving other stages unchanged."""
-        if stage in {"build", "revise"} and pool == "claude":
+        if stage in self._SESSION_LED and pool == self.LEAD_POOL:
             # Public submission mappings choose Claude/Fable. A durable pre-#498 Codex record
             # keeps its pinned attempt lineage so an upgrade cannot strand in-flight work.
             return "fable"

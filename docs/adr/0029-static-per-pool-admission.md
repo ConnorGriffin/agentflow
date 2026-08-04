@@ -1,6 +1,9 @@
 # ADR 0029 — Static five-permit admission per pool
 
-- Status: Accepted
+- Status: Accepted — the per-complexity model validation for build/revise superseded by
+  [ADR 498](adr-498-capability-routed-session-led-dispatch.md) (both stages launch the session
+  lead's model, with its own asserted rows); the static five-permit budget, the exclusive
+  unknown-row fallback, and every other stage's validation remain
 - Date: 2026-07-15
 - Amended: 2026-08-03 — inherited Revise effort leaves its admission demand on the existing
   `n/a` row ([#473](https://github.com/ConnorGriffin/agentflow/issues/473))

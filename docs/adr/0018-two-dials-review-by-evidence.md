@@ -1,6 +1,9 @@
 # ADR 0018 — Two dials, and review by evidence not demo
 
-- Status: Accepted
+- Status: Accepted — complexity sizing the builder superseded by
+  [ADR 498](adr-498-capability-routed-session-led-dispatch.md), and always-`deep` review by
+  [ADR 498](adr-498-tiered-parent-independent-review.md); the two dials themselves, the dropped
+  `review:` dial, and review-by-evidence remain
 - Date: 2026-07-09
 
 ## Context

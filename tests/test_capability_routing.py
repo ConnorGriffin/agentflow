@@ -139,13 +139,13 @@ def test_session_parent_and_cheap_review_admission_are_explicit():
         "deep": {"low": 4, "medium": 4, "high": 5, "extra": 5},
     }
     for complexity, efforts in build_demands.items():
+        # Revise is effort-blind (ADR 0029): one asserted row per complexity answers every dial.
+        assert ("revise", "claude", "fable", complexity, None) in ADMISSION_MATRIX
         for effort, expected in efforts.items():
             key = ("build", "claude", "fable", complexity, effort)
             assert key in ADMISSION_MATRIX
             assert admission_demand(*key) == expected
-            revise = ("revise", "claude", "fable", complexity, effort)
-            assert revise in ADMISSION_MATRIX
-            assert admission_demand(*revise) == 3
+            assert admission_demand("revise", "claude", "fable", complexity, effort) == 3
 
     assert admission_demand("review", "codex", "luna", "standard") <= \
         admission_demand("review", "codex", "sol", "deep")

@@ -1,6 +1,10 @@
 # ADR 0014 — Cost-appropriate model tiers: intake sizes every issue
 
-- Status: Accepted
+- Status: Accepted — tier selection for build/revise superseded by
+  [ADR 498](adr-498-capability-routed-session-led-dispatch.md) (a fixed session lead delegates by
+  benchmarked capability) and always-`deep` review by
+  [ADR 498](adr-498-tiered-parent-independent-review.md); intake still sizing every issue, and
+  tier being orthogonal to pool, remain
 - Date: 2026-07-09
 
 ## Context

@@ -131,14 +131,16 @@ for _pool, _model, _complexity, _demands in (
         _ADMISSION_ROWS[("build", _pool, _model, _complexity, _effort)] = _demand
 
 # Build and Revise now launch one Claude/Fable session lead regardless of the complexity dial.
-# The dial still selects the established ceiling/demand cell; it no longer sizes the parent.
+# The dial still selects the established ceiling/demand cell; it no longer sizes the parent. The
+# parent's demand equals the model it replaces, so a routed session lead never reaches the
+# exclusive unknown-row fallback. Revise stays effort-blind (ADR 0029), so it keeps one row per
+# complexity rather than four unmatchable effort-keyed copies of the same demand.
 for _complexity, _demands in (
     ("standard", (3, 4, 5, 5)),
     ("deep", (4, 4, 5, 5)),
 ):
     for _effort, _demand in zip(("low", "medium", "high", "extra"), _demands, strict=True):
         _ADMISSION_ROWS[("build", "claude", "fable", _complexity, _effort)] = _demand
-        _ADMISSION_ROWS[("revise", "claude", "fable", _complexity, _effort)] = 3
     _ADMISSION_ROWS[("build", "claude", "fable", _complexity, None)] = PERMIT_BUDGET
     _ADMISSION_ROWS[("revise", "claude", "fable", _complexity, None)] = 3
 ADMISSION_MATRIX = MappingProxyType(_ADMISSION_ROWS)
@@ -178,7 +180,7 @@ def admission_demand(stage, pool, model, complexity, effort=None):
     if pool not in {"claude", "codex"}:
         return None
     stage = normalize_stage(stage)
-    if stage != "build" and not (stage == "revise" and model == "fable"):
+    if stage != "build":
         effort = None
     return ADMISSION_MATRIX.get(
         (stage, pool, model, complexity, effort), PERMIT_BUDGET)
