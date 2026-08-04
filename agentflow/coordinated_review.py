@@ -400,8 +400,8 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
                                head_sha: str, reviewer_tool: str, pr_number: int,
                                acceptance: str, review=None,
                                transfer_from: str | None = None,
-                               supersede: bool = False):
-    """Submit a fresh exact-head Review for an already-open autonomous survivor.
+                               supersede: bool = False, resume: int = 0):
+    """Submit a fresh exact-head Review for an already-open survivor.
 
     A survivor has no completed coordinator predecessor to transfer from: its earlier chain has
     already reached an external PR boundary. This mapping therefore creates a cold Review that
@@ -434,7 +434,7 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         pool=reviewer_tool, complexity="deep",
         source=str(review_worktree(cfg.workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=prompt, builder_lineage=builder_tool,
-        review=state, transfer_from=transfer_from, supersede=supersede)
+        review=state, transfer_from=transfer_from, supersede=supersede, resume=resume)
 
 
 def _prior_attempt_push(record, obs) -> str:

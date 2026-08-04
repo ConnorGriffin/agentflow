@@ -21,7 +21,8 @@ from agentflow.balancer import pick_pair, pick_reviewer
 from agentflow.coordinator.record import WAITING
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.gate import (conflict_revises_used, maintainer_comment, maintainer_comment_id,
-                            park, reply_pending, supersede_clean_review)
+                            park, reply_pending, review_resume_passes,
+                            supersede_clean_review)
 from agentflow.intake import (INTAKE_MARK, _strip_quoted_lines, awaiting_recheck,
                               replies_since_intake)
 from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS,
@@ -583,14 +584,16 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
         return "exact-head review is already running; it was not preempted"
     predecessor = next((record for record in unretired if record.claim), None)
     sequence = max((record.review_sequence for record in same_head), default=-1) + 1
+    resume = max((record.resume for record in same_head), default=0) + 1
     review = ReviewState(
         assignment=assignment, change_author_tool=current_author,
-        reviewed_from_sha=head, sequence=sequence, tainted=force_same_tool)
+        reviewed_from_sha=head, passes=review_resume_passes(records, cfg.repo, issue),
+        sequence=sequence, tainted=force_same_tool)
     submission = coordinated_review.survivor_review_submission(
         cfg, issue=issue, slug=slug, builder_tool=builder_tool, head_sha=head,
         reviewer_tool=reviewer_tool, pr_number=pr, acceptance=acceptance,
         review=review, transfer_from=predecessor.identity if predecessor else None,
-        supersede=predecessor is not None)
+        supersede=predecessor is not None, resume=resume)
     if submission is None:
         return "review submission unavailable"
     if predecessor is None and not claim(cfg.repo, issue, BUILDING):

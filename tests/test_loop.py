@@ -1199,6 +1199,8 @@ def test_manual_review_uses_latest_exact_head_author_not_branch_builder(monkeypa
     assert choices == [("codex", {"allow_same_tool": False})]
     assert captured[-1]["reviewer_tool"] == "claude"
     assert captured[-1]["review"].change_author_tool == "codex"
+    assert captured[-1]["review"].passes == 1
+    assert captured[-1]["resume"] == 1
     assert captured[-1]["review"].tainted is False
 
     assert loop.review_pr(
@@ -1206,6 +1208,8 @@ def test_manual_review_uses_latest_exact_head_author_not_branch_builder(monkeypa
         maintainer_confirmed=True) == "same-tool review submitted; maintainer merge required"
     assert captured[-1]["reviewer_tool"] == "codex"
     assert captured[-1]["review"].change_author_tool == "codex"
+    assert captured[-1]["review"].passes == 1
+    assert captured[-1]["resume"] == 1
     assert captured[-1]["review"].tainted is True
 
 

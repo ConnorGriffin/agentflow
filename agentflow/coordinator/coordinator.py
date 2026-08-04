@@ -164,10 +164,9 @@ class Submission:
     conflict_round: int = 0         # which conflict Revise this is in the PR's lifetime (ADR 0038):
                                     # >0 joins the identity so each conflict resolution is a fresh
                                     # stage, budgeted separately from the finding-driven `round`
-    resume: int = 0                 # which deliberate maintainer resume of an exhausted `held` Build
-                                    # this is (#245): >0 joins the identity so the resume opens a
-                                    # fresh bounded execution instead of colliding with the terminal
-                                    # held record still living at the base identity
+    resume: int = 0                 # which deliberate maintainer resume this is: an exhausted
+                                    # `held` Build (#245), or a manual Review that must not collide
+                                    # with an automatic retarget (#501). >0 joins the identity.
     descendant_of: str | None = None  # a subagent shares this root stage's one reservation
     transfer_from: str | None = None  # the completed prior stage whose GitHub claim this assumes
     supersede: bool = False           # the ``transfer_from`` predecessor is a still-in-flight Review
@@ -1257,9 +1256,9 @@ def _identity(repo: str, subject: str, stage: str, target: str | None, round: in
     # whose re-review binds to the *same* head SHA — still opens a genuinely new stage rather
     # than colliding with the retired prior review's record. A conflict Revise's own round joins
     # it too (ADR 0038), so each conflict resolution is a fresh stage that never collides with a
-    # finding-driven revise on the same head SHA. A deliberate maintainer resume of an exhausted
-    # Build joins its resume number the same way (#245): the terminal `held` record keeps the base
-    # identity live, so the successor must carry a distinct dimension or it would silently reuse it.
+    # finding-driven revise on the same head SHA. A deliberate maintainer resume joins its resume
+    # number the same way: an exhausted Build must not reuse its terminal record (#245), and a
+    # manual Review must not collide with an automatic moved-head retarget (#501).
     parts = [repo, str(subject), stage, target or "-"]
     if round:
         parts.append(f"r{round}")
