@@ -128,6 +128,18 @@ def test_a_completed_revise_starts_the_manual_review_ledger_from_its_carried_cou
     assert review_resume_passes([old_review, boundary], "o/r", 7) == carried
 
 
+def test_a_same_second_successor_is_after_its_completed_revise_boundary():
+    predecessor = replace(_review_record("predecessor", created=200, passes=2), round=0)
+    boundary = Record(
+        identity="boundary", stage="revise", pool="claude", demand=1,
+        repo="o/r", subject="7", created_at=200, state="completed", round=0,
+        review_passes=0)
+    successor = replace(_review_record("successor", created=200, passes=2), round=1)
+
+    assert review_resume_passes([predecessor, boundary], "o/r", 7) == 0
+    assert review_resume_passes([predecessor, boundary, successor], "o/r", 7) == 2
+
+
 class _FakeGitHub:
     """Drive the gate through the agentflow.github interface it now leans on.
 

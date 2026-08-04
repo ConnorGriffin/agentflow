@@ -64,10 +64,22 @@ def review_resume_passes(records, repo, subject) -> int:
     boundary = max(
         (r for r in matching if r.stage == "revise" and r.state == "completed"),
         key=lambda r: (r.created_at, r.identity), default=None)
-    reviews = [
-        r for r in matching
-        if r.stage == "review" and (boundary is None or r.created_at > boundary.created_at)
-    ]
+    def after_boundary(record):
+        if boundary is None or record.created_at > boundary.created_at:
+            return True
+        if record.created_at < boundary.created_at:
+            return False
+        # Coordinator timestamps have one-second precision. An ordinary Revise's automatic
+        # successor advances its round, while its predecessor shares the boundary's round. A
+        # conflict Revise deliberately keeps its conflict namespace and carried ledger. Manual
+        # resumes have their own positive identity dimension. Those durable facts distinguish a
+        # same-second successor from an ordinary pre-boundary Review without relying on the clock.
+        return (record.resume > 0
+                or record.round > boundary.round
+                or (bool(boundary.conflict_round)
+                    and record.conflict_round == boundary.conflict_round))
+
+    reviews = [r for r in matching if r.stage == "review" and after_boundary(r)]
     newest = max(reviews, key=lambda r: (r.created_at, r.identity), default=None)
     if newest is None:
         return boundary.review_passes if boundary is not None else 0
