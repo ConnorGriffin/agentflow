@@ -8,6 +8,8 @@ ui-surfaces: agentflow/webui/src/
 
 ## Repo facts
 - **Python, uv.** Install: `uv sync --group dev`. **Test / CI gate:** `uv run pytest -q`.
+- **DCO is required.** Every commit carries a `Signed-off-by` trailer (`git commit -s`);
+  the `dco` check blocks any PR with an unsigned commit.
 - Source: `agentflow/`. Tests: `tests/`. Design: `docs/adr/` + `CONTEXT.md`. Mockups: `mockups/`.
 - **Frontend:** the v2 console `agentflow/webui/` (Svelte SPA + `agentflow/webapp.py`
   FastAPI, locked spec `mockups/dashboard-v2-combined.html`, ADR 0023) — the retired

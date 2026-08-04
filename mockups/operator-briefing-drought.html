@@ -1,0 +1,284 @@
+<!--
+★ LOCKED visual contract — issue #430 (local addition to the shipped operator briefing, ADR 0048)
+Locked: 2026-08-04 by the /agentflow pickup session (headless round; operator asked for recommendations to be carried).
+Base: operator-surface-finalist.html + operator-surface-finalist.lock.md — every term there still binds except as amended below.
+
+Thesis: a pipeline stage that spent sessions and produced zero stage outcomes across its last
+10 finished attempts is an operator exception, and it appears as a new Attention row kind —
+never a metric, never a dashboard.
+Addition: rows with kind `stage drought`, first in Attention. Title is the stage's own name
+(e.g. `pre-publish attack`); detail states the drought and its cost ("0 of its last 10
+finished attempts published a hardened brief · 37 sessions spent"); the third column is plain
+text — a stage has no GitHub object to open, so it reads `What to check: <where the missing
+output pools>`, unique per stage, and is not a link.
+Absence is load-bearing: a stage with fewer than 10 finished attempts, or any produced
+outcome in its window, renders nothing — the shipped reading path byte-identical.
+Declared deviations from the base lock: amends term 12 (adds the stage-drought condition as a
+sixth Attention condition) and term 13 (drought rows rank before all five existing conditions —
+a silently broken stage outranks any single item it starves).
+Fixture states: drought, under-window, all-healthy, multi-drought (mock-only ?fixture= switcher,
+not part of the real app).
+Out of scope: the counting rule (daemon computes the fact into its snapshot), push
+notifications, the daemon log, Decision Maps, Fleet health rows, retained console tabs.
+-->
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentflow · Operator briefing — drought</title>
+  <style>
+    /* Successor tokens for ADR 0035. The active v2 console’s source tokens are
+       agentflow/webui/src/styles.css; this locked surface deliberately reopens its visual system. */
+    :root { --paper:#f7f7f5; --surface:#fff; --line:#d8d9d5; --ink:#202320; --muted:#656963; --quiet:#eef0ec; --accent:#176e68; --warn:#9a5b14; --danger:#a94037; --ok:#397148; --link:#145e91; }
+    html[data-theme="dark"] { --paper:#181a19; --surface:#222523; --line:#414640; --ink:#edf0eb; --muted:#b5bbb2; --quiet:#2a2e2b; --accent:#72c9c0; --warn:#e6ae65; --danger:#ed9389; --ok:#8ac89a; --link:#8bc9f1; }
+    * { box-sizing:border-box } body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.48 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    button,a { font:inherit } a { color:var(--link); text-underline-offset:3px } button { color:inherit } button:focus-visible,a:focus-visible,summary:focus-visible { outline:3px solid var(--accent); outline-offset:3px; border-radius:2px }
+    .wrap { max-width:1120px; margin:auto; padding:0 28px 48px } .mast { display:flex; align-items:center; gap:16px; min-height:84px; border-bottom:1px solid var(--line) } .wordmark { font-size:19px; font-weight:700; letter-spacing:-.04em } .wordmark span { color:var(--accent) } .freshness { margin-left:auto; color:var(--muted); font-size:13px } .theme { border:1px solid var(--line); background:transparent; padding:7px 10px; border-radius:4px; cursor:pointer }
+    .banner { margin:18px 0 4px; padding:11px 13px; border:1px solid currentColor; color:var(--warn); background:color-mix(in srgb, var(--warn) 8%, transparent); font-size:14px } .banner.incomplete { color:var(--danger) }
+    section { padding-top:23px } h1,h2,h3,p { margin:0 } h1 { font-size:30px; letter-spacing:-.04em; font-weight:650; text-wrap:balance } .lede { margin-top:5px; color:var(--muted); max-width:60ch; text-wrap:pretty } .eyebrow { color:var(--muted); text-transform:uppercase; letter-spacing:.11em; font-size:11px; font-weight:700; margin-bottom:6px } .section-head { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:7px } h2 { font-size:19px; letter-spacing:-.025em; text-wrap:balance } .count { color:var(--muted); font-size:13px }
+    .rows { border-top:1px solid var(--line) } .attention { display:grid; grid-template-columns:104px minmax(0,1fr) auto; gap:17px; align-items:center; padding:9px 0; border-bottom:1px solid var(--line) } .kind { font-size:12px; font-weight:700; color:var(--warn) } .attention h3 { font-size:15px; font-weight:620; text-wrap:balance } .attention p,.meta { font-size:13px; color:var(--muted); margin-top:1px } .action { white-space:nowrap; border:1px solid var(--line); border-radius:4px; padding:7px 10px; text-decoration:none; color:var(--ink) } .action:hover { border-color:var(--accent); color:var(--accent) }
+    .action-note { color:var(--muted); font-size:13px; border-color:var(--line); } .action-note:hover { color:var(--ink); }
+    .map { border-top:1px solid var(--line); padding:10px 0; } .map:last-child { border-bottom:1px solid var(--line) } .map-top { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:20px; align-items:start } .map h3 { font-size:16px; font-weight:650; text-wrap:balance } .status { color:var(--accent); font-size:13px; font-weight:650; white-space:nowrap } .frontier { margin-top:5px; font-size:14px } .frontier b { color:var(--warn) } details { margin-top:5px; color:var(--muted); font-size:13px } summary { cursor:pointer; color:var(--link); width:max-content; max-width:100% } details ul { margin:7px 0 0; padding-left:18px } .support { display:flex; flex-wrap:wrap; gap:14px; margin-top:7px }
+    .fleet { border-top:1px solid var(--line) } .repo { display:grid; grid-template-columns:minmax(150px,1.3fr) 100px 1fr 1fr 1fr; gap:18px; padding:12px 0; border-bottom:1px solid var(--line); align-items:center } .repo strong { font-size:14px } .repo span { font-size:13px; color:var(--muted) } .healthy { color:var(--ok)!important } .capacity { display:flex; gap:18px; padding:13px 0; border-bottom:1px solid var(--line); color:var(--muted); font-size:13px } .capacity b { color:var(--ink) }
+    .empty { padding:28px 0; border-top:1px solid var(--line); border-bottom:1px solid var(--line); color:var(--muted) } .hidden { display:none!important }
+    @media (max-width:700px) { .wrap { padding:0 18px 34px } .mast { min-height:68px; flex-wrap:wrap; padding:12px 0; gap:8px } .freshness { margin-left:0; order:3; width:100% } h1 { font-size:26px } .attention { grid-template-columns:1fr; gap:5px } .action { width:max-content; margin-top:3px } .map-top { grid-template-columns:1fr; gap:5px } .repo { grid-template-columns:1fr 1fr; gap:5px 14px } .repo strong { grid-column:1/-1 } .capacity { flex-wrap:wrap; gap:5px 16px } }
+    @media (prefers-reduced-motion:reduce) { * { scroll-behavior:auto!important; transition:none!important } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header class="mast"><div class="wordmark">agent<span>flow</span></div><div class="freshness" id="freshness">Reading projection…</div><button class="theme" id="theme" type="button" aria-label="Toggle colour theme">Dark theme</button></header>
+    <div id="notice" class="banner hidden" role="status"></div>
+    <section aria-labelledby="briefing-title"><p class="eyebrow">Read-only operator briefing</p><h1 id="briefing-title">What needs you, then what is moving.</h1><p class="lede">A bounded daemon projection. Actions open their GitHub authority; this console changes nothing.</p></section>
+    <section id="attention-section" aria-labelledby="attention-title"><div class="section-head"><h2 id="attention-title">Attention</h2><span class="count" id="attention-count"></span></div><div class="rows" id="attention"></div></section>
+    <section id="maps-section" aria-labelledby="maps-title"><div class="section-head"><h2 id="maps-title">Decision Maps</h2><span class="count" id="maps-count"></span></div><div id="maps"></div></section>
+    <section id="fleet-section" aria-labelledby="fleet-title"><div class="section-head"><h2 id="fleet-title">Fleet health</h2><span class="count" id="fleet-count"></span></div><div class="capacity" id="capacity"></div><div class="fleet" id="fleet"></div></section>
+  </main>
+  <script>
+    // not part of the real app: mock-only fixture switcher (via ?fixture=all-healthy|drought|under-window|multi-drought)
+    const $ = (id) => document.getElementById(id);
+    const esc = (value) => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const mode = new URLSearchParams(location.search).get('fixture') || 'all-healthy';
+    const fallbackCapture = {
+      "_note": "Issue #183 mockup fixture. Runtime fields follow the shipping fleet snapshot. Map fields are an explicit synthetic ADR-0036 projection because schema-v2 map publication is not implemented yet. Gitignored.",
+      "schema_version": 2,
+      "generated_at": "2026-07-29T14:20:00Z",
+      "daemon": {"enabled": true, "last_cycle_at": "2026-07-29T14:19:51Z", "poll_seconds": 300},
+      "pools": [
+        {"tool": "claude", "headroom_pct": 27, "running": 2},
+        {"tool": "codex", "headroom_pct": 64, "running": 1}
+      ],
+      "attention": [
+        {
+          "priority": "blocker",
+          "kind": "merge",
+          "repo": "ConnorGriffin/agentflow",
+          "number": 178,
+          "title": "Preserve exact decision provenance in the map projection",
+          "reason": "Reviewed and passing; waiting for your merge",
+          "age": "2h",
+          "url": "https://github.com/ConnorGriffin/agentflow/pull/178"
+        },
+        {
+          "priority": "blocker",
+          "kind": "decision",
+          "repo": "ConnorGriffin/ciq-autotune",
+          "number": 318,
+          "title": "Choose the result-row hierarchy",
+          "reason": "Mockup decision needed before build",
+          "age": "5h",
+          "url": "https://github.com/ConnorGriffin/ciq-autotune/issues/318"
+        },
+        {
+          "priority": "secondary",
+          "kind": "ratchet",
+          "repo": "ConnorGriffin/agentflow-sandbox",
+          "number": null,
+          "title": "Eligible for autonomous",
+          "reason": "18 clean samples · 6% correction rate",
+          "age": "1d",
+          "url": "https://github.com/ConnorGriffin/agentflow-sandbox"
+        }
+      ],
+      "maps": [
+        {
+          "repo": "ConnorGriffin/agentflow",
+          "number": 180,
+          "title": "Retire the workspace and unify the operator surface",
+          "url": "https://github.com/ConnorGriffin/agentflow/issues/180",
+          "freshness": {"status": "fresh", "verified_at": "2026-07-29T14:18:00Z", "error": null},
+          "progress": {"closed": 3, "total": 5, "complete": true},
+          "frontier_complete": true,
+          "children_total": 5,
+          "children_overflow": 0,
+          "tickets": [
+            {"number": 181, "title": "Audit the retirement inventory", "state": "settled", "assignee": "claude", "blocked_by": [], "url": "#"},
+            {"number": 182, "title": "Settle the bounded map projection", "state": "settled", "assignee": "codex", "blocked_by": [], "url": "#"},
+            {"number": 183, "title": "Lock the operator surface", "state": "claimed", "assignee": "operator", "blocked_by": [], "url": "#"},
+            {"number": 184, "title": "Delete the retired workspace", "state": "frontier", "assignee": null, "blocked_by": [], "url": "#"},
+            {"number": 185, "title": "Implement the operator surface", "state": "blocked", "assignee": null, "blocked_by": [183, 184], "url": "#"}
+          ],
+          "decisions": [
+            {"text": "The product is a read-only operator surface.", "adr_label": "ADR 0035", "adr_url": "../docs/adr/0035-workflow-engine-read-only-operator-console.md"},
+            {"text": "The browser renders one bounded daemon projection.", "adr_label": "ADR 0036", "adr_url": "../docs/adr/0036-bounded-repository-map-projection.md"}
+          ],
+          "handoffs": [
+            {"number": 184, "title": "Delete the retired workspace", "state": "building", "url": "#"},
+            {"number": 185, "title": "Implement the operator surface", "state": "blocked", "url": "#"}
+          ],
+          "landed": [
+            {"pr_number": 177, "title": "Bound repository-map projection", "merged_at": "2026-07-29T12:31:00Z", "checks": "passing", "url": "#"}
+          ],
+          "history": [
+            {"at": "2026-07-29T12:31:00Z", "text": "Projection contract landed"},
+            {"at": "2026-07-28T17:02:00Z", "text": "Retirement inventory accepted"}
+          ]
+        },
+        {
+          "repo": "ConnorGriffin/ciq-autotune",
+          "number": 310,
+          "title": "Trustworthy recommendation evidence",
+          "url": "https://github.com/ConnorGriffin/ciq-autotune/issues/310",
+          "freshness": {"status": "stale", "verified_at": "2026-07-29T13:32:00Z", "error": "Latest GitHub read failed; showing last verified data"},
+          "progress": {"closed": 4, "total": 9, "complete": false},
+          "frontier_complete": false,
+          "children_total": 64,
+          "children_overflow": 14,
+          "tickets": [
+            {"number": 311, "title": "Choose the evidence denominator", "state": "settled", "assignee": "claude", "blocked_by": [], "url": "#"},
+            {"number": 312, "title": "Separate detected from delivered behavior", "state": "settled", "assignee": "codex", "blocked_by": [], "url": "#"},
+            {"number": 313, "title": "Bound counterfactual windows", "state": "unknown", "assignee": null, "blocked_by": [], "url": "#"},
+            {"number": 314, "title": "Ground recurrence ranking", "state": "claimed", "assignee": "claude", "blocked_by": [], "url": "#"},
+            {"number": 315, "title": "Define negative-evidence language", "state": "blocked", "assignee": null, "blocked_by": [313], "url": "#"}
+          ],
+          "decisions": [{"text": "Evidence claims remain observation-aware.", "adr_label": null, "adr_url": null}],
+          "handoffs": [],
+          "landed": [],
+          "history": [{"at": "2026-07-29T13:32:00Z", "text": "Last verified projection retained"}]
+        }
+      ],
+      "repos": [
+        {"repo": "ConnorGriffin/agentflow", "profile": "reviewed", "status": "fresh", "running": 1, "ready": 2, "held": 0, "parked": 1, "active_maps": 1, "ratchet": {"samples": 11, "correction_rate": 0.18}},
+        {"repo": "ConnorGriffin/ciq-autotune", "profile": "guarded", "status": "fresh", "running": 1, "ready": 0, "held": 1, "parked": 0, "active_maps": 2, "ratchet": {"samples": 23, "correction_rate": 0.09}},
+        {"repo": "ConnorGriffin/dotfiles", "profile": "reviewed", "status": "stale", "running": 1, "ready": 1, "held": 0, "parked": 0, "active_maps": 0, "ratchet": {"samples": 7, "correction_rate": 0.14}},
+        {"repo": "ConnorGriffin/agentflow-sandbox", "profile": "reviewed", "status": "fresh", "running": 0, "ready": 0, "held": 0, "parked": 0, "active_maps": 0, "ratchet": {"samples": 18, "correction_rate": 0.06}}
+      ],
+      "recent_landings": [
+        {"repo": "ConnorGriffin/agentflow", "number": 177, "title": "Bound repository-map projection", "merged_at": "2026-07-29T12:31:00Z", "url": "#"}
+      ]
+    };
+
+    const clone = (value) => JSON.parse(JSON.stringify(value));
+    const stageHealthFixtures = {
+      'drought': [
+        {"stage":"pre-publish attack","produces":"published a hardened brief","window":10,"attempts":10,"produced":0,"sessions_spent":37}
+      ],
+      'under-window': [
+        {"stage":"pre-publish attack","produces":"published a hardened brief","window":10,"attempts":4,"produced":0,"sessions_spent":12}
+      ],
+      'multi-drought': [
+        {"stage":"pre-publish attack","produces":"published a hardened brief","window":10,"attempts":10,"produced":0,"sessions_spent":37},
+        {"stage":"review","produces":"produced a review verdict","window":10,"attempts":10,"produced":0,"sessions_spent":41}
+      ],
+      'all-healthy': []
+    };
+
+    const fixtureForMode = (base, nextMode) => {
+      const data = clone(base);
+      data.freshness = {state: 'current', label: 'Projection current'};
+      data.stage_health = clone(stageHealthFixtures[nextMode] || []);
+      return data;
+    };
+
+    const isDrought = (stage) => stage && Number(stage.window) > 0 && Number(stage.attempts) >= Number(stage.window) && Number(stage.produced) === 0;
+    const stageAsRow = (stage) => {
+      const copy = {
+        'pre-publish attack': {
+          detail: '0 of its last 10 finished attempts published a hardened brief · 37 sessions spent',
+          actionText: 'What to check: held drafts and ready-for-agent holdbacks'
+        },
+        'review': {
+          detail: '0 of its last 10 finished attempts recorded a review verdict · 41 sessions spent',
+          actionText: 'What to check: open PRs waiting on a verdict'
+        }
+      }[stage.stage];
+      return {
+        kind: 'stage drought',
+        title: stage.stage,
+        detail: copy.detail,
+        actionText: copy.actionText,
+        actionClass: 'action-note'
+      };
+    };
+
+    const normalizeAttention = (attention = []) =>
+      attention.map(item => ({
+        kind: item.kind,
+        title: item.title,
+        detail: item.detail || item.reason || '',
+        url: item.url,
+        actionLabel: 'Open in GitHub',
+        actionClass: 'action'
+      }));
+
+    function render(data) {
+      const freshness = data.freshness || {};
+      const stageRows = (data.stage_health || []).filter(isDrought).map(stageAsRow);
+      $('freshness').textContent = freshness.label || 'Projection unavailable';
+      const notice = $('notice');
+      if (freshness.state === 'stale' || freshness.state === 'incomplete') { notice.className = 'banner ' + freshness.state; notice.textContent = freshness.message; } else notice.classList.add('hidden');
+
+      const attention = [...stageRows, ...normalizeAttention(data.attention || [])];
+      $('attention-count').textContent = attention.length + (attention.length === 1 ? ' item' : ' items');
+      $('attention').innerHTML = attention.length ? attention.map(item => {
+        const kind = esc(item.kind);
+        const title = esc(item.title);
+        const detail = esc(item.detail);
+        const actionClass = item.actionClass || 'action';
+        if (item.url) {
+          return `<article class="attention"><span class="kind">${kind}</span><div><h3>${title}</h3><p>${detail}</p></div><a class="${actionClass}" href="${esc(item.url)}">${esc(item.actionLabel || 'Open in GitHub')} ↗</a></article>`;
+        }
+        const note = esc(item.actionText || '');
+        return `<article class="attention"><span class="kind">${kind}</span><div><h3>${title}</h3><p>${detail}</p></div><span class="${actionClass}">${note}</span></article>`;
+      }).join('') : '<div class="empty">No operator actions in this projection.</div>';
+
+      const maps = data.maps || [];
+      $('maps-count').textContent = maps.length + (maps.length === 1 ? ' active map' : ' active maps');
+      const frontierVerified = freshness.state !== 'stale' && freshness.state !== 'incomplete';
+      $('maps').innerHTML = maps.length ? maps.map(map => {
+        const tickets = map.tickets || [];
+        const support = map.support || [];
+        const status = map.freshness?.status || map.status || 'open';
+        const frontier = frontierVerified ? (map.frontier || 'Not verified') : 'Not verified';
+        return `<article class="map"><div class="map-top"><div><h3>${esc(map.title)}</h3><p class="meta">${esc(map.repo)} · ${esc(`${map.progress?.closed || 0}/${map.progress?.total || 0}`)}</p></div><span class="status">${esc(status)}</span></div><p class="frontier"><b>Frontier:</b> ${esc(frontier)}</p><details><summary>Ticket outline · ${tickets.length} records</summary><ul>${tickets.map(t => `<li>${esc(t.title)}</li>`).join('')}</ul></details><details><summary>Supporting records</summary><div class="support">${support.map(s => `<a href="${esc(s.url)}">${esc(s.label)} ↗</a>`).join('')}</div></details></article>`;
+      }).join('') : '<div class="empty">No active Decision Maps in this bounded projection.</div>';
+
+      const fleet = data.repos || [];
+      $('fleet-count').textContent = fleet.length + (fleet.length === 1 ? ' repository' : ' repositories');
+      $('capacity').innerHTML = (data.pools || []).map(pool => `<span><b>${esc(pool.tool)}</b> ${esc(pool.running)} running · headroom ${esc(pool.headroom_pct)}%</span>`).join('');
+      $('fleet').innerHTML = fleet.map(repo => `<article class="repo"><strong>${esc(repo.repo)}</strong><span>${esc(repo.profile)}</span><span>${esc(repo.running)} running · ${esc(repo.ready)} ready-for-agent</span><span>${esc(repo.parked)} held · ${esc(repo.held)} held</span><span class="${repo.status === 'fresh' ? 'healthy' : ''}">${esc(repo.status === 'fresh' ? 'healthy' : repo.status)}</span></article>`).join('') || '<div class="empty">No repositories were included in this projection.</div>';
+    }
+
+    const load = async () => {
+      try {
+        const response = await fetch('./operator-surface.capture.json');
+        if (!response.ok) throw new Error('Projection unavailable');
+        const data = await response.json();
+        render(fixtureForMode(data, mode));
+      } catch (error) {
+        render(fixtureForMode(fallbackCapture, mode));
+        if (!mode) {
+          $('freshness').textContent = 'Projection unavailable';
+          const notice = $('notice');
+          notice.className = 'banner incomplete';
+          notice.textContent = 'The operator projection could not be read. Open GitHub for authoritative state.';
+        }
+      }
+    };
+
+    load();
+    $('theme').addEventListener('click', () => { const dark = document.documentElement.dataset.theme !== 'dark'; document.documentElement.dataset.theme = dark ? 'dark' : 'light'; $('theme').textContent = dark ? 'Light theme' : 'Dark theme'; });
+  </script>
+</body>
+</html>

@@ -24,6 +24,7 @@ captured to `dashboard-v2.capture.json`. Both captures are gitignored.
 | workspace | **shelf** + Ask + map detail | `retired` | workspace model superseded by ADR 0035; map detail survives only as an information-model precedent | `workspace-combined.html` |
 | workspace-approve-states | approve→publish feedback states | `retired` | Proposal/Publication model superseded by ADR 0035 | `workspace-approve-states.html` |
 | operator-surface | **continuous briefing** (attention → Decision Maps → fleet health) | `shipped` | #183, tracer bullet #372, fleet section #375 | `operator-surface-finalist.html` + `operator-surface-finalist.lock.md` |
+| operator-briefing-drought | **stage-drought Attention row** (local addition; amends base terms 12–13) | `locked` | #430 | `operator-briefing-drought.html` + `operator-briefing-drought.lock.md` |
 
 **`workspace` grounding is its own language, not the console's.** The operator's
 direction: this surface deliberately departs from the terminal-native console
