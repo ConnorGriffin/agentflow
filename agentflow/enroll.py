@@ -939,15 +939,22 @@ def enroll_repository(
 _SYNC_BRANCH = "agentflow/enroll-sync"
 
 
-def _repo_drift(root: Path) -> list[str]:
-    """The `drifted`/`missing` capability rows plus the `repository-instructions` row,
-    verbatim — what a converge would fix, or what is still wrong after it ran."""
+def _repo_drift(root: Path) -> tuple[list[str], list[str]]:
+    """The `drifted`/`missing` capability rows, split by `item.required`: `drift` is what
+    a converge would fix (or what is still wrong after it ran), `notes` is informational
+    only — never required here, so it never plans or blocks convergence."""
     report = doctor(str(root))
-    return [
-        f"{item.id}: {item.status}"
-        for item in report.capabilities
-        if item.status in ("drifted", "missing") or item.id == "repository-instructions"
-    ]
+    drift = []
+    notes = []
+    for item in report.capabilities:
+        if item.status not in ("drifted", "missing"):
+            continue
+        line = f"{item.id}: {item.status}"
+        if item.required:
+            drift.append(line)
+        else:
+            notes.append(line)
+    return drift, notes
 
 
 def _converge_paths(root: Path) -> list[Path]:
@@ -1034,13 +1041,16 @@ def sync_fleet(repos, *, apply: bool) -> int:
             print(f"  SKIP: {cfg.repo} — checkout is dirty")
             skipped += 1
             continue
-        drift = _repo_drift(root)
-        outdated = [line for line in drift if not line.endswith(": ok")]
-        if not outdated:
+        drift, notes = _repo_drift(root)
+        if not drift:
             print(f"  ok:   {cfg.repo} is already current")
+            for line in notes:
+                print(f"  note: {line} (not required here)")
             current += 1
             continue
-        for line in outdated:
+        for line in notes:
+            print(f"  note: {line} (not required here)")
+        for line in drift:
             print(f"  drifted: {line}")
         if not apply:
             print(f"  PLAN: converge {cfg.repo}")
