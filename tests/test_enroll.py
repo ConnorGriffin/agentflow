@@ -562,7 +562,7 @@ class TestEnrollSync:
         _git_init(repo)
         cfg = SimpleNamespace(repo="o/repo", workdir=str(repo))
         monkeypatch.setattr("agentflow.enroll._repo_drift",
-                            lambda root: ["agentflow-skill: drifted"])
+                            lambda root: (["agentflow-skill: drifted"], []))
         monkeypatch.setattr(
             "agentflow.enroll._converge_and_ship",
             lambda root, repo: (False, "gh pr create failed — authentication required"),
@@ -574,6 +574,60 @@ class TestEnrollSync:
         assert "WARN: o/repo failed to converge — gh pr create failed" in out
         assert "0 converged / 0 already current / 1 failed / 0 skipped (dirty)" in out
         assert exit_code == 1
+
+    def _headless_capabilities(self, *, agentflow_skill_status="ok"):
+        required_ok_ids = [
+            "repository-instructions", "agentflow-skill", "codebase-memory",
+        ]
+        rows = [
+            SimpleNamespace(id=cap_id, status=agentflow_skill_status if cap_id == "agentflow-skill"
+                             else "ok", required=True)
+            for cap_id in required_ok_ids
+        ]
+        rows += [
+            SimpleNamespace(id=ui_id, status="missing", required=False)
+            for ui_id in ("ui-craft", "drive-local-webapp", "screenshot-harness", "playwright")
+        ]
+        return rows
+
+    def test_a_headless_repo_with_only_ui_tier_drift_is_already_current(
+            self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        cfg = SimpleNamespace(repo="o/headless", workdir=str(repo))
+        monkeypatch.setattr(
+            "agentflow.enroll.doctor",
+            lambda root: SimpleNamespace(capabilities=self._headless_capabilities()),
+        )
+
+        exit_code = sync_fleet([cfg], apply=False)
+
+        out = capsys.readouterr().out
+        assert "ok:   o/headless is already current" in out
+        assert "0 converged / 1 already current / 0 failed / 0 skipped (dirty)" in out
+        assert "PLAN: converge" not in out
+        for ui_id in ("ui-craft", "drive-local-webapp", "screenshot-harness", "playwright"):
+            assert f"note: {ui_id}: missing (not required here)" in out
+        assert exit_code == 0
+
+    def test_a_required_row_drifted_still_plans_convergence(
+            self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        cfg = SimpleNamespace(repo="o/headless", workdir=str(repo))
+        monkeypatch.setattr(
+            "agentflow.enroll.doctor",
+            lambda root: SimpleNamespace(
+                capabilities=self._headless_capabilities(agentflow_skill_status="drifted")
+            ),
+        )
+
+        exit_code = sync_fleet([cfg], apply=False)
+
+        out = capsys.readouterr().out
+        assert "PLAN: converge o/headless" in out
+        assert "1 converged / 0 already current / 0 failed / 0 skipped (dirty)" in out
+        assert exit_code == 0
 
 
 class TestConvergeAndShip:
