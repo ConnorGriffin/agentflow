@@ -553,10 +553,15 @@ def _review_follow_ups_valid(record, verdict) -> bool:
     if not verdict.follow_ups:
         return True
 
+    facts = review_source_facts(record)
+    if facts is None:
+        return False
+    _workdir, pr = facts
     return validate_follow_ups(
         record.repo, verdict.follow_ups,
         issue_url=lambda number: github.issue_url(record.repo, number),
-        issue_search=lambda query: github.find_issues(record.repo, query, limit=100))
+        issue_body=lambda number: github.issue_body(record.repo, number),
+        reviewed_issue=int(record.subject), reviewed_pr=int(pr))
 
 def _commit_is_gone(workdir: str, sha: str) -> bool:
     """Whether ``sha`` is absent from the repository — the branch was rebased or amended past it
