@@ -48,8 +48,8 @@ temptation to re-litigate them slice by slice:
 - `ModelSpendRow` grew `estimated` and `delegate_uncaptured_attempts`; `format_spend_report`
   renders both, and a cell with no dollar fact at all still renders `—`, never `0.000000`.
 - Worker capture is read-side only: `ClaudeProviderAdapter.observe` scans the Codex sessions
-  root (`~/.codex/sessions`; direct callers pass `sessions_root=` instead of an environment
-  override, so no untrusted path ever reaches the scan) for rollouts whose `cwd` realpath-matches
+  root (`~/.codex/sessions`; the root is fixed at the user's home directory with no override of
+  any kind, so no untrusted path ever reaches the scan) for rollouts whose `cwd` realpath-matches
   the lead's workspace and whose mtime is at/after the attempt's own `started_at`, and merges
   their last cumulative `token_count` totals into the observation's `usage.model_costs` before the
   coordinator ever persists it. A scan failure of any kind degrades to no worker entries rather

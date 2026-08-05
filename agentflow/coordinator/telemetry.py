@@ -227,9 +227,9 @@ def codex_usage(events) -> AttemptUsage:
 
 
 def _codex_sessions_root() -> Path:
-    """Where Codex rollout ``.jsonl`` files live (issue #516 slice 2). Direct callers that need
-    a different root pass ``lead_codex_worker_usage``'s ``sessions_root=`` keyword instead of an
-    environment override, so no untrusted path ever reaches the ``rglob`` below."""
+    """Where Codex rollout ``.jsonl`` files live (issue #516 slice 2). The root is fixed at the
+    user's own home directory with no override of any kind, so no untrusted path ever reaches
+    the ``rglob`` below."""
     return Path.home() / ".codex" / "sessions"
 
 
@@ -283,7 +283,7 @@ def _rollout_worker_usage(records: list[dict]) -> tuple[str, dict] | None:
     return (model or session_meta_model or "codex"), last_totals
 
 
-def lead_codex_worker_usage(record, *, sessions_root: Path | str | None = None) -> tuple:
+def lead_codex_worker_usage(record) -> tuple:
     """Codex worker spend a lead (Claude ``fable``) build/revise attempt delegated to
     ``codex exec --cd <worktree>``, observed from the workers' own rollout files rather than
     self-reported by the lead (frozen decision 2, issue #516 slice 2).
@@ -303,7 +303,7 @@ def lead_codex_worker_usage(record, *, sessions_root: Path | str | None = None) 
     try:
         if record.stage not in {"build", "revise"} or record.model != "fable" or not record.source:
             return ()
-        root = Path(sessions_root) if sessions_root is not None else _codex_sessions_root()
+        root = _codex_sessions_root()
         workspace = os.path.realpath(record.source)
         cutoff = record.started_at if record.started_at else None
         try:
