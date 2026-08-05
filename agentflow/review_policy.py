@@ -387,13 +387,37 @@ def other_tool(tool: str) -> str | None:
     return {"claude": "codex", "codex": "claude"}.get(tool)
 
 
-def validate_follow_ups(repo: str, follow_ups: tuple[FollowUp, ...], *, issue_url,
-                        issue_search) -> bool:
-    """Prove each recorded follow-up exists here and its duplicate query finds it.
+_ORIGIN_LINE_RE = re.compile(
+    r"^discovered while reviewing (?:issue )?#(?P<issue>[1-9][0-9]*)"
+    r".*?(?:pull request|pr) #(?P<pr>[1-9][0-9]*)", re.IGNORECASE)
 
-    ``issue_url`` answers one issue's canonical URL and ``issue_search`` the issues a free-text
-    query matches; both answer ``None`` when the tracker could not be read, so a follow-up
-    agentflow was unable to confirm is never accepted."""
+# Markdown decoration a filer's editor may add around the mandated opening sentence without
+# changing what it says: bold/italic emphasis, a blockquote or heading marker, and stray
+# whitespace. Stripped before matching so a lightly-formatted honest origin line still validates.
+_LEADING_DECORATION_RE = re.compile(r"^[\s*_>#]+")
+
+
+def _first_line(body: str) -> str:
+    for line in body.lstrip("﻿").splitlines():
+        stripped = _LEADING_DECORATION_RE.sub("", line).strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def validate_follow_ups(repo: str, follow_ups: tuple[FollowUp, ...], *, issue_url, issue_body,
+                        reviewed_issue: int, reviewed_pr: int) -> bool:
+    """Prove each recorded follow-up exists here and was opened against this review.
+
+    ``issue_url`` answers one issue's canonical URL, ``None`` when it can't be read or the issue
+    doesn't exist. A live GitHub search of ``duplicate_query`` is not a gate: the search index
+    lags a freshly filed issue by minutes and a reasonable dedup query need not text-match the
+    issue it names, so that check only ever punished honest follow-ups. What is enforced instead
+    is provenance: ``issue_body`` must open with an origin line naming this reviewed issue and
+    pull request — the mandated opening sentence is "Discovered while reviewing #123 (pull
+    request #456)."; light markdown decoration (bold, a quote prefix, a heading marker, a BOM)
+    and the "issue #"/"PR #" phrasing variants are tolerated. A body agentflow could not read, or
+    one whose origin line is missing or names different numbers, is never accepted."""
     pattern = re.compile(
         rf"^https://github\.com/{re.escape(repo)}/issues/([1-9][0-9]*)/?$")
     for follow_up in follow_ups:
@@ -403,8 +427,12 @@ def validate_follow_ups(repo: str, follow_ups: tuple[FollowUp, ...], *, issue_ur
         number = int(match.group(1))
         if issue_url(number) != follow_up.url.rstrip("/"):
             return False
-        matches = issue_search(follow_up.duplicate_query)
-        if matches is None or not any(item.number == number for item in matches):
+        body = issue_body(number)
+        if body is None:
+            return False
+        origin = _ORIGIN_LINE_RE.match(_first_line(body))
+        if (origin is None or int(origin.group("issue")) != reviewed_issue
+                or int(origin.group("pr")) != reviewed_pr):
             return False
     return True
 

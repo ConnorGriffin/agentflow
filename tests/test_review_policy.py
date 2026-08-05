@@ -483,30 +483,108 @@ def test_fix_axis_accepts_a_verified_pr_body_fix_without_a_pushed_head():
         record, SimpleNamespace(final_message=payload))
 
 
-def test_follow_up_must_exist_in_this_repo_and_be_returned_by_its_duplicate_search():
+def test_follow_up_must_exist_in_this_repo_and_carry_a_correct_origin_line():
     from agentflow.review_policy import FollowUp
 
     follow_up = FollowUp(
         "https://github.com/o/r/issues/9", "walkthrough is absent",
         "add routine browser proof", "browser walkthrough in:title")
-    viewed, searched = [], []
-    hit = SimpleNamespace(number=9)
+    origin_body = "Discovered while reviewing #7 (pull request #42).\n\nMore detail here."
+    viewed = []
 
+    # A duplicate query that would match nothing in a live search still validates: the search
+    # index lags fresh issues and a reasonable dedup query need not text-match the issue body, so
+    # only the filed issue's own origin line is proof.
     valid = validate_follow_ups(
         "o/r", (follow_up,),
         issue_url=lambda number: viewed.append(number) or "https://github.com/o/r/issues/9",
-        issue_search=lambda query: searched.append(query) or [hit])
+        issue_body=lambda _n: origin_body, reviewed_issue=7, reviewed_pr=42)
 
     assert valid is True
-    assert viewed == [9] and searched == ["browser walkthrough in:title"]
+    assert viewed == [9]
+
+    # A nonexistent issue (issue_url disagrees, or reads None) fails closed.
     assert validate_follow_ups(
-        "other/r", (follow_up,), issue_url=lambda _n: None, issue_search=lambda _q: []) is False
-    # An unreadable tracker is never proof: neither read may pass as "confirmed".
+        "other/r", (follow_up,), issue_url=lambda _n: None, issue_body=lambda _n: origin_body,
+        reviewed_issue=7, reviewed_pr=42) is False
     assert validate_follow_ups(
-        "o/r", (follow_up,), issue_url=lambda _n: None, issue_search=lambda _q: [hit]) is False
+        "o/r", (follow_up,), issue_url=lambda _n: None, issue_body=lambda _n: origin_body,
+        reviewed_issue=7, reviewed_pr=42) is False
+
+    # A missing origin line fails.
     assert validate_follow_ups(
         "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
-        issue_search=lambda _q: None) is False
+        issue_body=lambda _n: "No origin line here at all.",
+        reviewed_issue=7, reviewed_pr=42) is False
+
+    # An origin line naming the wrong issue or PR number fails.
+    assert validate_follow_ups(
+        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
+        issue_body=lambda _n: "Discovered while reviewing #8 (pull request #42).",
+        reviewed_issue=7, reviewed_pr=42) is False
+    assert validate_follow_ups(
+        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
+        issue_body=lambda _n: "Discovered while reviewing #7 (pull request #43).",
+        reviewed_issue=7, reviewed_pr=42) is False
+
+    # An unreadable body is never proof: it fails closed rather than being skipped.
+    assert validate_follow_ups(
+        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url, issue_body=lambda _n: None,
+        reviewed_issue=7, reviewed_pr=42) is False
+
+
+@pytest.mark.parametrize("decorated_body", [
+    "**Discovered while reviewing #7 (pull request #42).**",
+    "> Discovered while reviewing #7 (pull request #42).",
+    "# Discovered while reviewing #7 (pull request #42).",
+    "Discovered while reviewing issue #7 (PR #42).",
+    "﻿Discovered while reviewing #7 (pull request #42).",
+])
+def test_origin_line_tolerates_light_markdown_decoration_and_phrasing_variants(decorated_body):
+    from agentflow.review_policy import FollowUp
+
+    follow_up = FollowUp(
+        "https://github.com/o/r/issues/9", "walkthrough is absent",
+        "add routine browser proof", "browser walkthrough in:title")
+
+    assert validate_follow_ups(
+        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
+        issue_body=lambda _n: decorated_body, reviewed_issue=7, reviewed_pr=42) is True
+
+
+def test_review_follow_ups_valid_threads_the_reviewed_issue_and_pr_from_the_record(monkeypatch):
+    """The call site must hand ``validate_follow_ups`` this review's own issue/PR, not any other
+    pair: a swapped or wrong number must fail even though the origin line and issue lookup are
+    otherwise honest."""
+    from agentflow import coordinated_review, github
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    record = Record(
+        identity="r", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
+        target="head", review_depth="targeted", depth_reason="one contained change",
+        review_axis="combined", change_author_tool="claude",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    follow_up = FollowUp(
+        "https://github.com/o/r/issues/9", "walkthrough is absent",
+        "add routine browser proof", "browser walkthrough in:title")
+    verdict = Verdict(parsed=True, clean=True, follow_ups=(follow_up,))
+
+    monkeypatch.setattr(github, "issue_url", lambda repo, number: follow_up.url)
+    monkeypatch.setattr(
+        github, "issue_body", lambda repo, number:
+        "Discovered while reviewing #7 (pull request #42).")
+
+    assert coordinated_review._review_follow_ups_valid(record, verdict) is True
+
+    # The record's own subject (#7) and worktree PR (42) are what must reach the validator: an
+    # origin line naming the swapped pair fails, proving the threading — not just the regex — is
+    # under test.
+    monkeypatch.setattr(
+        github, "issue_body", lambda repo, number:
+        "Discovered while reviewing #42 (pull request #7).")
+
+    assert coordinated_review._review_follow_ups_valid(record, verdict) is False
 
 
 def test_conflict_uncertainty_is_a_private_structured_provider_outcome():
