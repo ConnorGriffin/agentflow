@@ -48,11 +48,12 @@ temptation to re-litigate them slice by slice:
 - `ModelSpendRow` grew `estimated` and `delegate_uncaptured_attempts`; `format_spend_report`
   renders both, and a cell with no dollar fact at all still renders `—`, never `0.000000`.
 - Worker capture is read-side only: `ClaudeProviderAdapter.observe` scans the Codex sessions
-  root (default `~/.codex/sessions`, overridable via `AGENTFLOW_CODEX_SESSIONS`) for rollouts
-  whose `cwd` realpath-matches the lead's workspace, and merges their last cumulative
-  `token_count` totals into the observation's `usage.model_costs` before the coordinator ever
-  persists it. A scan failure of any kind degrades to no worker entries rather than failing the
-  observation it rides on.
+  root (`~/.codex/sessions`; direct callers pass `sessions_root=` instead of an environment
+  override, so no untrusted path ever reaches the scan) for rollouts whose `cwd` realpath-matches
+  the lead's workspace and whose mtime is at/after the attempt's own `started_at`, and merges
+  their last cumulative `token_count` totals into the observation's `usage.model_costs` before the
+  coordinator ever persists it. A scan failure of any kind degrades to no worker entries rather
+  than failing the observation it rides on.
 - Once a lead-run attempt's usage carries a Codex-priced model-cost entry (worker capture
   merged it in), the *delegate spend not counted* mark disappears for that attempt on its own —
   there is no separate flag to flip.

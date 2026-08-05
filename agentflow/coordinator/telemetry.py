@@ -227,10 +227,10 @@ def codex_usage(events) -> AttemptUsage:
 
 
 def _codex_sessions_root() -> Path:
-    """Where Codex rollout ``.jsonl`` files live — overridable so a test never touches a real
-    home directory (``AGENTFLOW_CODEX_SESSIONS``, issue #516 slice 2)."""
-    override = os.environ.get("AGENTFLOW_CODEX_SESSIONS")
-    return Path(override).expanduser() if override else Path.home() / ".codex" / "sessions"
+    """Where Codex rollout ``.jsonl`` files live (issue #516 slice 2). Direct callers that need
+    a different root pass ``lead_codex_worker_usage``'s ``sessions_root=`` keyword instead of an
+    environment override, so no untrusted path ever reaches the ``rglob`` below."""
+    return Path.home() / ".codex" / "sessions"
 
 
 def _rollout_records(path: Path) -> list[dict]:
@@ -283,29 +283,29 @@ def _rollout_worker_usage(records: list[dict]) -> tuple[str, dict] | None:
     return (model or session_meta_model or "codex"), last_totals
 
 
-# The mtime slack around an attempt's `started_at` a candidate rollout is admitted within — a
-# worker's rollout file can be flushed a little after the turn that produced it started.
-_ROLLOUT_MTIME_SLACK_SECONDS = 300
-
-
 def lead_codex_worker_usage(record, *, sessions_root: Path | str | None = None) -> tuple:
     """Codex worker spend a lead (Claude ``fable``) build/revise attempt delegated to
     ``codex exec --cd <worktree>``, observed from the workers' own rollout files rather than
     self-reported by the lead (frozen decision 2, issue #516 slice 2).
 
     Every rollout under the sessions root whose ``session_meta.cwd`` realpath-matches the
-    record's workspace, and whose mtime is at/after the attempt's ``started_at`` minus a small
-    slack, contributes its last cumulative ``token_count`` totals, summed per attributed model
-    (falling back to the literal ``"codex"`` identity when no model fact is found). Failure
-    anywhere — an unreadable sessions root, a malformed rollout, a bad path — degrades to no
-    worker entries; this must never fail the caller's observation.
+    record's workspace, and whose mtime is at/after the attempt's own ``started_at``, contributes
+    its last cumulative ``token_count`` totals, summed per attributed model (falling back to the
+    literal ``"codex"`` identity when no model fact is found). The floor is the attempt's own
+    admission time, not a backdated slack: a worker cannot start before the attempt that spawned
+    it, so a rollout last written before this attempt was admitted belongs to some earlier
+    attempt that reused the same workspace (a retry, or a prior build before a revise), never to
+    this one — a slack that reached backward past admission would double-book that earlier
+    attempt's spend onto this attempt too. A record with no ``started_at`` (falsy) applies no
+    mtime floor. Failure anywhere — an unreadable sessions root, a malformed rollout, a bad path —
+    degrades to no worker entries; this must never fail the caller's observation.
     """
     try:
         if record.stage not in {"build", "revise"} or record.model != "fable" or not record.source:
             return ()
         root = Path(sessions_root) if sessions_root is not None else _codex_sessions_root()
         workspace = os.path.realpath(record.source)
-        cutoff = (record.started_at - _ROLLOUT_MTIME_SLACK_SECONDS) if record.started_at else None
+        cutoff = record.started_at if record.started_at else None
         try:
             paths = list(root.rglob("*.jsonl"))
         except OSError:

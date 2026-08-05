@@ -9,6 +9,7 @@ prose is never a diagnosis.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -429,10 +430,10 @@ def _lead_session_artifacts(tmp_path, token):
 def test_lead_run_claude_observation_merges_codex_worker_usage_from_matching_rollouts(
         tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     workspace = tmp_path / "worktree"
     workspace.mkdir()
-    sessions_root = tmp_path / "codex-sessions"
-    monkeypatch.setenv("AGENTFLOW_CODEX_SESSIONS", str(sessions_root))
+    sessions_root = tmp_path / ".codex" / "sessions"
 
     _write_rollout(sessions_root / "matching.jsonl", str(workspace))
     _write_rollout(sessions_root / "other.jsonl", str(tmp_path / "elsewhere"))
@@ -468,10 +469,10 @@ def test_lead_run_claude_observation_merges_codex_worker_usage_from_matching_rol
 
 def test_a_rollout_with_a_different_cwd_is_not_merged(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     workspace = tmp_path / "worktree"
     workspace.mkdir()
-    sessions_root = tmp_path / "codex-sessions"
-    monkeypatch.setenv("AGENTFLOW_CODEX_SESSIONS", str(sessions_root))
+    sessions_root = tmp_path / ".codex" / "sessions"
     _write_rollout(sessions_root / "other.jsonl", str(tmp_path / "elsewhere"))
     _lead_session_artifacts(tmp_path, "lead-tok-2")
 
@@ -484,10 +485,10 @@ def test_a_rollout_with_a_different_cwd_is_not_merged(tmp_path, monkeypatch):
 
 def test_worker_capture_is_skipped_for_non_lead_run_attempts(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
     workspace = tmp_path / "worktree"
     workspace.mkdir()
-    sessions_root = tmp_path / "codex-sessions"
-    monkeypatch.setenv("AGENTFLOW_CODEX_SESSIONS", str(sessions_root))
+    sessions_root = tmp_path / ".codex" / "sessions"
     _write_rollout(sessions_root / "matching.jsonl", str(workspace))
     _lead_session_artifacts(tmp_path, "lead-tok-3")
 
@@ -497,3 +498,38 @@ def test_worker_capture_is_skipped_for_non_lead_run_attempts(tmp_path, monkeypat
     observation = ClaudeProviderAdapter().observe(record)
 
     assert observation.usage.model_costs == (ModelCost("fable", 0.01),)
+
+
+def test_a_rollout_from_an_earlier_attempt_is_not_absorbed_by_a_later_attempt_reusing_the_workspace(
+        tmp_path, monkeypatch):
+    """A worktree is reused across build -> revise, and each admission resets `started_at`. A
+    worker rollout the build attempt spawned must stay the build's, never re-absorbed by a
+    later revise attempt that reuses the same workspace, even though the rollout's mtime falls
+    inside the revise's old backward-looking slack window (issue #516 slice 2 regression)."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    sessions_root = tmp_path / ".codex" / "sessions"
+
+    build_started = 1_000_000
+    revise_started = build_started + 120       # revise admitted after the build's worker ran
+    rollout = sessions_root / "worker.jsonl"
+    _write_rollout(rollout, str(workspace))
+    os.utime(rollout, (build_started + 60, build_started + 60))   # written during the build
+
+    _lead_session_artifacts(tmp_path, "build-tok")
+    _lead_session_artifacts(tmp_path, "revise-tok")
+
+    build_record = Record("i", "build", "claude", 1, launch_token="build-tok",
+                          model="fable", source=str(workspace), started_at=build_started)
+    revise_record = Record("i", "revise", "claude", 1, launch_token="revise-tok",
+                           model="fable", source=str(workspace), started_at=revise_started)
+
+    build_costs = {c.model: c for c in
+                   ClaudeProviderAdapter().observe(build_record).usage.model_costs}
+    revise_costs = {c.model: c for c in
+                    ClaudeProviderAdapter().observe(revise_record).usage.model_costs}
+
+    assert "gpt-5.6-terra" in build_costs        # the build attempt still absorbs its own worker
+    assert "gpt-5.6-terra" not in revise_costs   # the revise attempt does not re-absorb it
