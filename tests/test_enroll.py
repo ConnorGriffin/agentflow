@@ -717,6 +717,39 @@ class TestConvergeAndShip:
         ).stdout
         assert _SYNC_BRANCH in local_branches
 
+    def test_a_successful_run_with_a_failed_restore_is_reported_as_a_failure(
+            self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill_dir = repo / ".agents" / "skills" / "agentflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("content")
+        monkeypatch.setattr("agentflow.enroll.enroll_repository",
+                            lambda *a, **k: SimpleNamespace(ready=True))
+
+        def fake_run(command, **kw):
+            if "push" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if "checkout" in command and _SYNC_BRANCH not in command:
+                # The restore checkout back to the original branch, not the sync branch's
+                # own creation — force it to fail as if something perturbed the checkout.
+                return subprocess.CompletedProcess(command, 1, "", "error: cannot restore")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda repo, **kw: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        # The underlying converge/commit/push/PR sequence succeeded, but the restore
+        # didn't — the operator must see this under sync_fleet's WARN: line, not DO:.
+        assert ok is False
+        assert "checkout left on" in detail
+        assert "cannot restore" in detail
+
     def test_a_push_failure_still_restores_the_original_branch(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
         _git_init(repo)

@@ -1058,6 +1058,7 @@ def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
 
     if restore_failure is not None:
         detail = f"{detail}; checkout left on {_SYNC_BRANCH} — restore failed: {restore_failure}"
+        ok = False
     return ok, detail
 
 
