@@ -487,8 +487,14 @@ def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict,
               if verdict.reviewer_tool != verdict.change_author_tool
               else "same-tool review; maintainer merge required")
     fixes = "\n".join(f"- {item}" for item in verdict.fixes) or "- None."
-    follow_ups = ("\n".join(f"- {item}" for item in verdict.follow_up_issues)
-                  or "- None.")
+    proposal = tuple(item for item in verdict.follow_ups if not item.historic_url)[:1]
+    proposed_follow_up = (
+        f"Desired outcome: {proposal[0].desired_outcome}\n"
+        f"Evidence: {proposal[0].evidence}"
+        if proposal else "None.")
+    historic_follow_up = ("\n".join(
+        f"- Historical follow-up reference: {item}" for item in verdict.follow_up_issues)
+        or "- None.")
     checks = "\n".join(f"- {item}" for item in verdict.checks) or "- No proof recorded."
     body = (
         f"> *agentflow: clean review.*\n{_CLEAN_REVIEW_MARKER}\n"
@@ -497,7 +503,8 @@ def post_clean_review_summary(repo: str, pr_number: int, verdict: Verdict,
         f"Review depth: {verdict.depth.value.title()} — "
         f"{verdict.depth_reason or 'legacy review assignment'}\n\n"
         f"Fixes shipped:\n{fixes}\n\n"
-        f"Necessary follow-ups:\n{follow_ups}\n\n"
+        f"Proposed follow-up:\n{proposed_follow_up}\n\n"
+        f"Historic follow-up references:\n{historic_follow_up}\n\n"
         f"Checks and proof:\n{checks}\n\n"
         f"Review status: {status}.")
     comments = github.pr_comments(repo, pr_number)
@@ -557,56 +564,10 @@ def park(repo: str, pr_number: int, verdict: Verdict | None,
                 verdict and (
                     verdict.uncertainty is not None
                     or any(item.action.value == "ask_maintainer" for item in verdict.actions))))
-    option_lines = "\n".join(f"- {item}" for item in context.options)
-    decision = (
-        f"Affected behavior: {context.behavior}\n\n"
-        f"Options:\n{option_lines}\n\n"
-        f"Consequences: {context.consequences}\n\n"
-        f"Recommendation: {context.recommendation}")
-    location_lines = "\n".join(f"- {item}" for item in context.locations)
-    check_lines = "\n".join(f"- {item}" for item in context.checks)
-    handoff = (
-        f"Code locations:\n{location_lines}\n\n"
-        f"Conflicting changes or unresolved facts: {context.conflicts}\n\n"
-        f"Checks:\n{check_lines}\n\n"
-        f"Retained work: {context.retained_work}\n\n"
-        f"Exact next action: {context.next_action}")
-    if verdict is not None:
-        action_lines = [
-            f"- **{item.action.value}** "
-            f"{item.file + ':' + str(item.line) if item.file else '(cross-cutting)'} — "
-            f"{item.summary}"
-            for item in verdict.actions
-        ]
-        if not action_lines:
-            action_lines = [
-                f"- **{'fix_before_completion' if item.severity == 'blocking' else 'discard_preference'}** "
-                f"{item.file + ':' + str(item.line) if item.file else '(cross-cutting)'} — "
-                f"{item.summary}"
-                for item in verdict.findings
-            ]
-        if action_lines:
-            handoff += "\n\nReview actions:\n" + "\n".join(action_lines)
-        handoff += (f"\n\nReview depth: {verdict.depth.value.title()} — "
-                    f"{verdict.depth_reason or 'legacy review assignment'}")
-        if verdict.fixes:
-            handoff += "\n\nReview fixes shipped:\n" + "\n".join(
-                f"- {summary}" for summary in verdict.fixes)
-        if verdict.follow_up_issues:
-            handoff += "\n\nFollow-up issues filed:\n" + "\n".join(
-                f"- {url}" for url in verdict.follow_up_issues)
-        if verdict.reviewer_tool and verdict.change_author_tool:
-            status = ("cross-tool review"
-                      if verdict.reviewer_tool != verdict.change_author_tool
-                      else "same-tool review; maintainer merge required")
-            handoff += f"\n\nReview status: {status}."
-    marker_line = f"\n<!-- {proof_marker} -->" if proof_marker else ""
-    heading = ("Maintainer decision needed" if context.decision_needed else "Action needed")
-    body = (f"{PARK_MARK}{marker_line}\n\n"
-            f"## {heading}\n\n"
-            f"{decision}\n\n"
-            "## Agent handoff\n\n"
-            f"{handoff}")
+    from agentflow.review_policy import format_park_comment
+
+    body = format_park_comment(
+        context, verdict, proof_marker=proof_marker, park_mark=PARK_MARK)
     if proof_marker:
         parked = [
             comment for comment in comments if PARK_MARK in comment.body]

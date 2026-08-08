@@ -22,7 +22,6 @@ from agentflow.review_policy import (
     encode_findings,
     parse_review_result,
     proposed_depth,
-    validate_follow_ups,
     conflict_uncertainty_from_message,
 )
 
@@ -67,6 +66,52 @@ def test_structured_review_requires_recorded_checks():
     assert result.parsed is False and "checks" in result.detail
 
 
+def test_follow_up_proposal_is_zero_or_one_and_required_exactly_for_its_finding():
+    base = {
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "checks": ["verified"],
+        "uncertainty": None, "decision": "",
+    }
+    proposal = {"evidence": "the browser proof is absent", "desired_outcome": "add proof"}
+    needed = {"action": "necessary_follow_up", "summary": "proof belongs elsewhere",
+              "grounding": "this PR has no browser surface", "file": "", "line": 0}
+
+    accepted = parse_review_result(json.dumps({
+        **base, "follow_ups": [proposal], "findings": [needed]}), expected_sha="head")
+    missing = parse_review_result(json.dumps({
+        **base, "follow_ups": [], "findings": [needed]}), expected_sha="head")
+    excess = parse_review_result(json.dumps({
+        **base, "follow_ups": [proposal, proposal], "findings": [needed]}), expected_sha="head")
+    unneeded = parse_review_result(json.dumps({
+        **base, "follow_ups": [proposal], "findings": []}), expected_sha="head")
+
+    assert accepted.parsed is True and accepted.follow_ups[0].desired_outcome == "add proof"
+    assert missing.parsed is False and "proposal" in missing.detail
+    assert excess.parsed is False and "one" in excess.detail
+    assert unneeded.parsed is False and "proposal" in unneeded.detail
+
+
+def test_multiple_legacy_follow_up_urls_remain_readable_and_historical_when_rewritten():
+    from agentflow.coordinator.record import Record
+
+    legacy = [
+        {"url": "https://github.com/o/r/issues/9", "evidence": "first evidence",
+         "desired_outcome": "first outcome", "duplicate_query": "first"},
+        {"url": "https://github.com/o/r/issues/10", "evidence": "second evidence",
+         "desired_outcome": "second outcome", "duplicate_query": "second"},
+    ]
+    state = ReviewState.from_record(Record(
+        identity="legacy", stage="review", pool="codex", demand=2,
+        review_follow_ups=json.dumps(legacy)))
+
+    assert state is not None
+    assert [item.historic_url for item in state.follow_ups] == [
+        "https://github.com/o/r/issues/9", "https://github.com/o/r/issues/10"]
+    assert [item["url"] for item in json.loads(state.record_fields()["review_follow_ups"])] == [
+        "https://github.com/o/r/issues/9", "https://github.com/o/r/issues/10"]
+
+
 def test_decision_pass_must_choose_or_return_structured_uncertainty():
     result = parse_review_result(json.dumps({
         "verdict": "PASS", "depth": "full", "depth_reason": "competing behavior",
@@ -93,7 +138,7 @@ def test_review_chain_state_round_trips_through_the_coordinator_store(tmp_path, 
             cross_tool_covered=True, tainted=True, handoff="verify the permission",
             findings=(ReviewFinding(ReviewAction.FIX, "fix", "rule"),),
             fixes=("fixed copy",),
-            follow_ups=(FollowUp("u", "evidence", "outcome", "query"),),
+            follow_ups=(FollowUp("evidence", "outcome"),),
             uncertainty=Uncertainty(("a", "b"), "missing", "choose a"),
             uncertainty_handoffs=1)))
 
@@ -483,108 +528,30 @@ def test_fix_axis_accepts_a_verified_pr_body_fix_without_a_pushed_head():
         record, SimpleNamespace(final_message=payload))
 
 
-def test_follow_up_must_exist_in_this_repo_and_carry_a_correct_origin_line():
-    from agentflow.review_policy import FollowUp
-
-    follow_up = FollowUp(
-        "https://github.com/o/r/issues/9", "walkthrough is absent",
-        "add routine browser proof", "browser walkthrough in:title")
-    origin_body = "Discovered while reviewing #7 (pull request #42).\n\nMore detail here."
-    viewed = []
-
-    # A duplicate query that would match nothing in a live search still validates: the search
-    # index lags fresh issues and a reasonable dedup query need not text-match the issue body, so
-    # only the filed issue's own origin line is proof.
-    valid = validate_follow_ups(
-        "o/r", (follow_up,),
-        issue_url=lambda number: viewed.append(number) or "https://github.com/o/r/issues/9",
-        issue_body=lambda _n: origin_body, reviewed_issue=7, reviewed_pr=42)
-
-    assert valid is True
-    assert viewed == [9]
-
-    # A nonexistent issue (issue_url disagrees, or reads None) fails closed.
-    assert validate_follow_ups(
-        "other/r", (follow_up,), issue_url=lambda _n: None, issue_body=lambda _n: origin_body,
-        reviewed_issue=7, reviewed_pr=42) is False
-    assert validate_follow_ups(
-        "o/r", (follow_up,), issue_url=lambda _n: None, issue_body=lambda _n: origin_body,
-        reviewed_issue=7, reviewed_pr=42) is False
-
-    # A missing origin line fails.
-    assert validate_follow_ups(
-        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
-        issue_body=lambda _n: "No origin line here at all.",
-        reviewed_issue=7, reviewed_pr=42) is False
-
-    # An origin line naming the wrong issue or PR number fails.
-    assert validate_follow_ups(
-        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
-        issue_body=lambda _n: "Discovered while reviewing #8 (pull request #42).",
-        reviewed_issue=7, reviewed_pr=42) is False
-    assert validate_follow_ups(
-        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
-        issue_body=lambda _n: "Discovered while reviewing #7 (pull request #43).",
-        reviewed_issue=7, reviewed_pr=42) is False
-
-    # An unreadable body is never proof: it fails closed rather than being skipped.
-    assert validate_follow_ups(
-        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url, issue_body=lambda _n: None,
-        reviewed_issue=7, reviewed_pr=42) is False
-
-
-@pytest.mark.parametrize("decorated_body", [
-    "**Discovered while reviewing #7 (pull request #42).**",
-    "> Discovered while reviewing #7 (pull request #42).",
-    "# Discovered while reviewing #7 (pull request #42).",
-    "Discovered while reviewing issue #7 (PR #42).",
-    "﻿Discovered while reviewing #7 (pull request #42).",
-])
-def test_origin_line_tolerates_light_markdown_decoration_and_phrasing_variants(decorated_body):
-    from agentflow.review_policy import FollowUp
-
-    follow_up = FollowUp(
-        "https://github.com/o/r/issues/9", "walkthrough is absent",
-        "add routine browser proof", "browser walkthrough in:title")
-
-    assert validate_follow_ups(
-        "o/r", (follow_up,), issue_url=lambda _n: follow_up.url,
-        issue_body=lambda _n: decorated_body, reviewed_issue=7, reviewed_pr=42) is True
-
-
-def test_review_follow_ups_valid_threads_the_reviewed_issue_and_pr_from_the_record(monkeypatch):
-    """The call site must hand ``validate_follow_ups`` this review's own issue/PR, not any other
-    pair: a swapped or wrong number must fail even though the origin line and issue lookup are
-    otherwise honest."""
+def test_ready_verdict_with_proposal_never_reads_a_github_issue(monkeypatch):
     from agentflow import coordinated_review, github
     from agentflow.coordinator.record import Record
-    from agentflow.reviewer import Verdict
 
     record = Record(
         identity="r", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
         target="head", review_depth="targeted", depth_reason="one contained change",
         review_axis="combined", change_author_tool="claude",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
-    follow_up = FollowUp(
-        "https://github.com/o/r/issues/9", "walkthrough is absent",
-        "add routine browser proof", "browser walkthrough in:title")
-    verdict = Verdict(parsed=True, clean=True, follow_ups=(follow_up,))
+    payload = json.dumps({
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one contained change",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [],
+        "follow_ups": [{"evidence": "walkthrough is absent",
+                        "desired_outcome": "add routine browser proof"}],
+        "checks": ["reviewed"], "findings": [{
+            "action": "necessary_follow_up", "summary": "browser proof belongs elsewhere",
+            "grounding": "this PR is backend-only", "file": "", "line": 0}],
+        "uncertainty": None, "decision": "",
+    })
+    monkeypatch.setattr(github, "issue_url", lambda *_args: pytest.fail("must not read issues"))
+    monkeypatch.setattr(github, "issue_body", lambda *_args: pytest.fail("must not read issues"))
 
-    monkeypatch.setattr(github, "issue_url", lambda repo, number: follow_up.url)
-    monkeypatch.setattr(
-        github, "issue_body", lambda repo, number:
-        "Discovered while reviewing #7 (pull request #42).")
-
-    assert coordinated_review._review_follow_ups_valid(record, verdict) is True
-
-    # The record's own subject (#7) and worktree PR (42) are what must reach the validator: an
-    # origin line naming the swapped pair fails, proving the threading — not just the regex — is
-    # under test.
-    monkeypatch.setattr(
-        github, "issue_body", lambda repo, number:
-        "Discovered while reviewing #42 (pull request #7).")
-
-    assert coordinated_review._review_follow_ups_valid(record, verdict) is False
+    assert coordinated_review._verdict_ready(record, SimpleNamespace(final_message=payload))
 
 
 def test_conflict_uncertainty_is_a_private_structured_provider_outcome():
@@ -949,7 +916,7 @@ def test_a_parked_review_asks_the_decision_its_chain_recorded(monkeypatch):
     assert _RESCUE_DECISION.recommendation in body
     for option in _RESCUE_DECISION.options:
         assert option in body
-    assert "standards axis reviewed" in body               # what the chain did prove
+    assert "product axis reviewed" in body                 # one completed check stays readable
     assert "No review was completed" not in body
     assert "Clarify the affected behavior" not in body
     assert "Reply on this PR with the behavior you want" in body
@@ -1077,8 +1044,7 @@ def test_a_cause_specific_park_replaces_only_unsupported_zero_pass_claims(
 
     assert cause in body
     assert remedy in body
-    assert "1 review pass recorded a verdict" in body
-    assert "The 1 earlier pass pushed a repair at its own head" in body
+    assert "after 1 verdict-recording review pass" in body
     assert "nothing has looked at this change at all" not in body
     assert "no budget was drawn down" not in body
     assert "nothing has judged this change yet" not in body

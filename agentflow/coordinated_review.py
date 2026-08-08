@@ -526,9 +526,6 @@ def _verdict_ready(record, obs):
                 "the fix-axis review recorded FIX findings but its verdict names no pushed fix, "
                 "and the retained checkout does not own a moved head (final_sha "
                 f"{(verdict.final_sha or 'unstated')[:12]}, target {record.target[:12]})")
-    if not _review_follow_ups_valid(record, verdict):
-        return unverified("follow-up-evidence", "a structured follow-up in the verdict could not "
-                          "be validated against the repository's live issue tracker")
     if (record.review_tainted and not record.review_taint_cleared
             and record.cross_tool_covered and not verdict.pushed_sha
             and record.review_axis in {"combined", "standards"}):
@@ -545,23 +542,6 @@ def _verdict_ready(record, obs):
             record.review_taint_cleared = True
     return VERIFIED
 
-
-def _review_follow_ups_valid(record, verdict) -> bool:
-    """Validate structured follow-up evidence against this repository's live issue tracker."""
-    from agentflow.review_policy import validate_follow_ups
-
-    if not verdict.follow_ups:
-        return True
-
-    facts = review_source_facts(record)
-    if facts is None:
-        return False
-    _workdir, pr = facts
-    return validate_follow_ups(
-        record.repo, verdict.follow_ups,
-        issue_url=lambda number: github.issue_url(record.repo, number),
-        issue_body=lambda number: github.issue_body(record.repo, number),
-        reviewed_issue=int(record.subject), reviewed_pr=int(pr))
 
 def _commit_is_gone(workdir: str, sha: str) -> bool:
     """Whether ``sha`` is absent from the repository — the branch was rebased or amended past it
@@ -1133,7 +1113,7 @@ def _review_verdict(review):
         actions=actions, findings=compatibility_findings,
         clean=verdict.clean and not any(
             item.action.value in {"fix_before_completion", "ask_maintainer"} for item in actions),
-        follow_up_issues=tuple(item.url for item in follow_ups))
+        follow_up_issues=tuple(item.historic_url for item in follow_ups if item.historic_url))
 
 
 def _moved_head_review_submission(record, head_sha: str):

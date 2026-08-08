@@ -73,15 +73,14 @@ REVIEW_VERDICT_SCHEMA = {
         "checks": {"type": "array", "items": {"type": "string"}},
         "decision": {"type": "string"},
         "follow_ups": {
-            "type": "array",
+            "type": "array", "maxItems": 1,
             "items": {
                 "type": "object", "additionalProperties": False,
                 "properties": {
-                    "url": {"type": "string"}, "evidence": {"type": "string"},
+                    "evidence": {"type": "string"},
                     "desired_outcome": {"type": "string"},
-                    "duplicate_query": {"type": "string"},
                 },
-                "required": ["url", "evidence", "desired_outcome", "duplicate_query"],
+                "required": ["evidence", "desired_outcome"],
             },
         },
         "findings": {
@@ -212,7 +211,8 @@ def parse_verdict(payload: str, expected_sha: str | None = None, *,
                 clean=result.clean, findings=compatibility_findings, parsed=True,
                 reviewed_sha=result.reviewed_sha, final_sha=result.final_sha,
                 pushed_sha=result.pushed_sha, fixes=result.fixes,
-                follow_up_issues=tuple(item.url for item in result.follow_ups),
+                follow_up_issues=tuple(item.historic_url for item in result.follow_ups
+                                        if item.historic_url),
                 depth=result.depth, depth_reason=result.depth_reason, axis=result.axis,
                 change_author_tool=result.change_author_tool, follow_ups=result.follow_ups,
                 checks=result.checks, actions=result.findings, uncertainty=result.uncertainty,
@@ -305,16 +305,9 @@ You own bounded cleanup in this review; do not merely report work you can safely
   builder already shipped one, `fix_before_completion` by deleting it, and name in the finding the
   enforced invariant that makes the state unreachable. Keep every guard that acceptance, security,
   or observed behavior grounds.
-- For a real necessary gap outside this PR's scope, search existing issues first, then file one
-  follow-up issue in this repo. Record its URL, evidence, desired outcome, and duplicate-search
-  query. Do not file issues for unsupported preferences. File it with NO labels — never
-  `ready-for-agent` and never any `agentflow:*` label: a follow-up enters intake like any other
-  new issue and earns its dials there; one born ready is unbuildable (ADR 0018). Open its
-  **description at creation** with an origin line naming both this ticket and this pull request:
-  the description's first line must read exactly "Discovered while reviewing #{issue} (pull
-  request #{pr})." — never as a comment and never added after filing: a comment isn't read by
-  whatever grounds the issue next, and a later edit to the description is overwritten when the
-  issue is groomed.
+- For a real necessary gap outside this PR's scope, do not create or file a GitHub issue. Record
+  at most one concise follow-up proposal with grounded evidence and the desired outcome. It does
+  not block a clean verdict and must not be used for unsupported preferences.
 - If a choice is materially ambiguous, changes product intent, needs missing context, or cannot be
   verified safely, do not guess. Record exactly two options, missing guidance, and your
   recommendation for agentflow's one private cross-tool decision handoff. Do not comment on GitHub.
@@ -361,7 +354,7 @@ evidenced improvement outside this PR's purpose. Otherwise discard it as unsuppo
 
 Choose exactly one action for every observation:
 1. `fix_before_completion` — ship the clear correction before returning.
-2. `necessary_follow_up` — file and prove real out-of-scope work.
+2. `necessary_follow_up` — propose one real, evidenced out-of-scope outcome; create no issue.
 3. `ask_maintainer` — only for unresolved product intent after the narrow decision handoff.
 4. `discard_preference` — unsupported reviewer taste; creates no work.
 
@@ -384,7 +377,8 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
   empty list and "pushed_sha" is an empty string; those earlier fixes are already recorded
   and restating them here contradicts your own push provenance and voids the verdict.
 - "checks": exact proof/checks you completed
-- "follow_ups": necessary issues as {{"url", "evidence", "desired_outcome", "duplicate_query"}}
+- "follow_ups": zero or one necessary follow-up proposal as {{"evidence", "desired_outcome"}}.
+  Supply exactly one when a `necessary_follow_up` finding is present, otherwise supply none.
 - "findings": unresolved/discarded observations as {{"action", "file", "line", "summary",
   "grounding"}}. Do not report already-fixed issues as unresolved findings.
 - "uncertainty": null, or {{"options": [exactly two], "missing_guidance", "recommendation"}}
