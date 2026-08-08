@@ -115,6 +115,19 @@ def test_review_keeps_tracker_reads_available_without_the_retired_write_action()
     assert adapter.verify(_record("review"), obs) is True
 
 
+@pytest.mark.parametrize("command", (
+    "printf 'gh issue create'",
+    "rg 'gh issue create' docs/",
+))
+def test_review_keeps_commands_that_only_mention_the_retired_action(command):
+    adapter = ReviewStageAdapter(verdict_ready=lambda record, obs: True)
+    obs = ProviderObservation(events=(
+        {"type": "tool_use", "name": "Bash", "input": {"command": command}},
+    ))
+
+    assert adapter.verify(_record("review"), obs) is True
+
+
 def test_a_stage_that_classifies_no_recovery_keeps_continuing_within_budget():
     """A partial adapter — one that implements neither ``recover`` nor ``integration_collision`` —
     keeps the historical behavior instead of tripping over the missing hook."""
