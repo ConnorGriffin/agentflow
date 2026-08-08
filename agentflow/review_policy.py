@@ -130,16 +130,16 @@ class FollowUp:
     historic_url: str = ""
 
 
-def merge_follow_ups(*groups: tuple[FollowUp, ...]) -> tuple[FollowUp, ...]:
+def merge_follow_ups(prior: tuple[FollowUp, ...], current: tuple[FollowUp, ...]) -> tuple[FollowUp, ...]:
     """Keep durable historical references and the newest single live proposal.
 
     A successor review may carry older, already-filed references while replacing the one
     proposal that describes current follow-up work. Keeping the proposal separate from history
     prevents a normal continuation from becoming unpersistable.
     """
-    all_items = tuple(item for group in groups for item in group)
+    all_items = prior + current
     historic = tuple(dict.fromkeys(item for item in all_items if item.historic_url))
-    proposals = tuple(item for item in all_items if not item.historic_url)
+    proposals = tuple(item for item in current if not item.historic_url)
     return historic + proposals[-1:]
 
 

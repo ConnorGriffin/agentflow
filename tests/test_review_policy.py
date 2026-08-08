@@ -20,6 +20,7 @@ from agentflow.review_policy import (
     assign_depth,
     decode_findings,
     encode_findings,
+    merge_follow_ups,
     parse_review_result,
     proposed_depth,
     conflict_uncertainty_from_message,
@@ -126,6 +127,16 @@ def test_historical_follow_up_references_do_not_block_one_current_proposal():
          "url": "https://github.com/o/r/issues/9"},
         {"desired_outcome": "new outcome", "evidence": "new evidence"},
     ]
+
+
+def test_later_review_replaces_or_clears_the_current_follow_up_proposal():
+    historical = FollowUp("legacy evidence", "legacy outcome", "https://github.com/o/r/issues/9")
+    prior_proposal = FollowUp("prior evidence", "prior outcome")
+    replacement = FollowUp("new evidence", "new outcome")
+
+    assert merge_follow_ups((historical, prior_proposal), ()) == (historical,)
+    assert merge_follow_ups((historical, prior_proposal), (replacement,)) == (
+        historical, replacement)
 
 
 def test_decision_pass_must_choose_or_return_structured_uncertainty():

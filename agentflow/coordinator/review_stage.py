@@ -27,7 +27,7 @@ from agentflow.coordinator.recovery import contract_repair
 from agentflow.coordinator.stage_adapter import StageAdapter
 
 
-_ISSUE_CREATE = re.compile(r"(?:^|[;&|]\s*)gh\s+issue\s+create(?:\s|$)", re.IGNORECASE)
+_ISSUE_CREATE = re.compile(r"\bgh\s+issue\s+create\b", re.IGNORECASE)
 
 
 def _created_follow_up_issue(events) -> bool:
