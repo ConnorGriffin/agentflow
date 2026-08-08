@@ -19,13 +19,14 @@ import json
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 from agentflow.coordinator.quota import QuotaFact, build_fact, epoch_seconds
 from agentflow.coordinator.session import read_session
 from agentflow.coordinator.store import default_store_path
-from agentflow.coordinator.telemetry import AttemptUsage, claude_usage, codex_usage
+from agentflow.coordinator.telemetry import (
+    AttemptUsage, claude_usage, codex_usage, lead_codex_worker_usage)
 
 
 class ProviderCause(str, Enum):
@@ -594,11 +595,21 @@ class ClaudeProviderAdapter:
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
-        return classify_claude(
+        observation = classify_claude(
             session.events, exit_status=session.exit_status, signal=session.signal,
             timed_out=session.timed_out, partial_output=session.partial_output,
             family=record.family, process_alive=record.process_alive,
             has_end_fact=session.has_end_fact)
+        # The lead (Claude `fable`) shells out to `codex exec` workers whose spend lands
+        # nowhere unless it is merged in here, from the workers' own rollout files — never
+        # self-reported by the lead (frozen decision 2, issue #516). One telemetry entry still
+        # comes out of this observation; the worker totals just widen its usage.
+        worker_costs = lead_codex_worker_usage(record)
+        if worker_costs:
+            usage = observation.usage
+            observation = replace(observation, usage=replace(
+                usage, model_costs=usage.model_costs + worker_costs))
+        return observation
 
     def verify(self, record, obs) -> bool:
         return False

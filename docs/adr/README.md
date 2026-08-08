@@ -258,3 +258,9 @@ Issue-keyed records:
 - [ADR 540](adr-540-bounded-review-follow-up-proposals.md) — A review carries one bounded
   follow-up proposal instead of creating a GitHub issue; historical URLs remain references, and
   public parks use a 2,000-character operator envelope. Amends ADR 0047.
+- [ADR 516](adr-516-codex-spend-estimated-and-worker-capture.md) — Codex tokens are priced from the
+  routing table's rate card at report time and every non-provider-billed figure is flagged
+  estimated; a lead-run build/revise attempt whose Codex worker spend has not been captured is
+  marked *delegate spend not counted*; worker spend is observed from the workers' own usage records
+  and rolls into the one stage record that spawned them, never self-reported; stored telemetry is
+  read, never rewritten. Extends 0040; reads ADR 498's capability table.
