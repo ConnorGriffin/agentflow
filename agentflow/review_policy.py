@@ -125,10 +125,74 @@ def merge_findings(*groups: tuple[ReviewFinding, ...]) -> tuple[ReviewFinding, .
 
 @dataclass(frozen=True, slots=True)
 class FollowUp:
-    url: str
     evidence: str
     desired_outcome: str
-    duplicate_query: str
+    historic_url: str = ""
+
+
+def merge_follow_ups(prior: tuple[FollowUp, ...], current: tuple[FollowUp, ...]) -> tuple[FollowUp, ...]:
+    """Keep durable historical references and the newest single live proposal.
+
+    A successor review may carry older, already-filed references while replacing the one
+    proposal that describes current follow-up work. Keeping the proposal separate from history
+    prevents a normal continuation from becoming unpersistable.
+    """
+    all_items = prior + current
+    historic = tuple(dict.fromkeys(item for item in all_items if item.historic_url))
+    proposals = tuple(item for item in current if not item.historic_url)
+    return historic + proposals[-1:]
+
+
+def _park_field(value: str, limit: int) -> str:
+    """One deterministic public-envelope field; no later whole-body trimming is permitted."""
+    compact = " ".join(value.split())
+    return compact if len(compact) <= limit else compact[:limit - 1] + "…"
+
+
+def format_park_comment(context, verdict=None, *, proof_marker: str = "",
+                        park_mark: str = "> *agentflow: parked for human review.*") -> str:
+    """Render the fixed, operator-sized public review park envelope.
+
+    This is deliberately pure and applies every dynamic-field budget before interpolation. The
+    terminal cap is only a regression tripwire: it never chooses fields or silently removes text.
+    """
+    marker = f"\n<!-- {proof_marker} -->" if proof_marker else ""
+    heading = "Maintainer decision needed" if context.decision_needed else "Action needed"
+    options = tuple(context.options[:2])
+    option_line = " | ".join(_park_field(item, 120) for item in options) or "None."
+    locations = tuple(context.locations[:2])
+    location_line = " | ".join(_park_field(item, 80) for item in locations) or "None."
+    proposal = (() if verdict is None else tuple(
+        item for item in getattr(verdict, "follow_ups", ()) if not item.historic_url)[:1])
+    proposal_block = ""
+    if proposal:
+        proposal_block = (
+            "\nProposed follow-up: "
+            f"{_park_field(proposal[0].desired_outcome, 100)}; evidence: "
+            f"{_park_field(proposal[0].evidence, 100)}")
+    facts = ""
+    if verdict is not None:
+        depth = getattr(getattr(verdict, "depth", None), "value", "")
+        facts = f"\nReview: {str(depth).title() or 'Legacy'}"
+        if getattr(verdict, "reviewer_tool", ""):
+            facts += (" / cross-tool" if verdict.reviewer_tool != verdict.change_author_tool
+                      else " / same-tool; merge required")
+    body = (
+        f"{park_mark}{marker}\n## {heading}\n"
+        f"Affected behavior: {_park_field(context.behavior, 200)}\n"
+        f"Options: {option_line}\n"
+        f"Consequences: {_park_field(context.consequences, 160)}\n"
+        f"Recommendation: {_park_field(context.recommendation, 160)}\n"
+        "## Agent handoff\n"
+        f"Code locations: {location_line}\n"
+        f"Unresolved fact: {_park_field(context.conflicts, 180)}\n"
+        f"Completed check: {_park_field(context.checks[0] if context.checks else '', 100)}\n"
+        f"Retained work: {_park_field(context.retained_work, 80)}\n"
+        f"Exact next action: {_park_field(context.next_action, 160)}"
+        f"{proposal_block}{facts}")
+    if len(body) > 2_000:
+        raise ValueError("park formatter exceeded its 2,000-character budget")
+    return body
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +261,8 @@ class ReviewState:
 
     def record_fields(self) -> dict[str, Any]:
         """Encode this value into the existing flat Record/store schema."""
+        if sum(not item.historic_url for item in self.follow_ups) > 1:
+            raise ValueError("new review records allow at most one follow-up proposal")
         return {
             "review_depth": self.assignment.depth.value,
             "depth_reason": self.assignment.reason,
@@ -212,9 +278,8 @@ class ReviewState:
             "review_findings": encode_findings(self.findings),
             "review_fixes": json.dumps(list(self.fixes)),
             "review_follow_ups": json.dumps([
-                {"url": item.url, "evidence": item.evidence,
-                 "desired_outcome": item.desired_outcome,
-                 "duplicate_query": item.duplicate_query}
+                {"evidence": item.evidence, "desired_outcome": item.desired_outcome,
+                 **({"url": item.historic_url} if item.historic_url else {})}
                 for item in self.follow_ups
             ], sort_keys=True),
             "review_checks": json.dumps(list(self.checks)),
@@ -239,13 +304,14 @@ def _decode_follow_ups(payload: str) -> tuple[FollowUp, ...] | None:
         if not isinstance(values, list) or not all(isinstance(value, dict) for value in values):
             return None
         result = tuple(FollowUp(
-            value["url"], value["evidence"], value["desired_outcome"],
-            value["duplicate_query"]) for value in values)
+            value["evidence"], value["desired_outcome"], value.get("url", ""))
+            for value in values)
         if not all(
                 isinstance(part, str) and part.strip()
                 for item in result
-                for part in (item.url, item.evidence, item.desired_outcome,
-                             item.duplicate_query)):
+                for part in (item.evidence, item.desired_outcome)):
+            return None
+        if sum(not item.historic_url for item in result) > 1:
             return None
         return result
     except (KeyError, TypeError, json.JSONDecodeError):
@@ -387,56 +453,6 @@ def other_tool(tool: str) -> str | None:
     return {"claude": "codex", "codex": "claude"}.get(tool)
 
 
-_ORIGIN_LINE_RE = re.compile(
-    r"^discovered while reviewing (?:issue )?#(?P<issue>[1-9][0-9]*)"
-    r".*?(?:pull request|pr) #(?P<pr>[1-9][0-9]*)", re.IGNORECASE)
-
-# Markdown decoration a filer's editor may add around the mandated opening sentence without
-# changing what it says: bold/italic emphasis, a blockquote or heading marker, and stray
-# whitespace. Stripped before matching so a lightly-formatted honest origin line still validates.
-_LEADING_DECORATION_RE = re.compile(r"^[\s*_>#]+")
-
-
-def _first_line(body: str) -> str:
-    for line in body.lstrip("﻿").splitlines():
-        stripped = _LEADING_DECORATION_RE.sub("", line).strip()
-        if stripped:
-            return stripped
-    return ""
-
-
-def validate_follow_ups(repo: str, follow_ups: tuple[FollowUp, ...], *, issue_url, issue_body,
-                        reviewed_issue: int, reviewed_pr: int) -> bool:
-    """Prove each recorded follow-up exists here and was opened against this review.
-
-    ``issue_url`` answers one issue's canonical URL, ``None`` when it can't be read or the issue
-    doesn't exist. A live GitHub search of ``duplicate_query`` is not a gate: the search index
-    lags a freshly filed issue by minutes and a reasonable dedup query need not text-match the
-    issue it names, so that check only ever punished honest follow-ups. What is enforced instead
-    is provenance: ``issue_body`` must open with an origin line naming this reviewed issue and
-    pull request — the mandated opening sentence is "Discovered while reviewing #123 (pull
-    request #456)."; light markdown decoration (bold, a quote prefix, a heading marker, a BOM)
-    and the "issue #"/"PR #" phrasing variants are tolerated. A body agentflow could not read, or
-    one whose origin line is missing or names different numbers, is never accepted."""
-    pattern = re.compile(
-        rf"^https://github\.com/{re.escape(repo)}/issues/([1-9][0-9]*)/?$")
-    for follow_up in follow_ups:
-        match = pattern.match(follow_up.url)
-        if match is None:
-            return False
-        number = int(match.group(1))
-        if issue_url(number) != follow_up.url.rstrip("/"):
-            return False
-        body = issue_body(number)
-        if body is None:
-            return False
-        origin = _ORIGIN_LINE_RE.match(_first_line(body))
-        if (origin is None or int(origin.group("issue")) != reviewed_issue
-                or int(origin.group("pr")) != reviewed_pr):
-            return False
-    return True
-
-
 def _invalid(detail: str) -> ReviewResult:
     return ReviewResult(clean=False, parsed=False, detail=detail)
 
@@ -508,13 +524,16 @@ def parse_review_result(payload: str, *, expected_sha: str | None = None,
         if not isinstance(raw_follow_ups, list):
             return _invalid("follow_ups is not a list")
         follow_ups = []
+        if len(raw_follow_ups) > 1:
+            return _invalid("review has more than one follow-up proposal")
         for raw in raw_follow_ups:
             if not isinstance(raw, dict):
                 return _invalid("follow-up is not an object")
-            values = tuple(raw.get(key) for key in
-                           ("url", "evidence", "desired_outcome", "duplicate_query"))
+            if set(raw) != {"evidence", "desired_outcome"}:
+                return _invalid("follow-up proposal has unsupported fields")
+            values = tuple(raw.get(key) for key in ("evidence", "desired_outcome"))
             if not all(isinstance(value, str) and value.strip() for value in values):
-                return _invalid("follow-up lacks evidence, outcome, or duplicate-search proof")
+                return _invalid("follow-up proposal lacks evidence or desired outcome")
             follow_ups.append(FollowUp(*(value.strip() for value in values)))
 
         raw_findings = data.get("findings")
@@ -555,9 +574,9 @@ def parse_review_result(payload: str, *, expected_sha: str | None = None,
             return _invalid("decision is not a string")
         if axis is ReviewAxis.DECISION and not decision.strip() and uncertainty is None:
             return _invalid("decision pass returned neither a decision nor uncertainty")
-        if (any(item.action is ReviewAction.FOLLOW_UP for item in findings)
-                and not follow_ups):
-            return _invalid("necessary follow-up finding has no proved issue")
+        needs_follow_up = any(item.action is ReviewAction.FOLLOW_UP for item in findings)
+        if needs_follow_up != bool(follow_ups):
+            return _invalid("necessary follow-up finding and proposal must appear together")
 
         blocking = uncertainty is not None or any(
             finding.action in {ReviewAction.FIX, ReviewAction.ASK} for finding in findings)

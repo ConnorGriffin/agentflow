@@ -180,7 +180,7 @@ def review_successor_submission(review_record, verdict):
     """
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
-        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
+        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_follow_ups)
     from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
@@ -198,7 +198,7 @@ def review_successor_submission(review_record, verdict):
     prior = ReviewState.from_record(review_record)
     if prior is None:
         return None
-    follow_ups = prior.follow_ups + verdict.follow_ups
+    follow_ups = merge_follow_ups(prior.follow_ups, verdict.follow_ups)
     fixes = prior.fixes + verdict.fixes
     all_checks = tuple(dict.fromkeys(prior.checks + verdict.checks))
     checks = "; ".join(all_checks) or "No checks were recorded; verify independently."
@@ -250,7 +250,8 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     import json
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
-        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_findings, other_tool)
+        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_findings,
+        merge_follow_ups, other_tool)
     from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
@@ -270,7 +271,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     prior = ReviewState.from_record(review_record)
     if prior is None:
         return None
-    follow_ups = prior.follow_ups + verdict.follow_ups
+    follow_ups = merge_follow_ups(prior.follow_ups, verdict.follow_ups)
     checks = tuple(dict.fromkeys(prior.checks + verdict.checks))
     combined_actions = merge_findings(prior.findings, verdict.actions)
     actions = [
@@ -526,9 +527,6 @@ def _verdict_ready(record, obs):
                 "the fix-axis review recorded FIX findings but its verdict names no pushed fix, "
                 "and the retained checkout does not own a moved head (final_sha "
                 f"{(verdict.final_sha or 'unstated')[:12]}, target {record.target[:12]})")
-    if not _review_follow_ups_valid(record, verdict):
-        return unverified("follow-up-evidence", "a structured follow-up in the verdict could not "
-                          "be validated against the repository's live issue tracker")
     if (record.review_tainted and not record.review_taint_cleared
             and record.cross_tool_covered and not verdict.pushed_sha
             and record.review_axis in {"combined", "standards"}):
@@ -545,23 +543,6 @@ def _verdict_ready(record, obs):
             record.review_taint_cleared = True
     return VERIFIED
 
-
-def _review_follow_ups_valid(record, verdict) -> bool:
-    """Validate structured follow-up evidence against this repository's live issue tracker."""
-    from agentflow.review_policy import validate_follow_ups
-
-    if not verdict.follow_ups:
-        return True
-
-    facts = review_source_facts(record)
-    if facts is None:
-        return False
-    _workdir, pr = facts
-    return validate_follow_ups(
-        record.repo, verdict.follow_ups,
-        issue_url=lambda number: github.issue_url(record.repo, number),
-        issue_body=lambda number: github.issue_body(record.repo, number),
-        reviewed_issue=int(record.subject), reviewed_pr=int(pr))
 
 def _commit_is_gone(workdir: str, sha: str) -> bool:
     """Whether ``sha`` is absent from the repository — the branch was rebased or amended past it
@@ -1102,7 +1083,7 @@ def _review_verdict(review):
     older records without making a mutable session the source of truth for newly completed work.
     """
     from agentflow.coordinator.providers import ProviderObserver
-    from agentflow.review_policy import ReviewState, merge_findings
+    from agentflow.review_policy import ReviewState, merge_findings, merge_follow_ups
     from agentflow.reviewer import Finding, parse_verdict
     payload = review.outcome
     if not payload:
@@ -1120,7 +1101,7 @@ def _review_verdict(review):
         return replace(verdict, clean=False, parsed=False,
                        detail="durable review ledger is unreadable", reviewer_tool=review.pool)
     fixes = tuple(dict.fromkeys(prior.fixes + verdict.fixes))
-    follow_ups = tuple(dict.fromkeys(prior.follow_ups + verdict.follow_ups))
+    follow_ups = merge_follow_ups(prior.follow_ups, verdict.follow_ups)
     checks = tuple(dict.fromkeys(prior.checks + verdict.checks))
     actions = (verdict.actions if review.review_axis == "fix"
                else merge_findings(prior.findings, verdict.actions))
@@ -1133,7 +1114,7 @@ def _review_verdict(review):
         actions=actions, findings=compatibility_findings,
         clean=verdict.clean and not any(
             item.action.value in {"fix_before_completion", "ask_maintainer"} for item in actions),
-        follow_up_issues=tuple(item.url for item in follow_ups))
+        follow_up_issues=tuple(item.historic_url for item in follow_ups if item.historic_url))
 
 
 def _moved_head_review_submission(record, head_sha: str):

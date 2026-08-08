@@ -37,15 +37,11 @@ def test_reviewer_prompt_calibrates_against_speculative_hardening():
     assert "name in the finding the enforced invariant" in prompt
 
 
-def test_reviewer_prompt_files_follow_ups_bare_of_pipeline_labels():
-    # A follow-up born `ready-for-agent` with no dials sits in the permanent gap between
-    # "looks triaged" and "can never build" (#433) — the prompt orders it filed label-free so
-    # intake triages it and stamps its dials like any other new issue.
+def test_reviewer_prompt_records_follow_up_proposals_without_creating_issues():
     prompt = " ".join(REVIEW_PROMPT.split())
 
-    assert "File it with NO labels" in prompt
-    assert "never `ready-for-agent` and never any `agentflow:*` label" in prompt
-    assert "earns its dials there" in prompt
+    assert "at most one concise follow-up proposal" in prompt
+    assert "do not create or file a GitHub issue" in prompt
 
 
 def test_pass_with_no_findings_is_clean():
@@ -156,18 +152,26 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
     assert "framed for the human" in body.lower()      # plain-language / no-jargon gate
     assert "agentflow/static/" in body                 # the repo's declared surfaces, not a hardcoded example
     assert "ship any clear fixes" in body.lower()      # Review owns safe fixes, not report-only nits
-    assert "follow-up issue" in body.lower()           # necessary out-of-scope work is not lost
+    assert "follow-up proposal" in body.lower()        # necessary out-of-scope work is not lost
 
 
-def test_review_prompt_carries_the_originating_issue_and_requires_provenance():
-    # #409: the reviewer must know which issue it's reviewing, and any follow-up issue it
-    # files must open its description with an origin line naming both, written at creation.
+def test_review_prompt_forbids_issue_creation_but_retains_all_four_actions():
+    body = REVIEW_PROMPT.format(
+        pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
+        surfaces="`agentflow/static/`")
+
+    assert "do not create or file a github issue" in body.lower()
+    for action in (
+            "fix_before_completion", "necessary_follow_up", "ask_maintainer",
+            "discard_preference"):
+        assert action in body
+
+
+def test_review_prompt_carries_the_originating_issue_without_issue_provenance_workflow():
     body = REVIEW_PROMPT.format(
         pr=398, issue=391, starting_sha="abc", acceptance="a", surfaces="none")
     assert "#391" in body
-    assert "origin line" in body.lower()
-    assert "at creation" in body.lower()
-    assert "groomed" in body.lower()  # states why: a later edit is overwritten by grooming
+    assert "do not create or file a github issue" in body.lower()
 
 
 def test_review_prompt_judges_screenshots_against_the_locked_contract():

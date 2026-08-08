@@ -20,7 +20,7 @@ from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                             touches_ui_surface, ui_evidence_gap)
 from agentflow.coordinator.record import Record
 from agentflow.reviewer import Finding, Verdict
-from agentflow.review_policy import ReviewAction, ReviewFinding
+from agentflow.review_policy import FollowUp, ReviewAction, ReviewFinding
 
 CLEAN = Verdict(clean=True)
 DIRTY = Verdict(clean=False, findings=(Finding("blocking", "bug"),))
@@ -456,6 +456,36 @@ def _park_body(monkeypatch, verdict):
     return captured[0]
 
 
+def test_park_comment_has_a_bounded_two_section_envelope_and_updates_in_place(monkeypatch):
+    long = "unbounded-test-log-" * 200
+    comments = []
+    context = gate.ParkContext(
+        behavior=long, options=(long, long, "excess option"), consequences=long,
+        recommendation=long, locations=(long, long, "excess location"), conflicts=long,
+        checks=(long, "excess check"), retained_work=long, next_action=long)
+    verdict = Verdict(
+        clean=False, actions=(ReviewFinding(ReviewAction.FIX, long, long, long, 1),),
+        fixes=(long,), follow_ups=(FollowUp(evidence=long, desired_outcome=long),))
+    marker = "agentflow-park:" + "a" * 20
+
+    monkeypatch.setattr(gate.github, "pr_comments", lambda *_args: list(comments))
+    monkeypatch.setattr(gate.github, "pr_comment", lambda _repo, _pr, body:
+                        comments.append(github.Comment(body=body, created_at="", id="park")) or True)
+    monkeypatch.setattr(gate.github, "edit_comment", lambda _id, body:
+                        comments.__setitem__(0, github.Comment(body=body, created_at="", id="park")) or True)
+
+    gate.park("o/r", 99, verdict, context=context, proof_marker=marker)
+    gate.park("o/r", 99, verdict, context=context, proof_marker=marker)
+
+    assert len(comments) == 1
+    body = comments[0].body
+    assert len(body) <= 2_000
+    assert marker in body
+    assert "## Action needed" in body and "## Agent handoff" in body
+    assert "Exact next action:" in body
+    assert long not in body and "excess option" not in body and "excess location" not in body
+
+
 def test_no_verdict_park_says_no_review_was_completed(monkeypatch):
     # Fails before the fix: exhaustion park posted '(no blocking findings)' instead.
     body = _park_body(monkeypatch, None)
@@ -481,12 +511,11 @@ def test_clean_verdict_park_uses_domain_sections_not_legacy_severity(monkeypatch
     assert "blocking findings" not in body
 
 
-def test_findings_verdict_park_renders_findings(monkeypatch):
+def test_findings_verdict_park_omits_unbounded_finding_lists(monkeypatch):
     verdict = Verdict(clean=False, findings=(Finding("blocking", "something bad", "f.py", 10),))
     body = _park_body(monkeypatch, verdict)
-    assert "something bad" in body
-    assert "**fix_before_completion**" in body
-    assert "**blocking**" not in body
+    assert "something bad" not in body
+    assert "fix_before_completion" not in body
     assert "No review was completed" not in body
 
 
@@ -502,13 +531,14 @@ def test_real_product_uncertainty_keeps_the_maintainer_decision_heading(monkeypa
     assert "## Maintainer decision needed" in body
 
 
-def test_reviewed_park_reports_fixes_shipped_and_follow_ups_filed(monkeypatch):
+def test_reviewed_park_shows_one_proposal_not_fixes_or_filed_issue_urls(monkeypatch):
     verdict = Verdict(
         clean=True, fixes=("Removed the stale helper",),
+        follow_ups=(FollowUp("browser proof is absent", "add browser proof"),),
         follow_up_issues=("https://github.com/o/r/issues/12",))
     body = _park_body(monkeypatch, verdict)
-    assert "Review fixes shipped:" in body and "Removed the stale helper" in body
-    assert "Follow-up issues filed:" in body and "issues/12" in body
+    assert "Proposed follow-up:" in body and "add browser proof" in body
+    assert "Removed the stale helper" not in body and "issues/12" not in body
 
 
 def test_agentflow_skill_reads_the_current_four_action_park_contract(monkeypatch):
@@ -519,8 +549,8 @@ def test_agentflow_skill_reads_the_current_four_action_park_contract(monkeypatch
     skill = Path("skills/agentflow/SKILL.md").read_text()
 
     for action in ReviewAction:
-        assert f"**{action.value}**" in body
         assert f"`{action.value}`" in skill
+        assert action.value not in body
     revise_section = skill.split("### `revise <PR>`", 1)[1].split("## Land it as ready", 1)[0]
     assert "severity" not in revise_section.lower()
     assert "blocking" not in revise_section.lower()
@@ -585,6 +615,26 @@ def test_clean_summary_posts_once_with_depth_proof_and_cross_tool_status(monkeyp
     assert len(comments) == 1
     assert "Targeted" in comments[0].body and "affected tests passed" in comments[0].body
     assert "cross-tool review" in comments[0].body
+
+
+def test_clean_summary_labels_one_proposal_and_only_labels_legacy_urls_as_historical(monkeypatch):
+    comments = []
+    monkeypatch.setattr(gate.github, "pr_comments", lambda _repo, _pr: list(comments))
+    monkeypatch.setattr(
+        gate.github, "pr_comment",
+        lambda _repo, _pr, body: comments.append(github.Comment(body=body, created_at="")) or True)
+    verdict = Verdict(
+        clean=True, reviewer_tool="codex", change_author_tool="claude",
+        follow_ups=(FollowUp("the browser proof is absent", "add browser proof"),),
+        follow_up_issues=("https://github.com/o/r/issues/12",))
+
+    assert gate.post_clean_review_summary("o/r", 9, verdict, "sha-a") is True
+    body = comments[0].body
+    assert "Proposed follow-up:" in body
+    assert "Desired outcome: add browser proof" in body
+    assert "Evidence: the browser proof is absent" in body
+    assert "Historical follow-up reference:" in body and "issues/12" in body
+    assert "filed" not in body.lower()
 
 
 def test_clean_summary_states_exact_same_tool_human_merge_status(monkeypatch):

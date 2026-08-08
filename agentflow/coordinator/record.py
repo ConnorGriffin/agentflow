@@ -160,7 +160,7 @@ class Record:
     review_handoff: str | None = None     # private bounded next-agent context
     review_findings: str = "[]"           # JSON action ledger across Full read-only axes
     review_fixes: str = "[]"              # JSON ledger; kept opaque by the coordinator
-    review_follow_ups: str = "[]"         # validated follow-up evidence ledger
+    review_follow_ups: str = "[]"         # historical references plus one current proposal
     review_checks: str = "[]"              # JSON proof ledger across serialized passes
     review_uncertainty: str | None = None # private options/guidance/recommendation JSON
     uncertainty_handoffs: int = 0         # at most one narrow cross-tool decision handoff

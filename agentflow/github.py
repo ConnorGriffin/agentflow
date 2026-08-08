@@ -31,12 +31,45 @@ names. Both halves of that seam are enforced by architectural tests in ``tests/t
 from __future__ import annotations
 
 import json
+import shlex
 import subprocess
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
 from agentflow.runner import _run
+
+
+def command_creates_issue(command: str) -> bool:
+    """Whether a captured shell command invokes GitHub's issue-creation verb."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    segment: list[str] = []
+    for token in (*tokens, ";"):
+        if token not in {";", "&&", "||", "|"}:
+            segment.append(token)
+            continue
+        while segment and "=" in segment[0] and not segment[0].startswith("="):
+            segment.pop(0)
+        if segment[:1] == ["env"]:
+            segment.pop(0)
+            while segment and (segment[0].startswith("-") or "=" in segment[0]):
+                segment.pop(0)
+        if segment[:1] == ["command"]:
+            segment.pop(0)
+        if segment[:1] in (["sh"], ["bash"], ["zsh"]) and "-c" in segment:
+            script = segment[segment.index("-c") + 1:]
+            if script and command_creates_issue(script[0]):
+                return True
+        if len(segment) >= 3 and segment[:3] == ["gh", "issue", "create"]:
+            return True
+        segment = []
+    return False
 
 
 # --- typed rows ----------------------------------------------------------------
