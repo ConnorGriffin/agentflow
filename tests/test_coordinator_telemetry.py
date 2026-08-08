@@ -20,8 +20,8 @@ from conftest import FakeSession
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import ProviderCause, classify_claude, classify_codex
 from agentflow.coordinator.telemetry import (
-    AttemptTelemetry, AttemptUsage, ModelCost, claude_usage, codex_usage, project,
-    read_attempts, record_attempt, spend_report, telemetry_dir)
+    AttemptTelemetry, AttemptUsage, ModelCost, claude_usage, codex_usage, format_spend_report,
+    project, read_attempts, record_attempt, spend_report, telemetry_dir)
 
 # --- representative provider usage streams -------------------------------------------------
 
@@ -282,9 +282,99 @@ def test_spend_report_uses_delegate_models_and_keeps_token_only_codex_rows(tmp_p
     assert rows[("build", "fable")].tokens == 120
     assert rows[("build", "sonnet")].cost_usd == pytest.approx(0.12)
     assert rows[("build", "gpt-5.6-terra")].tokens == 360
-    assert rows[("build", "gpt-5.6-terra")].cost_usd is None
+    # Terra ($2.50/$15 per million in/out) prices from the rate card since it is not billed.
+    assert rows[("build", "gpt-5.6-terra")].cost_usd == pytest.approx(
+        300 * 2.5 / 1_000_000 + 60 * 15 / 1_000_000)
+    assert rows[("build", "gpt-5.6-terra")].estimated is True
     assert rows[("review", "luna")].tokens == 240
-    assert rows[("review", "luna")].cost_usd is None
+    # Luna prices from the card too (input/output tokens only, from the fallback usage row).
+    assert rows[("review", "luna")].cost_usd == pytest.approx(
+        200 * 1 / 1_000_000 + 40 * 6 / 1_000_000)
+    assert rows[("review", "luna")].estimated is True
+
+
+def test_format_spend_report_flags_every_estimated_row_and_a_total_would_mix_estimates(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="codex", stage="review", model="luna",
+        usage=AttemptUsage(input_tokens=200, output_tokens=40)))
+    record_attempt(store, _entry(
+        token="billed", stage="review", model="sonnet",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("sonnet", 0.05, input_tokens=10, output_tokens=5),))))
+
+    report = spend_report(store, start=50, end=150)
+    rendered = format_spend_report(report)
+    rows_by_key = {(r.stage, r.model): r for r in report.rows}
+
+    # The estimated Codex row must render with the "est" flag — a test that fails if an
+    # estimated dollar figure ever renders unflagged (indistinguishable from a billed one).
+    assert rows_by_key[("review", "luna")].estimated is True
+    for line in rendered.splitlines():
+        if line.startswith("review\tluna\t"):
+            assert "est" in line
+            assert "~" in line
+        if line.startswith("review\tsonnet\t"):
+            assert "est" not in line   # provider-billed, never flagged
+
+
+def test_unknown_dollar_figure_is_never_rendered_as_zero(tmp_path):
+    store = tmp_path / "records.db"
+    # A model this routing table has never heard of: no rate card entry, no billed cost.
+    record_attempt(store, _entry(
+        token="unpriced", stage="review", model="mystery-model",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("mystery-model", None, input_tokens=10, output_tokens=5),))))
+
+    report = spend_report(store, start=50, end=150)
+    (row,) = report.rows
+    assert row.cost_usd is None
+    assert "—" in format_spend_report(report)
+    assert "0.000000" not in format_spend_report(report)
+
+
+def test_lead_run_attempt_without_worker_capture_shows_the_not_counted_mark(tmp_path):
+    store = tmp_path / "records.db"
+    # A build attempt run by fable whose usage carries only Claude-side model costs — no
+    # Codex worker spend has been merged in yet.
+    record_attempt(store, _entry(
+        token="uncaptured", stage="build", model="fable",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("fable", 0.03, input_tokens=100, output_tokens=20),))))
+
+    report = spend_report(store, start=50, end=150)
+    (row,) = report.rows
+    assert row.delegate_uncaptured_attempts == 1
+    assert "delegate spend not counted" in format_spend_report(report)
+
+
+def test_lead_run_attempt_with_merged_worker_capture_has_no_not_counted_mark(tmp_path):
+    store = tmp_path / "records.db"
+    # Same shape, but a Codex worker entry (slice 2's merge) is now present.
+    record_attempt(store, _entry(
+        token="captured", stage="build", model="fable",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("fable", 0.03, input_tokens=100, output_tokens=20),
+            ModelCost("codex", None, input_tokens=50, output_tokens=10),))))
+
+    report = spend_report(store, start=50, end=150)
+    for row in report.rows:
+        assert row.delegate_uncaptured_attempts == 0
+    assert "delegate spend not counted" not in format_spend_report(report)
+
+
+def test_spend_report_does_not_rewrite_historical_entry_files(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="historical", stage="build", model="opus",
+        usage=AttemptUsage(model_costs=(ModelCost("gpt-5.6-terra", None, input_tokens=100,
+                                                   output_tokens=20),))))
+    path = telemetry_dir(store) / "historical.json"
+    before = path.read_bytes()
+
+    spend_report(store, start=50, end=150)
+
+    assert path.read_bytes() == before
 
 
 # --- through the coordinator's public seam -------------------------------------------------

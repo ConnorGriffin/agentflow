@@ -9,12 +9,15 @@ prose is never a diagnosis.
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
 from agentflow.coordinator.providers import (
     PROVIDER_INPUT_V1, ClaudeProviderAdapter, EndingReason, ProviderCause, classify_claude,
     classify_codex)
+from agentflow.coordinator.record import Record
+from agentflow.coordinator.telemetry import AttemptTelemetry, ModelCost, record_attempt, telemetry_dir
 from agentflow.intake import parse_intake
 from agentflow.reviewer import parse_verdict
 
@@ -394,3 +397,139 @@ def test_default_codex_adapter_queries_the_typed_limit_companion(tmp_path, monke
         Record("codex", "review", "codex", 2, launch_token="tok"))
     assert observation.cause is ProviderCause.CAPACITY
     assert observation.reset_at == 77
+
+
+# --- lead-run Codex worker capture (issue #516 slice 2) -------------------------------------
+
+def _write_rollout(path, cwd, model="gpt-5.6-terra", input_tokens=1000, cached=100,
+                   output_tokens=200, reasoning=50):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}),
+        json.dumps({"type": "turn_context", "payload": {"model": model}}),
+        json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {
+                "input_tokens": input_tokens, "cached_input_tokens": cached,
+                "output_tokens": output_tokens, "reasoning_output_tokens": reasoning}}}}),
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _lead_session_artifacts(tmp_path, token):
+    from agentflow.coordinator.session import events_path, exit_path
+    from agentflow.coordinator.store import default_store_path
+
+    ev = events_path(default_store_path(), token)
+    ev.parent.mkdir(parents=True, exist_ok=True)
+    ev.write_text('{"type":"result","subtype":"success","result":"done",'
+                 '"usage":{"input_tokens":10,"output_tokens":5},'
+                 '"modelUsage":{"fable":{"costUSD":0.01}}}\n')
+    exit_path(default_store_path(), token).write_text("0\n")
+
+
+def test_lead_run_claude_observation_merges_codex_worker_usage_from_matching_rollouts(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    sessions_root = tmp_path / ".codex" / "sessions"
+
+    _write_rollout(sessions_root / "matching.jsonl", str(workspace))
+    _write_rollout(sessions_root / "other.jsonl", str(tmp_path / "elsewhere"))
+    _lead_session_artifacts(tmp_path, "lead-tok")
+
+    record = Record("i", "build", "claude", 1, launch_token="lead-tok",
+                    model="fable", source=str(workspace), started_at=0)
+
+    observation = ClaudeProviderAdapter().observe(record)
+
+    costs = {cost.model: cost for cost in observation.usage.model_costs}
+    assert "fable" in costs                       # the lead's own Claude usage is kept
+    assert "gpt-5.6-terra" in costs                # the matched worker's usage is merged in
+    worker = costs["gpt-5.6-terra"]
+    assert worker.input_tokens == 900              # 1000 gross - 100 cached, netted like codex_usage
+    assert worker.cached_input_tokens == 100
+    assert worker.output_tokens == 200
+    assert worker.reasoning_output_tokens == 50
+    assert worker.cost_usd is None                 # priced at report time, not here
+
+    # No second telemetry record is produced for the worker — it rides the one attempt.
+    entry = AttemptTelemetry(
+        token="lead-tok", identity="o/r|5|build|", repo="o/r", subject="5", stage="build",
+        pool="claude", model="fable", complexity="deep", effort="high", reasoning_effort=None,
+        attempt=1, continuation=False, restart_resumes=0, round=0, conflict_round=0,
+        verified=True, outcome="pr opened", cause="none", classification="incomplete",
+        started_at=0, finalized_at=1, usage=observation.usage)
+    store = tmp_path / "records.db"
+    record_attempt(store, entry)
+    record_attempt(store, entry)   # a restart re-observing the same ended family
+    assert len(list(telemetry_dir(store).iterdir())) == 1
+
+
+def test_a_rollout_with_a_different_cwd_is_not_merged(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    sessions_root = tmp_path / ".codex" / "sessions"
+    _write_rollout(sessions_root / "other.jsonl", str(tmp_path / "elsewhere"))
+    _lead_session_artifacts(tmp_path, "lead-tok-2")
+
+    record = Record("i", "build", "claude", 1, launch_token="lead-tok-2",
+                    model="fable", source=str(workspace), started_at=0)
+    observation = ClaudeProviderAdapter().observe(record)
+
+    assert observation.usage.model_costs == (ModelCost("fable", 0.01),)
+
+
+def test_worker_capture_is_skipped_for_non_lead_run_attempts(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    sessions_root = tmp_path / ".codex" / "sessions"
+    _write_rollout(sessions_root / "matching.jsonl", str(workspace))
+    _lead_session_artifacts(tmp_path, "lead-tok-3")
+
+    # Same workspace, but not a lead (fable) build/revise attempt — no merge should happen.
+    record = Record("i", "review", "claude", 1, launch_token="lead-tok-3",
+                    model="sonnet", source=str(workspace), started_at=0)
+    observation = ClaudeProviderAdapter().observe(record)
+
+    assert observation.usage.model_costs == (ModelCost("fable", 0.01),)
+
+
+def test_a_rollout_from_an_earlier_attempt_is_not_absorbed_by_a_later_attempt_reusing_the_workspace(
+        tmp_path, monkeypatch):
+    """A worktree is reused across build -> revise, and each admission resets `started_at`. A
+    worker rollout the build attempt spawned must stay the build's, never re-absorbed by a
+    later revise attempt that reuses the same workspace, even though the rollout's mtime falls
+    inside the revise's old backward-looking slack window (issue #516 slice 2 regression)."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    sessions_root = tmp_path / ".codex" / "sessions"
+
+    build_started = 1_000_000
+    revise_started = build_started + 120       # revise admitted after the build's worker ran
+    rollout = sessions_root / "worker.jsonl"
+    _write_rollout(rollout, str(workspace))
+    os.utime(rollout, (build_started + 60, build_started + 60))   # written during the build
+
+    _lead_session_artifacts(tmp_path, "build-tok")
+    _lead_session_artifacts(tmp_path, "revise-tok")
+
+    build_record = Record("i", "build", "claude", 1, launch_token="build-tok",
+                          model="fable", source=str(workspace), started_at=build_started)
+    revise_record = Record("i", "revise", "claude", 1, launch_token="revise-tok",
+                           model="fable", source=str(workspace), started_at=revise_started)
+
+    build_costs = {c.model: c for c in
+                   ClaudeProviderAdapter().observe(build_record).usage.model_costs}
+    revise_costs = {c.model: c for c in
+                    ClaudeProviderAdapter().observe(revise_record).usage.model_costs}
+
+    assert "gpt-5.6-terra" in build_costs        # the build attempt still absorbs its own worker
+    assert "gpt-5.6-terra" not in revise_costs   # the revise attempt does not re-absorb it
