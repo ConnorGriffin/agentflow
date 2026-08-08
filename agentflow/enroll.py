@@ -970,60 +970,96 @@ def _converge_paths(root: Path) -> list[Path]:
     ]
 
 
+def _current_ref(root: Path) -> str | None:
+    """The branch name to restore to afterwards, or the commit sha if detached. None if
+    even that can't be determined."""
+    branch = _run_command(
+        ["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"], timeout=30
+    )
+    if not branch.returncode:
+        return (branch.stdout or "").strip() or None
+    sha = _run_command(["git", "-C", str(root), "rev-parse", "HEAD"], timeout=30)
+    if not sha.returncode:
+        return (sha.stdout or "").strip() or None
+    return None
+
+
 def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
     """Converge one repo and open its PR. Any step failing — the converge apply itself,
-    the commit, the push, or `gh pr create` — is a convergence failure."""
-    branch = _run_command(
-        ["git", "-C", str(root), "checkout", "-B", _SYNC_BRANCH], timeout=30
-    )
-    if branch.returncode:
-        return False, f"could not create branch {_SYNC_BRANCH}"
-    report = enroll_repository(str(root), apply=True, converge=True)
-    if not report.ready:
-        return False, "enrollment did not converge cleanly"
-    paths = _converge_paths(root)
-    if not paths:
-        return True, "nothing to commit"
-    add = _run_command(
-        ["git", "-C", str(root), "add", *[str(p) for p in paths]], timeout=30
-    )
-    if add.returncode:
-        return False, "git add failed"
-    status = _run_command(["git", "-C", str(root), "status", "--porcelain"], timeout=30)
-    if not (status.stdout or "").strip():
-        return True, "already current after converge"
-    commit = _run_command(
-        [
-            "git", "-C", str(root), "commit", "-s", "-m",
-            "agentflow: converge bundled skill assets to the pinned content",
-        ],
-        timeout=30,
-    )
-    if commit.returncode:
-        reason = (commit.stderr or commit.stdout or "").strip()
-        return False, f"git commit failed — {reason}"
-    push = _run_command(
-        ["git", "-C", str(root), "push", "-u", "origin", _SYNC_BRANCH], timeout=60
-    )
-    if push.returncode:
-        reason = (push.stderr or push.stdout or "").strip()
-        return False, f"git push failed — {reason}"
-    from agentflow import github
+    the commit, the push, or `gh pr create` — is a convergence failure. Whatever branch
+    (or detached commit) the checkout was on before is restored afterwards, on every exit
+    path including exceptions from `enroll_repository`."""
+    original = _current_ref(root)
 
-    pr = github.create_pr(
-        repo,
-        head=_SYNC_BRANCH,
-        title="agentflow: converge enrollment to pinned bundled assets",
-        body=(
-            "Automated by `agentflow enroll --sync --apply`: rewrites this repo's bundled "
-            "AgentFlow skill and/or screenshot harness to match the pinned content recorded "
-            "in capabilities.toml. A drifted vendored skill pack (ui-craft, drive-local-webapp) "
-            "is reported by `agentflow doctor`, not rewritten here."
-        ),
-    )
-    if pr.url is None:
-        return False, f"gh pr create failed — {pr.error}"
-    return True, pr.url
+    def _do_converge() -> tuple[bool, str]:
+        branch = _run_command(
+            ["git", "-C", str(root), "checkout", "-B", _SYNC_BRANCH], timeout=30
+        )
+        if branch.returncode:
+            return False, f"could not create branch {_SYNC_BRANCH}"
+        report = enroll_repository(str(root), apply=True, converge=True)
+        if not report.ready:
+            return False, "enrollment did not converge cleanly"
+        paths = _converge_paths(root)
+        if not paths:
+            return True, "nothing to commit"
+        add = _run_command(
+            ["git", "-C", str(root), "add", *[str(p) for p in paths]], timeout=30
+        )
+        if add.returncode:
+            return False, "git add failed"
+        status = _run_command(["git", "-C", str(root), "status", "--porcelain"], timeout=30)
+        if not (status.stdout or "").strip():
+            return True, "already current after converge"
+        commit = _run_command(
+            [
+                "git", "-C", str(root), "commit", "-s", "-m",
+                "agentflow: converge bundled skill assets to the pinned content",
+            ],
+            timeout=30,
+        )
+        if commit.returncode:
+            reason = (commit.stderr or commit.stdout or "").strip()
+            return False, f"git commit failed — {reason}"
+        push = _run_command(
+            ["git", "-C", str(root), "push", "-u", "origin", _SYNC_BRANCH], timeout=60
+        )
+        if push.returncode:
+            reason = (push.stderr or push.stdout or "").strip()
+            return False, f"git push failed — {reason}"
+        from agentflow import github
+
+        pr = github.create_pr(
+            repo,
+            head=_SYNC_BRANCH,
+            title="agentflow: converge enrollment to pinned bundled assets",
+            body=(
+                "Automated by `agentflow enroll --sync --apply`: rewrites this repo's bundled "
+                "AgentFlow skill and/or screenshot harness to match the pinned content recorded "
+                "in capabilities.toml. A drifted vendored skill pack (ui-craft, drive-local-webapp) "
+                "is reported by `agentflow doctor`, not rewritten here."
+            ),
+        )
+        if pr.url is None:
+            return False, f"gh pr create failed — {pr.error}"
+        return True, pr.url
+
+    restore_failure: str | None = None
+    try:
+        ok, detail = _do_converge()
+    finally:
+        # Non-destructive: a plain checkout back to wherever we started, never forced.
+        if original is None:
+            restore_failure = "could not determine original ref"
+        else:
+            restore = _run_command(["git", "-C", str(root), "checkout", original], timeout=30)
+            if restore.returncode:
+                restore_failure = (restore.stderr or restore.stdout or "").strip()
+
+    if restore_failure is not None:
+        detail = f"{detail}; checkout left on {_SYNC_BRANCH} — restore failed: {restore_failure}"
+        ok = False
+    return ok, detail
 
 
 def sync_fleet(repos, *, apply: bool) -> int:

@@ -9,7 +9,7 @@ import pytest
 
 from agentflow import github
 from agentflow.enroll import (_audit_command, _converge_and_ship, _install_file,
-                              _skills_problem, audit_lines, checkout_repo,
+                              _skills_problem, _SYNC_BRANCH, audit_lines, checkout_repo,
                               configured_repositories, declaration_line, enroll_repository,
                               main, newly_gated_prs, propose_surfaces, sync_fleet,
                               write_declaration)
@@ -651,8 +651,11 @@ class TestConvergeAndShip:
 
         assert ok is False
         assert "git push failed" in detail
-        log = subprocess.run(["git", "-C", str(repo), "log", "-1", "--format=%B"],
-                              check=True, capture_output=True, text=True).stdout
+        # The checkout is restored to its original branch afterwards, so read the sweep
+        # commit off the sync branch rather than off HEAD.
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "-1", "--format=%B", _SYNC_BRANCH],
+            check=True, capture_output=True, text=True).stdout
         assert "Signed-off-by: Tester <tester@example.com>" in log
 
     def test_a_failing_gh_pr_create_is_reported_as_a_failure(self, tmp_path, monkeypatch):
@@ -680,6 +683,165 @@ class TestConvergeAndShip:
         assert ok is False
         assert "gh pr create failed" in detail
         assert "authentication required" in detail
+
+    def test_a_successful_run_restores_the_original_branch(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill_dir = repo / ".agents" / "skills" / "agentflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("content")
+        monkeypatch.setattr("agentflow.enroll.enroll_repository",
+                            lambda *a, **k: SimpleNamespace(ready=True))
+
+        def fake_run(command, **kw):
+            if "push" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda repo, **kw: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is True
+        assert "checkout left on" not in detail
+        branch = subprocess.run(["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short",
+                                  "HEAD"], capture_output=True, text=True).stdout.strip()
+        assert branch == "main" or branch == "master"
+        local_branches = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--list", _SYNC_BRANCH],
+            capture_output=True, text=True,
+        ).stdout
+        assert _SYNC_BRANCH in local_branches
+
+    def test_a_successful_run_with_a_failed_restore_is_reported_as_a_failure(
+            self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill_dir = repo / ".agents" / "skills" / "agentflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("content")
+        monkeypatch.setattr("agentflow.enroll.enroll_repository",
+                            lambda *a, **k: SimpleNamespace(ready=True))
+
+        def fake_run(command, **kw):
+            if "push" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            if "checkout" in command and _SYNC_BRANCH not in command:
+                # The restore checkout back to the original branch, not the sync branch's
+                # own creation — force it to fail as if something perturbed the checkout.
+                return subprocess.CompletedProcess(command, 1, "", "error: cannot restore")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda repo, **kw: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        # The underlying converge/commit/push/PR sequence succeeded, but the restore
+        # didn't — the operator must see this under sync_fleet's WARN: line, not DO:.
+        assert ok is False
+        assert "checkout left on" in detail
+        assert "cannot restore" in detail
+
+    def test_a_push_failure_still_restores_the_original_branch(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill_dir = repo / ".agents" / "skills" / "agentflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("content")
+        original_branch = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        monkeypatch.setattr("agentflow.enroll.enroll_repository",
+                            lambda *a, **k: SimpleNamespace(ready=True))
+        monkeypatch.setattr(
+            "agentflow.enroll._run_command",
+            lambda command, **kw: subprocess.run(command, capture_output=True, text=True),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is False
+        assert "git push failed" in detail
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert branch == original_branch
+
+    def test_a_detached_head_is_restored_to_the_same_commit_not_a_branch_named_head(
+            self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill_dir = repo / ".agents" / "skills" / "agentflow"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("content")
+        original_sha = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        subprocess.run(["git", "-C", str(repo), "checkout", original_sha], check=True,
+                        capture_output=True)
+        monkeypatch.setattr("agentflow.enroll.enroll_repository",
+                            lambda *a, **k: SimpleNamespace(ready=True))
+
+        def fake_run(command, **kw):
+            if "push" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda repo, **kw: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is True
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True, text=True,
+        )
+        assert branch.returncode != 0  # still detached, not a branch literally named HEAD
+        sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+        assert sha == original_sha
+
+    def test_enroll_repository_raising_still_restores_the_branch_and_propagates(
+            self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        original_branch = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+
+        def boom(*a, **k):
+            raise RuntimeError("filesystem write failed")
+
+        monkeypatch.setattr("agentflow.enroll.enroll_repository", boom)
+        monkeypatch.setattr(
+            "agentflow.enroll._run_command",
+            lambda command, **kw: subprocess.run(command, capture_output=True, text=True),
+        )
+
+        with pytest.raises(RuntimeError, match="filesystem write failed"):
+            _converge_and_ship(repo, "o/repo")
+
+        branch = subprocess.run(
+            ["git", "-C", str(repo), "symbolic-ref", "--quiet", "--short", "HEAD"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        assert branch == original_branch
 
 
 class TestSweepEnumerationExitCodes:
