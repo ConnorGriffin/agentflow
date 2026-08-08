@@ -255,3 +255,9 @@ Issue-keyed records:
   but its tier follows the builder's complexity dial — cheap for standard, frontier for deep —
   and independence is measured against the session lead's tool rather than whichever worker
   wrote the diff. Weakens 0003; supersedes 0018's always-deep reviewer.
+- [ADR 516](adr-516-codex-spend-estimated-and-worker-capture.md) — Codex tokens are priced from the
+  routing table's rate card at report time and every non-provider-billed figure is flagged
+  estimated; a lead-run build/revise attempt whose Codex worker spend has not been captured is
+  marked *delegate spend not counted*; worker spend is observed from the workers' own usage records
+  and rolls into the one stage record that spawned them, never self-reported; stored telemetry is
+  read, never rewritten. Extends 0040; reads ADR 498's capability table.

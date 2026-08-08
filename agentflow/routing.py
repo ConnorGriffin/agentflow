@@ -71,6 +71,7 @@ class CapabilityRouting:
         self._models = self._validate_models(models)
         self._reasoning = self._validate_reasoning(reasoning)
         self._areas = self._validate_areas(areas)
+        self._rate_card = self._validate_rate_card(data.get("rate_card"), self._models)
 
     @classmethod
     def from_path(cls, path: Path | str) -> "CapabilityRouting":
@@ -97,6 +98,34 @@ class CapabilityRouting:
                              "role": str(facts.get("role") or "worker")}
         if checked.get("fable", {}).get("role") != "session-lead":
             raise RoutingConfigError("fable must be the session-lead model")
+        return checked
+
+    @staticmethod
+    def _validate_rate_card(rate_card, models: dict) -> dict[str, tuple[float, float]]:
+        """Per-million-token USD rates, keyed by internal model name. Absent entirely on a
+        table with no priced models; a model priced here must already exist in ``models``, and
+        a malformed rate is a load-time config error rather than a silent zero. No cached-read
+        rate is ever carried — cached reads are excluded from every estimate that reads this."""
+        if rate_card is None:
+            return {}
+        if not isinstance(rate_card, dict):
+            raise RoutingConfigError("rate_card must be an object")
+        checked: dict[str, tuple[float, float]] = {}
+        for name, rates in rate_card.items():
+            if name not in models:
+                raise RoutingConfigError(f"rate_card prices unknown model {name!r}")
+            if not isinstance(rates, dict):
+                raise RoutingConfigError(f"rate_card entry {name!r} must be an object")
+            try:
+                input_rate = float(rates["input"])
+                output_rate = float(rates["output"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RoutingConfigError(f"rate_card entry {name!r} has a malformed rate") from exc
+            if isinstance(rates.get("input"), bool) or isinstance(rates.get("output"), bool):
+                raise RoutingConfigError(f"rate_card entry {name!r} has a malformed rate")
+            if input_rate < 0 or output_rate < 0:
+                raise RoutingConfigError(f"rate_card entry {name!r} has a negative rate")
+            checked[name] = (input_rate, output_rate)
         return checked
 
     @staticmethod
@@ -133,6 +162,49 @@ class CapabilityRouting:
                 routes.append(Route(when, ladder))
             checked[area] = Area(str(facts["title"]), tuple(routes), banned)
         return checked
+
+    def _resolve_model_name(self, model: str) -> str | None:
+        """The internal model name for ``model``, whether it already is one or is a
+        provider/CLI id (e.g. ``gpt-5.6-terra`` → ``terra``). ``None`` for an unknown model —
+        callers never guess past this."""
+        if model in self._models:
+            return model
+        for name, facts in self._models.items():
+            if facts["cli_id"] == model:
+                return name
+        return None
+
+    def provider_for(self, model: str) -> str | None:
+        """The provider (``claude``/``codex``) that launches ``model``, resolving internal
+        names and CLI ids alike; ``None`` for a model this table does not know."""
+        name = self._resolve_model_name(model)
+        return self._models[name]["provider"] if name is not None else None
+
+    def estimate_cost_usd(self, model: str, *, input_tokens: int | None = None,
+                          output_tokens: int | None = None,
+                          reasoning_output_tokens: int | None = None) -> float | None:
+        """A dollar estimate for one model's fresh input plus output tokens, priced from the rate
+        card (per-million-token USD). Cached reads are never priced — they are not even accepted
+        here. ``reasoning_output_tokens`` is priced at the output rate only as a *fallback* when
+        ``output_tokens`` is absent, never added on top of it: Codex's usage shape reports
+        reasoning tokens as a subset of the blended output total (codex-rs's ``TokenUsage`` sums
+        non-cached input and output for the blended total; reasoning is informational detail
+        inside that output figure, not additional to it), so summing both here would double-count
+        it. Resolves both internal model names and provider/CLI ids; returns ``None`` for an
+        unknown or unpriced model, or when no token fact was given at all — never a guessed
+        figure."""
+        if input_tokens is None and output_tokens is None and reasoning_output_tokens is None:
+            return None
+        name = self._resolve_model_name(model)
+        if name is None:
+            return None
+        rates = self._rate_card.get(name)
+        if rates is None:
+            return None
+        input_rate, output_rate = rates
+        fresh_in = input_tokens or 0
+        out = output_tokens if output_tokens is not None else (reasoning_output_tokens or 0)
+        return (fresh_in / 1_000_000) * input_rate + (out / 1_000_000) * output_rate
 
     def cli_identifier(self, provider: str, model: str) -> str:
         """Resolve an internal model name (or already-resolved id) for one provider."""
