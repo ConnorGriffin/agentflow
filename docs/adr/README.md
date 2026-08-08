@@ -255,3 +255,6 @@ Issue-keyed records:
   but its tier follows the builder's complexity dial — cheap for standard, frontier for deep —
   and independence is measured against the session lead's tool rather than whichever worker
   wrote the diff. Weakens 0003; supersedes 0018's always-deep reviewer.
+- [ADR 540](adr-540-bounded-review-follow-up-proposals.md) — A review carries one bounded
+  follow-up proposal instead of creating a GitHub issue; historical URLs remain references, and
+  public parks use a 2,000-character operator envelope. Amends ADR 0047.

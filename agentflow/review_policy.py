@@ -130,6 +130,19 @@ class FollowUp:
     historic_url: str = ""
 
 
+def merge_follow_ups(*groups: tuple[FollowUp, ...]) -> tuple[FollowUp, ...]:
+    """Keep durable historical references and the newest single live proposal.
+
+    A successor review may carry older, already-filed references while replacing the one
+    proposal that describes current follow-up work. Keeping the proposal separate from history
+    prevents a normal continuation from becoming unpersistable.
+    """
+    all_items = tuple(item for group in groups for item in group)
+    historic = tuple(dict.fromkeys(item for item in all_items if item.historic_url))
+    proposals = tuple(item for item in all_items if not item.historic_url)
+    return historic + proposals[-1:]
+
+
 def _park_field(value: str, limit: int) -> str:
     """One deterministic public-envelope field; no later whole-body trimming is permitted."""
     compact = " ".join(value.split())
@@ -248,7 +261,7 @@ class ReviewState:
 
     def record_fields(self) -> dict[str, Any]:
         """Encode this value into the existing flat Record/store schema."""
-        if len(self.follow_ups) > 1 and not all(item.historic_url for item in self.follow_ups):
+        if sum(not item.historic_url for item in self.follow_ups) > 1:
             raise ValueError("new review records allow at most one follow-up proposal")
         return {
             "review_depth": self.assignment.depth.value,
@@ -298,7 +311,7 @@ def _decode_follow_ups(payload: str) -> tuple[FollowUp, ...] | None:
                 for item in result
                 for part in (item.evidence, item.desired_outcome)):
             return None
-        if len(result) > 1 and not all(item.historic_url for item in result):
+        if sum(not item.historic_url for item in result) > 1:
             return None
         return result
     except (KeyError, TypeError, json.JSONDecodeError):

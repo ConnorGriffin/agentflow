@@ -112,6 +112,22 @@ def test_multiple_legacy_follow_up_urls_remain_readable_and_historical_when_rewr
         "https://github.com/o/r/issues/9", "https://github.com/o/r/issues/10"]
 
 
+def test_historical_follow_up_references_do_not_block_one_current_proposal():
+    """A review continuation retains history while carrying its one current outcome."""
+    state = ReviewState(follow_ups=(
+        FollowUp("legacy evidence", "legacy outcome", "https://github.com/o/r/issues/9"),
+        FollowUp("new evidence", "new outcome"),
+    ))
+
+    payload = json.loads(state.record_fields()["review_follow_ups"])
+
+    assert payload == [
+        {"desired_outcome": "legacy outcome", "evidence": "legacy evidence",
+         "url": "https://github.com/o/r/issues/9"},
+        {"desired_outcome": "new outcome", "evidence": "new evidence"},
+    ]
+
+
 def test_decision_pass_must_choose_or_return_structured_uncertainty():
     result = parse_review_result(json.dumps({
         "verdict": "PASS", "depth": "full", "depth_reason": "competing behavior",

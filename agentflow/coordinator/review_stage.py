@@ -21,8 +21,29 @@ is the Review-native handoff.
 
 from __future__ import annotations
 
+import re
+
 from agentflow.coordinator.recovery import contract_repair
 from agentflow.coordinator.stage_adapter import StageAdapter
+
+
+_ISSUE_CREATE = re.compile(r"(?:^|[;&|]\s*)gh\s+issue\s+create(?:\s|$)", re.IGNORECASE)
+
+
+def _created_follow_up_issue(events) -> bool:
+    """Whether captured session commands used Review's retired tracker-write action."""
+    def commands(value):
+        if isinstance(value, dict):
+            command = value.get("command")
+            if isinstance(command, str):
+                yield command
+            for child in value.values():
+                yield from commands(child)
+        elif isinstance(value, (list, tuple)):
+            for child in value:
+                yield from commands(child)
+
+    return any(_ISSUE_CREATE.search(command) for command in commands(events))
 
 
 def _contract_error(record, obs) -> str:
@@ -77,6 +98,12 @@ class ReviewStageAdapter(StageAdapter):
         """
         payload = (getattr(obs, "final_message", "") or "").strip()
         return payload if payload and self.verify(record, obs) else None
+
+    def verify(self, record, obs):
+        """Reject a review that used the retired GitHub follow-up creation action."""
+        if _created_follow_up_issue(getattr(obs, "events", ())):
+            return False
+        return super().verify(record, obs)
 
     def recover(self, record, obs):
         """Review may own partial fixes in its detached checkout, so the shared continuation

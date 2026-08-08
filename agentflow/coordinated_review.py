@@ -180,7 +180,7 @@ def review_successor_submission(review_record, verdict):
     """
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
-        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
+        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_follow_ups)
     from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
@@ -198,7 +198,7 @@ def review_successor_submission(review_record, verdict):
     prior = ReviewState.from_record(review_record)
     if prior is None:
         return None
-    follow_ups = prior.follow_ups + verdict.follow_ups
+    follow_ups = merge_follow_ups(prior.follow_ups, verdict.follow_ups)
     fixes = prior.fixes + verdict.fixes
     all_checks = tuple(dict.fromkeys(prior.checks + verdict.checks))
     checks = "; ".join(all_checks) or "No checks were recorded; verify independently."
@@ -250,7 +250,8 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     import json
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
-        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_findings, other_tool)
+        ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_findings,
+        merge_follow_ups, other_tool)
     from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
@@ -270,7 +271,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     prior = ReviewState.from_record(review_record)
     if prior is None:
         return None
-    follow_ups = prior.follow_ups + verdict.follow_ups
+    follow_ups = merge_follow_ups(prior.follow_ups, verdict.follow_ups)
     checks = tuple(dict.fromkeys(prior.checks + verdict.checks))
     combined_actions = merge_findings(prior.findings, verdict.actions)
     actions = [
@@ -1082,7 +1083,7 @@ def _review_verdict(review):
     older records without making a mutable session the source of truth for newly completed work.
     """
     from agentflow.coordinator.providers import ProviderObserver
-    from agentflow.review_policy import ReviewState, merge_findings
+    from agentflow.review_policy import ReviewState, merge_findings, merge_follow_ups
     from agentflow.reviewer import Finding, parse_verdict
     payload = review.outcome
     if not payload:
@@ -1100,7 +1101,7 @@ def _review_verdict(review):
         return replace(verdict, clean=False, parsed=False,
                        detail="durable review ledger is unreadable", reviewer_tool=review.pool)
     fixes = tuple(dict.fromkeys(prior.fixes + verdict.fixes))
-    follow_ups = tuple(dict.fromkeys(prior.follow_ups + verdict.follow_ups))
+    follow_ups = merge_follow_ups(prior.follow_ups, verdict.follow_ups)
     checks = tuple(dict.fromkeys(prior.checks + verdict.checks))
     actions = (verdict.actions if review.review_axis == "fix"
                else merge_findings(prior.findings, verdict.actions))
