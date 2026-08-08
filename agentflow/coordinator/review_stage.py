@@ -21,44 +21,13 @@ is the Review-native handoff.
 
 from __future__ import annotations
 
-import shlex
-
+from agentflow import github
 from agentflow.coordinator.recovery import contract_repair
 from agentflow.coordinator.stage_adapter import StageAdapter
 
 
 def _created_follow_up_issue(events) -> bool:
     """Whether captured session commands used Review's retired tracker-write action."""
-    def creates_issue(command: str) -> bool:
-        try:
-            lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-            lexer.whitespace_split = True
-            lexer.commenters = ""
-            tokens = list(lexer)
-        except ValueError:
-            return False
-        segment: list[str] = []
-        for token in (*tokens, ";"):
-            if token not in {";", "&&", "||", "|"}:
-                segment.append(token)
-                continue
-            while segment and "=" in segment[0] and not segment[0].startswith("="):
-                segment.pop(0)
-            if segment[:1] == ["env"]:
-                segment.pop(0)
-                while segment and (segment[0].startswith("-") or "=" in segment[0]):
-                    segment.pop(0)
-            if segment[:1] == ["command"]:
-                segment.pop(0)
-            if segment[:1] in (["sh"], ["bash"], ["zsh"]) and "-c" in segment:
-                script = segment[segment.index("-c") + 1:]
-                if script and creates_issue(script[0]):
-                    return True
-            if len(segment) >= 3 and segment[:3] == ["gh", "issue", "create"]:
-                return True
-            segment = []
-        return False
-
     def commands(value):
         if isinstance(value, dict):
             command = value.get("command")
@@ -70,7 +39,7 @@ def _created_follow_up_issue(events) -> bool:
             for child in value:
                 yield from commands(child)
 
-    return any(creates_issue(command) for command in commands(events))
+    return any(github.command_creates_issue(command) for command in commands(events))
 
 
 def _contract_error(record, obs) -> str:
