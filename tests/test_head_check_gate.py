@@ -294,12 +294,16 @@ def _wire_opener(monkeypatch, review, *, head_checks, pr_state="OPEN", pr_head="
     captured = {}
     real_submission = coordinated_revise.revise_submission
 
-    def _submission(review_record, complexity, findings, *, target_sha=""):
-        captured.update(complexity=complexity, findings=findings, target_sha=target_sha)
+    def _submission(review_record, complexity, findings, *, target_sha="", parent_pool="claude"):
+        captured.update(complexity=complexity, findings=findings, target_sha=target_sha,
+                        parent_pool=parent_pool)
         return real_submission(
-            review_record, complexity, findings, target_sha=target_sha)
+            review_record, complexity, findings, target_sha=target_sha,
+            parent_pool=parent_pool)
 
     monkeypatch.setattr("agentflow.coordinated_revise.revise_submission", _submission)
+    monkeypatch.setattr(pipeline, "pick_session_lead",
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
     return SimpleNamespace(coord=coord, submitted=submitted, parked=parked, captured=captured)
 
 
@@ -324,6 +328,22 @@ def test_a_caught_red_check_opens_a_revise_round_named_check_and_sha_only(monkey
     assert profile_for(revise).reasoning_effort == "low"
     assert "`python`" in world.captured["findings"] and "sha-a" in world.captured["findings"]
     assert "log" in world.captured["findings"].lower()  # the no-CI-log instruction rides along
+
+
+def test_a_caught_red_check_can_open_a_codex_parent_revise(monkeypatch):
+    review = _reviewed_record_for_opener()
+    review.builder_lineage = review.branch_lineage = "claude"
+    world = _wire_opener(monkeypatch, review,
+                         head_checks=HeadChecks(sha="sha-a", failing=("python",)))
+    monkeypatch.setattr(pipeline, "pick_session_lead",
+                        lambda **_kwargs: (SimpleNamespace(tool="codex"), None, ""))
+
+    pipeline._open_revise_on_red_check(world.coord, review, {})
+
+    revise = world.submitted[0]
+    assert world.captured["parent_pool"] == revise.pool == revise.builder_lineage == "codex"
+    assert revise.branch_lineage == "claude" and revise.source == "/work/build"
+    assert "Codex workers use" in revise.input_ptr
 
 
 def test_spent_rounds_open_nothing_here_because_settlement_owns_that_park(monkeypatch):

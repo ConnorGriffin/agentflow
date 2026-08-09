@@ -10,7 +10,7 @@ import pytest
 
 from agentflow import coordinated_build, coordinated_review, coordinated_revise
 from agentflow import runner as runner_mod
-from agentflow.balancer import PoolStatus, choose_session_lead
+from agentflow.balancer import LeadAvailability, PoolStatus, choose_session_lead, pick_session_lead
 from agentflow.coordinator.providers import provider_command
 from agentflow.coordinator.admission import ADMISSION_MATRIX, admission_demand
 from agentflow.coordinator.record import Record
@@ -216,15 +216,121 @@ def test_loader_rejects_unknown_models(tmp_path):
         CapabilityRouting.from_path(bad)
 
 
-def test_session_lead_launch_is_claude_gated_even_when_codex_is_clear():
+def test_session_lead_prefers_claude_and_falls_back_to_codex_when_needed():
     runners = {"claude": "CLAUDE", "codex": "CODEX"}
     claude_blocked = PoolStatus("claude", False, 100.0)
     codex_clear = PoolStatus("codex", True, 5.0)
-    assert choose_session_lead(claude_blocked, codex_clear, runners) == (None, None)
+    assert choose_session_lead(claude_blocked, codex_clear, runners) == ("CODEX", None)
 
     claude_clear = PoolStatus("claude", True, 90.0)
     codex_blocked = PoolStatus("codex", False, 100.0)
     assert choose_session_lead(claude_clear, codex_blocked, runners) == ("CLAUDE", None)
+
+    assert choose_session_lead(claude_blocked, codex_blocked, runners) == (None, None)
+
+
+def test_session_lead_uses_the_selected_parent_demand_against_live_permits(monkeypatch):
+    clear = PoolStatus("claude", True, 10.0)
+    codex = PoolStatus("codex", True, 10.0)
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool, *_args, **_kwargs: clear if tool == "claude" else codex)
+
+    lead, _reviewer, _reason = pick_session_lead(
+        operator=True, stage="build", complexity="standard", effort="low",
+        availability=LeadAvailability({"claude": 3, "codex": 0},
+                                      {"claude": False, "codex": False}))
+
+    assert lead is not None and lead.tool == "codex"  # Fable needs 3; Sol reserves all five
+
+
+def test_issue_build_yields_a_pool_with_pr_bound_work_but_revise_does_not(monkeypatch):
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool, *_args, **_kwargs: PoolStatus(tool, True, 10.0))
+    monkeypatch.setattr("agentflow.balancer._live_lead_availability", lambda: LeadAvailability(
+        {"claude": 0, "codex": 0}, {"claude": True, "codex": False}))
+
+    build, _reviewer, reason = pick_session_lead(
+        operator=True, floodgates=True, stage="build", complexity="standard", effort="low")
+    revise, _reviewer, _reason = pick_session_lead(
+        operator=True, stage="revise", complexity="deep", effort=None)
+
+    assert build is not None and build.tool == "codex"
+    assert "PR-bound work waiting" not in reason
+    assert revise is not None and revise.tool == "claude"
+
+
+def test_issue_build_fails_closed_when_its_shared_availability_read_fails(monkeypatch):
+    """An unreadable PR-bound barrier is never an all-clear cold Build selection."""
+    from agentflow.coordinator.store import StoreUnavailable
+
+    monkeypatch.setattr("agentflow.balancer._query_pool",
+                        lambda tool, *_args, **_kwargs: PoolStatus(tool, True, 10.0))
+    monkeypatch.setattr("agentflow.balancer.Store",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(StoreUnavailable("read")))
+
+    lead, _reviewer, reason = pick_session_lead(
+        operator=True, stage="build", complexity="standard", effort="low")
+
+    assert lead is None and "permit budget" in reason
+
+
+@pytest.mark.parametrize(("stage", "complexity", "effort"), [
+    ("build", "standard", "low"),
+    ("revise", "deep", None),
+])
+def test_session_lead_keeps_claude_when_the_actual_parent_cell_fits(
+        monkeypatch, stage, complexity, effort):
+    """Build and Revise pass their real dials, not the old exclusive-five defaults."""
+    clear = PoolStatus("claude", True, 10.0)
+    monkeypatch.setattr("agentflow.balancer._query_pool", lambda *_args, **_kwargs: clear)
+
+    lead, _reviewer, _reason = pick_session_lead(
+        operator=True, stage=stage, complexity=complexity, effort=effort,
+        availability=LeadAvailability({"claude": 2, "codex": 0},
+                                      {"claude": False, "codex": False}))
+
+    assert lead is not None and lead.tool == "claude"  # Fable's actual demand is three.
+
+
+@pytest.mark.parametrize(("operator", "floodgates", "expected_reservation", "expected_lead"), [
+    (False, False, 15.0, "codex"),
+    (True, False, 0.0, "claude"),
+    (False, True, 0.0, "claude"),
+])
+def test_session_lead_matches_admission_claude_inflight_reservation(
+        monkeypatch, operator, floodgates, expected_reservation, expected_lead):
+    """A stale Claude quota reading cannot stamp a record that admission will defer."""
+    calls = []
+
+    def query(tool, _operator=False, **kwargs):
+        reservation = kwargs.get("reserved_pct", 0.0)
+        calls.append((tool, reservation))
+        return PoolStatus(tool, tool != "claude" or 71.0 + reservation < 85.0,
+                          71.0, ceiling=85.0)
+
+    monkeypatch.setattr("agentflow.balancer._query_pool", query)
+    monkeypatch.setattr("agentflow.balancer._live_lead_availability", lambda: LeadAvailability(
+        {"claude": 1, "codex": 0}, {"claude": False, "codex": False}))
+    monkeypatch.setattr("agentflow.balancer._claude_dispatch_status",
+                        lambda status, *_args, **_kwargs: status)
+    monkeypatch.setattr("agentflow.balancer._codex_dispatch_status",
+                        lambda status, *_args, **_kwargs: status)
+
+    lead, _reviewer, _reason = pick_session_lead(
+        operator=operator, floodgates=floodgates, stage="build", complexity="standard",
+        effort="low")
+
+    assert lead is not None and lead.tool == expected_lead
+    assert calls[0] == ("claude", expected_reservation)
+
+
+def test_synthetic_historical_replay_keeps_the_new_sol_parent_exclusive(make_coord):
+    submission = coordinated_build.build_submission(
+        SimpleNamespace(repo="o/r", workdir="/work"), _issue("deep", "low"), parent_pool="codex")
+    coord = make_coord()
+    record = coord.stage_record(coord.submit_stage(submission))
+
+    assert record.model == "sol" and record.demand == 5
 
 
 def test_session_parent_and_cheap_review_admission_are_explicit():
@@ -235,11 +341,14 @@ def test_session_parent_and_cheap_review_admission_are_explicit():
     for complexity, efforts in build_demands.items():
         # Revise is effort-blind (ADR 0029): one asserted row per complexity answers every dial.
         assert ("revise", "claude", "fable", complexity, None) in ADMISSION_MATRIX
+        assert ("revise", "codex", "sol", complexity, None) in ADMISSION_MATRIX
+        assert admission_demand("revise", "codex", "sol", complexity) == 5
         for effort, expected in efforts.items():
             key = ("build", "claude", "fable", complexity, effort)
             assert key in ADMISSION_MATRIX
             assert admission_demand(*key) == expected
             assert admission_demand("revise", "claude", "fable", complexity, effort) == 3
+            assert admission_demand("build", "codex", "sol", complexity, effort) == 5
 
     assert admission_demand("review", "codex", "luna", "standard") <= \
         admission_demand("review", "codex", "sol", "deep")
@@ -254,10 +363,82 @@ def test_the_lead_brief_tells_the_lead_to_fall_back_to_claude_on_a_codex_provide
     brief = routing.session_lead_instructions("build", "medium")
 
     assert "provider error" in brief
-    assert "treat every Codex rung in that" in brief
+    assert "treat every rung from that provider" in brief
     assert "unavailable for the rest of this session" in brief
     assert "record the substitution in the final handoff" in brief
     assert "is never a finding to re-delegate" in brief
+
+
+def test_the_lead_brief_stops_and_surfaces_a_provider_failure_with_no_opposite_rung():
+    """#509 Blocker B: a single-provider ladder (plan/spec is Codex-only; code review's
+    load-bearing route is Claude-only in model-routing.json) has no remaining-provider rung to
+    re-enter at, so the brief must tell the lead to stop and hand back the failure by name
+    rather than inventing a substitute model or silently doing the work itself."""
+    assert routing._areas["plan"].routes[0].ladder == ("terra", "sol")
+    assert all(routing._models[m]["provider"] == "codex"
+               for m in routing._areas["plan"].routes[0].ladder)
+    load_bearing = next(r for r in routing._areas["review"].routes if r.when == "load-bearing")
+    assert all(routing._models[m]["provider"] == "claude" for m in load_bearing.ladder)
+
+    brief = routing.session_lead_instructions("build", "medium")
+
+    assert "has no rung from any other provider" in brief
+    assert "stop delegating in that area and hand back the" in brief
+    assert "provider failure by name in the final handoff" in brief
+    assert "do not invent a substitute" in brief
+    assert "do not silently do the work yourself" in brief
+
+
+def test_codex_parent_uses_native_codex_helpers_and_the_installed_claude_cli():
+    brief = routing.session_lead_instructions(
+        "build", "medium", parent_provider="codex", native_helpers_capable=True)
+
+    assert "Codex workers use\nnative sub-agents" in brief
+    assert "Claude workers through the installed `claude` CLI" in brief
+    assert "Provider launch identifiers: Fable (claude): fable" in brief
+    assert "Sol (codex): gpt-5.6-sol" in brief
+    assert "spawn_agent" in brief
+    assert 'agent_type` set to' in brief
+    assert 'fork_turns="none"' in brief
+    assert "Do not pass `model` or `reasoning_effort` directly" in brief
+    assert 'agent_type="af_codex_luna_medium"' in brief
+    assert 'agent_type="af_codex_terra_medium"' in brief
+    assert "provider error" in brief and "first remaining-provider\nrung" in brief
+
+
+def test_codex_parent_fails_closed_when_native_helpers_are_not_capable():
+    """#509 Blocker A: an installed Codex build outside the 0.144.0 compatibility allowlist must
+    never be told to call `spawn_agent` with the hidden role/model fields — the brief tells the
+    lead to treat every Codex rung as a provider failure from the start instead."""
+    brief = routing.session_lead_instructions(
+        "build", "medium", parent_provider="codex", native_helpers_capable=False)
+
+    assert "Native Codex delegation is unavailable for this session" in brief
+    assert "Never call `spawn_agent` for a Codex rung" in brief
+    assert "treat every Codex rung in every ladder as a provider failure" in brief
+    assert "af_codex_luna_medium" not in brief
+    assert "agent_type` set to" not in brief
+
+
+def test_claude_parent_keeps_codex_on_the_opposite_provider_cli_boundary():
+    brief = routing.session_lead_instructions("build", "medium", parent_provider="claude")
+
+    assert "`codex exec`" in brief
+    assert "spawn_agent" not in brief
+    assert "Native Codex delegation is unavailable" not in brief
+
+
+def test_codex_parent_submission_keeps_its_parent_and_branch_lineage(make_coord, tmp_path):
+    cfg = SimpleNamespace(repo="o/r", workdir=str(tmp_path))
+    submission = coordinated_build.build_submission(cfg, _issue(), parent_pool="codex")
+    coord = make_coord()
+    record = coord.stage_record(coord.submit_stage(submission))
+
+    assert record.pool == record.builder_lineage == "codex"
+    assert record.model == "sol"
+    assert submission.pool == submission.builder_lineage == submission.branch_lineage == "codex"
+    assert "/codex/issue-498-" in submission.source
+    assert "Codex workers use" in submission.input_ptr
 
 
 def test_the_lead_brief_states_codex_is_spent_up_front_when_rate_limited(monkeypatch):
@@ -282,15 +463,20 @@ def test_the_lead_brief_states_codex_is_spent_up_front_when_rate_limited(monkeyp
     assert brief.index("Codex is currently unavailable") < brief.index("Routes (workers enter")
 
 
-def test_the_lead_brief_names_the_all_codex_ladder_as_a_self_serve_exception_when_spent():
+def test_the_lead_brief_names_the_all_codex_ladder_as_a_provider_failure_handback_when_spent():
     """plan/spec's ladder (`["terra", "sol"]` in model-routing.json) has no Claude rung, so
     "enter at the first Claude rung" is unsatisfiable there. The brief must call that out by
-    name, derived from the loaded ladders rather than hardcoded, and only when Codex is spent."""
+    name, derived from the loaded ladders rather than hardcoded, and only when Codex is spent —
+    and it must route to the same named provider-failure handback as every other exhausted
+    ladder, never tell the lead to do the work itself (that contradicted the handback rule
+    stated later in the same brief)."""
     spent = routing.session_lead_instructions("build", "medium", codex_spent=True)
     clear = routing.session_lead_instructions("build", "medium", codex_spent=False)
 
     assert "plan/spec has no Claude rung to fall back to" in spent
-    assert "do that area's work yourself rather than delegating off-table" in spent
+    assert "no remaining provider from the very start of this session" in spent
+    assert "hand back the provider failure by name in the final handoff" in spent
+    assert "do that area's work yourself" not in spent
     assert "no Claude rung to fall back to" not in clear
 
 

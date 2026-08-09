@@ -1324,6 +1324,9 @@ def test_completed_conflict_decision_transfers_to_revise_before_settlement(
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
         lambda repo, pr, verdict, head: summarized.append((repo, pr, head)) or True)
+    monkeypatch.setattr(
+        pipeline, "pick_session_lead",
+            lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
 
     pipeline.reconcile_and_project(coord)
 

@@ -391,7 +391,7 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
                         lambda _pid, _signum: (_ for _ in ()).throw(PermissionError()))
 
     with pytest.raises(ChildExit) as exited:
-        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "",
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "", "", "",
                             "provider"])
 
     assert exited.value.args == (0,)
@@ -399,6 +399,231 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
     assert session.has_end_fact is True
     assert session.exit_status == 0
     assert "permission denied stopping provider process group" in session.partial_output
+
+
+def test_prepare_provider_argv_generates_and_splices_role_overrides_before_the_prompt(
+        tmp_path, monkeypatch):
+    """#509: the launch supervisor generates its own role directory (via
+    :func:`codex_native_helpers.build_role_overrides`, recomputing the same routes from the
+    routing table itself) immediately before it would spawn the provider, and splices the
+    resulting CLI argv in ahead of the final positional element — the prompt stays last."""
+    from agentflow.coordinator import _launch_child
+
+    monkeypatch.setattr(_launch_child.codex_native_helpers.tempfile, "gettempdir",
+                        lambda: str(tmp_path))
+    provider = ["codex", "exec", "--json", "the actual prompt"]
+
+    argv, directory = _launch_child._prepare_provider_argv(
+        provider, role_overrides=True, worker_effort="high")
+
+    assert argv[-1] == "the actual prompt"  # the prompt stays the final positional argument
+    assert argv[:len(provider) - 1] == provider[:-1]
+    assert "--strict-config" in argv[len(provider) - 1:-1]
+    assert directory is not None and directory.exists()
+    assert oct(directory.stat().st_mode)[-3:] == "700"
+    role_files = sorted(directory.glob("role-*.toml"))
+    assert len(role_files) == 3  # luna, terra, sol at the "high" rung
+    for path in role_files:
+        assert oct(path.stat().st_mode)[-3:] == "600"
+        assert 'model_reasoning_effort = "high"' in path.read_text()
+
+
+def test_prepare_provider_argv_is_a_no_op_without_role_overrides_or_provider(tmp_path, monkeypatch):
+    from agentflow.coordinator import _launch_child
+
+    monkeypatch.setattr(_launch_child.codex_native_helpers.tempfile, "gettempdir",
+                        lambda: str(tmp_path))
+    provider = ["codex", "exec", "the prompt"]
+
+    argv, directory = _launch_child._prepare_provider_argv(
+        provider, role_overrides=False, worker_effort="high")
+    assert argv == provider
+    assert directory is None
+
+    argv, directory = _launch_child._prepare_provider_argv(
+        [], role_overrides=True, worker_effort="high")
+    assert argv == []
+    assert directory is None
+    assert list(tmp_path.glob(f"{_launch_child.codex_native_helpers._ROLE_DIR_PREFIX}*")) == []
+
+
+def test_prepare_provider_argv_canonicalizes_a_symlinked_macos_temp_root(tmp_path, monkeypatch):
+    """A raw ``gettempdir()`` that is itself a symlink (macOS: ``/var`` -> ``/private/var``)
+    resolves to the canonical base before the role directory is created there, matching the
+    same containment checks :func:`codex_native_helpers.cleanup_role_dirs` re-runs at removal."""
+    from agentflow.coordinator import _launch_child
+
+    real = tmp_path / "private" / "var"
+    real.mkdir(parents=True)
+    raw = tmp_path / "var"
+    raw.symlink_to(real, target_is_directory=True)
+    monkeypatch.setattr(_launch_child.codex_native_helpers.tempfile, "gettempdir",
+                        lambda: str(raw))
+
+    _argv, directory = _launch_child._prepare_provider_argv(
+        ["codex", "exec", "prompt"], role_overrides=True, worker_effort="low")
+
+    assert directory is not None
+    assert directory.parent == real  # created under the canonical base, not the raw symlink
+
+
+def _started_double():
+    """A ``Store`` test double that always wins the reservation handshake — the shared shape
+    every ``main()`` lifecycle test below drives."""
+    class ChildExit(Exception):
+        pass
+
+    class StartedStore:
+        def __init__(self, _path):
+            pass
+
+        def child_start(self, identity, token, family):
+            return True
+
+        def close(self):
+            pass
+
+    return ChildExit, StartedStore
+
+
+def _patch_supervisor_scaffolding(monkeypatch, _launch_child, ChildExit, StartedStore):
+    monkeypatch.setattr(_launch_child.os, "fork", lambda: 0)
+    monkeypatch.setattr(_launch_child.os, "setsid", lambda: None)
+    monkeypatch.setattr(_launch_child.os, "_exit",
+                        lambda code: (_ for _ in ()).throw(ChildExit(code)))
+    monkeypatch.setattr(_launch_child.signal, "signal", lambda signum, handler: None)
+    monkeypatch.setattr(_launch_child, "Store", StartedStore)
+    monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
+
+
+def test_supervisor_generates_and_cleans_up_role_overrides_on_a_normal_exit(
+        tmp_path, monkeypatch):
+    """Success path (#509): the supervisor's own role directory is created immediately before
+    ``Popen`` and removed once the provider it fed has run to a normal, observed exit."""
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import read_session
+
+    monkeypatch.setattr(_launch_child.codex_native_helpers.tempfile, "gettempdir",
+                        lambda: str(tmp_path))
+    ChildExit, StartedStore = _started_double()
+    _patch_supervisor_scaffolding(monkeypatch, _launch_child, ChildExit, StartedStore)
+
+    captured = {}
+
+    class Provider:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 0
+
+    def start_provider(argv, **kwargs):
+        captured["argv"] = argv
+        return Provider()
+
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", start_provider)
+
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "", "1",
+                            "high", "codex", "exec", "the prompt"])
+
+    assert exited.value.args == (0,)
+    assert "--strict-config" in captured["argv"]
+    assert captured["argv"][-1] == "the prompt"
+    role_dirs = list(tmp_path.glob(f"{_launch_child.codex_native_helpers._ROLE_DIR_PREFIX}*"))
+    assert role_dirs == []  # removed once the provider's exit was observed
+    session = read_session(tmp_path / "records.db", "token")
+    assert session.exit_status == 0
+
+
+def test_supervisor_cleans_up_role_overrides_after_a_provider_failure(tmp_path, monkeypatch):
+    """A provider that dies (nonzero exit) still leaves its role directory owned by this same
+    launch — cleanup does not depend on how the provider ended, only that this launch did."""
+    from agentflow.coordinator import _launch_child
+
+    monkeypatch.setattr(_launch_child.codex_native_helpers.tempfile, "gettempdir",
+                        lambda: str(tmp_path))
+    ChildExit, StartedStore = _started_double()
+    _patch_supervisor_scaffolding(monkeypatch, _launch_child, ChildExit, StartedStore)
+
+    class Provider:
+        pid = 123
+
+        def wait(self, timeout=None):
+            return 1
+
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", lambda *a, **kw: Provider())
+
+    with pytest.raises(ChildExit):
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "", "1",
+                            "high", "codex", "exec", "the prompt"])
+
+    role_dirs = list(tmp_path.glob(f"{_launch_child.codex_native_helpers._ROLE_DIR_PREFIX}*"))
+    assert role_dirs == []
+
+
+def test_supervisor_cleans_up_role_overrides_after_a_popen_failure(tmp_path, monkeypatch):
+    """A provider that never even spawns (``Popen`` raises) still leaves behind the role
+    directory this supervisor generated for it moments earlier — cleaned up on this same
+    failure path, not left for the 24h sweep."""
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import read_session
+
+    monkeypatch.setattr(_launch_child.codex_native_helpers.tempfile, "gettempdir",
+                        lambda: str(tmp_path))
+    ChildExit, StartedStore = _started_double()
+    _patch_supervisor_scaffolding(monkeypatch, _launch_child, ChildExit, StartedStore)
+
+    def fail_popen(*args, **kwargs):
+        raise OSError("no such executable")
+
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", fail_popen)
+
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "", "1",
+                            "high", "codex", "exec", "the prompt"])
+
+    assert exited.value.args == (0,)
+    role_dirs = list(tmp_path.glob(f"{_launch_child.codex_native_helpers._ROLE_DIR_PREFIX}*"))
+    assert role_dirs == []
+    session = read_session(tmp_path / "records.db", "token")
+    assert session.has_end_fact is True
+    assert session.exit_status is None
+
+
+def test_supervisor_cleans_up_a_partial_role_directory_on_generation_failure(
+        tmp_path, monkeypatch):
+    """A role-generation failure (a role file write that fails partway through) must never reach
+    ``Popen`` — no provider family ever comes into existence for that attempt, and the partial
+    directory :func:`codex_native_helpers.build_role_overrides` itself removes is confirmed gone
+    rather than left for the 24h sweep."""
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import read_session
+
+    monkeypatch.setattr(_launch_child.codex_native_helpers.tempfile, "gettempdir",
+                        lambda: str(tmp_path))
+    ChildExit, StartedStore = _started_double()
+    _patch_supervisor_scaffolding(monkeypatch, _launch_child, ChildExit, StartedStore)
+
+    def fail_build(routes):
+        raise OSError("simulated role-generation failure")
+
+    monkeypatch.setattr(_launch_child.codex_native_helpers, "build_role_overrides", fail_build)
+    popen_called = []
+    monkeypatch.setattr(_launch_child.subprocess, "Popen",
+                        lambda *a, **kw: popen_called.append(True))
+
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "", "1",
+                            "high", "codex", "exec", "the prompt"])
+
+    assert exited.value.args == (0,)
+    assert popen_called == []  # never spawned a provider for a launch that failed to generate
+    role_dirs = list(tmp_path.glob(f"{_launch_child.codex_native_helpers._ROLE_DIR_PREFIX}*"))
+    assert role_dirs == []
+    session = read_session(tmp_path / "records.db", "token")
+    assert session.has_end_fact is True
+    assert session.exit_status is None
 
 
 def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tmp_path):

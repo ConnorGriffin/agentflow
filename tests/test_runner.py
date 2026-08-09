@@ -223,6 +223,152 @@ def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert str(wt.resolve()) in structured[-1]
 
 
+def test_only_a_sol_session_lead_keeps_its_parent_thread_for_native_helpers(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-509-owned"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-509-owned")
+
+    ordinary = CodexRunner().structured_argv("review", "gpt-5.6-sol", str(wt))
+    native = CodexRunner().structured_argv(
+        "build", "gpt-5.6-sol", str(wt), native_helpers=True)
+
+    assert "--ephemeral" in ordinary
+    assert "--ephemeral" not in native
+    assert native[native.index("-m") + 1] == "gpt-5.6-sol"
+
+
+def test_native_helper_launch_never_declares_role_overrides_itself(tmp_path):
+    """#509: this runner method never builds role declarations — a Sol session-lead launch's
+    ``--strict-config`` plus per-worker role declarations are generated later, by the launch
+    supervisor immediately before it spawns the provider (see
+    tests/test_coordinator_launcher.py's ``_prepare_provider_argv`` coverage), never here, so a
+    role directory's path is a value local to that one process and never crosses this argv."""
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-509-role"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-509-role")
+
+    argv = CodexRunner().structured_argv(
+        "build", "gpt-5.6-sol", str(wt), native_helpers=True)
+
+    assert "--strict-config" not in argv
+    assert not any("agents." in tok for tok in argv)
+    assert "--ephemeral" not in argv  # still a native-helper (durable) launch
+
+
+def test_codex_version_output_fails_closed_for_a_custom_executable(monkeypatch):
+    """The native-helper capability probe never runs an operator- or config-selected executable
+    — only the one literal allowlisted name. A custom ``AGENTFLOW_CODEX_BIN`` gets no capability,
+    not a subprocess launch of an arbitrary configured path."""
+    calls = []
+    monkeypatch.setattr(
+        runner_mod.subprocess, "run",
+        lambda argv, **kw: calls.append(argv) or pytest.fail("must not execute a custom binary"))
+
+    assert runner_mod._codex_version_output("/opt/evil/codex") is None
+    assert runner_mod._codex_version_output("codex-fork") is None
+    assert calls == []
+
+
+def test_codex_native_helpers_marker_at_render_fails_closed_for_a_custom_codex_bin(monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_CODEX_BIN", "/some/custom/codex")
+    monkeypatch.setattr(
+        runner_mod.subprocess, "run",
+        lambda argv, **kw: pytest.fail("must not execute a custom binary"))
+
+    assert runner_mod.codex_native_helpers_marker_at_render() is None
+    assert runner_mod.codex_native_helpers_capable_at_render() is False
+
+
+def test_codex_version_output_still_runs_the_allowlisted_literal_binary(monkeypatch):
+    captured = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "codex-cli 0.144.0\n"
+
+    def fake_run(argv, **kw):
+        captured["argv"] = argv
+        return _Result()
+
+    monkeypatch.setattr(runner_mod.subprocess, "run", fake_run)
+
+    assert runner_mod._codex_version_output("codex") == "codex-cli 0.144.0\n"
+    assert captured["argv"][0] == "codex"
+
+
+def test_codex_provider_only_enables_native_helpers_for_sol_build_and_revise(tmp_path):
+    build = _provider_record("codex", tmp_path)
+    build.model = "sol"
+    build.session_lead = True
+    revise = Record("codex-revise", "revise", "codex", 5, model="sol",
+                    source=str(tmp_path), input_ptr="revise", complexity="deep",
+                    session_lead=True)
+    review = Record("codex-review", "review", "codex", 2, model="sol",
+                    source=str(tmp_path), input_ptr="review", complexity="deep")
+    legacy = Record("legacy-sol-build", "build", "codex", 5, model="sol",
+                    source=str(tmp_path), input_ptr="historic prompt", complexity="deep")
+
+    assert "--ephemeral" not in provider_command(build)
+    assert "--ephemeral" not in provider_command(revise)
+    assert "--ephemeral" in provider_command(review)
+    assert "--ephemeral" in provider_command(legacy)
+
+
+def test_codex_provider_launches_role_overrides_only_on_an_exact_marker_match(tmp_path, monkeypatch):
+    """#509: the durable prompt and the launch read one authoritative capability fact — the
+    persisted render-time marker — instead of each independently re-probing ``codex --version``.
+    An exact match at launch verifies the role-override intent the brief promised (the launch
+    supervisor generates the actual declarations later, immediately before it spawns the
+    provider — see :mod:`agentflow.coordinator._launch_child`); a record that was never rendered
+    capable (``native_helpers_marker`` unset) launches durably but with that intent unset."""
+    from agentflow import runner
+    from agentflow.coordinator.providers import CodexProviderAdapter
+
+    monkeypatch.setattr(runner, "_codex_version_output", lambda codex_bin: "codex-cli 0.144.0\n")
+    matched = _provider_record("codex", tmp_path)
+    matched.model = "sol"
+    matched.session_lead = True
+    matched.native_helpers_marker = "codex-cli 0.144.0\n"
+    matched.effort = "medium"
+
+    argv = CodexProviderAdapter().command(matched)
+
+    assert "--ephemeral" not in argv
+    assert "--strict-config" not in argv  # generated later, by the launch supervisor
+    assert argv.role_overrides is True
+    assert argv.worker_effort == "medium"
+
+    unrendered = _provider_record("codex", tmp_path)
+    unrendered.model = "sol"
+    unrendered.session_lead = True
+    unrendered.native_helpers_marker = None
+
+    argv2 = CodexProviderAdapter().command(unrendered)
+
+    assert "--ephemeral" not in argv2  # still a durable Sol lead launch
+    assert argv2.role_overrides is False  # no role overrides were ever promised
+    assert argv2.worker_effort is None
+
+
+def test_codex_provider_fails_launch_closed_when_capability_drifts_since_submission(
+        tmp_path, monkeypatch):
+    """The durable prompt promised role declarations for ``0.144.0``; the installed build has
+    since moved to a different exact build. Launching anyway would strand a `spawn_agent` call
+    the brief told the lead to make — this must fail the launch closed instead (#509)."""
+    from agentflow import runner
+    from agentflow.coordinator.providers import CodexProviderAdapter, NativeHelperContractMismatch
+
+    monkeypatch.setattr(runner, "_codex_version_output", lambda codex_bin: "codex-cli 0.145.0\n")
+    record = _provider_record("codex", tmp_path)
+    record.model = "sol"
+    record.session_lead = True
+    record.native_helpers_marker = "codex-cli 0.144.0\n"
+
+    import pytest
+    with pytest.raises(NativeHelperContractMismatch):
+        CodexProviderAdapter().command(record)
+
+
 def test_claude_wires_the_result_schema_to_its_native_json_schema_flag(tmp_path):
     from agentflow.intake import INTAKE_RESULT_SCHEMA
     from agentflow.reviewer import REVIEW_VERDICT_SCHEMA

@@ -27,7 +27,7 @@ from pathlib import Path
 from agentflow import (coordinated_attack, coordinated_build, coordinated_converse,
                        coordinated_intake, coordinated_mockup, coordinated_research,
                        coordinated_respond, coordinated_review, coordinated_revise, github)
-from agentflow.balancer import BUILD_POOLS, PoolStatus, pick_pair, pick_reviewer
+from agentflow.balancer import BUILD_POOLS, PoolStatus, pick_pair, pick_reviewer, pick_session_lead
 from agentflow.coordinator import (AttackStageAdapter, BuildStageAdapter, ConverseStageAdapter,
                                    Coordinator, IntakeStageAdapter, MockupStageAdapter,
                                    ResearchStageAdapter, RespondStageAdapter, ReviewStageAdapter,
@@ -481,7 +481,13 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
                 coord.submit_stage(successor)
             return
         if review.review_axis == "decision":
-            successor = coordinated_revise.conflict_decision_revise_submission(review, verdict)
+            lead, _reviewer, _block_msg = pick_session_lead(
+                stage="revise", complexity=review.builder_complexity or "deep",
+                effort=review.builder_effort)
+            if lead is None:
+                return  # capacity is temporary; retain the completed review and its claim
+            successor = coordinated_revise.conflict_decision_revise_submission(
+                review, verdict, parent_pool=lead.tool)
             if successor is None:
                 coord.park_completed(review_identity)
             else:
@@ -535,8 +541,11 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
         coord.park_completed(review_identity)
         return
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking)
-    submission = coordinated_revise.revise_submission(
-        review, complexity, findings, target_sha=verdict.final_sha or review.target)
+    lead, _reviewer, _block_msg = pick_session_lead(
+        stage="revise", complexity=complexity, effort=review.builder_effort)
+    submission = (coordinated_revise.revise_submission(
+        review, complexity, findings, target_sha=verdict.final_sha or review.target,
+        parent_pool=lead.tool) if lead is not None else None)
     if submission is not None:
         coord.submit_stage(submission)
 
@@ -583,8 +592,11 @@ def _open_revise_on_red_check(coord: Coordinator, review, records: dict) -> None
         "failure locally in the PR branch and fix it. Do not fetch CI logs. If it does not "
         "reproduce, push nothing — the next settlement re-reads the check."
         for name in head_checks.failing)
-    submission = coordinated_revise.revise_submission(
-        review, complexity, findings, target_sha=reviewed_head)
+    lead, _reviewer, _block_msg = pick_session_lead(
+        stage="revise", complexity=complexity, effort=review.builder_effort)
+    submission = (coordinated_revise.revise_submission(
+        review, complexity, findings, target_sha=reviewed_head,
+        parent_pool=lead.tool) if lead is not None else None)
     if submission is not None:
         coord.submit_stage(submission)
 

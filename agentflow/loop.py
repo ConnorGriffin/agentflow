@@ -27,7 +27,7 @@ from agentflow.intake import (INTAKE_MARK, _strip_quoted_lines, awaiting_recheck
                               replies_since_intake)
 from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS,
                               RESEARCH_PARKED, RESEARCH_TICKET, RESOLVING, TRIAGE_SKIP, TRIAGING,
-                              WAYFINDER_NON_RESEARCH, claim)
+                              WAYFINDER_NON_RESEARCH, claim, complexity_from_labels, effort_from_labels)
 from agentflow.notify import notify
 from agentflow.prompts import CONFLICT_REASON
 from agentflow.repo_facts import intake_allowlist, repo_profile
@@ -208,11 +208,17 @@ def build_issue(cfg: RepoConfig, n: int, *, floodgates: bool = False) -> str:
         return f"#{n}: can't see what's in flight (gh error) — refusing to risk a duplicate; retry"
     if not _free_to_dispatch(cfg, issue, in_flight):
         return f"#{n}: not dispatchable — already claimed, in flight, or waiting on a blocker"
+    complexity = complexity_from_labels(labels)
+    if complexity is None:
+        return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
+    effort = effort_from_labels(labels).value
     builder, _reviewer, block_msg = pick_session_lead(
-        operator=True, floodgates=floodgates)
+        operator=True, floodgates=floodgates, stage="build",
+        complexity=complexity.value, effort=effort)
     if builder is None:
         return f"#{n}: no pool has headroom ({block_msg}) — deferring"
-    submission = coordinated_build.build_submission(cfg, issue, floodgates=floodgates)
+    submission = coordinated_build.build_submission(
+        cfg, issue, parent_pool=builder.tool, floodgates=floodgates)
     if submission is None:
         return f"#{n}: skipped — no agentflow:complexity:* label (ADR 0018 hard gate)"
     # A `build <N>` on an issue whose latest Build exhausted its budget and `held` is the explicit,
@@ -689,9 +695,13 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
     if any(r.target == head_sha for r in priors):
         return f"#{pr}: conflict — revise already open"   # idempotent under re-reconcile
     conflict_round = len(priors) + 1
+    lead, _reviewer, _block_msg = pick_session_lead(
+        stage="revise", complexity="deep", effort=None)
+    if lead is None:
+        return f"#{pr}: conflict — no pool has headroom, retry next cycle"
     submission = coordinated_revise.survivor_conflict_revise_submission(
         cfg, issue=n, slug=sl, builder_tool=tool, head_sha=head_sha, pr_number=pr,
-        conflict_round=conflict_round)
+        conflict_round=conflict_round, parent_pool=lead.tool)
     if submission is None:
         return None                                       # unreconstructable → caller parks
     if not claim(cfg.repo, n, BUILDING):

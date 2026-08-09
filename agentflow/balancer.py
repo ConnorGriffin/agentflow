@@ -62,7 +62,9 @@ import time
 from dataclasses import dataclass
 
 from agentflow.coordinator import quota
-from agentflow.coordinator.store import default_store_path
+from agentflow.coordinator.admission import PERMIT_BUDGET, admission_demand
+from agentflow.coordinator.store import Store, StoreUnavailable, default_store_path
+from agentflow.routing import routing
 from agentflow.runner import ClaudeRunner, CodexRunner, _WorktreeRunner
 from agentflow.state import state_path
 
@@ -139,6 +141,14 @@ class PoolStatus:
     active: bool = False           # operator working interactively on this pool (ADR 0025)
     ceiling: float = IDLE_CEILING_PCT   # the spend ceiling this pool dispatched under
     observed_at: float | None = None    # when the latest limit fact was seen (Codex)
+
+
+@dataclass(frozen=True)
+class LeadAvailability:
+    """The one durable read cold lead selection needs before it stamps a parent."""
+
+    used: dict[str, int]
+    pr_bound_waiting: dict[str, bool]
 
 
 def _parse_codex_facts(
@@ -352,14 +362,54 @@ def choose_pair(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
 
 
 def choose_session_lead(cs: PoolStatus, xs: PoolStatus, runners: dict) -> tuple:
-    """Choose the fixed Claude session lead; Codex headroom cannot substitute for it.
+    """Choose the preferred eligible session lead.
 
-    ``xs`` remains an input so tests and diagnostics show explicitly that its state has no
-    authority over this launch. Once admitted, workers route by capability inside the session.
+    Claude/Fable remains the normal parent. A clear Codex pool restores Build/Revise progress
+    only when Claude cannot admit a parent (ADR 538); worker routing remains inside the session.
     """
-    del xs
-    return (runners["claude"], None) if cs.clear else (None, None)
+    if cs.clear:
+        return runners["claude"], None
+    if xs.clear:
+        return runners["codex"], None
+    return None, None
 
+
+def _lead_permit_status(status: PoolStatus, stage: str, complexity: str, effort: str | None,
+                        permits: dict[str, int]) -> PoolStatus:
+    model = routing.model_for_stage(stage, status.tool, complexity)
+    demand = admission_demand(stage, status.tool, model, complexity, effort)
+    used = permits.get(status.tool, 0)
+    if status.clear and demand is not None and used + demand > PERMIT_BUDGET:
+        return PoolStatus(status.tool, False, status.spent_pct,
+                          f"permit budget ({used}/{PERMIT_BUDGET} reserved; demand {demand})",
+                          status.windows, status.active, status.ceiling, status.observed_at)
+    return status
+
+
+def _lead_pr_bound_status(status: PoolStatus, waiting: bool) -> PoolStatus:
+    """Keep a cold Build behind an eligible PR-bound record on its own pool."""
+    if status.clear and waiting:
+        return PoolStatus(status.tool, False, status.spent_pct, "PR-bound work waiting",
+                          status.windows, status.active, status.ceiling, status.observed_at)
+    return status
+
+
+def _live_lead_availability(now: int | None = None) -> LeadAvailability:
+    """Read one fail-closed durable snapshot for cold session-lead eligibility."""
+    now = int(time.time()) if now is None else now
+    try:
+        store = Store(default_store_path())
+        try:
+            used, waiting = store.lead_availability(now)
+            return LeadAvailability(used, waiting)
+        finally:
+            store.close()
+    except (StoreUnavailable, OSError):
+        # A cold Build cannot safely select either parent if its shared ledger
+        # snapshot is unreadable.  Marking both pools occupied also retains the
+        # existing hard-permit fail-closed behavior for Revise.
+        return LeadAvailability({pool: PERMIT_BUDGET for pool in BUILD_POOLS},
+                                {pool: True for pool in BUILD_POOLS})
 
 def choose_reviewer(builder_tool: str, cs: PoolStatus, xs: PoolStatus, *,
                     allow_same_tool: bool = True) -> str | None:
@@ -543,17 +593,41 @@ def pick_pair(claude: _WorktreeRunner | None = None,
 def pick_session_lead(claude: _WorktreeRunner | None = None,
                       codex: _WorktreeRunner | None = None,
                       operator: bool = False,
-                      floodgates: bool = False) -> tuple:
-    """Apply the existing launch gates, then choose the Claude-only build/revise parent."""
+                      floodgates: bool = False, *, stage: str,
+                      complexity: str, effort: str | None,
+                      availability: LeadAvailability | None = None) -> tuple:
+    """Apply provider and durable-permit gates, preferring Claude then Codex."""
     claude = claude or ClaudeRunner()
     codex = codex or CodexRunner()
-    cs = _query_pool("claude", operator, floodgates=floodgates)
+    # Selection and admission read the same durable permit snapshot: Claude's provider quota only
+    # updates after a session ends, so unattended selection must reserve running permits before it
+    # stamps a Claude record. Interactive and floodgates paths intentionally bypass that *soft*
+    # quota reservation, exactly as admission does; `_lead_permit_status` still enforces permits.
+    availability = _live_lead_availability() if availability is None else availability
+    reserved = availability.used
+    fg = floodgates or floodgates_active()
+    claude_reservation = (0.0 if operator or fg else
+                          reserved.get("claude", 0) * CLAUDE_INFLIGHT_RESERVE_PCT)
+    cs = _query_pool("claude", operator, reserved_pct=claude_reservation,
+                     floodgates=floodgates)
+    xs = _query_pool("codex", operator, floodgates=floodgates)
     if not operator:
-        cs = _claude_dispatch_status(cs, time.time(), floodgates=floodgates)
-    # Codex is deliberately not probed: its headroom neither permits nor refuses the parent.
-    xs = PoolStatus("codex", False, 100.0, "not a session-lead launch gate")
+        now = time.time()
+        cs = _claude_dispatch_status(cs, now, floodgates=floodgates)
+        xs = _codex_dispatch_status(xs, now, floodgates=floodgates)
+    cs = _lead_permit_status(cs, stage, complexity, effort, reserved)
+    xs = _lead_permit_status(xs, stage, complexity, effort, reserved)
+    # A new issue-bound Build must leave a pool's waiting PR work its next
+    # admission.  This barrier is intentionally neither an operator nor a
+    # floodgates override, and Revise is itself PR-bound so is never held here.
+    if stage == "build":
+        cs = _lead_pr_bound_status(cs, availability.pr_bound_waiting.get("claude", False))
+        xs = _lead_pr_bound_status(xs, availability.pr_bound_waiting.get("codex", False))
     lead, reviewer = choose_session_lead(cs, xs, {"claude": claude, "codex": codex})
     if lead is not None:
         return lead, reviewer, ""
-    reason = f"claude: {cs.reason}" if cs.reason else "claude"
+    blocked = [status for status in (cs, xs) if not status.clear]
+    reason = ", ".join(
+        f"{status.tool}: {status.reason}" if status.reason else status.tool
+        for status in blocked) or "both at capacity"
     return None, None, reason

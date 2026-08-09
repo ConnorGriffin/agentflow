@@ -1,0 +1,2 @@
+{"type":"agentflow.codex-claude-child-probe.v1","parent":{"model":"gpt-5.6-sol","json":true,"sandbox":"workspace-write","ignore_user_config":true,"ephemeral":false}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'claude --version'","aggregated_output":"2.1.212 (Claude Code)\n","exit_code":0,"status":"completed"}}

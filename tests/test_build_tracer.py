@@ -219,9 +219,11 @@ def test_codex_launch_honors_weekly_unattended_budget(monkeypatch):
     assert pipeline._production_gate()(codex) is True
 
 
-def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high"):
+def _build(subject="7", *, pool="claude", source="/wt/issue-7", effort="high",
+           session_lead=False):
     return Submission(repo="o/r", subject=subject, stage="build", pool=pool,
-                      complexity="deep", effort=effort, source=source)
+                      complexity="deep", effort=effort, source=source,
+                      session_lead=session_lead)
 
 
 def _adapter(fake, *, pr, prep, handoff=None, collision=None, main=None):
@@ -616,6 +618,28 @@ def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlock
     assert permits(coord, "claude") == moved.demand
 
 
+def test_durable_legacy_sol_build_migrates_but_marked_sol_parent_stays_pinned(make_coord):
+    """A historical durable prompt never becomes a #509 parent merely because it says Sol."""
+    fake = FakeSession()
+    blocked = _gate_blocking("codex")
+    legacy = Record(
+        identity="o/r|7|build|-", stage="build", pool="codex", demand=5, repo="o/r",
+        subject="7", model="sol", complexity="deep", source=_SRC,
+        input_ptr="historic Codex build prompt", builder_lineage="codex",
+        branch_lineage="codex", lineage="codex")
+    seed = make_coord(fake, gate=blocked, adapter=_adapter(fake, pr=[False], prep=[True]))
+    seed._store.upsert(legacy)  # persisted JSON lacks `session_lead`, as real pre-#509 rows do
+
+    coord = make_coord(fake, gate=blocked, adapter=_adapter(fake, pr=[False], prep=[True]))
+    coord.cycle("claude", now=0)
+    assert record_of(coord, legacy.identity).pool == "claude"
+
+    fresh = _build("8", pool="codex", source=_SRC, session_lead=True)
+    fresh_id = coord.submit_stage(fresh)
+    coord.cycle("claude", now=0)
+    assert record_of(coord, fresh_id).pool == "codex"
+
+
 def test_a_session_led_build_waits_for_claude_rather_than_moving_to_codex(make_coord):
     """Build launches the Claude session lead (ADR 498), so a blocked Claude launch gate makes the
     work *wait*: a clear codex pool must never adopt it, which would run a single codex agent under
@@ -625,7 +649,8 @@ def test_a_session_led_build_waits_for_claude_rather_than_moving_to_codex(make_c
     coord = make_coord(fake, gate=_gate_blocking("claude"),
                        adapter=_adapter(fake, pr=[False], prep=[True]))
     ident = coord.submit_stage(
-        _build("7", source="/work/o-r/.agentflow/worktrees/claude/issue-7-fix"))
+        _build("7", source="/work/o-r/.agentflow/worktrees/claude/issue-7-fix",
+               session_lead=True))
     assert record_of(coord, ident).model == "fable"
     coord.cycle("claude", now=0)                       # claude cannot launch it; ledger untouched
     coord.cycle("codex", now=0)                        # ... and codex must not adopt it

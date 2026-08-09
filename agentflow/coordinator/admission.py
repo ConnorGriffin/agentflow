@@ -130,7 +130,8 @@ for _pool, _model, _complexity, _demands in (
     for _effort, _demand in zip(("low", "medium", "high", "extra"), _demands, strict=True):
         _ADMISSION_ROWS[("build", _pool, _model, _complexity, _effort)] = _demand
 
-# Build and Revise now launch one Claude/Fable session lead regardless of the complexity dial.
+# Build and Revise prefer Claude/Fable and fall back to Codex/Sol. The Codex parent reserves the
+# whole pool for its lifetime, including its native helpers (ADR 538).
 # The dial still selects the established ceiling/demand cell; it no longer sizes the parent. The
 # parent's demand equals the model it replaces, so a routed session lead never reaches the
 # exclusive unknown-row fallback. Revise stays effort-blind (ADR 0029), so it keeps one row per
@@ -142,6 +143,9 @@ for _complexity, _demands in (
     for _effort, _demand in zip(("low", "medium", "high", "extra"), _demands, strict=True):
         _ADMISSION_ROWS[("build", "claude", "fable", _complexity, _effort)] = _demand
     _ADMISSION_ROWS[("revise", "claude", "fable", _complexity, None)] = 3
+    for _effort in ("low", "medium", "high", "extra"):
+        _ADMISSION_ROWS[("build", "codex", "sol", _complexity, _effort)] = PERMIT_BUDGET
+    _ADMISSION_ROWS[("revise", "codex", "sol", _complexity, None)] = PERMIT_BUDGET
 ADMISSION_MATRIX = MappingProxyType(_ADMISSION_ROWS)
 
 # The concrete model each pool runs for a given complexity — a validation of the model the
@@ -183,3 +187,20 @@ def admission_demand(stage, pool, model, complexity, effort=None):
         effort = None
     return ADMISSION_MATRIX.get(
         (stage, pool, model, complexity, effort), PERMIT_BUDGET)
+
+
+def pr_bound_waiting(records, pool: str, now: int) -> bool:
+    """Whether an eligible PR-bound record is waiting on ``pool`` right now.
+
+    Both cold lead selection and the atomic coordinator admission gate use this
+    predicate.  Keeping the record test here prevents a newly stamped Build from
+    selecting a pool whose PR-bound work must drain first, while leaving the
+    final admission check authoritative under its transaction.
+    """
+    from agentflow.coordinator.record import WAITING
+
+    return any(
+        record.stage in PR_BOUND and record.pool == pool and record.state == WAITING
+        and not record.hold_pending and record.root is None
+        and record.attempts < ATTEMPT_BUDGET and record.eligible_at <= now
+        for record in records)

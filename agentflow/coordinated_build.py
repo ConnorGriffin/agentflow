@@ -29,11 +29,11 @@ from agentflow.labels import BUILDING, complexity_from_labels, effort_from_label
 from agentflow.prompts import BUILD_PROMPT
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
-from agentflow.runner import _run, codex_spent_at_render
+from agentflow.runner import _run, codex_native_helpers_marker_at_render, codex_spent_at_render
 from agentflow.worktree_ref import WorktreeRef, source_facts
 
 
-def build_submission(cfg, issue: dict, *, floodgates: bool = False):
+def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgates: bool = False):
     """Translate one ready issue into a single session-led Build stage submission — the
     minimal facts the coordinator needs (ADR 0030). The durable input pointer is the full build
     brief the provider session runs, so a recovered attempt rebuilds the same prompt. Pure: the
@@ -49,17 +49,20 @@ def build_submission(cfg, issue: dict, *, floodgates: bool = False):
         return None
     sl = worktree_ref.slug(issue["title"])
     effort = effort_from_labels(labels).value
+    marker = codex_native_helpers_marker_at_render() if parent_pool == "codex" else None
     brief = BUILD_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort,
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
     brief += routing.session_lead_instructions(
-        "build", effort, codex_spent=codex_spent_at_render())
+        "build", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
+        native_helpers_capable=marker is not None)
     return Submission(
-        repo=cfg.repo, subject=str(n), stage="build", pool="claude",
+        repo=cfg.repo, subject=str(n), stage="build", pool=parent_pool,
         complexity=complexity.value, effort=effort,
-        source=WorktreeRef.for_build(cfg.workdir, "claude", n, sl).path, claim=True, input_ptr=brief,
-        floodgates=floodgates)
+        source=WorktreeRef.for_build(cfg.workdir, parent_pool, n, sl).path, claim=True, input_ptr=brief,
+        builder_lineage=parent_pool, branch_lineage=parent_pool, session_lead=True,
+        native_helpers_marker=marker, floodgates=floodgates)
 
 
 def resume_if_held(submission, records):
