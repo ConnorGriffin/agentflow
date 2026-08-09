@@ -21,6 +21,11 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 538](adr-538-automatic-codex-session-lead-fallback.md) — Automatic Codex session-lead
+  fallback.
+- [ADR 541](adr-541-native-session-lead-helpers.md) — Native session-lead helpers retain parent
+  accounting.
+
 - [0001](0001-per-repo-autonomy-profile.md) — One pipeline, one dial: the per-repo
   autonomy profile.
 - [0002](0002-three-autonomy-levels.md) — Three autonomy levels: `autonomous`,
@@ -250,7 +255,8 @@ Issue-keyed records:
   after it: Build and Revise wait for a clear Claude pool because that is the only pool with a
   parent implementation, and no worker delegation inside a running session consults the
   balancer. Nested `codex exec` workers deliberately bypass the Codex permit ledger. Narrows
-  0020 until ADR 509's second parent restores partial-availability throughput.
+  0020 until [ADR 538](adr-538-automatic-codex-session-lead-fallback.md)'s second parent restores
+  partial-availability throughput.
 - [ADR 498](adr-498-tiered-parent-independent-review.md) — Review stays one single-model session
   but its tier follows the builder's complexity dial — cheap for standard, frontier for deep —
   and independence is measured against the session lead's tool rather than whichever worker

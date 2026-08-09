@@ -14,7 +14,7 @@ from agentflow import (coordinated_build, coordinated_respond, coordinated_revie
                        pipeline)
 from agentflow.balancer import pick_pair, pick_session_lead
 from agentflow.intake import replies_since_intake
-from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim
+from agentflow.labels import BUILDING, RESOLVING, TRIAGING, claim, complexity_from_labels, effort_from_labels
 from agentflow.repo_facts import intake_allowlist
 from agentflow.coordinator.quota_poll import refresh_claude_quota
 from agentflow.coordinator.store import default_store_path
@@ -57,10 +57,19 @@ def _submit_coordinated_build(cfg, coordinator, _log) -> str:
             return _report("no further runnable ready-for-agent issues") if skipped \
                 else "no ready-for-agent issues"
         number = issue["number"]
-        builder, _reviewer, block_msg = pick_session_lead()
-        if builder is None:
-            return _report(f"#{number}: no pool has headroom ({block_msg}) — deferring")
-        submission = coordinated_build.build_submission(cfg, issue)
+        names = [label["name"] for label in issue.get("labels", [])]
+        complexity = complexity_from_labels(names)
+        if complexity is None:
+            # This permanent label fact has its own remediation below. Do not let a temporary
+            # permit shortage turn it into a capacity deferral before the ADR 0018 hard gate.
+            submission = None
+        else:
+            effort = effort_from_labels(names).value
+            builder, _reviewer, block_msg = pick_session_lead(
+                stage="build", complexity=complexity.value, effort=effort)
+            if builder is None:
+                return _report(f"#{number}: no pool has headroom ({block_msg}) — deferring")
+            submission = coordinated_build.build_submission(cfg, issue, parent_pool=builder.tool)
         if submission is None:
             # A definite fact, not an unreadable answer: this candidate's labels came off the
             # ready listing itself, and they carry no complexity dial. Such an issue looks

@@ -27,7 +27,7 @@ from uuid import uuid4
 
 from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
-    STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage)
+    STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage, pr_bound_waiting)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.providers import EndingReason, ProviderCause
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
@@ -156,6 +156,11 @@ class Submission:
     effort: str | None = None
     pool: str = "claude"            # allowed pool or pinned lineage
     input_ptr: str | None = None
+    session_lead: bool = False       # explicit #509 parent contract; absent historical records decode false
+    native_helpers_marker: str | None = None  # the render-time native-helper capability fact
+                                      # (agentflow.runner.codex_native_helpers_marker_at_render),
+                                      # carried onto the Record so launch can require an exact
+                                      # match instead of re-probing capability independently (#509)
     builder_lineage: str | None = None
     branch_lineage: str | None = None   # retained PR checkout owner; may differ from session lead
     builder_complexity: str | None = None  # the original builder complexity, carried to a Revise
@@ -283,6 +288,8 @@ class Coordinator:
             builder_effort=submission.builder_effort, round=submission.round,
             conflict_round=submission.conflict_round, resume=submission.resume,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
+            session_lead=submission.session_lead,
+            native_helpers_marker=submission.native_helpers_marker,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
             floodgates=submission.floodgates,
@@ -805,13 +812,13 @@ class Coordinator:
         ``revise``/``respond`` continuations bound to an existing PR on a specific lineage, stay
         pinned; only a genuinely fresh Build moves.
 
-        Build is session-led, and only one pool can run that lead (ADR 498), so the move is
-        one-directional: a durable pre-#498 Build stranded on the other pool may still be re-placed
-        onto the lead's pool, but a Build already there *waits* when that pool is blocked. Adopting
-        it elsewhere would launch a single agent of the wrong tool under instructions written for
-        the accountable lead."""
+        A record created before this explicit marker remains historical even if its legacy model
+        happens to be ``sol`` and its prompt is durable. Such records retain the old safe Codex→
+        Claude migration. Fresh marked Fable and Sol parents already selected their pool before
+        persistence and stay pinned."""
         return (record.stage == "build" and record.attempts == 0
-                and dest_pool == routing.LEAD_POOL)
+                and not record.session_lead
+                and dest_pool == "claude")
 
     def _admit_migration(self, record: Record, dest_pool: str, now: int) -> None:
         """Move a migratable stage to ``dest_pool``, recomputing its admission demand and model
@@ -855,11 +862,7 @@ class Coordinator:
         permits are per-pool. Coupling pools here would invite a cross-pool deadlock. A gate-blocked
         autonomous review deliberately stays waiting for its required independent tool without
         consuming permits; reviewed-profile same-tool fallback is selected before submission."""
-        return any(
-            r.stage in PR_BOUND and r.pool == pool and r.state == WAITING
-            and not r.hold_pending and r.root is None
-            and r.attempts < ATTEMPT_BUDGET and r.eligible_at <= now
-            for r in self._records.values())
+        return pr_bound_waiting(self._records.values(), pool, now)
 
     def _begin_start(self, record: Record, now: int) -> bool:
         if (record.state != WAITING or record.hold_pending

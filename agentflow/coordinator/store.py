@@ -174,6 +174,30 @@ class Store:
                 raise StoreUnavailable(f"cannot read continuation store: {e}") from e
         return {r.identity: r for r in (self._decode(row[0]) for row in rows)}
 
+    def lead_availability(self, now: int) -> tuple[dict[str, int], dict[str, bool]]:
+        """One durable snapshot for cold session-lead selection.
+
+        The hard permit counts and the PR-bound drain-first barrier must describe
+        the same instant.  This is a read-only convenience over the existing
+        ledger, not a second reservation ledger; coordinator admission remains
+        the atomic authority when the selected submission starts.
+        """
+        from agentflow.coordinator.admission import pr_bound_waiting
+
+        with self._lock:
+            try:
+                rows = self._conn.execute("SELECT data FROM records").fetchall()
+            except sqlite3.DatabaseError as e:
+                raise StoreUnavailable(f"cannot read continuation store: {e}") from e
+        records = [self._decode(row[0]) for row in rows]
+        permits = {
+            pool: sum(record.demand for record in records
+                      if record.pool == pool and record.state == RUNNING)
+            for pool in ("claude", "codex")
+        }
+        waiting = {pool: pr_bound_waiting(records, pool, now) for pool in permits}
+        return permits, waiting
+
     def upsert(self, record: Record, *, retire_descendants: bool = False) -> bool:
         """Persist one record only if its durable revision is still current.
 

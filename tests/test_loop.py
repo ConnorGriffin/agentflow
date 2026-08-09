@@ -576,8 +576,10 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
                          labels=["ready-for-agent", "agentflow:complexity:standard"])
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
+    picked = []
     monkeypatch.setattr(loop, "pick_session_lead",
-                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda **kwargs: picked.append(kwargs) or
+                        (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: True)
     submission = SimpleNamespace(resume=0, pool="claude")
     monkeypatch.setattr(coordinated_build, "build_submission", lambda *_, **__: submission)
@@ -598,6 +600,8 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     assert out == "#5: submitted to coordinator → claude (build)"
     assert submitted == [submission]
     assert reconciled == [coordinator]
+    assert picked == [{"operator": True, "floodgates": False, "stage": "build",
+                       "complexity": "standard", "effort": "medium"}]
 
 
 def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(monkeypatch):
@@ -615,7 +619,7 @@ def test_build_issue_resumes_an_exhausted_held_build_on_the_original_worktree(mo
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     # The held Build predates session-led dispatch and owns a Codex checkout.
     monkeypatch.setattr(loop, "pick_session_lead",
-                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="codex"), None, ""))
+                        lambda **_kwargs: (SimpleNamespace(tool="codex"), None, ""))
     claimed = []
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claimed.append(n) or True)
     base = Submission(repo="o/r", subject="5", stage="build", pool="claude",
@@ -660,7 +664,7 @@ def test_build_issue_withdraws_the_submission_when_the_claim_race_is_lost(monkey
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_session_lead",
-                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: False)   # the race is lost
     submission = SimpleNamespace(resume=0, pool="claude")
     monkeypatch.setattr(coordinated_build, "build_submission", lambda *_, **__: submission)
@@ -695,7 +699,7 @@ def test_build_issue_acknowledges_a_resume_already_running(monkeypatch):
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_session_lead",
-                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(loop, "claim",
                         lambda repo, n, _label: pytest.fail("must not claim a held record"))
     submission = SimpleNamespace(repo="o/r", subject="5", resume=0, pool="claude")
@@ -732,7 +736,7 @@ def test_build_issue_dispatches_again_after_a_withdrawn_never_run_attempt(monkey
     _issue_view(monkeypatch, issue)
     monkeypatch.setattr(loop, "_issues_in_flight", lambda cfg: set())
     monkeypatch.setattr(loop, "pick_session_lead",
-                        lambda operator=False, floodgates=False: (SimpleNamespace(tool="claude"), None, ""))
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
     monkeypatch.setattr(coordinated_build, "build_submission",
                         lambda *_, **__: Submission(repo="o/r", subject="5", stage="build",
                                               pool="claude", complexity="deep"))
@@ -1295,6 +1299,8 @@ def _stub_conflict_env(monkeypatch, *, priors, head="sha-conf", claim=True):
                         lambda argv: _FakeRun(head + "\n") if "rev-parse" in argv else _FakeRun(""))
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: list(priors))
     monkeypatch.setattr(loop, "claim", lambda repo, n, _label: claim)
+    monkeypatch.setattr(loop, "pick_session_lead",
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
     submitted = []
     monkeypatch.setattr(pipeline, "build_coordinator",
                         lambda: SimpleNamespace(submit_stage=submitted.append))
@@ -1309,6 +1315,10 @@ def test_survivor_conflict_opens_a_conflict_revise_on_the_builder_lineage(monkey
     lineage with the ADR's findings text, and posts no park comment. Reproduces the #194 park —
     before the fix, this path called _park_conflicted_survivor and submitted nothing."""
     submitted, reconciled = _stub_conflict_env(monkeypatch, priors=[], head="sha-conf")
+    picked = []
+    monkeypatch.setattr(loop, "pick_session_lead",
+                        lambda **kwargs: picked.append(kwargs) or
+                        (SimpleNamespace(tool="claude"), None, ""))
     parked = []
     monkeypatch.setattr(loop, "_park_conflicted_survivor", lambda cfg, pr, n: parked.append(pr))
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CONFLICT)
@@ -1324,6 +1334,7 @@ def test_survivor_conflict_opens_a_conflict_revise_on_the_builder_lineage(monkey
     assert "resolve the merge conflicts" in sub.input_ptr
     assert "Preserve both sides" in sub.input_ptr
     assert "revise round 1 opened" in out
+    assert picked == [{"stage": "revise", "complexity": "deep", "effort": None}]
 
 
 def test_second_survivor_conflict_opens_a_distinct_second_round_idempotently(monkeypatch):
@@ -1506,6 +1517,8 @@ def _survivor_world(monkeypatch, *, head="sha-conf", records=(), profile="review
     head, the durable coordinator store and the rebase verdict. Everything a test asserts about
     ordering, comment reads and retirement is the real code path. The returned dict is mutable, so
     a test can advance the world between cycles the way a real cycle would."""
+    monkeypatch.setattr(loop, "pick_session_lead",
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
     world = {"rows": [{"id": "clean", "createdAt": "2026-08-01T09:00:00Z", "body": _HAND_OFF}],
              "records": list(records), "reads": 0, "rebased": [], "submitted": [],
              "edits_fail": False, "head": head}

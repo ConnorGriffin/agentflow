@@ -101,6 +101,9 @@ class _Live:
         self.verdict = verdict
         self.fail_gh = False            # flip to make every gh read fail (a transient outage)
         self.projections = []
+        monkeypatch.setattr(
+            pipeline, "pick_session_lead",
+            lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
         # The transitions state PR/issue facts through the github module now, never by shelling
         # out: the open PR for a branch, the issue's acceptance body, the PR's own content that a
         # reopened review's depth is assigned from, and the PR identity — the last kept unreadable
@@ -1162,6 +1165,12 @@ def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineag
     assert sub.effort == effort and sub.builder_effort == effort
     assert "shared rule owns ties" in sub.input_ptr
 
+    codex = coordinated_revise.conflict_decision_revise_submission(
+        review, verdict, parent_pool="codex")
+    assert codex is not None
+    assert codex.builder_lineage == "codex"
+    assert codex.review.change_author_tool == "codex"
+
     fake = FakeSession()
     coord = make_coord(fake)
     identity = coord.submit_stage(replace(sub, transfer_from=None))
@@ -1173,6 +1182,50 @@ def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineag
     attempt = next(entry for entry in read_attempts(coord._store.path)
                    if entry.identity == identity)
     assert attempt.effort == effort and attempt.reasoning_effort == reasoning
+
+
+def test_fresh_codex_revise_shapes_keep_the_retained_branch_lineage():
+    review = Record(
+        identity="o/r|7|review|head", stage="review", pool="claude", demand=1,
+        repo="o/r", subject="7", target="head", builder_lineage="claude",
+        branch_lineage="claude", builder_complexity="deep", builder_effort="high",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    ordinary = coordinated_revise.revise_submission(
+        review, "deep", "- fix", parent_pool="codex")
+    decision_review = replace(review, review_axis="decision", conflict_round=1,
+                              uncertainty_handoffs=1)
+    decision = coordinated_revise.conflict_decision_revise_submission(
+        decision_review, Verdict(clean=True, decision="keep both"), parent_pool="codex")
+    survivor = coordinated_revise.survivor_conflict_revise_submission(
+        SimpleNamespace(repo="o/r", workdir="/work"), issue=7, slug="fix", builder_tool="claude",
+        head_sha="head", pr_number=42, conflict_round=1, parent_pool="codex")
+
+    for submission in (ordinary, decision, survivor):
+        assert submission is not None
+        assert submission.pool == submission.builder_lineage == "codex"
+        assert submission.branch_lineage == "claude"
+        assert "Codex workers use" in submission.input_ptr
+
+
+def test_decision_revise_waits_for_capacity_without_parking_the_completed_review(monkeypatch):
+    review = Record(
+        identity="o/r|7|review|head|adecision|u1", stage="review", pool="claude", demand=1,
+        repo="o/r", subject="7", target="head", builder_lineage="claude",
+        branch_lineage="claude", builder_complexity="deep", review_axis="decision",
+        conflict_round=1, uncertainty_handoffs=1,
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    coord = SimpleNamespace(submit_stage=lambda _: pytest.fail("must wait"), parked=[])
+    coord.park_completed = coord.parked.append
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [review])
+    monkeypatch.setattr(coordinated_review, "_review_verdict",
+                        lambda _: Verdict(clean=True, decision="keep both",
+                                          change_author_tool="codex"))
+    monkeypatch.setattr(pipeline, "pick_session_lead",
+                        lambda **_kwargs: (None, None, "capacity"))
+
+    pipeline._open_revise_on_blocking_review(coord, review.identity)
+
+    assert coord.parked == []
 
 
 def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypatch):

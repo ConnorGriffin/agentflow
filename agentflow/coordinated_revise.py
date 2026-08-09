@@ -28,7 +28,7 @@ from agentflow.balancer import BUILD_POOLS
 from agentflow.prompts import REVISE_PROMPT
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
 from agentflow.routing import routing
-from agentflow.runner import _run, codex_spent_at_render
+from agentflow.runner import _run, codex_native_helpers_marker_at_render, codex_spent_at_render
 from agentflow.stage_worktree import worktree_owns_head
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef, source_facts
 
@@ -42,13 +42,22 @@ _CONFLICT_REVISE_FINDING = (
     "intent, return the private two-option conflict uncertainty instead of choosing silently.")
 
 
-def _session_lead_prompt(prompt: str, effort: str | None) -> str:
-    return prompt + routing.session_lead_instructions(
-        "revise", effort, codex_spent=codex_spent_at_render())
+def _session_lead_prompt(prompt: str, effort: str | None,
+                         parent_pool: str) -> tuple[str, str | None]:
+    """The rendered brief plus the one native-helper capability marker (#509) it was rendered
+    against for a Codex parent (``None`` for a Claude parent or an incapable Codex build) — the
+    caller carries this marker onto the ``Submission`` so launch can require an exact match
+    instead of re-deriving its own capability fact."""
+    marker = codex_native_helpers_marker_at_render() if parent_pool == "codex" else None
+    brief = prompt + routing.session_lead_instructions(
+        "revise", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
+        native_helpers_capable=marker is not None)
+    return brief, marker
 
 
 def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_tool: str,
-                                        head_sha: str, pr_number: int, conflict_round: int):
+                                        head_sha: str, pr_number: int, conflict_round: int,
+                                        parent_pool: str = "claude"):
     """Submit a conflict Revise for an open survivor whose re-rebase no longer applies (ADR 0038).
 
     Like a survivor re-review, a survivor has no completed coordinator predecessor to transfer from —
@@ -61,16 +70,17 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
     from agentflow.coordinator import Submission
     if not head_sha or builder_tool not in BUILD_POOLS:
         return None
-    brief = _session_lead_prompt(REVISE_PROMPT.format(
+    brief, marker = _session_lead_prompt(REVISE_PROMPT.format(
         n=pr_number, repo=cfg.repo, findings=f"- {_CONFLICT_REVISE_FINDING}",
-        surfaces="any user-facing surface"), None)
+        surfaces="any user-facing surface"), None, parent_pool)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
-        pool="claude", complexity="deep", conflict_round=conflict_round,
+        pool=parent_pool, complexity="deep", conflict_round=conflict_round,
         source=WorktreeRef.for_build(cfg.workdir, builder_tool, issue, slug).path,
         claim=True, input_ptr=brief,
-        builder_lineage="claude", branch_lineage=builder_tool,
-        builder_complexity="deep", continuation=True)
+        builder_lineage=parent_pool, branch_lineage=builder_tool,
+        builder_complexity="deep", continuation=True, session_lead=True,
+        native_helpers_marker=marker)
 
 
 def _revise_builder_source(review_record):
@@ -88,7 +98,8 @@ def _revise_builder_source(review_record):
     return build.path, review.number
 
 
-def revise_submission(review_record, complexity, findings="", *, surfaces="", target_sha=""):
+def revise_submission(review_record, complexity, findings="", *, surfaces="", target_sha="",
+                      parent_pool: str = "claude"):
     """Translate a blocking Review into one Revise stage submission — the minimal facts the
     coordinator needs (ADR 0030). The revise adopts the original builder's retained PR branch and
     worktree, stays pinned to the builder's tool lineage and its original complexity and effort,
@@ -103,21 +114,22 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     if facts is None or not reviewed_head:
         return None
     build_worktree, pr_number = facts
-    brief = _session_lead_prompt(REVISE_PROMPT.format(
+    brief, marker = _session_lead_prompt(REVISE_PROMPT.format(
         n=pr_number, repo=review_record.repo, findings=findings or "- (see review)",
-        surfaces=surfaces or "any user-facing surface"), review_record.builder_effort)
+        surfaces=surfaces or "any user-facing surface"), review_record.builder_effort, parent_pool)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=reviewed_head, pool="claude", complexity=complexity,
+        target=reviewed_head, pool=parent_pool, complexity=complexity,
         effort=review_record.builder_effort, source=build_worktree, claim=True, input_ptr=brief,
-        builder_lineage="claude",
+        builder_lineage=parent_pool,
         branch_lineage=review_record.branch_lineage or review_record.builder_lineage,
         builder_complexity=complexity,
         builder_effort=review_record.builder_effort,
-        round=review_record.round, transfer_from=review_record.identity)
+        round=review_record.round, transfer_from=review_record.identity, session_lead=True,
+        native_helpers_marker=marker)
 
 
-def conflict_decision_revise_submission(review_record, verdict):
+def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: str = "claude"):
     """Resume the same retained conflict after the other tool supplies a grounded decision."""
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
@@ -132,9 +144,9 @@ def conflict_decision_revise_submission(review_record, verdict):
         "The other tool resolved the private conflict decision. Apply this choice while preserving "
         f"all compatible behavior: {verdict.decision}"
     )
-    prompt = _session_lead_prompt(REVISE_PROMPT.format(
+    prompt, marker = _session_lead_prompt(REVISE_PROMPT.format(
         n=pr_number, repo=review_record.repo, findings=f"- {decision}",
-        surfaces="any user-facing surface"), review_record.builder_effort)
+        surfaces="any user-facing surface"), review_record.builder_effort, parent_pool)
     prior = ReviewState.from_record(review_record)
     if prior is None:
         return None
@@ -142,19 +154,19 @@ def conflict_decision_revise_submission(review_record, verdict):
         prior,
         assignment=ReviewAssignment(
             ReviewDepth.FULL, review_record.depth_reason, ReviewAxis.PRODUCT),
-        change_author_tool=review_record.builder_lineage, handoff=decision)
+        change_author_tool=parent_pool, handoff=decision)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=review_record.target, pool="claude",
+        target=review_record.target, pool=parent_pool,
         complexity=review_record.builder_complexity or "deep",
         effort=review_record.builder_effort, source=build_worktree,
-        claim=True, input_ptr=prompt, builder_lineage="claude",
+        claim=True, input_ptr=prompt, builder_lineage=parent_pool,
         branch_lineage=review_record.branch_lineage or review_record.builder_lineage,
         builder_complexity=review_record.builder_complexity or "deep",
         builder_effort=review_record.builder_effort,
         round=review_record.round, conflict_round=review_record.conflict_round,
-        transfer_from=review_record.identity, continuation=True,
-        review=review)
+        transfer_from=review_record.identity, continuation=True, session_lead=True,
+        review=review, native_helpers_marker=marker)
 
 
 def _conflict_uncertainty_outcome(record, obs) -> str | None:

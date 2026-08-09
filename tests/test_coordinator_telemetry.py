@@ -363,6 +363,34 @@ def test_lead_run_attempt_with_merged_worker_capture_has_no_not_counted_mark(tmp
     assert "delegate spend not counted" not in format_spend_report(report)
 
 
+def test_sol_lead_helper_usage_is_captured_without_counting_its_parent(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="sol-missing", stage="build", model="sol",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("sol", None, input_tokens=100, output_tokens=20),
+            ModelCost("gpt-5.6-sol", None, input_tokens=5, output_tokens=1)))))
+    record_attempt(store, _entry(
+        token="sol-captured", stage="revise", model="sol",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("sol", None, input_tokens=100, output_tokens=20),
+            ModelCost("terra", None, input_tokens=50, output_tokens=10)))))
+    record_attempt(store, _entry(
+        token="sol-claude-helper", stage="build", model="sol",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("sol", None, input_tokens=100, output_tokens=20),
+            ModelCost("sonnet", 0.03, input_tokens=50, output_tokens=10)))))
+    record_attempt(store, _entry(
+        token="sol-opus-helper", stage="revise", model="sol",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("gpt-5.6-sol", None, input_tokens=100, output_tokens=20),
+            ModelCost("opus", 0.05, input_tokens=50, output_tokens=10)))))
+
+    rows = {(row.stage, row.model): row for row in spend_report(store, start=50, end=150).rows}
+    assert rows[("build", "sol")].delegate_uncaptured_attempts == 1
+    assert rows[("revise", "sol")].delegate_uncaptured_attempts == 0
+
+
 def test_spend_report_does_not_rewrite_historical_entry_files(tmp_path):
     store = tmp_path / "records.db"
     record_attempt(store, _entry(

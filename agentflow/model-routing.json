@@ -10,7 +10,7 @@
     "opus": {"provider": "claude", "cli_id": "claude-opus-5", "role": "worker"},
     "sonnet": {"provider": "claude", "cli_id": "sonnet", "role": "worker"},
     "haiku": {"provider": "claude", "cli_id": "haiku", "role": "worker"},
-    "sol": {"provider": "codex", "cli_id": "gpt-5.6-sol", "role": "worker"},
+    "sol": {"provider": "codex", "cli_id": "gpt-5.6-sol", "role": "session-lead"},
     "terra": {"provider": "codex", "cli_id": "gpt-5.6-terra", "role": "worker"},
     "luna": {"provider": "codex", "cli_id": "gpt-5.6-luna", "role": "worker"}
   },

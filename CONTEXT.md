@@ -114,22 +114,24 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   low in a vibe-code project.
 
 - **Complexity** — the per-issue review and ceiling dial intake stamps as a hard gate:
-  `standard` (cheap review) or `deep` (frontier review). Build and Revise always launch a
-  Fable session lead; complexity no longer sizes that parent. The dial still selects the
+  `standard` (cheap review) or `deep` (frontier review). Build and Revise prefer a Fable
+  session lead and fall back to Sol when Claude cannot admit; complexity no longer sizes that
+  parent. The dial still selects the
   established Build/Revise ceiling and travels durably as `builder_complexity` so every
   review round keeps the original tier (ADR 498).
 
 - **Effort** — the second dial intake stamps alongside complexity: `low | medium |
-  high | extra` — how much work the issue warrants. The Fable parent always launches at
+  high | extra` — how much work the issue warrants. The selected Fable or Sol parent launches at
   low reasoning; the dial maps to the worker reasoning rung in its brief (`extra` → `xhigh`)
   and retains the established ceiling. Revise inherits it; non-build stages use provider
   defaults (ADR 0044/0046/498).
 
 - **Session lead** — the fixed parent accountable for a Build or Revise session. It plans,
   delegates by the benchmarked capability table, verifies results, and ships; it never writes
-  the implementation directly. The current implementation is Claude/Fable at low reasoning.
+  the implementation directly. Claude/Fable is preferred; Codex/Sol is the low-reasoning
+  fallback when Claude cannot admit.
 
-- **Runner** — the executor of a pipeline stage. Build and Revise use the Claude/Fable
+- **Runner** — the executor of a pipeline stage. Build and Revise use the selected Fable or Sol
   session lead; other stages retain their stage-specific Claude or Codex runner.
 
 - **Builder** — the accountable session lead that delegates an issue's implementation,

@@ -45,7 +45,7 @@ def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):
     ("revise", "claude", "sonnet", "standard", 3),
     ("revise", "claude", "opus", "deep", 3),
     ("revise", "codex", "terra", "standard", 4),
-    ("revise", "codex", "sol", "deep", 4),
+    ("revise", "codex", "sol", "deep", 5),
     ("respond", "claude", "opus", "deep", 3),
     ("respond", "codex", "sol", "deep", 5),
     ("mockup", "claude", "opus", "deep", 5),

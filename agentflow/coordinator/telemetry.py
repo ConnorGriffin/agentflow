@@ -620,12 +620,25 @@ def _codex_priced(model: str) -> bool:
 
 
 def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
-    """Whether ``entry`` is a lead-run build/revise attempt whose delegated Codex worker spend
-    has not been merged into its usage yet (issue #516, frozen decision 1). Once a worker-capture
-    merge (slice 2) adds a Codex-priced model-cost entry, this returns false for that attempt."""
-    if entry.stage not in _LEAD_LED_STAGES or entry.model != "fable":
+    """Whether a Fable or Sol lead has no attributed delegated-helper usage.
+
+    A Fable parent needs a reported Codex child. A Sol parent accepts any routing-known helper
+    model other than its own internal or CLI identity: Terra, Luna, generic Codex, and Claude
+    provider models are helper evidence; Sol's own internal or CLI identifier is not.
+    """
+    if entry.stage not in _LEAD_LED_STAGES or entry.model not in {"fable", "sol"}:
         return False
-    return not any(_codex_priced(cost.model) for cost in entry.usage.model_costs)
+    from agentflow.routing import routing
+    parent = routing.provider_for(entry.model)
+    def delegated_helper(cost: ModelCost) -> bool:
+        if parent == "claude" and _codex_priced(cost.model):
+            return True
+        if parent != "codex":
+            return False
+        parent_ids = {entry.model, routing.cli_identifier("codex", entry.model)}
+        return cost.model not in parent_ids and (
+            cost.model == "codex" or routing.provider_for(cost.model) is not None)
+    return not any(delegated_helper(cost) for cost in entry.usage.model_costs)
 
 
 def _priced_dollars(model: str, tokens_in, tokens_out, tokens_reasoning, billed):

@@ -84,6 +84,7 @@ class Record:
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move
     source: str | None = None    # durable working-directory/worktree pointer for provider launch
     input_ptr: str | None = None # durable pointer the provider adapter rebuilds the prompt from
+    session_lead: bool = False   # missing historical JSON decodes false; never infer from model
     outcome: str | None = None   # stage-native durable outcome, captured before external projection
     started_at: int = 0                  # epoch when the current attempt was admitted
     deadline: int = 0                    # supervisor observe-until deadline, for the recovered-running log
@@ -174,6 +175,14 @@ class Record:
                                          # same effect as the fleet-wide toggle — weekly allowance
                                          # lifted, ceiling raised to 100, pacing cap lifted — but
                                          # scoped to this one record; the permit ledger is untouched
+    native_helpers_marker: str | None = None  # the exact `codex --version` stdout the durable
+                                         # session-lead brief was rendered as native-helper
+                                         # capable against (#509); None for every non-Codex-lead
+                                         # record and for a lead render that was not capable.
+                                         # The launch-time provider adapter requires today's
+                                         # installed build to match this exactly before it
+                                         # injects the role declarations the brief promised —
+                                         # never re-derives its own independent capability fact
 
 
 def stalled_for(record: Record, now: int) -> int:
