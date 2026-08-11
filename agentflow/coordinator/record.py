@@ -175,7 +175,7 @@ class Record:
                                          # same effect as the fleet-wide toggle — weekly allowance
                                          # lifted, ceiling raised to 100, pacing cap lifted — but
                                          # scoped to this one record; the permit ledger is untouched
-    # Retained only so pre-#555 durable records decode on restart. No production launch reads it.
+    # Retained so pre-#555 durable session-lead records decode and refresh safely on restart.
     native_helpers_marker: str | None = None
 
 
