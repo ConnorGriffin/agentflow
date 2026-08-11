@@ -24,6 +24,17 @@ uv run agentflow status
 Activation permits cold submissions. It does not discard existing records; the first full pass
 reconciles them before admission.
 
+To keep one provider out of admission while the other continues, use the durable per-pool control:
+
+```bash
+uv run agentflow pool pause claude
+uv run agentflow pool status claude
+uv run agentflow pool resume claude
+```
+
+A per-pool pause survives service restarts and is not bypassed by operator dispatch or floodgates.
+It does not replace the fleet-wide `pause`/`resume` drain boundary.
+
 ## Observe
 
 Use `uv run agentflow status` and `~/Library/Logs/agentflow.log`, captured by the

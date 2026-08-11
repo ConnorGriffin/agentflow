@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from agentflow.coordinator import quota
 from agentflow.coordinator.admission import PERMIT_BUDGET, admission_demand
 from agentflow.coordinator.store import Store, StoreUnavailable, default_store_path
+from agentflow.pool_control import pool_paused
 from agentflow.routing import routing
 from agentflow.runner import ClaudeRunner, CodexRunner, _WorktreeRunner
 from agentflow.state import state_path
@@ -463,6 +464,8 @@ def _gate_facts(env: dict, operator: bool) -> tuple[bool, bool, str, str]:
 def _query_pool(tool: str, operator: bool = False, *,
                 reserved_pct: float = 0.0, now: float | None = None,
                 floodgates: bool = False) -> PoolStatus:
+    if pool_paused(tool):
+        return PoolStatus(tool, False, 100.0, "paused by operator")
     now = time.time() if now is None else now
     fg = floodgates or floodgates_active()
     env = {**os.environ, "TRIAGE_AGENT": tool}

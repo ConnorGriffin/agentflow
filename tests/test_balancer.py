@@ -7,11 +7,13 @@ import time
 import pytest
 
 from agentflow import balancer
-from agentflow.balancer import (PoolStatus, RateLimitWindow, _codex_dispatch_status,
-                                 choose_pair, choose_reviewer, parse_pct, pick_pair)
+from agentflow.balancer import (LeadAvailability, PoolStatus, RateLimitWindow,
+                                 _codex_dispatch_status, choose_pair, choose_reviewer,
+                                 parse_pct, pick_pair, pick_session_lead)
 from agentflow.coordinator import quota
 from agentflow.coordinator.store import default_store_path
 from agentflow.dashboard_data import pools
+from agentflow.state import state_path
 
 RUNNERS = {"claude": "CLAUDE", "codex": "CODEX"}
 
@@ -134,6 +136,49 @@ def test_missing_optional_capacity_helper_keeps_codex_closed_but_uses_claude_fac
     codex = balancer._query_pool("codex")
     assert codex.clear is False
     assert codex.reason == "capacity helper not configured"
+
+
+@pytest.mark.parametrize(("operator", "floodgates"), [
+    (False, False),
+    (True, False),
+    (False, True),
+])
+def test_operator_paused_pool_fails_before_capacity_helper(
+        monkeypatch, operator, floodgates):
+    flag = state_path("pools", "claude.paused")
+    flag.parent.mkdir(parents=True)
+    flag.touch()
+
+    def capacity_probe(*_args, **_kwargs):
+        raise AssertionError("an operator-paused pool must not probe the provider")
+
+    monkeypatch.setattr(balancer.subprocess, "run", capacity_probe)
+
+    status = balancer._query_pool(
+        "claude", operator=operator, floodgates=floodgates)
+
+    assert status.clear is False
+    assert status.reason == "paused by operator"
+
+
+def test_session_lead_falls_back_to_codex_when_claude_is_operator_paused(
+        stub_gate, monkeypatch):
+    flag = state_path("pools", "claude.paused")
+    flag.parent.mkdir(parents=True)
+    flag.touch()
+    monkeypatch.setenv("TEST_LIMITS", _limits(time.time(), [{
+        "used_percent": 4,
+        "window_minutes": 10080,
+        "resets_at": int(time.time()) + 6 * 24 * 60 * 60,
+    }]))
+
+    lead, _reviewer, reason = pick_session_lead(
+        "CLAUDE", "CODEX", operator=True, stage="build", complexity="standard",
+        effort="low", availability=LeadAvailability(
+            {"claude": 0, "codex": 0}, {"claude": False, "codex": False}))
+
+    assert lead == "CODEX"
+    assert reason == ""
 
 
 # --- choose_reviewer: ADR 0020 review under partial availability -----------------
