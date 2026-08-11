@@ -88,32 +88,18 @@ class LocalLauncher:
         return pid_family_alive(family)
 
     def start(self, record, store) -> StartResult:
-        from agentflow.coordinator.providers import NativeHelperContractMismatch
-
         token = record.launch_token
         try:
             command = self._provider_command(record)
-        except NativeHelperContractMismatch:
-            # The installed Codex build no longer matches the capability this launch's durable
-            # prompt already promised the lead (#509) — no provider family ever came into
-            # existence, exactly like the OSError case below, so it fails through the same
-            # existing not-started path rather than a new one.
+        except OSError:
             return StartResult(NOT_STARTED)
         argv = [str(a) for a in command]
-        # The narrow role-override intent (#509) this command already verified, threaded to the
-        # supervisor as two small dedicated fields it recomputes the exact same routes from — a
-        # boolean and a reasoning-effort string, never a directory or a file path. A plain-list
-        # double (tests) carries neither attribute, so this is a no-op for those, exactly like
-        # an ordinary launch with no role overrides.
-        role_overrides = getattr(command, "role_overrides", False)
-        worker_effort = getattr(command, "worker_effort", None)
         try:
             child = subprocess.Popen(
                 [sys.executable, "-m", "agentflow.coordinator._launch_child",
                  str(store.path), record.identity, str(token),
                  str(self._session_timeout_for(record)),
-                 record.source or "", "1" if role_overrides else "",
-                 worker_effort or "", *argv])
+                 record.source or "", *argv])
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence
         # The intermediate exits at once; reap it so it does not linger. The provider

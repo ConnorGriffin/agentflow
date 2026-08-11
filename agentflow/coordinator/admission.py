@@ -131,7 +131,7 @@ for _pool, _model, _complexity, _demands in (
         _ADMISSION_ROWS[("build", _pool, _model, _complexity, _effort)] = _demand
 
 # Build and Revise prefer Claude/Fable and fall back to Codex/Sol. The Codex parent reserves the
-# whole pool for its lifetime, including its native helpers (ADR 538).
+# whole pool for its lifetime, including bounded nested workers (ADR 538).
 # The dial still selects the established ceiling/demand cell; it no longer sizes the parent. The
 # parent's demand equals the model it replaces, so a routed session lead never reaches the
 # exclusive unknown-row fallback. Revise stays effort-blind (ADR 0029), so it keeps one row per

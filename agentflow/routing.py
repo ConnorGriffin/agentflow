@@ -247,7 +247,7 @@ class CapabilityRouting:
         return self._reasoning.get(effort or "medium", "medium")
 
     def _codex_worker_models(self) -> frozenset[str]:
-        """Every Codex model reachable as a *worker* rung in any area's ladder, including Sol:
+        """Every Codex model reachable as a worker rung in any area's ladder, including Sol:
         ``role: session-lead`` on ``sol`` is parent eligibility only (:data:`_LEAD_MODELS`), and
         is separate from whether an area's ladder also routes delegated work to it — the plan/
         spec, prototype, and documentation ladders all do. Deriving from the ladders themselves
@@ -257,21 +257,16 @@ class CapabilityRouting:
             model for area in self._areas.values() for route in area.routes
             for model in route.ladder if self._models[model]["provider"] == "codex")
 
-    def codex_worker_roles(self, effort: str | None) -> tuple[tuple[str, str, str], ...]:
-        """The ``(role_name, cli_id, reasoning_effort)`` triples a 0.144.0 native-helper
-        compatibility adapter (:mod:`agentflow.codex_native_helpers`) may declare for one
-        session: every Codex model reachable as a worker rung (:meth:`_codex_worker_models`),
-        crossed with the one worker reasoning rung ``effort`` resolves to (a session renders one
-        rung for every worker, so one role per model — not the full reasoning ladder — is what a
-        launch can reach). The role name is an opaque, deterministic selector
-        (``af_codex_<model>_<rung>``); no adapter should invent or maintain its own copy of this
-        pairing."""
-        rung = self.worker_reasoning(effort)
-        key = next((k for k, v in self._reasoning.items() if v == rung), rung)
-        return tuple(sorted(
-            (f"af_codex_{name}_{key}", self._models[name]["cli_id"], rung)
-            for name in self._codex_worker_models()
-        ))
+    def codex_worker_cli_identifier(self, worker: str) -> str:
+        """Resolve one routed Codex worker to its pinned CLI model id.
+
+        This is intentionally narrower than :meth:`cli_identifier`: the bounded worker launcher
+        accepts only models a ladder actually delegates to, rather than arbitrary Codex models.
+        """
+        name = self._resolve_model_name(worker)
+        if name not in self._codex_worker_models():
+            raise RoutingConfigError(f"{worker!r} is not a routed Codex worker")
+        return self._models[name]["cli_id"]
 
     @staticmethod
     def _area_line(area: Area) -> str:
@@ -291,19 +286,13 @@ class CapabilityRouting:
     def session_lead_instructions(self, stage: str, effort: str | None, *,
                                    parent_provider: str = "claude",
                                    codex_spent: bool = False,
-                                   unavailable_providers: frozenset[str] = frozenset(),
-                                   native_helpers_capable: bool = False) -> str:
+                                   unavailable_providers: frozenset[str] = frozenset()) -> str:
         """Render the session-lead brief. ``codex_spent`` is the caller's render-time capacity
         fact (see :func:`agentflow.runner.codex_spent_at_render`) — routing has no seam of its
         own onto Codex account state, so a caller that knows it passes it in; a caller that
         doesn't (or the fact was unreadable) gets the ordinary brief. ``unavailable_providers``
         is the caller's durable pool-pause snapshot, distinct from the render-time Codex capacity
-        fact. ``native_helpers_capable``
-        is the analogous render-time fact for a Codex parent's own delegation mechanism (see
-        :func:`agentflow.runner.codex_native_helpers_capable_at_render`): whether the installed
-        Codex build passes the 0.144.0 compatibility adapter's version gate. It is only consulted
-        for a Codex parent — an opposite-provider worker never goes through native `spawn_agent`
-        regardless of this flag."""
+        fact."""
         if stage not in {"build", "revise"}:
             raise RoutingConfigError(f"stage {stage!r} has no session lead")
         if parent_provider not in self._LEAD_MODELS:
@@ -314,6 +303,7 @@ class CapabilityRouting:
             for name, facts in self._models.items()
         )
         rung = self.worker_reasoning(effort)
+        effort_label = effort if effort in self._reasoning else "medium"
         preamble = ""
         if unavailable_providers:
             for provider in ("claude", "codex"):
@@ -343,38 +333,20 @@ class CapabilityRouting:
                     "delegate into it, do not invent a substitute model, and do not do the work "
                     "yourself — hand back the provider failure by name in the final handoff.\n"
                 )
-        native_provider = parent_provider.title()
         opposite_provider = ("codex" if parent_provider == "claude" else "claude")
         opposite_cli = "`codex exec`" if opposite_provider == "codex" else "the installed `claude` CLI"
-        if parent_provider != "codex":
-            native_instruction = ""
-        elif native_helpers_capable:
-            roles = self.codex_worker_roles(effort)
-            role_lines = "; ".join(
-                f"{cli_id} at {reasoning} reasoning → `agent_type=\"{role}\"`"
-                for role, cli_id, reasoning in roles)
-            native_instruction = (
-                "`spawn_agent`'s displayed schema on this build does not list an `agent_type` "
-                "parameter, but the runtime still accepts one — this is a known compatibility "
-                "path for reaching a pre-configured routed role, not a mistake to avoid. When "
-                "delegating to a Codex rung, call `spawn_agent` with `agent_type` set to the role "
-                "for the routed model and worker rung, `fork_turns=\"none\"`, and `message` set "
-                "to the worker's task, exactly as you would for any other call — include "
-                "`agent_type` even though the visible schema does not show it. Do not pass "
-                "`model` or `reasoning_effort` directly and do not merely mention either in the "
-                "worker prompt. `task_name` is only the child's instance name, never a role "
-                f"selector. Routed roles for this session: {role_lines}."
-            )
-        else:
-            native_instruction = (
-                "Native Codex delegation is unavailable for this session: the installed Codex "
-                "runtime does not pass this session's native-helper compatibility check, so "
-                "`spawn_agent`'s hidden role/model fields cannot be trusted to reach the routed "
-                "model. Never call `spawn_agent` for a Codex rung and never merely mention a "
-                "Codex model in a worker prompt — treat every Codex rung in every ladder as a "
-                "provider failure from the very start of this session and apply the "
-                "provider-failure rule below immediately, without first attempting the call."
-            )
+        codex_instruction = (
+            "Codex workers use the bounded AgentFlow command. For a Codex rung, create a fresh "
+            "file with `prompt_file=$(mktemp)` then run `trap 'rm -f \"$prompt_file\"' EXIT`; run "
+            "`chmod 600 \"$prompt_file\"`; write the task into that file without placing task "
+            "text in a shell command. Run `agentflow-codex-worker --worker <routed-name> --effort " + effort_label +
+            " --timeout 900 < \"$prompt_file\"`, capture its stdout/stderr and "
+            "exit status. This AgentFlow-owned "
+            "command reads the file without shell interpolation and enforces the routed CLI model, "
+            "reasoning effort, wall timeout, and process-group termination. Read its stdout/stderr "
+            "and non-zero result as the worker outcome. Never use `spawn_agent`, `agent_type`, or "
+            "hidden role fields."
+        )
         return f"""
 {preamble}
 ## Session lead — benchmarked capability routing
@@ -383,9 +355,8 @@ You are the accountable Session lead. Do not write the implementation directly. 
 delegate exploration, implementation, and fix work, verify every result, and ship only verified
 work. Fable is lead-only and is never a delegate target.
 
-worker reasoning rung: {rung}. Give that rung in every worker prompt. {native_provider} workers use
-native sub-agents. {native_instruction} Reach {opposite_provider.title()} workers through {opposite_cli} with the routed
-CLI id named below; do not consult pool headroom from inside this running session.
+worker reasoning rung: {rung}. {codex_instruction} Reach {opposite_provider.title()} workers through
+{opposite_cli} with the routed CLI id named below; do not consult pool headroom from inside this running session.
 
 Routes (workers enter at the first rung; a banned model never takes that area's work):
 {table}

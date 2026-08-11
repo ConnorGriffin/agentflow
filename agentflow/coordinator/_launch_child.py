@@ -2,14 +2,7 @@
 
 Run as
 ``python -m agentflow.coordinator._launch_child <store_path> <identity> <token> <timeout>
-<working_dir> <role_overrides> <worker_effort> [argv...]``. ``role_overrides`` (``"1"`` or
-empty) and ``worker_effort`` (a reasoning-effort string, or empty) are the narrow role-override
-*intent* :mod:`agentflow.coordinator.launcher` already verified — never a directory or a file
-path. When set, this supervisor recomputes the exact same routes from the routing table itself
-(:func:`agentflow.routing.CapabilityRouting.codex_worker_roles`) and generates its own role
-directory (:func:`agentflow.codex_native_helpers.build_role_overrides`) immediately before it
-spawns the provider, so that directory's path is a local value this one process both creates and
-removes — it never crosses argv, an environment variable, or the durable record (#509).
+<working_dir> [argv...]``.
 
 It double-forks so the provider family is reparented away from the daemon (and so an ended
 provider never lingers as a zombie the daemon would misread as alive), then makes a *guarded*
@@ -19,7 +12,6 @@ boundary: the attempt is recoverable even if the provider exits immediately or t
 dies before observing it. The guard is the second half of that boundary: if the coordinator
 already disowned this launch on a handshake timeout (rotating the token) or returned the
 record to waiting, the write is refused and the child exits *without* becoming a provider — and
-without ever having generated a role directory, so there is nothing to clean up in that case.
 With no provider argv (the dormant slice) it exits after a successful start, which reconciliation
 reads as a started-but-ended attempt.
 """
@@ -33,10 +25,8 @@ import sys
 import time
 from pathlib import Path
 
-from agentflow import codex_native_helpers
 from agentflow.coordinator.session import events_path, write_result
 from agentflow.coordinator.store import Store
-from agentflow.routing import routing
 
 
 def _mark_active(working_dir: str) -> Path | None:
@@ -65,30 +55,8 @@ def _clear_active(marker: Path | None) -> None:
         pass
 
 
-def _prepare_provider_argv(
-        provider: list[str], role_overrides: bool,
-        worker_effort: str | None) -> tuple[list[str], Path | None]:
-    """Generate this launch's role overrides (#509), immediately before ``Popen``, and splice
-    their CLI argv into *provider* right before its final positional element (the prompt) —
-    order among ``-c`` flags ahead of that positional argument does not matter to ``codex exec``.
-    Returns the resulting argv and the local directory this call owns (``None`` for a launch
-    that declared no role overrides, or one with no provider argv to append ahead of). The
-    directory is created fresh here, read once to build this argv, and never returned any
-    further than this function's caller — the same process that also cleans it up."""
-    if not role_overrides or not provider:
-        return provider, None
-    overrides = codex_native_helpers.build_role_overrides(
-        routing.codex_worker_roles(worker_effort))
-    if not overrides.argv:
-        return provider, overrides.directory
-    return provider[:-1] + overrides.argv + provider[-1:], overrides.directory
-
-
 def main(args: list[str]) -> None:
-    (store_path, identity, token, timeout, working_dir, role_overrides_flag,
-     worker_effort, *provider) = args
-    role_overrides = bool(role_overrides_flag)
-    worker_effort = worker_effort or None
+    store_path, identity, token, timeout, working_dir, *provider = args
     # Double-fork: the intermediate exits immediately so the daemon reaps it at once, while
     # the detached supervisor is reparented to init and cannot zombie under the daemon.
     if os.fork() > 0:
@@ -124,26 +92,15 @@ def main(args: list[str]) -> None:
     events = events_path(store_path, token)
     events.parent.mkdir(parents=True, exist_ok=True)
     timed_out = False
-    # Own the role directory (#509), if any, for its whole lifetime: this supervisor is the one
-    # process that both generates it (immediately below, right before Popen) and observes the
-    # provider actually end, so it is the one that removes it — on a role-generation failure, a
-    # spawn failure, a clean exit, or a provider failure alike — rather than leaving every
-    # launch's directory for the 24h stale sweep. ``os._exit`` bypasses ``finally`` blocks, so
-    # every exit below calls this explicitly instead of relying on one wrapping ``try``.
-    owned_role_dir: Path | None = None
     with events.open("w") as output:
         try:
-            provider, owned_role_dir = _prepare_provider_argv(
-                provider, role_overrides, worker_effort)
             process = subprocess.Popen(
                 provider, cwd=working_dir or None, stdout=output,
                 stderr=subprocess.STDOUT, start_new_session=True)
         except OSError:
-            # Either role-override generation or the provider spawn itself failed; either way no
-            # provider family ever came into existence for this attempt.
+            # No provider family ever came into existence for this attempt.
             write_result(store_path, token, exit_status=None, signal=None, timed_out=False)
             _clear_active(marker)
-            codex_native_helpers.cleanup_role_dirs(owned_role_dir)
             os._exit(0)
 
         def stop_provider() -> int:
@@ -194,7 +151,6 @@ def main(args: list[str]) -> None:
     write_result(store_path, token, exit_status=exit_status,
                  signal=ended_by_signal, timed_out=timed_out)
     _clear_active(marker)
-    codex_native_helpers.cleanup_role_dirs(owned_role_dir)
     os._exit(0)
 
 

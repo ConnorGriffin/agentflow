@@ -389,43 +389,45 @@ def test_the_lead_brief_stops_and_surfaces_a_provider_failure_with_no_opposite_r
     assert "do not silently do the work yourself" in brief
 
 
-def test_codex_parent_uses_native_codex_helpers_and_the_installed_claude_cli():
-    brief = routing.session_lead_instructions(
-        "build", "medium", parent_provider="codex", native_helpers_capable=True)
+def test_codex_parent_uses_the_bounded_worker_command_and_installed_claude_cli():
+    brief = routing.session_lead_instructions("build", "medium", parent_provider="codex")
 
-    assert "Codex workers use\nnative sub-agents" in brief
-    assert "Claude workers through the installed `claude` CLI" in brief
+    assert "agentflow-codex-worker" in brief
+    assert "--effort medium" in brief
+    assert "--timeout 900" in brief
+    assert "mktemp" in brief and "chmod 600" in brief and "< \"$prompt_file\"" in brief
+    assert "installed `claude` CLI" in brief
     assert "Provider launch identifiers: Fable (claude): fable" in brief
     assert "Sol (codex): gpt-5.6-sol" in brief
-    assert "spawn_agent" in brief
-    assert 'agent_type` set to' in brief
-    assert 'fork_turns="none"' in brief
-    assert "Do not pass `model` or `reasoning_effort` directly" in brief
-    assert 'agent_type="af_codex_luna_medium"' in brief
-    assert 'agent_type="af_codex_terra_medium"' in brief
+    assert "Never use `spawn_agent`" in brief
+    assert "agent_type" in brief
     assert "provider error" in brief and "first remaining-provider\nrung" in brief
 
 
-def test_codex_parent_fails_closed_when_native_helpers_are_not_capable():
+def test_extra_effort_reaches_the_worker_as_extra_then_maps_to_xhigh(tmp_path):
+    from agentflow import codex_worker
+
+    brief = routing.session_lead_instructions("build", "extra", parent_provider="codex")
+    assert "--effort extra" in brief
+    argv = codex_worker.worker_argv("terra", "extra")
+    assert "model_reasoning_effort=xhigh" in argv
+
+
+def test_codex_parent_never_depends_on_native_helper_capability():
     """#509 Blocker A: an installed Codex build outside the 0.144.0 compatibility allowlist must
     never be told to call `spawn_agent` with the hidden role/model fields — the brief tells the
     lead to treat every Codex rung as a provider failure from the start instead."""
-    brief = routing.session_lead_instructions(
-        "build", "medium", parent_provider="codex", native_helpers_capable=False)
+    brief = routing.session_lead_instructions("build", "medium", parent_provider="codex")
 
-    assert "Native Codex delegation is unavailable for this session" in brief
-    assert "Never call `spawn_agent` for a Codex rung" in brief
-    assert "treat every Codex rung in every ladder as a provider failure" in brief
-    assert "af_codex_luna_medium" not in brief
-    assert "agent_type` set to" not in brief
+    assert "agentflow-codex-worker" in brief
+    assert "native sub-agents" not in brief
 
 
 def test_claude_parent_keeps_codex_on_the_opposite_provider_cli_boundary():
     brief = routing.session_lead_instructions("build", "medium", parent_provider="claude")
 
     assert "`codex exec`" in brief
-    assert "spawn_agent" not in brief
-    assert "Native Codex delegation is unavailable" not in brief
+    assert "Never use `spawn_agent`" in brief
 
 
 def test_codex_parent_submission_keeps_its_parent_and_branch_lineage(make_coord, tmp_path):
@@ -438,7 +440,7 @@ def test_codex_parent_submission_keeps_its_parent_and_branch_lineage(make_coord,
     assert record.model == "sol"
     assert submission.pool == submission.builder_lineage == submission.branch_lineage == "codex"
     assert "/codex/issue-498-" in submission.source
-    assert "Codex workers use" in submission.input_ptr
+    assert "agentflow-codex-worker" in submission.input_ptr
 
 
 def test_the_lead_brief_states_codex_is_spent_up_front_when_rate_limited(monkeypatch):
@@ -579,6 +581,6 @@ def test_shared_revise_prompt_carries_the_durable_paused_provider_snapshot(monke
     monkeypatch.setattr(coordinated_revise, "pool_paused", lambda pool: pool == "claude",
                         raising=False)
 
-    brief, _marker = coordinated_revise._session_lead_prompt("prompt", "medium", "codex")
+    brief = coordinated_revise._session_lead_prompt("prompt", "medium", "codex")
 
     assert "Claude is currently unavailable (pool paused)" in brief

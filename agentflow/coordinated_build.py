@@ -30,7 +30,7 @@ from agentflow.prompts import BUILD_PROMPT
 from agentflow.pool_control import POOLS, pool_paused
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
-from agentflow.runner import _run, codex_native_helpers_marker_at_render, codex_spent_at_render
+from agentflow.runner import _run, codex_spent_at_render
 from agentflow.worktree_ref import WorktreeRef, source_facts
 
 
@@ -50,21 +50,19 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         return None
     sl = worktree_ref.slug(issue["title"])
     effort = effort_from_labels(labels).value
-    marker = codex_native_helpers_marker_at_render() if parent_pool == "codex" else None
     brief = BUILD_PROMPT.format(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort,
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
     brief += routing.session_lead_instructions(
         "build", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
-        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
-        native_helpers_capable=marker is not None)
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool=parent_pool,
         complexity=complexity.value, effort=effort,
         source=WorktreeRef.for_build(cfg.workdir, parent_pool, n, sl).path, claim=True, input_ptr=brief,
         builder_lineage=parent_pool, branch_lineage=parent_pool, session_lead=True,
-        native_helpers_marker=marker, floodgates=floodgates)
+        floodgates=floodgates)
 
 
 def resume_if_held(submission, records):
