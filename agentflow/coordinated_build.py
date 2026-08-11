@@ -27,6 +27,7 @@ from agentflow import github, worktree_ref
 from agentflow.intake import held_build_result
 from agentflow.labels import BUILDING, complexity_from_labels, effort_from_labels
 from agentflow.prompts import BUILD_PROMPT
+from agentflow.pool_control import POOLS, pool_paused
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
 from agentflow.runner import _run, codex_native_helpers_marker_at_render, codex_spent_at_render
@@ -56,6 +57,7 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
     brief += routing.session_lead_instructions(
         "build", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
         native_helpers_capable=marker is not None)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool=parent_pool,
