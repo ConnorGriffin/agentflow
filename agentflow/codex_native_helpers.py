@@ -115,6 +115,38 @@ def is_supported_version(version_output: str | None) -> bool:
     return match is not None and match.group(1) in SUPPORTED_CODEX_VERSIONS
 
 
+def has_supported_model_cache() -> bool:
+    """Whether Codex's local model cache has every instruction field this adapter needs.
+
+    The cache is durable external state, so an absent, unreadable, malformed, or schema-drifted
+    file is not evidence the native-helper contract remains safe. This predicate only reads the
+    cache at ``$CODEX_HOME/models_cache.json`` (or ``~/.codex/models_cache.json``) and fails
+    closed for every uncertain result.
+    """
+    # ``CODEX_HOME`` is intentionally operator-selectable: the Codex CLI itself uses it to
+    # relocate its local state. Canonicalize that root, then reconstruct the one code-authored
+    # cache name beneath it and prove it remains contained before treating it as a file path.
+    # This retains alternate and symlinked homes while refusing any unexpected path expression.
+    codex_home = os.path.realpath(os.path.expanduser(
+        os.fspath(os.environ.get("CODEX_HOME", Path.home() / ".codex"))))
+    cache_path = os.path.normpath(os.path.join(codex_home, "models_cache.json"))
+    if not cache_path.startswith(codex_home + os.sep):
+        return False
+    try:
+        with open(cache_path, encoding="utf-8") as handle:
+            cache = json.load(handle)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(cache, dict):
+        return False
+    models = cache.get("models")
+    return (isinstance(models, list) and bool(models)
+            and all(isinstance(model, dict)
+                    and isinstance(model.get("base_instructions"), str)
+                    and bool(model["base_instructions"])
+                    for model in models))
+
+
 def _sweep_stale_role_dirs() -> None:
     """Reclaim role directories a crashed or killed launch left behind, bounded per call.
 

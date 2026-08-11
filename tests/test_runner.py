@@ -296,7 +296,8 @@ def test_codex_version_output_still_runs_the_allowlisted_literal_binary(monkeypa
     assert captured["argv"][0] == "codex"
 
 
-def test_codex_provider_only_enables_native_helpers_for_sol_build_and_revise(tmp_path):
+def test_codex_provider_only_enables_native_helpers_for_sol_build_and_revise(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "missing-codex-home"))
     build = _provider_record("codex", tmp_path)
     build.model = "sol"
     build.session_lead = True
@@ -324,6 +325,10 @@ def test_codex_provider_launches_role_overrides_only_on_an_exact_marker_match(tm
     from agentflow import runner
     from agentflow.coordinator.providers import CodexProviderAdapter
 
+    (tmp_path / "models_cache.json").write_text(json.dumps({
+        "models": [{"base_instructions": "delegate narrowly"}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     monkeypatch.setattr(runner, "_codex_version_output", lambda codex_bin: "codex-cli 0.144.0\n")
     matched = _provider_record("codex", tmp_path)
     matched.model = "sol"
@@ -348,6 +353,27 @@ def test_codex_provider_launches_role_overrides_only_on_an_exact_marker_match(tm
     assert "--ephemeral" not in argv2  # still a durable Sol lead launch
     assert argv2.role_overrides is False  # no role overrides were ever promised
     assert argv2.worker_effort is None
+
+
+def test_codex_provider_accepts_a_valid_native_helper_model_cache(tmp_path, monkeypatch):
+    """A marked Sol session lead may build its command when Codex's cache still provides every
+    model's base instructions, the native-helper schema the adapter relies on (#551)."""
+    from agentflow import runner
+    from agentflow.coordinator.providers import CodexProviderAdapter
+
+    (tmp_path / "models_cache.json").write_text(json.dumps({
+        "models": [{"base_instructions": "delegate narrowly"}],
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setattr(runner, "_codex_version_output", lambda codex_bin: "codex-cli 0.144.0\n")
+    record = _provider_record("codex", tmp_path)
+    record.model = "sol"
+    record.session_lead = True
+    record.native_helpers_marker = "codex-cli 0.144.0\n"
+
+    argv = CodexProviderAdapter().command(record)
+
+    assert argv.role_overrides is True
 
 
 def test_codex_provider_fails_launch_closed_when_capability_drifts_since_submission(
