@@ -15,6 +15,8 @@ tests/test_coordinator_launcher.py.
 
 from __future__ import annotations
 
+import pytest
+
 from conftest import FakeSession, permits, record_of, starts_until_held
 
 from agentflow.coordinator import Submission
@@ -22,6 +24,9 @@ from agentflow.coordinator import providers
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.recovery import (NO_NEW_STATE, REPAIR, Recovery,
                                             durable_progress, targeted_repair)
+from agentflow.pool_control import POOLS, pool_paused
+from agentflow.routing import routing
+from agentflow.runner import codex_spent_at_render
 
 
 class ClassifyingSession(FakeSession):
@@ -50,6 +55,18 @@ class ProgressingSession(FakeSession):
         return durable_progress(record, "an opened pull request on the owned branch")
 
 
+class CapturingSession(ProgressingSession):
+    """Records the prompt at the launcher boundary while retaining the public fake world."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompts: list[str] = []
+
+    def start(self, record, store):
+        self.prompts.append(providers._durable_prompt(record))
+        return super().start(record, store)
+
+
 def _review(subject: str = "7", pool: str = "claude", **kw) -> Submission:
     return Submission(repo="o/r", subject=subject, stage="review", pool=pool, **kw)
 
@@ -57,6 +74,125 @@ def _review(subject: str = "7", pool: str = "claude", **kw) -> Submission:
 def _build(subject: str = "7", pool: str = "claude", **kw) -> Submission:
     return Submission(repo="o/r", subject=subject, stage="build", pool=pool,
                       builder_lineage=pool, **kw)
+
+
+_TASK_PREFIX = "Implement issue 529 exactly; preserve its recovery facts.\n"
+
+
+def _stale_native_helper_contract(*, codex_spent: bool = False) -> str:
+    return routing.session_lead_instructions(
+        "build", None, parent_provider="codex", codex_spent=codex_spent).replace(
+            "Codex workers use the bounded AgentFlow command.",
+            "Codex workers use native Codex sub-agents.")
+
+
+def _observed_529_brief(prefix: str = _TASK_PREFIX) -> str:
+    return prefix + _stale_native_helper_contract()
+
+
+def _submit_codex_session_lead(coord, stale: str, native_helpers_marker: str | None) -> str:
+    identity = coord.submit_stage(_build(
+        pool="codex", input_ptr=stale, source="/wt/issue-529",
+        session_lead=native_helpers_marker is None))
+    if native_helpers_marker is not None:
+        record = record_of(coord, identity)
+        record.native_helpers_marker = native_helpers_marker
+        coord._store.upsert(record)
+    return identity
+
+
+@pytest.mark.parametrize("native_helpers_marker", [None, "codex-cli 0.144.0\n"],
+                         ids=["current", "pre-555-native-helper"])
+def test_codex_continuation_refreshes_a_session_lead_contract_at_launch(
+        make_coord, native_helpers_marker):
+    """Current and #529-shaped Codex records keep task/recovery bytes, never stale policy."""
+    fake = CapturingSession()
+    coord = make_coord(fake)
+    stale = _observed_529_brief()
+    identity = _submit_codex_session_lead(coord, stale, native_helpers_marker)
+    coord.cycle("codex")
+    fake.end(identity, cause=ProviderCause.PROCESS)
+
+    assert coord.cycle("codex") == []
+    record = record_of(coord, identity)
+    assert record.input_ptr == stale
+    assert record.recovery_envelope is not None
+    assert len(fake.prompts) == 2
+    refreshed = providers._durable_prompt(record).removesuffix(
+        f"\n\n{record.recovery_envelope}")
+    expected_contract = routing.session_lead_instructions(
+        record.stage, record.effort, parent_provider=record.pool,
+        codex_spent=codex_spent_at_render(),
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+    assert refreshed == _TASK_PREFIX + expected_contract
+    assert fake.prompts == [refreshed, f"{refreshed}\n\n{record.recovery_envelope}"]
+    assert "Codex workers use the bounded AgentFlow command." in refreshed
+    assert "agentflow-codex-worker --worker <routed-name>" in refreshed
+    assert "native Codex sub-agents" not in refreshed
+    assert "spawn_agent agent_type roles" not in refreshed
+
+
+def test_restart_re_admission_refreshes_a_legacy_session_lead_contract_at_launch(make_coord):
+    """A restart-resumed historical record receives the current worker contract too."""
+    fake = CapturingSession()
+    stale = _observed_529_brief()
+    started = make_coord(fake, daemon_generation="before-restart")
+    identity = _submit_codex_session_lead(started, stale, "codex-cli 0.144.0\n")
+    started.cycle("codex")
+    fake.kill(identity)
+
+    resumed = make_coord(fake, daemon_generation="after-restart")
+    assert resumed.cycle("codex") == []
+    assert len(fake.prompts) == 2
+    assert all("Codex workers use the bounded AgentFlow command." in prompt
+               for prompt in fake.prompts)
+    assert all("native Codex sub-agents" not in prompt for prompt in fake.prompts)
+
+
+def test_task_marker_before_generated_session_lead_contract_preserves_task_bytes(make_coord):
+    fake = CapturingSession()
+    coord = make_coord(fake)
+    task_text = ("Implement the task's own heading exactly.\n"
+                 "## Session lead — benchmarked capability routing\n"
+                 "This heading belongs to the task, not AgentFlow policy.\n")
+    identity = _submit_codex_session_lead(coord, _observed_529_brief(task_text), None)
+
+    assert coord.cycle("codex") == []
+    record = record_of(coord, identity)
+    expected_contract = routing.session_lead_instructions(
+        record.stage, record.effort, parent_provider=record.pool,
+        codex_spent=codex_spent_at_render(),
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+    assert fake.prompts == [task_text + expected_contract]
+    assert record.input_ptr == _observed_529_brief(task_text)
+
+
+def test_generated_session_lead_preamble_refreshes_at_launch(make_coord):
+    fake = CapturingSession()
+    coord = make_coord(fake)
+    stale = _TASK_PREFIX + _stale_native_helper_contract(codex_spent=True)
+    identity = _submit_codex_session_lead(coord, stale, None)
+
+    assert coord.cycle("codex") == []
+    assert fake.prompts[0].startswith(_TASK_PREFIX)
+    assert "native Codex sub-agents" not in fake.prompts[0]
+
+
+def test_marker_only_session_lead_input_refuses_before_provider_start(make_coord):
+    fake = CapturingSession()
+    coord = make_coord(fake)
+    task_text = "Task-owned section\n## Session lead — benchmarked capability routing\nkeep this text"
+    identity = coord.submit_stage(_build(
+        pool="codex", input_ptr=task_text, source="/wt/issue-529", session_lead=True))
+
+    assert coord.cycle("codex") == []
+    record = record_of(coord, identity)
+    assert fake.prompts == []
+    assert identity not in fake.family_of
+    assert fake.alive == set()
+    assert record.attempts == 0
+    assert record.refusal.startswith("session-lead-input-unreadable:")
+    assert record.input_ptr == task_text
 
 
 # --- clean exit, missing outcome: one targeted repair, then park -------------------------

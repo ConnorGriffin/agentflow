@@ -544,6 +544,29 @@ def classify_codex(*, account_fact=None, exit_status=None, signal=None, timed_ou
 
 PROVIDER_INPUT_V1 = "agentflow-provider-input-v1"
 
+_SESSION_LEAD_MARKER = "\n## Session lead — benchmarked capability routing\n"
+_SESSION_LEAD_OPENING = (
+    "\nYou are the accountable Session lead. Do not write the implementation directly. Plan the work,\n"
+    "delegate exploration, implementation, and fix work, verify every result, and ship only verified\n"
+    "work. Fable is lead-only and is never a delegate target.\n")
+_SESSION_LEAD_CLOSING = (
+    "\nIf a worker from either provider fails to launch or dies on a provider error (rate limit, quota\n"
+    "exhausted, API unreachable) rather than on the work itself, treat every rung from that provider in\n"
+    "that ladder as unavailable for the rest of this session: re-enter at the first remaining-provider\n"
+    "rung of the same ladder instead of retrying the failed provider; record the substitution in the final handoff.\n"
+    "If that specific ladder has no rung from any other provider (a single-provider ladder — check the\n"
+    "routes above; some areas mix providers only in one of their routes), do not invent a substitute\n"
+    "model and do not silently do the work yourself: stop delegating in that area and hand back the\n"
+    "provider failure by name in the final handoff instead of a result. This is separate from a failed\n"
+    "verification — it is never a finding to re-delegate against.\n")
+_SESSION_LEAD_START = re.compile(
+    r"\n(?:\n(?:Claude|Codex) is currently unavailable[^\n]*\n(?:Exception:[^\n]*\n)?)*"
+    + re.escape(_SESSION_LEAD_MARKER) + r"\Z")
+
+
+class SessionLeadInputError(ValueError):
+    """A durable session-lead input cannot be safely refreshed before launch."""
+
 
 def _stage_result_schema(stage: str) -> dict | None:
     """The provider-neutral result contract a stage's terminal decision must match, or None
@@ -566,19 +589,75 @@ def _durable_prompt(record) -> str:
     """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt. A
     continuation carrying a recovery envelope (issue #225) appends those bounded durable facts so
     the fresh session resumes from them rather than replaying the identical base prompt."""
+    prompt = _base_durable_prompt(record)
+    if _has_session_lead_provenance(record):
+        prompt = _refresh_session_lead_contract(record, prompt)
+    elif _SESSION_LEAD_MARKER in prompt:
+        raise SessionLeadInputError(
+            "session-lead input has an ambiguous Session lead contract boundary; retain the "
+            "durable task brief and resubmit")
+    envelope = getattr(record, "recovery_envelope", None)
+    return f"{prompt}\n\n{envelope}" if envelope else prompt
+
+
+def _refresh_session_lead_contract(record, prompt: str) -> str:
+    """Keep a durable task brief while replacing its runtime-owned lead contract.
+
+    The final generated contract has a stable opening, routing sections, and provider-failure
+    footer across the native-helper and bounded-worker generations. A record that cannot prove
+    that structure cannot be separated without risking user text, so it is refused before a
+    provider process is started.
+    """
+    marker = prompt.rfind(_SESSION_LEAD_MARKER)
+    if marker < 0:
+        raise SessionLeadInputError(
+            "session-lead input cannot be safely refreshed: expected a generated "
+            "Session lead contract boundary; retain the durable task brief and resubmit")
+    suffix = prompt[marker:]
+    start = _SESSION_LEAD_START.search(prompt[:marker + len(_SESSION_LEAD_MARKER)])
+    if (start is None or not suffix.startswith(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING)
+            or "\nRoutes (workers enter at the first rung; a banned model never takes that area's work):\n"
+            not in suffix or "\nProvider launch identifiers: " not in suffix
+            or not suffix.endswith(_SESSION_LEAD_CLOSING)):
+        raise SessionLeadInputError(
+            "session-lead input cannot be safely refreshed: expected a complete generated "
+            "Session lead contract; retain the durable task brief and resubmit")
+    task_brief = prompt[:start.start()]
+    from agentflow.pool_control import POOLS, pool_paused
+    from agentflow.routing import routing
+    from agentflow.runner import codex_spent_at_render
+    return task_brief + routing.session_lead_instructions(
+        record.stage, record.effort, parent_provider=record.pool,
+        codex_spent=codex_spent_at_render(),
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+
+
+def validate_session_lead_input(record) -> None:
+    """Refuse an ambiguous legacy session-lead record before it reserves provider capacity."""
+    _durable_prompt(record)
+
+
+def _has_session_lead_provenance(record) -> bool:
+    """Recognize current records and Codex native-helper records that predate #555.
+
+    A marker embedded only in a raw prompt is not provenance: task text may contain the same
+    heading, and replacing what follows it would silently turn that task text into policy.
+    """
+    return bool(getattr(record, "session_lead", False)
+                or getattr(record, "native_helpers_marker", None))
+
+
+def _base_durable_prompt(record) -> str:
+    """Decode the durable prompt envelope without applying runtime launch policy."""
     raw = record.input_ptr or ""
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
-        prompt = raw
-    else:
-        if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
-                and isinstance(payload.get("prompt"), str)):
-            prompt = payload["prompt"]
-        else:
-            prompt = raw
-    envelope = getattr(record, "recovery_envelope", None)
-    return f"{prompt}\n\n{envelope}" if envelope else prompt
+        return raw
+    if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
+            and isinstance(payload.get("prompt"), str)):
+        return payload["prompt"]
+    return raw
 
 
 class ProviderArgv(list):

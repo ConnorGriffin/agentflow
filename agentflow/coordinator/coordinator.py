@@ -29,7 +29,8 @@ from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage, pr_bound_waiting)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
-from agentflow.coordinator.providers import EndingReason, ProviderCause
+from agentflow.coordinator.providers import (EndingReason, ProviderCause, SessionLeadInputError,
+                                             validate_session_lead_input)
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import (
     COMPLETED, HELD, RUNNING, STALL_LOG_EVERY, STALL_OBSERVATION_MAX_GAP, STALL_PARK_AFTER,
@@ -40,7 +41,7 @@ from agentflow.coordinator.store import Store, default_store_path
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
-    VERIFIED, miss_summary, refusal_expected, refusal_stalls)
+    VERIFIED, miss_summary, refusal_expected, refusal_stalls, unprepared)
 from agentflow.review_policy import ReviewState
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
@@ -728,7 +729,12 @@ class Coordinator:
         # The state this cycle observes is compared against the durable one at the end, so a
         # refusal that genuinely changes nothing costs no write (#405).
         was_refused = _refusal_state(record)
-        prepared = self._adapter.prepare(record)
+        try:
+            validate_session_lead_input(record)
+        except SessionLeadInputError as exc:
+            prepared = unprepared("session-lead-input-unreadable", str(exc))
+        else:
+            prepared = self._adapter.prepare(record)
         if not prepared:
             self._note_refusal(record, miss_summary(prepared), refusal_expected(prepared))
             if observed:
