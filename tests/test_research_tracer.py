@@ -200,6 +200,12 @@ def test_the_intake_wall_still_excludes_every_wayfinder_ticket():
     assert loop._untriaged({"number": 6, "labels": [{"name": "wayfinder:task"}]}) is False
 
 
+def test_ignore_label_excludes_a_research_ticket():
+    assert loop._research_eligible(
+        {"labels": [{"name": "wayfinder:research"}, {"name": "agentflow:ignore"}]}
+    ) is False
+
+
 def test_next_research_ticket_picks_the_oldest_eligible_unblocked_ticket(monkeypatch):
     listed = [
         _ticket(6, "already claimed"),                                   # carries resolving → skip

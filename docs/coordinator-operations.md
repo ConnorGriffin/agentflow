@@ -35,6 +35,11 @@ uv run agentflow pool resume claude
 A per-pool pause survives service restarts and is not bypassed by operator dispatch or floodgates.
 It does not replace the fleet-wide `pause`/`resume` drain boundary.
 
+To keep a deliberately human-owned open issue (for example an operations ledger) out of
+unattended intake and other issue dispatch, add the neutral `agentflow:ignore` label. It is an
+operator opt-out, not a pipeline state or ownership claim; remove it only when the issue should
+become eligible for unattended work.
+
 ## Observe
 
 Use `uv run agentflow status` and `~/Library/Logs/agentflow.log`, captured by the
