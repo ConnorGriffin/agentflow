@@ -900,12 +900,14 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
     assert "running_strict" not in production
 
     allowed_spawners = {root / "coordinator" / "launcher.py",
-                        root / "coordinator" / "_launch_child.py"}
+                        root / "coordinator" / "_launch_child.py",
+                        root / "codex_worker.py"}
     allowed_subprocess_run = {
         root / "balancer.py",
         root / "macos_service.py",
         root / "notify.py",
         root / "runner.py",
+        root / "codex_worker.py",
         root / "coordinator" / "quota_poll.py",
     }
     for path in root.rglob("*.py"):
@@ -927,7 +929,8 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
             if isinstance(node, ast.Call) and node.args and isinstance(node.args[0], ast.List):
                 first = node.args[0].elts[0] if node.args[0].elts else None
                 if isinstance(first, ast.Constant) and first.value in {"claude", "codex"}:
-                    assert path == root / "runner.py", f"direct provider command execution: {path}"
+                    assert path in {root / "runner.py", root / "codex_worker.py"}, \
+                        f"direct provider command execution: {path}"
             if isinstance(node, ast.Call):
                 counter_name = None
                 if isinstance(node.func, ast.Name):

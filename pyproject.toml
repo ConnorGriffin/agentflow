@@ -17,6 +17,7 @@ Documentation = "https://github.com/ConnorGriffin/agentflow#readme"
 [project.scripts]
 agentflow = "agentflow.cli:main"
 agentflow-capacity-helper = "agentflow.capacity_helper:main"
+agentflow-codex-worker = "agentflow.codex_worker:main"
 agentflow-web = "agentflow.webapp:main"
 
 [dependency-groups]

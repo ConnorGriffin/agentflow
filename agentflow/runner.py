@@ -950,8 +950,7 @@ class CodexRunner(_WorktreeRunner):
     _REASONING_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
-                        schema: dict | None = None, profile=None,
-                        native_helpers: bool = False) -> list[str]:
+                        schema: dict | None = None, profile=None) -> list[str]:
         """Build the structured Codex command run only by the coordinator launcher.
 
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
@@ -967,23 +966,6 @@ class CodexRunner(_WorktreeRunner):
         while account connectors and environment values stay excluded, on every stage including
         read-only ones. The wall ceiling is applied per-record by the launcher, the same as for
         Claude.
-
-        A Sol session lead deliberately omits ``--ephemeral``: native ``spawn_agent`` needs the
-        durable parent thread Codex otherwise discards at exit. Coordinator recovery remains a
-        fresh durable-record launch, never a Codex resume. All non-lead launches stay ephemeral.
-
-        ``native_helpers`` alone decides the durable-thread launch shape (omitting ``--ephemeral``
-        so a Sol session lead's parent thread stays addressable) — it is the coordinator's own
-        `session_lead`/pool/stage fact and never re-probed here. This method never itself builds
-        the private per-launch role declarations that let `spawn_agent`'s hidden ``agent_type``
-        selector reach a routed model/reasoning pair (#509): the caller
-        (:class:`agentflow.coordinator.providers.CodexProviderAdapter`) is the one authoritative
-        capability check (requiring an exact match between the submission's persisted
-        render-time marker (:func:`codex_native_helpers_marker_at_render`) and the installed
-        build's current ``--version`` at launch), but generation itself happens later, inside the
-        launch supervisor (:mod:`agentflow.coordinator._launch_child`), immediately before it
-        spawns the provider — so the role directory it creates is a value local to that one
-        process and never crosses this argv, an environment variable, or the durable record.
 
         A legacy Codex build/revise profile carries the session lead's low reasoning effort. Codex has no
         ``--effort`` flag — reasoning effort is a config override — so it is appended as another
@@ -1012,8 +994,7 @@ class CodexRunner(_WorktreeRunner):
                 "-c", "sandbox_workspace_write.network_access=true",
                 "-c", f"sandbox_workspace_write.writable_roots={writable_roots}",
                 "--skip-git-repo-check"]
-        if not native_helpers:
-            argv.insert(argv.index("-c"), "--ephemeral")
+        argv.insert(argv.index("-c"), "--ephemeral")
         argv += _codex_local_mcp_config(_codebase_memory_mcp_servers())
         if profile is not None and profile.reasoning_effort is not None:
             level = _clamp_reasoning(profile.reasoning_effort, self._REASONING_LADDER)
@@ -1066,60 +1047,6 @@ def codex_spent_at_render() -> bool:
     fact = CodexRunner().account_fact()
     return isinstance(fact, dict) and fact.get("kind") == "rate_limited"
 
-
-_CODEX_VERSION_PROBE_TIMEOUT_S = 10
-
-# The native-helper capability probe never runs an operator- or config-selected executable — it
-# only ever runs this one literal, code-authored name. A real launch (structured_argv, above)
-# keeps honoring AGENTFLOW_CODEX_BIN as before; only this compatibility gate is restricted, so an
-# operator running Codex from a custom path simply never gets native-helper capability rather
-# than having this probe execute an arbitrary configured path.
-_NATIVE_CAPABILITY_ALLOWED_CODEX_BIN = "codex"
-
-
-def _codex_version_output(codex_bin: str) -> str | None:
-    """The raw stdout of ``codex_bin --version``, or ``None`` on any launch failure *or* when
-    ``codex_bin`` is not the one allowlisted literal name (:data:`_NATIVE_CAPABILITY_ALLOWED_CODEX_BIN`)
-    — this probe is the native-helper capability gate, so it fails closed for any operator- or
-    config-selected executable (``AGENTFLOW_CODEX_BIN``) rather than running it. The one place in
-    the package that actually runs this probe (tests/test_dispatch.py confines ``subprocess.run``
-    to a fixed adapter allowlist that includes this module); version *parsing* stays in
-    :mod:`agentflow.codex_native_helpers`, which never spawns a process itself."""
-    if codex_bin != _NATIVE_CAPABILITY_ALLOWED_CODEX_BIN:
-        return None
-    # The equality check above already fails closed for anything but the one literal name; the
-    # sink itself is still given that literal, never the checked variable, so no operator- or
-    # config-controlled value ever reaches this subprocess call.
-    try:
-        result = subprocess.run([_NATIVE_CAPABILITY_ALLOWED_CODEX_BIN, "--version"], text=True,
-                                capture_output=True, timeout=_CODEX_VERSION_PROBE_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    return result.stdout if result.returncode == 0 else None
-
-
-def codex_native_helpers_marker_at_render() -> str | None:
-    """The one capability fact a Codex session-lead submission persists at render time (#509):
-    the exact ``codex --version`` stdout that passed the 0.144.0 native-helper compatibility
-    gate (:func:`agentflow.codex_native_helpers.is_supported_version`), or ``None`` on any
-    unreadable or unsupported build. This is the *only* place that fact is established for a
-    submission — the durable prompt (:func:`codex_native_helpers_capable_at_render`, derived
-    from this) and the launch-time gate (:class:`agentflow.coordinator.providers.
-    CodexProviderAdapter`, which requires an exact match against the persisted marker) both read
-    the one value this returns, so a Codex upgrade or downgrade between submission and launch can
-    never leave the durable prompt promising a contract the launch argv does not satisfy."""
-    from agentflow import codex_native_helpers
-    codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
-    output = _codex_version_output(codex_bin)
-    return output if codex_native_helpers.is_supported_version(output) else None
-
-
-def codex_native_helpers_capable_at_render() -> bool:
-    """True when :func:`codex_native_helpers_marker_at_render` names a supported build, for a
-    Codex session-lead brief to render the right delegation instructions up front (#509). Fails
-    closed (False) on any unreadable or unsupported build — an absent or ambiguous version is
-    never treated as capability."""
-    return codex_native_helpers_marker_at_render() is not None
 
 
 def _pr_state_for_branch(repo: str, branch: str) -> str | None:

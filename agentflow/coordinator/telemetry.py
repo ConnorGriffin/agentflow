@@ -258,6 +258,31 @@ def _rollout_cwd(records: list[dict]) -> str | None:
     return None
 
 
+def _rollout_id(records: list[dict]) -> str | None:
+    """The durable Codex rollout identifier, if this rollout supplies one."""
+    for record in records:
+        if record.get("type") != "session_meta":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        for key in ("id", "session_id", "thread_id"):
+            if isinstance(payload.get(key), str):
+                return payload[key]
+    return None
+
+
+def _parent_thread_id(record) -> str | None:
+    """Read this attempt's parent thread id from its own durable event stream."""
+    from agentflow.coordinator.session import read_session
+    from agentflow.coordinator.store import default_store_path
+
+    for event in read_session(default_store_path(), record.launch_token).events:
+        if event.get("type") == "thread.started" and isinstance(event.get("thread_id"), str):
+            return event["thread_id"]
+    return None
+
+
 def _rollout_worker_usage(records: list[dict]) -> tuple[str, dict] | None:
     """The last ``token_count`` event's cumulative totals and the model that ran, from one
     Codex rollout. ``None`` when the rollout carries no token fact at all."""
@@ -284,7 +309,7 @@ def _rollout_worker_usage(records: list[dict]) -> tuple[str, dict] | None:
 
 
 def lead_codex_worker_usage(record) -> tuple:
-    """Codex worker spend a lead (Claude ``fable``) build/revise attempt delegated to
+    """Codex worker spend a lead (Claude ``fable`` or Codex ``sol``) build/revise attempt delegated to
     ``codex exec --cd <worktree>``, observed from the workers' own rollout files rather than
     self-reported by the lead (frozen decision 2, issue #516 slice 2).
 
@@ -301,10 +326,12 @@ def lead_codex_worker_usage(record) -> tuple:
     degrades to no worker entries; this must never fail the caller's observation.
     """
     try:
-        if record.stage not in {"build", "revise"} or record.model != "fable" or not record.source:
+        if record.stage not in {"build", "revise"} or record.model not in {"fable", "sol"} \
+                or not record.source:
             return ()
         root = _codex_sessions_root()
         workspace = os.path.realpath(record.source)
+        parent_thread = _parent_thread_id(record) if record.model == "sol" else None
         cutoff = record.started_at if record.started_at else None
         try:
             paths = list(root.rglob("*.jsonl"))
@@ -318,6 +345,8 @@ def lead_codex_worker_usage(record) -> tuple:
             except OSError:
                 continue
             records = _rollout_records(path)
+            if parent_thread is not None and _rollout_id(records) == parent_thread:
+                continue
             cwd = _rollout_cwd(records)
             if cwd is None:
                 continue

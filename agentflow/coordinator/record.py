@@ -175,14 +175,8 @@ class Record:
                                          # same effect as the fleet-wide toggle — weekly allowance
                                          # lifted, ceiling raised to 100, pacing cap lifted — but
                                          # scoped to this one record; the permit ledger is untouched
-    native_helpers_marker: str | None = None  # the exact `codex --version` stdout the durable
-                                         # session-lead brief was rendered as native-helper
-                                         # capable against (#509); None for every non-Codex-lead
-                                         # record and for a lead render that was not capable.
-                                         # The launch-time provider adapter requires today's
-                                         # installed build to match this exactly before it
-                                         # injects the role declarations the brief promised —
-                                         # never re-derives its own independent capability fact
+    # Retained only so pre-#555 durable records decode on restart. No production launch reads it.
+    native_helpers_marker: str | None = None
 
 
 def stalled_for(record: Record, now: int) -> int:

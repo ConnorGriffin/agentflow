@@ -157,10 +157,6 @@ class Submission:
     pool: str = "claude"            # allowed pool or pinned lineage
     input_ptr: str | None = None
     session_lead: bool = False       # explicit #509 parent contract; absent historical records decode false
-    native_helpers_marker: str | None = None  # the render-time native-helper capability fact
-                                      # (agentflow.runner.codex_native_helpers_marker_at_render),
-                                      # carried onto the Record so launch can require an exact
-                                      # match instead of re-probing capability independently (#509)
     builder_lineage: str | None = None
     branch_lineage: str | None = None   # retained PR checkout owner; may differ from session lead
     builder_complexity: str | None = None  # the original builder complexity, carried to a Revise
@@ -289,7 +285,6 @@ class Coordinator:
             conflict_round=submission.conflict_round, resume=submission.resume,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             session_lead=submission.session_lead,
-            native_helpers_marker=submission.native_helpers_marker,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
             floodgates=submission.floodgates,

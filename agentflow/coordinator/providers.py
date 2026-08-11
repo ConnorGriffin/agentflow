@@ -581,27 +581,8 @@ def _durable_prompt(record) -> str:
     return f"{prompt}\n\n{envelope}" if envelope else prompt
 
 
-class NativeHelperContractMismatch(RuntimeError):
-    """The installed Codex build at launch no longer matches the render-time capability marker
-    a session-lead submission's durable prompt was built against (#509). Raised instead of
-    silently launching without the role declarations that prompt already promised the lead, or
-    silently launching a marker the runtime no longer supports — either would be a contract the
-    argv cannot satisfy. The launcher (:mod:`agentflow.coordinator.launcher`) treats this exactly
-    like any other spawn failure, so it fails closed through the existing provider fallback/hold
-    path rather than through a new one."""
-
-
 class ProviderArgv(list):
-    """The provider CLI argv a launch runs — still a plain ``list[str]`` to every existing
-    caller — plus (Codex-only) the launch-time role-override *intent* this call already
-    verified: whether to declare role overrides at all, and at which reasoning effort. These
-    are the narrow, immutable facts the launch supervisor needs to recompute the exact same
-    routes from the routing table itself and generate its own role directory immediately before
-    it spawns the provider — never a directory or a file path, so nothing here crosses the
-    launcher boundary as anything CodeQL would treat as path-shaped external input (#509)."""
-
-    role_overrides: bool = False
-    worker_effort: str | None = None
+    """The provider CLI argv a launch runs, kept as a list for existing callers."""
 
 
 class ClaudeProviderAdapter:
@@ -650,35 +631,9 @@ class CodexProviderAdapter:
     def command(self, record) -> list[str]:
         from agentflow.coordinator.profiles import profile_for
         from agentflow.runner import CodexRunner
-        eligible = (record.session_lead and record.pool == "codex"
-                   and record.stage in {"build", "revise"})
-        role_overrides = False
-        if eligible and record.native_helpers_marker:
-            # The one authoritative capability check (#509): today's installed Codex build must
-            # match, exactly, the marker the durable prompt was rendered as capable against. Not
-            # merely "still supported" — an *upgrade* to a different exact build is just as much
-            # a broken promise as a downgrade, since the allowlist is exact-match only. A drift
-            # either way fails this launch closed rather than silently launch a contract the
-            # argv cannot satisfy.
-            from agentflow.runner import _codex_version_output
-            codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
-            if _codex_version_output(codex_bin) == record.native_helpers_marker:
-                from agentflow.codex_native_helpers import has_supported_model_cache
-                if not has_supported_model_cache():
-                    raise NativeHelperContractMismatch(
-                        f"native-helper model cache is not compatible for {record.identity!r}")
-                role_overrides = True
-            else:
-                raise NativeHelperContractMismatch(
-                    f"native-helper capability drifted between submission and launch for "
-                    f"{record.identity!r}")
-        argv = ProviderArgv(CodexRunner().structured_argv(
+        return ProviderArgv(CodexRunner().structured_argv(
             self._prompt_of(record), record.model, record.source,
-            schema=_stage_result_schema(record.stage), profile=profile_for(record),
-            native_helpers=eligible))
-        argv.role_overrides = role_overrides
-        argv.worker_effort = record.effort if role_overrides else None
-        return argv
+            schema=_stage_result_schema(record.stage), profile=profile_for(record)))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
@@ -687,12 +642,17 @@ class CodexProviderAdapter:
         else:
             from agentflow.runner import CodexRunner
             account = CodexRunner().account_fact()
-        return classify_codex(
+        observation = classify_codex(
             account_fact=account, exit_status=session.exit_status, signal=session.signal,
             timed_out=session.timed_out, partial_output=session.partial_output,
             events=session.events,
             family=record.family, process_alive=record.process_alive,
             has_end_fact=session.has_end_fact)
+        worker_costs = lead_codex_worker_usage(record)
+        if worker_costs:
+            observation = replace(observation, usage=replace(
+                observation.usage, model_costs=observation.usage.model_costs + worker_costs))
+        return observation
 
     def verify(self, record, obs) -> bool:
         return False

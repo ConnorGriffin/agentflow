@@ -402,10 +402,11 @@ def test_default_codex_adapter_queries_the_typed_limit_companion(tmp_path, monke
 # --- lead-run Codex worker capture (issue #516 slice 2) -------------------------------------
 
 def _write_rollout(path, cwd, model="gpt-5.6-terra", input_tokens=1000, cached=100,
-                   output_tokens=200, reasoning=50):
+                   output_tokens=200, reasoning=50, rollout_id=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
-        json.dumps({"type": "session_meta", "payload": {"cwd": cwd}}),
+        json.dumps({"type": "session_meta", "payload": {
+            "cwd": cwd, **({"id": rollout_id} if rollout_id else {})}}),
         json.dumps({"type": "turn_context", "payload": {"model": model}}),
         json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
             "total_token_usage": {
@@ -465,6 +466,33 @@ def test_lead_run_claude_observation_merges_codex_worker_usage_from_matching_rol
     record_attempt(store, entry)
     record_attempt(store, entry)   # a restart re-observing the same ended family
     assert len(list(telemetry_dir(store).iterdir())) == 1
+
+
+def test_lead_run_codex_observation_merges_codex_worker_usage_from_matching_rollouts(
+        tmp_path, monkeypatch):
+    from agentflow.coordinator.providers import CodexProviderAdapter
+
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    _write_rollout(tmp_path / ".codex" / "sessions" / "parent.jsonl", str(workspace),
+                   model="gpt-5.6-sol", rollout_id="parent-thread")
+    _write_rollout(tmp_path / ".codex" / "sessions" / "worker.jsonl", str(workspace),
+                   model="gpt-5.6-sol", rollout_id="worker-thread")
+    _lead_session_artifacts(tmp_path, "sol-lead-tok")
+    from agentflow.coordinator.session import events_path
+    parent_events = events_path(tmp_path / "coordinator" / "records.db", "sol-lead-tok")
+    parent_events.parent.mkdir(parents=True, exist_ok=True)
+    parent_events.write_text(
+        '{"type":"thread.started","thread_id":"parent-thread"}\n')
+    record = Record("i", "build", "codex", 1, launch_token="sol-lead-tok",
+                    model="sol", source=str(workspace), started_at=0)
+
+    observation = CodexProviderAdapter(account_of=lambda _: None).observe(record)
+
+    sol = [cost for cost in observation.usage.model_costs if cost.model == "gpt-5.6-sol"]
+    assert len(sol) == 1 and sol[0].input_tokens == 900
 
 
 def test_a_rollout_with_a_different_cwd_is_not_merged(tmp_path, monkeypatch):
