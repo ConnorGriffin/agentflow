@@ -25,9 +25,10 @@ from agentflow.gate import (conflict_revises_used, maintainer_comment, maintaine
                             supersede_clean_review)
 from agentflow.intake import (INTAKE_MARK, _strip_quoted_lines, awaiting_recheck,
                               replies_since_intake)
-from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS,
+from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABELS, IGNORED,
                               RESEARCH_PARKED, RESEARCH_TICKET, RESOLVING, TRIAGE_SKIP, TRIAGING,
-                              WAYFINDER_NON_RESEARCH, claim, complexity_from_labels, effort_from_labels)
+                              WAYFINDER_NON_RESEARCH, claim, complexity_from_labels,
+                              effort_from_labels)
 from agentflow.notify import notify
 from agentflow.prompts import CONFLICT_REASON
 from agentflow.repo_facts import intake_allowlist, repo_profile
@@ -116,8 +117,8 @@ def _free_to_dispatch(cfg: RepoConfig, issue: dict, in_flight: set[int], _log=No
     every selection pass. Unknown is not closed: a missing issue, `gh` failure, or malformed
     response — from either source — skips the dependent until a later pass can verify it
     safely. Shared by queue selection and by-hand builds."""
-    if (issue["number"] in in_flight
-            or BUILDING in {lbl["name"] for lbl in issue.get("labels", [])}):
+    labels = {lbl["name"] for lbl in issue.get("labels", [])}
+    if issue["number"] in in_flight or BUILDING in labels or IGNORED in labels:
         return False
 
     native = _native_blockers(cfg, issue["number"])
@@ -259,7 +260,7 @@ def _research_eligible(issue: dict) -> bool:
     rule on it — ADR 362), and carries no other `wayfinder:*` type label the daemon must never run
     (ADR 0037). Its blocker state is verified separately against the live dependency graph."""
     labels = {lbl["name"] for lbl in issue.get("labels", [])}
-    if (RESEARCH_TICKET not in labels or RESOLVING in labels
+    if (RESEARCH_TICKET not in labels or IGNORED in labels or RESOLVING in labels
             or AWAITING_DISPOSITION in labels or RESEARCH_PARKED in labels):
         return False
     return not (labels & WAYFINDER_NON_RESEARCH)
@@ -322,7 +323,7 @@ def _next_resumable_issue(cfg: RepoConfig,
         if issue["number"] in reserved:
             continue
         claims = {lbl["name"] for lbl in issue["labels"]}
-        if TRIAGING in claims or DRAWING in claims:
+        if IGNORED in claims or TRIAGING in claims or DRAWING in claims:
             continue   # Intake or the current Mockup round already owns this held issue
         comments = github.issue_comment_rows(cfg.repo, issue["number"])
         if comments is None:

@@ -60,6 +60,7 @@ def mockup_scope_from_labels(labels: list[str]) -> MockupScope:
 BUILDING = "agentflow:building"   # dispatch claim — an agent is building this issue
 TRIAGING = "agentflow:triaging"   # dispatch claim — a grounding session owns this issue
 DRAWING = "agentflow:drawing-mockup"   # dispatch claim — a session is drawing this issue's variants
+IGNORED = "agentflow:ignore"            # operator opt-out — never admit this issue unattended
 RESEARCH_TICKET = "wayfinder:research"   # the one AFK-able planning ticket type the daemon may run
 RESOLVING = "wayfinder:resolving"        # shared claim — a session (human or daemon) owns this ticket
 AWAITING_DISPOSITION = "wayfinder:awaiting-disposition"  # completed research needs operator judgment
@@ -73,7 +74,7 @@ HELD_LABELS = {"agentflow:needs-grilling", "agentflow:needs-mockup"}
 # build/mockup claim. An issue already owned by a downstream lane (`agentflow:building`,
 # `agentflow:drawing-mockup`) is mid-pipeline, not un-triaged, so intake never re-claims it —
 # even after the reconciler strips its stale `triaging` label (#201).
-TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING, BUILDING, DRAWING}
+TRIAGE_SKIP = set(STATE_LABELS) | {TRIAGING, BUILDING, DRAWING, IGNORED}
 
 # The wayfinder type labels the daemon must never dispatch: grilling/prototype/task stay
 # human-in-the-loop (ADR 0037). A ticket carrying any of these is refused even if it is also

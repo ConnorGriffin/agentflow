@@ -139,6 +139,19 @@ def test_untriaged_skips_state_labels_and_triage_claim():
     assert _untriaged(routed) is False     # already has a state label
 
 
+def test_ignore_label_excludes_issue_from_intake_and_build(monkeypatch):
+    ignored = {"number": 9, "body": "", "labels": [{"name": "agentflow:ignore"}]}
+
+    assert _untriaged(ignored) is False
+
+    monkeypatch.setattr(
+        loop,
+        "_native_blockers",
+        lambda *_: pytest.fail("an ignored issue must not reach blocker discovery"),
+    )
+    assert _free_to_dispatch(RepoConfig("o/r", "."), ignored, set()) is False
+
+
 def test_untriaged_skips_downstream_claim_labels():
     # A mid-pipeline issue whose only label is a build/mockup claim is not un-triaged, so
     # intake never re-picks it after the reconciler strips its stale triaging label (#201).
@@ -830,6 +843,15 @@ def test_next_resumable_issue_waits_while_mockup_owns_the_drawing_claim(monkeypa
     issue = {"number": 11, "title": "t", "body": "b",
              "labels": [{"name": "agentflow:needs-mockup"}, {"name": DRAWING}]}
     _install_resumable(monkeypatch, [], [issue])
+
+    assert _next_resumable_issue(RepoConfig("o/r", ".")) is None
+
+
+def test_next_resumable_issue_skips_an_ignored_hold(monkeypatch):
+    issue = {"number": 13, "title": "t", "body": "b",
+             "labels": [{"name": "agentflow:needs-grilling"},
+                        {"name": "agentflow:ignore"}]}
+    _install_resumable(monkeypatch, [issue], [])
 
     assert _next_resumable_issue(RepoConfig("o/r", ".")) is None
 
