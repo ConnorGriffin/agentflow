@@ -988,10 +988,7 @@ class CodexRunner(_WorktreeRunner):
         common = _run(["git", "-C", worktree, "rev-parse", "--path-format=absolute",
                        "--git-common-dir"])
         writable_roots = json.dumps([common.stdout.strip()]) if common.returncode == 0 else "[]"
-        approval_policy = (
-            "approval_policy={granular={sandbox_approval=true,rules=false,"
-            "mcp_elicitations=false,request_permissions=false,skill_approval=false}}"
-        )
+        approval_policy = 'approval_policy="on-request"'
         read_only = profile is not None and profile.allowed_tools is not None
         sandbox = "read-only" if read_only else "workspace-write"
         argv = [codex_bin, "exec", "-m", routing.cli_identifier("codex", model), "--json",

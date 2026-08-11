@@ -208,6 +208,8 @@ def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert cmd[cmd.index("--cd") + 1] == str(wt.resolve())
     assert "--ignore-user-config" in cmd and "--ephemeral" in cmd
     assert 'approvals_reviewer="auto_review"' in cmd
+    assert 'approval_policy="on-request"' in cmd
+    assert not any("approval_policy={granular=" in value for value in cmd)
     assert 'approval_policy="never"' not in cmd
     assert "sandbox_workspace_write.network_access=true" in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
@@ -351,7 +353,8 @@ def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(t
         codex_config = [codex[i + 1] for i, arg in enumerate(codex[:-1]) if arg == "-c"]
 
         assert codex[codex.index("--sandbox") + 1] == "workspace-write"
-        assert any("sandbox_approval=true" in value for value in codex_config)
+        assert 'approval_policy="on-request"' in codex_config
+        assert not any("approval_policy={granular=" in value for value in codex_config)
         assert 'approvals_reviewer="auto_review"' in codex_config
         assert 'approval_policy="never"' not in codex_config
         assert "HEADLESS-SANDBOX-BLOCKED" in codex[-1]
