@@ -14,6 +14,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -23,6 +24,7 @@ DAEMON_LABEL = "agentflow.daemon"
 CONSOLE_LABEL = "agentflow.console"
 CONSOLE_HOST = "127.0.0.1"
 CONSOLE_PORT = 8788
+BOOTSTRAP_BACKOFF_SECONDS = (0.25, 0.5, 1.0, 2.0, 4.0)
 
 
 class ServiceError(RuntimeError):
@@ -59,15 +61,23 @@ def _bootstrap(label: str, plist_path: Path) -> None:
         capture_output=True,
         check=False,
     )
-    loaded = subprocess.run(
-        ["launchctl", "bootstrap", domain, str(plist_path)],
-        text=True,
-        capture_output=True,
-        check=False,
+    attempts = len(BOOTSTRAP_BACKOFF_SECONDS) + 1
+    for attempt in range(attempts):
+        loaded = subprocess.run(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if loaded.returncode == 0:
+            return
+        if attempt < len(BOOTSTRAP_BACKOFF_SECONDS):
+            time.sleep(BOOTSTRAP_BACKOFF_SECONDS[attempt])
+
+    detail = loaded.stderr.strip() or loaded.stdout.strip() or "unknown error"
+    raise ServiceError(
+        f"launchctl bootstrap failed for {label} after {attempts} attempts: {detail}"
     )
-    if loaded.returncode != 0:
-        detail = loaded.stderr.strip() or loaded.stdout.strip() or "unknown error"
-        raise ServiceError(f"launchctl bootstrap failed for {label}: {detail}")
 
 
 def _write_service(label: str, program_args: list[str], environment: dict, log_name: str) -> Path:

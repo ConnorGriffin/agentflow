@@ -3,9 +3,11 @@ from __future__ import annotations
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from agentflow import macos_service
 from agentflow.macos_service import ServiceError, install, probe_console
 
 
@@ -21,6 +23,51 @@ class _SnapshotHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):  # silence stdlib per-request logging
         pass
+
+
+def test_bootstrap_retries_until_launchctl_accepts_the_reloaded_job(monkeypatch, tmp_path):
+    calls = []
+    sleeps = []
+    results = iter(
+        [
+            SimpleNamespace(returncode=0, stdout="", stderr=""),  # bootout
+            SimpleNamespace(returncode=5, stdout="", stderr="Input/output error"),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
+    )
+
+    monkeypatch.setattr(
+        macos_service.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append(command) or next(results),
+    )
+    monkeypatch.setattr(macos_service.time, "sleep", sleeps.append)
+
+    macos_service._bootstrap("agentflow.console", tmp_path / "console.plist")
+
+    assert [command[1] for command in calls] == ["bootout", "bootstrap", "bootstrap"]
+    assert sleeps == [macos_service.BOOTSTRAP_BACKOFF_SECONDS[0]]
+
+
+def test_bootstrap_gives_up_after_a_bounded_number_of_attempts(monkeypatch, tmp_path):
+    calls = []
+    sleeps = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[1] == "bootout":
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=5, stdout="", stderr="Input/output error")
+
+    monkeypatch.setattr(macos_service.subprocess, "run", run)
+    monkeypatch.setattr(macos_service.time, "sleep", sleeps.append)
+
+    with pytest.raises(ServiceError, match="after 6 attempts: Input/output error"):
+        macos_service._bootstrap("agentflow.console", tmp_path / "console.plist")
+
+    bootstrap_calls = [command for command in calls if command[1] == "bootstrap"]
+    assert len(bootstrap_calls) == 6
+    assert sleeps == list(macos_service.BOOTSTRAP_BACKOFF_SECONDS)
 
 
 def test_probe_console_confirms_the_snapshot_endpoint_is_reachable():
