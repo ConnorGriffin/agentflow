@@ -138,6 +138,27 @@ def test_resume_status_and_pause_control_cold_submission(tmp_path):
     assert not (tmp_path / "state" / "enabled").exists()
 
 
+def test_pool_pause_resume_and_status_round_trip(tmp_path):
+    env = os.environ | {"AGENTFLOW_STATE": str(tmp_path / "state")}
+    run = lambda *args: subprocess.run(
+        ["uv", "run", "agentflow", "pool", *args],
+        cwd=ROOT, env=env, text=True, capture_output=True, timeout=30)
+
+    active = run("status", "claude")
+    paused = run("pause", "claude")
+    status_paused = run("status", "claude")
+    resumed = run("resume", "claude")
+    status_active = run("status", "claude")
+
+    assert active.returncode == paused.returncode == resumed.returncode == 0
+    assert active.stdout.strip() == "claude pool ACTIVE"
+    assert paused.stdout.strip() == "claude pool PAUSED"
+    assert status_paused.stdout.strip() == "claude pool PAUSED"
+    assert resumed.stdout.strip() == "claude pool ACTIVE"
+    assert status_active.stdout.strip() == "claude pool ACTIVE"
+    assert not (tmp_path / "state" / "pools" / "claude.paused").exists()
+
+
 def test_floodgates_open_close_status_round_trip(tmp_path):
     env = os.environ | {"AGENTFLOW_STATE": str(tmp_path / "state")}
     run = lambda *args: subprocess.run(

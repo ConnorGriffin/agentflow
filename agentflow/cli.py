@@ -113,6 +113,19 @@ def main(argv: list[str] | None = None) -> int | None:
     )
     commands.add_parser("resume", help="allow new cold submissions")
     commands.add_parser("pause", help="stop new cold submissions")
+    from agentflow.pool_control import POOLS
+
+    pool_command = commands.add_parser(
+        "pool", help="pause or resume one provider pool"
+    )
+    pool_commands = pool_command.add_subparsers(
+        dest="pool_command", required=True
+    )
+    for action in ("pause", "resume", "status"):
+        pool_action = pool_commands.add_parser(
+            action, help=f"{action} one provider pool"
+        )
+        pool_action.add_argument("pool", choices=POOLS)
     commands.add_parser("status", help="show submission and daemon state")
     commands.add_parser("console", help="serve the operator console")
     service = commands.add_parser("service", help="manage the macOS daemon service")
@@ -230,6 +243,15 @@ def main(argv: list[str] | None = None) -> int | None:
     elif args.command == "pause":
         (_state_dir() / "enabled").unlink(missing_ok=True)
         print("cold submission paused")
+    elif args.command == "pool":
+        from agentflow.pool_control import pause_pool, pool_paused, resume_pool
+
+        if args.pool_command == "pause":
+            pause_pool(args.pool)
+        elif args.pool_command == "resume":
+            resume_pool(args.pool)
+        state = "PAUSED" if pool_paused(args.pool) else "ACTIVE"
+        print(f"{args.pool} pool {state}")
     elif args.command == "status":
         from agentflow.macos_service import probe_console
 

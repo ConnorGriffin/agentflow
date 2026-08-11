@@ -239,6 +239,17 @@ uv run agentflow console
 The LaunchAgent starts paused and submits no new work until `agentflow resume`.
 Use `agentflow pause` before maintenance.
 
+Pause one provider pool without stopping the other pool or daemon reconciliation:
+
+```bash
+uv run agentflow pool pause claude
+uv run agentflow pool status claude
+uv run agentflow pool resume claude
+```
+
+The per-pool pause survives daemon and service restarts. Operator dispatch and floodgates do not
+override it; resume that pool explicitly when it should take work again.
+
 `service install` writes `~/Library/LaunchAgents/agentflow.daemon.plist`.
 Daemon output goes to `~/Library/Logs/agentflow.log`. Re-run the install command
 after changing paths, environment, or the AgentFlow checkout.
