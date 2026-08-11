@@ -223,6 +223,42 @@ def test_codex_command_confines_the_session_to_its_assigned_worktree(tmp_path):
     assert str(wt.resolve()) in structured[-1]
 
 
+def test_codex_auto_review_policy_allows_only_the_bounded_worker_escalation(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-557-owned"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-557-owned")
+    command = CodexRunner().structured_argv("build it", "terra", str(wt))
+    config = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
+    policy = json.loads(next(value.removeprefix("auto_review.policy=") for value in config
+                             if value.startswith("auto_review.policy=")))
+
+    assert "exact `agentflow-codex-worker --worker <routed-allowlisted-name> --effort" in policy
+    assert "worker name is routed and allowlisted" in policy
+    assert "low`, `medium`, `high`, or `extra`" in policy
+    assert "integer from 1 through 900" in policy
+    assert "stdin is redirected from a mode-0600 private regular file" in policy
+    assert "allow no other arguments" in policy
+    assert "no extra shell segments" in policy
+    assert "no sandbox-weakening flags" in policy
+    assert "drive-local-webapp/driver.mjs browser driver" in policy
+
+
+def test_codex_auto_review_policy_rejects_broad_codex_or_shell_escalation(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-557-reject"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-557-reject")
+    command = CodexRunner().structured_argv("build it", "terra", str(wt))
+    config = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
+    policy = json.loads(next(value.removeprefix("auto_review.policy=") for value in config
+                             if value.startswith("auto_review.policy=")))
+
+    assert "Reject bare `codex` invocations, shell wrappers" in policy
+    assert "`--dangerously-bypass-approvals-and-sandbox`" in policy
+    assert "Reject every other sandbox escalation" in policy
+    assert "any Codex command" not in policy
+    assert "any shell command" not in policy
+
+
 def test_claude_wires_the_result_schema_to_its_native_json_schema_flag(tmp_path):
     from agentflow.intake import INTAKE_RESULT_SCHEMA
     from agentflow.reviewer import REVIEW_VERDICT_SCHEMA

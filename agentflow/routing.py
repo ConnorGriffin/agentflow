@@ -340,7 +340,9 @@ class CapabilityRouting:
             "file with `prompt_file=$(mktemp)` then run `trap 'rm -f \"$prompt_file\"' EXIT`; run "
             "`chmod 600 \"$prompt_file\"`; write the task into that file without placing task "
             "text in a shell command. Run `agentflow-codex-worker --worker <routed-name> --effort " + effort_label +
-            " --timeout 900 < \"$prompt_file\"`, capture its stdout/stderr and "
+            " --timeout 900 < \"$prompt_file\"`. On its first attempt, request "
+            "`sandbox_permissions=require_escalated` for exactly `agentflow-codex-worker --worker "
+            "<routed-name> --effort " + effort_label + " --timeout 900 < \"$prompt_file\"`; capture its stdout/stderr and "
             "exit status. This AgentFlow-owned "
             "command reads the file without shell interpolation and enforces the routed CLI model, "
             "reasoning effort, wall timeout, and process-group termination. Read its stdout/stderr "

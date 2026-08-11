@@ -396,6 +396,9 @@ def test_codex_parent_uses_the_bounded_worker_command_and_installed_claude_cli()
     assert "--effort medium" in brief
     assert "--timeout 900" in brief
     assert "mktemp" in brief and "chmod 600" in brief and "< \"$prompt_file\"" in brief
+    assert ("On its first attempt, request `sandbox_permissions=require_escalated` for exactly "
+            "`agentflow-codex-worker --worker <routed-name> --effort medium --timeout 900 < "
+            "\"$prompt_file\"`" in brief)
     assert "installed `claude` CLI" in brief
     assert "Provider launch identifiers: Fable (claude): fable" in brief
     assert "Sol (codex): gpt-5.6-sol" in brief

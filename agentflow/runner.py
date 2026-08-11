@@ -80,9 +80,17 @@ workspace sandbox. Do not replace required UI evidence with a written explanatio
 """
 
 _CODEX_AUTO_REVIEW_POLICY = (
-    "Approve sandbox escalation only for a Node command launching the shared "
-    "drive-local-webapp/driver.mjs browser driver to capture required UI evidence. "
-    "Reject every other sandbox escalation and every request to weaken the session sandbox."
+    "Approve sandbox escalation only for either a Node command launching the shared "
+    "drive-local-webapp/driver.mjs browser driver to capture required UI evidence, or the "
+    "exact `agentflow-codex-worker --worker <routed-allowlisted-name> --effort <allowlisted-effort> "
+    "--timeout <1-through-900> < <mode-0600-private-regular-file>` command. For the worker, "
+    "approve only when the worker name is routed and allowlisted, effort is one of `low`, "
+    "`medium`, `high`, or `extra`, timeout is an integer from 1 through 900, and stdin is "
+    "redirected from a mode-0600 private regular file; allow no other arguments, no extra shell "
+    "segments, and no sandbox-weakening flags. Reject bare `codex` invocations, shell wrappers, "
+    "unallowlisted workers, invalid effort or timeout values, and worker requests without that "
+    "private-file redirection. Reject every other sandbox escalation and every request to weaken "
+    "the session sandbox, including `--dangerously-bypass-approvals-and-sandbox`."
 )
 
 
