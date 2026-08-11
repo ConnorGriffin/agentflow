@@ -346,8 +346,10 @@ class CapabilityRouting:
             "exit status. This AgentFlow-owned "
             "command reads the file without shell interpolation and enforces the routed CLI model, "
             "reasoning effort, wall timeout, and process-group termination. Read its stdout/stderr "
-            "and non-zero result as the worker outcome. Never use `spawn_agent`, `agent_type`, or "
-            "hidden role fields."
+            "and non-zero result as the worker outcome. If a yielded agentflow-codex-worker command "
+            "returns a running handle, poll that exact handle until terminal and never relaunch it "
+            "while active; use its eventual result. Never use `spawn_agent`, `agent_type`, or hidden "
+            "role fields."
         )
         return f"""
 {preamble}

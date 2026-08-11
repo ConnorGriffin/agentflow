@@ -407,6 +407,14 @@ def test_codex_parent_uses_the_bounded_worker_command_and_installed_claude_cli()
     assert "provider error" in brief and "first remaining-provider\nrung" in brief
 
 
+def test_codex_parent_polls_a_yielded_worker_command_without_relaunching_it():
+    brief = routing.session_lead_instructions("build", "medium", parent_provider="codex")
+
+    assert "yielded agentflow-codex-worker command" in brief
+    assert "poll that exact handle until terminal" in brief
+    assert "never relaunch it while active" in brief
+
+
 def test_extra_effort_reaches_the_worker_as_extra_then_maps_to_xhigh(tmp_path):
     from agentflow import codex_worker
 
