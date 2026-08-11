@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -29,6 +30,21 @@ def test_is_supported_version_fails_closed_on_none():
 
 def test_is_supported_version_fails_closed_on_empty_output():
     assert helpers.is_supported_version("") is False
+
+
+def test_model_cache_preflight_honors_a_symlinked_custom_codex_home(tmp_path, monkeypatch):
+    """An operator may relocate Codex state through ``CODEX_HOME``; the preflight must inspect
+    that canonical home, rather than only the default location, before enabling native helpers."""
+    actual_home = tmp_path / "actual-codex-home"
+    actual_home.mkdir()
+    (actual_home / "models_cache.json").write_text(json.dumps({
+        "models": [{"base_instructions": "delegate narrowly"}],
+    }))
+    configured_home = tmp_path / "configured-codex-home"
+    configured_home.symlink_to(actual_home, target_is_directory=True)
+    monkeypatch.setenv("CODEX_HOME", str(configured_home))
+
+    assert helpers.has_supported_model_cache() is True
 
 
 def test_build_role_overrides_writes_one_owner_only_file_per_route(tmp_path, monkeypatch):

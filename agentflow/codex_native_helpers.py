@@ -123,9 +123,17 @@ def has_supported_model_cache() -> bool:
     cache at ``$CODEX_HOME/models_cache.json`` (or ``~/.codex/models_cache.json``) and fails
     closed for every uncertain result.
     """
-    codex_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    # ``CODEX_HOME`` is intentionally operator-selectable: the Codex CLI itself uses it to
+    # relocate its local state. Canonicalize that root, then reconstruct the one code-authored
+    # cache name beneath it and prove it remains contained before treating it as a file path.
+    # This retains alternate and symlinked homes while refusing any unexpected path expression.
+    codex_home = os.path.realpath(os.path.expanduser(
+        os.fspath(os.environ.get("CODEX_HOME", Path.home() / ".codex"))))
+    cache_path = os.path.normpath(os.path.join(codex_home, "models_cache.json"))
+    if not cache_path.startswith(codex_home + os.sep):
+        return False
     try:
-        with (codex_home / "models_cache.json").open(encoding="utf-8") as handle:
+        with open(cache_path, encoding="utf-8") as handle:
             cache = json.load(handle)
     except (OSError, ValueError):
         return False
