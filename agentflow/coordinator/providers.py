@@ -663,6 +663,10 @@ class CodexProviderAdapter:
             from agentflow.runner import _codex_version_output
             codex_bin = os.environ.get("AGENTFLOW_CODEX_BIN", "codex")
             if _codex_version_output(codex_bin) == record.native_helpers_marker:
+                from agentflow.codex_native_helpers import has_supported_model_cache
+                if not has_supported_model_cache():
+                    raise NativeHelperContractMismatch(
+                        f"native-helper model cache is not compatible for {record.identity!r}")
                 role_overrides = True
             else:
                 raise NativeHelperContractMismatch(

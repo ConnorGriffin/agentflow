@@ -14,6 +14,7 @@ import os
 import signal
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,7 +24,9 @@ from conftest import (FakeSession, NeverStartsLauncher, permits, record_of,
 from agentflow.coordinator import Coordinator, Submission
 from agentflow.coordinator.admission import ATTEMPT_BUDGET
 from agentflow.coordinator.coordinator import RESTART_RESUME_CAP
-from agentflow.coordinator.launcher import LocalLauncher, pid_family_alive
+from agentflow.coordinator import launcher as launcher_mod
+from agentflow.coordinator.launcher import LocalLauncher, NOT_STARTED, pid_family_alive
+from agentflow.coordinator.record import Record
 from agentflow.coordinator.providers import ProviderCause
 
 
@@ -197,6 +200,32 @@ def test_real_launcher_spawns_a_provider_and_the_start_is_durable(coord_state):
     recovered = Coordinator(launcher=LocalLauncher(alive_provider, timeout=5))
     assert recovered.cycle("claude") == []
     assert permits(recovered, "claude") == 1
+
+
+@pytest.mark.parametrize("cache", [None, '{"models": [{}]}', "not json"])
+def test_native_helper_rejects_an_invalid_model_cache_before_spawning(
+        tmp_path, monkeypatch, cache):
+    """A native-helper lead with a missing field, malformed cache, or no cache never starts a
+    provider, even though its exact 0.144 marker still matches (#551)."""
+    from agentflow import runner
+
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    if cache is not None:
+        (codex_home / "models_cache.json").write_text(cache)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(runner, "_codex_version_output", lambda codex_bin: "codex-cli 0.144.0\n")
+    popen_calls = []
+    monkeypatch.setattr(launcher_mod.subprocess, "Popen",
+                        lambda *args, **kwargs: popen_calls.append((args, kwargs)))
+    record = Record("native-helper", "build", "codex", 1, model="sol", source=str(tmp_path),
+                    input_ptr="build", complexity="deep", session_lead=True,
+                    native_helpers_marker="codex-cli 0.144.0\n", launch_token="token")
+
+    result = LocalLauncher().start(record, SimpleNamespace(path=tmp_path / "records.db"))
+
+    assert result.fact == NOT_STARTED
+    assert popen_calls == []
 
 
 def test_real_launcher_releases_when_the_spawned_provider_exits(coord_state):
