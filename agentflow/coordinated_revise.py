@@ -26,6 +26,7 @@ from datetime import datetime
 from agentflow import github
 from agentflow.balancer import BUILD_POOLS
 from agentflow.prompts import REVISE_PROMPT
+from agentflow.pool_control import POOLS, pool_paused
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
 from agentflow.routing import routing
 from agentflow.runner import _run, codex_native_helpers_marker_at_render, codex_spent_at_render
@@ -51,6 +52,7 @@ def _session_lead_prompt(prompt: str, effort: str | None,
     marker = codex_native_helpers_marker_at_render() if parent_pool == "codex" else None
     brief = prompt + routing.session_lead_instructions(
         "revise", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
         native_helpers_capable=marker is not None)
     return brief, marker
 

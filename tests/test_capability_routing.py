@@ -537,3 +537,48 @@ def test_revise_submission_carries_the_codex_spent_brief_when_capacity_is_exhaus
 
     assert submission is not None
     assert "Codex is currently unavailable (spent)" in submission.input_ptr
+
+
+@pytest.mark.parametrize(("parent_provider", "unavailable", "provider"), [
+    ("codex", frozenset({"claude"}), "Claude"),
+    ("claude", frozenset({"codex"}), "Codex"),
+])
+def test_the_lead_brief_excludes_a_durably_paused_provider_for_the_entire_session(
+        parent_provider, unavailable, provider):
+    """A pause snapshot constrains workers even when its provider owns the session lead."""
+    brief = routing.session_lead_instructions(
+        "build", "medium", parent_provider=parent_provider,
+        unavailable_providers=unavailable)
+
+    assert f"{provider} is currently unavailable (pool paused)" in brief
+    assert f"skip every {provider} rung in every ladder" in brief
+    assert "hand back the provider failure by name in the final handoff" in brief
+
+
+def test_the_lead_brief_is_unchanged_for_an_empty_unavailable_provider_snapshot():
+    ordinary = routing.session_lead_instructions("build", "medium")
+    snapshotted = routing.session_lead_instructions(
+        "build", "medium", unavailable_providers=frozenset())
+
+    assert snapshotted == ordinary
+
+
+def test_build_submission_carries_the_durable_paused_provider_snapshot(monkeypatch, tmp_path):
+    monkeypatch.setattr(coordinated_build, "pool_paused", lambda pool: pool == "codex",
+                        raising=False)
+    cfg = SimpleNamespace(repo="o/r", workdir=str(tmp_path))
+
+    submission = coordinated_build.build_submission(cfg, _issue())
+
+    assert submission is not None
+    assert "Codex is currently unavailable (pool paused)" in submission.input_ptr
+
+
+def test_shared_revise_prompt_carries_the_durable_paused_provider_snapshot(monkeypatch):
+    """Every revise variant reaches the shared prompt helper before it becomes a submission."""
+    monkeypatch.setattr(coordinated_revise, "pool_paused", lambda pool: pool == "claude",
+                        raising=False)
+
+    brief, _marker = coordinated_revise._session_lead_prompt("prompt", "medium", "codex")
+
+    assert "Claude is currently unavailable (pool paused)" in brief

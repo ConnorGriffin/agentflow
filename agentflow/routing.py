@@ -291,11 +291,14 @@ class CapabilityRouting:
     def session_lead_instructions(self, stage: str, effort: str | None, *,
                                    parent_provider: str = "claude",
                                    codex_spent: bool = False,
+                                   unavailable_providers: frozenset[str] = frozenset(),
                                    native_helpers_capable: bool = False) -> str:
         """Render the session-lead brief. ``codex_spent`` is the caller's render-time capacity
         fact (see :func:`agentflow.runner.codex_spent_at_render`) — routing has no seam of its
         own onto Codex account state, so a caller that knows it passes it in; a caller that
-        doesn't (or the fact was unreadable) gets the ordinary brief. ``native_helpers_capable``
+        doesn't (or the fact was unreadable) gets the ordinary brief. ``unavailable_providers``
+        is the caller's durable pool-pause snapshot, distinct from the render-time Codex capacity
+        fact. ``native_helpers_capable``
         is the analogous render-time fact for a Codex parent's own delegation mechanism (see
         :func:`agentflow.runner.codex_native_helpers_capable_at_render`): whether the installed
         Codex build passes the 0.144.0 compatibility adapter's version gate. It is only consulted
@@ -312,8 +315,20 @@ class CapabilityRouting:
         )
         rung = self.worker_reasoning(effort)
         preamble = ""
+        if unavailable_providers:
+            for provider in ("claude", "codex"):
+                if provider not in unavailable_providers:
+                    continue
+                title = provider.title()
+                preamble += (
+                    f"\n{title} is currently unavailable (pool paused): skip every {title} "
+                    "rung in every ladder for this entire session. Where that leaves a "
+                    "provider-only ladder with no remaining provider rung, do not delegate into "
+                    "it, do not invent a substitute model, and do not do the work yourself — "
+                    "hand back the provider failure by name in the final handoff.\n"
+                )
         if codex_spent:
-            preamble = (
+            preamble += (
                 "\nCodex is currently unavailable (spent): every Codex rung is closed for this "
                 "session — enter each ladder at its first Claude rung instead.\n"
             )

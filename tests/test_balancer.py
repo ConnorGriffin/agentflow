@@ -181,6 +181,21 @@ def test_session_lead_falls_back_to_codex_when_claude_is_operator_paused(
     assert reason == ""
 
 
+def test_session_lead_falls_back_to_claude_when_codex_is_operator_paused(
+        stub_gate, monkeypatch):
+    flag = state_path("pools", "codex.paused")
+    flag.parent.mkdir(parents=True)
+    flag.touch()
+
+    lead, _reviewer, reason = pick_session_lead(
+        "CLAUDE", "CODEX", operator=True, stage="build", complexity="standard",
+        effort="low", availability=LeadAvailability(
+            {"claude": 0, "codex": 0}, {"claude": False, "codex": False}))
+
+    assert lead == "CLAUDE"
+    assert reason == ""
+
+
 # --- choose_reviewer: ADR 0020 review under partial availability -----------------
 _CS = PoolStatus("claude", True, 20.0)
 _XS = PoolStatus("codex", True, 60.0)
