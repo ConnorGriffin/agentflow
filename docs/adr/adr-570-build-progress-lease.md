@@ -20,9 +20,19 @@ attempt between two processes.
 
 Build alone replaces its fixed child wall timeout with a child-local progress lease. The
 detached supervisor renews its silent-inactivity deadline only on a new branch `HEAD`, a
-completed `Edit`/`Write`/`NotebookEdit` action, or a completed successful recognized test.
+completed `Edit`/`Write`/`NotebookEdit` action, a completed successful recognized test, or a new
+durable worktree state observed while an approved bounded AgentFlow Codex worker is active.
 The recognized test commands are `pytest`, `uv run pytest`, `npm test`, `npm run test`,
 `pnpm test`, `yarn test`, `cargo test`, `go test`, and `make test`.
+
+A bounded worker becomes active only from Codex's canonical `item.started` command record for the
+launcher-owned `/bin/zsh -lc` envelope. The shell program must be exactly
+`agentflow-codex-worker --worker <routed-name> --effort <allowed-effort> --timeout <1..900>`
+followed by one stdin redirection from a quoted absolute private prompt file; allowed effort is
+`low`, `medium`, `high`, or `extra`. The routed worker and the prompt file's regular-file,
+ownership, and mode-0600 invariants are revalidated by the supervisor. The matching canonical
+completion ends observation regardless of worker exit status. A changed snapshot renews once;
+repeated identical snapshots do not.
 
 An in-flight recognized test may run through the silent deadline until its own test grace,
 but neither test grace nor any later progress may cross the immutable attempt cap. Standard
@@ -47,7 +57,8 @@ non-Build stage, including Revise, keeps its current fixed ceiling.
 The supervisor retains existing timeout classification and TERM→KILL cleanup, so a lease or
 cap expiry is the same recoverable timeout-class ending with the same retained worktree and
 continuation accounting. No generic checkpoint protocol is introduced: the only facts are
-already-durable output records and the worktree's `HEAD`.
+already-durable output records, the worktree's `HEAD`, and bounded fingerprints of its durable
+non-ignored change state while a recognized worker invocation is active.
 
 Provider streams are decoded according to the record's pool. Codex facts come only from its
 typed `item.started` / `item.completed` command and file-change records; Claude facts come only
@@ -76,3 +87,18 @@ in a killable 25ms helper so a special or slow file cannot strand the provider-o
 A natural provider exit retains its status and signal, but the supervisor refreshes its monotonic
 clock after observing it and marks the result timed out when that observation is at or beyond the
 silent, active-test, or absolute deadline that governed the iteration.
+
+Bounded-worker snapshots use Git's porcelain status to select tracked changes and untracked,
+non-ignored files, then hash their durable mode/content state. They never include paths outside
+the assigned Build worktree, Git-ignored generated artifacts, or the internal `.agentflow` tree;
+the latter is excluded explicitly rather than relying on each repository's ignore configuration.
+The observation runs in its own killable process group and returns only a digest. Each observation
+is capped at 100ms, 1 MiB of status, 4,096 changed paths, 8 MiB per file, and 64 MiB total file
+content. It does not follow a changed path outside the worktree. A timeout, oversized state,
+special file, torn read, malformed status, Git failure, or teardown anomaly fails closed as no
+snapshot and cannot renew. The supervisor checks the governing silent/test/absolute deadline
+after every observation before accepting a changed digest. The first snapshot taken when the
+supervisor recognizes the worker start is a non-renewing baseline: state already present cannot be
+attributed to that worker, while each later changed snapshot can. A killed helper is reaped
+non-blockingly on later polls; an uninterruptible helper therefore cannot strand the
+provider-owning supervisor.

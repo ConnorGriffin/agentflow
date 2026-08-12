@@ -18,8 +18,10 @@ reads as a started-but-ended attempt.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import select
 import shlex
 import signal
@@ -199,6 +201,12 @@ _EVENT_READ_BYTES = 64 * 1024
 _EVENT_RECORDS_PER_POLL = 128
 _EVENT_POLL_SLICE_S = 0.01
 _EVENT_RECORD_BYTES = 1024 * 1024
+_WORKTREE_OBSERVATION_S = 0.10
+_WORKTREE_STATUS_BYTES = 1024 * 1024
+_WORKTREE_PATHS = 4096
+_WORKTREE_FILE_BYTES = 8 * 1024 * 1024
+_WORKTREE_TOTAL_BYTES = 64 * 1024 * 1024
+_WORKTREE_HELPERS: set[int] = set()
 
 
 def _recognized_test(command: object, provider: str) -> bool:
@@ -235,6 +243,205 @@ def _recognized_test(command: object, provider: str) -> bool:
     return any(tuple(words[:len(prefix)]) == prefix for prefix in _TEST_PREFIXES)
 
 
+def _recognized_worker(command: object) -> bool:
+    """Recognize the exact bounded-worker command shape the Codex launcher may approve."""
+    if not isinstance(command, str):
+        return False
+    try:
+        outer = shlex.split(command)
+        if (len(outer) != 3 or outer[:2] != ["/bin/zsh", "-lc"]
+                or shlex.join(outer) != command):
+            return False
+        program = outer[2]
+    except ValueError:
+        return False
+    matched = re.fullmatch(
+        r'agentflow-codex-worker --worker ([A-Za-z0-9._-]+) '
+        r'--effort (low|medium|high|extra) --timeout ([0-9]+) < "([^"\r\n]+)"',
+        program)
+    if matched is None:
+        return False
+    worker, _effort, timeout_text, prompt_text = matched.groups()
+    if any(char in "\\$`" for char in prompt_text):
+        return False
+    try:
+        timeout = int(timeout_text)
+        prompt = Path(prompt_text)
+        info = prompt.lstat()
+        from agentflow.routing import RoutingConfigError, routing
+        routing.codex_worker_cli_identifier(worker)
+    except (OSError, RoutingConfigError, ValueError):
+        return False
+    return (timeout_text == str(timeout) and 1 <= timeout <= 900 and prompt.is_absolute()
+            and stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == 0o600)
+
+
+def _reap_worktree_helpers() -> None:
+    for pid in tuple(_WORKTREE_HELPERS):
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            waited = pid
+        if waited:
+            _WORKTREE_HELPERS.discard(pid)
+
+
+def _status_paths(raw: bytes) -> list[tuple[bytes, bytes]] | None:
+    """Decode bounded porcelain-v1 records into the paths whose durable bytes matter."""
+    records = raw.split(b"\0")
+    if records[-1] != b"":
+        return None
+    paths: list[tuple[bytes, bytes]] = []
+    index = 0
+    while index < len(records) - 1:
+        record = records[index]
+        index += 1
+        if len(record) < 4 or record[2:3] != b" ":
+            return None
+        status, path = record[:2], record[3:]
+        if not path or b"\0" in path:
+            return None
+        paths.append((status, path))
+        if b"R" in status or b"C" in status:
+            if index >= len(records) - 1 or not records[index]:
+                return None
+            index += 1  # the old name has no current filesystem bytes
+        if len(paths) > _WORKTREE_PATHS:
+            return None
+    return paths
+
+
+def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
+    """Write one bounded digest of Git-enforced changed and untracked worktree state."""
+    root = Path(working_dir).resolve()
+    process = subprocess.Popen(
+        ["git", "-C", str(root), "status", "--porcelain=v1", "-z",
+         "--untracked-files=all", "--ignored=no", "--", ".",
+         ":(exclude).agentflow", ":(exclude).agentflow/**"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert process.stdout is not None
+    raw = process.stdout.read(_WORKTREE_STATUS_BYTES + 1)
+    if len(raw) > _WORKTREE_STATUS_BYTES:
+        process.kill()
+        process.wait()
+        return
+    if process.wait() != 0 or (paths := _status_paths(raw)) is None:
+        return
+
+    digest = hashlib.sha256(raw)
+    total = 0
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    for status, encoded in paths:
+        candidate = root / os.fsdecode(encoded)
+        try:
+            candidate.parent.resolve().relative_to(root)
+            before = candidate.lstat()
+        except FileNotFoundError:
+            if b"D" not in status:
+                return
+            digest.update(encoded + b"\0deleted\0")
+            continue
+        except (OSError, ValueError):
+            return
+        digest.update(encoded + b"\0" + str(stat.S_IMODE(before.st_mode)).encode() + b"\0")
+        if stat.S_ISLNK(before.st_mode):
+            try:
+                target = os.fsencode(os.readlink(candidate))
+            except OSError:
+                return
+            if len(target) > _WORKTREE_FILE_BYTES:
+                return
+            digest.update(target)
+            total += len(target)
+        elif stat.S_ISREG(before.st_mode):
+            if before.st_size > _WORKTREE_FILE_BYTES:
+                return
+            try:
+                fd = os.open(candidate, flags)
+                try:
+                    chunks: list[bytes] = []
+                    remaining = _WORKTREE_FILE_BYTES + 1
+                    while remaining:
+                        chunk = os.read(fd, min(64 * 1024, remaining))
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    after = os.fstat(fd)
+                finally:
+                    os.close(fd)
+            except OSError:
+                return
+            content = b"".join(chunks)
+            if (len(content) > _WORKTREE_FILE_BYTES or before.st_ino != after.st_ino
+                    or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns):
+                return
+            digest.update(content)
+            total += len(content)
+        else:
+            return
+        if total > _WORKTREE_TOTAL_BYTES:
+            return
+    os.write(write_fd, digest.digest())
+
+
+def _worktree_snapshot(working_dir: str,
+                       timeout: float = _WORKTREE_OBSERVATION_S) -> bytes | None:
+    """Observe durable Git worktree state in a killable, bounded process group."""
+    if not working_dir:
+        return None
+    _reap_worktree_helpers()
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError:
+        return None
+    try:
+        pid = os.fork()
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        return None
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            os.setpgid(0, 0)
+            _worktree_snapshot_child(working_dir, write_fd)
+        except (OSError, ValueError):
+            pass
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    try:
+        try:
+            os.setpgid(pid, pid)
+        except OSError:
+            pass
+        ready, _, _ = select.select([read_fd], [], [], timeout)
+        raw = os.read(read_fd, 33) if ready else b""
+    except (OSError, ValueError):
+        raw = b""
+    finally:
+        os.close(read_fd)
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+            if waited == 0:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    os.kill(pid, signal.SIGKILL)
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+                if waited == 0:
+                    _WORKTREE_HELPERS.add(pid)
+        except (ChildProcessError, OSError):
+            pass
+    return raw if len(raw) == hashlib.sha256().digest_size else None
+
+
 def _worktree_path(value: object, working_dir: str) -> bool:
     if not isinstance(value, str) or not value or not working_dir:
         return False
@@ -262,6 +469,7 @@ class _ProgressStream:
         self.calls: dict[str, tuple[str, object] | None] = {}
         self.seen: set[str] = set()
         self.active_tests: dict[str, float] = {}
+        self.active_workers: set[str] = set()
 
     def _remember(self, call_id: object, value: tuple[str, object], now: float) -> None:
         if not isinstance(call_id, str) or not call_id:
@@ -273,16 +481,20 @@ class _ProgressStream:
             self.calls[call_id] = value
             if value[0] == "test":
                 self.active_tests[call_id] = now
+            elif value[0] == "worker":
+                self.active_workers.add(call_id)
         elif self.calls[call_id] != value:
             # A provider id is canonical. Reusing it for a different action makes both
             # records ambiguous, so neither can renew or retain test supervision.
             self.calls[call_id] = None
             self.active_tests.pop(call_id, None)
+            self.active_workers.discard(call_id)
 
     def _complete(self, call_id: object, expected: tuple[str, object], success: bool) -> bool:
         if not isinstance(call_id, str) or self.calls.get(call_id) != expected:
             return False
         self.active_tests.pop(call_id, None)
+        self.active_workers.discard(call_id)
         fact = f"{self.provider}:{expected[0]}:{call_id}"
         if not success or fact in self.seen:
             return False
@@ -298,22 +510,29 @@ class _ProgressStream:
         item_type = item.get("type")
         if item_type == "command_execution":
             command = item.get("command")
-            expected = ("test", command)
+            kind = ("test" if _recognized_test(command, "codex") else
+                    "worker" if _recognized_worker(command) else "")
+            expected = (kind, command)
             if event_type == "item.started":
                 if (item.get("status") == "in_progress" and item.get("exit_code") is None
-                        and _recognized_test(command, "codex")):
+                        and kind):
                     self._remember(call_id, expected, now)
                 return False
             if not isinstance(call_id, str) or self.calls.get(call_id) != expected:
                 if isinstance(call_id, str):
                     self.active_tests.pop(call_id, None)
+                    self.active_workers.discard(call_id)
                 return False
             exit_code = item.get("exit_code")
             valid = (item.get("status") == "completed"
                      and isinstance(exit_code, int) and not isinstance(exit_code, bool))
             if not valid:
                 self.active_tests.pop(call_id, None)
+                self.active_workers.discard(call_id)
                 self.calls[call_id] = None
+                return False
+            if kind == "worker":
+                self._complete(call_id, expected, False)
                 return False
             return self._complete(call_id, expected, exit_code == 0)
         if event_type != "item.completed" or item_type != "file_change":
@@ -370,8 +589,8 @@ class _ProgressStream:
         return renewed
 
     def poll(self, events: Path, *, silent_deadline: float, test_timeout: float,
-             absolute_deadline: float) -> tuple[bool, float, bool, bool]:
-        """Return progress, fresh clock, backlog state, and pre-decode deadline expiry.
+             absolute_deadline: float) -> tuple[bool, float, bool, bool, bool]:
+        """Return progress, fresh clock, backlog, expiry, and worker-state transition.
 
         A provider owns the append rate, so one observation reads at most 64 KiB, considers at
         most 128 complete records, and cooperatively yields after 10 ms. A single record is
@@ -380,12 +599,13 @@ class _ProgressStream:
         """
         decoder = {"codex": self._codex, "claude": self._claude}.get(self.provider)
         if decoder is None:
-            return False, time.monotonic(), False, False
+            return False, time.monotonic(), False, False, False
 
         def result(progressed: bool, observed_at: float,
-                   expired: bool = False) -> tuple[bool, float, bool, bool]:
+                   expired: bool = False,
+                   worker_changed: bool = False) -> tuple[bool, float, bool, bool, bool]:
             pending = b"\n" in self.partial or self.may_have_unread
-            return progressed, observed_at, pending, expired
+            return progressed, observed_at, pending, expired, worker_changed
 
         def effective_deadline() -> float:
             if self.active_tests:
@@ -457,10 +677,13 @@ class _ProgressStream:
                 # caller immediately ends the attempt against this pre-decode deadline, so late
                 # progress is rejected and the mutated process-local state is never reused.
                 decode_deadline = effective_deadline()
+                workers_before = self.active_workers.copy()
                 progressed = decoder(event, now)
                 observed_at = time.monotonic()
                 if observed_at >= decode_deadline:
                     return result(False, observed_at, True)
+                if self.active_workers != workers_before:
+                    return result(progressed, observed_at, worker_changed=True)
                 if progressed:
                     return result(True, observed_at)
         return result(False, time.monotonic())
@@ -580,6 +803,8 @@ def main(args: list[str]) -> None:
         head_poll_s = min(5.0, build_lease[0] / 4) if build_lease else 0
         next_head_poll = started_at + head_poll_s
         progress_stream = _ProgressStream(progress_provider, working_dir) if build_lease else None
+        worker_snapshot: bytes | None = None
+        next_worker_poll = started_at
         while True:
             if stop_requested:
                 returncode = stop_provider()
@@ -607,7 +832,8 @@ def main(args: list[str]) -> None:
                         last_head = head
                         silent_deadline = now + build_lease[0]
                     next_head_poll = now + head_poll_s
-                event_progressed, now, events_pending, lease_expired = progress_stream.poll(
+                (event_progressed, now, events_pending, lease_expired,
+                 worker_changed) = progress_stream.poll(
                     events, silent_deadline=silent_deadline, test_timeout=build_lease[1],
                     absolute_deadline=absolute_deadline)
                 if lease_expired or now >= absolute_deadline:
@@ -616,6 +842,28 @@ def main(args: list[str]) -> None:
                     break
                 if event_progressed:
                     silent_deadline = now + build_lease[0]
+                if (worker_changed or
+                        (progress_stream.active_workers and now >= next_worker_poll)):
+                    snapshot = _worktree_snapshot(working_dir)
+                    now = time.monotonic()
+                    active_test_deadline = (min(progress_stream.active_tests.values())
+                                            + build_lease[1]
+                                            if progress_stream.active_tests else None)
+                    observation_deadline = (
+                        min(absolute_deadline, active_test_deadline)
+                        if active_test_deadline is not None
+                        else min(absolute_deadline, silent_deadline))
+                    if now >= observation_deadline:
+                        timed_out = True
+                        returncode = stop_provider()
+                        break
+                    if (worker_snapshot is not None and snapshot is not None
+                            and snapshot != worker_snapshot):
+                        silent_deadline = now + build_lease[0]
+                    worker_snapshot = snapshot
+                    next_worker_poll = now + head_poll_s
+                if not progress_stream.active_workers and worker_changed:
+                    worker_snapshot = None
                 test_deadline = min(progress_stream.active_tests.values(), default=0) + build_lease[1]
                 deadline = (min(absolute_deadline, test_deadline)
                             if progress_stream.active_tests
@@ -638,7 +886,10 @@ def main(args: list[str]) -> None:
                     break
                 continue
             try:
-                returncode = process.wait(timeout=min(remaining, 0.1))
+                wait_timeout = min(remaining, 0.1)
+                if build_lease and progress_stream.active_workers:
+                    wait_timeout = min(wait_timeout, max(0.001, next_worker_poll - now))
+                returncode = process.wait(timeout=wait_timeout)
                 now = time.monotonic()
                 if build_lease and now >= deadline:
                     timed_out = True

@@ -381,6 +381,312 @@ def _codex_command_event(command: str, *, completed: bool = False) -> dict:
         "status": "completed" if completed else "in_progress"}}
 
 
+def _tracked_build(tmp_path, name="worker-build"):
+    source = tmp_path / name
+    source.mkdir()
+    for command in (("git", "init", str(source)),
+                    ("git", "-C", str(source), "config", "user.email", "test@example.com"),
+                    ("git", "-C", str(source), "config", "user.name", "Test")):
+        subprocess.run(command, check=True, capture_output=True)
+    target = source / "implementation.py"
+    target.write_text("before\n")
+    subprocess.run(("git", "-C", str(source), "add", "."), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "initial"),
+                   check=True, capture_output=True)
+    return source, target
+
+
+def _bounded_worker_command(tmp_path, *, worker="luna", effort="medium", timeout="900"):
+    prompt_file = tmp_path / f"worker-prompt-{worker}-{effort}-{timeout}"
+    prompt_file.write_text("Implement the assigned slice")
+    prompt_file.chmod(0o600)
+    return (
+        f"agentflow-codex-worker --worker {worker} --effort {effort} --timeout {timeout} "
+        f'< "{prompt_file}"'
+    )
+
+
+def test_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_path):
+    """A real Build supervisor observes uncommitted work from its bounded Codex worker."""
+    source, target = _tracked_build(tmp_path)
+    command = _bounded_worker_command(tmp_path)
+    started = _codex_command_event(command)
+    completed = _codex_command_event(command, completed=True)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after\\n')\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "time.sleep(.45)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.50, 0.60, 1.2)))
+    identity = coord.submit_stage(_build("codex", "bounded-worker-progress", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker Build child did not exit")
+    assert target.read_text() == "after\n"
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_path):
+    """Deleting a tracked implementation file is a durable worker progress state."""
+    source, target = _tracked_build(tmp_path)
+    command = _bounded_worker_command(tmp_path)
+    started = _codex_command_event(command)
+    completed = _codex_command_event(command, completed=True)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).unlink()\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "time.sleep(.45)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.50, 0.60, 1.2)))
+    identity = coord.submit_stage(_build("codex", "bounded-worker-deletion", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker deletion child did not exit")
+    assert not target.exists()
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_unchanged_state_does_not_renew_build_silence(coord_state, tmp_path):
+    """An active recognized worker is not progress without a new durable worktree state."""
+    source, _target = _tracked_build(tmp_path)
+    marker = tmp_path / "unchanged-worker-crossed-silence"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", "unchanged-worker", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "unchanged worker retained its Build lease")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_changes_after_completion_do_not_renew(coord_state, tmp_path):
+    """A recognized invocation stops authorizing observation at its completion event."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "post-worker-change-crossed-silence"
+    command = _bounded_worker_command(tmp_path)
+    started = _codex_command_event(command)
+    completed = _codex_command_event(command, completed=True)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.08)\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after worker\\n')\n"
+        "time.sleep(.20)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.28, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", "post-worker-change", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "post-worker change retained Build silence")
+    assert target.read_text() == "after worker\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize(
+    "command_kind", ["unrelated", "unallowlisted", "composed", "malformed", "unquoted"])
+def test_nonapproved_worker_command_cannot_turn_durable_churn_into_progress(
+        coord_state, tmp_path, command_kind):
+    """Only the launcher's exact approved worker command activates worktree observation."""
+    source, target = _tracked_build(tmp_path)
+    canonical = _bounded_worker_command(tmp_path)
+    commands = {
+        "unrelated": "sed -n '1,20p' implementation.py",
+        "unallowlisted": _bounded_worker_command(tmp_path, worker="impostor"),
+        "composed": canonical + " && echo extra",
+        "malformed": canonical.split(" < ", 1)[0],
+        "unquoted": canonical.replace('< "', "< ")[:-1],
+    }
+    marker = tmp_path / f"{command_kind}-crossed-silence"
+    started = _codex_command_event(commands[command_kind])
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.18)\n"
+        "pathlib.Path(sys.argv[1]).write_text('untrusted churn\\n')\n"
+        "time.sleep(.28)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.32, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", f"nonapproved-{command_kind}", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "nonapproved worker command retained Build silence")
+    assert target.read_text() == "untrusted churn\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_prior_unapproved_change_is_not_reclassified_when_worker_starts(coord_state, tmp_path):
+    """A worker starts from the durable barrier left by the preceding parent command."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "prior-unapproved-change-renewed"
+    unapproved = "python -c 'write implementation.py'"
+    worker = _bounded_worker_command(tmp_path)
+    unapproved_started = _codex_command_event(unapproved)
+    unapproved_completed = _codex_command_event(unapproved, completed=True)
+    worker_started = _codex_command_event(worker)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({unapproved_started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('unapproved change\\n')\n"
+        f"print(json.dumps({unapproved_completed!r}), flush=True)\n"
+        f"print(json.dumps({worker_started!r}), flush=True)\n"
+        "time.sleep(.18)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.22, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", "prior-unapproved-change", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "prior unapproved change retained Build silence")
+    assert target.read_text() == "unapproved change\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("churn_kind", ["outside", "internal", "generated"])
+def test_bounded_worker_ignores_outside_internal_and_generated_churn(
+        coord_state, tmp_path, churn_kind):
+    """Worker observation excludes state outside Git's implementation-change surface."""
+    source, _target = _tracked_build(tmp_path)
+    empty_global_excludes = tmp_path / "empty-global-excludes"
+    empty_global_excludes.write_text("")
+    subprocess.run(("git", "-C", str(source), "config", "core.excludesFile",
+                    str(empty_global_excludes)), check=True, capture_output=True)
+    (source / ".gitignore").write_text("generated/\n")
+    subprocess.run(("git", "-C", str(source), "add", ".gitignore"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "ignore generated"),
+                   check=True, capture_output=True)
+    churn = {
+        "outside": tmp_path / "outside.py",
+        "internal": source / ".agentflow" / "supervisor-state",
+        "generated": source / "generated" / "cache.py",
+    }[churn_kind]
+    marker = tmp_path / f"{churn_kind}-crossed-silence"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.18)\n"
+        "target=pathlib.Path(sys.argv[1])\n"
+        "target.parent.mkdir(parents=True, exist_ok=True)\n"
+        "target.write_text('churn\\n')\n"
+        "time.sleep(.28)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(churn), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.32, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", f"ignored-{churn_kind}", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "nonimplementation churn retained Build silence")
+    assert churn.exists()
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_progress_cannot_cross_the_immutable_cap(coord_state, tmp_path):
+    """Repeated worker-owned durable states renew silence but never the attempt cap."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "worker-crossed-absolute-cap"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "target=pathlib.Path(sys.argv[1])\n"
+        "for n in range(1,6):\n"
+        " time.sleep(.10)\n"
+        " target.write_text(f'{n}\\n')\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly crossed cap')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.50, 0.42)))
+    identity = coord.submit_stage(_build("codex", "worker-absolute-cap", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "worker progress crossed the immutable cap")
+    assert target.read_text() != "before\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_snapshot_cannot_strand_the_supervisor(
+        coord_state, tmp_path, monkeypatch):
+    """A blocking Git status helper cannot delay the immutable cap or provider teardown."""
+    source, _target = _tracked_build(tmp_path)
+    invoked = tmp_path / "blocking-status-invoked"
+    marker = tmp_path / "provider-survived-blocking-status"
+    fake_bin = tmp_path / "fake-status-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        f"  *\" status \"*) printf invoked > {shlex.quote(str(invoked))}; sleep 2; exit 1 ;;\n"
+        f"  *) exec {shlex.quote(real_git)} \"$@\" ;;\n"
+        "esac\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.70)\n"
+        "pathlib.Path(sys.argv[1]).write_text('not cleaned up')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    absolute_cap = 0.35
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(5.0, 5.0, absolute_cap)))
+    identity = coord.submit_stage(_build("codex", "blocking-worker-snapshot", str(source)))
+
+    started_at = time.monotonic()
+    coord.cycle("codex")
+    record = _wait_for_real_child(identity, "worker snapshot stranded the supervisor")
+    elapsed = time.monotonic() - started_at
+
+    assert invoked.exists(), "the worker snapshot did not exercise the blocking Git adapter"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert elapsed < 1.2, f"{absolute_cap:.2f}s absolute cap took {elapsed:.3f}s"
+    assert not marker.exists()
+
+
 def test_build_head_progress_renews_its_child_local_silent_lease(coord_state, tmp_path):
     """A real Build child survives a short silent lease after committing new work (#570)."""
     from agentflow.coordinator.store import Store, default_store_path
@@ -419,6 +725,29 @@ def test_build_head_progress_renews_its_child_local_silent_lease(coord_state, tm
     assert pid_family_alive(record.family)
 
     record = _wait_for_real_child(identity, "Build child did not exit")
+    assert _build_observation(record).timed_out is False
+
+
+def test_active_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_path):
+    """An approved bounded worker's uncommitted work keeps its Build parent alive."""
+    source, target = _tracked_build(tmp_path)
+    worker = _bounded_worker_command(tmp_path, effort="low")
+    started = _codex_command_event(worker)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after\\n')\n"
+        "time.sleep(.24)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.22, 0.60, 1.0)))
+    identity = coord.submit_stage(_build("codex", "worker-progress", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker Build child did not exit")
+    assert target.read_text() == "after\n"
     assert _build_observation(record).timed_out is False
 
 
