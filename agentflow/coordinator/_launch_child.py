@@ -31,19 +31,72 @@ from agentflow.coordinator.session import events_path, write_result
 from agentflow.coordinator.store import Store
 
 
+def _object_id(value: str) -> str | None:
+    fields = value.split()
+    if len(fields) != 1:
+        return None
+    oid = fields[0]
+    return (oid if len(oid) in {40, 64}
+            and all(c in "0123456789abcdef" for c in oid) else None)
+
+
+def _git_dir(working_dir: str) -> Path | None:
+    dot_git = Path(working_dir) / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    try:
+        marker = dot_git.read_text().strip()
+    except OSError:
+        return None
+    if not marker.startswith("gitdir: "):
+        return None
+    path = Path(marker.removeprefix("gitdir: "))
+    return path if path.is_absolute() else dot_git.parent / path
+
+
 def _head(working_dir: str) -> str | None:
-    if not working_dir:
+    """Read HEAD from Git's durable ref files without starting or waiting on a process."""
+    if not working_dir or (git_dir := _git_dir(working_dir)) is None:
         return None
     try:
-        return subprocess.run(["git", "-C", working_dir, "rev-parse", "HEAD"],
-                              capture_output=True, text=True, timeout=2).stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
+        head = (git_dir / "HEAD").read_text().strip()
+    except OSError:
         return None
+    if not head.startswith("ref: "):
+        return _object_id(head)
+    ref = head.removeprefix("ref: ")
+    parts = Path(ref).parts
+    if not ref.startswith("refs/") or not parts or ".." in parts:
+        return None
+    common_dir = git_dir
+    try:
+        common = (git_dir / "commondir").read_text().strip()
+        common_dir = Path(common) if Path(common).is_absolute() else git_dir / common
+    except OSError:
+        pass
+    for root in (git_dir, common_dir):
+        try:
+            if oid := _object_id((root / ref).read_text()):
+                return oid
+        except OSError:
+            pass
+    try:
+        packed = (common_dir / "packed-refs").read_text().splitlines()
+    except OSError:
+        return None
+    for line in packed:
+        if line.startswith(("#", "^")):
+            continue
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == ref:
+            return _object_id(fields[0])
+    return None
 
 
 _TEST_PREFIXES = (("pytest",), ("uv", "run", "pytest"), ("npm", "test"),
                   ("npm", "run", "test"), ("pnpm", "test"), ("yarn", "test"),
                   ("cargo", "test"), ("go", "test"), ("make", "test"))
+_SHELL_COMPOSITION = frozenset(";&|<>()$`\\*?[]{}~!#\r\n")
 
 
 def _recognized_test(command: object, provider: str) -> bool:
@@ -56,22 +109,26 @@ def _recognized_test(command: object, provider: str) -> bool:
     """
     if not isinstance(command, str):
         return False
-    try:
-        words = shlex.split(command)
-    except ValueError:
-        return False
+    test_command = command
     if provider == "codex":
-        if len(words) != 3 or words[:2] != ["/bin/zsh", "-lc"]:
-            return False
         try:
-            words = shlex.split(words[2])
+            words = shlex.split(command)
         except ValueError:
             return False
+        if len(words) != 3 or words[:2] != ["/bin/zsh", "-lc"]:
+            return False
+        test_command = words[2]
     elif provider != "claude":
         return False
-    # shlex preserves operators as words only when spaced; rejecting their characters as well
-    # closes compact forms such as ``pytest|tail`` and redirections such as ``2>&1``.
-    if not words or any(any(char in word for char in ";&|<>") for word in words):
+    # Reject shell interpretation before tokenizing. Even quoted or escaped syntax fails closed:
+    # this lease recognizes one literal test command, never composition, substitution,
+    # redirection, variable/glob/brace/tilde expansion, or a comment/newline boundary.
+    if (not test_command or any(char in _SHELL_COMPOSITION for char in test_command)
+            or any(ord(char) < 32 and char != "\t" for char in test_command)):
+        return False
+    try:
+        words = shlex.split(test_command)
+    except ValueError:
         return False
     return any(tuple(words[:len(prefix)]) == prefix for prefix in _TEST_PREFIXES)
 
@@ -352,6 +409,10 @@ def main(args: list[str]) -> None:
                 break
             now = time.monotonic()
             if build_lease:
+                if now >= absolute_deadline:
+                    timed_out = True
+                    returncode = stop_provider()
+                    break
                 # A completion first observed after its already-active test cap cannot erase
                 # that cap. Preserve the pre-poll fact and enforce it after consuming this
                 # batch; provider events have no trustworthy monotonic timestamp of their own.
@@ -363,6 +424,11 @@ def main(args: list[str]) -> None:
                 progressed = False
                 if now >= next_head_poll:
                     head = _head(working_dir)
+                    now = time.monotonic()
+                    if now >= absolute_deadline:
+                        timed_out = True
+                        returncode = stop_provider()
+                        break
                     progressed = head is not None and head != last_head
                     if progressed:
                         last_head = head

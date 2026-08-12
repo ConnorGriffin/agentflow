@@ -11,6 +11,8 @@ its family is alive. A separate test exercises the real spawning launcher end to
 from __future__ import annotations
 
 import os
+import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -312,6 +314,15 @@ def _build(pool: str, subject: str, source: str) -> Submission:
                       complexity="standard", effort="low", input_ptr="build")
 
 
+def _codex_command_event(command: str, *, completed: bool = False) -> dict:
+    return {"type": "item.completed" if completed else "item.started", "item": {
+        "id": "t1", "type": "command_execution",
+        "command": shlex.join(["/bin/zsh", "-lc", command]),
+        "aggregated_output": "read output" if completed else "",
+        "exit_code": 0 if completed else None,
+        "status": "completed" if completed else "in_progress"}}
+
+
 def test_build_head_progress_renews_its_child_local_silent_lease(coord_state, tmp_path):
     """A real Build child survives a short silent lease after committing new work (#570)."""
     from agentflow.coordinator.store import Store, default_store_path
@@ -480,6 +491,73 @@ def test_build_progress_stream_fails_closed_for_wrong_malformed_or_composed_even
     assert _build_observation(record).cause is ProviderCause.TIMEOUT
 
 
+@pytest.mark.parametrize(("pool", "command"), [
+    ("claude", "pytest $(sleep 100)"),
+    ("codex", "pytest $(sleep 100)"),
+    ("claude", "pytest `sleep 100`"),
+    ("codex", "pytest `sleep 100`"),
+    ("claude", "pytest > result.txt"),
+    ("codex", "pytest 2>&1"),
+    ("claude", "pytest $TEST_ARGS"),
+    ("codex", "pytest ${TEST_ARGS}"),
+    ("claude", "pytest tests/*.py"),
+    ("codex", "pytest tests/[ab].py"),
+    ("claude", "pytest tests/{a,b}.py"),
+    ("codex", "pytest ~/tests"),
+    ("claude", "pytest <(cat test-list)"),
+    ("codex", "pytest (sleep 100)"),
+    ("claude", "pytest # ignore the rest"),
+    ("codex", "pytest\\ -q"),
+    ("claude", "pytest\nsleep 100"),
+    ("codex", "pytest; sleep 100"),
+])
+def test_shell_interpretation_shapes_never_gain_test_grace(
+        coord_state, tmp_path, pool, command):
+    """Every composition/substitution/redirect/expansion form in ADR 570 fails closed."""
+    marker = tmp_path / "gained-test-grace"
+    if pool == "codex":
+        event = _codex_command_event(command)
+    else:
+        event = {"type": "assistant", "message": {"type": "message", "role": "assistant",
+                 "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                              "input": {"command": command}}]}}
+    script = ("import json,pathlib,sys,time\n"
+              f"print(json.dumps({event!r}), flush=True)\n"
+              "time.sleep(.35)\n"
+              "pathlib.Path(sys.argv[1]).write_text('incorrectly supervised')\n")
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.80, 1.0)))
+    identity = coord.submit_stage(_build(pool, "shell-composition", str(tmp_path)))
+    coord.cycle(pool)
+
+    record = _wait_for_real_child(identity, "shell composition retained test supervision")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_codex_read_only_command_events_do_not_renew(coord_state, tmp_path):
+    """A paired successful Codex read is durable output, but never a Build progress fact."""
+    marker = tmp_path / "read-renewed-silence"
+    started = _codex_command_event("sed -n '1,80p' README.md")
+    completed = _codex_command_event("sed -n '1,80p' README.md", completed=True)
+    script = ("import json,pathlib,sys,time\n"
+              f"print(json.dumps({started!r}), flush=True)\n"
+              "time.sleep(.12)\n"
+              f"print(json.dumps({completed!r}), flush=True)\n"
+              "time.sleep(.20)\n"
+              "pathlib.Path(sys.argv[1]).write_text('incorrectly renewed')\n")
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.80, 1.0)))
+    identity = coord.submit_stage(_build("codex", "read-only-events", str(tmp_path)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "Codex read-only events renewed Build silence")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize("pool", ["claude", "codex"])
 def test_malformed_test_completion_ends_supervision_without_renewing(
         coord_state, tmp_path, pool):
@@ -576,6 +654,57 @@ def test_repeated_head_progress_cannot_cross_the_absolute_cap(coord_state, tmp_p
     record = _wait_for_real_child(identity, "Build commits crossed the absolute cap")
     assert _build_observation(record).cause is ProviderCause.TIMEOUT
     assert not marker.exists()
+
+
+def test_head_observation_cannot_block_past_the_absolute_cap(
+        coord_state, tmp_path, monkeypatch):
+    """A real child ignores a blocking `git` executable and stops at its immutable cap."""
+    source = tmp_path / "timed-build"
+    source.mkdir()
+    for command in (("git", "init", str(source)),
+                    ("git", "-C", str(source), "config", "user.email", "test@example.com"),
+                    ("git", "-C", str(source), "config", "user.name", "Test")):
+        subprocess.run(command, check=True, capture_output=True)
+    (source / "initial").write_text("initial")
+    subprocess.run(("git", "-C", str(source), "add", "."), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "initial"),
+                   check=True, capture_output=True)
+
+    invoked = tmp_path / "fake-git-invoked"
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        f"  *\" rev-parse HEAD \"*) printf invoked > {shlex.quote(str(invoked))}; "
+        "sleep 2; exit 1 ;;\n"
+        f"  *) exec {shlex.quote(real_git)} \"$@\" ;;\n"
+        "esac\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    event = {"type": "assistant", "message": {"type": "message", "role": "assistant",
+             "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                          "input": {"command": "pytest -q"}}]}}
+    script = ("import json,time\n"
+              f"print(json.dumps({event!r}), flush=True)\n"
+              "time.sleep(5)\n")
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 5.0, 0.35)))
+    identity = coord.submit_stage(_build("claude", "nonblocking-head", str(source)))
+
+    started_at = time.monotonic()
+    coord.cycle("claude")
+    record = _wait_for_real_child(identity, "HEAD observation crossed the absolute cap")
+    elapsed = time.monotonic() - started_at
+
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert elapsed < 1.2, f"0.35s absolute cap took {elapsed:.3f}s"
+    assert not invoked.exists(), "HEAD observation executed the blocking git adapter"
 
 
 def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord_state):

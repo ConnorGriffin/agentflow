@@ -53,5 +53,8 @@ Provider streams are decoded according to the record's pool. Codex facts come on
 typed `item.started` / `item.completed` command and file-change records; Claude facts come only
 from its paired `tool_use` / `tool_result` records. Malformed records, the other provider's
 records, edits outside the worktree, and composed shell commands fail closed and do not renew or
-gain test supervision. When recognized tests overlap, the earliest test deadline wins, so each
-test keeps its own cap.
+gain test supervision. Composition includes chaining, pipes, redirects, command/process
+substitution, variable/glob/brace/tilde expansion, comments, escaped shell syntax, and embedded
+newlines. When recognized tests overlap, the earliest test deadline wins, so each test keeps its
+own cap. `HEAD` is read from Git's durable ref files without starting a subprocess, and the
+supervisor refreshes its monotonic clock after each observation before accepting progress.
