@@ -61,5 +61,5 @@ supervisor refreshes its monotonic clock after each observation before accepting
 Provider output is observed in bounded slices: at most 64 KiB and 128 JSONL records per poll,
 with a cooperative 10ms parsing slice and a 1 MiB per-record ceiling. The supervisor checks the
 current silent, test, and absolute deadline before and after each JSON decode; oversized records
-fail closed. Thus an output burst cannot postpone teardown except for the bounded decode between
-two clock checks.
+and decoder failures, including pathological structural recursion, fail closed. Thus an output
+burst cannot postpone teardown except for the bounded decode between two clock checks.

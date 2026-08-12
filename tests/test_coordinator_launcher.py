@@ -739,6 +739,42 @@ def test_large_slow_event_burst_cannot_delay_the_absolute_cap(coord_state, tmp_p
     assert not marker.exists()
 
 
+def test_deeply_nested_json_cannot_strand_provider_or_timeout_result(coord_state, tmp_path):
+    """A decoder recursion failure stays non-progress and cannot escape the supervisor."""
+    provider_pid = tmp_path / "provider-pid"
+    marker = tmp_path / "provider-survived-cap"
+    script = (
+        "import os,pathlib,sys,time\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "print('['*10000+'0'+']'*10000, flush=True)\n"
+        "time.sleep(.70)\n"
+        "pathlib.Path(sys.argv[2]).write_text('not cleaned up')\n"
+    )
+    provider = lambda record: [
+        sys.executable, "-c", script, str(provider_pid), str(marker)]
+    absolute_cap = 0.35
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(5.0, 5.0, absolute_cap)))
+    identity = coord.submit_stage(_build("claude", "recursive-json", str(tmp_path)))
+
+    started_at = time.monotonic()
+    coord.cycle("claude")
+    record = _wait_for_real_child(identity, "recursive JSON stranded the Build supervisor")
+    elapsed = time.monotonic() - started_at
+    observation = _build_observation(record)
+
+    assert provider_pid.exists(), "real provider did not emit its malformed event"
+    assert not pid_family_alive(provider_pid.read_text()), "provider process was not reaped"
+    assert observation.has_end_fact is True
+    assert observation.timed_out is True
+    assert observation.cause is ProviderCause.TIMEOUT
+    assert observation.signal in {signal.SIGTERM, signal.SIGKILL}
+    assert observation.events == ()
+    assert observation.partial_output.startswith("[[[[")
+    assert elapsed < 1.2, f"{absolute_cap:.2f}s absolute cap took {elapsed:.3f}s"
+    assert not marker.exists()
+
+
 def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord_state):
     """A reconciliation SIGTERM reaches the provider group, while the supervisor stays long
     enough to write the normal durable end facts for the stopped attempt (#220)."""

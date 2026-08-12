@@ -338,7 +338,10 @@ class _ProgressStream:
                 continue
             try:
                 event = json.loads(raw)
-            except (UnicodeDecodeError, json.JSONDecodeError):
+            # Provider bytes are a cross-process trust boundary. CPython's JSON decoder raises
+            # RecursionError for structurally valid but pathologically deep values; treat that
+            # decoder failure like malformed JSON, without hiding memory/system/programmer faults.
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                 self.partial = self.partial[newline + 1:]
                 records += 1
                 now = time.monotonic()

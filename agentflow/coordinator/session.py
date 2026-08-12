@@ -77,17 +77,20 @@ def read_session(store_path: Path | str, token: str | None) -> CapturedSession:
     events: list[dict] = []
     partial: list[str] = []
     try:
-        raw = events_path(store_path, token).read_text()
+        raw = events_path(store_path, token).read_bytes()
     except OSError:
-        raw = ""
+        raw = b""
     for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
             parsed = json.loads(line)
-        except json.JSONDecodeError:
-            partial.append(line)  # provider prose or a truncated tail — preserved, not parsed
+        # The provider owns this line. Deep JSON can raise RecursionError rather than the
+        # documented JSONDecodeError; both are malformed durable output, not a reader failure.
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+            # Provider prose or malformed/truncated bytes are preserved, never interpreted.
+            partial.append(line.decode("utf-8", errors="replace"))
             continue
         events.append(parsed if isinstance(parsed, dict) else {"value": parsed})
     exit_status: int | None = None
