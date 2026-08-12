@@ -286,6 +286,199 @@ def test_reviewer_push_opens_an_exact_head_pass_for_the_other_tool():
     assert successor.effort is None
 
 
+def test_session_led_reviewer_push_keeps_the_generated_contract_terminal(monkeypatch):
+    from agentflow import coordinated_review
+    from agentflow.coordinator.providers import validate_session_lead_input
+    from agentflow.coordinator.record import Record
+    from agentflow.reviewer import Verdict
+
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+        repo="o/r", subject="7",
+        source="/work/.agentflow/worktrees/claude/issue-7-fix")
+    opening = coordinated_review.review_submission(
+        build, "old-head", "codex", 42, acceptance="Preserve the public behavior.")
+    contract = opening.input_ptr[opening.input_ptr.index(
+        "\n## Session lead — benchmarked capability routing\n"):]
+    review = Record(
+        identity="o/r|7|review|old-head", stage="review", pool="codex", demand=2,
+        repo=opening.repo, subject=opening.subject, target=opening.target,
+        source=opening.source, input_ptr=opening.input_ptr, session_lead=opening.session_lead,
+        builder_lineage=opening.builder_lineage, branch_lineage=opening.branch_lineage,
+        builder_complexity=opening.builder_complexity,
+        builder_effort=opening.builder_effort,
+        **opening.review.record_fields())
+    monkeypatch.setattr(
+        "agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr(
+        coordinated_review, "pick_reviewer", lambda *_args, **_kwargs: "claude")
+
+    successor = coordinated_review.review_successor_submission(
+        review, Verdict(
+            clean=True, reviewed_sha="old-head", final_sha="new-head",
+            pushed_sha="new-head", fixes=("fixed the journey",),
+            change_author_tool="claude", checks=("journey checked",)))
+
+    assert successor is not None
+    assert successor.target == "new-head"
+    assert "`new-head`" in successor.input_ptr and "`old-head`" not in successor.input_ptr
+    assert successor.input_ptr.count("<!-- agentflow-review-assignment:start -->") == 1
+    assert successor.input_ptr.count(
+        "\n## Session lead — benchmarked capability routing\n") == 1
+    assert successor.input_ptr.endswith(contract)
+    assert successor.review.handoff in successor.input_ptr
+    assert successor.transfer_from == review.identity and successor.claim is True
+    assert successor.session_lead is True
+    validate_session_lead_input(successor)
+
+
+def _proven_session_led_review(*, state=None, legacy_provenance=False, head_sha="head"):
+    from agentflow import coordinated_review
+    from agentflow.coordinator.record import Record
+
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+        repo="o/r", subject="7",
+        source="/work/.agentflow/worktrees/claude/issue-7-fix")
+    opening = coordinated_review.review_submission(
+        build, head_sha, "codex", 42, acceptance="Preserve the public behavior.",
+        review=state)
+    contract = opening.input_ptr[opening.input_ptr.index(
+        "\n## Session lead — benchmarked capability routing\n"):]
+    review = Record(
+        identity=f"o/r|7|review|{head_sha}", stage="review", pool="codex", demand=2,
+        repo=opening.repo, subject=opening.subject, target=opening.target,
+        source=opening.source, input_ptr=opening.input_ptr,
+        session_lead=opening.session_lead and not legacy_provenance,
+        native_helpers_marker="codex-cli 0.144.0\n" if legacy_provenance else None,
+        builder_lineage=opening.builder_lineage, branch_lineage=opening.branch_lineage,
+        builder_complexity=opening.builder_complexity,
+        builder_effort=opening.builder_effort,
+        **opening.review.record_fields())
+    return review, contract
+
+
+def _assert_proven_session_lead_successor(submission, contract):
+    from agentflow.coordinator.providers import validate_session_lead_input
+
+    assert submission.input_ptr.count("<!-- agentflow-review-assignment:start -->") == 1
+    assert submission.input_ptr.count(
+        "\n## Session lead — benchmarked capability routing\n") == 1
+    assert submission.input_ptr.endswith(contract)
+    assert submission.review.handoff in submission.input_ptr
+    assert submission.session_lead is True
+    validate_session_lead_input(submission)
+
+
+@pytest.mark.parametrize("legacy_provenance", [False, True], ids=["current", "pre-555"])
+def test_session_led_axis_successor_keeps_the_generated_contract_terminal(legacy_provenance):
+    from agentflow import coordinated_review
+    from agentflow.reviewer import Verdict
+
+    review, contract = _proven_session_led_review(state=ReviewState(
+        assignment=ReviewAssignment(
+            ReviewDepth.FULL, "shared behavior", ReviewAxis.PRODUCT),
+        change_author_tool="claude"), legacy_provenance=legacy_provenance)
+
+    successor = coordinated_review.review_axis_successor_submission(
+        review, Verdict(
+            clean=True, reviewed_sha="head", final_sha="head",
+            depth=ReviewDepth.FULL, depth_reason="shared behavior",
+            change_author_tool="claude", checks=("product checked",)))
+
+    assert successor is not None
+    assert successor.review.assignment.axis is ReviewAxis.STANDARDS
+    _assert_proven_session_lead_successor(successor, contract)
+
+
+@pytest.mark.parametrize("legacy_provenance", [False, True], ids=["current", "pre-555"])
+def test_session_led_taint_reopen_keeps_the_generated_contract_terminal(legacy_provenance):
+    from agentflow import coordinated_review
+
+    review, contract = _proven_session_led_review(state=ReviewState(
+        assignment=ReviewAssignment(
+            ReviewDepth.TARGETED, "one journey", ReviewAxis.COMBINED),
+        change_author_tool="claude", tainted=True), legacy_provenance=legacy_provenance)
+
+    successor = coordinated_review.tainted_review_submission(review, "codex")
+
+    assert successor is not None
+    assert successor.review.tainted is True
+    _assert_proven_session_lead_successor(successor, contract)
+
+
+@pytest.mark.parametrize("legacy_provenance", [False, True], ids=["current", "pre-555"])
+def test_session_led_decision_resume_keeps_the_generated_contract_terminal(legacy_provenance):
+    from agentflow import coordinated_review
+
+    review, contract = _proven_session_led_review(state=ReviewState(
+        assignment=ReviewAssignment(
+            ReviewDepth.FULL, "shared behavior", ReviewAxis.FIX),
+        change_author_tool="claude", uncertainty=Uncertainty(
+            ("keep conservative behavior", "adopt the new behavior"),
+            "which behavior should win", "keep conservative behavior")),
+        legacy_provenance=legacy_provenance)
+
+    successor = coordinated_review.decision_resume_review_submission(
+        review, "codex", target="IC_1", answer="keep the conservative behavior", sequence=4)
+
+    assert successor is not None
+    assert successor.review.sequence == 4
+    _assert_proven_session_lead_successor(successor, contract)
+
+
+def test_legacy_proven_session_led_reviewer_push_normalizes_provenance(monkeypatch):
+    from agentflow import coordinated_review
+    from agentflow.reviewer import Verdict
+
+    review, contract = _proven_session_led_review(
+        legacy_provenance=True, head_sha="old-head")
+    monkeypatch.setattr(
+        "agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr(
+        coordinated_review, "pick_reviewer", lambda *_args, **_kwargs: "claude")
+
+    successor = coordinated_review.review_successor_submission(
+        review, Verdict(
+            clean=True, reviewed_sha="old-head", final_sha="new-head", pushed_sha="new-head",
+            fixes=("fixed",), change_author_tool="claude", checks=("checked",)))
+
+    assert successor is not None
+    _assert_proven_session_lead_successor(successor, contract)
+
+
+@pytest.mark.parametrize("provenance", [False, True], ids=["marker-only", "truncated"])
+def test_review_successor_does_not_repair_an_unproven_or_incomplete_contract(
+        monkeypatch, provenance):
+    from dataclasses import replace
+
+    from agentflow import coordinated_review
+    from agentflow.coordinator.providers import (
+        SessionLeadInputError, validate_session_lead_input)
+    from agentflow.reviewer import Verdict
+
+    review, _contract = _proven_session_led_review()
+    if provenance:
+        prompt = review.input_ptr[:-20]
+    else:
+        marker = "\n## Session lead — benchmarked capability routing\n"
+        prompt = review.input_ptr[:review.input_ptr.index(marker) + len(marker)] + "task text"
+    review = replace(review, input_ptr=prompt, session_lead=provenance)
+    monkeypatch.setattr(
+        "agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr(
+        coordinated_review, "pick_reviewer", lambda *_args, **_kwargs: "claude")
+
+    successor = coordinated_review.review_successor_submission(
+        review, Verdict(
+            clean=True, reviewed_sha="head", final_sha="new-head", pushed_sha="new-head",
+            fixes=("fixed",), change_author_tool="claude", checks=("checked",)))
+
+    assert successor is not None
+    with pytest.raises(SessionLeadInputError):
+        validate_session_lead_input(successor)
+
+
 def test_reviewed_reviewer_fix_uses_immediate_same_tool_fallback_without_forced_taint(
         monkeypatch):
     from agentflow import coordinated_review, pipeline, pr_park

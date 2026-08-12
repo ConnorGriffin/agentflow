@@ -590,7 +590,7 @@ def _durable_prompt(record) -> str:
     continuation carrying a recovery envelope (issue #225) appends those bounded durable facts so
     the fresh session resumes from them rather than replaying the identical base prompt."""
     prompt = _base_durable_prompt(record)
-    if _has_session_lead_provenance(record):
+    if has_session_lead_provenance(record):
         prompt = _refresh_session_lead_contract(record, prompt)
     elif _SESSION_LEAD_MARKER in prompt:
         raise SessionLeadInputError(
@@ -608,6 +608,18 @@ def _refresh_session_lead_contract(record, prompt: str) -> str:
     that structure cannot be separated without risking user text, so it is refused before a
     provider process is started.
     """
+    task_brief, _contract = split_terminal_session_lead_contract(prompt)
+    from agentflow.pool_control import POOLS, pool_paused
+    from agentflow.routing import routing
+    from agentflow.runner import codex_spent_at_render
+    return task_brief + routing.session_lead_instructions(
+        record.stage, record.effort, parent_provider=record.pool,
+        codex_spent=codex_spent_at_render(),
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+
+
+def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:
+    """Return a proven task brief and its complete terminal generated lead contract."""
     marker = prompt.rfind(_SESSION_LEAD_MARKER)
     if marker < 0:
         raise SessionLeadInputError(
@@ -622,14 +634,7 @@ def _refresh_session_lead_contract(record, prompt: str) -> str:
         raise SessionLeadInputError(
             "session-lead input cannot be safely refreshed: expected a complete generated "
             "Session lead contract; retain the durable task brief and resubmit")
-    task_brief = prompt[:start.start()]
-    from agentflow.pool_control import POOLS, pool_paused
-    from agentflow.routing import routing
-    from agentflow.runner import codex_spent_at_render
-    return task_brief + routing.session_lead_instructions(
-        record.stage, record.effort, parent_provider=record.pool,
-        codex_spent=codex_spent_at_render(),
-        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+    return prompt[:start.start()], prompt[start.start():]
 
 
 def validate_session_lead_input(record) -> None:
@@ -637,7 +642,7 @@ def validate_session_lead_input(record) -> None:
     _durable_prompt(record)
 
 
-def _has_session_lead_provenance(record) -> bool:
+def has_session_lead_provenance(record) -> bool:
     """Recognize current records and Codex native-helper records that predate #555.
 
     A marker embedded only in a raw prompt is not provenance: task text may contain the same

@@ -32,6 +32,8 @@ from types import SimpleNamespace
 from agentflow import github
 from agentflow.balancer import BUILD_POOLS, pick_reviewer
 from agentflow.coordinator import Coordinator, tracer
+from agentflow.coordinator.providers import (
+    SessionLeadInputError, has_session_lead_provenance, split_terminal_session_lead_contract)
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
@@ -63,6 +65,20 @@ def _session_lead_prompt(prompt: str, parent_pool: str) -> str:
     return prompt + routing.session_lead_instructions(
         "review", None, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
         unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+
+
+def _with_durable_review_assignment(review_record, prompt: str, **assignment) -> str:
+    """Replace a durable assignment without displacing a proven terminal lead contract."""
+    from agentflow.reviewer import with_review_assignment
+
+    contract = ""
+    if has_session_lead_provenance(review_record):
+        try:
+            prompt, contract = split_terminal_session_lead_contract(prompt)
+        except SessionLeadInputError:
+            # Preparation owns the durable refusal. Do not guess a contract boundary here.
+            pass
+    return with_review_assignment(prompt, **assignment) + contract
 
 
 def _build_source_parts(record):
@@ -225,7 +241,9 @@ def review_successor_submission(review_record, verdict):
               else prior.assignment.reason)
     prompt = (review_record.input_ptr or "").replace(
         review_record.target or "", verdict.final_sha)
-    prompt = with_review_assignment(
+    session_lead = has_session_lead_provenance(review_record)
+    prompt = _with_durable_review_assignment(
+        review_record,
         prompt,
         depth=depth,
         reason=reason,
@@ -251,7 +269,7 @@ def review_successor_submission(review_record, verdict):
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state,
-        session_lead=review_record.session_lead)
+        session_lead=session_lead)
 
 
 def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=None,
@@ -262,7 +280,6 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_findings,
         merge_follow_ups, other_tool)
-    from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
     if facts is None or verdict.pushed_sha:
@@ -300,13 +317,14 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     reason = (verdict.depth_reason if verdict.depth != prior.assignment.depth
               else prior.assignment.reason)
     author = prior.change_author_tool or review_record.builder_lineage
-    prompt = with_review_assignment(
+    session_lead = has_session_lead_provenance(review_record)
+    prompt = _with_durable_review_assignment(
+        review_record,
         review_record.input_ptr or "",
         depth=depth,
         reason=reason,
         axis=axis,
-        change_author_tool=author or "",
-        handoff=handoff)
+        change_author_tool=author or "", handoff=handoff)
     state = replace(
         prior, assignment=ReviewAssignment(depth, reason, axis),
         change_author_tool=author,
@@ -327,7 +345,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state,
-        session_lead=review_record.session_lead)
+        session_lead=session_lead)
 
 
 def tainted_review_submission(review_record, reviewer_tool: str):
@@ -335,7 +353,6 @@ def tainted_review_submission(review_record, reviewer_tool: str):
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
-    from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
     author = review_record.change_author_tool or review_record.builder_lineage
@@ -352,7 +369,9 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         "Verify the current exact head independently; a clean unchanged result clears the "
         "human-merge-only taint."
     )
-    prompt = with_review_assignment(
+    session_lead = has_session_lead_provenance(review_record)
+    prompt = _with_durable_review_assignment(
+        review_record,
         review_record.input_ptr or "",
         depth=depth, reason=review_record.depth_reason or "taint-clearing independent review",
         axis=axis, change_author_tool=author or "", handoff=handoff)
@@ -373,7 +392,7 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state,
-        session_lead=review_record.session_lead)
+        session_lead=session_lead)
 
 
 def decision_resume_review_submission(review_record, reviewer_tool: str, *, target: str,
@@ -391,7 +410,6 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, decision_answer_handoff)
-    from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
     author = review_record.change_author_tool or review_record.builder_lineage
@@ -405,7 +423,9 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
     axis = ReviewAxis.PRODUCT if depth is ReviewDepth.FULL else ReviewAxis.COMBINED
     reason = review_record.depth_reason or "maintainer answered the recorded product decision"
     handoff = decision_answer_handoff(target, answer)
-    prompt = with_review_assignment(
+    session_lead = has_session_lead_provenance(review_record)
+    prompt = _with_durable_review_assignment(
+        review_record,
         review_record.input_ptr or "",
         depth=depth, reason=reason, axis=axis, change_author_tool=author or "", handoff=handoff)
     state = replace(
@@ -423,7 +443,7 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state,
-        session_lead=review_record.session_lead)
+        session_lead=session_lead)
 
 
 def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
