@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -284,6 +285,297 @@ def test_real_supervisor_preserves_partial_output_signal_and_timeout(coord_state
     assert "partial stdout" in observation.partial_output
     assert "partial stderr" in observation.partial_output
     assert observation.cause is ProviderCause.TIMEOUT
+
+
+def _wait_for_real_child(identity: str, message: str):
+    from agentflow.coordinator.store import Store, default_store_path
+
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        record = Store(default_store_path()).load()[identity]
+        if not pid_family_alive(record.family):
+            return record
+        time.sleep(.02)
+    pytest.fail(message)
+
+
+def _build_observation(record):
+    from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
+
+    if record.pool == "codex":
+        return CodexProviderAdapter(account_of=lambda _record: None).observe(record)
+    return ClaudeProviderAdapter().observe(record)
+
+
+def _build(pool: str, subject: str, source: str) -> Submission:
+    return Submission(repo="o/r", subject=subject, stage="build", pool=pool, source=source,
+                      complexity="standard", effort="low", input_ptr="build")
+
+
+def test_build_head_progress_renews_its_child_local_silent_lease(coord_state, tmp_path):
+    """A real Build child survives a short silent lease after committing new work (#570)."""
+    from agentflow.coordinator.store import Store, default_store_path
+
+    source = tmp_path / "build"
+    source.mkdir()
+    for command in (("git", "init", str(source)),
+                    ("git", "-C", str(source), "config", "user.email", "test@example.com"),
+                    ("git", "-C", str(source), "config", "user.name", "Test")):
+        subprocess.run(command, check=True, capture_output=True)
+    (source / "initial").write_text("initial")
+    subprocess.run(("git", "-C", str(source), "add", "."), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "initial"),
+                   check=True, capture_output=True)
+
+    script = (
+        "import pathlib,subprocess,sys,time\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1], 'progress').write_text('done')\n"
+        "subprocess.run(['git','-C',sys.argv[1],'add','.'], check=True)\n"
+        "subprocess.run(['git','-C',sys.argv[1],'commit','-m','progress'], check=True)\n"
+        "time.sleep(.24)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, record.source]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.25, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("claude", "head-progress", str(source)))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 2
+    while not (source / "progress").exists() and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert (source / "progress").exists()
+    time.sleep(.18)  # past the original silent lease, but after the new HEAD
+    record = Store(default_store_path()).load()[identity]
+    assert pid_family_alive(record.family)
+
+    record = _wait_for_real_child(identity, "Build child did not exit")
+    assert _build_observation(record).timed_out is False
+
+
+@pytest.mark.parametrize("pool", ["claude", "codex"])
+def test_build_recognized_test_crosses_silence_then_renews_on_success(
+        coord_state, tmp_path, pool):
+    """Both real provider stream shapes supervise a test, then renew only on success."""
+    from agentflow.coordinator.store import Store, default_store_path
+
+    if pool == "claude":
+        started = {"type": "assistant", "message": {"type": "message", "role": "assistant",
+                   "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                "input": {"command": "uv run pytest -q"}}]}}
+        completed = {"type": "user", "message": {"type": "message", "role": "user",
+                     "content": [{"type": "tool_result", "tool_use_id": "t1",
+                                  "is_error": False, "content": "1 passed"}]}}
+    else:
+        command = '/bin/zsh -lc "uv run pytest -q"'
+        started = {"type": "item.started", "item": {"id": "t1",
+                   "type": "command_execution", "command": command,
+                   "aggregated_output": "", "exit_code": None, "status": "in_progress"}}
+        completed = {"type": "item.completed", "item": {"id": "t1",
+                     "type": "command_execution", "command": command,
+                     "aggregated_output": "1 passed", "exit_code": 0,
+                     "status": "completed"}}
+    script = (
+        "import json,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.30)\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.60, 1.0)))
+    identity = coord.submit_stage(_build(pool, f"test-grace-{pool}", str(tmp_path)))
+    coord.cycle(pool)
+
+    time.sleep(.25)
+    record = Store(default_store_path()).load()[identity]
+    assert pid_family_alive(record.family)  # the in-flight test crossed silence
+
+    record = _wait_for_real_child(identity, "Build test child did not exit")
+    assert _build_observation(record).timed_out is False
+
+
+def test_build_test_grace_cannot_cross_the_immutable_absolute_cap(coord_state, tmp_path):
+    """A recognized in-flight test is still stopped at Build's absolute attempt cap (#570)."""
+    from agentflow.coordinator.store import Store, default_store_path
+
+    script = (
+        "import json,time\n"
+        "print(json.dumps({'type':'assistant','message':{'type':'message','role':'assistant','content':[{'type':'tool_use','id':'t1','name':'Bash','input':{'command':'pytest -q'}}]}}), flush=True)\n"
+        "time.sleep(.60)\n"
+    )
+    gate = {"open": True}
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 1.0, 0.35)), gate=lambda _record: gate["open"])
+    identity = coord.submit_stage(_build("claude", "absolute-cap", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "Build test child did not stop at its absolute cap")
+    observation = _build_observation(record)
+    assert observation.cause is ProviderCause.TIMEOUT
+    gate["open"] = False
+    coord.cycle("claude")
+    assert Store(default_store_path()).load()[identity].attempts == 1
+
+
+def test_build_prose_and_repeated_structured_facts_do_not_renew(coord_state, tmp_path):
+    """Only one completed edit is progress; chat, usage, and its replay cannot extend silence."""
+    edit = {'type': 'assistant', 'message': {'type': 'message', 'role': 'assistant', 'content': [
+        {'type': 'tool_use', 'id': 'w1', 'name': 'Write',
+         'input': {'file_path': str(tmp_path / 'x')}}]}}
+    completed = {'type': 'user', 'message': {'type': 'message', 'role': 'user', 'content': [
+        {'type': 'tool_result', 'tool_use_id': 'w1', 'is_error': False, 'content': 'done'}]}}
+    script = (
+        "import json,time\n"
+        f"print(json.dumps({edit!r}), flush=True)\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "print(json.dumps({'type':'assistant','message':{'type':'message','role':'assistant','content':[{'type':'text','text':'still working'}]}}), flush=True)\n"
+        "print(json.dumps({'type':'rate_limit_event','rate_limit_info':{'status':'allowed'}}), flush=True)\n"
+        "print('partial output only', flush=True)\n"
+        "time.sleep(.20)\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "time.sleep(.40)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.30, 0.60, 1.0)))
+    identity = coord.submit_stage(_build("claude", "no-chatter-lease", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "Build child did not expire after one silent lease")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+
+
+@pytest.mark.parametrize(("pool", "event"), [
+    ("claude", {"type": "item.started", "item": {"id": "t1",
+                "type": "command_execution", "command": '/bin/zsh -lc "pytest -q"',
+                "aggregated_output": "", "exit_code": None, "status": "in_progress"}}),
+    ("codex", {"type": "assistant", "message": {"type": "message", "role": "assistant",
+               "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                            "input": {"command": "pytest -q"}}]}}),
+    ("codex", {"type": "item.started", "item": {"id": "t1",
+               "type": "command_execution", "command": '/bin/zsh -lc "pytest -q"'}}),
+    ("claude", {"type": "assistant", "message": {"type": "message", "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                             "input": {"command": "pytest -q && echo done"}}]}}),
+    ("codex", {"type": "item.started", "item": {"id": "t1",
+               "type": "command_execution", "command": '/bin/zsh -lc "pytest -q | tail -1"',
+               "aggregated_output": "", "exit_code": None, "status": "in_progress"}}),
+])
+def test_build_progress_stream_fails_closed_for_wrong_malformed_or_composed_events(
+        coord_state, tmp_path, pool, event):
+    """Provider-specific, malformed, and command-shaped lookalikes never gain test grace."""
+    script = ("import json,time\n"
+              f"print(json.dumps({event!r}), flush=True)\n"
+              "time.sleep(.50)\n")
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.25, 0.80, 1.0)))
+    identity = coord.submit_stage(_build(pool, "fail-closed", str(tmp_path)))
+    coord.cycle(pool)
+
+    record = _wait_for_real_child(identity, "unrecognized Build event retained supervision")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+
+
+@pytest.mark.parametrize("pool", ["claude", "codex"])
+def test_malformed_test_completion_ends_supervision_without_renewing(
+        coord_state, tmp_path, pool):
+    """A valid start cannot lend test grace to an ambiguous provider completion."""
+    if pool == "claude":
+        started = {"type": "assistant", "message": {"type": "message", "role": "assistant",
+                   "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                                "input": {"command": "pytest -q"}}]}}
+        malformed = {"type": "user", "message": {"type": "message", "role": "user",
+                     "content": [{"type": "tool_result", "tool_use_id": "t1",
+                                  "content": "looks green"}]}}
+    else:
+        command = '/bin/zsh -lc "pytest -q"'
+        started = {"type": "item.started", "item": {"id": "t1",
+                   "type": "command_execution", "command": command,
+                   "aggregated_output": "", "exit_code": None, "status": "in_progress"}}
+        malformed = {"type": "item.completed", "item": {"id": "t1",
+                     "type": "command_execution", "command": command,
+                     "aggregated_output": "looks green", "status": "completed"}}
+    script = ("import json,time\n"
+              f"print(json.dumps({started!r}), flush=True)\n"
+              "time.sleep(.15)\n"
+              f"print(json.dumps({malformed!r}), flush=True)\n"
+              "time.sleep(.40)\n")
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.25, 0.80, 1.0)))
+    identity = coord.submit_stage(_build(pool, f"malformed-completion-{pool}", str(tmp_path)))
+    coord.cycle(pool)
+
+    record = _wait_for_real_child(identity, "malformed completion retained test supervision")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+
+
+def test_overlapping_tests_are_each_bounded_by_the_test_cap(coord_state, tmp_path):
+    """A second recognized test cannot move the first test's immutable supervision deadline."""
+    marker = tmp_path / "past-first-cap"
+    one = '/bin/zsh -lc "pytest -q tests/one"'
+    two = '/bin/zsh -lc "pytest -q tests/two"'
+    start_one = {"type": "item.started", "item": {"id": "t1", "type": "command_execution",
+                 "command": one, "aggregated_output": "", "exit_code": None,
+                 "status": "in_progress"}}
+    start_two = {"type": "item.started", "item": {"id": "t2", "type": "command_execution",
+                 "command": two, "aggregated_output": "", "exit_code": None,
+                 "status": "in_progress"}}
+    script = ("import json,pathlib,sys,time\n"
+              f"print(json.dumps({start_one!r}), flush=True)\n"
+              "time.sleep(.25)\n"
+              f"print(json.dumps({start_two!r}), flush=True)\n"
+              "time.sleep(.45)\n"
+              "pathlib.Path(sys.argv[1]).write_text('too late')\n")
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.30, 0.50, 1.2)))
+    identity = coord.submit_stage(_build("codex", "overlapping-tests", str(tmp_path)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "first overlapping test exceeded its test cap")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_repeated_head_progress_cannot_cross_the_absolute_cap(coord_state, tmp_path):
+    """Commits can renew silence, but the attempt still ends at its original absolute cap."""
+    source = tmp_path / "capped-build"
+    source.mkdir()
+    for command in (("git", "init", str(source)),
+                    ("git", "-C", str(source), "config", "user.email", "test@example.com"),
+                    ("git", "-C", str(source), "config", "user.name", "Test")):
+        subprocess.run(command, check=True, capture_output=True)
+    (source / "progress").write_text("0")
+    subprocess.run(("git", "-C", str(source), "add", "."), check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "initial"),
+                   check=True, capture_output=True)
+
+    marker = source / "past-absolute-cap"
+    script = (
+        "import pathlib,subprocess,sys,time\n"
+        "root=pathlib.Path(sys.argv[1])\n"
+        "for n in range(1,5):\n"
+        " time.sleep(.12)\n"
+        " (root/'progress').write_text(str(n))\n"
+        " subprocess.run(['git','-C',str(root),'add','.'], check=True)\n"
+        " subprocess.run(['git','-C',str(root),'commit','-m',f'progress-{n}'], check=True)\n"
+        "time.sleep(.10)\n"
+        "(root/'past-absolute-cap').write_text('too late')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, record.source]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.25, 0.80, 0.45)))
+    identity = coord.submit_stage(_build("claude", "head-absolute-cap", str(source)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "Build commits crossed the absolute cap")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
 
 
 def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord_state):

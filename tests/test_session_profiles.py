@@ -149,14 +149,45 @@ def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):
     assert launcher._session_timeout_for(_record("intake", str(tmp_path))) == 20 * 60
     assert launcher._session_timeout_for(_record("review", str(tmp_path))) == 30 * 60
     assert launcher._session_timeout_for(
-        _record("build", str(tmp_path), complexity="deep", effort="extra")) == 60 * 60
-    # The standard tier carries the deep tier's 45-minute wall: its drafted 25 minutes was never
-    # measured, and at recorded pace the raised 160-call allowance straddles it (§3b‴, #421).
+        _record("build", str(tmp_path), complexity="deep", effort="extra")) == 4 * 60 * 60
+    # Build's fixed wall became its immutable lease cap; ordinary activity renews only the
+    # child-local silent lease (#570), never this absolute deadline.
     assert launcher._session_timeout_for(
-        _record("build", str(tmp_path), complexity="standard", effort="low")) == 45 * 60
+        _record("build", str(tmp_path), complexity="standard", effort="low")) == 2 * 60 * 60
 
     pinned = LocalLauncher(session_timeout=0.1)
     assert pinned._session_timeout_for(_record("build", str(tmp_path))) == 0.1
+
+
+def test_build_profile_exposes_a_progress_lease_with_an_immutable_cap(tmp_path):
+    """Build gets the #570 child-local lease; every other stage keeps one fixed ceiling."""
+    from agentflow.coordinator.profiles import profile_for
+
+    standard = profile_for(_record("build", str(tmp_path), complexity="standard", effort="low"))
+    deep = profile_for(_record("build", str(tmp_path), complexity="deep", effort="high"))
+    extra = profile_for(_record("build", str(tmp_path), complexity="deep", effort="extra"))
+
+    assert standard.build_lease == (15 * 60, 45 * 60, 2 * 60 * 60)
+    assert deep.build_lease == (20 * 60, 60 * 60, 3 * 60 * 60)
+    assert extra.build_lease == (30 * 60, 75 * 60, 4 * 60 * 60)
+    assert profile_for(_record("review", str(tmp_path))).build_lease is None
+
+
+def test_explicit_timeouts_replace_build_lease_and_other_stages_never_get_one(
+        tmp_path, monkeypatch):
+    """Existing constructor/env timeout controls remain fixed walls, never renewable leases."""
+    build = _record("build", str(tmp_path), complexity="standard", effort="low")
+    review = _record("review", str(tmp_path))
+    short_lease = (0.20, 0.60, 1.0)
+
+    launcher = LocalLauncher(build_lease=short_lease)
+    assert launcher._build_lease_for(build) == short_lease
+    assert launcher._build_lease_for(review) is None
+    assert LocalLauncher(session_timeout=0.1, build_lease=short_lease)._build_lease_for(build) is None
+
+    monkeypatch.setenv("AGENTFLOW_SESSION_TIMEOUT", "0.2")
+    assert launcher._build_lease_for(build) is None
+    assert launcher._session_timeout_for(build) == 0.2
 
 
 def test_profile_pins_session_leads_low_and_other_stages_use_provider_default(tmp_path):

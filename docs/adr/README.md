@@ -25,6 +25,8 @@ ADRs in that format.
   fallback.
 - [ADR 541](adr-541-native-session-lead-helpers.md) — Native session-lead helpers retain parent
   accounting.
+- [ADR 570](adr-570-build-progress-lease.md) — Build alone uses a child-local progress lease,
+  supervised test deadline, and immutable absolute cap; every other stage keeps its fixed wall.
 
 - [0001](0001-per-repo-autonomy-profile.md) — One pipeline, one dial: the per-repo
   autonomy profile.

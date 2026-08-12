@@ -151,6 +151,22 @@ _BUILD_DEFAULT: dict[str, tuple[int, int]] = {
     "deep": (45 * _MIN, 200),
 }
 
+# #570 keeps a hard attempt cap, but lets a Build's detached child renew only a
+# short silent-inactivity lease when it observes durable implementation progress.
+# Revise deliberately continues to use the fixed ceilings above: Build is the only
+# stage that owns this child-local policy.
+_BUILD_LEASES: dict[tuple[str, str], tuple[int, int, int]] = {
+    ("standard", "low"): (15 * _MIN, 45 * _MIN, 2 * 60 * _MIN),
+    ("standard", "medium"): (15 * _MIN, 45 * _MIN, 2 * 60 * _MIN),
+    ("deep", "medium"): (20 * _MIN, 60 * _MIN, 3 * 60 * _MIN),
+    ("deep", "high"): (20 * _MIN, 60 * _MIN, 3 * 60 * _MIN),
+    ("deep", "extra"): (30 * _MIN, 75 * _MIN, 4 * 60 * _MIN),
+}
+_BUILD_LEASE_DEFAULT: dict[str, tuple[int, int, int]] = {
+    "standard": (15 * _MIN, 45 * _MIN, 2 * 60 * _MIN),
+    "deep": (20 * _MIN, 60 * _MIN, 3 * 60 * _MIN),
+}
+
 # The legacy uniform two-hour wall, kept only as the fallback for a stage the table never names
 # so an unrecognized stage is never accidentally strangled by a tight ceiling.
 _DEFAULT_CEILING = (2 * 3600, 200)
@@ -166,6 +182,7 @@ class StageProfile:
     wall_ceiling_s: int
     turn_ceiling: int
     reasoning_effort: str | None = None
+    build_lease: tuple[int, int, int] | None = None  # silent, test grace, immutable cap
 
     @property
     def read_only(self) -> bool:
@@ -179,6 +196,12 @@ def _build_ceiling(complexity: str | None, effort: str | None) -> tuple[int, int
     return _BUILD_DEFAULT.get(complexity or "deep", _DEFAULT_CEILING)
 
 
+def _build_lease(complexity: str | None, effort: str | None) -> tuple[int, int, int]:
+    key = (complexity or "deep", effort or "")
+    return _BUILD_LEASES.get(key, _BUILD_LEASE_DEFAULT.get(complexity or "deep",
+                                                            _BUILD_LEASE_DEFAULT["deep"]))
+
+
 def profile_for(record) -> StageProfile:
     """Resolve the session profile for a record from its ``(stage, complexity, effort)``.
 
@@ -190,8 +213,9 @@ def profile_for(record) -> StageProfile:
     """
     stage = record.stage
     if stage == "build":
-        wall, turns = _build_ceiling(record.complexity, record.effort)
-        return StageProfile(None, wall, turns, "low")
+        _wall, turns = _build_ceiling(record.complexity, record.effort)
+        lease = _build_lease(record.complexity, record.effort)
+        return StageProfile(None, lease[2], turns, "low", lease)
     if stage == "revise":
         wall, turns = _build_ceiling(record.builder_complexity or record.complexity, record.effort)
         return StageProfile(None, wall, turns, "low")
