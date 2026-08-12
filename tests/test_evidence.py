@@ -9,6 +9,30 @@ from agentflow.evidence import (AuthorityPointer, EvidenceStore, Observation,
 from agentflow.evidence_contract import validate_fixtures
 
 
+OLD_V1_DDL = """
+CREATE TABLE events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL, subject TEXT NOT NULL, revision TEXT NOT NULL, failure_class TEXT NOT NULL, signature TEXT NOT NULL, normalizer TEXT NOT NULL, UNIQUE(repository,subject,revision,failure_class,signature,normalizer));
+CREATE TABLE observations (observation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, source_kind TEXT NOT NULL, source_repository TEXT NOT NULL, source_locator TEXT NOT NULL, source_revision TEXT NOT NULL, source_hash_algorithm TEXT NOT NULL, source_hash TEXT NOT NULL, source_scope TEXT NOT NULL, validation_state TEXT NOT NULL, observed_at INTEGER NOT NULL, parent_revision TEXT NOT NULL, fixer_revision TEXT NOT NULL);
+CREATE TABLE evaluations (evaluation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL, validation_state TEXT NOT NULL, evaluated_at INTEGER NOT NULL);
+CREATE TABLE candidates (candidate_id TEXT PRIMARY KEY, proposal_digest TEXT NOT NULL, policy_version INTEGER NOT NULL, nominated_at INTEGER NOT NULL);
+CREATE TABLE candidate_events (candidate_id TEXT NOT NULL, event_id TEXT NOT NULL, PRIMARY KEY(candidate_id,event_id));
+CREATE TABLE receipts (candidate_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL, approval_id TEXT NOT NULL, policy_version INTEGER NOT NULL, promoted_at INTEGER NOT NULL);
+"""
+
+
+def _old_v1(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(OLD_V1_DDL)
+    conn.execute("INSERT INTO events VALUES ('event-1', 'octo/repo', 'pr/42', ?, 'original_defect', ?, 'v1')", ("a" * 40, "b" * 64))
+    conn.execute("INSERT INTO observations VALUES ('obs-1', 'event-1', 'github', 'octo/repo', 'issues/42', ?, 'sha256', ?, 'issue', 'observed', 1, '', '')", ("a" * 40, "c" * 64))
+    conn.execute("INSERT INTO evaluations VALUES ('evaluation-1', 'event-1', 'human_validated', 2)")
+    conn.execute("INSERT INTO candidates VALUES ('candidate-1', ?, 1, 3)", ("d" * 64,))
+    conn.execute("INSERT INTO candidate_events VALUES ('candidate-1', 'event-1')")
+    conn.execute("INSERT INTO receipts VALUES ('candidate-1', 'receipt-candidate-1', 'approval-1', 1, 4)")
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+
+
 def _source():
     return AuthorityPointer("github", "octo/repo", "issues/42", "a" * 40,
                             "sha256", "b" * 64, "issue")
@@ -186,6 +210,54 @@ def test_separate_evidence_schema_fails_closed_and_never_changes_records_db(tmp_
     conn.close()
 
 
+def test_exact_e79a_v1_migrates_atomically_preserving_data_and_marking_receipt_legacy(tmp_path):
+    path = tmp_path / "evidence.db"
+    _old_v1(path)
+    authority = _source()
+    approved = ApprovedAuthority(authority, "approval-1", authority.revision, authority.content_hash,
+                                 authority.scope, "fake", "v1", "verified")
+    store = EvidenceStore(path=path, verifier=FakeAuthorityVerifier((approved,)))
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM evaluations").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM candidates").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM candidate_events").fetchone()[0] == 1
+    assert conn.execute("SELECT binding_status FROM receipts").fetchone()[0] == "legacy_unverifiable"
+    conn.close()
+    with pytest.raises(EvidenceError, match="legacy receipt"):
+        store.promote("candidate-1", authority, promoted_at=5)
+
+
+def test_v1_migration_rolls_back_version_and_data_on_injected_failure(tmp_path, monkeypatch):
+    path = tmp_path / "evidence.db"
+    _old_v1(path)
+
+    def fail():
+        raise RuntimeError("injected migration failure")
+
+    monkeypatch.setattr(EvidenceStore, "_migration_checkpoint", staticmethod(fail))
+    with pytest.raises(RuntimeError, match="injected"):
+        EvidenceStore(path=path)
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM receipts").fetchone()[0] == 1
+    assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == 1
+    conn.close()
+
+
+def test_tampered_exact_v1_schema_is_not_a_migration_source(tmp_path):
+    path = tmp_path / "evidence.db"
+    _old_v1(path)
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE events ADD COLUMN tampered TEXT")
+    conn.commit()
+    conn.close()
+    with pytest.raises(EvidenceError, match="v1 schema"):
+        EvidenceStore(path=path)
+
+
 @pytest.mark.parametrize("statement", [
     "CREATE TABLE events (event_id TEXT PRIMARY KEY)",
     "CREATE TABLE events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL, subject TEXT NOT NULL, revision TEXT NOT NULL, failure_class TEXT NOT NULL, signature TEXT NOT NULL, normalizer TEXT NOT NULL)",
@@ -202,7 +274,7 @@ def test_versioned_malformed_evidence_schema_fails_closed_before_use(tmp_path, s
 
 
 @pytest.mark.parametrize("tamper", ["ALTER TABLE events ADD COLUMN untrusted TEXT", "DROP INDEX observations_by_event"])
-def test_complete_v1_schema_fingerprint_rejects_column_and_index_tampering(tmp_path, tamper):
+def test_complete_v2_schema_fingerprint_rejects_column_and_index_tampering(tmp_path, tamper):
     path = tmp_path / "evidence.db"
     EvidenceStore(path=path)
     conn = sqlite3.connect(path)

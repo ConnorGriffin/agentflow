@@ -14,7 +14,7 @@ import sqlite3
 
 from agentflow.state import state_path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 FAILURE_CLASSES = frozenset({"original_defect", "plan_gap", "slice_scope_error",
                              "reviewer_false_claim", "speculative_preference",
                              "fix_introduced_defect"})
@@ -25,7 +25,27 @@ _DIGEST = re.compile(r"^[a-f0-9]{32,128}$")
 _SHA = re.compile(r"^[a-f0-9]{40,64}$")
 _CONTENT_REVISION = re.compile(r"^sha256:([a-f0-9]{64})$")
 
-_SCHEMA = """
+_V1_SCHEMA = """
+CREATE TABLE events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL,
+  subject TEXT NOT NULL, revision TEXT NOT NULL, failure_class TEXT NOT NULL,
+  signature TEXT NOT NULL, normalizer TEXT NOT NULL,
+  UNIQUE(repository,subject,revision,failure_class,signature,normalizer));
+CREATE TABLE observations (observation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL, source_repository TEXT NOT NULL, source_locator TEXT NOT NULL,
+  source_revision TEXT NOT NULL, source_hash_algorithm TEXT NOT NULL, source_hash TEXT NOT NULL,
+  source_scope TEXT NOT NULL, validation_state TEXT NOT NULL, observed_at INTEGER NOT NULL,
+  parent_revision TEXT NOT NULL, fixer_revision TEXT NOT NULL);
+CREATE TABLE evaluations (evaluation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+  validation_state TEXT NOT NULL, evaluated_at INTEGER NOT NULL);
+CREATE TABLE candidates (candidate_id TEXT PRIMARY KEY, proposal_digest TEXT NOT NULL,
+  policy_version INTEGER NOT NULL, nominated_at INTEGER NOT NULL);
+CREATE TABLE candidate_events (candidate_id TEXT NOT NULL, event_id TEXT NOT NULL,
+  PRIMARY KEY(candidate_id,event_id));
+CREATE TABLE receipts (candidate_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL,
+  approval_id TEXT NOT NULL, policy_version INTEGER NOT NULL, promoted_at INTEGER NOT NULL);
+"""
+
+_V2_SCHEMA = """
 CREATE TABLE events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL,
   subject TEXT NOT NULL, revision TEXT NOT NULL, failure_class TEXT NOT NULL,
   signature TEXT NOT NULL, normalizer TEXT NOT NULL,
@@ -47,11 +67,11 @@ CREATE TABLE candidate_events (candidate_id TEXT NOT NULL, event_id TEXT NOT NUL
   FOREIGN KEY(event_id) REFERENCES events(event_id));
 CREATE TABLE receipts (candidate_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL UNIQUE,
   approval_id TEXT NOT NULL, policy_version INTEGER NOT NULL, promoted_at INTEGER NOT NULL,
-  authority_kind TEXT NOT NULL, authority_repository TEXT NOT NULL, authority_locator TEXT NOT NULL,
-  authority_revision TEXT NOT NULL, authority_hash_algorithm TEXT NOT NULL, authority_hash TEXT NOT NULL,
-  authority_scope TEXT NOT NULL, verifier_id TEXT NOT NULL, verifier_version TEXT NOT NULL,
-  verifier_outcome TEXT NOT NULL, approved_revision TEXT NOT NULL, approved_hash TEXT NOT NULL,
-  approved_scope TEXT NOT NULL,
+  binding_status TEXT NOT NULL CHECK(binding_status IN ('verified', 'legacy_unverifiable')),
+  authority_kind TEXT, authority_repository TEXT, authority_locator TEXT,
+  authority_revision TEXT, authority_hash_algorithm TEXT, authority_hash TEXT,
+  authority_scope TEXT, verifier_id TEXT, verifier_version TEXT, verifier_outcome TEXT,
+  approved_revision TEXT, approved_hash TEXT, approved_scope TEXT,
   FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id));
 CREATE INDEX observations_by_event ON observations(event_id);
 CREATE INDEX evaluations_by_event ON evaluations(event_id);
@@ -86,13 +106,19 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, 
     return tuple((row[0], row[1], row[2], re.sub(r"\s+", "", row[3] or "").lower()) for row in rows)
 
 
-def _schema_fingerprint_for_v1() -> tuple[tuple[str, str, str, str], ...]:
+def _schema_fingerprint_for(schema: str) -> tuple[tuple[str, str, str, str], ...]:
     conn = sqlite3.connect(":memory:")
     try:
-        conn.executescript(_SCHEMA)
+        conn.executescript(schema)
         return _schema_fingerprint(conn)
     finally:
         conn.close()
+
+
+def _execute_schema(conn: sqlite3.Connection, schema: str) -> None:
+    for statement in schema.split(";"):
+        if statement.strip():
+            conn.execute(statement)
 
 
 @dataclass(frozen=True)
@@ -266,7 +292,8 @@ class PromotionReceipt:
     candidate_id: str
     approval_id: str
     policy_version: int
-    authority: ApprovedAuthority
+    authority: ApprovedAuthority | None
+    authoritative: bool
 
 
 class EvidenceStore:
@@ -286,19 +313,54 @@ class EvidenceStore:
     @staticmethod
     def _initialize(conn: sqlite3.Connection) -> None:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, SCHEMA_VERSION):
+        if version not in (0, 1, SCHEMA_VERSION):
             raise EvidenceError("unsupported evidence schema version")
         existing = _schema_fingerprint(conn)
-        expected = _schema_fingerprint_for_v1()
+        v1 = _schema_fingerprint_for(_V1_SCHEMA)
+        v2 = _schema_fingerprint_for(_V2_SCHEMA)
         if version == 0 and existing:
             raise EvidenceError("unversioned evidence database is not safe to open")
-        if version == SCHEMA_VERSION and existing != expected:
+        if version == 1 and existing != v1:
+            raise EvidenceError("evidence v1 schema does not match the known migration source")
+        if version == SCHEMA_VERSION and existing != v2:
             raise EvidenceError("evidence schema does not match its version")
         if version == 0:
-            conn.executescript(_SCHEMA)
-            if _schema_fingerprint(conn) != expected:
+            _execute_schema(conn, _V2_SCHEMA)
+            if _schema_fingerprint(conn) != v2:
                 raise EvidenceError("evidence schema did not initialize exactly")
-        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        elif version == 1:
+            EvidenceStore._migrate_v1_to_v2(conn, v2)
+
+    @staticmethod
+    def _migration_checkpoint() -> None:
+        """Private test seam for proving the migration transaction rolls back."""
+
+    @staticmethod
+    def _migrate_v1_to_v2(conn: sqlite3.Connection, expected: tuple[tuple[str, str, str, str], ...]) -> None:
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            for table in ("events", "observations", "evaluations", "candidates", "candidate_events", "receipts"):
+                conn.execute(f"ALTER TABLE {table} RENAME TO v1_{table}")
+            _execute_schema(conn, _V2_SCHEMA)
+            for table in ("events", "observations", "evaluations", "candidates", "candidate_events"):
+                conn.execute(f"INSERT INTO {table} SELECT * FROM v1_{table}")
+            conn.execute("""INSERT INTO receipts (candidate_id, receipt_id, approval_id, policy_version,
+                promoted_at, binding_status) SELECT candidate_id, receipt_id, approval_id, policy_version,
+                promoted_at, 'legacy_unverifiable' FROM v1_receipts""")
+            EvidenceStore._migration_checkpoint()
+            for table in ("events", "observations", "evaluations", "candidates", "candidate_events", "receipts"):
+                conn.execute(f"DROP TABLE v1_{table}")
+            if _schema_fingerprint(conn) != expected:
+                raise EvidenceError("evidence migration did not produce v2 exactly")
+            conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
     def _event_id(observation: Observation) -> str:
@@ -383,20 +445,25 @@ class EvidenceStore:
             prior = conn.execute("SELECT * FROM receipts WHERE candidate_id=?", (candidate_id,)).fetchone()
             if prior:
                 receipt = self._receipt(prior)
+                if not receipt.authoritative:
+                    raise EvidenceError("legacy receipt is unverifiable and cannot be promotion-active")
                 if receipt.authority.pointer != authority:
                     raise EvidenceError("candidate was promoted under a different authority")
                 return receipt
             receipt_id = f"receipt-{candidate_id}"
-            conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 candidate_id, receipt_id, approved.approval_id, candidate[0], promoted_at,
-                authority.authority_kind, authority.repository, authority.locator, authority.revision,
+                "verified", authority.authority_kind, authority.repository, authority.locator, authority.revision,
                 authority.content_hash_algorithm, authority.content_hash, authority.scope,
                 approved.verifier_id, approved.verifier_version, approved.outcome,
                 approved.approved_revision, approved.approved_hash, approved.approved_scope))
-            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id, candidate[0], approved)
+            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id, candidate[0], approved, True)
 
     @staticmethod
     def _receipt(row: sqlite3.Row) -> PromotionReceipt:
+        if row["binding_status"] == "legacy_unverifiable":
+            return PromotionReceipt(row["receipt_id"], row["candidate_id"], row["approval_id"],
+                                    row["policy_version"], None, False)
         pointer = AuthorityPointer(row["authority_kind"], row["authority_repository"],
             row["authority_locator"], row["authority_revision"], row["authority_hash_algorithm"],
             row["authority_hash"], row["authority_scope"])
@@ -404,7 +471,7 @@ class EvidenceStore:
             row["approved_hash"], row["approved_scope"], row["verifier_id"],
             row["verifier_version"], row["verifier_outcome"])
         return PromotionReceipt(row["receipt_id"], row["candidate_id"], row["approval_id"],
-                                row["policy_version"], approved)
+                                row["policy_version"], approved, True)
 
     def brief_for(self, subject: str, *, now: int, effective_policy_versions: tuple[int, ...] = ()) -> tuple[Event, ...]:
         _token(subject, "subject")

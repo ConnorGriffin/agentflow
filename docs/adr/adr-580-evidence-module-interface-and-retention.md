@@ -27,6 +27,11 @@ scope before promotion; concrete GitHub and repository adapters remain outside t
 Unpromoted and unreferenced material expires after 90 days. A promoted candidate is retained
 while cited by an effective policy and through that policy's one subsequent version.
 
+The database version is fail-closed. New stores create v2 directly. The only accepted upgrade is
+the exact original v1 schema; it migrates transactionally into v2 and preserves its rows. Because
+v1 promotion receipts did not record authority binding, migrated receipts are retained as
+`legacy_unverifiable` and cannot authorize or activate a promotion.
+
 ## Alternatives
 
 - Extend coordinator `records.db`: rejected because it conflates durable coordination with
