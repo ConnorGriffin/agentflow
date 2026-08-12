@@ -293,7 +293,7 @@ class CapabilityRouting:
         doesn't (or the fact was unreadable) gets the ordinary brief. ``unavailable_providers``
         is the caller's durable pool-pause snapshot, distinct from the render-time Codex capacity
         fact."""
-        if stage not in {"build", "revise"}:
+        if stage not in {"build", "review", "revise"}:
             raise RoutingConfigError(f"stage {stage!r} has no session lead")
         if parent_provider not in self._LEAD_MODELS:
             raise RoutingConfigError(f"provider {parent_provider!r} has no session lead")

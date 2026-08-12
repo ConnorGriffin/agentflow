@@ -1409,6 +1409,23 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
         "sha", "codex", 42) is None
 
 
+def test_coordinated_review_submission_is_preparable_as_a_session_lead(make_coord):
+    """The Review opener records ownership of the generated lead contract before admission."""
+    fake = FakeSession()
+    coord = make_coord(
+        fake, adapter=_review_adapter(fake, verdict=[False], prep=[True]))
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
+        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing")
+    submission = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
+
+    assert submission.session_lead is True
+    identity = coord.submit_stage(replace(submission, transfer_from=None))
+
+    assert coord.cycle("codex") == []
+    assert record_of(coord, identity).state == "running"
+
+
 def test_survivor_review_has_no_synthetic_predecessor(monkeypatch):
     monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: [])
     cfg = SimpleNamespace(repo="o/r", workdir="/work")
