@@ -10,6 +10,7 @@ its family is alive. A separate test exercises the real spawning launcher end to
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import shutil
@@ -64,9 +65,18 @@ def test_durable_started_then_dead_recovery_consumes_exactly_one_attempt(make_co
     assert starts_until_held(recovered, fake, identity, "codex") == 2
 
 
-def test_public_coordinator_recovery_survives_recursive_result_with_exit_fallback(
-        coord_state):
-    """A fresh coordinator reconstructs a corrupt ended attempt without replaying it."""
+@pytest.mark.parametrize(("result", "legacy_exit"), [
+    ({"exit_status": 17, "signal": None, "timed_out": False}, None),
+    (None, 17),
+    ({}, 17),
+    ({"exit_status": 17, "signal": None}, 17),
+    ({"exit_status": "17", "signal": None, "timed_out": False}, 17),
+    ({"exit_status": 17, "signal": None, "timed_out": False, "unknown": True}, 17),
+    ("recursive", 17),
+])
+def test_public_coordinator_recovery_accepts_only_current_or_legacy_terminal_facts(
+        coord_state, result, legacy_exit):
+    """Fresh recovery accepts writer schema or `.exit`, never an invalid result object."""
     from agentflow.coordinator.launcher import STARTED, StartResult
     from agentflow.coordinator.providers import ClaudeProviderAdapter
     from agentflow.coordinator.session import exit_path, result_path
@@ -76,10 +86,14 @@ def test_public_coordinator_recovery_survives_recursive_result_with_exit_fallbac
 
         def start(self, record, store):
             self.starts += 1
-            result = result_path(store.path, record.launch_token)
-            result.parent.mkdir(parents=True, exist_ok=True)
-            result.write_bytes(b"[" * 10000 + b"0" + b"]" * 10000)
-            exit_path(store.path, record.launch_token).write_text("17\n")
+            terminal = result_path(store.path, record.launch_token)
+            terminal.parent.mkdir(parents=True, exist_ok=True)
+            if result == "recursive":
+                terminal.write_bytes(b"[" * 10000 + b"0" + b"]" * 10000)
+            elif result is not None:
+                terminal.write_text(json.dumps(result))
+            if legacy_exit is not None:
+                exit_path(store.path, record.launch_token).write_text(f"{legacy_exit}\n")
             return StartResult(STARTED, "corrupt-ended-family")
 
         @staticmethod

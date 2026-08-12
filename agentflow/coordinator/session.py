@@ -68,6 +68,19 @@ def write_result(store_path: Path | str, token: str, *, exit_status: int | None,
         tmp.unlink(missing_ok=True)
 
 
+def _result_fields(result: object) -> tuple[int | None, int | None, bool] | None:
+    """Return terminal fields only for the exact shape :func:`write_result` publishes."""
+    if not isinstance(result, dict) or set(result) != {"exit_status", "signal", "timed_out"}:
+        return None
+    exit_status, signal, timed_out = (
+        result["exit_status"], result["signal"], result["timed_out"])
+    if not ((exit_status is None or type(exit_status) is int)
+            and (signal is None or type(signal) is int)
+            and type(timed_out) is bool):
+        return None
+    return exit_status, signal, timed_out
+
+
 def read_session(store_path: Path | str, token: str | None) -> CapturedSession:
     """Reconstruct one attempt's durable session facts. A missing file means the attempt left
     nothing to read (it never ran, or its artifacts were pruned) — an empty capture, never an
@@ -103,10 +116,9 @@ def read_session(store_path: Path | str, token: str | None) -> CapturedSession:
         result = json.loads(result_path(store_path, token).read_bytes())
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         result = None
-    if isinstance(result, dict):
-        exit_status = result.get("exit_status")
-        signal = result.get("signal")
-        timed_out = result.get("timed_out") is True
+    fields = _result_fields(result)
+    if fields is not None:
+        exit_status, signal, timed_out = fields
         has_end_fact = True
     else:
         # Compatibility with artifacts written before the full supervisor result existed.

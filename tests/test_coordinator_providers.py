@@ -414,6 +414,68 @@ def test_provider_observation_recovers_malformed_result_through_exit_fallback(
     assert safe.exit_status is None and safe.signal is None and safe.timed_out is False
 
 
+@pytest.mark.parametrize("invalid_result", [
+    {},
+    {"exit_status": 0, "signal": None},
+    {"exit_status": 0, "timed_out": False},
+    {"signal": None, "timed_out": False},
+    {"exit_status": True, "signal": None, "timed_out": False},
+    {"exit_status": "0", "signal": None, "timed_out": False},
+    {"exit_status": 0, "signal": False, "timed_out": False},
+    {"exit_status": 0, "signal": "15", "timed_out": False},
+    {"exit_status": 0, "signal": None, "timed_out": 0},
+    {"exit_status": 0, "signal": None, "timed_out": None},
+    {"exit_status": 0, "signal": None, "timed_out": False, "unknown": True},
+])
+def test_provider_observation_rejects_schema_invalid_result_objects(
+        tmp_path, monkeypatch, invalid_result):
+    """Incomplete, ill-typed, and unknown result objects cannot manufacture an end fact."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.coordinator.session import exit_path, result_path
+    from agentflow.coordinator.store import default_store_path
+
+    token = "invalid-result"
+    result = result_path(default_store_path(), token)
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_text(json.dumps(invalid_result))
+    adapter = ClaudeProviderAdapter()
+    record = Record("invalid", "review", "claude", 1, launch_token=token)
+
+    unknown = adapter.observe(record)
+    assert unknown.has_end_fact is False
+    assert unknown.exit_status is None and unknown.signal is None and unknown.timed_out is False
+
+    exit_path(default_store_path(), token).write_text("17\n")
+    fallback = adapter.observe(record)
+    assert fallback.has_end_fact is True and fallback.exit_status == 17
+    assert fallback.cause is ProviderCause.PROCESS
+
+
+@pytest.mark.parametrize(("current_result", "expected"), [
+    ({"exit_status": 0, "signal": None, "timed_out": False}, (0, None, False)),
+    ({"exit_status": None, "signal": 15, "timed_out": True}, (None, 15, True)),
+    ({"exit_status": None, "signal": None, "timed_out": False}, (None, None, False)),
+])
+def test_provider_observation_accepts_exact_current_result_schema(
+        tmp_path, monkeypatch, current_result, expected):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.coordinator.session import exit_path, write_result
+    from agentflow.coordinator.store import default_store_path
+
+    token = "current-result"
+    write_result(default_store_path(), token, **current_result)
+    exit_path(default_store_path(), token).write_text("99\n")
+
+    observation = ClaudeProviderAdapter().observe(
+        Record("current", "review", "claude", 1, launch_token=token))
+    assert observation.has_end_fact is True
+    assert (observation.exit_status, observation.signal, observation.timed_out) == expected
+
+
 def test_default_codex_adapter_queries_the_typed_limit_companion(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
     from agentflow.coordinator.providers import CodexProviderAdapter
