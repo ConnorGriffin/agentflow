@@ -2,7 +2,7 @@
 
 Run as
 ``python -m agentflow.coordinator._launch_child <store_path> <identity> <token> <timeout>
-<working_dir> [argv...]``.
+[--build-lease <provider> <silent> <test> <absolute>] <working_dir> [argv...]``.
 
 It double-forks so the provider family is reparented away from the daemon (and so an ended
 provider never lingers as a zombie the daemon would misread as alive), then makes a *guarded*
@@ -18,8 +18,12 @@ reads as a started-but-ended attempt.
 
 from __future__ import annotations
 
+import json
 import os
+import select
+import shlex
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -27,6 +31,439 @@ from pathlib import Path
 
 from agentflow.coordinator.session import events_path, write_result
 from agentflow.coordinator.store import Store
+
+_HEAD_FILE_BYTES = 8 * 1024 * 1024
+_HEAD_OBSERVATION_S = 0.025
+_HEAD_HELPERS: set[int] = set()
+
+
+def _reap_head_helpers() -> None:
+    for pid in tuple(_HEAD_HELPERS):
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            waited = pid
+        if waited:
+            _HEAD_HELPERS.discard(pid)
+
+
+def _read_regular_text(path: Path, limit: int = _HEAD_FILE_BYTES) -> str | None:
+    """Read one bounded regular Git metadata file without following a special-file trap."""
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                return None
+            chunks: list[bytes] = []
+            remaining = limit + 1
+            while remaining:
+                chunk = os.read(fd, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            if len(raw) > limit:
+                return None
+            return raw.decode("utf-8")
+        finally:
+            os.close(fd)
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _object_id(value: str) -> str | None:
+    fields = value.split()
+    if len(fields) != 1:
+        return None
+    oid = fields[0]
+    return (oid if len(oid) in {40, 64}
+            and all(c in "0123456789abcdef" for c in oid) else None)
+
+
+def _git_dir(working_dir: str) -> Path | None:
+    dot_git = Path(working_dir) / ".git"
+    if dot_git.is_dir():
+        return dot_git
+    marker_text = _read_regular_text(dot_git)
+    if marker_text is None:
+        return None
+    marker = marker_text.strip()
+    if not marker.startswith("gitdir: "):
+        return None
+    path = Path(marker.removeprefix("gitdir: "))
+    return path if path.is_absolute() else dot_git.parent / path
+
+
+def _head_snapshot(working_dir: str) -> str | None:
+    """Read HEAD from bounded regular Git metadata files, failing closed on every anomaly."""
+    if not working_dir or (git_dir := _git_dir(working_dir)) is None:
+        return None
+    head_text = _read_regular_text(git_dir / "HEAD")
+    if head_text is None:
+        return None
+    head = head_text.strip()
+    if not head.startswith("ref: "):
+        return _object_id(head)
+    ref = head.removeprefix("ref: ")
+    parts = Path(ref).parts
+    if not ref.startswith("refs/") or not parts or ".." in parts:
+        return None
+    common_dir = git_dir
+    try:
+        common_text = _read_regular_text(git_dir / "commondir")
+        if common_text is None:
+            raise ValueError("no regular commondir")
+        common = common_text.strip()
+        common_dir = Path(common) if Path(common).is_absolute() else git_dir / common
+    except (OSError, ValueError):
+        pass
+    for root in (git_dir, common_dir):
+        text = _read_regular_text(root / ref)
+        if text is not None and (oid := _object_id(text)):
+            return oid
+    packed_text = _read_regular_text(common_dir / "packed-refs")
+    if packed_text is None:
+        return None
+    packed = packed_text.splitlines()
+    for line in packed:
+        if line.startswith(("#", "^")):
+            continue
+        fields = line.split()
+        if len(fields) == 2 and fields[1] == ref:
+            return _object_id(fields[0])
+    return None
+
+
+def _head(working_dir: str, timeout: float = _HEAD_OBSERVATION_S) -> str | None:
+    """Observe HEAD in a killable helper so slow metadata cannot strand the provider owner."""
+    _reap_head_helpers()
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError:
+        return None
+    try:
+        pid = os.fork()
+    except OSError:
+        os.close(read_fd)
+        os.close(write_fd)
+        return None
+    if pid == 0:
+        os.close(read_fd)
+        try:
+            head = _head_snapshot(working_dir)
+            if head is not None:
+                os.write(write_fd, head.encode("ascii"))
+        except (OSError, UnicodeError, ValueError):
+            pass
+        finally:
+            os.close(write_fd)
+        os._exit(0)
+
+    os.close(write_fd)
+    raw = b""
+    deadline = time.monotonic() + timeout
+    try:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([read_fd], [], [], remaining)
+        if ready:
+            raw = os.read(read_fd, 65)
+    except (OSError, ValueError):
+        raw = b""
+    finally:
+        os.close(read_fd)
+        try:
+            waited, _ = os.waitpid(pid, os.WNOHANG)
+            if waited == 0:
+                os.kill(pid, signal.SIGKILL)
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            if waited == 0:
+                _HEAD_HELPERS.add(pid)
+        except (ChildProcessError, OSError):
+            _HEAD_HELPERS.discard(pid)
+    try:
+        return _object_id(raw.decode("ascii"))
+    except UnicodeError:
+        return None
+
+
+_TEST_PREFIXES = (("pytest",), ("uv", "run", "pytest"), ("npm", "test"),
+                  ("npm", "run", "test"), ("pnpm", "test"), ("yarn", "test"),
+                  ("cargo", "test"), ("go", "test"), ("make", "test"))
+_SHELL_COMPOSITION = frozenset(";&|<>()$`\\*?[]{}~!#\r\n")
+_EVENT_READ_BYTES = 64 * 1024
+_EVENT_RECORDS_PER_POLL = 128
+_EVENT_POLL_SLICE_S = 0.01
+_EVENT_RECORD_BYTES = 1024 * 1024
+
+
+def _recognized_test(command: object, provider: str) -> bool:
+    """Recognize only the provider's canonical, single test-command shape.
+
+    Codex reports the shell wrapper it owns; Claude reports the Bash input itself. Shell
+    composition is deliberately refused: a pipeline or chained command's eventual success is
+    not proof that the named test succeeded, and supervising it would turn arbitrary commands
+    beginning with ``pytest`` into test work.
+    """
+    if not isinstance(command, str):
+        return False
+    test_command = command
+    if provider == "codex":
+        try:
+            words = shlex.split(command)
+        except ValueError:
+            return False
+        if len(words) != 3 or words[:2] != ["/bin/zsh", "-lc"]:
+            return False
+        test_command = words[2]
+    elif provider != "claude":
+        return False
+    # Reject shell interpretation before tokenizing. Even quoted or escaped syntax fails closed:
+    # this lease recognizes one literal test command, never composition, substitution,
+    # redirection, variable/glob/brace/tilde expansion, or a comment/newline boundary.
+    if (not test_command or any(char in _SHELL_COMPOSITION for char in test_command)
+            or any(ord(char) < 32 and char != "\t" for char in test_command)):
+        return False
+    try:
+        words = shlex.split(test_command)
+    except ValueError:
+        return False
+    return any(tuple(words[:len(prefix)]) == prefix for prefix in _TEST_PREFIXES)
+
+
+def _worktree_path(value: object, working_dir: str) -> bool:
+    if not isinstance(value, str) or not value or not working_dir:
+        return False
+    root = Path(working_dir).resolve()
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = root / candidate
+    try:
+        candidate.resolve().relative_to(root)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+class _ProgressStream:
+    """Incrementally decode one provider's durable stream into canonical Build facts."""
+
+    def __init__(self, provider: str, working_dir: str) -> None:
+        self.provider = provider
+        self.working_dir = working_dir
+        self.offset = 0
+        self.partial = b""
+        self.discarding_oversize = False
+        self.may_have_unread = False
+        self.calls: dict[str, tuple[str, object] | None] = {}
+        self.seen: set[str] = set()
+        self.active_tests: dict[str, float] = {}
+
+    def _remember(self, call_id: object, value: tuple[str, object], now: float) -> None:
+        if not isinstance(call_id, str) or not call_id:
+            return
+        fact = f"{self.provider}:{value[0]}:{call_id}"
+        if fact in self.seen:
+            return
+        if call_id not in self.calls:
+            self.calls[call_id] = value
+            if value[0] == "test":
+                self.active_tests[call_id] = now
+        elif self.calls[call_id] != value:
+            # A provider id is canonical. Reusing it for a different action makes both
+            # records ambiguous, so neither can renew or retain test supervision.
+            self.calls[call_id] = None
+            self.active_tests.pop(call_id, None)
+
+    def _complete(self, call_id: object, expected: tuple[str, object], success: bool) -> bool:
+        if not isinstance(call_id, str) or self.calls.get(call_id) != expected:
+            return False
+        self.active_tests.pop(call_id, None)
+        fact = f"{self.provider}:{expected[0]}:{call_id}"
+        if not success or fact in self.seen:
+            return False
+        self.seen.add(fact)
+        return True
+
+    def _codex(self, event: dict[str, object], now: float) -> bool:
+        event_type = event.get("type")
+        item = event.get("item")
+        if event_type not in {"item.started", "item.completed"} or not isinstance(item, dict):
+            return False
+        call_id = item.get("id")
+        item_type = item.get("type")
+        if item_type == "command_execution":
+            command = item.get("command")
+            expected = ("test", command)
+            if event_type == "item.started":
+                if (item.get("status") == "in_progress" and item.get("exit_code") is None
+                        and _recognized_test(command, "codex")):
+                    self._remember(call_id, expected, now)
+                return False
+            if not isinstance(call_id, str) or self.calls.get(call_id) != expected:
+                if isinstance(call_id, str):
+                    self.active_tests.pop(call_id, None)
+                return False
+            exit_code = item.get("exit_code")
+            valid = (item.get("status") == "completed"
+                     and isinstance(exit_code, int) and not isinstance(exit_code, bool))
+            if not valid:
+                self.active_tests.pop(call_id, None)
+                self.calls[call_id] = None
+                return False
+            return self._complete(call_id, expected, exit_code == 0)
+        if event_type != "item.completed" or item_type != "file_change":
+            return False
+        changes = item.get("changes")
+        valid = (item.get("status") == "completed" and isinstance(changes, list) and changes
+                 and all(isinstance(change, dict)
+                         and change.get("kind") in {"add", "update", "delete"}
+                         and self._local_change(change.get("path")) for change in changes))
+        if not valid:
+            return False
+        expected = ("edit", tuple((change["path"], change["kind"]) for change in changes))
+        self._remember(call_id, expected, now)
+        return self._complete(call_id, expected, True)
+
+    def _local_change(self, value: object) -> bool:
+        return _worktree_path(value, self.working_dir)
+
+    def _claude(self, event: dict[str, object], now: float) -> bool:
+        message = event.get("message")
+        if not isinstance(message, dict) or message.get("type") != "message":
+            return False
+        event_type = event.get("type")
+        role = message.get("role")
+        if (event_type, role) not in {("assistant", "assistant"), ("user", "user")}:
+            return False
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        renewed = False
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if event_type == "assistant" and block.get("type") == "tool_use":
+                name, payload = block.get("name"), block.get("input")
+                if name == "Bash" and isinstance(payload, dict):
+                    command = payload.get("command")
+                    if _recognized_test(command, "claude"):
+                        self._remember(block.get("id"), ("test", command), now)
+                elif name in {"Edit", "Write", "NotebookEdit"} and isinstance(payload, dict):
+                    path = payload.get("notebook_path" if name == "NotebookEdit" else "file_path")
+                    if self._local_change(path):
+                        self._remember(block.get("id"), ("edit", (name, path)), now)
+            elif event_type == "user" and block.get("type") == "tool_result":
+                call_id = block.get("tool_use_id")
+                call = self.calls.get(call_id) if isinstance(call_id, str) else None
+                if call is None:
+                    continue
+                if block.get("is_error") is not False:
+                    self.active_tests.pop(call_id, None)
+                    self.calls[call_id] = None
+                    continue
+                renewed = self._complete(call_id, call, True) or renewed
+        return renewed
+
+    def poll(self, events: Path, *, silent_deadline: float, test_timeout: float,
+             absolute_deadline: float) -> tuple[bool, float, bool, bool]:
+        """Return progress, fresh clock, backlog state, and pre-decode deadline expiry.
+
+        A provider owns the append rate, so one observation reads at most 64 KiB, considers at
+        most 128 complete records, and cooperatively yields after 10 ms. A single record is
+        limited to 1 MiB; anything larger is discarded through its newline and fails closed.
+        The effective lease deadline is checked immediately before and after every JSON decode.
+        """
+        decoder = {"codex": self._codex, "claude": self._claude}.get(self.provider)
+        if decoder is None:
+            return False, time.monotonic(), False, False
+
+        def result(progressed: bool, observed_at: float,
+                   expired: bool = False) -> tuple[bool, float, bool, bool]:
+            pending = b"\n" in self.partial or self.may_have_unread
+            return progressed, observed_at, pending, expired
+
+        def effective_deadline() -> float:
+            if self.active_tests:
+                test_deadline = min(self.active_tests.values()) + test_timeout
+                return min(absolute_deadline, test_deadline)
+            return min(absolute_deadline, silent_deadline)
+
+        now = time.monotonic()
+        slice_deadline = now + _EVENT_POLL_SLICE_S
+        if now >= effective_deadline():
+            return result(False, now)
+
+        # Retained complete records are consumed before reading more, so a provider cannot make
+        # the in-memory backlog grow while decoding is deliberately yielding between slices.
+        if b"\n" not in self.partial:
+            try:
+                with events.open("rb") as stream:
+                    stream.seek(self.offset)
+                    chunk = stream.read(_EVENT_READ_BYTES)
+            except OSError:
+                return result(False, time.monotonic())
+            self.offset += len(chunk)
+            self.partial += chunk
+            self.may_have_unread = len(chunk) == _EVENT_READ_BYTES
+            now = time.monotonic()
+            if now >= effective_deadline():
+                return result(False, now)
+
+        records = 0
+        while records < _EVENT_RECORDS_PER_POLL:
+            now = time.monotonic()
+            if now >= effective_deadline() or (records and now >= slice_deadline):
+                break
+            newline = self.partial.find(b"\n")
+            if newline < 0:
+                if len(self.partial) > _EVENT_RECORD_BYTES:
+                    self.partial = b""
+                    self.discarding_oversize = True
+                break
+            raw = self.partial[:newline]
+            if self.discarding_oversize:
+                self.partial = self.partial[newline + 1:]
+                self.discarding_oversize = False
+                records += 1
+                continue
+            if len(raw) > _EVENT_RECORD_BYTES:
+                self.partial = self.partial[newline + 1:]
+                records += 1
+                continue
+            try:
+                event = json.loads(raw)
+            # Provider bytes are a cross-process trust boundary. CPython's JSON decoder raises
+            # RecursionError for structurally valid but pathologically deep values; treat that
+            # decoder failure like malformed JSON, without hiding memory/system/programmer faults.
+            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+                self.partial = self.partial[newline + 1:]
+                records += 1
+                now = time.monotonic()
+                if now >= effective_deadline():
+                    break
+                continue
+            now = time.monotonic()
+            if now >= effective_deadline():
+                break
+            self.partial = self.partial[newline + 1:]
+            records += 1
+            if isinstance(event, dict):
+                # Decoder work can itself cross a lease edge and mutate test supervision. The
+                # caller immediately ends the attempt against this pre-decode deadline, so late
+                # progress is rejected and the mutated process-local state is never reused.
+                decode_deadline = effective_deadline()
+                progressed = decoder(event, now)
+                observed_at = time.monotonic()
+                if observed_at >= decode_deadline:
+                    return result(False, observed_at, True)
+                if progressed:
+                    return result(True, observed_at)
+        return result(False, time.monotonic())
 
 
 def _mark_active(working_dir: str) -> Path | None:
@@ -56,7 +493,13 @@ def _clear_active(marker: Path | None) -> None:
 
 
 def main(args: list[str]) -> None:
-    store_path, identity, token, timeout, working_dir, *provider = args
+    store_path, identity, token, timeout, *tail = args
+    build_lease: tuple[float, float, float] | None = None
+    progress_provider = ""
+    if tail[:1] == ["--build-lease"]:
+        progress_provider, silent, test_grace, absolute, *tail = tail[1:]
+        build_lease = (float(silent), float(test_grace), float(absolute))
+    working_dir, *provider = tail
     # Double-fork: the intermediate exits immediately so the daemon reaps it at once, while
     # the detached supervisor is reparented to init and cannot zombie under the daemon.
     if os.fork() > 0:
@@ -129,18 +572,76 @@ def main(args: list[str]) -> None:
         # Reconciliation signals this supervisor, not the provider's separate session. Turn that
         # request into the same orderly process-group shutdown the deadline path uses, then keep
         # the supervisor alive to write the provider's durable end facts.
-        deadline = time.monotonic() + float(timeout)
+        started_at = time.monotonic()
+        deadline = started_at + float(timeout)
+        silent_deadline = started_at + build_lease[0] if build_lease else deadline
+        absolute_deadline = started_at + build_lease[2] if build_lease else deadline
+        last_head = _head(working_dir) if build_lease else None
+        head_poll_s = min(5.0, build_lease[0] / 4) if build_lease else 0
+        next_head_poll = started_at + head_poll_s
+        progress_stream = _ProgressStream(progress_provider, working_dir) if build_lease else None
         while True:
             if stop_requested:
                 returncode = stop_provider()
                 break
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            if build_lease:
+                active_test_deadline = (min(progress_stream.active_tests.values())
+                                        + build_lease[1]
+                                        if progress_stream.active_tests else None)
+                lease_deadline = (min(absolute_deadline, active_test_deadline)
+                                  if active_test_deadline is not None
+                                  else min(absolute_deadline, silent_deadline))
+                if now >= lease_deadline:
+                    timed_out = True
+                    returncode = stop_provider()
+                    break
+                if now >= next_head_poll:
+                    head = _head(working_dir)
+                    now = time.monotonic()
+                    if now >= lease_deadline:
+                        timed_out = True
+                        returncode = stop_provider()
+                        break
+                    if head is not None and head != last_head:
+                        last_head = head
+                        silent_deadline = now + build_lease[0]
+                    next_head_poll = now + head_poll_s
+                event_progressed, now, events_pending, lease_expired = progress_stream.poll(
+                    events, silent_deadline=silent_deadline, test_timeout=build_lease[1],
+                    absolute_deadline=absolute_deadline)
+                if lease_expired or now >= absolute_deadline:
+                    timed_out = True
+                    returncode = stop_provider()
+                    break
+                if event_progressed:
+                    silent_deadline = now + build_lease[0]
+                test_deadline = min(progress_stream.active_tests.values(), default=0) + build_lease[1]
+                deadline = (min(absolute_deadline, test_deadline)
+                            if progress_stream.active_tests
+                            else min(absolute_deadline, silent_deadline))
+                if now >= deadline:
+                    timed_out = True
+                    returncode = stop_provider()
+                    break
+            remaining = deadline - now
             if remaining <= 0:
                 timed_out = True
                 returncode = stop_provider()
                 break
+            if build_lease and events_pending:
+                returncode = process.poll()
+                if returncode is not None:
+                    now = time.monotonic()
+                    if now >= deadline:
+                        timed_out = True
+                    break
+                continue
             try:
                 returncode = process.wait(timeout=min(remaining, 0.1))
+                now = time.monotonic()
+                if build_lease and now >= deadline:
+                    timed_out = True
                 break
             except subprocess.TimeoutExpired:
                 pass

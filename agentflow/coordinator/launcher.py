@@ -62,13 +62,15 @@ class LocalLauncher:
     """
 
     def __init__(self, provider_command=None, *, timeout: float = _HANDSHAKE_TIMEOUT_S,
-                 session_timeout: float | None = None) -> None:
+                 session_timeout: float | None = None,
+                 build_lease: tuple[float, float, float] | None = None) -> None:
         from agentflow.coordinator.providers import provider_command as real_command
         self._provider_command = provider_command or real_command
         self._timeout = timeout
         # ``None`` (the production default) sizes each launch's wall ceiling from its stage
         # profile (ADR 0044); an explicit value pins one ceiling for all launches (tests/ops).
         self._session_timeout = session_timeout
+        self._build_lease = build_lease
 
     def _session_timeout_for(self, record) -> float:
         """The wall-clock ceiling for this launch: an explicit constructor override, else the
@@ -80,6 +82,21 @@ class LocalLauncher:
             return float(override)
         from agentflow.coordinator.profiles import profile_for
         return float(profile_for(record).wall_ceiling_s)
+
+    def _build_lease_for(self, record) -> tuple[float, float, float] | None:
+        """Return Build's progress lease unless an operator pinned a fixed timeout.
+
+        Constructor and environment overrides are intentionally a complete replacement for
+        supervision policy: they retain the fixed, non-renewable timeout operators already use.
+        """
+        if record.stage != "build" or self._session_timeout is not None:
+            return None
+        if os.environ.get("AGENTFLOW_SESSION_TIMEOUT"):
+            return None
+        if self._build_lease is not None:
+            return self._build_lease
+        from agentflow.coordinator.profiles import profile_for
+        return profile_for(record).build_lease
 
     @staticmethod
     def is_alive(family: str | None) -> bool:
@@ -94,12 +111,15 @@ class LocalLauncher:
         except OSError:
             return StartResult(NOT_STARTED)
         argv = [str(a) for a in command]
+        lease = self._build_lease_for(record)
+        lease_args = (["--build-lease", record.pool,
+                       *(str(value) for value in lease)] if lease else [])
         try:
             child = subprocess.Popen(
                 [sys.executable, "-m", "agentflow.coordinator._launch_child",
                  str(store.path), record.identity, str(token),
                  str(self._session_timeout_for(record)),
-                 record.source or "", *argv])
+                 *lease_args, record.source or "", *argv])
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence
         # The intermediate exits at once; reap it so it does not linger. The provider
