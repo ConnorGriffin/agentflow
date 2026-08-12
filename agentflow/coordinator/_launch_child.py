@@ -633,14 +633,14 @@ def main(args: list[str]) -> None:
                 returncode = process.poll()
                 if returncode is not None:
                     now = time.monotonic()
-                    if now >= absolute_deadline:
+                    if now >= deadline:
                         timed_out = True
                     break
                 continue
             try:
                 returncode = process.wait(timeout=min(remaining, 0.1))
                 now = time.monotonic()
-                if build_lease and now >= absolute_deadline:
+                if build_lease and now >= deadline:
                     timed_out = True
                 break
             except subprocess.TimeoutExpired:

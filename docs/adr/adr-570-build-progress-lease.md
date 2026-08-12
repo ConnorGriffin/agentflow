@@ -73,3 +73,6 @@ the result and legacy exit artifacts are capped at 4 KiB and 64 bytes respective
 sit above the largest repository-evidenced legitimate session while keeping recovery finite.
 Git ref observation is likewise regular-file-only, reads at most 8 MiB per metadata file, and runs
 in a killable 25ms helper so a special or slow file cannot strand the provider-owning supervisor.
+A natural provider exit retains its status and signal, but the supervisor refreshes its monotonic
+clock after observing it and marks the result timed out when that observation is at or beyond the
+silent, active-test, or absolute deadline that governed the iteration.

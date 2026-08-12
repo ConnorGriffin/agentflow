@@ -867,6 +867,79 @@ def test_natural_exit_observed_at_absolute_cap_is_durable_timeout(coord_state, t
     assert observation.exit_status == 0 and observation.signal is None
 
 
+def _delay_supervisor_wait(tmp_path, monkeypatch, delay: float) -> None:
+    """Make the launched supervisor observe a natural exit after a deterministic delay."""
+    custom = tmp_path / "delayed-wait"
+    custom.mkdir()
+    (custom / "sitecustomize.py").write_text(
+        "import os,subprocess,time\n"
+        "_wait=subprocess.Popen.wait\n"
+        "def wait(self,timeout=None):\n"
+        " result=_wait(self,timeout=timeout)\n"
+        " if timeout is not None: time.sleep(float(os.environ['AGENTFLOW_TEST_WAIT_DELAY']))\n"
+        " return result\n"
+        "subprocess.Popen.wait=wait\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_WAIT_DELAY", str(delay))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+
+
+def test_natural_exit_observed_after_silent_deadline_is_durable_timeout(
+        coord_state, tmp_path, monkeypatch):
+    """Post-exit observation cannot turn an expired silent lease into a clean exit."""
+    _delay_supervisor_wait(tmp_path, monkeypatch, 0.08)
+    provider = lambda record: [sys.executable, "-c", "import time; time.sleep(.08)"]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.12, 1.0, 1.0)))
+    identity = coord.submit_stage(_build("claude", "natural-silent-edge", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "silent-edge natural exit was not published")
+    observation = _build_observation(record)
+    assert observation.has_end_fact is True
+    assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
+    assert observation.exit_status == 0 and observation.signal is None
+
+
+def test_natural_exit_observed_after_active_test_deadline_is_durable_timeout(
+        coord_state, tmp_path, monkeypatch):
+    """An active test's own cap governs post-exit classification ahead of silence."""
+    _delay_supervisor_wait(tmp_path, monkeypatch, 0.08)
+    event = {"type": "assistant", "message": {"type": "message", "role": "assistant",
+             "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
+                          "input": {"command": "pytest -q"}}]}}
+    script = ("import json,time\n"
+              f"print(json.dumps({event!r}), flush=True)\n"
+              "time.sleep(.08)\n")
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.30, 0.06, 1.0)))
+    identity = coord.submit_stage(_build("claude", "natural-test-edge", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "test-edge natural exit was not published")
+    observation = _build_observation(record)
+    assert observation.has_end_fact is True
+    assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
+    assert observation.exit_status == 0 and observation.signal is None
+
+
+def test_natural_exit_before_effective_deadline_remains_clean(
+        coord_state, tmp_path, monkeypatch):
+    """The post-exit clock check does not convert a genuinely early natural exit."""
+    _delay_supervisor_wait(tmp_path, monkeypatch, 0.02)
+    provider = lambda record: [sys.executable, "-c", "import time; time.sleep(.02)"]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 1.0, 1.0)))
+    identity = coord.submit_stage(_build("claude", "natural-before-deadline", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "early natural exit was not published")
+    observation = _build_observation(record)
+    assert observation.has_end_fact is True and observation.timed_out is False
+    assert observation.exit_status == 0 and observation.signal is None
+
+
 def test_large_slow_event_burst_cannot_delay_the_absolute_cap(coord_state, tmp_path):
     """A real child cannot hold teardown inside a large, expensive JSONL append (#570)."""
     burst_delivered = tmp_path / "burst-delivered"
