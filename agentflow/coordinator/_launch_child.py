@@ -97,6 +97,10 @@ _TEST_PREFIXES = (("pytest",), ("uv", "run", "pytest"), ("npm", "test"),
                   ("npm", "run", "test"), ("pnpm", "test"), ("yarn", "test"),
                   ("cargo", "test"), ("go", "test"), ("make", "test"))
 _SHELL_COMPOSITION = frozenset(";&|<>()$`\\*?[]{}~!#\r\n")
+_EVENT_READ_BYTES = 64 * 1024
+_EVENT_RECORDS_PER_POLL = 128
+_EVENT_POLL_SLICE_S = 0.01
+_EVENT_RECORD_BYTES = 1024 * 1024
 
 
 def _recognized_test(command: object, provider: str) -> bool:
@@ -155,6 +159,8 @@ class _ProgressStream:
         self.working_dir = working_dir
         self.offset = 0
         self.partial = b""
+        self.discarding_oversize = False
+        self.may_have_unread = False
         self.calls: dict[str, tuple[str, object] | None] = {}
         self.seen: set[str] = set()
         self.active_tests: dict[str, float] = {}
@@ -265,28 +271,88 @@ class _ProgressStream:
                 renewed = self._complete(call_id, call, True) or renewed
         return renewed
 
-    def poll(self, events: Path, now: float) -> bool:
-        try:
-            with events.open("rb") as stream:
-                stream.seek(self.offset)
-                chunk = stream.read()
-        except OSError:
-            return False
-        self.offset += len(chunk)
-        parts = (self.partial + chunk).split(b"\n")
-        self.partial = parts.pop()
-        renewed = False
+    def poll(self, events: Path, *, silent_deadline: float, test_timeout: float,
+             absolute_deadline: float) -> tuple[bool, float, bool]:
+        """Consume one bounded slice; return progress, a fresh clock, and backlog state.
+
+        A provider owns the append rate, so one observation reads at most 64 KiB, considers at
+        most 128 complete records, and cooperatively yields after 10 ms. A single record is
+        limited to 1 MiB; anything larger is discarded through its newline and fails closed.
+        The effective lease deadline is checked immediately before and after every JSON decode.
+        """
         decoder = {"codex": self._codex, "claude": self._claude}.get(self.provider)
         if decoder is None:
-            return False
-        for raw in parts:
+            return False, time.monotonic(), False
+
+        def result(progressed: bool, observed_at: float) -> tuple[bool, float, bool]:
+            pending = b"\n" in self.partial or self.may_have_unread
+            return progressed, observed_at, pending
+
+        def effective_deadline() -> float:
+            if self.active_tests:
+                test_deadline = min(self.active_tests.values()) + test_timeout
+                return min(absolute_deadline, test_deadline)
+            return min(absolute_deadline, silent_deadline)
+
+        now = time.monotonic()
+        slice_deadline = now + _EVENT_POLL_SLICE_S
+        if now >= effective_deadline():
+            return result(False, now)
+
+        # Retained complete records are consumed before reading more, so a provider cannot make
+        # the in-memory backlog grow while decoding is deliberately yielding between slices.
+        if b"\n" not in self.partial:
+            try:
+                with events.open("rb") as stream:
+                    stream.seek(self.offset)
+                    chunk = stream.read(_EVENT_READ_BYTES)
+            except OSError:
+                return result(False, time.monotonic())
+            self.offset += len(chunk)
+            self.partial += chunk
+            self.may_have_unread = len(chunk) == _EVENT_READ_BYTES
+            now = time.monotonic()
+            if now >= effective_deadline():
+                return result(False, now)
+
+        records = 0
+        while records < _EVENT_RECORDS_PER_POLL:
+            now = time.monotonic()
+            if now >= effective_deadline() or (records and now >= slice_deadline):
+                break
+            newline = self.partial.find(b"\n")
+            if newline < 0:
+                if len(self.partial) > _EVENT_RECORD_BYTES:
+                    self.partial = b""
+                    self.discarding_oversize = True
+                break
+            raw = self.partial[:newline]
+            if self.discarding_oversize:
+                self.partial = self.partial[newline + 1:]
+                self.discarding_oversize = False
+                records += 1
+                continue
+            if len(raw) > _EVENT_RECORD_BYTES:
+                self.partial = self.partial[newline + 1:]
+                records += 1
+                continue
             try:
                 event = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError):
+                self.partial = self.partial[newline + 1:]
+                records += 1
+                now = time.monotonic()
+                if now >= effective_deadline():
+                    break
                 continue
-            if isinstance(event, dict):
-                renewed = decoder(event, now) or renewed
-        return renewed
+            now = time.monotonic()
+            if now >= effective_deadline():
+                break
+            self.partial = self.partial[newline + 1:]
+            records += 1
+            if isinstance(event, dict) and decoder(event, now):
+                return result(True, time.monotonic())
+        return result(False, time.monotonic())
 
 
 def _mark_active(working_dir: str) -> Path | None:
@@ -433,7 +499,14 @@ def main(args: list[str]) -> None:
                     if progressed:
                         last_head = head
                     next_head_poll = now + head_poll_s
-                progressed = progress_stream.poll(events, now) or progressed
+                event_progressed, now, events_pending = progress_stream.poll(
+                    events, silent_deadline=silent_deadline, test_timeout=build_lease[1],
+                    absolute_deadline=absolute_deadline)
+                progressed = event_progressed or progressed
+                if now >= absolute_deadline:
+                    timed_out = True
+                    returncode = stop_provider()
+                    break
                 if progressed:
                     silent_deadline = now + build_lease[0]
                 test_deadline = min(progress_stream.active_tests.values(), default=0) + build_lease[1]
@@ -447,6 +520,11 @@ def main(args: list[str]) -> None:
                 timed_out = True
                 returncode = stop_provider()
                 break
+            if build_lease and events_pending:
+                returncode = process.poll()
+                if returncode is not None:
+                    break
+                continue
             try:
                 returncode = process.wait(timeout=min(remaining, 0.1))
                 break

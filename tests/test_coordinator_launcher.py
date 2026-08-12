@@ -707,6 +707,38 @@ def test_head_observation_cannot_block_past_the_absolute_cap(
     assert not invoked.exists(), "HEAD observation executed the blocking git adapter"
 
 
+def test_large_slow_event_burst_cannot_delay_the_absolute_cap(coord_state, tmp_path):
+    """A real child cannot hold teardown inside a large, expensive JSONL append (#570)."""
+    burst_delivered = tmp_path / "burst-delivered"
+    marker = tmp_path / "past-absolute-cap"
+    script = (
+        "import json,pathlib,sys,time\n"
+        "time.sleep(.22)\n"
+        "line=json.dumps({'type':'rate_limit_event','items':list(range(1000))})+'\\n'\n"
+        "sys.stdout.write(line*12000)\n"
+        "sys.stdout.flush()\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(time.monotonic()))\n"
+        "time.sleep(.60)\n"
+        "pathlib.Path(sys.argv[2]).write_text('too late')\n"
+    )
+    provider = lambda record: [
+        sys.executable, "-c", script, str(burst_delivered), str(marker)]
+    absolute_cap = 0.55
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(5.0, 5.0, absolute_cap)))
+    identity = coord.submit_stage(_build("claude", "bounded-event-burst", str(tmp_path)))
+
+    started_at = time.monotonic()
+    coord.cycle("claude")
+    record = _wait_for_real_child(identity, "event parsing crossed the absolute cap")
+    elapsed = time.monotonic() - started_at
+
+    assert burst_delivered.exists(), "provider did not deliver the large pre-cap event burst"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert elapsed < 1.2, f"{absolute_cap:.2f}s absolute cap took {elapsed:.3f}s"
+    assert not marker.exists()
+
+
 def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord_state):
     """A reconciliation SIGTERM reaches the provider group, while the supervisor stays long
     enough to write the normal durable end facts for the stopped attempt (#220)."""
