@@ -867,19 +867,46 @@ def test_natural_exit_observed_at_absolute_cap_is_durable_timeout(coord_state, t
     assert observation.exit_status == 0 and observation.signal is None
 
 
-def _delay_supervisor_wait(tmp_path, monkeypatch, delay: float) -> None:
+def _delay_supervisor_wait(
+        tmp_path, monkeypatch, delay: float, *, decoded_marker=None,
+        wait_returned_marker=None) -> None:
     """Make the launched supervisor observe a natural exit after a deterministic delay."""
     custom = tmp_path / "delayed-wait"
     custom.mkdir()
-    (custom / "sitecustomize.py").write_text(
+    instrumentation = ""
+    if decoded_marker is not None:
+        instrumentation += (
+            "import json,pathlib\n"
+            "_loads=json.loads\n"
+            "def loads(value,*args,**kwargs):\n"
+            " result=_loads(value,*args,**kwargs)\n"
+            " data=value if isinstance(value,(bytes,bytearray)) else str(value).encode()\n"
+            " if b'\\\"command\\\": \\\"pytest -q\\\"' in data:\n"
+            "  pathlib.Path(os.environ['AGENTFLOW_TEST_DECODED_MARKER']).write_text('decoded')\n"
+            " return result\n"
+            "json.loads=loads\n")
+    wait_marker = ""
+    if wait_returned_marker is not None:
+        wait_marker = (
+            "  pathlib.Path(os.environ['AGENTFLOW_TEST_WAIT_RETURNED_MARKER']).write_text(str(timeout))\n")
+    sitecustomize = (
         "import os,subprocess,time\n"
-        "_wait=subprocess.Popen.wait\n"
+        + instrumentation
+        + "_wait=subprocess.Popen.wait\n"
         "def wait(self,timeout=None):\n"
         " result=_wait(self,timeout=timeout)\n"
-        " if timeout is not None: time.sleep(float(os.environ['AGENTFLOW_TEST_WAIT_DELAY']))\n"
+        " if timeout is not None:\n"
+        + wait_marker
+        + "  time.sleep(float(os.environ['AGENTFLOW_TEST_WAIT_DELAY']))\n"
         " return result\n"
         "subprocess.Popen.wait=wait\n")
+    (custom / "sitecustomize.py").write_text(sitecustomize)
     monkeypatch.setenv("AGENTFLOW_TEST_WAIT_DELAY", str(delay))
+    if decoded_marker is not None:
+        monkeypatch.setenv("AGENTFLOW_TEST_DECODED_MARKER", os.fspath(decoded_marker))
+    if wait_returned_marker is not None:
+        monkeypatch.setenv(
+            "AGENTFLOW_TEST_WAIT_RETURNED_MARKER", os.fspath(wait_returned_marker))
     monkeypatch.setenv(
         "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
 
@@ -904,21 +931,31 @@ def test_natural_exit_observed_after_silent_deadline_is_durable_timeout(
 def test_natural_exit_observed_after_active_test_deadline_is_durable_timeout(
         coord_state, tmp_path, monkeypatch):
     """An active test's own cap governs post-exit classification ahead of silence."""
-    _delay_supervisor_wait(tmp_path, monkeypatch, 0.08)
+    decoded_marker = tmp_path / "test-event-decoded"
+    wait_returned_marker = tmp_path / "provider-wait-returned"
+    _delay_supervisor_wait(
+        tmp_path, monkeypatch, 0.25, decoded_marker=decoded_marker,
+        wait_returned_marker=wait_returned_marker)
     event = {"type": "assistant", "message": {"type": "message", "role": "assistant",
              "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
                           "input": {"command": "pytest -q"}}]}}
-    script = ("import json,time\n"
+    script = ("import json,pathlib,sys,time\n"
               f"print(json.dumps({event!r}), flush=True)\n"
-              "time.sleep(.08)\n")
-    provider = lambda record: [sys.executable, "-c", script]
+              "deadline=time.monotonic()+2\n"
+              "marker=pathlib.Path(sys.argv[1])\n"
+              "while not marker.exists() and time.monotonic()<deadline: time.sleep(.002)\n"
+              "if not marker.exists(): raise RuntimeError('test event was not decoded')\n"
+              "time.sleep(.03)\n")
+    provider = lambda record: [sys.executable, "-c", script, str(decoded_marker)]
     coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.30, 0.06, 1.0)))
+        provider, timeout=5, build_lease=(0.80, 0.20, 1.5)))
     identity = coord.submit_stage(_build("claude", "natural-test-edge", str(tmp_path)))
     coord.cycle("claude")
 
     record = _wait_for_real_child(identity, "test-edge natural exit was not published")
     observation = _build_observation(record)
+    assert decoded_marker.exists(), "supervisor never decoded the recognized test event"
+    assert wait_returned_marker.exists(), "provider did not exit inside the wait window"
     assert observation.has_end_fact is True
     assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
     assert observation.exit_status == 0 and observation.signal is None
