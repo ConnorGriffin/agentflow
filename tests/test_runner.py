@@ -3,7 +3,9 @@
 import datetime
 import json
 import os
+import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +16,7 @@ from agentflow import runner as runner_mod
 from agentflow.coordinator.providers import provider_command
 from agentflow.coordinator.record import Record
 from agentflow.reviewer import REVIEW_PROMPT
+from agentflow.routing import routing
 from agentflow.runner import (ClaudeRunner, CodexRunner, Complexity,
                               Effort, _run, recover_stale_worktrees,
                               remove_worktree_if_safe,
@@ -235,14 +238,15 @@ def test_codex_auto_review_policy_allows_only_the_bounded_worker_escalation(tmp_
     policy = json.loads(next(value.removeprefix("auto_review.policy=") for value in config
                              if value.startswith("auto_review.policy=")))
 
-    assert "exact `agentflow-codex-worker --worker <routed-allowlisted-name> --effort" in policy
-    assert "worker name is routed and allowlisted" in policy
+    assert "bare worker command" in policy
+    assert "standard launcher-owned `/bin/zsh -lc '<bounded-worker-command>'` envelope" in policy
+    assert "worker name must be routed and allowlisted" in policy
     assert "low`, `medium`, `high`, or `extra`" in policy
     assert "integer from 1 through 900" in policy
-    assert "stdin is redirected from a mode-0600 private regular file" in policy
-    assert "allow no other arguments" in policy
-    assert "no extra shell segments" in policy
-    assert "no sandbox-weakening flags" in policy
+    assert "private regular file with mode exactly 0600" in policy
+    assert "extra arguments" in policy
+    assert "other shell segments" in policy
+    assert "sandbox-weakening flags" in policy
     assert "drive-local-webapp/driver.mjs browser driver" in policy
 
 
@@ -255,12 +259,116 @@ def test_codex_auto_review_policy_rejects_broad_codex_or_shell_escalation(tmp_pa
     policy = json.loads(next(value.removeprefix("auto_review.policy=") for value in config
                              if value.startswith("auto_review.policy=")))
 
-    assert "Reject bare `codex` invocations, shell wrappers" in policy
+    assert "Reject authored shell wrappers" in policy
+    assert "bare `codex` invocations" in policy
     assert "`--dangerously-bypass-approvals-and-sandbox`" in policy
     assert "Reject every other sandbox escalation" in policy
     assert "gh pr" not in policy  # Review's narrow gh reads need no escalation exception.
     assert "any Codex command" not in policy
     assert "any shell command" not in policy
+
+
+def test_codex_session_lead_worker_command_matches_the_launcher_approval_policy(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex" / "issue-568-owned"
+    _branch_worktree(repo, wt, "agentflow/codex/issue-568-owned")
+    launcher = CodexRunner().structured_argv("build it", "terra", str(wt))
+    config = [launcher[index + 1] for index, value in enumerate(launcher[:-1])
+              if value == "-c"]
+    policy = json.loads(next(value.removeprefix("auto_review.policy=") for value in config
+                             if value.startswith("auto_review.policy=")))
+    brief = routing.session_lead_instructions("build", "medium", parent_provider="codex")
+
+    prompt_file = tmp_path / "worker-prompt"
+    prompt_file.write_text("Review the change")
+    prompt_file.chmod(0o600)
+    inner_command = (
+        "agentflow-codex-worker --worker luna --effort medium --timeout 900 "
+        f"< \"{prompt_file}\""
+    )
+    brief_envelope = (
+        "/bin/zsh -lc 'agentflow-codex-worker --worker <routed-allowlisted-name> "
+        "--effort medium --timeout 900 < \"<absolute-private-prompt-file>\"'"
+    )
+    assert brief_envelope in brief
+    assert prompt_file.is_file() and prompt_file.stat().st_mode & 0o777 == 0o600
+    assert "bare worker command" in policy
+    assert "/bin/zsh -lc '<bounded-worker-command>'" in policy
+    assert "launcher-owned envelope" in policy
+    assert "exactly one `agentflow-codex-worker` command" in policy
+    assert "one stdin `<` redirection" in policy
+    assert "literal absolute path" in brief and "literal absolute path" in policy
+    assert "mode exactly 0600" in policy
+
+    # Exercise the public command boundary that Codex's launcher places behind auto-review.
+    # The reviewer itself is a Codex service. CI may not install zsh, so use it when present and
+    # otherwise exercise the same ``-lc`` + redirection boundary through the platform shell; the
+    # assertions above separately pin the production contract to Codex's exact /bin/zsh envelope.
+    fake_codex = tmp_path / "codex-provider"
+    fake_codex.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "task = sys.stdin.read()\n"
+        "raise SystemExit(0 if task == 'Review the change' else 91)\n"
+    )
+    fake_codex.chmod(0o755)
+    worker_bin = Path(sys.executable).with_name("agentflow-codex-worker")
+    assert worker_bin.is_file()
+    env = os.environ.copy()
+    env["AGENTFLOW_CODEX_BIN"] = str(fake_codex)
+    env["PATH"] = f"{worker_bin.parent}{os.pathsep}{env['PATH']}"
+    command_shell = shutil.which("zsh") or shutil.which("sh")
+    assert command_shell is not None
+    launched = subprocess.run(
+        [command_shell, "-lc", inner_command], cwd=wt, env=env,
+        text=True, capture_output=True,
+    )
+    assert launched.returncode == 0, launched.stderr
+
+    rejected_commands = {
+        "/bin/zsh -lc 'echo ready && agentflow-codex-worker --worker luna "
+        "--effort medium --timeout 900 < \"/private/tmp/prompt\"'":
+            ("chains", "extra commands", "&& <extra-command>"),
+        "/bin/bash -lc 'agentflow-codex-worker --worker luna --effort medium "
+        "--timeout 900 < \"/private/tmp/prompt\"'":
+            ("authored shell wrappers", "/bin/bash -lc"),
+        "/bin/zsh -lc 'agentflow-codex-worker --worker luna --effort medium "
+        "--timeout 900 --extra < \"/private/tmp/prompt\"'":
+            ("extra arguments", "--timeout 900 --extra"),
+        "/bin/zsh -lc 'agentflow-codex-worker --worker impostor --effort medium "
+        "--timeout 900 < \"/private/tmp/prompt\"'":
+            ("unallowlisted workers", "--worker <unallowlisted-worker>"),
+        "/bin/zsh -lc 'agentflow-codex-worker --worker luna --effort max "
+        "--timeout 900 < \"/private/tmp/prompt\"'": ("invalid effort", "--effort max"),
+        "/bin/zsh -lc 'agentflow-codex-worker --worker luna --effort medium "
+        "--timeout 901 < \"/private/tmp/prompt\"'": ("invalid timeout", "--timeout 901"),
+        "/bin/zsh -lc 'agentflow-codex-worker --worker luna --effort medium "
+        "--timeout 900 < \"/private/tmp/mode-0644-prompt\"'":
+            ("unsafe stdin", "<mode-0644-file>"),
+        "/bin/zsh -lc 'agentflow-codex-worker --worker luna --effort medium "
+        "--timeout 900 --dangerously-bypass-approvals-and-sandbox "
+        "< \"/private/tmp/prompt\"'": ("sandbox-weakening flags",),
+    }
+    for rejected_command, rejection_terms in rejected_commands.items():
+        assert rejected_command not in brief
+        assert all(term in policy for term in rejection_terms)
+
+    unsafe_prompt = tmp_path / "unsafe-prompt"
+    unsafe_prompt.write_text("Review the change")
+    unsafe_prompt.chmod(0o644)
+    rejected_at_worker_boundary = (
+        f'agentflow-codex-worker --worker luna --effort max --timeout 900 < "{prompt_file}"',
+        f'agentflow-codex-worker --worker luna --effort medium --timeout 901 < "{prompt_file}"',
+        f'agentflow-codex-worker --worker impostor --effort medium --timeout 900 < "{prompt_file}"',
+        f'agentflow-codex-worker --worker luna --effort medium --timeout 900 --extra < "{prompt_file}"',
+        f'agentflow-codex-worker --worker luna --effort medium --timeout 900 < "{unsafe_prompt}"',
+    )
+    for rejected_command in rejected_at_worker_boundary:
+        rejected = subprocess.run(
+            [command_shell, "-lc", rejected_command], cwd=wt, env=env,
+            text=True, capture_output=True,
+        )
+        assert rejected.returncode != 0
 
 
 def test_codex_review_pr_reads_stay_in_the_existing_networked_sandbox(tmp_path):
