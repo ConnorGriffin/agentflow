@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 580](adr-580-evidence-module-interface-and-retention.md) — Evidence module interface,
+  authority-verification seam, and bounded retention.
+
 - [ADR 538](adr-538-automatic-codex-session-lead-fallback.md) — Automatic Codex session-lead
   fallback.
 - [ADR 541](adr-541-native-session-lead-helpers.md) — Native session-lead helpers retain parent

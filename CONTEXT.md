@@ -5,6 +5,43 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 
 ## Terms
 
+- **Evidence event** — the canonical, deduplicated record of one classified failure
+  recurrence for an immutable subject revision. Multiple evidence observations may
+  support one event without increasing its recurrence.
+
+- **Evidence observation** — one immutable, redacted source observation supporting an
+  evidence event. It contains references and digests only, never source prose.
+
+- **Subject revision** — the immutable version of a reviewed change, issue, or document
+  to which evidence applies: an exact reviewed SHA for code review, or a stable locator
+  and normalized-content digest for an issue or document.
+
+- **Failure class** — the closed classification of what failed: `original_defect`,
+  `plan_gap`, `slice_scope_error`, `reviewer_false_claim`, `speculative_preference`, or
+  `fix_introduced_defect`.
+
+- **Validation state** — the independent confidence classification for evidence:
+  `observed`, `reproduced`, `refuted`, `model_judged`, `human_validated`, or
+  `unvalidated`.
+
+- **Evaluation** — a timestamped validation-state assessment of an evidence event. It
+  does not change the event's failure class or its observations.
+
+- **Lesson candidate** — a bounded proposed lesson that references evidence events and
+  has not yet become an approved policy proposal.
+
+- **Policy proposal** — a versioned, digest-identified candidate for a governed policy
+  change; its authoritative approval remains in GitHub or checked-in repository artifacts.
+
+- **Promotion record** — the idempotent receipt that binds a lesson candidate to a
+  verified authoritative approval of its exact revision, hash, and scope.
+
+- **Evidence briefing** — the bounded canonical-event projection prepared for one
+  subject; it is not a transcript, source archive, or alternate decision authority.
+
+- **Environment failure** — a failure of the execution environment rather than the
+  subject under examination; it is not evidence of a product or process defect.
+
 - **Agentflow** — the headless workflow engine that moves approved GitHub build
   issues through intake, dispatch, build, review, and merge. It does not own
   planning conversations, issue tracking, or repository decisions.
