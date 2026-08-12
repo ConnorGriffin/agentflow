@@ -98,12 +98,17 @@ def read_session(store_path: Path | str, token: str | None) -> CapturedSession:
     timed_out = False
     has_end_fact = False
     try:
-        result = json.loads(result_path(store_path, token).read_text())
+        # This file is durable cross-process state and may be truncated or human-edited. Decode
+        # it under the same narrow trust boundary as events, then require its canonical object.
+        result = json.loads(result_path(store_path, token).read_bytes())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+        result = None
+    if isinstance(result, dict):
         exit_status = result.get("exit_status")
         signal = result.get("signal")
         timed_out = result.get("timed_out") is True
         has_end_fact = True
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    else:
         # Compatibility with artifacts written before the full supervisor result existed.
         try:
             exit_status = int(exit_path(store_path, token).read_text().strip())

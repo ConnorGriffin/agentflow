@@ -63,3 +63,6 @@ with a cooperative 10ms parsing slice and a 1 MiB per-record ceiling. The superv
 current silent, test, and absolute deadline before and after each JSON decode; oversized records
 and decoder failures, including pathological structural recursion, fail closed. Thus an output
 burst cannot postpone teardown except for the bounded decode between two clock checks.
+Durable reconstruction applies the same narrow decoder boundary to event and terminal-result
+artifacts; a malformed result retains the pre-result `.exit` fallback rather than crashing
+recovery or inventing an end fact.

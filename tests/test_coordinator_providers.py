@@ -379,6 +379,41 @@ def test_provider_adapters_observe_from_durable_session_artifacts(tmp_path, monk
     assert typed_obs.cause is ProviderCause.CAPACITY and typed_obs.reset_at == 99
 
 
+@pytest.mark.parametrize(("label", "malformed_result"), [
+    ("recursive", b"[" * 10000 + b"0" + b"]" * 10000),
+    ("invalid-utf8", b"\xff\xfe\xfa"),
+])
+def test_provider_observation_recovers_malformed_result_through_exit_fallback(
+        tmp_path, monkeypatch, label, malformed_result):
+    """Public observation fails closed on a corrupt result and preserves legacy recovery."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.coordinator.session import exit_path, result_path
+    from agentflow.coordinator.store import default_store_path
+
+    adapter = ClaudeProviderAdapter()
+    fallback_token = f"{label}-fallback"
+    result = result_path(default_store_path(), fallback_token)
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_bytes(malformed_result)
+    exit_path(default_store_path(), fallback_token).write_text("17\n")
+
+    fallback = adapter.observe(Record(
+        f"{label}-fallback", "review", "claude", 1, launch_token=fallback_token))
+    assert fallback.has_end_fact is True
+    assert fallback.exit_status == 17
+    assert fallback.signal is None and fallback.timed_out is False
+    assert fallback.cause is ProviderCause.PROCESS
+
+    safe_token = f"{label}-safe"
+    result_path(default_store_path(), safe_token).write_bytes(malformed_result)
+    safe = adapter.observe(Record(
+        f"{label}-safe", "review", "claude", 1, launch_token=safe_token))
+    assert safe.has_end_fact is False
+    assert safe.exit_status is None and safe.signal is None and safe.timed_out is False
+
+
 def test_default_codex_adapter_queries_the_typed_limit_companion(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
     from agentflow.coordinator.providers import CodexProviderAdapter
