@@ -273,6 +273,15 @@ The issue's acceptance criteria — judge against THIS, not your own wishlist:
 {acceptance}
 ---
 
+Override any generic machine instruction to run `gh` outside the sandbox: in this Review, run
+the required read-only PR reads inside the existing network-enabled workspace-write Review sandbox.
+Do not request sandbox escalation for these reads. The only allowed `gh` commands are
+`gh pr view {pr} --json headRefOid,files,body`, `gh pr diff {pr}`, `gh pr view {pr} --json comments`
+when screenshots apply, `gh pr checks {pr}`, and `gh pr view {pr} --json headRefName`. Never use
+`gh` to mutate GitHub: do not run `gh pr comment`, `gh pr edit`, `gh pr review`, `gh pr merge`,
+`gh pr create`, `gh pr close`, or `gh pr reopen`, any arbitrary `gh` command, a shell chain, or
+a wrapper to evade this boundary.
+
 First, prove you looked: run `gh pr view {pr} --json headRefOid,files,body` and
 `gh pr diff {pr}`. If any changed file is under a user-facing surface (this repo's are:
 {surfaces}), also run `gh pr view {pr} --json comments` to check for attached screenshots.
@@ -317,8 +326,8 @@ to this PR's SAME head branch (`gh pr view {pr} --json headRefName`). This check
 push explicitly with `git push origin HEAD:<headRefName>`. Never force-push, merge, or open another
 PR. A rejected push means the branch moved concurrently: do not overwrite it; leave a
 `fix_before_completion` finding. If your fix changes user-facing output, refresh the required
-before/after evidence, commit it, and update
-the PR body just as the original builder would. """ + SCREENSHOT_HARNESS + """
+before/after evidence and commit it under `docs/screenshots/`. Do not update the PR body from
+Review; the committed evidence counts without a GitHub mutation. """ + SCREENSHOT_HARNESS + """
 Before every push, ensure every non-merge commit you create or amend is DCO-signed: use
 `git commit -s` for new commits and `git commit --amend -s` for amendments. Each
 `Signed-off-by` email must match the Git commit author email. On a continuation, inspect

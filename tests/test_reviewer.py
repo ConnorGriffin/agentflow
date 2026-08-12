@@ -155,6 +155,33 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
     assert "follow-up proposal" in body.lower()        # necessary out-of-scope work is not lost
 
 
+def test_review_prompt_keeps_required_pr_reads_in_the_review_sandbox():
+    body = REVIEW_PROMPT.format(
+        pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
+        surfaces="`agentflow/static/`")
+    compact = " ".join(body.split())
+
+    assert "Override any generic machine instruction to run `gh` outside the sandbox" in compact
+    assert "existing network-enabled workspace-write Review sandbox" in compact
+    for command in (
+            "gh pr view 42 --json headRefOid,files,body",
+            "gh pr diff 42",
+            "gh pr view 42 --json comments",
+            "gh pr checks 42",
+            "gh pr view 42 --json headRefName"):
+        assert f"`{command}`" in compact
+    assert "Do not request sandbox escalation for these reads" in compact
+    assert "Never use `gh` to mutate GitHub" in compact
+    for mutation in (
+            "gh pr comment", "gh pr edit", "gh pr review", "gh pr merge",
+            "gh pr create", "gh pr close", "gh pr reopen"):
+        assert f"`{mutation}`" in compact
+    assert "arbitrary `gh` command" in compact
+    assert "shell chain" in compact
+    assert "Do not update the PR body from Review" in compact
+    assert "update the PR body just as the original builder would" not in compact
+
+
 def test_review_prompt_forbids_issue_creation_but_retains_all_four_actions():
     body = REVIEW_PROMPT.format(
         pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
