@@ -13,6 +13,7 @@ import pytest
 from agentflow import runner as runner_mod
 from agentflow.coordinator.providers import provider_command
 from agentflow.coordinator.record import Record
+from agentflow.reviewer import REVIEW_PROMPT
 from agentflow.runner import (ClaudeRunner, CodexRunner, Complexity,
                               Effort, _run, recover_stale_worktrees,
                               remove_worktree_if_safe,
@@ -257,8 +258,33 @@ def test_codex_auto_review_policy_rejects_broad_codex_or_shell_escalation(tmp_pa
     assert "Reject bare `codex` invocations, shell wrappers" in policy
     assert "`--dangerously-bypass-approvals-and-sandbox`" in policy
     assert "Reject every other sandbox escalation" in policy
+    assert "gh pr" not in policy  # Review's narrow gh reads need no escalation exception.
     assert "any Codex command" not in policy
     assert "any shell command" not in policy
+
+
+def test_codex_review_pr_reads_stay_in_the_existing_networked_sandbox(tmp_path):
+    repo = _repo_with_origin(tmp_path)
+    wt = repo / ".agentflow" / "worktrees" / "codex-review" / "pr-42-read"
+    _detached_worktree(repo, wt)
+    prompt = REVIEW_PROMPT.format(
+        pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
+        surfaces="`agentflow/webui/`")
+
+    command = CodexRunner().structured_argv(prompt, "gpt-5.6-terra", str(wt))
+    config = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
+    policy = json.loads(next(value.removeprefix("auto_review.policy=") for value in config
+                             if value.startswith("auto_review.policy=")))
+    rendered = command[-1]
+
+    assert command[command.index("--sandbox") + 1] == "workspace-write"
+    assert "sandbox_workspace_write.network_access=true" in config
+    assert "gh pr" not in policy
+    assert "Do not request sandbox escalation for these reads" in rendered
+    assert "`gh pr view 42 --json headRefOid,files,body`" in rendered
+    assert "`gh pr diff 42`" in rendered
+    # The only escalation instruction remains the pre-existing browser-driver recovery.
+    assert rendered.count("sandbox_permissions=require_escalated") == 1
 
 
 def test_claude_wires_the_result_schema_to_its_native_json_schema_flag(tmp_path):
