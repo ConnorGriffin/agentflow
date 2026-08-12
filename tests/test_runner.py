@@ -3,8 +3,8 @@
 import datetime
 import json
 import os
-import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 from unittest.mock import patch
@@ -285,15 +285,11 @@ def test_codex_session_lead_worker_command_matches_the_launcher_approval_policy(
         "agentflow-codex-worker --worker luna --effort medium --timeout 900 "
         f"< \"{prompt_file}\""
     )
-    envelope = shlex.join(["/bin/zsh", "-lc", inner_command])
     brief_envelope = (
         "/bin/zsh -lc 'agentflow-codex-worker --worker <routed-allowlisted-name> "
         "--effort medium --timeout 900 < \"<absolute-private-prompt-file>\"'"
     )
     assert brief_envelope in brief
-    assert envelope == brief_envelope.replace(
-        "<routed-allowlisted-name>", "luna").replace(
-            "<absolute-private-prompt-file>", str(prompt_file))
     assert prompt_file.is_file() and prompt_file.stat().st_mode & 0o777 == 0o600
     assert "bare worker command" in policy
     assert "/bin/zsh -lc '<bounded-worker-command>'" in policy
@@ -302,6 +298,28 @@ def test_codex_session_lead_worker_command_matches_the_launcher_approval_policy(
     assert "one stdin `<` redirection" in policy
     assert "literal absolute path" in brief and "literal absolute path" in policy
     assert "mode exactly 0600" in policy
+
+    # Exercise the public command boundary that Codex's launcher places behind auto-review.
+    # The reviewer itself is a Codex service, but this is the exact zsh envelope it approves,
+    # the installed AgentFlow worker CLI it starts, and the private stdin contract it relies on.
+    fake_codex = tmp_path / "codex-provider"
+    fake_codex.write_text(
+        f"#!{sys.executable}\n"
+        "import sys\n"
+        "task = sys.stdin.read()\n"
+        "raise SystemExit(0 if task == 'Review the change' else 91)\n"
+    )
+    fake_codex.chmod(0o755)
+    worker_bin = Path(sys.executable).with_name("agentflow-codex-worker")
+    assert worker_bin.is_file()
+    env = os.environ.copy()
+    env["AGENTFLOW_CODEX_BIN"] = str(fake_codex)
+    env["PATH"] = f"{worker_bin.parent}{os.pathsep}{env['PATH']}"
+    launched = subprocess.run(
+        ["/bin/zsh", "-lc", inner_command], cwd=wt, env=env,
+        text=True, capture_output=True,
+    )
+    assert launched.returncode == 0, launched.stderr
 
     rejected_commands = {
         "/bin/zsh -lc 'echo ready && agentflow-codex-worker --worker luna "
@@ -330,6 +348,23 @@ def test_codex_session_lead_worker_command_matches_the_launcher_approval_policy(
     for rejected_command, rejection_terms in rejected_commands.items():
         assert rejected_command not in brief
         assert all(term in policy for term in rejection_terms)
+
+    unsafe_prompt = tmp_path / "unsafe-prompt"
+    unsafe_prompt.write_text("Review the change")
+    unsafe_prompt.chmod(0o644)
+    rejected_at_worker_boundary = (
+        f'agentflow-codex-worker --worker luna --effort max --timeout 900 < "{prompt_file}"',
+        f'agentflow-codex-worker --worker luna --effort medium --timeout 901 < "{prompt_file}"',
+        f'agentflow-codex-worker --worker impostor --effort medium --timeout 900 < "{prompt_file}"',
+        f'agentflow-codex-worker --worker luna --effort medium --timeout 900 --extra < "{prompt_file}"',
+        f'agentflow-codex-worker --worker luna --effort medium --timeout 900 < "{unsafe_prompt}"',
+    )
+    for rejected_command in rejected_at_worker_boundary:
+        rejected = subprocess.run(
+            ["/bin/zsh", "-lc", rejected_command], cwd=wt, env=env,
+            text=True, capture_output=True,
+        )
+        assert rejected.returncode != 0
 
 
 def test_codex_review_pr_reads_stay_in_the_existing_networked_sandbox(tmp_path):
