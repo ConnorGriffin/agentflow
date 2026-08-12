@@ -1,0 +1,10 @@
+{
+  "observation_id": "observation-1",
+  "subject": {"subject_kind": "review", "subject": "pr/42", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "locator": "", "content_digest": ""},
+  "failure_class": "original_defect",
+  "validation_state": "observed",
+  "signature_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "normalizer_version": "v1",
+  "source": {"authority_kind": "github", "repository": "octo/repo", "locator": "issues/42", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content_hash_algorithm": "sha256", "content_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "scope": "issue"},
+  "observed_at": 1
+}

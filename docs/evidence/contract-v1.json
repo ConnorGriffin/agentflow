@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "envelope": "observation",
+  "allowed_fields": ["failure_class", "fixer_revision", "normalizer_version", "observation_id", "observed_at", "reviewed_parent_revision", "signature_digest", "source", "subject", "validation_state"],
+  "failure_classes": ["fix_introduced_defect", "original_defect", "plan_gap", "reviewer_false_claim", "slice_scope_error", "speculative_preference"],
+  "validation_states": ["human_validated", "model_judged", "observed", "refuted", "reproduced", "unvalidated"]
+}
