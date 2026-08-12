@@ -23,6 +23,40 @@ VALIDATION_STATES = frozenset({"observed", "reproduced", "refuted", "model_judge
 _ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$")
 _DIGEST = re.compile(r"^[a-f0-9]{32,128}$")
 _SHA = re.compile(r"^[a-f0-9]{40,64}$")
+_CONTENT_REVISION = re.compile(r"^sha256:([a-f0-9]{64})$")
+
+_SCHEMA = """
+CREATE TABLE events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL,
+  subject TEXT NOT NULL, revision TEXT NOT NULL, failure_class TEXT NOT NULL,
+  signature TEXT NOT NULL, normalizer TEXT NOT NULL,
+  UNIQUE(repository,subject,revision,failure_class,signature,normalizer));
+CREATE TABLE observations (observation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL, source_repository TEXT NOT NULL, source_locator TEXT NOT NULL,
+  source_revision TEXT NOT NULL, source_hash_algorithm TEXT NOT NULL, source_hash TEXT NOT NULL,
+  source_scope TEXT NOT NULL, validation_state TEXT NOT NULL, observed_at INTEGER NOT NULL,
+  parent_revision TEXT NOT NULL, fixer_revision TEXT NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES events(event_id));
+CREATE TABLE evaluations (evaluation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+  validation_state TEXT NOT NULL, evaluated_at INTEGER NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES events(event_id));
+CREATE TABLE candidates (candidate_id TEXT PRIMARY KEY, proposal_digest TEXT NOT NULL,
+  policy_version INTEGER NOT NULL, nominated_at INTEGER NOT NULL);
+CREATE TABLE candidate_events (candidate_id TEXT NOT NULL, event_id TEXT NOT NULL,
+  PRIMARY KEY(candidate_id,event_id),
+  FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id),
+  FOREIGN KEY(event_id) REFERENCES events(event_id));
+CREATE TABLE receipts (candidate_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL UNIQUE,
+  approval_id TEXT NOT NULL, policy_version INTEGER NOT NULL, promoted_at INTEGER NOT NULL,
+  authority_kind TEXT NOT NULL, authority_repository TEXT NOT NULL, authority_locator TEXT NOT NULL,
+  authority_revision TEXT NOT NULL, authority_hash_algorithm TEXT NOT NULL, authority_hash TEXT NOT NULL,
+  authority_scope TEXT NOT NULL, verifier_id TEXT NOT NULL, verifier_version TEXT NOT NULL,
+  verifier_outcome TEXT NOT NULL, approved_revision TEXT NOT NULL, approved_hash TEXT NOT NULL,
+  approved_scope TEXT NOT NULL,
+  FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id));
+CREATE INDEX observations_by_event ON observations(event_id);
+CREATE INDEX evaluations_by_event ON evaluations(event_id);
+CREATE INDEX candidate_events_by_event ON candidate_events(event_id);
+"""
 
 
 class EvidenceError(ValueError):
@@ -45,6 +79,22 @@ def _locator(value: str, name: str) -> None:
         raise EvidenceError(f"invalid {name}")
 
 
+def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
+    rows = conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master "
+                        "WHERE type IN ('table', 'index') AND name NOT LIKE 'sqlite_%' "
+                        "ORDER BY type, name").fetchall()
+    return tuple((row[0], row[1], row[2], re.sub(r"\s+", "", row[3] or "").lower()) for row in rows)
+
+
+def _schema_fingerprint_for_v1() -> tuple[tuple[str, str, str, str], ...]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(_SCHEMA)
+        return _schema_fingerprint(conn)
+    finally:
+        conn.close()
+
+
 @dataclass(frozen=True)
 class AuthorityPointer:
     authority_kind: str
@@ -60,6 +110,15 @@ class AuthorityPointer:
             _token(getattr(self, name), name)
         _locator(self.locator, "locator")
         _digest(self.content_hash, "content_hash")
+        if self.authority_kind == "github":
+            immutable = _SHA.fullmatch(self.revision)
+        elif self.authority_kind == "repository":
+            match = _CONTENT_REVISION.fullmatch(self.revision)
+            immutable = match is not None and match.group(1) == self.content_hash
+        else:
+            immutable = False
+        if not immutable:
+            raise EvidenceError("invalid immutable revision for authority_kind")
 
 
 @dataclass(frozen=True)
@@ -191,6 +250,9 @@ class LessonCandidate:
             raise EvidenceError("candidate needs bounded event references")
         for event_id in self.event_ids:
             _token(event_id, "event_id")
+        if len(set(self.event_ids)) != len(self.event_ids):
+            raise EvidenceError("candidate event references must be unique")
+        object.__setattr__(self, "event_ids", tuple(sorted(self.event_ids)))
         _digest(self.proposal_digest, "proposal_digest")
         if not isinstance(self.policy_version, int) or self.policy_version < 1:
             raise EvidenceError("invalid policy_version")
@@ -204,6 +266,7 @@ class PromotionReceipt:
     candidate_id: str
     approval_id: str
     policy_version: int
+    authority: ApprovedAuthority
 
 
 class EvidenceStore:
@@ -217,6 +280,7 @@ class EvidenceStore:
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     @staticmethod
@@ -224,32 +288,16 @@ class EvidenceStore:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version not in (0, SCHEMA_VERSION):
             raise EvidenceError("unsupported evidence schema version")
-        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        known = {"events", "observations", "evaluations", "candidates", "candidate_events", "receipts"}
-        if version == 0 and tables:
+        existing = _schema_fingerprint(conn)
+        expected = _schema_fingerprint_for_v1()
+        if version == 0 and existing:
             raise EvidenceError("unversioned evidence database is not safe to open")
-        if version == SCHEMA_VERSION and tables != known:
+        if version == SCHEMA_VERSION and existing != expected:
             raise EvidenceError("evidence schema does not match its version")
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL,
-          subject TEXT NOT NULL, revision TEXT NOT NULL, failure_class TEXT NOT NULL,
-          signature TEXT NOT NULL, normalizer TEXT NOT NULL,
-          UNIQUE(repository,subject,revision,failure_class,signature,normalizer));
-        CREATE TABLE IF NOT EXISTS observations (observation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
-          source_kind TEXT NOT NULL, source_repository TEXT NOT NULL, source_locator TEXT NOT NULL,
-          source_revision TEXT NOT NULL, source_hash_algorithm TEXT NOT NULL, source_hash TEXT NOT NULL,
-          source_scope TEXT NOT NULL,
-          validation_state TEXT NOT NULL, observed_at INTEGER NOT NULL, parent_revision TEXT NOT NULL,
-          fixer_revision TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS evaluations (evaluation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
-          validation_state TEXT NOT NULL, evaluated_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS candidates (candidate_id TEXT PRIMARY KEY, proposal_digest TEXT NOT NULL,
-          policy_version INTEGER NOT NULL, nominated_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS candidate_events (candidate_id TEXT NOT NULL, event_id TEXT NOT NULL,
-          PRIMARY KEY(candidate_id,event_id));
-        CREATE TABLE IF NOT EXISTS receipts (candidate_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL,
-          approval_id TEXT NOT NULL, policy_version INTEGER NOT NULL, promoted_at INTEGER NOT NULL);
-        """)
+        if version == 0:
+            conn.executescript(_SCHEMA)
+            if _schema_fingerprint(conn) != expected:
+                raise EvidenceError("evidence schema did not initialize exactly")
         conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
@@ -289,33 +337,74 @@ class EvidenceStore:
     def evaluate(self, evaluation: Evaluation) -> Evaluation:
         with self._connect() as conn:
             self._event(conn, evaluation.event_id)
-            conn.execute("INSERT OR IGNORE INTO evaluations VALUES (?,?,?,?)", (evaluation.evaluation_id,
-                         evaluation.event_id, evaluation.validation_state, evaluation.evaluated_at))
+            existing = conn.execute("SELECT event_id, validation_state, evaluated_at FROM evaluations "
+                                    "WHERE evaluation_id=?", (evaluation.evaluation_id,)).fetchone()
+            facts = (evaluation.event_id, evaluation.validation_state, evaluation.evaluated_at)
+            if existing is not None:
+                if tuple(existing) != facts:
+                    raise EvidenceError("evaluation_id already names different immutable facts")
+                return Evaluation(evaluation.evaluation_id, *existing)
+            conn.execute("INSERT INTO evaluations VALUES (?,?,?,?)", (evaluation.evaluation_id, *facts))
         return evaluation
 
     def nominate(self, candidate: LessonCandidate) -> LessonCandidate:
         with self._connect() as conn:
             for event_id in candidate.event_ids:
                 self._event(conn, event_id)
-            conn.execute("INSERT OR IGNORE INTO candidates VALUES (?,?,?,?)", (candidate.candidate_id,
-                         candidate.proposal_digest, candidate.policy_version, candidate.nominated_at))
+            existing = conn.execute("SELECT proposal_digest, policy_version, nominated_at FROM candidates "
+                                    "WHERE candidate_id=?", (candidate.candidate_id,)).fetchone()
+            facts = (candidate.proposal_digest, candidate.policy_version, candidate.nominated_at)
+            if existing is not None:
+                relations = tuple(row[0] for row in conn.execute(
+                    "SELECT event_id FROM candidate_events WHERE candidate_id=? ORDER BY event_id",
+                    (candidate.candidate_id,)))
+                if tuple(existing) != facts or relations != candidate.event_ids:
+                    raise EvidenceError("candidate_id already names different immutable facts or relations")
+                return LessonCandidate(candidate.candidate_id, relations, *existing)
+            conn.execute("INSERT INTO candidates VALUES (?,?,?,?)", (candidate.candidate_id, *facts))
             for event_id in candidate.event_ids:
-                conn.execute("INSERT OR IGNORE INTO candidate_events VALUES (?,?)", (candidate.candidate_id, event_id))
+                conn.execute("INSERT INTO candidate_events VALUES (?,?)", (candidate.candidate_id, event_id))
         return candidate
 
     def promote(self, candidate_id: str, authority: AuthorityPointer, *, promoted_at: int) -> PromotionReceipt:
         _token(candidate_id, "candidate_id")
         approved = self.verifier.verify(authority)
         if approved is None: raise EvidenceError("authority was not verified")
+        if not isinstance(approved, ApprovedAuthority):
+            raise EvidenceError("verifier returned an invalid authority approval")
+        if (approved.pointer != authority or approved.approved_revision != authority.revision or
+                approved.approved_hash != authority.content_hash or
+                approved.approved_scope != authority.scope):
+            raise EvidenceError("verifier did not approve the requested authority")
         if not isinstance(promoted_at, int) or promoted_at < 0: raise EvidenceError("invalid promoted_at")
         with self._connect() as conn:
             candidate = conn.execute("SELECT policy_version FROM candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
             if candidate is None: raise EvidenceError("unknown candidate")
-            prior = conn.execute("SELECT receipt_id, approval_id, policy_version FROM receipts WHERE candidate_id=?", (candidate_id,)).fetchone()
-            if prior: return PromotionReceipt(prior[0], candidate_id, prior[1], prior[2])
+            prior = conn.execute("SELECT * FROM receipts WHERE candidate_id=?", (candidate_id,)).fetchone()
+            if prior:
+                receipt = self._receipt(prior)
+                if receipt.authority.pointer != authority:
+                    raise EvidenceError("candidate was promoted under a different authority")
+                return receipt
             receipt_id = f"receipt-{candidate_id}"
-            conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?)", (candidate_id, receipt_id, approved.approval_id, candidate[0], promoted_at))
-            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id, candidate[0])
+            conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                candidate_id, receipt_id, approved.approval_id, candidate[0], promoted_at,
+                authority.authority_kind, authority.repository, authority.locator, authority.revision,
+                authority.content_hash_algorithm, authority.content_hash, authority.scope,
+                approved.verifier_id, approved.verifier_version, approved.outcome,
+                approved.approved_revision, approved.approved_hash, approved.approved_scope))
+            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id, candidate[0], approved)
+
+    @staticmethod
+    def _receipt(row: sqlite3.Row) -> PromotionReceipt:
+        pointer = AuthorityPointer(row["authority_kind"], row["authority_repository"],
+            row["authority_locator"], row["authority_revision"], row["authority_hash_algorithm"],
+            row["authority_hash"], row["authority_scope"])
+        approved = ApprovedAuthority(pointer, row["approval_id"], row["approved_revision"],
+            row["approved_hash"], row["approved_scope"], row["verifier_id"],
+            row["verifier_version"], row["verifier_outcome"])
+        return PromotionReceipt(row["receipt_id"], row["candidate_id"], row["approval_id"],
+                                row["policy_version"], approved)
 
     def brief_for(self, subject: str, *, now: int, effective_policy_versions: tuple[int, ...] = ()) -> tuple[Event, ...]:
         _token(subject, "subject")

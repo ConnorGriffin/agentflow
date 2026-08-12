@@ -85,6 +85,28 @@ def test_evaluation_nomination_and_verified_promotion_are_idempotent(tmp_path):
     first = store.promote(candidate.candidate_id, authority, promoted_at=4)
     second = store.promote(candidate.candidate_id, authority, promoted_at=5)
     assert first == second and first.approval_id == "approval-1"
+    assert first.authority == approved
+    assert EvidenceStore(path=tmp_path / "evidence.db", verifier=FakeAuthorityVerifier((approved,))).promote(
+        candidate.candidate_id, authority, promoted_at=6) == first
+
+
+def test_evaluation_and_nomination_replays_require_exact_immutable_facts(tmp_path):
+    store = EvidenceStore(path=tmp_path / "evidence.db")
+    first = store.observe(_observation())
+    second = store.observe(_observation(revision="f" * 40, source=AuthorityPointer(
+        "github", "octo/repo", "issues/43", "d" * 40, "sha256", "e" * 64, "issue")))
+    evaluation = Evaluation("evaluation-1", first.event_id, "human_validated", 2)
+    assert store.evaluate(evaluation) == evaluation
+    assert store.evaluate(evaluation) == evaluation
+    with pytest.raises(EvidenceError, match="immutable"):
+        store.evaluate(Evaluation("evaluation-1", first.event_id, "refuted", 2))
+    candidate = LessonCandidate("candidate-1", (first.event_id,), "d" * 64, 1, 3)
+    assert store.nominate(candidate) == candidate
+    assert store.nominate(candidate) == candidate
+    with pytest.raises(EvidenceError, match="immutable"):
+        store.nominate(LessonCandidate("candidate-1", (second.event_id,), "d" * 64, 1, 3))
+    with pytest.raises(EvidenceError, match="immutable"):
+        store.nominate(LessonCandidate("candidate-1", (first.event_id,), "e" * 64, 1, 3))
 
 
 def test_promotion_requires_verified_exact_authority(tmp_path):
@@ -95,6 +117,34 @@ def test_promotion_requires_verified_exact_authority(tmp_path):
         store.promote("candidate-1", _source(), promoted_at=4)
     with pytest.raises(EvidenceError, match="exact authority"):
         ApprovedAuthority(_source(), "approval-1", "b" * 40, "c" * 64, "issue", "fake", "v1", "verified")
+
+
+def test_promotion_rejects_a_verifier_response_for_another_authority(tmp_path):
+    requested = _source()
+    other = AuthorityPointer("github", "octo/repo", "issues/43", "d" * 40,
+                             "sha256", "e" * 64, "issue")
+    approved = ApprovedAuthority(other, "approval-1", other.revision, other.content_hash,
+                                 other.scope, "fake", "v1", "verified")
+
+    class WrongAuthorityVerifier:
+        def verify(self, authority):
+            return approved
+
+    store = EvidenceStore(path=tmp_path / "evidence.db", verifier=WrongAuthorityVerifier())
+    event = store.observe(_observation())
+    store.nominate(LessonCandidate("candidate-1", (event.event_id,), "d" * 64, 1, 3))
+    with pytest.raises(EvidenceError, match="requested authority"):
+        store.promote("candidate-1", requested, promoted_at=4)
+
+
+def test_authority_pointer_requires_kind_specific_immutable_revision():
+    with pytest.raises(EvidenceError, match="immutable revision"):
+        AuthorityPointer("github", "octo/repo", "issues/42", "main", "sha256", "a" * 64, "issue")
+    with pytest.raises(EvidenceError, match="immutable revision"):
+        AuthorityPointer("repository", "octo/repo", "docs/guide", "main", "sha256", "a" * 64, "document")
+    pointer = AuthorityPointer("repository", "octo/repo", "docs/guide", "sha256:" + "a" * 64,
+                               "sha256", "a" * 64, "document")
+    assert pointer.revision.startswith("sha256:")
 
 
 def test_retention_expires_unreferenced_and_abandoned_candidates_but_keeps_effective_versions(tmp_path):
@@ -134,3 +184,30 @@ def test_separate_evidence_schema_fails_closed_and_never_changes_records_db(tmp_
     conn = sqlite3.connect(records)
     assert conn.execute("SELECT name FROM sqlite_master WHERE name='records'").fetchone()
     conn.close()
+
+
+@pytest.mark.parametrize("statement", [
+    "CREATE TABLE events (event_id TEXT PRIMARY KEY)",
+    "CREATE TABLE events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL, subject TEXT NOT NULL, revision TEXT NOT NULL, failure_class TEXT NOT NULL, signature TEXT NOT NULL, normalizer TEXT NOT NULL)",
+])
+def test_versioned_malformed_evidence_schema_fails_closed_before_use(tmp_path, statement):
+    path = tmp_path / "evidence.db"
+    conn = sqlite3.connect(path)
+    conn.execute(statement)
+    conn.execute("PRAGMA user_version = 1")
+    conn.commit()
+    conn.close()
+    with pytest.raises(EvidenceError, match="schema"):
+        EvidenceStore(path=path)
+
+
+@pytest.mark.parametrize("tamper", ["ALTER TABLE events ADD COLUMN untrusted TEXT", "DROP INDEX observations_by_event"])
+def test_complete_v1_schema_fingerprint_rejects_column_and_index_tampering(tmp_path, tamper):
+    path = tmp_path / "evidence.db"
+    EvidenceStore(path=path)
+    conn = sqlite3.connect(path)
+    conn.execute(tamper)
+    conn.commit()
+    conn.close()
+    with pytest.raises(EvidenceError, match="schema"):
+        EvidenceStore(path=path)
