@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -300,8 +301,9 @@ def test_codex_session_lead_worker_command_matches_the_launcher_approval_policy(
     assert "mode exactly 0600" in policy
 
     # Exercise the public command boundary that Codex's launcher places behind auto-review.
-    # The reviewer itself is a Codex service, but this is the exact zsh envelope it approves,
-    # the installed AgentFlow worker CLI it starts, and the private stdin contract it relies on.
+    # The reviewer itself is a Codex service. CI may not install zsh, so use it when present and
+    # otherwise exercise the same ``-lc`` + redirection boundary through the platform shell; the
+    # assertions above separately pin the production contract to Codex's exact /bin/zsh envelope.
     fake_codex = tmp_path / "codex-provider"
     fake_codex.write_text(
         f"#!{sys.executable}\n"
@@ -315,8 +317,10 @@ def test_codex_session_lead_worker_command_matches_the_launcher_approval_policy(
     env = os.environ.copy()
     env["AGENTFLOW_CODEX_BIN"] = str(fake_codex)
     env["PATH"] = f"{worker_bin.parent}{os.pathsep}{env['PATH']}"
+    command_shell = shutil.which("zsh") or shutil.which("sh")
+    assert command_shell is not None
     launched = subprocess.run(
-        ["/bin/zsh", "-lc", inner_command], cwd=wt, env=env,
+        [command_shell, "-lc", inner_command], cwd=wt, env=env,
         text=True, capture_output=True,
     )
     assert launched.returncode == 0, launched.stderr
@@ -361,7 +365,7 @@ def test_codex_session_lead_worker_command_matches_the_launcher_approval_policy(
     )
     for rejected_command in rejected_at_worker_boundary:
         rejected = subprocess.run(
-            ["/bin/zsh", "-lc", rejected_command], cwd=wt, env=env,
+            [command_shell, "-lc", rejected_command], cwd=wt, env=env,
             text=True, capture_output=True,
         )
         assert rejected.returncode != 0
