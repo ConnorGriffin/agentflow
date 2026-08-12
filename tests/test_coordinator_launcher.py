@@ -73,6 +73,8 @@ def test_durable_started_then_dead_recovery_consumes_exactly_one_attempt(make_co
     ({"exit_status": "17", "signal": None, "timed_out": False}, 17),
     ({"exit_status": 17, "signal": None, "timed_out": False, "unknown": True}, 17),
     ("recursive", 17),
+    ("oversized", 17),
+    ("duplicate", 17),
 ])
 def test_public_coordinator_recovery_accepts_only_current_or_legacy_terminal_facts(
         coord_state, result, legacy_exit):
@@ -90,6 +92,11 @@ def test_public_coordinator_recovery_accepts_only_current_or_legacy_terminal_fac
             terminal.parent.mkdir(parents=True, exist_ok=True)
             if result == "recursive":
                 terminal.write_bytes(b"[" * 10000 + b"0" + b"]" * 10000)
+            elif result == "oversized":
+                terminal.write_bytes(b" " * (4096 + 1))
+            elif result == "duplicate":
+                terminal.write_bytes(
+                    b'{"exit_status":0,"exit_status":99,"signal":null,"timed_out":false}')
             elif result is not None:
                 terminal.write_text(json.dumps(result))
             if legacy_exit is not None:
@@ -756,6 +763,108 @@ def test_head_observation_cannot_block_past_the_absolute_cap(
     assert _build_observation(record).cause is ProviderCause.TIMEOUT
     assert elapsed < 1.2, f"0.35s absolute cap took {elapsed:.3f}s"
     assert not invoked.exists(), "HEAD observation executed the blocking git adapter"
+
+
+@pytest.mark.parametrize("bad_ref", ["invalid-utf8-ref", "fifo-ref"])
+def test_bad_or_special_git_metadata_cannot_strand_real_provider(
+        coord_state, tmp_path, bad_ref):
+    """HEAD observation fails closed on hostile ref storage while the real child is cleaned."""
+    source = tmp_path / bad_ref
+    source.mkdir()
+    subprocess.run(("git", "init", str(source)), check=True, capture_output=True)
+    head = (source / ".git" / "HEAD").read_text().strip()
+    ref = source / ".git" / head.removeprefix("ref: ")
+    ref.parent.mkdir(parents=True, exist_ok=True)
+    ref.unlink(missing_ok=True)
+    if bad_ref == "invalid-utf8-ref":
+        ref.write_bytes(b"\xff\xfe\n")
+    else:
+        os.mkfifo(ref)
+
+    provider_pid = tmp_path / f"{bad_ref}-pid"
+    marker = tmp_path / f"{bad_ref}-survived"
+    script = (
+        "import os,pathlib,sys,time\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "time.sleep(.70)\n"
+        "pathlib.Path(sys.argv[2]).write_text('not stopped')\n"
+    )
+    provider = lambda record: [
+        sys.executable, "-c", script, str(provider_pid), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(5.0, 5.0, 0.35)))
+    identity = coord.submit_stage(_build("claude", bad_ref, str(source)))
+
+    started_at = time.monotonic()
+    coord.cycle("claude")
+    record = _wait_for_real_child(identity, "hostile Git ref stranded the provider")
+    elapsed = time.monotonic() - started_at
+    observation = _build_observation(record)
+
+    assert provider_pid.exists()
+    assert not pid_family_alive(provider_pid.read_text())
+    assert observation.has_end_fact is True and observation.cause is ProviderCause.TIMEOUT
+    assert elapsed < 1.2
+    assert not marker.exists()
+
+
+def test_post_decode_deadline_cannot_be_renewed_by_late_progress(
+        coord_state, tmp_path, monkeypatch):
+    """A real child rolls back a completion whose decoder crosses the silent deadline."""
+    custom = tmp_path / "slow-json"
+    custom.mkdir()
+    (custom / "sitecustomize.py").write_text(
+        "import json,time\n"
+        "_loads=json.loads\n"
+        "def loads(value,*args,**kwargs):\n"
+        " data=value if isinstance(value,bytes) else str(value).encode()\n"
+        " if b'\\\"slow_decode\\\":true' in data: time.sleep(.08)\n"
+        " return _loads(value,*args,**kwargs)\n"
+        "json.loads=loads\n")
+    monkeypatch.setenv("PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+
+    target = tmp_path / "changed.py"
+    marker = tmp_path / "late-progress-renewed"
+    started = {"type": "assistant", "message": {"type": "message", "role": "assistant",
+               "content": [{"type": "tool_use", "id": "w1", "name": "Write",
+                            "input": {"file_path": str(target)}}]}}
+    completed = {"slow_decode": True, "type": "user",
+                 "message": {"type": "message", "role": "user", "content": [
+                     {"type": "tool_result", "tool_use_id": "w1", "is_error": False}]}}
+    script = (
+        "import pathlib,sys,time\n"
+        f"print({json.dumps(json.dumps(started))}, flush=True)\n"
+        "time.sleep(.07)\n"
+        f"print({json.dumps(json.dumps(completed, separators=(',', ':')))}, flush=True)\n"
+        "time.sleep(.13)\n"
+        "pathlib.Path(sys.argv[1]).write_text('expired progress renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.15, 1.0, 0.60)))
+    identity = coord.submit_stage(_build("claude", "post-decode-deadline", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "late decoder progress renewed an expired lease")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_natural_exit_observed_at_absolute_cap_is_durable_timeout(coord_state, tmp_path):
+    """An exit racing the immutable cap keeps its natural status but is classified timeout."""
+    absolute_cap = 0.30
+    provider = lambda record: [
+        sys.executable, "-c", f"import time; time.sleep({absolute_cap - 0.025})"]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(5.0, 5.0, absolute_cap)))
+    identity = coord.submit_stage(_build("claude", "natural-at-cap", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "natural cap-edge exit was not published")
+    observation = _build_observation(record)
+    assert observation.has_end_fact is True
+    assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
+    assert observation.exit_status == 0 and observation.signal is None
 
 
 def test_large_slow_event_burst_cannot_delay_the_absolute_cap(coord_state, tmp_path):

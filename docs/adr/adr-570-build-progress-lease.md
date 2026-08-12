@@ -67,4 +67,9 @@ Durable reconstruction applies the same narrow decoder boundary to event and ter
 artifacts. A result is authoritative only when it has exactly the writer's three typed fields
 (`exit_status: int|null`, `signal: int|null`, `timed_out: bool`); malformed, incomplete, or
 unknown objects retain the pre-result `.exit` fallback rather than crashing recovery or inventing
-an end fact.
+an end fact. Duplicate result keys are malformed. Recovery reads only regular files and caps the
+event artifact at 64 MiB, 100,000 records, 16 MiB per record and 16 MiB preserved partial output;
+the result and legacy exit artifacts are capped at 4 KiB and 64 bytes respectively. These bounds
+sit above the largest repository-evidenced legitimate session while keeping recovery finite.
+Git ref observation is likewise regular-file-only, reads at most 8 MiB per metadata file, and runs
+in a killable 25ms helper so a special or slow file cannot strand the provider-owning supervisor.

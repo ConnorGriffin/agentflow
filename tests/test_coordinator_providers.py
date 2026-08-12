@@ -476,6 +476,75 @@ def test_provider_observation_accepts_exact_current_result_schema(
     assert (observation.exit_status, observation.signal, observation.timed_out) == expected
 
 
+def test_provider_observation_rejects_duplicate_result_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.coordinator.session import exit_path, result_path
+    from agentflow.coordinator.store import default_store_path
+
+    token = "duplicate-result"
+    result = result_path(default_store_path(), token)
+    result.parent.mkdir(parents=True, exist_ok=True)
+    result.write_bytes(
+        b'{"exit_status":0,"exit_status":99,"signal":null,"timed_out":false}')
+    exit_path(default_store_path(), token).write_text("17\n")
+
+    observation = ClaudeProviderAdapter().observe(
+        Record("duplicate", "review", "claude", 1, launch_token=token))
+    assert observation.has_end_fact is True and observation.exit_status == 17
+    assert observation.cause is ProviderCause.PROCESS
+
+
+@pytest.mark.parametrize("oversized", ["events-artifact", "event-records", "event-record",
+                                        "result", "legacy-exit"])
+def test_provider_observation_bounds_every_durable_artifact(
+        tmp_path, monkeypatch, oversized):
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    from agentflow.coordinator import session
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.record import Record
+    from agentflow.coordinator.store import default_store_path
+
+    token = f"oversized-{oversized}"
+    events = session.events_path(default_store_path(), token)
+    events.parent.mkdir(parents=True, exist_ok=True)
+    if oversized == "events-artifact":
+        with events.open("wb") as stream:
+            stream.truncate(session._EVENT_ARTIFACT_BYTES + 1)
+        session.write_result(default_store_path(), token, exit_status=None,
+                             signal=15, timed_out=True)
+    elif oversized == "event-records":
+        events.write_bytes(b"{}\n" * (session._EVENT_RECORDS + 1))
+        session.write_result(default_store_path(), token, exit_status=None,
+                             signal=15, timed_out=True)
+    elif oversized == "event-record":
+        events.write_bytes(b'"' + b"x" * session._EVENT_RECORD_BYTES + b'"\n')
+        session.write_result(default_store_path(), token, exit_status=None,
+                             signal=15, timed_out=True)
+    elif oversized == "result":
+        session.result_path(default_store_path(), token).write_bytes(
+            b" " * (session._RESULT_ARTIFACT_BYTES + 1))
+        session.exit_path(default_store_path(), token).write_text("17\n")
+    else:
+        session.result_path(default_store_path(), token).write_text("{}")
+        session.exit_path(default_store_path(), token).write_bytes(
+            b"1" * (session._EXIT_ARTIFACT_BYTES + 1))
+
+    observation = ClaudeProviderAdapter().observe(
+        Record(oversized, "review", "claude", 1, launch_token=token))
+    assert observation.events == ()
+    assert observation.partial_output == ""
+    if oversized.startswith("event"):
+        assert observation.has_end_fact is True
+        assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
+    elif oversized == "result":
+        assert observation.has_end_fact is True and observation.exit_status == 17
+        assert observation.cause is ProviderCause.PROCESS
+    else:
+        assert observation.has_end_fact is False and observation.cause is ProviderCause.NONE
+
+
 def test_default_codex_adapter_queries_the_typed_limit_companion(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
     from agentflow.coordinator.providers import CodexProviderAdapter
