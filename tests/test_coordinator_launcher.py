@@ -381,44 +381,1003 @@ def _codex_command_event(command: str, *, completed: bool = False) -> dict:
         "status": "completed" if completed else "in_progress"}}
 
 
-def test_build_head_progress_renews_its_child_local_silent_lease(coord_state, tmp_path):
-    """A real Build child survives a short silent lease after committing new work (#570)."""
-    from agentflow.coordinator.store import Store, default_store_path
-
-    source = tmp_path / "build"
+def _tracked_build(tmp_path, name="worker-build"):
+    source = tmp_path / name
     source.mkdir()
     for command in (("git", "init", str(source)),
                     ("git", "-C", str(source), "config", "user.email", "test@example.com"),
                     ("git", "-C", str(source), "config", "user.name", "Test")):
         subprocess.run(command, check=True, capture_output=True)
-    (source / "initial").write_text("initial")
+    target = source / "implementation.py"
+    target.write_text("before\n")
     subprocess.run(("git", "-C", str(source), "add", "."), check=True, capture_output=True)
     subprocess.run(("git", "-C", str(source), "commit", "-m", "initial"),
                    check=True, capture_output=True)
+    return source, target
 
-    script = (
-        "import pathlib,subprocess,sys,time\n"
-        "time.sleep(.12)\n"
-        "pathlib.Path(sys.argv[1], 'progress').write_text('done')\n"
-        "subprocess.run(['git','-C',sys.argv[1],'add','.'], check=True)\n"
-        "subprocess.run(['git','-C',sys.argv[1],'commit','-m','progress'], check=True)\n"
-        "time.sleep(.24)\n"
+
+def _bounded_worker_command(tmp_path, *, worker="luna", effort="medium", timeout="900"):
+    prompt_file = tmp_path / f"worker-prompt-{worker}-{effort}-{timeout}"
+    prompt_file.write_text("Implement the assigned slice")
+    prompt_file.chmod(0o600)
+    return (
+        f"agentflow-codex-worker --worker {worker} --effort {effort} --timeout {timeout} "
+        f'< "{prompt_file}"'
     )
-    provider = lambda record: [sys.executable, "-c", script, record.source]
+
+
+def test_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_path):
+    """A real Build supervisor observes uncommitted work from its bounded Codex worker."""
+    source, target = _tracked_build(tmp_path)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after\\n')\n"
+        "time.sleep(.45)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target)]
     coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.25, 0.50, 1.0)))
-    identity = coord.submit_stage(_build("claude", "head-progress", str(source)))
-    coord.cycle("claude")
+        provider, timeout=5, build_lease=(0.50, 0.60, 1.2)))
+    identity = coord.submit_stage(_build("codex", "bounded-worker-progress", str(source)))
+    coord.cycle("codex")
 
-    deadline = time.monotonic() + 2
-    while not (source / "progress").exists() and time.monotonic() < deadline:
-        time.sleep(.01)
-    assert (source / "progress").exists()
-    time.sleep(.18)  # past the original silent lease, but after the new HEAD
-    record = Store(default_store_path()).load()[identity]
-    assert pid_family_alive(record.family)
+    record = _wait_for_real_child(identity, "bounded worker Build child did not exit")
+    assert target.read_text() == "after\n"
+    assert _build_observation(record).timed_out is False
 
-    record = _wait_for_real_child(identity, "Build child did not exit")
+
+def test_bounded_worker_untracked_addition_renews_build_silence(coord_state, tmp_path):
+    """A non-ignored untracked implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    added = source / "new.py"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('new implementation\\n')\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(added)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-untracked-addition", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker untracked addition did not exit")
+    assert added.read_text() == "new implementation\n"
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_tracked_empty_addition_renews_build_silence(coord_state, tmp_path):
+    """Adding a tracked empty implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    added = source / "empty.py"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,subprocess,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).touch()\n"
+        "subprocess.run(['git','-C',sys.argv[2],'add','empty.py'], check=True)\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(added), str(source)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-tracked-empty-addition", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker tracked empty addition did not exit")
+    assert added.exists()
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_path):
+    """Deleting a tracked implementation file is a durable worker progress state."""
+    source, target = _tracked_build(tmp_path)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).unlink()\n"
+        "time.sleep(.45)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.50, 0.60, 1.2)))
+    identity = coord.submit_stage(_build("codex", "bounded-worker-deletion", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker deletion child did not exit")
+    assert not target.exists()
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_deletion_cannot_collide_with_tracked_content(
+        coord_state, tmp_path, monkeypatch):
+    """A deletion renews after content that formerly encoded to the same snapshot bytes."""
+    source, target = _tracked_build(tmp_path)
+    collided = source / "a"
+    collided.write_text("initial")
+    subprocess.run(("git", "-C", str(source), "add", "a"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "track collision path"),
+                   check=True, capture_output=True)
+    snapshots = tmp_path / "collision-snapshots"
+    custom = tmp_path / "collision-instrumentation"
+    custom.mkdir()
+    (custom / "sitecustomize.py").write_text(
+        "import os\n"
+        "_write=os.write\n"
+        "def write(fd,data):\n"
+        " if len(data)==32:\n"
+        "  with open(os.environ['AGENTFLOW_TEST_SNAPSHOTS'],'ab') as stream: stream.write(b'x')\n"
+        " return _write(fd,data)\n"
+        "os.write=write\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_SNAPSHOTS", str(snapshots))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,os,pathlib,sys,time\n"
+        "started_at=time.monotonic()\n"
+        "target=pathlib.Path(sys.argv[1])\n"
+        "snapshots=pathlib.Path(os.environ['AGENTFLOW_TEST_SNAPSHOTS'])\n"
+        "target.write_bytes(b'a\\0deleted\\0')\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "while not snapshots.exists() or snapshots.stat().st_size < 1: time.sleep(.002)\n"
+        "target.unlink()\n"
+        "while snapshots.stat().st_size < 2: time.sleep(.002)\n"
+        "time.sleep(max(0, started_at + 1.10 - time.monotonic()))\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(collided)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(1.0, 1.50, 2.0)))
+    identity = coord.submit_stage(_build("codex", "worker-snapshot-collision", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "collision-safe bounded worker did not exit")
+    assert not collided.exists()
+    assert target.read_text() == "before\n"
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_tracked_empty_deletion_renews_build_silence(coord_state, tmp_path):
+    """Deleting a tracked empty implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    deleted = source / "empty.py"
+    deleted.touch()
+    subprocess.run(("git", "-C", str(source), "add", "empty.py"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "track empty"),
+                   check=True, capture_output=True)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).unlink()\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(deleted)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-tracked-empty-deletion", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker tracked empty deletion did not exit")
+    assert not deleted.exists()
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_tracked_empty_path_change_renews_build_silence(
+        coord_state, tmp_path):
+    """Renaming a tracked empty implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    original = source / "empty.py"
+    renamed = source / "renamed.py"
+    original.touch()
+    subprocess.run(("git", "-C", str(source), "add", "empty.py"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "track empty"),
+                   check=True, capture_output=True)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,subprocess,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "subprocess.run(['git','-C',sys.argv[1],'mv','empty.py','renamed.py'], check=True)\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(source)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-tracked-empty-path", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker tracked empty rename did not exit")
+    assert not original.exists() and renamed.exists()
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_unchanged_state_does_not_renew_build_silence(coord_state, tmp_path):
+    """An active recognized worker is not progress without a new durable worktree state."""
+    source, _target = _tracked_build(tmp_path)
+    marker = tmp_path / "unchanged-worker-crossed-silence"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", "unchanged-worker", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "unchanged worker retained its Build lease")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_chmod_only_does_not_renew_build_silence(coord_state, tmp_path):
+    """Mode-only churn is not durable implementation progress."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "chmod-worker-crossed-silence"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).chmod(0o755)\n"
+        "time.sleep(.55)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+        "time.sleep(.50)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.00, 1.5)))
+    identity = coord.submit_stage(_build("codex", "chmod-worker", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "chmod-only worker retained Build silence")
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_changes_after_completion_do_not_renew(coord_state, tmp_path):
+    """A recognized invocation stops authorizing observation at its completion event."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "post-worker-change-crossed-silence"
+    command = _bounded_worker_command(tmp_path)
+    started = _codex_command_event(command)
+    completed = _codex_command_event(command, completed=True)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.08)\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after worker\\n')\n"
+        "time.sleep(.20)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.28, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", "post-worker-change", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "post-worker change retained Build silence")
+    assert target.read_text() == "after worker\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("revocation", ["completion", "stale-completion"])
+def test_bounded_worker_snapshot_rechecks_current_authorization(
+        tmp_path, monkeypatch, revocation):
+    """Completion or staleness during snapshot B wins before B can renew silence."""
+    import threading
+
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import events_path, read_session
+
+    class ChildExit(Exception):
+        pass
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+    command = _bounded_worker_command(tmp_path)
+    started = _codex_command_event(command)
+    revoked = _codex_command_event(
+        command if revocation == "completion" else "different command", completed=True)
+
+    class StartedStore:
+        def __init__(self, _path):
+            pass
+
+        def child_start(self, identity, token, family):
+            return True
+
+        def close(self):
+            pass
+
+    class Provider:
+        pid = 123
+
+        def __init__(self, *args, **kwargs):
+            output = kwargs["stdout"]
+            output.write(json.dumps(started) + "\n")
+            output.flush()
+
+        def wait(self, timeout=None):
+            if timeout is None or clock.now + timeout >= 0.22:
+                clock.now = 0.22
+                return 0
+            clock.now += timeout
+            raise subprocess.TimeoutExpired("provider", timeout)
+
+        def poll(self):
+            return None
+
+    snapshot_calls = 0
+    snapshot_b_started = threading.Event()
+    snapshot_b_release = threading.Event()
+
+    def snapshot(_working_dir):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            return b"A" * 32
+        snapshot_b_started.set()
+        assert snapshot_b_release.wait(1), "authorization revocation did not release snapshot B"
+        return b"B" * 32
+
+    def revoke_authorization():
+        assert snapshot_b_started.wait(1), "snapshot B did not reach its barrier"
+        with events.open("a") as output:
+            output.write(json.dumps(revoked) + "\n")
+        snapshot_b_release.set()
+
+    store_path = tmp_path / "records.db"
+    events = events_path(store_path, "token")
+    monkeypatch.setattr(_launch_child.os, "fork", lambda: 0)
+    monkeypatch.setattr(_launch_child.os, "setsid", lambda: None)
+    monkeypatch.setattr(_launch_child.os, "_exit",
+                        lambda code: (_ for _ in ()).throw(ChildExit(code)))
+    monkeypatch.setattr(_launch_child.os, "killpg", lambda _pid, _signum: None)
+    monkeypatch.setattr(_launch_child.signal, "signal", lambda _signum, _handler: None)
+    monkeypatch.setattr(_launch_child, "Store", StartedStore)
+    monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
+    monkeypatch.setattr(_launch_child, "_head", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_worktree_snapshot", snapshot)
+    monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", Provider)
+    monkeypatch.chdir(tmp_path)
+
+    args = [str(store_path), "attempt", "token", "5", "--build-lease", "codex",
+            "0.20", "0.50", "1.0", _launch_child._INHERITED_WORKTREE, "provider"]
+    revoker = threading.Thread(target=revoke_authorization)
+    revoker.start()
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main(args)
+    revoker.join(timeout=1)
+
+    assert exited.value.args == (0,)
+    assert not revoker.is_alive()
+    session = read_session(store_path, "token")
+    assert snapshot_calls == 2
+    assert session.timed_out is True
+    assert session.exit_status == 0 and session.signal is None
+
+
+@pytest.mark.parametrize(
+    "command_kind", ["unrelated", "unallowlisted", "composed", "malformed", "unquoted"])
+def test_nonapproved_worker_command_cannot_turn_durable_churn_into_progress(
+        coord_state, tmp_path, command_kind):
+    """Only the launcher's exact approved worker command activates worktree observation."""
+    source, target = _tracked_build(tmp_path)
+    canonical = _bounded_worker_command(tmp_path)
+    commands = {
+        "unrelated": "sed -n '1,20p' implementation.py",
+        "unallowlisted": _bounded_worker_command(tmp_path, worker="impostor"),
+        "composed": canonical + " && echo extra",
+        "malformed": canonical.split(" < ", 1)[0],
+        "unquoted": canonical.replace('< "', "< ")[:-1],
+    }
+    marker = tmp_path / f"{command_kind}-crossed-silence"
+    started = _codex_command_event(commands[command_kind])
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.18)\n"
+        "pathlib.Path(sys.argv[1]).write_text('untrusted churn\\n')\n"
+        "time.sleep(.28)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.32, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", f"nonapproved-{command_kind}", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "nonapproved worker command retained Build silence")
+    assert target.read_text() == "untrusted churn\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_prior_unapproved_change_is_not_reclassified_when_worker_starts(coord_state, tmp_path):
+    """A worker starts from the durable barrier left by the preceding parent command."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "prior-unapproved-change-renewed"
+    unapproved = "python -c 'write implementation.py'"
+    worker = _bounded_worker_command(tmp_path)
+    unapproved_started = _codex_command_event(unapproved)
+    unapproved_completed = _codex_command_event(unapproved, completed=True)
+    worker_started = _codex_command_event(worker)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({unapproved_started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('unapproved change\\n')\n"
+        f"print(json.dumps({unapproved_completed!r}), flush=True)\n"
+        f"print(json.dumps({worker_started!r}), flush=True)\n"
+        "time.sleep(.18)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.22, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", "prior-unapproved-change", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "prior unapproved change retained Build silence")
+    assert target.read_text() == "unapproved change\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("churn_kind", ["outside", "internal", "generated"])
+def test_bounded_worker_ignores_outside_internal_and_generated_churn(
+        coord_state, tmp_path, churn_kind):
+    """Worker observation excludes state outside Git's implementation-change surface."""
+    source, _target = _tracked_build(tmp_path)
+    empty_global_excludes = tmp_path / "empty-global-excludes"
+    empty_global_excludes.write_text("")
+    subprocess.run(("git", "-C", str(source), "config", "core.excludesFile",
+                    str(empty_global_excludes)), check=True, capture_output=True)
+    (source / ".gitignore").write_text("generated/\n")
+    subprocess.run(("git", "-C", str(source), "add", ".gitignore"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "ignore generated"),
+                   check=True, capture_output=True)
+    churn = {
+        "outside": tmp_path / "outside.py",
+        "internal": source / ".agentflow" / "supervisor-state",
+        "generated": source / "generated" / "cache.py",
+    }[churn_kind]
+    marker = tmp_path / f"{churn_kind}-crossed-silence"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.18)\n"
+        "target=pathlib.Path(sys.argv[1])\n"
+        "target.parent.mkdir(parents=True, exist_ok=True)\n"
+        "target.write_text('churn\\n')\n"
+        "time.sleep(.28)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(churn), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.32, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", f"ignored-{churn_kind}", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "nonimplementation churn retained Build silence")
+    assert churn.exists()
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_progress_cannot_cross_the_immutable_cap(coord_state, tmp_path):
+    """Repeated worker-owned durable states renew silence but never the attempt cap."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "worker-crossed-absolute-cap"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "target=pathlib.Path(sys.argv[1])\n"
+        "for n in range(1,6):\n"
+        " time.sleep(.10)\n"
+        " target.write_text(f'{n}\\n')\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly crossed cap')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.50, 0.42)))
+    identity = coord.submit_stage(_build("codex", "worker-absolute-cap", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "worker progress crossed the immutable cap")
+    assert target.read_text() != "before\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_snapshot_cannot_strand_the_supervisor(
+        coord_state, tmp_path, monkeypatch):
+    """A blocking Git status helper cannot delay the immutable cap or provider teardown."""
+    source, _target = _tracked_build(tmp_path)
+    invoked = tmp_path / "blocking-status-invoked"
+    marker = tmp_path / "provider-survived-blocking-status"
+    fake_bin = tmp_path / "fake-status-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        f"  *\" status \"*) printf invoked > {shlex.quote(str(invoked))}; sleep 2; exit 1 ;;\n"
+        f"  *) exec {shlex.quote(real_git)} \"$@\" ;;\n"
+        "esac\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.70)\n"
+        "pathlib.Path(sys.argv[1]).write_text('not cleaned up')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    absolute_cap = 0.35
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(5.0, 5.0, absolute_cap)))
+    identity = coord.submit_stage(_build("codex", "blocking-worker-snapshot", str(source)))
+
+    started_at = time.monotonic()
+    coord.cycle("codex")
+    record = _wait_for_real_child(identity, "worker snapshot stranded the supervisor")
+    elapsed = time.monotonic() - started_at
+
+    assert invoked.exists(), "the worker snapshot did not exercise the blocking Git adapter"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert elapsed < 1.2, f"{absolute_cap:.2f}s absolute cap took {elapsed:.3f}s"
+    assert not marker.exists()
+
+
+def test_bounded_worker_snapshot_cleanup_permission_denial_cannot_renew(
+        coord_state, tmp_path, monkeypatch):
+    """A digest is invalid when its still-running helper cannot be cleanly reaped."""
+    source, target = _tracked_build(tmp_path)
+    cleanup_denied = tmp_path / "snapshot-cleanup-denied"
+    marker = tmp_path / "provider-crossed-silence"
+    custom = tmp_path / "snapshot-cleanup-instrumentation"
+    custom.mkdir()
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib,signal,time\n"
+        "_write=os.write\n"
+        "def write(fd,data):\n"
+        " result=_write(fd,data)\n"
+        " if len(data)==32: time.sleep(2)\n"
+        " return result\n"
+        "os.write=write\n"
+        "_killpg=os.killpg\n"
+        "def killpg(pid,signum):\n"
+        " if signum==signal.SIGKILL:\n"
+        "  pathlib.Path(os.environ['AGENTFLOW_TEST_CLEANUP_DENIED']).write_text('denied')\n"
+        "  raise PermissionError('deterministic snapshot cleanup denial')\n"
+        " return _killpg(pid,signum)\n"
+        "os.killpg=killpg\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_CLEANUP_DENIED", str(cleanup_denied))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after cleanup denial\\n')\n"
+        "time.sleep(.65)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-cleanup-denial", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "cleanup-denied worker retained Build silence")
+    assert cleanup_denied.exists(), "snapshot cleanup did not exercise permission denial"
+    assert target.read_text() == "after cleanup denial\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("status, numstat", [
+    (b"?? ../../outside\x00", b""),
+    (b"?? /outside\x00", b""),
+    (b"?? linked/secret\x00", b""),
+    (b"R  renamed\x00../../outside\x00", b"0\t0\trenamed\x00"),
+    (b"R  ../../outside\x00renamed\x00", b"0\t0\t../../outside\x00"),
+], ids=["traversal", "absolute", "symlink", "rename-source", "rename-destination"])
+def test_bounded_worktree_snapshot_rejects_paths_outside_its_worktree(
+        tmp_path, monkeypatch, status, numstat):
+    """A malformed Git record cannot read external bytes or renew Build silence."""
+    from agentflow.coordinator import _launch_child
+
+    root = tmp_path / "worktree"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_bytes(b"external bytes must remain unread")
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    (root / "renamed").write_bytes(b"inside")
+
+    class Process:
+        def __init__(self, output):
+            self.stdout = SimpleNamespace(read=lambda _limit: output)
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    outputs = iter([status, numstat])
+    monkeypatch.setattr(_launch_child.subprocess, "Popen",
+                        lambda *_args, **_kwargs: Process(next(outputs)))
+
+    assert _launch_child._worktree_snapshot(str(root), timeout=0.5) is None
+
+
+@pytest.mark.parametrize("status, numstat", [
+    ("?? ../../outside\\0", ""),
+    ("?? /outside\\0", ""),
+    ("?? linked/secret\\0", ""),
+    ("R  renamed\\0../../outside\\0", "0\\t0\\trenamed\\0"),
+    ("R  ../../outside\\0renamed\\0", "0\\t0\\t../../outside\\0"),
+], ids=["traversal", "absolute", "symlink", "rename-source", "rename-destination"])
+def test_malicious_git_paths_cannot_renew_build_silence(
+        coord_state, tmp_path, monkeypatch, status, numstat):
+    """The public Build supervisor ignores snapshots that would leave its worktree."""
+    source, _target = _tracked_build(tmp_path)
+    fake_bin = tmp_path / "malicious-git"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        f" *\" status \"*) printf '{status}' ;;\n"
+        f" *\" diff \"*) printf '{numstat}' ;;\n"
+        f" *) exec {shlex.quote(real_git)} \"$@\" ;;\n"
+        "esac\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    marker = tmp_path / "malicious-snapshot-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.60)\n"
+        "pathlib.Path(sys.argv[1]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.45)))
+    identity = coord.submit_stage(_build("codex", "malicious-snapshot", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "malicious snapshot retained Build silence")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("missing_flag", ["O_NOFOLLOW", "O_DIRECTORY"])
+def test_missing_containment_primitive_cannot_renew_build_silence(
+        coord_state, tmp_path, monkeypatch, missing_flag):
+    """Build fails closed before observing worktree state without either containment primitive."""
+    source, target = _tracked_build(tmp_path)
+    changed = source / "changed.py"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"external bytes must remain unread")
+    target.unlink()
+    target.symlink_to(outside)
+    custom = tmp_path / "missing-primitive-instrumentation"
+    custom.mkdir()
+    external_read = tmp_path / "external-read"
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib\n"
+        "_open=os.open\n"
+        "_read=os.read\n"
+        "external_fds=set()\n"
+        "delattr(os, os.environ['AGENTFLOW_TEST_MISSING_FLAG'])\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if path == os.environ['AGENTFLOW_TEST_EXTERNAL_NAME'] and flags & os.O_NONBLOCK:\n"
+        "  external_fds.add(result)\n"
+        " return result\n"
+        "def read(fd,size):\n"
+        " if fd in external_fds: pathlib.Path(os.environ['AGENTFLOW_TEST_EXTERNAL_READ']).write_text('read')\n"
+        " return _read(fd,size)\n"
+        "os.open=open\n"
+        "os.read=read\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_MISSING_FLAG", missing_flag)
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_NAME", target.name)
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_READ", str(external_read))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "missing-primitive-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.08)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.16)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(changed), str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.80)))
+    identity = coord.submit_stage(_build("codex", "missing-primitive", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "missing primitive retained Build silence")
+    assert not external_read.exists()
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_file_replaced_with_external_symlink_cannot_renew_build_silence(
+        coord_state, tmp_path, monkeypatch):
+    """A replacement after lstat cannot make the bounded reader consume external bytes."""
+    source, target = _tracked_build(tmp_path)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"external bytes must remain unread")
+    custom = tmp_path / "replacement-instrumentation"
+    custom.mkdir()
+    replaced = tmp_path / "replacement-observed"
+    external_read = tmp_path / "external-read"
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib\n"
+        "_open=os.open\n"
+        "_read=os.read\n"
+        "external_fds=set()\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " if (path == os.environ['AGENTFLOW_TEST_REPLACED_NAME']\n"
+        "     and flags & os.O_NONBLOCK):\n"
+        "  target=pathlib.Path(os.environ['AGENTFLOW_TEST_REPLACED_TARGET'])\n"
+        "  target.unlink()\n"
+        "  target.symlink_to(os.environ['AGENTFLOW_TEST_REPLACED_OUTSIDE'])\n"
+        "  pathlib.Path(os.environ['AGENTFLOW_TEST_REPLACED_MARKER']).write_text('replaced')\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if path == os.environ['AGENTFLOW_TEST_REPLACED_NAME']: external_fds.add(result)\n"
+        " return result\n"
+        "def read(fd,size):\n"
+        " if fd in external_fds: pathlib.Path(os.environ['AGENTFLOW_TEST_EXTERNAL_READ']).write_text('read')\n"
+        " return _read(fd,size)\n"
+        "os.open=open\n"
+        "os.read=read\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_NAME", target.name)
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_TARGET", str(target))
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_OUTSIDE", str(outside))
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_MARKER", str(replaced))
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_READ", str(external_read))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "replacement-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.12)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.46)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(target), str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.80)))
+    identity = coord.submit_stage(_build("codex", "replacement-race", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "replacement race retained Build silence")
+    assert replaced.exists(), "snapshot did not reach the replacement race"
+    assert target.is_symlink()
+    assert not external_read.exists()
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_failed_rename_prior_path_closes_worktree_descriptors_and_cannot_renew_silence(
+        coord_state, tmp_path, monkeypatch):
+    """A rejected rename prior path releases both parent descriptors before Build times out."""
+    source, target = _tracked_build(tmp_path)
+    fake_bin = tmp_path / "rename-failure-git"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        " *\" status \"*) printf 'R  implementation.py\\0nested/file\\0' ;;\n"
+        " *\" diff \"*) printf '0\\t0\\timplementation.py\\0' ;;\n"
+        f" *) exec {shlex.quote(real_git)} \"$@\" ;;\n"
+        "esac\n")
+    fake_git.chmod(0o755)
+    custom = tmp_path / "rename-failure-instrumentation"
+    custom.mkdir()
+    closed = tmp_path / "closed-root-descriptors"
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib\n"
+        "_open=os.open\n"
+        "_close=os.close\n"
+        "roots=set()\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " if os.fspath(path) == 'nested': raise OSError('deterministic prior-path failure')\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if os.fspath(path) == os.environ['AGENTFLOW_TEST_WORKTREE_ROOT']: roots.add(result)\n"
+        " return result\n"
+        "def close(fd):\n"
+        " if fd in roots:\n"
+        "  with pathlib.Path(os.environ['AGENTFLOW_TEST_CLOSED_ROOTS']).open('a') as stream: stream.write('x')\n"
+        " return _close(fd)\n"
+        "os.open=open\n"
+        "os.close=close\n")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("AGENTFLOW_TEST_WORKTREE_ROOT", str(source))
+    monkeypatch.setenv("AGENTFLOW_TEST_CLOSED_ROOTS", str(closed))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "rename-failure-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.05)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.19)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(target), str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.80)))
+    identity = coord.submit_stage(_build("codex", "rename-fd-cleanup", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "failed rename prior path retained Build silence")
+    assert closed.read_text().count("x") >= 2
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def _run_clocked_supervisor(
+        tmp_path, monkeypatch, *, build_lease, exit_at, heads=(None,)):
+    """Run the production supervisor interface against an exact monotonic timeline."""
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import read_session
+
+    class ChildExit(Exception):
+        pass
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
+
+    class StartedStore:
+        def __init__(self, _path):
+            pass
+
+        def child_start(self, identity, token, family):
+            return True
+
+        def close(self):
+            pass
+
+    class Provider:
+        pid = 123
+
+        def wait(self, timeout=None):
+            assert timeout is not None
+            if clock.now + timeout >= exit_at:
+                clock.now = exit_at
+                return 0
+            clock.now += timeout
+            raise subprocess.TimeoutExpired("provider", timeout)
+
+        def poll(self):
+            return None
+
+    observed_heads = iter(heads)
+    last_head = heads[-1]
+
+    def head(_working_dir):
+        nonlocal last_head
+        last_head = next(observed_heads, last_head)
+        return last_head
+
+    monkeypatch.setattr(_launch_child.os, "fork", lambda: 0)
+    monkeypatch.setattr(_launch_child.os, "setsid", lambda: None)
+    monkeypatch.setattr(_launch_child.os, "_exit",
+                        lambda code: (_ for _ in ()).throw(ChildExit(code)))
+    monkeypatch.setattr(_launch_child.signal, "signal", lambda _signum, _handler: None)
+    monkeypatch.setattr(_launch_child, "Store", StartedStore)
+    monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
+    monkeypatch.setattr(_launch_child, "_head", head)
+    monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", lambda *args, **kwargs: Provider())
+    monkeypatch.chdir(tmp_path)
+
+    silent, test_grace, absolute = build_lease
+    store_path = tmp_path / "records.db"
+    args = [str(store_path), "attempt", "token", "5", "--build-lease", "claude",
+            str(silent), str(test_grace), str(absolute), _launch_child._INHERITED_WORKTREE,
+            "provider"]
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main(args)
+
+    assert exited.value.args == (0,)
+    return read_session(store_path, "token")
+
+
+def test_build_head_progress_renews_its_child_local_silent_lease(tmp_path, monkeypatch):
+    """A HEAD change extends silence past the original lease on an exact clock (#570)."""
+    session = _run_clocked_supervisor(
+        tmp_path, monkeypatch, build_lease=(0.25, 0.50, 1.0), exit_at=0.30,
+        heads=("before", "after"))
+
+    assert session.timed_out is False
+    assert session.exit_status == 0 and session.signal is None
+
+
+def test_active_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_path):
+    """An approved bounded worker's uncommitted work keeps its Build parent alive."""
+    source, target = _tracked_build(tmp_path)
+    worker = _bounded_worker_command(tmp_path, effort="low")
+    started = _codex_command_event(worker)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        # Leave enough time for the 100ms-bounded baseline helper plus its next poll on
+        # slower CI hosts. The provider still exits after the original silent lease, so
+        # this remains a renewal test rather than a natural-exit test.
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after\\n')\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-progress", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker Build child did not exit")
+    assert target.read_text() == "after\n"
     assert _build_observation(record).timed_out is False
 
 
@@ -850,21 +1809,13 @@ def test_post_decode_deadline_cannot_be_renewed_by_late_progress(
     assert not marker.exists()
 
 
-def test_natural_exit_observed_at_absolute_cap_is_durable_timeout(coord_state, tmp_path):
-    """An exit racing the immutable cap keeps its natural status but is classified timeout."""
-    absolute_cap = 0.30
-    provider = lambda record: [
-        sys.executable, "-c", f"import time; time.sleep({absolute_cap - 0.025})"]
-    coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(5.0, 5.0, absolute_cap)))
-    identity = coord.submit_stage(_build("claude", "natural-at-cap", str(tmp_path)))
-    coord.cycle("claude")
+def test_natural_exit_observed_at_absolute_cap_is_durable_timeout(tmp_path, monkeypatch):
+    """An exit at the immutable cap keeps its natural status but is classified timeout."""
+    session = _run_clocked_supervisor(
+        tmp_path, monkeypatch, build_lease=(5.0, 5.0, 0.30), exit_at=0.30)
 
-    record = _wait_for_real_child(identity, "natural cap-edge exit was not published")
-    observation = _build_observation(record)
-    assert observation.has_end_fact is True
-    assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
-    assert observation.exit_status == 0 and observation.signal is None
+    assert session.has_end_fact is True and session.timed_out is True
+    assert session.exit_status == 0 and session.signal is None
 
 
 def _delay_supervisor_wait(
@@ -911,21 +1862,13 @@ def _delay_supervisor_wait(
         "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
 
 
-def test_natural_exit_observed_after_silent_deadline_is_durable_timeout(
-        coord_state, tmp_path, monkeypatch):
-    """Post-exit observation cannot turn an expired silent lease into a clean exit."""
-    _delay_supervisor_wait(tmp_path, monkeypatch, 0.08)
-    provider = lambda record: [sys.executable, "-c", "import time; time.sleep(.08)"]
-    coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.12, 1.0, 1.0)))
-    identity = coord.submit_stage(_build("claude", "natural-silent-edge", str(tmp_path)))
-    coord.cycle("claude")
+def test_natural_exit_observed_at_silent_deadline_is_durable_timeout(tmp_path, monkeypatch):
+    """An exit at the silent deadline keeps its natural status but is classified timeout."""
+    session = _run_clocked_supervisor(
+        tmp_path, monkeypatch, build_lease=(0.12, 1.0, 1.0), exit_at=0.12)
 
-    record = _wait_for_real_child(identity, "silent-edge natural exit was not published")
-    observation = _build_observation(record)
-    assert observation.has_end_fact is True
-    assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
-    assert observation.exit_status == 0 and observation.signal is None
+    assert session.has_end_fact is True and session.timed_out is True
+    assert session.exit_status == 0 and session.signal is None
 
 
 def test_natural_exit_observed_after_active_test_deadline_is_durable_timeout(
@@ -1152,10 +2095,11 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
     monkeypatch.setattr(_launch_child.subprocess, "Popen", start_provider)
     monkeypatch.setattr(_launch_child.os, "killpg",
                         lambda _pid, _signum: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.chdir(tmp_path)
 
     with pytest.raises(ChildExit) as exited:
-        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "", "", "",
-                            "provider"])
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30",
+                            _launch_child._INHERITED_WORKTREE, "provider"])
 
     assert exited.value.args == (0,)
     session = read_session(tmp_path / "records.db", "token")
@@ -1189,6 +2133,105 @@ def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tm
 
     observation = ClaudeProviderAdapter().observe(record)
     assert observation.partial_output == str(source)
+
+
+def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, monkeypatch):
+    """The public launcher carries source authority in cwd, never in child argv."""
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator import launcher as launcher_mod
+    from agentflow.coordinator.launcher import STARTED
+
+    source = tmp_path / "authorized-worktree"
+    source.mkdir()
+    observed = {}
+
+    class Child:
+        def wait(self, timeout):
+            assert timeout == 1
+
+    class Store:
+        path = tmp_path / "records.db"
+
+        def record_of(self, _identity):
+            return SimpleNamespace(start_fact=STARTED, launch_token="token", family="123")
+
+    record = SimpleNamespace(identity="attempt", launch_token="token", stage="review",
+                             source=str(source))
+
+    def launch(argv, **kwargs):
+        observed["argv"] = argv
+        observed["cwd"] = kwargs["cwd"]
+        return Child()
+
+    monkeypatch.setattr(launcher_mod.subprocess, "Popen", launch)
+    result = launcher_mod.LocalLauncher(lambda _record: ["provider"], timeout=1,
+                                        session_timeout=5).start(record, Store())
+
+    assert result.family == "123"
+    assert observed["cwd"] == str(source)
+    assert _launch_child._INHERITED_WORKTREE in observed["argv"]
+    assert str(source) not in observed["argv"]
+
+
+def test_public_launcher_ignores_forged_provider_root_for_snapshot_authority(
+        coord_state, tmp_path, monkeypatch):
+    """A provider path cannot redirect the snapshot away from LocalLauncher's inherited cwd."""
+    from agentflow.coordinator import _launch_child
+
+    source, target = _tracked_build(tmp_path)
+    forged = tmp_path / "forged-worktree"
+    forged.mkdir()
+    external = forged / "external"
+    external.write_bytes(b"external bytes must remain unread")
+    custom = tmp_path / "forged-root-instrumentation"
+    custom.mkdir()
+    external_read = tmp_path / "external-read"
+    bootstrap = tmp_path / "bootstrap-authority"
+    (custom / "sitecustomize.py").write_text(
+        "import json,os,pathlib,sys\n"
+        "_open=os.open\n"
+        "_read=os.read\n"
+        "external_fds=set()\n"
+        "with pathlib.Path(os.environ['AGENTFLOW_TEST_BOOTSTRAP_AUTHORITY']).open('a') as stream:\n"
+        " stream.write(json.dumps([os.getcwd(),sys.argv])+ '\\n')\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if isinstance(path,(str,bytes,os.PathLike)) and os.fspath(path) == os.environ['AGENTFLOW_TEST_FORGED_EXTERNAL']:\n"
+        "  external_fds.add(result)\n"
+        " return result\n"
+        "def read(fd,size):\n"
+        " if fd in external_fds: pathlib.Path(os.environ['AGENTFLOW_TEST_EXTERNAL_READ']).write_text('read')\n"
+        " return _read(fd,size)\n"
+        "os.open=open\n"
+        "os.read=read\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_BOOTSTRAP_AUTHORITY", str(bootstrap))
+    monkeypatch.setenv("AGENTFLOW_TEST_FORGED_EXTERNAL", str(external))
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_READ", str(external_read))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "forged-root-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.05)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.19)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(target), str(marker), str(forged)],
+        timeout=5, build_lease=(0.50, 0.60, 1.2)))
+    identity = coord.submit_stage(_build("codex", "forged-root", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "forged root redirected the worktree snapshot")
+    starts = [json.loads(line) for line in bootstrap.read_text().splitlines()]
+    cwd, argv = next(start for start in starts if _launch_child._INHERITED_WORKTREE in start[1])
+    assert cwd == str(source)
+    assert _launch_child._INHERITED_WORKTREE in argv
+    assert not external_read.exists()
+    assert marker.exists()
+    assert _build_observation(record).timed_out is False
 
 
 def test_coordinator_supervisor_marks_its_worktree_active(tmp_path, monkeypatch):
