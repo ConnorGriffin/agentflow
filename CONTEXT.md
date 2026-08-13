@@ -5,12 +5,20 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 
 ## Terms
 
-- **Evidence event** — the canonical, deduplicated record of one classified failure
-  recurrence for an immutable subject revision. Multiple evidence observations may
-  support one event without increasing its recurrence.
+- **Evidence event** — a canonical, deduplicated fact about an immutable subject revision.
+  It is exactly one failure observation or producer fact.
 
-- **Evidence observation** — one immutable, redacted source observation supporting an
-  evidence event. It contains references and digests only, never source prose.
+- **Failure observation** — an Evidence event classifying one failure recurrence. Multiple
+  Evidence observations may support it without increasing its recurrence.
+
+- **Producer fact** — an Evidence event recording one typed, digest-identified fact emitted
+  by an agentflow or methodology producer; it may own bounded Evidence links.
+
+- **Evidence link** — an ordered typed lineage relation owned by a producer fact and pointing
+  to an already resolved Evidence event in the same repository.
+
+- **Evidence observation** — one immutable, redacted authority observation supporting an
+  Evidence event. It contains references and digests only, never source prose.
 
 - **Subject revision** — the immutable version of a reviewed change, issue, or document
   to which evidence applies: an exact reviewed SHA for code review, or a stable locator
