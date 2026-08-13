@@ -161,7 +161,8 @@ uv run python scripts/check-evaluation-artifacts-v1.py \
   --lock docs/evaluation/preflight/evaluation-artifacts.lock.json
 ```
 
-CI invokes that exact command after dependency installation. It must verify
+The recommended CI change invokes that exact command after dependency
+installation. The future command must verify
 lock schema/root, revision, exact paths, and every digest; then
 execute the exact reviewed verifier and focused-test paths from the lock. CI
 must invoke only this command for the evaluation proof and fail if it returns

@@ -5,7 +5,7 @@ checker or change the Evaluation Contract.
 
 ## Recommended ruling
 
-Adopt one closed, canonical dependency-facts record and one fail-closed checker
+We recommend one closed, canonical dependency-facts record and one fail-closed checker
 with two call sites: `pre-adr` and `complete`.  The record is the smallest durable
 join of the four facts that prose currently leaves separable:
 
@@ -121,9 +121,10 @@ tests demonstrate the repository's fake-git pattern and PATH isolation
 ([`tests/test_coordinator_launcher.py`](../../tests/test_coordinator_launcher.py#L924-L942),
 [`tests/test_coordinator_launcher.py`](../../tests/test_coordinator_launcher.py#L1061-L1078)).
 
-The CI entry point is `scripts/check-evaluation-prerequisites-v1.py`, invoked
+The recommended CI entry point is
+`scripts/check-evaluation-prerequisites-v1.py`, invoked
 from the existing Python job after the ordinary test suite and before
-public-tree/link audits. CI runs `uv run python
+public-tree/link audits. The future CI change runs `uv run python
 scripts/check-evaluation-prerequisites-v1.py --record
 docs/evaluation/preflight/evaluation-prerequisites-v1.json --target
 "$GITHUB_SHA" --phase complete`. The command
