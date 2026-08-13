@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 582](adr-582-capability-parity-and-environment-failure.md) — Methodology capability parity
+  and named environment-failure recovery.
+
 - [ADR 580](adr-580-evidence-module-interface-and-retention.md) — Evidence module interface,
   authority-verification seam, and bounded retention.
 

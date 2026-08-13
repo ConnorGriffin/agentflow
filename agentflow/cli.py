@@ -50,6 +50,8 @@ def main(argv: list[str] | None = None) -> int | None:
     doctor_command.add_argument("path", nargs="?", default=None)
     doctor_command.add_argument("--repo", dest="repo_path")
     doctor_command.add_argument("--json", action="store_true", dest="json_output")
+    doctor_command.add_argument("--stage")
+    doctor_command.add_argument("--provider", choices=("claude", "codex"))
     enroll_command = commands.add_parser(
         "enroll", help="configure a repository for reproducible AgentFlow use"
     )
@@ -159,7 +161,8 @@ def main(argv: list[str] | None = None) -> int | None:
     elif args.command == "doctor":
         from agentflow.enroll import doctor, print_doctor
 
-        report = doctor(args.repo_path or args.path or ".")
+        report = doctor(args.repo_path or args.path or ".", stage=args.stage,
+                        provider=args.provider)
         print_doctor(report, json_output=args.json_output)
         return 0 if report.ready else 1
     elif args.command == "churn":

@@ -5,6 +5,11 @@ its Claude and Codex sessions. The checked-in
 `agentflow/capabilities.toml` manifest is the source of truth for those
 capabilities, their versions, and their content hashes.
 
+The manifest's public methodology release is `v0.3.0` at commit
+`230e71a55ab07f0cd9beaa61649b583cb9d1bde1`. The release-verification discovery controls are
+`scripts/provider-discovery-probe.sh {claude|codex} {positive|negative}`; CI runs only its
+non-provider helper seam in `tests/test-provider-discovery-probe.sh`.
+
 ## Inspect a repository
 
 ```sh

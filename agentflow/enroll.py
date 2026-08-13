@@ -68,6 +68,7 @@ class CapabilityReport:
     ui: bool
     ready: bool
     capabilities: tuple[Capability, ...]
+    stage_matrix: tuple["StageCapability", ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -76,7 +77,21 @@ class CapabilityReport:
             "ui": self.ui,
             "ready": self.ready,
             "capabilities": [asdict(item) for item in self.capabilities],
+            "stage_matrix": [asdict(item) for item in self.stage_matrix],
         }
+
+
+@dataclass(frozen=True)
+class StageCapability:
+    """One dispatchable stage/context/provider capability decision."""
+    stage: str
+    context: str
+    provider: str
+    contracts: tuple[str, ...]
+    state: str
+    evidence: tuple[str, ...]
+    repair_command: str
+    ready: bool
 
 
 def _manifest() -> dict:
@@ -309,7 +324,7 @@ def _fleet_config_available(root: Path) -> bool:
     )
 
 
-def doctor(workdir: str) -> CapabilityReport:
+def doctor(workdir: str, *, stage: str | None = None, provider: str | None = None) -> CapabilityReport:
     """Inspect one repository against the checked-in capability manifest."""
     root = Path(workdir).expanduser().resolve()
     declaration = surface_declaration(str(root))
@@ -349,7 +364,7 @@ def doctor(workdir: str) -> CapabilityReport:
                 else "install Claude Code or Codex"
             )
             install = "Install Claude Code or Codex and ensure its command is on PATH"
-        elif name in {"agentflow-skill", "ui-craft", "drive-local-webapp"}:
+        elif name in {"agentflow-skill", "ui-craft", "drive-local-webapp", "tdd", "codebase-design", "domain-modeling"}:
             skill_name = spec["skill"]
             status = _skill_status(root, skill_name, spec["files"])
             available = status == "ok"
@@ -407,6 +422,29 @@ def doctor(workdir: str) -> CapabilityReport:
                 install=None if available else install,
             )
         )
+    from agentflow.prompts import STAGE_PROMPTS, requirements_for
+
+    selected_stages = (stage,) if stage else tuple(STAGE_PROMPTS)
+    selected_providers = (provider,) if provider else ("claude", "codex")
+    by_id = {row.id: row for row in rows}
+    matrix: list[StageCapability] = []
+    for stage_name in selected_stages:
+        for ui_context, context_name in ((False, "headless"), (True, "ui")):
+            for provider_name in selected_providers:
+                required_contracts = requirements_for(stage_name, {"ui": ui_context})
+                missing = [item for item in required_contracts
+                           if item.id not in by_id or not by_id[item.id].available]
+                state = "ready" if providers.get(provider_name, False) and not missing else "missing"
+                evidence = ("pinned project-local contracts present",) if state == "ready" else tuple(
+                    [f"{provider_name} is not on PATH"] * (not providers.get(provider_name, False))
+                    + [f"{item.id}@{item.version} is not intact in both project-local roots" for item in missing]
+                )
+                matrix.append(StageCapability(
+                    stage_name, context_name, provider_name,
+                    tuple(f"{item.id}@{item.version}" for item in required_contracts), state,
+                    evidence, f"agentflow enroll {root} --apply", state == "ready"))
+    # The legacy repository-ready summary remains the installation prerequisite.  The matrix is
+    # intentionally more granular: a selected provider/stage is admitted only from its own cell.
     ready = all(row.available for row in rows if row.required)
     return CapabilityReport(
         schema_version=manifest["schema_version"],
@@ -414,6 +452,7 @@ def doctor(workdir: str) -> CapabilityReport:
         ui=ui,
         ready=ready,
         capabilities=tuple(rows),
+        stage_matrix=tuple(matrix),
     )
 
 
