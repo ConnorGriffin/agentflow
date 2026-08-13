@@ -28,9 +28,11 @@ current type and still leave action and lineage untyped. [evidence.py](../../age
 
 ## Caller-visible interface
 
-`observe` accepts exactly one value from `EvidenceEnvelopeV1 | EvidenceEnvelopeV2` and
-returns the existing canonical `Event`. No caller reads tables, supplies a canonical
-event ID, or writes an edge separately.
+`observe` accepts the existing `Observation` or one `EvidenceEnvelopeV2` and returns
+the existing failure `Event` or a new immutable `ProducerEvent` projection. Do not add
+an `EvidenceEnvelopeV1` alias: preserving the existing Python type is part of
+compatibility. No caller reads tables, supplies a canonical event ID, or writes an
+edge separately.
 
 ```python
 @dataclass(frozen=True)
@@ -68,6 +70,14 @@ the same canonical identity. JSON v2 is a tagged envelope, not an additive v1 ob
 V1 fixtures and the skills #31 byte-for-byte pin remain valid until that repository
 explicitly elects to consume v2. [#31](https://github.com/ConnorGriffin/skills/issues/31), [#581](https://github.com/ConnorGriffin/agentflow/issues/581)
 
+`ProducerEvent` exposes the canonical event ID, sorted observation IDs, producer kind,
+optional review action, the sorted distinct validation states of remaining observations,
+and ordered links; it has no recurrence count. `brief_for` returns failure and producer
+projections and accepts an optional validation-state filter whose default admits all six
+states. An event is returned when at least one remaining observation matches; its projection
+still reports every remaining state. This is the public read seam #581 uses without table
+access or inferred epistemic status.
+
 `AuthorityPointer` and `SubjectRevision` retain their current immutable-revision and
 digest checks. `fact_digest` and `signature_digest` are normalizer outputs, never a
 free-text finding, summary, prompt, source body, or transcript. Thus the envelope is
@@ -87,17 +97,19 @@ stored for a caller to interpret:
 | `ReviewAction` | `fix_before_completion`, `necessary_follow_up`, `ask_maintainer`, `discard_preference`; required only by `review_action`, forbidden otherwise. |
 | `LineageRelation` | `derives_from`, `governs`, `addresses`, `delegates`, `implements`, `verifies`, `refutes`, `revises`, `settles`. |
 
-`failure_observation` requires `FailureFacts` and forbids `ProducerFacts`; it may carry
-links, but `reviewed_parent_revision` and `fixer_revision` remain permitted only for
-`fix_introduced_defect`. `producer_fact` requires `ProducerFacts`, forbids
+`failure_observation` requires `FailureFacts`, forbids `ProducerFacts`, and carries no
+links. This preserves failure identity and prevents a later recurrence from adding an
+edge back to an already-linked producer event. `reviewed_parent_revision` and
+`fixer_revision` remain permitted only for `fix_introduced_defect`. `producer_fact`
+requires `ProducerFacts`, forbids
 `FailureFacts`, and therefore never needs a failure class. `finding` carries a failure
 class only by linking to its separately observed failure; it does not duplicate the
 classification. `fix` requires at least one `addresses` link; `settlement` requires at
 least one `settles` link; `delegation` or `slice` requires at least one `delegates` or
 `derives_from` link. These are module-enforced invariants, not producer conventions.
-Every producer fact explicitly carries a validation state; miners reject
-`unvalidated` and `refuted` facts and never infer epistemic status from its kind,
-authority, or links.
+Every producer fact explicitly carries a validation state. The contract admits all six
+states, including `unvalidated` and `refuted`; miners exclude those two through the
+public briefing filter and never infer epistemic status from kind, authority, or links.
 
 The vocabulary belongs to the versioned Evidence contract, not to a provider. Adding a
 semantic kind or relation is a new contract version with fixtures and an ADR-backed
@@ -144,13 +156,17 @@ upstream fact from its own immutable authority, then observes the dependent fact
 link to that event. This rejects forward, missing, cross-store, and deleted-reference
 dangling provenance. The dense ordinal makes relation lists deterministic and preserves
 the source order where a producer has one (for example, selected criteria or the
-complete actionable-finding set); it never claims causality beyond the relation value.
-At most 32 links are admitted and link triples are unique. Resolved-only insertion
+actionable findings supplied by an adapter); it never claims causality beyond the
+relation value. At most 32 links are admitted; ordinals and
+`(relation, target_event_id)` pairs are unique, and tuple position must equal the dense
+ordinal. Resolved-only insertion
 order makes each edge point from a newly committed canonical event to an earlier one;
 therefore a cycle is unreachable and the stored lineage is a DAG without an ancestor
 traversal guard. The source pointer remains the reference to the external system of
-record, not an Evidence-owned copy of it. This matches #581's rule that a multi-finding
-fix references the complete actionable set rather than inventing a one-to-one cause.
+record, not an Evidence-owned copy of it. Evidence can require one or more dense unique
+`addresses` links, but it cannot know an external review's complete actionable set.
+#581 owns that adapter-level completeness check; this contract can represent one fix
+linked to all findings without inventing one-to-one causality.
 [#581](https://github.com/ConnorGriffin/agentflow/issues/581)
 
 Failure-event identity stays exactly as ADR 580 specifies:
@@ -164,7 +180,8 @@ Producer-event identity is instead:
 
 ```text
 repository + subject + subject revision + producer kind
-  + fact digest + normalizer version + ordered (relation, target-event-id) links
+  + fact digest + normalizer version + review action-or-empty
+  + ordered (ordinal, relation, target-event-id) links
 ```
 
 The link tuple belongs in producer identity: the same digest supported by a different
@@ -188,21 +205,27 @@ durable content budget. [evidence_contract.py](../../agentflow/evidence_contract
 Keep `contract-v1.json` and every `*-v1.json` fixture immutable. Add
 `contract-v2.json`, positive arm fixtures, and negative fixtures for arm mixing,
 unknown vocabularies, positive facts with a failure class, review action on another
-kind, missing validation state, `unvalidated`/`refuted` miner input, forward or missing
-links, non-dense ordering, unbounded links, raw text, and v1/v2 parsing. Public-interface
+kind, missing or unknown validation state, forward or missing links, non-dense ordering,
+unbounded links, raw text, and v1/v2 parsing. Both `unvalidated` and `refuted` are positive
+contract fixtures and negative briefing-filter cases. Public-interface
 tests call `observe`, not tables, to prove v1 replay identity, v2 producer identity,
 resolved-only link order/DAG construction, rejection, redaction, retention, explicit
 validation handling, and a request revision → criterion → finding/fix → merge-or-park
 chain. Fixtures for #581 must also prove edited source revisions make new criterion IDs,
-and two findings/one fix creates complete-set rather than invented per-finding lineage.
+and two findings/one fix can carry both links; #581 proves the adapter supplied the
+complete actionable set rather than inventing per-finding lineage.
 
 #592 authorizes the required evolution of ADR 580's migration rule. The selected build
 must add an ADR amending ADR 580: only an exact v2 schema fingerprint may migrate to
 v3; the migration is transactional and atomic; it preserves every v2 row, canonical
 event ID, observation ID, and receipt binding status; and unknown or tampered stores
 remain fail-closed. An injected migration failure must roll back both schema version and
-all data. New stores create v3 only after that amendment; v1 remains supported through
-the existing exact v1→v2 migration followed by the exact v2→v3 migration. [ADR 580](../adr/adr-580-evidence-module-interface-and-retention.md)
+all data for that leg. New stores create v3 only after that amendment. V1 remains
+supported through the existing committed exact v1→v2 migration followed by a distinct
+exact v2→v3 transaction: first-leg failure leaves exact v1; second-leg failure leaves
+exact, row-preserving, reopenable v2. The selected build specifies the complete
+source-to-target column map, public event projections, closed relation applicability
+matrix, and mark-and-sweep retention roots before implementation. [ADR 580](../adr/adr-580-evidence-module-interface-and-retention.md)
 
 ```yaml
 wayfinder_findings:
