@@ -1,0 +1,8 @@
+{
+  "envelope_kind": "failure_observation",
+  "observation_id": "obs-failure-v2",
+  "subject": {"subject_kind": "review", "subject": "pr/596", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "source": {"authority_kind": "github", "repository": "octo/repo", "locator": "issues/596", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content_hash_algorithm": "sha256", "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "scope": "issue"},
+  "observed_at": 1,
+  "failure": {"failure_class": "original_defect", "validation_state": "unvalidated", "signature_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "normalizer_version": "v2"}
+}

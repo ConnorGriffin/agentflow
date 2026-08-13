@@ -1,0 +1,9 @@
+{
+  "envelope_kind": "producer_fact",
+  "observation_id": "obs-producer-v2",
+  "subject": {"subject_kind": "issue", "subject": "issue/596", "revision": "rev-1", "locator": "issues/596", "content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "source": {"authority_kind": "github", "repository": "octo/repo", "locator": "issues/596", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content_hash_algorithm": "sha256", "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "scope": "issue"},
+  "observed_at": 2,
+  "producer": {"producer_kind": "revision", "fact_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "normalizer_version": "v2", "validation_state": "refuted"},
+  "links": []
+}

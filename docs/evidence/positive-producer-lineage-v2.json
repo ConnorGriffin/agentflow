@@ -1,0 +1,9 @@
+{
+  "envelope_kind": "producer_fact",
+  "observation_id": "obs-criterion-v2",
+  "subject": {"subject_kind": "document", "subject": "plan/596", "revision": "rev-2", "locator": "docs/plan", "content_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+  "source": {"authority_kind": "github", "repository": "octo/repo", "locator": "issues/596", "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "content_hash_algorithm": "sha256", "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "scope": "issue"},
+  "observed_at": 3,
+  "producer": {"producer_kind": "criterion", "fact_digest": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "normalizer_version": "v2", "validation_state": "observed"},
+  "links": [{"ordinal": 0, "relation": "derives_from", "target_event_id": "event-prior"}]
+}
