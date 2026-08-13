@@ -14,12 +14,65 @@ import sqlite3
 
 from agentflow.state import state_path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 FAILURE_CLASSES = frozenset({"original_defect", "plan_gap", "slice_scope_error",
                              "reviewer_false_claim", "speculative_preference",
                              "fix_introduced_defect"})
 VALIDATION_STATES = frozenset({"observed", "reproduced", "refuted", "model_judged",
                                "human_validated", "unvalidated"})
+ALL_VALIDATION_STATES = (
+    "human_validated", "model_judged", "observed",
+    "refuted", "reproduced", "unvalidated",
+)
+PRODUCER_KINDS = frozenset({"claim", "criterion", "decision", "decline", "delegation",
+                            "disposition", "finding", "fix", "objection", "review_action",
+                            "revision", "settlement", "slice", "verification", "verdict"})
+REVIEW_ACTIONS = frozenset({"ask_maintainer", "discard_preference", "fix_before_completion",
+                            "necessary_follow_up"})
+LINEAGE_RELATIONS = frozenset({"addresses", "delegates", "derives_from", "governs",
+                               "implements", "refutes", "revises", "settles", "verifies"})
+_LINEAGE_MATRIX = {
+    "derives_from": (
+        PRODUCER_KINDS,
+        PRODUCER_KINDS | {"failure_observation"},
+    ),
+    "governs": (
+        frozenset({"decision", "disposition", "verdict"}),
+        frozenset({"claim", "criterion", "delegation", "slice", "finding",
+                   "review_action", "fix", "verification"}),
+    ),
+    "addresses": (
+        frozenset({"finding", "review_action", "fix"}),
+        frozenset({"failure_observation", "finding", "objection"}),
+    ),
+    "delegates": (
+        frozenset({"delegation", "slice"}),
+        frozenset({"claim", "criterion", "decision", "delegation"}),
+    ),
+    "implements": (
+        frozenset({"revision", "fix"}),
+        frozenset({"criterion", "decision", "finding", "review_action"}),
+    ),
+    "verifies": (
+        frozenset({"verification", "verdict"}),
+        frozenset({"claim", "criterion", "decision", "finding", "fix", "verification"}),
+    ),
+    "refutes": (
+        frozenset({"verification", "verdict"}),
+        frozenset({"claim", "criterion", "decision", "finding", "fix", "verification"}),
+    ),
+    "revises": (
+        frozenset({"revision", "decision", "disposition", "objection", "fix"}),
+        frozenset({"claim", "criterion", "decision", "disposition", "objection",
+                   "revision", "finding", "fix"}),
+    ),
+    "settles": (
+        frozenset({"settlement"}),
+        frozenset({"claim", "decision", "disposition", "verdict", "fix", "verification"}),
+    ),
+}
+_REQUIRED_RELATION = {"fix": "addresses", "settlement": "settles",
+                      "delegation": "delegates", "slice": "derives_from"}
 _ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$")
 _DIGEST = re.compile(r"^[a-f0-9]{32,128}$")
 _SHA = re.compile(r"^[a-f0-9]{40,64}$")
@@ -76,6 +129,54 @@ CREATE TABLE receipts (candidate_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL U
 CREATE INDEX observations_by_event ON observations(event_id);
 CREATE INDEX evaluations_by_event ON evaluations(event_id);
 CREATE INDEX candidate_events_by_event ON candidate_events(event_id);
+"""
+
+_V3_SCHEMA = """
+CREATE TABLE events (event_id TEXT PRIMARY KEY, event_kind TEXT NOT NULL,
+  repository TEXT NOT NULL, subject_kind TEXT NOT NULL, subject TEXT NOT NULL,
+  revision TEXT NOT NULL, locator TEXT NOT NULL, content_digest TEXT NOT NULL,
+  failure_class TEXT NOT NULL, producer_kind TEXT NOT NULL, fact_digest TEXT NOT NULL,
+  normalizer TEXT NOT NULL, review_action TEXT NOT NULL,
+  CHECK(event_kind IN ('failure_observation','producer_fact')),
+  CHECK((event_kind='failure_observation' AND failure_class<>'' AND producer_kind='' AND review_action='')
+     OR (event_kind='producer_fact' AND failure_class='' AND producer_kind<>'')));
+CREATE TABLE observations (observation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+  source_kind TEXT NOT NULL, source_repository TEXT NOT NULL, source_locator TEXT NOT NULL,
+  source_revision TEXT NOT NULL, source_hash_algorithm TEXT NOT NULL, source_hash TEXT NOT NULL,
+  source_scope TEXT NOT NULL, validation_state TEXT NOT NULL, observed_at INTEGER NOT NULL,
+  parent_revision TEXT NOT NULL, fixer_revision TEXT NOT NULL,
+  subject_kind TEXT NOT NULL, subject_locator TEXT NOT NULL, subject_content_digest TEXT NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES events(event_id));
+CREATE TABLE evaluations (evaluation_id TEXT PRIMARY KEY, event_id TEXT NOT NULL,
+  validation_state TEXT NOT NULL, evaluated_at INTEGER NOT NULL,
+  FOREIGN KEY(event_id) REFERENCES events(event_id));
+CREATE TABLE candidates (candidate_id TEXT PRIMARY KEY, proposal_digest TEXT NOT NULL,
+  policy_version INTEGER NOT NULL, nominated_at INTEGER NOT NULL);
+CREATE TABLE candidate_events (candidate_id TEXT NOT NULL, event_id TEXT NOT NULL,
+  PRIMARY KEY(candidate_id,event_id),
+  FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id),
+  FOREIGN KEY(event_id) REFERENCES events(event_id));
+CREATE TABLE receipts (candidate_id TEXT PRIMARY KEY, receipt_id TEXT NOT NULL UNIQUE,
+  approval_id TEXT NOT NULL, policy_version INTEGER NOT NULL, promoted_at INTEGER NOT NULL,
+  binding_status TEXT NOT NULL CHECK(binding_status IN ('verified','legacy_unverifiable')),
+  authority_kind TEXT, authority_repository TEXT, authority_locator TEXT,
+  authority_revision TEXT, authority_hash_algorithm TEXT, authority_hash TEXT,
+  authority_scope TEXT, verifier_id TEXT, verifier_version TEXT, verifier_outcome TEXT,
+  approved_revision TEXT, approved_hash TEXT, approved_scope TEXT,
+  FOREIGN KEY(candidate_id) REFERENCES candidates(candidate_id));
+CREATE TABLE event_links (source_event_id TEXT NOT NULL, ordinal INTEGER NOT NULL,
+  relation TEXT NOT NULL, target_event_id TEXT NOT NULL,
+  PRIMARY KEY(source_event_id,ordinal), UNIQUE(source_event_id,relation,target_event_id),
+  CHECK(ordinal>=0 AND ordinal<=31),
+  FOREIGN KEY(source_event_id) REFERENCES events(event_id) ON DELETE CASCADE,
+  FOREIGN KEY(target_event_id) REFERENCES events(event_id) ON DELETE RESTRICT);
+CREATE UNIQUE INDEX events_failure_identity ON events(
+  repository,subject,revision,failure_class,fact_digest,normalizer)
+  WHERE event_kind='failure_observation';
+CREATE INDEX observations_by_event ON observations(event_id);
+CREATE INDEX evaluations_by_event ON evaluations(event_id);
+CREATE INDEX candidate_events_by_event ON candidate_events(event_id);
+CREATE INDEX event_links_by_target ON event_links(target_event_id);
 """
 
 
@@ -240,10 +341,119 @@ class Observation:
 
 
 @dataclass(frozen=True)
+class EvidenceLink:
+    relation: str
+    target_event_id: str
+    ordinal: int
+
+    def __post_init__(self) -> None:
+        if self.relation not in LINEAGE_RELATIONS:
+            raise EvidenceError("invalid lineage relation")
+        _token(self.target_event_id, "target_event_id")
+        if isinstance(self.ordinal, bool) or not isinstance(self.ordinal, int) or not 0 <= self.ordinal <= 31:
+            raise EvidenceError("invalid link ordinal")
+
+
+@dataclass(frozen=True)
+class FailureFacts:
+    failure_class: str
+    validation_state: str
+    signature_digest: str
+    normalizer_version: str
+    reviewed_parent_revision: str | None = None
+    fixer_revision: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.failure_class not in FAILURE_CLASSES:
+            raise EvidenceError("invalid failure_class")
+        if self.validation_state not in VALIDATION_STATES:
+            raise EvidenceError("invalid validation_state")
+        _digest(self.signature_digest, "signature_digest")
+        _token(self.normalizer_version, "normalizer_version")
+        revisions = (self.reviewed_parent_revision, self.fixer_revision)
+        if self.failure_class == "fix_introduced_defect":
+            if not all(isinstance(value, str) and _SHA.fullmatch(value) for value in revisions):
+                raise EvidenceError("fix-introduced defect requires both fixer revisions")
+        elif any(value is not None for value in revisions):
+            raise EvidenceError("only fix-introduced defects carry fixer lineage")
+
+
+@dataclass(frozen=True)
+class ProducerFacts:
+    producer_kind: str
+    fact_digest: str
+    normalizer_version: str
+    validation_state: str
+    review_action: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.producer_kind not in PRODUCER_KINDS:
+            raise EvidenceError("invalid producer_kind")
+        _digest(self.fact_digest, "fact_digest")
+        _token(self.normalizer_version, "normalizer_version")
+        if self.validation_state not in VALIDATION_STATES:
+            raise EvidenceError("invalid validation_state")
+        if self.producer_kind == "review_action":
+            if self.review_action not in REVIEW_ACTIONS:
+                raise EvidenceError("review_action producer requires a review action")
+        elif self.review_action is not None:
+            raise EvidenceError("review action is forbidden for this producer kind")
+
+
+@dataclass(frozen=True)
+class EvidenceEnvelopeV2:
+    envelope_kind: str
+    observation_id: str
+    subject: SubjectRevision
+    source: AuthorityPointer
+    observed_at: int
+    links: tuple[EvidenceLink, ...] = ()
+    failure: FailureFacts | None = None
+    producer: ProducerFacts | None = None
+
+    def __post_init__(self) -> None:
+        _token(self.observation_id, "observation_id")
+        if not isinstance(self.subject, SubjectRevision) or not isinstance(self.source, AuthorityPointer):
+            raise EvidenceError("evidence envelope requires immutable subject and authority pointers")
+        if isinstance(self.observed_at, bool) or not isinstance(self.observed_at, int) or self.observed_at < 0:
+            raise EvidenceError("invalid observed_at")
+        if not isinstance(self.links, tuple):
+            raise EvidenceError("links must be a tuple")
+        if self.envelope_kind == "failure_observation":
+            valid = isinstance(self.failure, FailureFacts) and self.producer is None and not self.links
+        elif self.envelope_kind == "producer_fact":
+            valid = isinstance(self.producer, ProducerFacts) and self.failure is None
+        else:
+            valid = False
+        if not valid:
+            raise EvidenceError("invalid tagged evidence envelope")
+        if len(self.links) > 32:
+            raise EvidenceError("producer lineage is bounded to 32 links")
+        for position, link in enumerate(self.links):
+            if not isinstance(link, EvidenceLink) or link.ordinal != position:
+                raise EvidenceError("producer lineage ordinals must be dense and ordered")
+        pairs = tuple((link.relation, link.target_event_id) for link in self.links)
+        if len(set(pairs)) != len(pairs):
+            raise EvidenceError("producer lineage links must be unique")
+
+
+@dataclass(frozen=True)
 class Event:
     event_id: str
     recurrence_count: int
     observation_ids: tuple[str, ...]
+    contextual: bool = False
+
+
+@dataclass(frozen=True)
+class ProducerEvent:
+    event_id: str
+    observation_ids: tuple[str, ...]
+    producer_kind: str
+    review_action: str
+    validation_states: tuple[str, ...]
+    links: tuple[EvidenceLink, ...]
+    contextual: bool = False
 
 
 @dataclass(frozen=True)
@@ -313,27 +523,33 @@ class EvidenceStore:
     @staticmethod
     def _initialize(conn: sqlite3.Connection) -> None:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, SCHEMA_VERSION):
+        if version not in (0, 1, 2, SCHEMA_VERSION):
             raise EvidenceError("unsupported evidence schema version")
         existing = _schema_fingerprint(conn)
         v1 = _schema_fingerprint_for(_V1_SCHEMA)
         v2 = _schema_fingerprint_for(_V2_SCHEMA)
+        v3 = _schema_fingerprint_for(_V3_SCHEMA)
         if version == 0 and existing:
             raise EvidenceError("unversioned evidence database is not safe to open")
         if version == 1 and existing != v1:
             raise EvidenceError("evidence v1 schema does not match the known migration source")
-        if version == SCHEMA_VERSION and existing != v2:
+        if version == 2 and existing != v2:
+            raise EvidenceError("evidence v2 schema does not match the known migration source")
+        if version == SCHEMA_VERSION and existing != v3:
             raise EvidenceError("evidence schema does not match its version")
         if version == 0:
-            _execute_schema(conn, _V2_SCHEMA)
-            if _schema_fingerprint(conn) != v2:
+            _execute_schema(conn, _V3_SCHEMA)
+            if _schema_fingerprint(conn) != v3:
                 raise EvidenceError("evidence schema did not initialize exactly")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif version == 1:
             EvidenceStore._migrate_v1_to_v2(conn, v2)
+            EvidenceStore._migrate_v2_to_v3(conn, v3)
+        elif version == 2:
+            EvidenceStore._migrate_v2_to_v3(conn, v3)
 
     @staticmethod
-    def _migration_checkpoint() -> None:
+    def _migration_checkpoint(label: str) -> None:
         """Private test seam for proving the migration transaction rolls back."""
 
     @staticmethod
@@ -349,12 +565,91 @@ class EvidenceStore:
             conn.execute("""INSERT INTO receipts (candidate_id, receipt_id, approval_id, policy_version,
                 promoted_at, binding_status) SELECT candidate_id, receipt_id, approval_id, policy_version,
                 promoted_at, 'legacy_unverifiable' FROM v1_receipts""")
-            EvidenceStore._migration_checkpoint()
+            EvidenceStore._migration_checkpoint("v1-to-v2:after-copy-receipts")
             for table in ("events", "observations", "evaluations", "candidates", "candidate_events", "receipts"):
                 conn.execute(f"DROP TABLE v1_{table}")
             if _schema_fingerprint(conn) != expected:
                 raise EvidenceError("evidence migration did not produce v2 exactly")
             conn.execute("PRAGMA user_version = 2")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+
+    @staticmethod
+    def _migrate_v2_to_v3(conn: sqlite3.Connection,
+                          expected: tuple[tuple[str, str, str, str], ...]) -> None:
+        tables = ("events", "observations", "evaluations", "candidates",
+                  "candidate_events", "receipts")
+        statements = tuple(statement.strip() for statement in _V3_SCHEMA.split(";")
+                           if statement.strip())
+        table_names = ("events", "observations", "evaluations", "candidates",
+                       "candidate_events", "receipts", "event_links")
+        index_names = ("events_failure_identity", "observations_by_event",
+                       "evaluations_by_event", "candidate_events_by_event",
+                       "event_links_by_target")
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            before = {
+                table: tuple(sorted((tuple(row) for row in conn.execute(f"SELECT * FROM {table}")),
+                                    key=repr))
+                for table in tables
+            }
+            expected_rows = {
+                "events": tuple(sorted((
+                    (row[0], "failure_observation", row[1], "", row[2], row[3], "", "",
+                     row[4], "", row[5], row[6], "") for row in before["events"]), key=repr)),
+                "observations": tuple(sorted((
+                    (*row, "", "", "") for row in before["observations"]), key=repr)),
+                **{table: before[table] for table in tables[2:]},
+            }
+            for table in ("receipts", "candidate_events", "evaluations", "observations",
+                          "candidates", "events"):
+                conn.execute(f"ALTER TABLE {table} RENAME TO v2_{table}")
+                EvidenceStore._migration_checkpoint(f"rename:{table}")
+            for index in ("candidate_events_by_event", "evaluations_by_event",
+                          "observations_by_event"):
+                conn.execute(f"DROP INDEX {index}")
+                EvidenceStore._migration_checkpoint(f"drop-old-index:{index}")
+            for table, statement in zip(table_names, statements[:7], strict=True):
+                conn.execute(statement)
+                EvidenceStore._migration_checkpoint(f"create-table:{table}")
+            conn.execute("""INSERT INTO events
+                SELECT event_id, 'failure_observation', repository, '', subject, revision, '', '',
+                       failure_class, '', signature, normalizer, '' FROM v2_events""")
+            EvidenceStore._migration_checkpoint("copy:events")
+            conn.execute("""INSERT INTO observations
+                SELECT observation_id, event_id, source_kind, source_repository, source_locator,
+                       source_revision, source_hash_algorithm, source_hash, source_scope,
+                       validation_state, observed_at, parent_revision, fixer_revision, '', '', ''
+                FROM v2_observations""")
+            EvidenceStore._migration_checkpoint("copy:observations")
+            for table in ("evaluations", "candidates", "candidate_events", "receipts"):
+                conn.execute(f"INSERT INTO {table} SELECT * FROM v2_{table}")
+                EvidenceStore._migration_checkpoint(f"copy:{table}")
+            copied = {
+                table: tuple(sorted((tuple(row) for row in conn.execute(f"SELECT * FROM {table}")),
+                                    key=repr))
+                for table in tables
+            }
+            if copied != expected_rows:
+                raise EvidenceError("evidence migration did not preserve every v2 value")
+            EvidenceStore._migration_checkpoint("verify:copied-values")
+            for table in ("receipts", "candidate_events", "evaluations", "observations",
+                          "candidates", "events"):
+                conn.execute(f"DROP TABLE v2_{table}")
+                EvidenceStore._migration_checkpoint(f"drop-old-table:{table}")
+            for index, statement in zip(index_names, statements[7:], strict=True):
+                conn.execute(statement)
+                EvidenceStore._migration_checkpoint(f"create-index:{index}")
+            if _schema_fingerprint(conn) != expected:
+                raise EvidenceError("evidence migration did not produce v3 exactly")
+            EvidenceStore._migration_checkpoint("verify:fingerprint")
+            conn.execute("PRAGMA user_version = 3")
+            EvidenceStore._migration_checkpoint("set:user-version")
             conn.commit()
         except Exception:
             conn.rollback()
@@ -369,32 +664,137 @@ class EvidenceStore:
                  observation.failure_class, observation.signature_digest, observation.normalizer_version)
         return "event-" + hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
 
-    def observe(self, observation: Observation) -> Event:
+    @staticmethod
+    def _producer_event_id(envelope: EvidenceEnvelopeV2) -> str:
+        import hashlib
+        producer = envelope.producer
+        assert producer is not None
+        parts = ["agentflow-evidence-producer-v2", envelope.source.repository,
+                 envelope.subject.subject_kind, envelope.subject.subject, envelope.subject.revision,
+                 envelope.subject.locator, envelope.subject.content_digest, producer.producer_kind,
+                 producer.fact_digest, producer.normalizer_version, producer.review_action or ""]
+        for link in envelope.links:
+            parts.extend((str(link.ordinal), link.relation, link.target_event_id))
+        return "event-" + hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
+
+    def observe(self, observation: Observation | EvidenceEnvelopeV2) -> Event | ProducerEvent:
+        if isinstance(observation, EvidenceEnvelopeV2):
+            if observation.envelope_kind == "producer_fact":
+                return self._observe_producer(observation)
+            failure = observation.failure
+            assert failure is not None
+            observation = Observation(
+                observation.observation_id, observation.subject, failure.failure_class,
+                failure.validation_state, failure.signature_digest, failure.normalizer_version,
+                observation.source, observation.observed_at,
+                failure.reviewed_parent_revision or "", failure.fixer_revision or "",
+            )
+        if not isinstance(observation, Observation):
+            raise EvidenceError("observe requires an Evidence envelope")
         event_id = self._event_id(observation)
         with self._connect() as conn:
-            conn.execute("INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?)", (event_id, observation.source.repository,
-                observation.subject.subject, observation.subject.revision, observation.failure_class,
-                observation.signature_digest, observation.normalizer_version))
+            event_values = (event_id, "failure_observation", observation.source.repository,
+                observation.subject.subject_kind, observation.subject.subject, observation.subject.revision,
+                observation.subject.locator, observation.subject.content_digest, observation.failure_class, "",
+                observation.signature_digest, observation.normalizer_version, "")
+            conn.execute("INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", event_values)
             existing = conn.execute("SELECT * FROM observations WHERE observation_id=?", (observation.observation_id,)).fetchone()
             immutable = (event_id, observation.source.authority_kind, observation.source.repository,
                          observation.source.locator, observation.source.revision,
                          observation.source.content_hash_algorithm, observation.source.content_hash,
                          observation.source.scope, observation.validation_state, observation.observed_at,
-                         observation.reviewed_parent_revision, observation.fixer_revision)
-            if existing is not None and tuple(existing)[1:] != immutable:
-                raise EvidenceError("observation_id already names a different immutable observation")
-            conn.execute("INSERT OR IGNORE INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (observation.observation_id,
+                         observation.reviewed_parent_revision, observation.fixer_revision,
+                         observation.subject.subject_kind, observation.subject.locator,
+                         observation.subject.content_digest)
+            if existing is not None:
+                stored = tuple(existing)[1:]
+                legacy_unknown = stored[-3:] == ("", "", "")
+                if (stored[:12] != immutable[:12]
+                        or (not legacy_unknown and stored[12:] != immutable[12:])):
+                    raise EvidenceError("observation_id already names a different immutable observation")
+            conn.execute("INSERT OR IGNORE INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (observation.observation_id,
                 event_id, observation.source.authority_kind, observation.source.repository, observation.source.locator,
                 observation.source.revision, observation.source.content_hash_algorithm, observation.source.content_hash,
                 observation.source.scope, observation.validation_state, observation.observed_at,
-                observation.reviewed_parent_revision, observation.fixer_revision))
+                observation.reviewed_parent_revision, observation.fixer_revision,
+                observation.subject.subject_kind, observation.subject.locator, observation.subject.content_digest))
             return self._event(conn, event_id)
 
-    def _event(self, conn: sqlite3.Connection, event_id: str) -> Event:
-        row = conn.execute("SELECT event_id FROM events WHERE event_id=?", (event_id,)).fetchone()
+    def _observe_producer(self, envelope: EvidenceEnvelopeV2) -> ProducerEvent:
+        producer = envelope.producer
+        assert producer is not None
+        event_id = self._producer_event_id(envelope)
+        event_values = (event_id, "producer_fact", envelope.source.repository,
+                        envelope.subject.subject_kind, envelope.subject.subject,
+                        envelope.subject.revision, envelope.subject.locator,
+                        envelope.subject.content_digest, "", producer.producer_kind,
+                        producer.fact_digest, producer.normalizer_version,
+                        producer.review_action or "")
+        observation_values = (envelope.observation_id, event_id, envelope.source.authority_kind,
+                              envelope.source.repository, envelope.source.locator,
+                              envelope.source.revision, envelope.source.content_hash_algorithm,
+                              envelope.source.content_hash, envelope.source.scope,
+                              producer.validation_state, envelope.observed_at, "", "",
+                              envelope.subject.subject_kind, envelope.subject.locator,
+                              envelope.subject.content_digest)
+        with self._connect() as conn:
+            required = _REQUIRED_RELATION.get(producer.producer_kind)
+            if required is not None and all(link.relation != required for link in envelope.links):
+                raise EvidenceError(f"{producer.producer_kind} requires {required} lineage")
+            for link in envelope.links:
+                target = conn.execute(
+                    "SELECT event_kind, repository, producer_kind FROM events WHERE event_id=?",
+                    (link.target_event_id,),
+                ).fetchone()
+                if target is None:
+                    raise EvidenceError("lineage target does not resolve in this Evidence store")
+                if target["repository"] != envelope.source.repository:
+                    raise EvidenceError("lineage target belongs to a different repository")
+                target_kind = ("failure_observation" if target["event_kind"] == "failure_observation"
+                               else target["producer_kind"])
+                sources, targets = _LINEAGE_MATRIX[link.relation]
+                if producer.producer_kind not in sources or target_kind not in targets:
+                    raise EvidenceError("lineage relation is not applicable to source and target kinds")
+            existing_event = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+            if existing_event is not None and tuple(existing_event) != event_values:
+                raise EvidenceError("event_id already names different immutable producer facts")
+            if existing_event is not None:
+                stored_links = tuple(tuple(row) for row in conn.execute(
+                    "SELECT ordinal, relation, target_event_id FROM event_links "
+                    "WHERE source_event_id=? ORDER BY ordinal", (event_id,)))
+                supplied_links = tuple((link.ordinal, link.relation, link.target_event_id)
+                                       for link in envelope.links)
+                if stored_links != supplied_links:
+                    raise EvidenceError("event_id already names different immutable producer lineage")
+            conn.execute("INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", event_values)
+            existing = conn.execute("SELECT * FROM observations WHERE observation_id=?",
+                                    (envelope.observation_id,)).fetchone()
+            if existing is not None and tuple(existing) != observation_values:
+                raise EvidenceError("observation_id already names a different immutable observation")
+            conn.execute("INSERT OR IGNORE INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         observation_values)
+            for link in envelope.links:
+                conn.execute("INSERT OR IGNORE INTO event_links VALUES (?,?,?,?)",
+                             (event_id, link.ordinal, link.relation, link.target_event_id))
+            event = self._event(conn, event_id)
+            assert isinstance(event, ProducerEvent)
+            return event
+
+    def _event(self, conn: sqlite3.Connection, event_id: str, *, contextual: bool = False) -> Event | ProducerEvent:
+        row = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
         if row is None: raise EvidenceError("unknown event")
-        ids = tuple(row[0] for row in conn.execute("SELECT observation_id FROM observations WHERE event_id=? ORDER BY observation_id", (event_id,)))
-        return Event(event_id, 1, ids)
+        ids = () if contextual else tuple(item[0] for item in conn.execute(
+            "SELECT observation_id FROM observations WHERE event_id=? ORDER BY observation_id", (event_id,)))
+        if row["event_kind"] == "failure_observation":
+            return Event(event_id, 1, ids, contextual)
+        states = () if contextual else tuple(item[0] for item in conn.execute(
+            "SELECT DISTINCT validation_state FROM observations WHERE event_id=? ORDER BY validation_state",
+            (event_id,)))
+        links = tuple(EvidenceLink(item[0], item[1], item[2]) for item in conn.execute(
+            "SELECT relation, target_event_id, ordinal FROM event_links WHERE source_event_id=? ORDER BY ordinal",
+            (event_id,)))
+        return ProducerEvent(event_id, ids, row["producer_kind"], row["review_action"], states,
+                             links, contextual)
 
     def evaluate(self, evaluation: Evaluation) -> Evaluation:
         with self._connect() as conn:
@@ -473,13 +873,49 @@ class EvidenceStore:
         return PromotionReceipt(row["receipt_id"], row["candidate_id"], row["approval_id"],
                                 row["policy_version"], approved, True)
 
-    def brief_for(self, subject: str, *, now: int, effective_policy_versions: tuple[int, ...] = ()) -> tuple[Event, ...]:
+    def brief_for(self, subject: str, *, repository: str = "", now: int,
+                  effective_policy_versions: tuple[int, ...] = (),
+                  accepted_validation_states: tuple[str, ...] = ALL_VALIDATION_STATES
+                  ) -> tuple[Event | ProducerEvent, ...]:
         _token(subject, "subject")
-        if not isinstance(now, int) or now < 0: raise EvidenceError("invalid now")
+        if repository:
+            _token(repository, "repository")
+        if isinstance(now, bool) or not isinstance(now, int) or now < 0:
+            raise EvidenceError("invalid now")
+        if (not isinstance(accepted_validation_states, tuple)
+                or len(set(accepted_validation_states)) != len(accepted_validation_states)
+                or any(state not in VALIDATION_STATES for state in accepted_validation_states)):
+            raise EvidenceError("accepted validation states must be a unique tuple of known states")
         self._expire(now, frozenset(effective_policy_versions))
+        if not accepted_validation_states:
+            return ()
         with self._connect() as conn:
-            rows = conn.execute("SELECT event_id FROM events WHERE subject=? ORDER BY event_id", (subject,)).fetchall()
-            return tuple(self._event(conn, row[0]) for row in rows)
+            marks = ",".join("?" for _ in accepted_validation_states)
+            if not repository:
+                rows = conn.execute(
+                    f"SELECT event_id FROM events WHERE event_kind='failure_observation' AND subject=? "
+                    f"AND EXISTS (SELECT 1 FROM observations WHERE observations.event_id=events.event_id "
+                    f"AND validation_state IN ({marks})) ORDER BY event_id",
+                    (subject, *accepted_validation_states),
+                ).fetchall()
+                return tuple(self._event(conn, row[0]) for row in rows)
+            roots = {row[0] for row in conn.execute(
+                f"SELECT event_id FROM events WHERE repository=? AND subject=? "
+                f"AND EXISTS (SELECT 1 FROM observations WHERE observations.event_id=events.event_id "
+                f"AND validation_state IN ({marks}))",
+                (repository, subject, *accepted_validation_states),
+            )}
+            selected = set(roots)
+            frontier = list(roots)
+            while frontier:
+                source = frontier.pop()
+                for row in conn.execute(
+                        "SELECT target_event_id FROM event_links WHERE source_event_id=?", (source,)):
+                    if row[0] not in selected:
+                        selected.add(row[0])
+                        frontier.append(row[0])
+            return tuple(self._event(conn, event_id, contextual=event_id not in roots)
+                         for event_id in sorted(selected))
 
     def _expire(self, now: int, effective_versions: frozenset[int]) -> None:
         """Private retention work performed as part of briefing, never a caller verb."""
@@ -494,4 +930,19 @@ class EvidenceStore:
                 conn.execute("DELETE FROM candidate_events WHERE candidate_id=?", (cid,)); conn.execute("DELETE FROM receipts WHERE candidate_id=?", (cid,)); conn.execute("DELETE FROM candidates WHERE candidate_id=?", (cid,))
             conn.execute("DELETE FROM evaluations WHERE event_id NOT IN (SELECT event_id FROM candidate_events) AND evaluated_at<?", (cutoff,))
             conn.execute("DELETE FROM observations WHERE event_id NOT IN (SELECT event_id FROM candidate_events) AND observed_at<?", (cutoff,))
-            conn.execute("DELETE FROM events WHERE event_id NOT IN (SELECT event_id FROM observations) AND event_id NOT IN (SELECT event_id FROM candidate_events)")
+            conn.execute("CREATE TEMP TABLE retained_event_marks (event_id TEXT PRIMARY KEY)")
+            conn.execute("INSERT OR IGNORE INTO retained_event_marks SELECT event_id FROM observations")
+            conn.execute("INSERT OR IGNORE INTO retained_event_marks SELECT event_id FROM evaluations")
+            conn.execute("INSERT OR IGNORE INTO retained_event_marks SELECT event_id FROM candidate_events")
+            while True:
+                inserted = conn.execute(
+                    "INSERT OR IGNORE INTO retained_event_marks "
+                    "SELECT links.target_event_id FROM event_links AS links "
+                    "JOIN retained_event_marks AS marks ON marks.event_id=links.source_event_id"
+                ).rowcount
+                if not inserted:
+                    break
+            conn.execute("DELETE FROM event_links WHERE source_event_id NOT IN "
+                         "(SELECT event_id FROM retained_event_marks)")
+            conn.execute("DELETE FROM events WHERE event_id NOT IN "
+                         "(SELECT event_id FROM retained_event_marks)")

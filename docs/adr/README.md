@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 596](adr-596-typed-evidence-envelopes-and-lineage.md) — Typed failure/producer
+  envelopes, bounded same-repository lineage, contextual briefing closure, SQLite schema v3,
+  and suffix-routed JSON contract v2.
 - [ADR 582](adr-582-capability-parity-and-environment-failure.md) — Methodology capability parity
   and named environment-failure recovery.
 
