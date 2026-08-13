@@ -3,14 +3,15 @@
 # provider flags are not represented as isolation from every ambient instruction source.
 set -eu
 
-root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+checkout=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+root=${AGENTFLOW_PROVIDER_PROBE_ROOT:-$checkout}
 skill=agentflow-582-probe-4bab5ff0
 marker=AGENTFLOW_582_DISCOVERED_4BAB5FF0_AEE6_4D44_BEA3_1BE5D089256F
 agent_skill="$root/.agents/skills/$skill"
 claude_skill="$root/.claude/skills/$skill"
 prompt="Invoke the project-local skill named $skill using only native skill discovery. Do not use shell commands, search files, read files, or inspect configuration. If it is unavailable, reply exactly SKILL_UNAVAILABLE."
 
-usage() { echo "usage: $0 {claude|codex} {positive|negative|print-command}" >&2; exit 64; }
+usage() { echo "usage: $0 {claude|codex} {positive|negative}" >&2; exit 64; }
 require_fixture() { test -f "$agent_skill/SKILL.md"; test -L "$claude_skill"; }
 run_claude() {
   claude -p "$prompt" --model sonnet --output-format stream-json --verbose \
@@ -21,7 +22,13 @@ run_codex() {
   codex exec -m gpt-5.6-terra --json --sandbox workspace-write --cd "$root" \
     --ignore-user-config --ephemeral --skip-git-repo-check "$prompt"
 }
-run_provider() { case $1 in claude) run_claude;; codex) run_codex;; *) usage;; esac; }
+run_provider() {
+  if test -n "${AGENTFLOW_PROVIDER_PROBE_RUNNER:-}"; then
+    "$AGENTFLOW_PROVIDER_PROBE_RUNNER" "$1" "$root" "$skill" "$marker"
+    return
+  fi
+  case $1 in claude) run_claude;; codex) run_codex;; *) usage;; esac
+}
 positive() { require_fixture; output=$(run_provider "$1"); printf '%s\n' "$output"; printf '%s' "$output" | grep -Fq "$marker"; }
 negative() {
   require_fixture
@@ -32,4 +39,4 @@ negative() {
 }
 test $# = 2 || usage
 case $1 in claude|codex) ;; *) usage;; esac
-case $2 in positive) positive "$1";; negative) negative "$1";; print-command) printf '%s\n' "provider=$1 mode=runner-equivalent pinned-project-local-contract";; *) usage;; esac
+case $2 in positive) positive "$1";; negative) negative "$1";; *) usage;; esac

@@ -427,6 +427,11 @@ class TestConvergeMode:
 
     def _drifted_repo(self, tmp_path, monkeypatch) -> Path:
         monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path / "missing-config.toml"))
+        monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+        monkeypatch.setattr(
+            "agentflow.enroll._install_methodology_skills",
+            lambda _root: "ok:   methodology contracts supplied by focused fixture",
+        )
         repo = tmp_path / "repo"
         _git_init(repo, origin="git@github.com:o/repo.git")
         skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"

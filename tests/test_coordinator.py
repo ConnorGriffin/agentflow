@@ -26,11 +26,14 @@ from agentflow.capability_contracts import CapabilityPreflightResult, ContractRe
 def test_nonready_capability_preflight_holds_before_admission_and_survives_restart(
         make_coord, provider):
     session = FakeSession()
+    events = []
     result = CapabilityPreflightResult(
         stage="build", provider=provider, contracts=(ContractRequirement("tdd", "v0.3.0"),),
         state="missing", evidence=("tdd project-local destination missing",),
         repair_command="agentflow enroll /repo --apply")
-    coord = make_coord(session, capability_preflight=lambda _record: result)
+    coord = make_coord(
+        session, capability_preflight=lambda _record: result, log=events.append
+    )
     ident = coord.submit_stage(Submission(repo="o/r", subject="5", stage="build", pool=provider,
                                           effort="low"))
 
@@ -39,6 +42,8 @@ def test_nonready_capability_preflight_holds_before_admission_and_survives_resta
     assert held.state == "held" and held.claim and held.attempts == 0
     assert held.capability_preflight and "environment_failure" in held.hold_reason
     assert permits(coord, provider) == 0 and not session.family_of
+    assert any("environment_failure missing; claim retained" in event for event in events)
+    assert not any("environment_failure" in event and "claim released" in event for event in events)
 
     restarted = make_coord(session, capability_preflight=lambda _record: result)
     assert record_of(restarted, ident).capability_preflight == held.capability_preflight

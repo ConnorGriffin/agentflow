@@ -61,9 +61,26 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
         evidence.append(f"{provider}: selected provider runtime is unavailable")
     for requirement in requirements:
         if requirement.runtime:
-            if not (root / "scripts" / "screenshots.mjs").is_file():
+            runtime = manifest.get("playwright", {})
+            pinned_version = runtime.get("version")
+            if requirement.id != "playwright" or requirement.version != pinned_version:
                 states.append("incompatible")
-                evidence.append(f"{requirement.id}@{requirement.version}: pinned runtime is unavailable")
+                evidence.append(
+                    f"{requirement.id}@{requirement.version}: manifest pins "
+                    f"playwright@{pinned_version}"
+                )
+                continue
+            from agentflow.enroll import playwright_runtime_status
+
+            status, detail = playwright_runtime_status(
+                root,
+                version=pinned_version,
+                node_minimum=runtime["node_minimum"],
+                manifest=manifest,
+            )
+            if status != "ok":
+                states.append(status)
+                evidence.append(f"{requirement.id}@{requirement.version}: {detail}")
             continue
         destinations = [root / ".agents" / "skills" / requirement.id,
                         root / ".claude" / "skills" / requirement.id]

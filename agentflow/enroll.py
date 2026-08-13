@@ -294,32 +294,49 @@ def _playwright_versions(root: Path) -> tuple[str, ...]:
     return tuple(versions)
 
 
+def playwright_runtime_status(
+    root: Path,
+    *,
+    version: str,
+    node_minimum: int,
+    manifest: dict | None = None,
+) -> tuple[str, str]:
+    """Statically inspect the complete pinned browser runtime contract."""
+    harness = root / "scripts" / "screenshots.mjs"
+    manifest = manifest or _manifest()
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    drive = specs["drive-local-webapp"]
+    harness_status = _file_status(harness, specs["screenshot-harness"]["sha256"])
+    if harness_status != "ok":
+        return harness_status, f"pinned screenshot harness is {harness_status}"
+    drive_status = _skill_status(root, drive["skill"], drive["files"])
+    if drive_status != "ok":
+        return drive_status, f"pinned drive-local-webapp contract is {drive_status}"
+    if shutil.which("node") is None:
+        return "missing", "Node runtime is not on PATH"
+    node = _run_command(["node", "--version"], timeout=10)
+    match = re.match(r"v(\d+)", node.stdout.strip())
+    if node.returncode or not match or int(match.group(1)) < node_minimum:
+        return "incompatible", f"Node {node_minimum}+ is required"
+    installed_versions = _playwright_versions(root)
+    if len(installed_versions) != 2:
+        return "missing", "installed Playwright metadata is missing from a project-local root"
+    if any(found != version for found in installed_versions):
+        return "incompatible", f"installed Playwright metadata does not pin {version}"
+    return "ok", f"pinned harness, Node {node_minimum}+, and Playwright {version} metadata are intact"
+
+
 def _playwright_available(
     root: Path, *, version: str, node_minimum: int, verify_runtime: bool = False
 ) -> bool:
-    harness = root / "scripts" / "screenshots.mjs"
-    manifest = _manifest()
-    specs = {item["id"]: item for item in manifest["capabilities"]}
-    drive = specs["drive-local-webapp"]
-    if (
-        _file_status(harness, specs["screenshot-harness"]["sha256"]) != "ok"
-        or _skill_status(root, drive["skill"], drive["files"]) != "ok"
-        or shutil.which("node") is None
-    ):
-        return False
-    node = _run_command(["node", "--version"], timeout=10)
-    match = re.match(r"v(\d+)", node.stdout.strip())
-    installed_versions = _playwright_versions(root)
-    if (
-        node.returncode
-        or not match
-        or int(match.group(1)) < node_minimum
-        or any(found != version for found in installed_versions)
-        or len(installed_versions) != 2
-    ):
+    status, _detail = playwright_runtime_status(
+        root, version=version, node_minimum=node_minimum
+    )
+    if status != "ok":
         return False
     if not verify_runtime:
         return True
+    harness = root / "scripts" / "screenshots.mjs"
     result = _run_command(
         ["node", str(harness), "--self-check"], cwd=root, timeout=30
     )
@@ -398,12 +415,17 @@ def doctor(workdir: str, *, stage: str | None = None, provider: str | None = Non
         elif name == "playwright":
             playwright = manifest["playwright"]
             version = playwright["version"]
-            available = _playwright_available(
-                root, version=version, node_minimum=playwright["node_minimum"]
+            status, runtime_detail = playwright_runtime_status(
+                root,
+                version=version,
+                node_minimum=playwright["node_minimum"],
+                manifest=manifest,
             )
+            available = status == "ok"
             detail = (
                 f"trusted harness and drive skill, Node >= "
-                f"{playwright['node_minimum']}, and installed Playwright {version} metadata"
+                f"{playwright['node_minimum']}, and installed Playwright {version} metadata; "
+                f"{runtime_detail}"
             )
             install = f"agentflow enroll {root} --apply"
         elif name in {"claude", "codex"}:
@@ -464,9 +486,10 @@ def doctor(workdir: str, *, stage: str | None = None, provider: str | None = Non
                     stage_name, context_name, provider_name,
                     tuple(f"{item.id}@{item.version}" for item in required_contracts), state,
                     evidence, f"agentflow enroll {root} --apply", state == "ready"))
-    # The legacy repository-ready summary remains the installation prerequisite.  The matrix is
-    # intentionally more granular: a selected provider/stage is admitted only from its own cell.
-    ready = all(row.available for row in rows if row.required)
+    ready = (
+        all(row.available for row in rows if row.required)
+        and all(cell.ready for cell in matrix)
+    )
     return CapabilityReport(
         schema_version=manifest["schema_version"],
         repository=str(root),
@@ -580,11 +603,10 @@ def _config_problem() -> str | None:
 
 
 def _tooling_problem(surfaces: tuple[str, ...]) -> str | None:
-    if not surfaces:
-        return None
-    missing = [name for name in ("node", "npm", "npx") if shutil.which(name) is None]
+    required = ("node", "npm", "npx") if surfaces else ("npx",)
+    missing = [name for name in required if shutil.which(name) is None]
     if missing:
-        return f"missing required UI command(s): {', '.join(missing)}"
+        return f"missing required enrollment command(s): {', '.join(missing)}"
     return None
 
 
@@ -954,6 +976,7 @@ def _apply_enrollment(
     )
     outcomes.append(_wire_claude_skill(root, "agentflow"))
     outcomes.append(_ensure_fleet_config(root))
+    outcomes.append(_install_methodology_skills(root))
 
     if surfaces:
         harness = root / "scripts" / "screenshots.mjs"
@@ -963,7 +986,6 @@ def _apply_enrollment(
             )
         )
         outcomes.append(_install_connor_skills(root))
-        outcomes.append(_install_methodology_skills(root))
         outcomes.append(_install_ui_runtime(root))
     return outcomes
 
@@ -1017,6 +1039,7 @@ def enroll_repository(
     else:
         print("  PLAN: write shared repository instructions")
         print("  PLAN: install the bundled agentflow skill for Claude Code and Codex")
+        print("  PLAN: install pinned methodology contracts for Claude Code and Codex")
         if surfaces:
             print("  PLAN: install the canonical screenshot harness")
 

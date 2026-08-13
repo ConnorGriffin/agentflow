@@ -5,10 +5,11 @@ its Claude and Codex sessions. The checked-in
 `agentflow/capabilities.toml` manifest is the source of truth for those
 capabilities, their versions, and their content hashes.
 
-The manifest's public methodology release is `v0.3.0` at commit
-`230e71a55ab07f0cd9beaa61649b583cb9d1bde1`. The release-verification discovery controls are
-`scripts/provider-discovery-probe.sh {claude|codex} {positive|negative}`; CI runs only its
-non-provider helper seam in `tests/test-provider-discovery-probe.sh`.
+The manifest's `methodology_skills` entry is the sole authority for the public
+methodology release tag and commit. The release-verification discovery controls
+are `scripts/provider-discovery-probe.sh {claude|codex} {positive|negative}`;
+CI runs only its non-provider helper seam in
+`tests/test-provider-discovery-probe.sh`.
 
 ## Inspect a repository
 
@@ -17,9 +18,10 @@ agentflow doctor --repo /path/to/repository
 agentflow doctor --repo /path/to/repository --json
 ```
 
-The command exits nonzero when a required capability is missing or drifted.
-At least one runner (`claude` or `codex`) is required; installing the second is
-recommended but does not block readiness. Codebase Memory is optional.
+The command exits nonzero when a required capability or any selected dispatch
+matrix cell is not ready. The default full matrix selects both `claude` and
+`codex`; `--provider` and `--stage` narrow that same readiness decision.
+Codebase Memory is optional.
 UI capabilities become required only when the repository declares or contains a
 user-facing surface. An explicit declaration is authoritative even when its path
 does not match AgentFlow's conservative directory heuristics.
@@ -59,8 +61,8 @@ Enrollment writes only reproducible local wiring:
 - for UI repositories, the pinned Connor skill pack, screenshot harness, and
   the Playwright/Chromium runtime locked by `drive-local-webapp/package-lock.json`.
 
-The Connor pack is installed from public release tag `v0.1.0`, whose expected
-commit is recorded in the manifest, with a pinned version of the skills
+The Connor pack and methodology contracts are installed from the public release
+and exact commit recorded in the manifest, with a pinned version of the skills
 installer. Every tracked file in each required skill directory—including
 executable scripts, package locks, agent metadata, and referenced prompts—is
 checked against the deterministic file list and SHA-256 values in the manifest.
