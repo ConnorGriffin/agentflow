@@ -71,12 +71,12 @@ V1 fixtures and the skills #31 byte-for-byte pin remain valid until that reposit
 explicitly elects to consume v2. [#31](https://github.com/ConnorGriffin/skills/issues/31), [#581](https://github.com/ConnorGriffin/agentflow/issues/581)
 
 `ProducerEvent` exposes the canonical event ID, sorted observation IDs, producer kind,
-optional review action, the sorted distinct validation states of remaining observations,
-and ordered links; it has no recurrence count. `brief_for` returns failure and producer
-projections and accepts an optional validation-state filter whose default admits all six
-states. An event is returned when at least one remaining observation matches; its projection
-still reports every remaining state. This is the public read seam #581 uses without table
-access or inferred epistemic status.
+review action-or-empty, sorted distinct validation states, ordered links, and a contextual
+marker; it has no recurrence count. Repository-qualified `brief_for` selects subject roots
+by validation state and adds their same-repository target closure. Closure-only projections
+suppress observation IDs and validation states. Unqualified calls retain legacy failure-only
+behavior. This is the public read seam #581 uses without table access, cross-repository
+lineage, or inferred epistemic status.
 
 `AuthorityPointer` and `SubjectRevision` retain their current immutable-revision and
 digest checks. `fact_digest` and `signature_digest` are normalizer outputs, never a
@@ -100,13 +100,16 @@ stored for a caller to interpret:
 `failure_observation` requires `FailureFacts`, forbids `ProducerFacts`, and carries no
 links. This preserves failure identity and prevents a later recurrence from adding an
 edge back to an already-linked producer event. `reviewed_parent_revision` and
-`fixer_revision` remain permitted only for `fix_introduced_defect`. `producer_fact`
+`fixer_revision` remain permitted only for `fix_introduced_defect`. The existing Python
+`Observation` keeps its legacy optional-field behavior; the v2 failure arm and JSON v2
+require both non-empty revisions together for that class and forbid both otherwise. `producer_fact`
 requires `ProducerFacts`, forbids
 `FailureFacts`, and therefore never needs a failure class. `finding` carries a failure
 class only by linking to its separately observed failure; it does not duplicate the
 classification. `fix` requires at least one `addresses` link; `settlement` requires at
-least one `settles` link; `delegation` or `slice` requires at least one `delegates` or
-`derives_from` link. These are module-enforced invariants, not producer conventions.
+least one `settles` link; `delegation` requires at least one `delegates` link; and `slice`
+requires at least one `derives_from` link. These are module-enforced invariants, not
+producer conventions.
 Every producer fact explicitly carries a validation state. The contract admits all six
 states, including `unvalidated` and `refuted`; miners exclude those two through the
 public briefing filter and never infer epistemic status from kind, authority, or links.
@@ -151,7 +154,7 @@ class EvidenceLink:
 ```
 
 `target_event_id` must already resolve to a canonical Evidence event in the same
-transaction; it is not an arbitrary locator or a digest. A producer first observes the
+store and repository; it is not an arbitrary locator or a digest. A producer first observes the
 upstream fact from its own immutable authority, then observes the dependent fact with a
 link to that event. This rejects forward, missing, cross-store, and deleted-reference
 dangling provenance. The dense ordinal makes relation lists deterministic and preserves
@@ -179,7 +182,8 @@ repository + subject + subject revision + failure class
 Producer-event identity is instead:
 
 ```text
-repository + subject + subject revision + producer kind
+repository + subject kind + subject + revision + locator-or-empty
+  + content-digest-or-empty + producer kind
   + fact digest + normalizer version + review action-or-empty
   + ordered (ordinal, relation, target-event-id) links
 ```
