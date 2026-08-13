@@ -153,15 +153,16 @@ separate decisions in #605 and #608; #607 should not duplicate them.
 
 ## Verification contract summary
 
-The eventual public command should have this observable shape (the final path
-and command name are implementation decisions, not created by this research):
+The recommended public command has this exact repository path and observable
+shape:
 
 ```text
-python3 docs/evaluation/preflight/verify-evaluation-artifacts.py \
+uv run python scripts/check-evaluation-artifacts-v1.py \
   --lock docs/evaluation/preflight/evaluation-artifacts.lock.json
 ```
 
-It must verify lock schema/root, revision, exact paths, and every digest; then
+CI invokes that exact command after dependency installation. It must verify
+lock schema/root, revision, exact paths, and every digest; then
 execute the exact reviewed verifier and focused-test paths from the lock. CI
 must invoke only this command for the evaluation proof and fail if it returns
 non-zero. The lock must identify the expected revision as a full commit ID, and

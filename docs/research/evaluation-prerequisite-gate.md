@@ -3,7 +3,7 @@
 Status: research finding for Wayfinder #608.  This report does not implement the
 checker or change the Evaluation Contract.
 
-## Ruling
+## Recommended ruling
 
 Adopt one closed, canonical dependency-facts record and one fail-closed checker
 with two call sites: `pre-adr` and `complete`.  The record is the smallest durable
@@ -38,8 +38,8 @@ adr:
       artifact_digests: <same-map-as-above>
 ```
 
-The actual implementation may serialize this as canonical JSON; the shape above
-is the contract, not a requirement to add a YAML parser.  Object keys and
+The proposed implementation may serialize this as canonical JSON; the shape above
+is the recommended contract, not a requirement to add a YAML parser. Object keys and
 prerequisite IDs are closed; IDs are unique; paths are repository-relative; SHA
 values have exact lengths and lowercase hex; and the ADR binding must repeat the
 same commit/digest values rather than merely naming issues.
@@ -121,8 +121,12 @@ tests demonstrate the repository's fake-git pattern and PATH isolation
 ([`tests/test_coordinator_launcher.py`](../../tests/test_coordinator_launcher.py#L924-L942),
 [`tests/test_coordinator_launcher.py`](../../tests/test_coordinator_launcher.py#L1061-L1078)).
 
-The CI entry point should be a checked-in command invoked from the existing Python
-job after the ordinary test suite and before public-tree/link audits.  The command
+The CI entry point is `scripts/check-evaluation-prerequisites-v1.py`, invoked
+from the existing Python job after the ordinary test suite and before
+public-tree/link audits. CI runs `uv run python
+scripts/check-evaluation-prerequisites-v1.py --record
+docs/evaluation/preflight/evaluation-prerequisites-v1.json --target
+"$GITHUB_SHA" --phase complete`. The command
 must use a repository-relative target revision supplied by CI, not a developer's
 machine-specific checkout or an implicit `origin/main`; this addresses the
 portability blocker recorded by #604.  The current workflow has the natural
@@ -153,4 +157,3 @@ fact.  Every mutation exits nonzero with a stable code; the positive record pass
 `pre-adr`; adding the correctly bound ADR makes `complete` pass; and changing any
 child review verdict, merge commit, artifact digest, target ancestry, or ADR
 binding makes `complete` fail before substrate completion can be reported.
-
