@@ -542,10 +542,9 @@ def _worktree_path(value: object, working_dir: str) -> bool:
 class _ProgressStream:
     """Incrementally decode one provider's durable stream into canonical Build facts."""
 
-    def __init__(self, provider: str, working_dir: str, *, monotonic=time.monotonic) -> None:
+    def __init__(self, provider: str, working_dir: str) -> None:
         self.provider = provider
         self.working_dir = working_dir
-        self.monotonic = monotonic
         self.offset = 0
         self.partial = b""
         self.discarding_oversize = False
@@ -683,7 +682,7 @@ class _ProgressStream:
         """
         decoder = {"codex": self._codex, "claude": self._claude}.get(self.provider)
         if decoder is None:
-            return False, self.monotonic(), False, False, False
+            return False, time.monotonic(), False, False, False
 
         def result(progressed: bool, observed_at: float,
                    expired: bool = False,
@@ -697,7 +696,7 @@ class _ProgressStream:
                 return min(absolute_deadline, test_deadline)
             return min(absolute_deadline, silent_deadline)
 
-        now = self.monotonic()
+        now = time.monotonic()
         slice_deadline = now + _EVENT_POLL_SLICE_S
         if now >= effective_deadline():
             return result(False, now)
@@ -710,17 +709,17 @@ class _ProgressStream:
                     stream.seek(self.offset)
                     chunk = stream.read(_EVENT_READ_BYTES)
             except OSError:
-                return result(False, self.monotonic())
+                return result(False, time.monotonic())
             self.offset += len(chunk)
             self.partial += chunk
             self.may_have_unread = len(chunk) == _EVENT_READ_BYTES
-            now = self.monotonic()
+            now = time.monotonic()
             if now >= effective_deadline():
                 return result(False, now)
 
         records = 0
         while records < _EVENT_RECORDS_PER_POLL:
-            now = self.monotonic()
+            now = time.monotonic()
             if now >= effective_deadline() or (records and now >= slice_deadline):
                 break
             newline = self.partial.find(b"\n")
@@ -747,11 +746,11 @@ class _ProgressStream:
             except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                 self.partial = self.partial[newline + 1:]
                 records += 1
-                now = self.monotonic()
+                now = time.monotonic()
                 if now >= effective_deadline():
                     break
                 continue
-            now = self.monotonic()
+            now = time.monotonic()
             if now >= effective_deadline():
                 break
             self.partial = self.partial[newline + 1:]
@@ -763,14 +762,14 @@ class _ProgressStream:
                 decode_deadline = effective_deadline()
                 workers_before = self.active_workers.copy()
                 progressed = decoder(event, now)
-                observed_at = self.monotonic()
+                observed_at = time.monotonic()
                 if observed_at >= decode_deadline:
                     return result(False, observed_at, True)
                 if self.active_workers != workers_before:
                     return result(progressed, observed_at, worker_changed=True)
                 if progressed:
                     return result(True, observed_at)
-        return result(False, self.monotonic())
+        return result(False, time.monotonic())
 
 
 def _mark_active(working_dir: str) -> Path | None:
@@ -799,8 +798,7 @@ def _clear_active(marker: Path | None) -> None:
         pass
 
 
-def main(args: list[str], *, monotonic=time.monotonic,
-         worktree_snapshot=_worktree_snapshot) -> None:
+def main(args: list[str]) -> None:
     store_path, identity, token, timeout, *tail = args
     build_lease: tuple[float, float, float] | None = None
     progress_provider = ""
@@ -880,14 +878,14 @@ def main(args: list[str], *, monotonic=time.monotonic,
         # Reconciliation signals this supervisor, not the provider's separate session. Turn that
         # request into the same orderly process-group shutdown the deadline path uses, then keep
         # the supervisor alive to write the provider's durable end facts.
-        started_at = monotonic()
+        started_at = time.monotonic()
         deadline = started_at + float(timeout)
         silent_deadline = started_at + build_lease[0] if build_lease else deadline
         absolute_deadline = started_at + build_lease[2] if build_lease else deadline
         last_head = _head(working_dir) if build_lease else None
         head_poll_s = min(5.0, build_lease[0] / 4) if build_lease else 0
         next_head_poll = started_at + head_poll_s
-        progress_stream = (_ProgressStream(progress_provider, working_dir, monotonic=monotonic)
+        progress_stream = (_ProgressStream(progress_provider, working_dir)
                            if build_lease else None)
         worker_snapshot: bytes | None = None
         next_worker_poll = started_at
@@ -895,7 +893,7 @@ def main(args: list[str], *, monotonic=time.monotonic,
             if stop_requested:
                 returncode = stop_provider()
                 break
-            now = monotonic()
+            now = time.monotonic()
             if build_lease:
                 active_test_deadline = (min(progress_stream.active_tests.values())
                                         + build_lease[1]
@@ -909,7 +907,7 @@ def main(args: list[str], *, monotonic=time.monotonic,
                     break
                 if now >= next_head_poll:
                     head = _head(working_dir)
-                    now = monotonic()
+                    now = time.monotonic()
                     if now >= lease_deadline:
                         timed_out = True
                         returncode = stop_provider()
@@ -930,8 +928,8 @@ def main(args: list[str], *, monotonic=time.monotonic,
                     silent_deadline = now + build_lease[0]
                 if (progress_stream.active_workers and
                         (worker_changed or now >= next_worker_poll)):
-                    snapshot = worktree_snapshot(working_dir)
-                    now = monotonic()
+                    snapshot = _worktree_snapshot(working_dir)
+                    now = time.monotonic()
                     (snapshot_progressed, now, events_pending, lease_expired,
                      snapshot_worker_changed) = progress_stream.poll(
                         events, silent_deadline=silent_deadline,
@@ -976,7 +974,7 @@ def main(args: list[str], *, monotonic=time.monotonic,
             if build_lease and events_pending:
                 returncode = process.poll()
                 if returncode is not None:
-                    now = monotonic()
+                    now = time.monotonic()
                     if now >= deadline:
                         timed_out = True
                     break
@@ -986,7 +984,7 @@ def main(args: list[str], *, monotonic=time.monotonic,
                 if build_lease and progress_stream.active_workers:
                     wait_timeout = min(wait_timeout, max(0.001, next_worker_poll - now))
                 returncode = process.wait(timeout=wait_timeout)
-                now = monotonic()
+                now = time.monotonic()
                 if build_lease and now >= deadline:
                     timed_out = True
                 break

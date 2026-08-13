@@ -764,6 +764,8 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
     monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
     monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
     monkeypatch.setattr(_launch_child, "_head", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_worktree_snapshot", snapshot)
+    monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(_launch_child.subprocess, "Popen", Provider)
 
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "codex",
@@ -771,7 +773,7 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
     revoker = threading.Thread(target=revoke_authorization)
     revoker.start()
     with pytest.raises(ChildExit) as exited:
-        _launch_child.main(args, monotonic=clock, worktree_snapshot=snapshot)
+        _launch_child.main(args)
     revoker.join(timeout=1)
 
     assert exited.value.args == (0,)
@@ -1069,6 +1071,7 @@ def _run_clocked_supervisor(
     monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
     monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
     monkeypatch.setattr(_launch_child, "_head", head)
+    monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(_launch_child.subprocess, "Popen", lambda *args, **kwargs: Provider())
 
     silent, test_grace, absolute = build_lease
@@ -1076,7 +1079,7 @@ def _run_clocked_supervisor(
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "claude",
             str(silent), str(test_grace), str(absolute), str(tmp_path), "provider"]
     with pytest.raises(ChildExit) as exited:
-        _launch_child.main(args, monotonic=clock)
+        _launch_child.main(args)
 
     assert exited.value.args == (0,)
     return read_session(store_path, "token")
