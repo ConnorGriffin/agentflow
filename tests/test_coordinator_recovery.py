@@ -184,7 +184,9 @@ def test_generated_session_lead_preamble_refreshes_at_launch(make_coord):
     ("Task-owned section\n## Session lead — benchmarked capability routing\nkeep this text",
      True),
     (_observed_529_brief()[:-20], True),
-], ids=["marker-only-no-provenance", "marker-only-provenance", "truncated-proven-contract"])
+    (_observed_529_brief() + _stale_native_helper_contract(), True),
+], ids=["marker-only-no-provenance", "marker-only-provenance", "truncated-proven-contract",
+        "duplicate-proven-contract"])
 def test_unproven_or_incomplete_session_lead_input_refuses_before_provider_start(
         make_coord, task_text, session_lead):
     fake = CapturingSession()

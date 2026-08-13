@@ -620,6 +620,10 @@ def _refresh_session_lead_contract(record, prompt: str) -> str:
 
 def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:
     """Return a proven task brief and its complete terminal generated lead contract."""
+    if prompt.count(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING) != 1:
+        raise SessionLeadInputError(
+            "session-lead input cannot be safely refreshed: expected exactly one complete "
+            "generated Session lead contract; retain the durable task brief and resubmit")
     marker = prompt.rfind(_SESSION_LEAD_MARKER)
     if marker < 0:
         raise SessionLeadInputError(
