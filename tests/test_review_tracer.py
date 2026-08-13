@@ -1393,7 +1393,8 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
 
 def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     build = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
-                   subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing")
+                   subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
+                   capability_context="{")
     sub = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
     assert sub is not None
     assert sub.stage == "review" and sub.target == "head-sha-123"
@@ -1402,6 +1403,7 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     assert sub.complexity == "deep"                                   # review is the deep net
     assert "pr-42-fix-thing" in sub.source                            # detached review worktree
     assert "`head-sha-123`" in sub.input_ptr                          # exact starting head contract
+    assert sub.capability_context == "{"
     # A build whose worktree is unreadable, or a missing head SHA, yields no submission.
     assert coordinated_review.review_submission(build, "", "codex", 42) is None
     assert coordinated_review.review_submission(
@@ -1992,8 +1994,10 @@ def test_manual_resume_identity_never_reuses_a_daemon_retarget_record(make_coord
             assignment=ReviewAssignment(reason="one journey"),
             change_author_tool="claude", passes=2)))
     stranded = record_of(coord, stranded_id)
+    stranded.capability_context = "{"
     daemon = coordinated_review._moved_head_review_submission(stranded, "sha-b")
     assert daemon is not None and daemon.resume == 0 and daemon.review.passes == 2
+    assert daemon.capability_context == "{"
     manual = coordinated_review.survivor_review_submission(
         RepoConfig("o/r", "/work"), issue=7, slug="fix", builder_tool="claude",
         head_sha="sha-b", reviewer_tool="codex", pr_number=42, acceptance="acceptance",

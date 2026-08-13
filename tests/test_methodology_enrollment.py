@@ -2,14 +2,60 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+from importlib.resources import files
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
+import tomllib
 
+from agentflow.capability_contracts import ContractRequirement, preflight
+from agentflow.cli import main
 from agentflow.enroll import doctor, enroll_repository
 from agentflow.provider_skills import (
     materialize_launch_capabilities, provider_skill_status,
     record_native_discovery_receipt, skill_destination_status)
+
+
+def test_recommended_native_discovery_repair_is_runnable_idempotent_and_releases_hold(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == "domain-modeling")
+    (repo / ".agents" / "skills").mkdir(parents=True)
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    monkeypatch.setattr("agentflow.capability_contracts.shutil.which", lambda _name: "/bin/codex")
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.provider_skill_status",
+        lambda root, provider, _spec:
+            __import__("agentflow.provider_skills", fromlist=["native_discovery_status"])
+            .native_discovery_status(root, provider),
+    )
+    runs = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills._run_native_discovery_probe",
+        lambda _root, _provider: runs.append(True) or SimpleNamespace(
+            returncode=0, stdout="native output " +
+            "AGENTFLOW_582_DISCOVERED_4BAB5FF0_AEE6_4D44_BEA3_1BE5D089256F",
+            stderr=""),
+    )
+    requirement = (ContractRequirement("domain-modeling", spec["version"]),)
+
+    held = preflight(repo, "build", "codex", requirement)
+    assert held.state == "missing"
+    assert held.repair_command == f"agentflow capability-probe --repo {repo} --provider codex"
+    assert main(["capability-probe", "--repo", str(repo), "--provider", "codex"]) == 0
+    assert preflight(repo, "build", "codex", requirement).ready
+    assert main(["capability-probe", "--repo", str(repo), "--provider", "codex"]) == 0
+    assert runs == [True]
 
 
 def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(

@@ -18,6 +18,18 @@ import tomllib
 
 RECEIPT_SCHEMA = 1
 NATIVE_DISCOVERY_MARKER = "AGENTFLOW_582_DISCOVERED_4BAB5FF0_AEE6_4D44_BEA3_1BE5D089256F"
+NATIVE_DISCOVERY_SKILL = "agentflow-582-probe-4bab5ff0"
+_NATIVE_DISCOVERY_FIXTURE = f"""---
+name: {NATIVE_DISCOVERY_SKILL}
+description: Harmless project-local capability discovery probe for AgentFlow issue 582.
+---
+
+# AgentFlow 582 discovery probe
+
+When invoked, reply with this exact line and nothing else:
+
+{NATIVE_DISCOVERY_MARKER}
+"""
 
 
 def _regular_directory(path: Path) -> bool:
@@ -199,6 +211,75 @@ def native_discovery_status(root: Path, provider: str) -> tuple[str, str]:
     if payload != expected:
         return "drifted", f"{provider} native-discovery receipt is stale or incompatible"
     return "ok", f"{provider} native discovery was proven for this repository and binary"
+
+
+def _run_native_discovery_probe(root: Path, provider: str):
+    """Run the provider proof; kept as the deterministic CI seam."""
+    from agentflow.runner import ClaudeRunner, CodexRunner, run_provider_discovery_probe
+
+    prompt = (
+        f"Invoke the project-local skill named {NATIVE_DISCOVERY_SKILL} using only native "
+        "skill discovery. Do not use shell commands, search files, read files, or inspect "
+        "configuration. If it is unavailable, reply exactly SKILL_UNAVAILABLE."
+    )
+    argv = (
+        ClaudeRunner().structured_argv(prompt, "sonnet", str(root))
+        if provider == "claude"
+        else CodexRunner().structured_argv(prompt, "terra", str(root))
+    )
+    return run_provider_discovery_probe(argv, str(root))
+
+
+def prove_native_discovery(root: str | Path, provider: str) -> tuple[bool, str]:
+    """Idempotently prove provider-native project skill discovery and issue its receipt."""
+    checkout = Path(root)
+    if provider not in {"claude", "codex"}:
+        return False, f"unsupported provider {provider}"
+    current, detail = native_discovery_status(checkout, provider)
+    if current == "ok":
+        return True, detail
+    if checkout.is_symlink() or not checkout.is_dir():
+        return False, "probe root must be a real project-local directory"
+    location = ".agents" if provider == "codex" else ".claude"
+    skill_root = checkout / location / "skills"
+    if (not _regular_directory(skill_root) or not _contained(skill_root, checkout)):
+        return False, f"{provider} project-local skill root is missing or incompatible"
+    fixture = skill_root / NATIVE_DISCOVERY_SKILL
+    created = False
+    try:
+        if fixture.exists() or fixture.is_symlink():
+            skill_file = fixture / "SKILL.md"
+            if (not _regular_directory(fixture) or not _contained(fixture, checkout)
+                    or skill_file.is_symlink() or not skill_file.is_file()
+                    or skill_file.read_text() != _NATIVE_DISCOVERY_FIXTURE):
+                return False, "native-discovery fixture destination is occupied or incompatible"
+        else:
+            fixture.mkdir()
+            (fixture / "SKILL.md").write_text(_NATIVE_DISCOVERY_FIXTURE)
+            created = True
+        clear_native_discovery_receipt(checkout, provider)
+        result = _run_native_discovery_probe(checkout, provider)
+        output = (result.stdout or "") + (result.stderr or "")
+        proven = result.returncode == 0 and NATIVE_DISCOVERY_MARKER in output
+        if provider == "claude":
+            proven = proven and '"name":"Skill"' in output and (
+                f'"skill":"{NATIVE_DISCOVERY_SKILL}"' in output
+            )
+        else:
+            proven = proven and '"type":"command_execution"' not in output
+        if not proven:
+            return False, f"{provider} did not prove native project skill discovery"
+        receipt = record_native_discovery_receipt(checkout, provider)
+        return True, f"recorded {provider} native-discovery receipt at {receipt}"
+    except OSError as exc:
+        return False, f"native-discovery probe failed: {exc}"
+    finally:
+        if created:
+            try:
+                (fixture / "SKILL.md").unlink()
+                fixture.rmdir()
+            except OSError:
+                pass
 
 
 def provider_skill_status(root: Path, provider: str, spec: dict) -> tuple[str, str]:

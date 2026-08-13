@@ -73,8 +73,9 @@ def _review_prompt(prompt: str) -> str:
     return stage_prompt_spec("review").render(prompt=prompt)
 
 
-def _capability_context(record) -> dict[str, bool]:
-    return json.loads(record.capability_context or "{}")
+def _capability_context(record) -> str:
+    """Carry durable context verbatim; admission owns its sole fail-closed decode."""
+    return record.capability_context or "{}"
 
 
 def _with_durable_review_assignment(review_record, prompt: str, **assignment) -> str:

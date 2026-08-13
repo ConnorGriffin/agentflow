@@ -28,7 +28,10 @@ Static files cannot prove native provider discovery. A real positive release pro
 repository-scoped discovery receipt bound to the provider name, resolved executable bytes, and
 capability-manifest bytes only after the expected native invocation evidence is observed. Production
 preflight validates that receipt as well as the actual launch checkout. Missing, unreadable, stale,
-or incompatible receipts fail closed; the deterministic CI probe seam never creates one.
+or incompatible receipts fail closed. The named `agentflow capability-probe --repo … --provider …`
+repair temporarily installs a reserved fixture in the selected project-local provider root, records
+the receipt only after native invocation evidence, removes the fixture, and is idempotent when the
+receipt remains valid. The deterministic CI probe seam never creates a receipt.
 
 Doctor evaluates the same preflight over every supported stage/context/provider cell. Headless
 repositories omit UI-only contexts, and Mockup explicitly supports only UI context; `--stage` and

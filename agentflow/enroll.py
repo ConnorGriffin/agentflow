@@ -289,11 +289,21 @@ def playwright_runtime_status(
     drive_status = _skill_status(root, drive["skill"], drive["files"])
     if drive_status != "ok":
         return drive_status, f"pinned drive-local-webapp contract is {drive_status}"
-    return _runtime_status(
-        root,
-        version=version,
-        node_minimum=node_minimum,
-        manifest=resolved_manifest,
+    results = tuple(
+        _runtime_status(
+            root, version=version, node_minimum=node_minimum,
+            manifest=resolved_manifest, provider=provider,
+        )
+        for provider in ("claude", "codex")
+    )
+    for state in ("missing", "drifted", "incompatible"):
+        details = [f"{provider}: {detail}" for provider, (status, detail)
+                   in zip(("claude", "codex"), results) if status == state]
+        if details:
+            return state, "; ".join(details)
+    return "ok", "; ".join(
+        f"{provider}: {detail}" for provider, (_status, detail)
+        in zip(("claude", "codex"), results)
     )
 
 

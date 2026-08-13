@@ -198,6 +198,16 @@ def _run(cmd: list[str], cwd: str | None = None, timeout: int | None = None,
         return subprocess.CompletedProcess(cmd, returncode=1, stdout="", stderr=f"timed out after {t}s")
 
 
+def run_provider_discovery_probe(argv: list[str], cwd: str):
+    """Run the explicit operator-requested native discovery proof outside orchestration."""
+    try:
+        return subprocess.run(
+            argv, cwd=cwd, text=True, capture_output=True, timeout=300
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return subprocess.CompletedProcess(argv, 1, "", str(exc))
+
+
 def _canonical_graph_project(cwd: str) -> str | None:
     """The maintained code-graph project identity for the repository this worktree belongs to.
 

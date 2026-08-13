@@ -38,7 +38,6 @@ from agentflow.intake import (IntakeResult, IntakeRoute, apply_intake, intake_re
                               redraft_prompt)
 from agentflow.labels import TRIAGING, release
 from agentflow.prompts import stage_prompt_spec
-from agentflow.repo_facts import surface_declaration
 from agentflow.runner import _run
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
@@ -83,14 +82,11 @@ def _dial(draft: IntakeResult) -> str:
     return draft.complexity.value if draft.complexity else "deep"
 
 
-def _capability(record, ref: WorktreeRef) -> tuple[str, dict[str, bool]]:
+def _capability(record, ref: WorktreeRef) -> tuple[str, str]:
     """Recover capability facts for current and pre-#582 durable chain records."""
     root = getattr(record, "capability_root", None) or ref.workdir
     raw = getattr(record, "capability_context", "{}") or "{}"
-    context = json.loads(raw)
-    if "ui" not in context:
-        context["ui"] = bool(surface_declaration(root).surfaces)
-    return root, context
+    return root, raw
 
 
 def attack_submission(intake_record, draft: IntakeResult, tool: str) -> Submission | None:

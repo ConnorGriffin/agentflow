@@ -21,6 +21,17 @@ CI runs only its non-provider helper seam in
 `tests/test-provider-discovery-probe.sh`. A successful real positive probe writes
 a repository-scoped native-discovery receipt bound to the resolved provider
 executable and capability manifest. The deterministic seam writes no receipt.
+When admission reports only a missing or stale native-discovery receipt, its
+repair command is runnable directly:
+
+```sh
+agentflow capability-probe --repo /path/to/repository --provider codex
+```
+
+The command temporarily materializes a reserved probe skill in only the selected
+provider root, requires provider-native invocation evidence, records the receipt,
+and removes the fixture. Repeating it reuses the valid receipt without relaunching
+the provider. Static-file failures continue to recommend enrollment instead.
 
 ## Inspect a repository
 

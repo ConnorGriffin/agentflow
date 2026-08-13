@@ -74,8 +74,11 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
     specs = {item["id"]: item for item in manifest["capabilities"]}
     evidence: list[str] = []
     states: list[str] = []
+    native_failure = False
+    other_failure = False
     if provider not in {"claude", "codex"} or shutil.which(provider) is None:
         states.append("incompatible")
+        other_failure = True
         evidence.append(f"{provider}: selected provider runtime is unavailable")
     for requirement in requirements:
         if requirement.runtime:
@@ -83,6 +86,7 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
             pinned_version = runtime.get("version")
             if requirement.id != "playwright" or requirement.version != pinned_version:
                 states.append("incompatible")
+                other_failure = True
                 evidence.append(
                     f"{requirement.id}@{requirement.version}: manifest pins "
                     f"playwright@{pinned_version}"
@@ -93,18 +97,22 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
                 version=pinned_version,
                 node_minimum=runtime["node_minimum"],
                 manifest=manifest,
+                provider=provider,
             )
             if status != "ok":
                 states.append(status)
+                other_failure = True
                 evidence.append(f"{requirement.id}@{requirement.version}: {detail}")
             continue
         spec = specs.get(requirement.id)
         if spec is None:
             states.append("incompatible")
+            other_failure = True
             evidence.append(f"{requirement.id}@{requirement.version}: no manifest contract")
             continue
         if spec.get("version") != requirement.version:
             states.append("incompatible")
+            other_failure = True
             evidence.append(
                 f"{requirement.id}@{requirement.version}: manifest pins "
                 f"{spec.get('version', 'no version')}"
@@ -114,6 +122,7 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
         required_dependencies = tuple(item.id for item in requirement.dependencies)
         if declared_dependencies != required_dependencies:
             states.append("incompatible")
+            other_failure = True
             evidence.append(
                 f"{requirement.id}@{requirement.version}: dependency contract is incompatible"
             )
@@ -121,10 +130,18 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
         status, detail = provider_skill_status(root, provider, spec)
         if status != "ok":
             states.append(status)
+            if "native-discovery receipt" in detail:
+                native_failure = True
+            else:
+                other_failure = True
         evidence.append(f"{requirement.id}@{requirement.version}: {detail}")
     state = next((item for item in ("missing", "drifted", "incompatible") if item in states), "ready")
     return CapabilityPreflightResult(
         stage=stage, provider=provider, contracts=requirements, state=state,
         evidence=tuple(evidence) or ("pinned project-local contracts present",),
-        repair_command=f"agentflow enroll {root} --apply",
+        repair_command=(
+            f"agentflow capability-probe --repo {root} --provider {provider}"
+            if native_failure and not other_failure
+            else f"agentflow enroll {root} --apply"
+        ),
     )

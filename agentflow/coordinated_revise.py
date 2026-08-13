@@ -126,7 +126,7 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
         builder_effort=review_record.builder_effort,
         round=review_record.round, transfer_from=review_record.identity, session_lead=True,
         capability_root=review_record.capability_root,
-        capability_context=__import__("json").loads(review_record.capability_context))
+        capability_context=review_record.capability_context or "{}")
 
 
 def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: str = "claude"):
@@ -167,7 +167,7 @@ def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: 
         round=review_record.round, conflict_round=review_record.conflict_round,
         transfer_from=review_record.identity, continuation=True, session_lead=True,
         review=review, capability_root=review_record.capability_root,
-        capability_context=__import__("json").loads(review_record.capability_context))
+        capability_context=review_record.capability_context or "{}")
 
 
 def _conflict_uncertainty_outcome(record, obs) -> str | None:

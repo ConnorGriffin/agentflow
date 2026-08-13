@@ -66,6 +66,11 @@ def main(argv: list[str] | None = None) -> int | None:
         choices=("autonomous", "reviewed", "guarded"),
         default="reviewed",
     )
+    capability_probe = commands.add_parser(
+        "capability-probe", help="prove provider-native project skill discovery"
+    )
+    capability_probe.add_argument("--repo", required=True)
+    capability_probe.add_argument("--provider", required=True, choices=("claude", "codex"))
     enroll_command.add_argument(
         "--audit", action="store_true",
         help="print the fleet-wide UI-surface declaration census and exit",
@@ -229,6 +234,12 @@ def main(argv: list[str] | None = None) -> int | None:
         except ValueError as exc:
             parser.error(str(exc))
         return 0 if report.ready else 1
+    elif args.command == "capability-probe":
+        from agentflow.provider_skills import prove_native_discovery
+
+        ready, detail = prove_native_discovery(args.repo, args.provider)
+        print(detail)
+        return 0 if ready else 1
     elif args.command == "decision-map-probe":
         from agentflow.operator_projection import decision_map_probe
 

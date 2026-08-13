@@ -184,7 +184,7 @@ class Submission:
                                       # continuation of nearly-merged work, not new build (ADR 0038)
     review: ReviewState | None = None
     capability_root: str | None = None
-    capability_context: dict[str, bool] | None = None
+    capability_context: dict[str, bool] | str | None = None
 
 
 @dataclass(frozen=True)
@@ -291,7 +291,9 @@ class Coordinator:
             conflict_round=submission.conflict_round, resume=submission.resume,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
             capability_root=submission.capability_root,
-            capability_context=json.dumps(submission.capability_context or {}, sort_keys=True),
+            capability_context=(submission.capability_context
+                                if isinstance(submission.capability_context, str)
+                                else json.dumps(submission.capability_context or {}, sort_keys=True)),
             session_lead=submission.session_lead,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
