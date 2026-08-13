@@ -41,9 +41,6 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
     monkeypatch.setattr(enrollment, "_manifest", lambda: manifest)
     monkeypatch.setattr(enrollment, "_checkout_problem", lambda _root: None)
     monkeypatch.setattr(
-        enrollment, "_resolved_skill_release", lambda _manifest: (fixture_commit, None)
-    )
-    monkeypatch.setattr(
         enrollment.shutil, "which", lambda command: f"/usr/bin/{command}"
     )
 
@@ -51,6 +48,12 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
 
     def run(command, **_kwargs):
         commands.append(command)
+        if command[:3] == ["git", "ls-remote", "--tags"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=f"{fixture_commit}\trefs/tags/v0.3.0\n",
+                stderr="",
+            )
         if command[-2:] == ["rev-parse", "HEAD"]:
             return SimpleNamespace(returncode=0, stdout=f"{fixture_commit}\n", stderr="")
         if command[0] == "npx":
@@ -75,6 +78,13 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
         for command in commands
         if command[:3] == ["git", "clone", "--no-checkout"]
     )
+    release = next(
+        command
+        for command in commands
+        if command[:3] == ["git", "ls-remote", "--tags"]
+    )
+    assert release[3] == str(source.parent)
+    assert release[4:] == ["refs/tags/v0.3.0", "refs/tags/v0.3.0^{}"]
     assert clone[3] == str(source.parent)
     for location in (".agents/skills", ".claude/skills"):
         for name in names:

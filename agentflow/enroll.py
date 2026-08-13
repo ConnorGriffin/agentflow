@@ -177,8 +177,7 @@ def _connor_skill_command(manifest: dict, source_tree: Path | None = None) -> li
     return command
 
 
-def _resolved_skill_release(manifest: dict) -> tuple[str | None, str | None]:
-    source = manifest["connor_skills"]
+def _resolved_skill_release(source: dict) -> tuple[str | None, str | None]:
     tag_ref = f"refs/tags/{source['tag']}"
     peeled_ref = f"{tag_ref}^{{}}"
     result = _run_command(
@@ -232,7 +231,7 @@ def _skills_problem(
     if not surfaces:
         return None
     manifest = _manifest()
-    resolved, error = _resolved_skill_release(manifest)
+    resolved, error = _resolved_skill_release(manifest["connor_skills"])
     if error:
         return f"public skill release could not be verified: {error}"
     expected = manifest["connor_skills"]["commit"]
@@ -718,7 +717,7 @@ def _install_connor_skills(root: Path) -> str:
             "WARN: existing public skill destinations are partial or conflicting; "
             f"installer was not run ({rendered})"
         )
-    resolved, error = _resolved_skill_release(manifest)
+    resolved, error = _resolved_skill_release(manifest["connor_skills"])
     expected = manifest["connor_skills"]["commit"]
     if error:
         return f"WARN: public skill release could not be verified — {error}"
@@ -777,7 +776,7 @@ def _install_methodology_skills(root: Path) -> str:
         return "ok:   methodology contracts already installed"
     if any(state != "absent" for state in states.values()):
         return "WARN: methodology destinations are partial, conflicting, or drifted; installer was not run"
-    resolved, error = _resolved_skill_release(manifest)
+    resolved, error = _resolved_skill_release(source)
     if error or resolved != source["commit"]:
         return "WARN: methodology release could not be verified; installer was not run"
     with tempfile.TemporaryDirectory(prefix="agentflow-methodology-") as temporary:

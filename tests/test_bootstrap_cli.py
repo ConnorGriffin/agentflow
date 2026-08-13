@@ -802,7 +802,7 @@ def test_release_verification_accepts_lightweight_and_annotated_tags(
         or SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
     )
 
-    resolved, error = _resolved_skill_release(_manifest())
+    resolved, error = _resolved_skill_release(_manifest()["connor_skills"])
 
     assert error is None
     assert resolved == "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
