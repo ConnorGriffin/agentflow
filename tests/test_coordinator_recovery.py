@@ -178,12 +178,19 @@ def test_generated_session_lead_preamble_refreshes_at_launch(make_coord):
     assert "native Codex sub-agents" not in fake.prompts[0]
 
 
-def test_marker_only_session_lead_input_refuses_before_provider_start(make_coord):
+@pytest.mark.parametrize(("task_text", "session_lead"), [
+    ("Task-owned section\n## Session lead — benchmarked capability routing\nkeep this text",
+     False),
+    ("Task-owned section\n## Session lead — benchmarked capability routing\nkeep this text",
+     True),
+    (_observed_529_brief()[:-20], True),
+], ids=["marker-only-no-provenance", "marker-only-provenance", "truncated-proven-contract"])
+def test_unproven_or_incomplete_session_lead_input_refuses_before_provider_start(
+        make_coord, task_text, session_lead):
     fake = CapturingSession()
     coord = make_coord(fake)
-    task_text = "Task-owned section\n## Session lead — benchmarked capability routing\nkeep this text"
     identity = coord.submit_stage(_build(
-        pool="codex", input_ptr=task_text, source="/wt/issue-529", session_lead=True))
+        pool="codex", input_ptr=task_text, source="/wt/issue-529", session_lead=session_lead))
 
     assert coord.cycle("codex") == []
     record = record_of(coord, identity)
