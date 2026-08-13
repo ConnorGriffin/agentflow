@@ -8,20 +8,22 @@ This is a repository-native research result for [#607](https://github.com/Connor
 `docs/evaluation/preflight/evaluation-artifacts.lock.json` as the sole artifact
 selection authority. It must contain:
 
-- the reviewed source revision as an immutable full Git commit ID;
+- `reviewed_source_revision` as the immutable full Git commit ID of the source
+  snapshot reviewed before the lock was added; it is provenance and must be an
+  ancestor of the checkout, not equal to the lock-containing checkout `HEAD`;
 - one closed, exact relative-path set for every reviewed verifier, grammar,
   fixture, negative fixture, digest/receipt, matrix, and focused test;
 - one lowercase SHA-256 for every listed regular file;
 - a canonical `root_sha256` over the complete normalized lock payload with the
   `root_sha256` field omitted from that calculation, including the path/digest
-  entries and the lock's own declared schema/revision fields;
+  entries and the lock's own declared schema/provenance fields;
 - the exact public command and its exact path arguments, represented as data and
   executed without caller-side manifest reconstruction.
 
 The lock verifier is the first executable in that command. It must fail closed
 if the lock is absent, malformed, has duplicate or unexpected paths, contains
 symlinks/path escapes, has a missing or drifted listed file, has a wrong root,
-or names a revision other than the checkout's `git rev-parse HEAD`. It must
+or names a malformed, missing, or non-ancestral `reviewed_source_revision`. It must
 also reject any reviewed artifact under the evaluation root that is not in the
 closed path set. After the lock passes, the same public command invokes every
 listed verifier and focused test by the exact paths in the lock. The command
@@ -66,9 +68,9 @@ that set, and CI pins execution to the commit containing both.
 The lock must include the terminal digest/receipt file as an ordinary listed
 artifact and must verify the terminal file's bytes. The terminal file must not
 become a second authority that can be omitted or silently replaced. The
-`root_sha256` is over the entire normalized lock payload except its own
-declared path/digest set and revision cannot be altered without detection by
-the lock verifier. The verifier must reject duplicate JSON keys and non-canonical
+`root_sha256` is over the entire normalized lock payload except its own value;
+the declared path/digest set and provenance cannot be altered without detection
+by the lock verifier. The verifier must reject duplicate JSON keys and non-canonical
 or non-UTF-8 input, following the canonical-JSON and duplicate-key constraints
 already described by #603.
 
@@ -93,10 +95,10 @@ but it does not replace the evaluation lock.
 
 The Python CI job uses `actions/checkout` but does not currently set or verify
 an explicit revision; the default checkout behavior is therefore not a
-repository proof that the later command used the reviewed commit. The proposed
-contract makes the revision observable and testable: CI checks out the event
-SHA, then the command compares the lock's full revision to `git rev-parse
-HEAD`.
+repository proof that the later command used the event commit. The proposed
+contract separates two proofs that cannot share one self-referential field:
+the lock's path/digest/root set proves reviewed artifact closure, while CI
+supplies the event SHA and the command requires it to equal `git rev-parse HEAD`.
 [CI source](https://github.com/ConnorGriffin/agentflow/blob/7a23ccc/.github/workflows/ci.yml#L17-L35)
 
 The application has a separate, intentional `origin/main` convention for
@@ -126,10 +128,10 @@ merges/digests it named.
 [Final panel](https://github.com/ConnorGriffin/agentflow/issues/604#issuecomment-5280377247)
 
 The contract above resolves those findings at the smallest boundary relevant to
-#607: the lock owns the complete reviewed path/digest/revision set; the lock
-verifier consumes and validates that set; the public command executes every
-listed verifier and focused test; and post-merge CI binds the run to
-`github.sha`/`HEAD`. Prerequisite ordering and semantic authority remain the
+#607: the lock owns the complete reviewed path/digest set and source provenance;
+the lock verifier consumes and validates that set; the public command executes
+every listed verifier and focused test; and post-merge CI separately binds the
+run to `github.sha`/`HEAD`. Prerequisite ordering and semantic authority remain the
 separate decisions in #605 and #608; #607 should not duplicate them.
 
 ## Rejected alternatives
@@ -158,14 +160,17 @@ shape:
 
 ```text
 uv run python scripts/check-evaluation-artifacts-v1.py \
-  --lock docs/evaluation/preflight/evaluation-artifacts.lock.json
+  --lock docs/evaluation/preflight/evaluation-artifacts.lock.json \
+  --expected-head "$GITHUB_SHA"
 ```
 
 The recommended CI change invokes that exact command after dependency
-installation. The future command must verify
-lock schema/root, revision, exact paths, and every digest; then
+installation. The future command must require `--expected-head` to equal the
+checkout's `git rev-parse HEAD`; verify lock schema/root, ancestral source
+provenance, exact paths, and every digest; then
 execute the exact reviewed verifier and focused-test paths from the lock. CI
 must invoke only this command for the evaluation proof and fail if it returns
-non-zero. The lock must identify the expected revision as a full commit ID, and
-the command must print that resolved `HEAD`/lock match in bounded output so the
-post-merge run is auditable.
+non-zero. The lock's `reviewed_source_revision` must identify an existing
+ancestor as a full commit ID but must not be required to equal `HEAD`. The
+command must print the event-`HEAD` identity and lock root in bounded output so
+the post-merge run is auditable.
