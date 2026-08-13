@@ -366,10 +366,36 @@ def _manifest(directory_fd: int, version: int, expected: dict[str, Any]) -> None
         raise _ContractFailure(basename, "manifest")
 
 
+def _open_authorized_directory(directory: Path) -> int:
+    supplied = directory.lstat()
+    if stat.S_ISLNK(supplied.st_mode) or not stat.S_ISDIR(supplied.st_mode):
+        raise OSError
+    resolved = directory.resolve(strict=True)
+    expected = resolved.stat(follow_symlinks=False)
+    if (not stat.S_ISDIR(expected.st_mode)
+            or (supplied.st_dev, supplied.st_ino) != (expected.st_dev, expected.st_ino)):
+        raise OSError
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(
+            resolved,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISDIR(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)):
+            raise OSError
+        return descriptor
+    except BaseException:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+
+
 def validate_fixtures(directory: Path) -> None:
     directory_fd: int | None = None
     try:
-        directory_fd = os.open(directory, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+        directory_fd = _open_authorized_directory(directory)
         basenames = sorted(os.listdir(directory_fd))
         names = set(basenames)
         routed: list[tuple[str, str, str, int]] = []

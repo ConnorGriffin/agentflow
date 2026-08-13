@@ -24,6 +24,29 @@ def _open_descriptors() -> set[str]:
     return set(os.listdir("/dev/fd"))
 
 
+@pytest.mark.parametrize("absolute", [False, True])
+def test_api_accepts_relative_and_absolute_authorized_corpus(tmp_path, absolute):
+    corpus = _corpus(tmp_path)
+    authorized = corpus if absolute else Path(os.path.relpath(corpus, Path.cwd()))
+
+    validate_fixtures(authorized)
+
+
+@pytest.mark.parametrize("absolute", [False, True])
+def test_cli_accepts_relative_and_absolute_authorized_corpus(tmp_path, absolute):
+    corpus = _corpus(tmp_path)
+    authorized = corpus if absolute else Path(os.path.relpath(corpus, Path.cwd()))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "agentflow.evidence_contract", str(authorized)],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
 def test_invalid_filename_and_duplicate_version_slug_fail_closed_in_sorted_order(tmp_path):
     corpus = _corpus(tmp_path)
     (corpus / "00-invalid.json").write_text("{}")
@@ -58,6 +81,60 @@ def test_directory_and_known_file_io_errors_use_only_sentinel_or_basename(tmp_pa
     fixture.mkdir()
     with pytest.raises(EvidenceError, match=r"positive-producer-refuted-v2\.json: io$"):
         validate_fixtures(corpus)
+
+
+def test_api_rejects_symlink_as_authorized_corpus_directory(tmp_path):
+    corpus = _corpus(tmp_path)
+    corpus_link = tmp_path / "evidence-link"
+    corpus_link.symlink_to(corpus, target_is_directory=True)
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus_link)
+
+    assert str(caught.value) == "<corpus>: io"
+    assert str(corpus) not in str(caught.value)
+
+
+def test_cli_rejects_symlink_as_authorized_corpus_directory_without_echo(tmp_path):
+    corpus = _corpus(tmp_path)
+    corpus_link = tmp_path / "private-corpus-link"
+    corpus_link.symlink_to(corpus, target_is_directory=True)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "agentflow.evidence_contract", str(corpus_link)],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "evidence contract invalid: <corpus>: io\n"
+    assert "private-corpus-link" not in result.stderr
+
+
+def test_api_rejects_authorized_corpus_replacement_and_closes_descriptor(
+        tmp_path, monkeypatch):
+    corpus = _corpus(tmp_path)
+    displaced = tmp_path / "displaced-evidence"
+    original_open = os.open
+    replaced = False
+
+    def replace_before_open(path, flags, *args, **kwargs):
+        nonlocal replaced
+        if not replaced and flags & os.O_DIRECTORY:
+            corpus.rename(displaced)
+            corpus.mkdir()
+            replaced = True
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", replace_before_open)
+    descriptors_before = _open_descriptors()
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+
+    assert replaced
+    assert str(caught.value) == "<corpus>: io"
+    assert _open_descriptors() == descriptors_before
 
 
 def test_oversized_regular_fixture_is_sanitized_io_and_closes_descriptor(tmp_path):
