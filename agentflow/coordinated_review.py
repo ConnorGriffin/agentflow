@@ -1188,7 +1188,7 @@ def _moved_head_review_submission(record, head_sha: str):
         branch_lineage=record.branch_lineage,
         builder_complexity=record.builder_complexity, builder_effort=record.builder_effort,
         round=record.round,
-        review=review, session_lead=record.session_lead,
+        review=review, session_lead=has_session_lead_provenance(record),
         transfer_from=record.identity, supersede=True)
 
 
