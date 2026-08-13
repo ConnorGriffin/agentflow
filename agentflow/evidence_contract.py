@@ -15,7 +15,7 @@ _FIXTURE = re.compile(r"^(positive|negative)-([a-z0-9]+(?:-[a-z0-9]+)*)-v(1|2)\.
 _FORBIDDEN = frozenset({"prompt", "prompts", "transcript", "transcripts", "source_body",
                         "source_bodies", "secret", "secrets", "finding", "summary",
                         "summaries", "grounding", "payload", "payloads", "excerpt", "body",
-                        "text", "raw", "metadata"})
+                        "text", "raw", "metadata", "reason"})
 _REASON_CODES = frozenset({"duplicate-key", "shape", "type", "vocabulary", "redaction",
                            "suffix", "manifest", "json", "io"})
 _V1_FIELDS = {"observation_id", "subject", "failure_class", "validation_state",
@@ -67,8 +67,8 @@ def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _read(path: Path, basename: str) -> str:
     try:
-        return path.read_text()
-    except OSError as exc:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
         raise _ContractFailure(basename, "io") from exc
 
 

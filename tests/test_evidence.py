@@ -364,6 +364,17 @@ def test_repository_brief_filters_roots_and_closes_over_contextual_lineage(tmp_p
             )
 
 
+@pytest.mark.parametrize("keyword,value", [
+    ("accepted_validation_states", (["observed"],)),
+    ("effective_policy_versions", ([1],)),
+])
+def test_briefing_tuple_elements_fail_with_evidence_error_before_set_or_arithmetic(
+        tmp_path, keyword, value):
+    store = EvidenceStore(path=tmp_path / "evidence.db")
+    with pytest.raises(EvidenceError, match="invalid|must be"):
+        store.brief_for("issue/596", now=1, **{keyword: value})
+
+
 def test_retention_marks_live_descendant_closure_then_sweeps_after_last_root(tmp_path):
     store = EvidenceStore(path=tmp_path / "evidence.db")
     cutoff_age = 90 * 24 * 60 * 60

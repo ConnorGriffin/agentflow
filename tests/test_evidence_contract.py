@@ -98,6 +98,36 @@ def test_missing_subject_kind_is_shape_not_an_inferred_subject_shape(tmp_path):
         validate_fixtures(corpus)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+def test_reason_is_recursively_redacted_before_shape_without_echo(tmp_path, nested):
+    corpus = _corpus(tmp_path)
+    fixture = corpus / "positive-producer-lineage-v2.json"
+    body = fixture.read_text()
+    if nested:
+        body = body.replace('"subject_kind": "document"',
+                            '"reason": "private-rationale", "subject_kind": "document"')
+    else:
+        body = body.replace('"envelope_kind": "producer_fact"',
+                            '"reason": "private-rationale", "envelope_kind": "producer_fact"')
+    fixture.write_text(body)
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+    assert str(caught.value) == "positive-producer-lineage-v2.json: redaction"
+    assert "reason" not in str(caught.value)
+    assert "private-rationale" not in str(caught.value)
+    result = subprocess.run(
+        [sys.executable, "-m", "agentflow.evidence_contract", str(corpus)],
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        "evidence contract invalid: positive-producer-lineage-v2.json: redaction\n")
+    assert "reason" not in result.stderr
+    assert "private-rationale" not in result.stderr
+
+
 @pytest.mark.parametrize("member,value", [
     ("ordinal", "true"),
     ("relation", "[]"),
@@ -134,3 +164,33 @@ def test_invalid_link_primitives_return_sanitized_type_without_traceback(
     assert result.stdout == ""
     assert result.stderr == "evidence contract invalid: positive-producer-lineage-v2.json: type\n"
     assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize("basename", [
+    "contract-v2.json",
+    "positive-producer-lineage-v2.json",
+])
+def test_invalid_utf8_known_file_is_sanitized_io_without_traceback(tmp_path, basename):
+    corpus = _corpus(tmp_path)
+    (corpus / basename).write_bytes(b"\xffprivate-bytes")
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+    assert str(caught.value) == f"{basename}: io"
+    assert "private-bytes" not in str(caught.value)
+    result = subprocess.run(
+        [sys.executable, "-m", "agentflow.evidence_contract", str(corpus)],
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == f"evidence contract invalid: {basename}: io\n"
+    assert "UnicodeDecodeError" not in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "private-bytes" not in result.stderr
+
+
+def test_readme_remains_excluded_from_fixture_decoding(tmp_path):
+    corpus = _corpus(tmp_path)
+    (corpus / "README.md").write_bytes(b"\xffnot-a-wire-fixture")
+    validate_fixtures(corpus)

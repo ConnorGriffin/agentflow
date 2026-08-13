@@ -975,9 +975,14 @@ class EvidenceStore:
         if isinstance(now, bool) or not isinstance(now, int) or now < 0:
             raise EvidenceError("invalid now")
         if (not isinstance(accepted_validation_states, tuple)
-                or len(set(accepted_validation_states)) != len(accepted_validation_states)
-                or any(state not in VALIDATION_STATES for state in accepted_validation_states)):
+                or any(not isinstance(state, str) for state in accepted_validation_states)
+                or any(state not in VALIDATION_STATES for state in accepted_validation_states)
+                or len(set(accepted_validation_states)) != len(accepted_validation_states)):
             raise EvidenceError("accepted validation states must be a unique tuple of known states")
+        if (not isinstance(effective_policy_versions, tuple)
+                or any(isinstance(version, bool) or not isinstance(version, int) or version < 1
+                       for version in effective_policy_versions)):
+            raise EvidenceError("invalid effective policy versions")
         self._expire(now, frozenset(effective_policy_versions))
         if not accepted_validation_states:
             return ()
