@@ -147,7 +147,7 @@ An `EvidenceLink` is:
 class EvidenceLink:
     relation: LineageRelation
     target_event_id: EvidenceId
-    ordinal: int  # 0..31, dense and unique across this observation
+    ordinal: int  # 0..31, dense and unique across this producer event/envelope
 ```
 
 `target_event_id` must already resolve to a canonical Evidence event in the same
