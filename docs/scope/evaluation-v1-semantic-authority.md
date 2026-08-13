@@ -12,5 +12,5 @@ None.
 
 - [Prove evaluation artifact closure and portable CI](https://github.com/ConnorGriffin/agentflow/issues/607) — resolved; one committed canonical lock binds the reviewed artifact set and CI command.
 - [Define the executable evaluation prerequisite gate](https://github.com/ConnorGriffin/agentflow/issues/608) — resolved; one two-phase facts checker binds clean review, exact merges, digests, and ADR 583.
-- [Decide one executable authority for Evaluation v1 semantics](https://github.com/ConnorGriffin/agentflow/issues/605) — this interview owns the remaining policy choice.
+- [Decide one executable authority for Evaluation v1 semantics](https://github.com/ConnorGriffin/agentflow/issues/605) — resolved and merged; one versioned canonical data contract owns Evaluation v1 semantics.
 - [Map the README and documentation split for the learning pipeline](https://github.com/ConnorGriffin/agentflow/issues/610) — resolved and merged; every README section now has one planned home and learning details remain gated on shipped behavior.
