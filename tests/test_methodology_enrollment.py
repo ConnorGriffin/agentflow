@@ -12,8 +12,50 @@ from agentflow.capability_contracts import ContractRequirement, preflight
 from agentflow.cli import main
 from agentflow.enroll import doctor, enroll_repository
 from agentflow.provider_skills import (
+    NATIVE_DISCOVERY_MARKER, NATIVE_DISCOVERY_SKILL,
     materialize_launch_capabilities, provider_skill_status,
-    record_native_discovery_receipt, skill_destination_status)
+    native_discovery_output_is_proof, native_discovery_output_is_unavailable,
+    native_discovery_prompt, record_native_discovery_receipt, skill_destination_status)
+
+
+def test_native_discovery_prompts_are_provider_specific():
+    assert native_discovery_prompt("claude") == (
+        f"Invoke the project-local skill named {NATIVE_DISCOVERY_SKILL} using only native "
+        "skill discovery. Do not use shell commands, search files, read files, or inspect "
+        "configuration. If it is unavailable, reply exactly SKILL_UNAVAILABLE."
+    )
+    assert native_discovery_prompt("codex") == f"${NATIVE_DISCOVERY_SKILL}"
+
+
+def test_claude_discovery_proof_keeps_native_skill_tool_predicate():
+    skill_event = f'{{"name":"Skill","input":{{"skill":"{NATIVE_DISCOVERY_SKILL}"}}}}'
+
+    assert native_discovery_output_is_proof(
+        "claude", f"{skill_event}\n{NATIVE_DISCOVERY_MARKER}"
+    )
+    assert not native_discovery_output_is_proof("claude", NATIVE_DISCOVERY_MARKER)
+
+
+def test_codex_discovery_proof_requires_marker_without_any_command_event():
+    assert native_discovery_output_is_proof(
+        "codex", f'{{"type":"item.completed"}}\n{NATIVE_DISCOVERY_MARKER}'
+    )
+    assert not native_discovery_output_is_proof(
+        "codex",
+        f'{{"type":"item.completed","item":{{"type":"command_execution"}}}}\n'
+        f"{NATIVE_DISCOVERY_MARKER}",
+    )
+    assert not native_discovery_output_is_proof("codex", "SKILL_UNAVAILABLE")
+
+
+def test_negative_discovery_predicate_rejects_native_or_command_evidence():
+    assert native_discovery_output_is_unavailable("codex", "SKILL_UNAVAILABLE")
+    assert not native_discovery_output_is_unavailable(
+        "codex", f"SKILL_UNAVAILABLE\n{NATIVE_DISCOVERY_MARKER}"
+    )
+    assert not native_discovery_output_is_unavailable(
+        "codex", 'SKILL_UNAVAILABLE\n{"type":"command_execution"}'
+    )
 
 
 def test_recommended_native_discovery_repair_is_runnable_idempotent_and_releases_hold(

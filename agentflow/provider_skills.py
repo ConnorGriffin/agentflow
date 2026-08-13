@@ -213,15 +213,67 @@ def native_discovery_status(root: Path, provider: str) -> tuple[str, str]:
     return "ok", f"{provider} native discovery was proven for this repository and binary"
 
 
+def native_discovery_prompt(provider: str) -> str:
+    """Return the provider-native invocation form proven by the release contract."""
+    if provider == "codex":
+        return f"${NATIVE_DISCOVERY_SKILL}"
+    if provider == "claude":
+        return (
+            f"Invoke the project-local skill named {NATIVE_DISCOVERY_SKILL} using only native "
+            "skill discovery. Do not use shell commands, search files, read files, or inspect "
+            "configuration. If it is unavailable, reply exactly SKILL_UNAVAILABLE."
+        )
+    raise ValueError(f"unsupported provider {provider}")
+
+
+def _has_command_event(output: str) -> bool:
+    def contains_command(value: object) -> bool:
+        if isinstance(value, dict):
+            if value.get("type") == "command_execution":
+                return True
+            return any(contains_command(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_command(item) for item in value)
+        return False
+
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if contains_command(event):
+            return True
+    return False
+
+
+def native_discovery_output_is_proof(provider: str, output: str) -> bool:
+    """Validate the provider-specific positive native-discovery evidence."""
+    if NATIVE_DISCOVERY_MARKER not in output:
+        return False
+    if provider == "claude":
+        return ('"name":"Skill"' in output
+                and f'"skill":"{NATIVE_DISCOVERY_SKILL}"' in output)
+    if provider == "codex":
+        return not _has_command_event(output)
+    return False
+
+
+def native_discovery_output_is_unavailable(provider: str, output: str) -> bool:
+    """Validate a negative probe without accepting leaked invocation evidence."""
+    return (
+        provider in {"claude", "codex"}
+        and "SKILL_UNAVAILABLE" in output
+        and NATIVE_DISCOVERY_MARKER not in output
+        and '"name":"Skill"' not in output
+        and not _has_command_event(output)
+    )
+
+
 def _run_native_discovery_probe(root: Path, provider: str):
     """Run the provider proof; kept as the deterministic CI seam."""
     from agentflow.runner import ClaudeRunner, CodexRunner, run_provider_discovery_probe
 
-    prompt = (
-        f"Invoke the project-local skill named {NATIVE_DISCOVERY_SKILL} using only native "
-        "skill discovery. Do not use shell commands, search files, read files, or inspect "
-        "configuration. If it is unavailable, reply exactly SKILL_UNAVAILABLE."
-    )
+    prompt = native_discovery_prompt(provider)
     argv = (
         ClaudeRunner().structured_argv(prompt, "sonnet", str(root))
         if provider == "claude"
@@ -260,13 +312,7 @@ def prove_native_discovery(root: str | Path, provider: str) -> tuple[bool, str]:
         clear_native_discovery_receipt(checkout, provider)
         result = _run_native_discovery_probe(checkout, provider)
         output = (result.stdout or "") + (result.stderr or "")
-        proven = result.returncode == 0 and NATIVE_DISCOVERY_MARKER in output
-        if provider == "claude":
-            proven = proven and '"name":"Skill"' in output and (
-                f'"skill":"{NATIVE_DISCOVERY_SKILL}"' in output
-            )
-        else:
-            proven = proven and '"type":"command_execution"' not in output
+        proven = result.returncode == 0 and native_discovery_output_is_proof(provider, output)
         if not proven:
             return False, f"{provider} did not prove native project skill discovery"
         receipt = record_native_discovery_receipt(checkout, provider)
