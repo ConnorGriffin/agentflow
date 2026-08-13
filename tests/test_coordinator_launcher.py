@@ -432,6 +432,29 @@ def test_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_pat
     assert _build_observation(record).timed_out is False
 
 
+def test_bounded_worker_untracked_addition_renews_build_silence(coord_state, tmp_path):
+    """A non-ignored untracked implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    added = source / "new.py"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('new implementation\\n')\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(added)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-untracked-addition", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker untracked addition did not exit")
+    assert added.read_text() == "new implementation\n"
+    assert _build_observation(record).timed_out is False
+
+
 def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_path):
     """Deleting a tracked implementation file is a durable worker progress state."""
     source, target = _tracked_build(tmp_path)
