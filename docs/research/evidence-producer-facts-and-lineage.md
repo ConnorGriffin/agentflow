@@ -209,13 +209,14 @@ durable content budget. [evidence_contract.py](../../agentflow/evidence_contract
 Keep `contract-v1.json` and every `*-v1.json` fixture immutable. Add
 `contract-v2.json`, positive arm fixtures, and negative fixtures for arm mixing,
 unknown vocabularies, positive facts with a failure class, review action on another
-kind, missing or unknown validation state, forward or missing links, non-dense ordering,
-unbounded links, raw text, and v1/v2 parsing. Both `unvalidated` and `refuted` are positive
+kind, missing or unknown validation state, non-dense ordering, unbounded links, raw text,
+and v1/v2 parsing. Missing/forward target resolution belongs to `EvidenceStore.observe`
+tests because the standalone JSON validator has no store graph. Both `unvalidated` and `refuted` are positive
 contract fixtures and negative briefing-filter cases. Public-interface
 tests call `observe`, not tables, to prove v1 replay identity, v2 producer identity,
 resolved-only link order/DAG construction, rejection, redaction, retention, explicit
 validation handling, and a request revision → criterion → finding/fix → merge-or-park
-chain. Fixtures for #581 must also prove edited source revisions make new criterion IDs,
+chain. Fixtures for #581 must also prove edited subject revisions make new criterion IDs,
 and two findings/one fix can carry both links; #581 proves the adapter supplied the
 complete actionable set rather than inventing per-finding lineage.
 
