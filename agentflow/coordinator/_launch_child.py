@@ -349,30 +349,39 @@ def _hash_frame(digest, tag: bytes, value: bytes) -> None:
     digest.update(value)
 
 
+def _close_fd(fd: int) -> None:
+    """Release a snapshot descriptor without letting cleanup obscure a failed observation."""
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 def _worktree_member(root: Path, encoded: bytes) -> tuple[int, str] | None:
     """Open a no-symlink parent inside ``root`` for one Git-relative filename."""
+    parent: int | None = None
     try:
         relative = Path(os.fsdecode(encoded))
         if relative.is_absolute() or not relative.parts or any(
                 component in ("", ".", "..") for component in relative.parts):
             return None
-        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        if hasattr(os, "O_DIRECTORY"):
-            flags |= os.O_DIRECTORY
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW | os.O_DIRECTORY
         parent = os.open(root, flags)
         for component in relative.parts[:-1]:
             child = os.open(component, flags, dir_fd=parent)
-            os.close(parent)
+            _close_fd(parent)
             parent = child
     except (OSError, UnicodeError, ValueError):
+        if parent is not None:
+            _close_fd(parent)
         return None
     return parent, relative.name
 
 
 def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
     """Write one bounded digest of Git-enforced changed and untracked worktree state."""
+    if not all(hasattr(os, flag) for flag in ("O_NOFOLLOW", "O_DIRECTORY")):
+        return
     try:
         root = Path(working_dir).resolve(strict=True)
     except (OSError, ValueError):
@@ -407,87 +416,84 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
 
     digest = hashlib.sha256()
     total = 0
-    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
+    flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0) | os.O_NOFOLLOW
     for status, encoded, prior_path in paths:
         member = _worktree_member(root, encoded)
+        if member is None:
+            return
         prior_member = _worktree_member(root, prior_path) if prior_path is not None else None
-        if member is None or (prior_path is not None and prior_member is None):
+        if prior_path is not None and prior_member is None:
+            _close_fd(member[0])
             return
         parent_fd, name = member
-        if prior_member is not None:
-            os.close(prior_member[0])
-        structural_change = any(change in status for change in b"ADRC")
-        if status != b"??" and encoded not in content_paths and not structural_change:
-            os.close(parent_fd)
-            continue
-        record = hashlib.sha256()
-        _hash_frame(record, b"path", encoded)
-        if prior_path is not None:
-            _hash_frame(record, b"prior-path", prior_path)
         try:
-            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            os.close(parent_fd)
-            if b"D" not in status:
-                return
-            _hash_frame(digest, b"deletion-record", record.digest())
-            continue
-        except (OSError, ValueError):
-            os.close(parent_fd)
-            return
-        if stat.S_ISLNK(before.st_mode):
+            if prior_member is not None:
+                _close_fd(prior_member[0])
+                prior_member = None
+            structural_change = any(change in status for change in b"ADRC")
+            if status != b"??" and encoded not in content_paths and not structural_change:
+                continue
+            record = hashlib.sha256()
+            _hash_frame(record, b"path", encoded)
+            if prior_path is not None:
+                _hash_frame(record, b"prior-path", prior_path)
             try:
-                target = os.fsencode(os.readlink(name, dir_fd=parent_fd))
-            except OSError:
-                os.close(parent_fd)
+                before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if b"D" not in status:
+                    return
+                _hash_frame(digest, b"deletion-record", record.digest())
+                continue
+            except (OSError, ValueError):
                 return
-            if len(target) > _WORKTREE_FILE_BYTES:
-                os.close(parent_fd)
-                return
-            _hash_frame(record, b"symlink-target", target)
-            total += len(target)
-        elif stat.S_ISREG(before.st_mode):
-            if before.st_size > _WORKTREE_FILE_BYTES:
-                os.close(parent_fd)
-                return
-            try:
-                fd = os.open(name, flags, dir_fd=parent_fd)
+            if stat.S_ISLNK(before.st_mode):
                 try:
-                    chunks: list[bytes] = []
-                    remaining = _WORKTREE_FILE_BYTES + 1
-                    while remaining:
-                        chunk = os.read(fd, min(64 * 1024, remaining))
-                        if not chunk:
-                            break
-                        chunks.append(chunk)
-                        remaining -= len(chunk)
-                    after = os.fstat(fd)
-                finally:
-                    os.close(fd)
-            except OSError:
-                os.close(parent_fd)
+                    target = os.fsencode(os.readlink(name, dir_fd=parent_fd))
+                except OSError:
+                    return
+                if len(target) > _WORKTREE_FILE_BYTES:
+                    return
+                _hash_frame(record, b"symlink-target", target)
+                total += len(target)
+            elif stat.S_ISREG(before.st_mode):
+                if before.st_size > _WORKTREE_FILE_BYTES:
+                    return
+                try:
+                    fd = os.open(name, flags, dir_fd=parent_fd)
+                    try:
+                        chunks: list[bytes] = []
+                        remaining = _WORKTREE_FILE_BYTES + 1
+                        while remaining:
+                            chunk = os.read(fd, min(64 * 1024, remaining))
+                            if not chunk:
+                                break
+                            chunks.append(chunk)
+                            remaining -= len(chunk)
+                        after = os.fstat(fd)
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    return
+                content = b"".join(chunks)
+                if (len(content) > _WORKTREE_FILE_BYTES or before.st_ino != after.st_ino
+                        or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns):
+                    return
+                _hash_frame(record, b"file-content", content)
+                total += len(content)
+            else:
                 return
-            content = b"".join(chunks)
-            if (len(content) > _WORKTREE_FILE_BYTES or before.st_ino != after.st_ino
-                    or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns):
-                os.close(parent_fd)
+            if total > _WORKTREE_TOTAL_BYTES:
                 return
-            _hash_frame(record, b"file-content", content)
-            total += len(content)
-        else:
-            os.close(parent_fd)
-            return
-        os.close(parent_fd)
-        if total > _WORKTREE_TOTAL_BYTES:
-            return
-        record_type = (b"untracked-record" if status == b"??" else
-                       b"rename-record" if b"R" in status else
-                       b"copy-record" if b"C" in status else
-                       b"addition-record" if b"A" in status else
-                       b"content-record")
-        _hash_frame(digest, record_type, record.digest())
+            record_type = (b"untracked-record" if status == b"??" else
+                           b"rename-record" if b"R" in status else
+                           b"copy-record" if b"C" in status else
+                           b"addition-record" if b"A" in status else
+                           b"content-record")
+            _hash_frame(digest, record_type, record.digest())
+        finally:
+            if prior_member is not None:
+                _close_fd(prior_member[0])
+            _close_fd(parent_fd)
     os.write(write_fd, digest.digest())
 
 

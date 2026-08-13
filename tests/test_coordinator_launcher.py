@@ -1093,6 +1093,183 @@ def test_malicious_git_paths_cannot_renew_build_silence(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("missing_flag", ["O_NOFOLLOW", "O_DIRECTORY"])
+def test_missing_containment_primitive_cannot_renew_build_silence(
+        coord_state, tmp_path, monkeypatch, missing_flag):
+    """Build fails closed before observing worktree state without either containment primitive."""
+    source, target = _tracked_build(tmp_path)
+    changed = source / "changed.py"
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"external bytes must remain unread")
+    target.unlink()
+    target.symlink_to(outside)
+    custom = tmp_path / "missing-primitive-instrumentation"
+    custom.mkdir()
+    external_read = tmp_path / "external-read"
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib\n"
+        "_open=os.open\n"
+        "_read=os.read\n"
+        "external_fds=set()\n"
+        "delattr(os, os.environ['AGENTFLOW_TEST_MISSING_FLAG'])\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if path == os.environ['AGENTFLOW_TEST_EXTERNAL_NAME'] and flags & os.O_NONBLOCK:\n"
+        "  external_fds.add(result)\n"
+        " return result\n"
+        "def read(fd,size):\n"
+        " if fd in external_fds: pathlib.Path(os.environ['AGENTFLOW_TEST_EXTERNAL_READ']).write_text('read')\n"
+        " return _read(fd,size)\n"
+        "os.open=open\n"
+        "os.read=read\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_MISSING_FLAG", missing_flag)
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_NAME", target.name)
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_READ", str(external_read))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "missing-primitive-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.08)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.16)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(changed), str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.80)))
+    identity = coord.submit_stage(_build("codex", "missing-primitive", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "missing primitive retained Build silence")
+    assert not external_read.exists()
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_file_replaced_with_external_symlink_cannot_renew_build_silence(
+        coord_state, tmp_path, monkeypatch):
+    """A replacement after lstat cannot make the bounded reader consume external bytes."""
+    source, target = _tracked_build(tmp_path)
+    outside = tmp_path / "outside"
+    outside.write_bytes(b"external bytes must remain unread")
+    custom = tmp_path / "replacement-instrumentation"
+    custom.mkdir()
+    replaced = tmp_path / "replacement-observed"
+    external_read = tmp_path / "external-read"
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib\n"
+        "_open=os.open\n"
+        "_read=os.read\n"
+        "external_fds=set()\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " if (path == os.environ['AGENTFLOW_TEST_REPLACED_NAME']\n"
+        "     and flags & os.O_NONBLOCK):\n"
+        "  target=pathlib.Path(os.environ['AGENTFLOW_TEST_REPLACED_TARGET'])\n"
+        "  target.unlink()\n"
+        "  target.symlink_to(os.environ['AGENTFLOW_TEST_REPLACED_OUTSIDE'])\n"
+        "  pathlib.Path(os.environ['AGENTFLOW_TEST_REPLACED_MARKER']).write_text('replaced')\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if path == os.environ['AGENTFLOW_TEST_REPLACED_NAME']: external_fds.add(result)\n"
+        " return result\n"
+        "def read(fd,size):\n"
+        " if fd in external_fds: pathlib.Path(os.environ['AGENTFLOW_TEST_EXTERNAL_READ']).write_text('read')\n"
+        " return _read(fd,size)\n"
+        "os.open=open\n"
+        "os.read=read\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_NAME", target.name)
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_TARGET", str(target))
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_OUTSIDE", str(outside))
+    monkeypatch.setenv("AGENTFLOW_TEST_REPLACED_MARKER", str(replaced))
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_READ", str(external_read))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "replacement-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.05)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.19)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(target), str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.80)))
+    identity = coord.submit_stage(_build("codex", "replacement-race", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "replacement race retained Build silence")
+    assert replaced.exists(), "snapshot did not reach the replacement race"
+    assert target.is_symlink()
+    assert not external_read.exists()
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_failed_rename_prior_path_closes_worktree_descriptors_and_cannot_renew_silence(
+        coord_state, tmp_path, monkeypatch):
+    """A rejected rename prior path releases both parent descriptors before Build times out."""
+    source, target = _tracked_build(tmp_path)
+    fake_bin = tmp_path / "rename-failure-git"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        " *\" status \"*) printf 'R  implementation.py\\0nested/file\\0' ;;\n"
+        " *\" diff \"*) printf '0\\t0\\timplementation.py\\0' ;;\n"
+        f" *) exec {shlex.quote(real_git)} \"$@\" ;;\n"
+        "esac\n")
+    fake_git.chmod(0o755)
+    custom = tmp_path / "rename-failure-instrumentation"
+    custom.mkdir()
+    closed = tmp_path / "closed-root-descriptors"
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib\n"
+        "_open=os.open\n"
+        "_close=os.close\n"
+        "roots=set()\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " if os.fspath(path) == 'nested': raise OSError('deterministic prior-path failure')\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if os.fspath(path) == os.environ['AGENTFLOW_TEST_WORKTREE_ROOT']: roots.add(result)\n"
+        " return result\n"
+        "def close(fd):\n"
+        " if fd in roots:\n"
+        "  with pathlib.Path(os.environ['AGENTFLOW_TEST_CLOSED_ROOTS']).open('a') as stream: stream.write('x')\n"
+        " return _close(fd)\n"
+        "os.open=open\n"
+        "os.close=close\n")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("AGENTFLOW_TEST_WORKTREE_ROOT", str(source))
+    monkeypatch.setenv("AGENTFLOW_TEST_CLOSED_ROOTS", str(closed))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "rename-failure-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.05)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.19)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(target), str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.80)))
+    identity = coord.submit_stage(_build("codex", "rename-fd-cleanup", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "failed rename prior path retained Build silence")
+    assert closed.read_text().count("x") >= 2
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
 def _run_clocked_supervisor(
         tmp_path, monkeypatch, *, build_lease, exit_at, heads=(None,)):
     """Run the production supervisor interface against an exact monotonic timeline."""
