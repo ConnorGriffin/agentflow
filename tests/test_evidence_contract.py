@@ -40,30 +40,60 @@ def test_each_manifest_is_exact_and_required(tmp_path, change):
         validate_fixtures(corpus)
 
 
-def test_directory_and_known_file_io_errors_use_only_sentinel_or_basename(tmp_path, monkeypatch):
-    corpus = _corpus(tmp_path)
-    original_iterdir = Path.iterdir
-
-    def unreadable_directory(path):
-        if path == corpus:
-            raise OSError("private directory detail")
-        return original_iterdir(path)
-
-    monkeypatch.setattr(Path, "iterdir", unreadable_directory)
+def test_directory_and_known_file_io_errors_use_only_sentinel_or_basename(tmp_path):
+    corpus = tmp_path / "missing-evidence"
     with pytest.raises(EvidenceError, match=r"<corpus>: io$"):
         validate_fixtures(corpus)
-    monkeypatch.setattr(Path, "iterdir", original_iterdir)
 
-    original_read_text = Path.read_text
-
-    def unreadable_file(path, *args, **kwargs):
-        if path.name == "positive-producer-refuted-v2.json":
-            raise OSError("private file detail")
-        return original_read_text(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "read_text", unreadable_file)
+    corpus = _corpus(tmp_path)
+    fixture = corpus / "positive-producer-refuted-v2.json"
+    fixture.unlink()
+    fixture.mkdir()
     with pytest.raises(EvidenceError, match=r"positive-producer-refuted-v2\.json: io$"):
         validate_fixtures(corpus)
+
+
+def test_fixture_symlink_with_traversal_target_never_reads_outside_corpus(tmp_path):
+    corpus = _corpus(tmp_path)
+    basename = "positive-producer-refuted-v2.json"
+    fixture = corpus / basename
+    outside = tmp_path / "outside.json"
+    fixture.rename(outside)
+    fixture.symlink_to(Path("..") / outside.name)
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+    assert str(caught.value) == f"{basename}: io"
+
+
+def test_fixture_symlink_with_absolute_target_never_reads_outside_corpus(tmp_path):
+    corpus = _corpus(tmp_path)
+    basename = "positive-producer-refuted-v2.json"
+    fixture = corpus / basename
+    outside = tmp_path / "outside.json"
+    fixture.rename(outside)
+    fixture.symlink_to(outside)
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+    assert str(caught.value) == f"{basename}: io"
+
+
+def test_fixture_symlink_chain_never_escapes_corpus(tmp_path):
+    corpus = _corpus(tmp_path)
+    basename = "positive-producer-refuted-v2.json"
+    fixture = corpus / basename
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fixture.rename(outside / "fixture.json")
+    readme = corpus / "README.md"
+    readme.unlink()
+    readme.symlink_to(outside, target_is_directory=True)
+    fixture.symlink_to(Path("README.md") / "fixture.json")
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+    assert str(caught.value) == f"{basename}: io"
 
 
 def test_decoded_fault_precedence_selects_redaction_before_shape_type_and_vocabulary(tmp_path):

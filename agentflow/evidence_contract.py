@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 from typing import Any
 
@@ -18,6 +20,7 @@ _FORBIDDEN = frozenset({"prompt", "prompts", "transcript", "transcripts", "sourc
                         "text", "raw", "metadata", "reason"})
 _REASON_CODES = frozenset({"duplicate-key", "shape", "type", "vocabulary", "redaction",
                            "suffix", "manifest", "json", "io"})
+_MANIFESTS = frozenset({"contract-v1.json", "contract-v2.json"})
 _V1_FIELDS = {"observation_id", "subject", "failure_class", "validation_state",
               "signature_digest", "normalizer_version", "source", "observed_at",
               "reviewed_parent_revision", "fixer_revision"}
@@ -65,21 +68,43 @@ def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return value
 
 
-def _read(path: Path, basename: str) -> str:
+def _read(directory_fd: int, basename: str) -> str:
+    path = Path(basename)
+    if (path.is_absolute() or path.name != basename
+            or (basename not in _MANIFESTS and _FIXTURE.fullmatch(basename) is None)):
+        raise _ContractFailure("<corpus>", "io")
+    descriptor: int | None = None
     try:
-        return path.read_text(encoding="utf-8")
+        descriptor = os.open(
+            basename,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode):
+            raise OSError
+        body = bytearray()
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            body.extend(chunk)
+        return body.decode("utf-8")
     except (OSError, UnicodeError) as exc:
         raise _ContractFailure(basename, "io") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
-def _decode(path: Path) -> Any:
-    body = _read(path, path.name)
+def _decode(directory_fd: int, basename: str) -> Any:
+    body = _read(directory_fd, basename)
     try:
         return json.loads(body, object_pairs_hook=_pairs)
     except json.JSONDecodeError as exc:
-        raise _ContractFailure(path.name, "json") from exc
+        raise _ContractFailure(basename, "json") from exc
     except _DuplicateKey as exc:
-        raise _ContractFailure(path.name, "duplicate-key") from exc
+        raise _ContractFailure(basename, "duplicate-key") from exc
 
 
 def _has_forbidden(value: Any) -> bool:
@@ -327,59 +352,67 @@ def _negative_reason(slug: str) -> str | None:
                  if slug.startswith(code + "-")), None)
 
 
-def _manifest(directory: Path, version: int, expected: dict[str, Any]) -> None:
-    path = directory / f"contract-v{version}.json"
+def _manifest(directory_fd: int, version: int, expected: dict[str, Any]) -> None:
+    basename = f"contract-v{version}.json"
     try:
-        actual = json.loads(_read(path, path.name), object_pairs_hook=_pairs)
+        actual = json.loads(_read(directory_fd, basename), object_pairs_hook=_pairs)
     except (json.JSONDecodeError, _DuplicateKey) as exc:
-        raise _ContractFailure(path.name, "manifest") from exc
+        raise _ContractFailure(basename, "manifest") from exc
     if actual != expected:
-        raise _ContractFailure(path.name, "manifest")
+        raise _ContractFailure(basename, "manifest")
 
 
 def validate_fixtures(directory: Path) -> None:
+    directory_fd: int | None = None
     try:
-        files = sorted(directory.iterdir(), key=lambda path: path.name)
-    except OSError as exc:
-        raise _ContractFailure("<corpus>", "io") from exc
-    names = {path.name for path in files}
-    routed: list[tuple[Path, str, str, int]] = []
-    seen: set[tuple[int, str]] = set()
-    for path in files:
-        if path.name in {"contract-v1.json", "contract-v2.json", "README.md"}:
-            continue
-        match = _FIXTURE.fullmatch(path.name)
-        if match is None:
-            raise _ContractFailure(path.name, "suffix")
-        polarity, slug, version_text = match.groups()
-        version = int(version_text)
-        identity = (version, slug)
-        if identity in seen:
-            raise _ContractFailure(path.name, "suffix")
-        seen.add(identity)
-        routed.append((path, polarity, slug, version))
-    for version in (1, 2):
-        if f"contract-v{version}.json" not in names:
-            raise _ContractFailure(f"contract-v{version}.json", "manifest")
-    _manifest(directory, 1, _V1_MANIFEST)
-    _manifest(directory, 2, _V2_MANIFEST)
-    for path, polarity, slug, version in routed:
-        try:
-            value = _decode(path)
-        except _ContractFailure as failure:
-            if polarity == "negative" and version == 2 and _negative_reason(slug) == failure.code:
+        directory_fd = os.open(directory, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+        basenames = sorted(os.listdir(directory_fd))
+        names = set(basenames)
+        routed: list[tuple[str, str, str, int]] = []
+        seen: set[tuple[int, str]] = set()
+        for basename in basenames:
+            if basename in _MANIFESTS | {"README.md"}:
                 continue
-            raise
-        reason = _v1_reason(value) if version == 1 else _v2_reason(value)
-        if polarity == "positive":
-            if reason is not None:
-                raise _ContractFailure(path.name, reason)
-        elif version == 2:
-            expected_reason = _negative_reason(slug)
-            if expected_reason is None or reason != expected_reason:
-                raise _ContractFailure(path.name, reason or "shape")
-        elif reason is None:
-            raise _ContractFailure(path.name, "shape")
+            match = _FIXTURE.fullmatch(basename)
+            if match is None:
+                raise _ContractFailure(basename, "suffix")
+            polarity, slug, version_text = match.groups()
+            version = int(version_text)
+            identity = (version, slug)
+            if identity in seen:
+                raise _ContractFailure(basename, "suffix")
+            seen.add(identity)
+            routed.append((basename, polarity, slug, version))
+        for version in (1, 2):
+            if f"contract-v{version}.json" not in names:
+                raise _ContractFailure(f"contract-v{version}.json", "manifest")
+        _manifest(directory_fd, 1, _V1_MANIFEST)
+        _manifest(directory_fd, 2, _V2_MANIFEST)
+        for basename, polarity, slug, version in routed:
+            try:
+                value = _decode(directory_fd, basename)
+            except _ContractFailure as failure:
+                if (polarity == "negative" and version == 2
+                        and _negative_reason(slug) == failure.code):
+                    continue
+                raise
+            reason = _v1_reason(value) if version == 1 else _v2_reason(value)
+            if polarity == "positive":
+                if reason is not None:
+                    raise _ContractFailure(basename, reason)
+            elif version == 2:
+                expected_reason = _negative_reason(slug)
+                if expected_reason is None or reason != expected_reason:
+                    raise _ContractFailure(basename, reason or "shape")
+            elif reason is None:
+                raise _ContractFailure(basename, "shape")
+    except _ContractFailure:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        raise _ContractFailure("<corpus>", "io") from exc
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 def main() -> int:
