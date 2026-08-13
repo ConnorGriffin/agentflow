@@ -9,7 +9,7 @@ This is a structure recommendation, not a rewrite of `README.md` or any product 
   `5fa5e867ffde8326a94d9cb2db55e24df8500f0f`, clean at audit start.
 - Repository sources only: `README.md`, checked-in Markdown/JSON, Python/Svelte source,
   tests, `CONTEXT.md`, `PRODUCT.md`, `DESIGN.md`, `AGENTS.md`, and ADRs.
-- README size: 344 lines, one H1, 14 H2 headings, and 6 H3 headings.
+- README size: 344 lines, one H1, 14 H2 headings, and 5 H3 headings.
 - Documentation tree: 112 Markdown files; 84 ADR/research-history records under `docs/adr`,
   22 research notes under `docs/research`, 20 evidence JSON fixtures/contracts, 75 screenshot
   artifacts, and the small operational homes `docs/capabilities.md`,
@@ -29,7 +29,7 @@ This is a structure recommendation, not a rewrite of `README.md` or any product 
 | Skills/capabilities | `agentflow/capabilities.toml`, `agentflow/provider_skills.py`, `docs/capabilities.md`, enrolled skill | Inline in “How skills are invoked” and “Repository capabilities” | Move setup/generated-contract detail to existing capabilities doc; keep one short conceptual pointer. |
 | Installation/enrollment/recovery | `agentflow/cli.py`, `enroll.py`, `repo_facts.py`, `docs/capabilities.md`, ADR 0049 | Large “Quick start” plus recovery section | Move to a new `docs/getting-started.md`; README retains a minimal path. |
 | Service, pause/drain, diagnosis, rollback | `agentflow/macos_service.py`, `daemon.py`, `pool_control.py`, `docs/coordinator-operations.md`, ADR 0051 | Split between Start, notifications, and Operations | Existing operations doc is the authority; README keeps commands and links only. |
-| Evidence contracts | `agentflow/evidence*.py`, `docs/evidence/README.md`, contract JSON, ADRs 0580/0581/0596 | Not yet described coherently in README | Existing evidence index is the authority; link it from the future pipeline/learning section. |
+| Evidence contracts | `agentflow/evidence*.py`, `docs/evidence/README.md`, contract JSON, ADRs 580/581/596 | Not yet described coherently in README | Existing evidence index is the authority; link it from the future pipeline/learning section. |
 | Public beta/policy/support | `docs/public-beta.md`, `COMPATIBILITY.md`, `SECURITY.md`, `SUPPORT.md`, `GOVERNANCE.md`, LICENSE/NOTICE | README “Project policy” repeats boundary facts | Keep a concise policy link list; detailed promises stay in their existing homes. |
 | UI/console | `agentflow/webui/`, `agentflow/webapp.py`, `PRODUCT.md`, `DESIGN.md`, ADRs 0023/0026/0048 | Mentioned in mental model, current state, enrollment | README states read-only projection only; UI behavior/design stays in product/design/ADR sources. |
 | Learning pipeline future surface | `agentflow/evidence_pipeline.py` and related modules plus ADR/issue records | Absent or only implied by current evidence wording | Do not invent a guide now. Reserve a later `docs/learning-pipeline.md` only after the merged contract exists. |
@@ -53,13 +53,13 @@ owns the explanation. “New” names are proposals only; this audit does not cr
 | `## Quick start` | Move | New `docs/getting-started.md` | Requirements, install, enroll, capacity, start, and recovery form one runnable procedure. |
 | `### Requirements` | Move | New `docs/getting-started.md` | Version/runtime prerequisites need one maintained home. |
 | `### Install` | Move | New `docs/getting-started.md` | Clone and dependency setup belong to onboarding. |
-| `### Enroll a repository` | Move | Existing `docs/capabilities.md` plus new getting-started pointer | Generated contract detail already has a home; onboarding should link, not repeat it. |
-| `### Calibrate provider capacity` | Move | Existing `docs/coordinator-operations.md` or new `docs/getting-started.md` subsection | The command is onboarding plus operational capacity policy; choose one owner during rewrite and link the other. Recommendation: getting-started owns first calibration, operations owns diagnosis. |
+| `### Enroll a repository` | Move | New `docs/getting-started.md` | Getting-started owns the enrollment procedure and links to `docs/capabilities.md` for generated-contract details. |
+| `### Calibrate provider capacity` | Move | New `docs/getting-started.md` | Getting-started owns first calibration; it links to `docs/coordinator-operations.md` for later diagnosis without repeating that procedure. |
 | `### Start` | Move | Existing `docs/coordinator-operations.md` | Service install, pause/resume, pool controls, paths, and restart semantics are operations. |
 | `## Repository capabilities` | Move | Existing `docs/capabilities.md` | This document already explains enrollment, generated skills, and optional integrations. |
 | `## Recover on a new machine` | Move | New `docs/getting-started.md` | It is the second onboarding path and should share prerequisites/enrollment instructions. |
 | `## Foreground notifications` | Move | Existing `docs/coordinator-operations.md` | Environment/service inheritance and sensitive notification configuration are operating rules. |
-| `## Operations and development` | Move | Existing `docs/coordinator-operations.md`; `CONTRIBUTING.md`; new pipeline pointer | README should link the operational and contributor homes, not summarize each command. |
+| `## Operations and development` | Move and split | `docs/coordinator-operations.md` for operating behavior; `CONTRIBUTING.md` for development | The mixed heading becomes two README pointers. Each target owns one non-overlapping reader task. |
 | `## Support AgentFlow` | Keep | README; `SUPPORT.md` | Small sponsorship/support boundary is appropriate at the front door. |
 | `## Project policy` | Update in-place | README link list; `docs/public-beta.md`, `COMPATIBILITY.md`, `SECURITY.md`, `SUPPORT.md`, `GOVERNANCE.md` | Keep the clone-only beta sentence and links; remove duplicated promises and guarantees. |
 
@@ -92,6 +92,21 @@ Historical `docs/research/*`, `docs/adr/*`, evidence fixtures, and screenshots r
 evidence/history. They should not all be promoted to README navigation; the ADR index and evidence
 index are the controlled gateways.
 
+The rewritten README uses these exact pointer labels and targets:
+
+| README pointer | Exact target |
+| --- | --- |
+| Get started | `docs/getting-started.md` |
+| Understand the pipeline | `docs/pipeline.md` |
+| Operate AgentFlow | `docs/coordinator-operations.md` |
+| Repository capabilities | `docs/capabilities.md` |
+| Evidence contracts | `docs/evidence/README.md` |
+| Learning pipeline | `docs/learning-pipeline.md`, added only when that deferred guide lands |
+| Contribute | `CONTRIBUTING.md` |
+| Product and design | `PRODUCT.md` and `DESIGN.md` |
+| Decisions | `docs/adr/README.md` |
+| Policy and support | `docs/public-beta.md`, `COMPATIBILITY.md`, `SECURITY.md`, `SUPPORT.md`, and `GOVERNANCE.md` |
+
 ## One-authority and pointer rules
 
 1. README is an index and first read, not a second specification. It may state a boundary in one
@@ -103,7 +118,8 @@ index are the controlled gateways.
 4. Python source, checked-in manifests, JSON contracts, and tests own executable behavior. Docs
    describe observed behavior and link to the relevant source/test; prose never upgrades a
    hypothesis or ADR proposal into a fact.
-5. `docs/capabilities.md` owns enrollment/generated-capability facts; `docs/coordinator-operations.md`
+5. `agentflow/capabilities.toml` owns generated-capability facts and pins;
+   `docs/capabilities.md` explains that manifest and its workflows; `docs/coordinator-operations.md`
    owns service/operator procedures; `docs/evidence/README.md` and its manifests own evidence
    wire contracts; `docs/public-beta.md` owns beta promises and publication/rollback boundaries.
 6. Product and design language stays in `PRODUCT.md` and `DESIGN.md`; the README may link to the
@@ -154,4 +170,3 @@ research note exists.
   complete self-healing contract.
 - **Treat research notes as the public manual:** rejected; they contain limits, hypotheses, and
   historical alternatives, while current behavior belongs to code, tests, manifests, and ADRs.
-
