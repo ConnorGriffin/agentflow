@@ -13,6 +13,7 @@ from importlib.resources import files
 import tomllib
 from pathlib import Path
 from typing import Iterable
+import shutil
 
 
 @dataclass(frozen=True)
@@ -55,7 +56,15 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
     specs = {item["id"]: item for item in manifest["capabilities"]}
     evidence: list[str] = []
     states: list[str] = []
+    if provider not in {"claude", "codex"} or shutil.which(provider) is None:
+        states.append("incompatible")
+        evidence.append(f"{provider}: selected provider runtime is unavailable")
     for requirement in requirements:
+        if requirement.runtime:
+            if not (root / "scripts" / "screenshots.mjs").is_file():
+                states.append("incompatible")
+                evidence.append(f"{requirement.id}@{requirement.version}: pinned runtime is unavailable")
+            continue
         destinations = [root / ".agents" / "skills" / requirement.id,
                         root / ".claude" / "skills" / requirement.id]
         if not all(destination.is_dir() for destination in destinations):

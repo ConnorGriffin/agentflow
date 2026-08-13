@@ -20,6 +20,7 @@ injected launcher, gate, and observer collaborators.
 from __future__ import annotations
 
 import os
+import json
 import threading
 import time
 from dataclasses import dataclass
@@ -182,6 +183,8 @@ class Submission:
     continuation: bool = False        # admit ahead of cold work — a conflict Revise is a
                                       # continuation of nearly-merged work, not new build (ADR 0038)
     review: ReviewState | None = None
+    capability_root: str | None = None
+    capability_context: dict[str, bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -215,7 +218,7 @@ class Coordinator:
     public operation — the public surface is ``submit_stage``, ``cycle``, and ``park_completed``.
     """
 
-    def __init__(self, *, launcher=None, gate=None, adapter=None, log=None,
+    def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None, log=None,
                  daemon_generation: str | None = None,
                  disabled_cold_stages: frozenset[str] = frozenset()) -> None:
         self._store = Store(default_store_path())
@@ -224,6 +227,7 @@ class Coordinator:
         # Every adapter hook is optional; StageCalls owns the default for each one, so the
         # coordinator never carries a second copy of them (ADR 0030).
         self._adapter = StageCalls(adapter or _DefaultAdapter())
+        self._capability_preflight = capability_preflight or (lambda _record: None)
         # This process's daemon-lifecycle identity, stamped on every attempt it admits. A restart
         # is a new process with a new pid, so an attempt found dead under a *different* generation
         # — and leaving no supervisor end fact — was taken down with the daemon, not by the
@@ -285,6 +289,8 @@ class Coordinator:
             builder_effort=submission.builder_effort, round=submission.round,
             conflict_round=submission.conflict_round, resume=submission.resume,
             source=submission.source, input_ptr=submission.input_ptr, lineage=lineage,
+            capability_root=submission.capability_root,
+            capability_context=json.dumps(submission.capability_context or {}, sort_keys=True),
             session_lead=submission.session_lead,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
@@ -729,6 +735,20 @@ class Coordinator:
         # The state this cycle observes is compared against the durable one at the end, so a
         # refusal that genuinely changes nothing costs no write (#405).
         was_refused = _refusal_state(record)
+        capability = self._capability_preflight(record)
+        if capability is not None and not capability.ready:
+            record.capability_preflight = json.dumps({
+                "stage": capability.stage, "provider": capability.provider,
+                "contracts": [f"{item.id}@{item.version}" for item in capability.contracts],
+                "state": capability.state, "evidence": capability.evidence,
+                "repair_command": capability.repair_command,
+            }, sort_keys=True)
+            record.hold_reason = "environment_failure — " + record.capability_preflight
+            self._hold(record)
+            self._emit(record, f"environment_failure {capability.state}; claim retained; "
+                              f"repair: {capability.repair_command}")
+            self._finalize_hold(record)
+            return "unprepared"
         try:
             validate_session_lead_input(record)
         except SessionLeadInputError as exc:
@@ -1197,7 +1217,8 @@ class Coordinator:
                 current.notifications = 1
             current.state = HELD
             current.hold_pending = False
-            current.claim = False
+            if not (current.hold_reason or "").startswith("environment_failure — "):
+                current.claim = False
             return True
 
         held = self._store.transition(record, hold, retire_descendants=True)

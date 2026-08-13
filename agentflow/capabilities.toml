@@ -10,6 +10,12 @@ tag = "v0.3.0"
 commit = "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
 skills = ["ui-craft", "drive-local-webapp"]
 
+[methodology_skills]
+source = "https://github.com/ConnorGriffin/skills"
+tag = "v0.3.0"
+commit = "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+skills = ["tdd", "codebase-design", "domain-modeling"]
+
 [[capabilities]]
 id = "tdd"
 description = "the pinned vertical public-interface test workflow"

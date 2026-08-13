@@ -26,7 +26,7 @@ from pathlib import Path
 from agentflow import github, worktree_ref
 from agentflow.intake import held_build_result
 from agentflow.labels import BUILDING, complexity_from_labels, effort_from_labels
-from agentflow.prompts import BUILD_PROMPT
+from agentflow.prompts import stage_prompt_spec
 from agentflow.pool_control import POOLS, pool_paused
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
@@ -50,7 +50,7 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         return None
     sl = worktree_ref.slug(issue["title"])
     effort = effort_from_labels(labels).value
-    brief = BUILD_PROMPT.format(
+    brief = stage_prompt_spec("build").render(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort,
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
@@ -62,7 +62,8 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         complexity=complexity.value, effort=effort,
         source=WorktreeRef.for_build(cfg.workdir, parent_pool, n, sl).path, claim=True, input_ptr=brief,
         builder_lineage=parent_pool, branch_lineage=parent_pool, session_lead=True,
-        floodgates=floodgates)
+        floodgates=floodgates, capability_root=cfg.workdir,
+        capability_context={"ui": bool(surface_declaration(cfg.workdir).surfaces)})
 
 
 def resume_if_held(submission, records):

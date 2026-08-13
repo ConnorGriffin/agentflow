@@ -211,6 +211,21 @@ def _public_skill_destination_states(root: Path, manifest: dict) -> dict:
     }
 
 
+def _methodology_destination_states(root: Path, manifest: dict) -> dict:
+    names = manifest["methodology_skills"]["skills"]
+    specs = {item.get("skill"): item for item in manifest["capabilities"]}
+    return {(location, name): _skill_destination_status(root / location / name, specs[name]["files"])
+            for location in (".agents/skills", ".claude/skills") for name in names}
+
+
+def _methodology_problem(root: Path) -> str | None:
+    states = _methodology_destination_states(root, _manifest())
+    if all(state == "ok" for state in states.values()) or all(state == "absent" for state in states.values()):
+        return None
+    rendered = ", ".join(f"{location}/{name}={state}" for (location, name), state in states.items())
+    return f"existing methodology destinations are partial, conflicting, or drifted ({rendered})"
+
+
 def _skills_problem(
     root: Path, surfaces: tuple[str, ...], *, converge: bool = False
 ) -> str | None:
@@ -434,7 +449,13 @@ def doctor(workdir: str, *, stage: str | None = None, provider: str | None = Non
                 required_contracts = requirements_for(stage_name, {"ui": ui_context})
                 missing = [item for item in required_contracts
                            if item.id not in by_id or not by_id[item.id].available]
-                state = "ready" if providers.get(provider_name, False) and not missing else "missing"
+                if not providers.get(provider_name, False):
+                    state = "incompatible"
+                elif missing:
+                    state = ("drifted" if any(by_id[item.id].status == "drifted" for item in missing
+                                                if item.id in by_id) else "missing")
+                else:
+                    state = "ready"
                 evidence = ("pinned project-local contracts present",) if state == "ready" else tuple(
                     [f"{provider_name} is not on PATH"] * (not providers.get(provider_name, False))
                     + [f"{item.id}@{item.version} is not intact in both project-local roots" for item in missing]
@@ -720,6 +741,46 @@ def _install_connor_skills(root: Path) -> str:
     return "DO:   installed the pinned Connor skill pack"
 
 
+def _install_methodology_skills(root: Path) -> str:
+    """Install all method contracts atomically enough to reject any occupied destination.
+
+    The installer is allowed only when every declared provider-local destination is absent.  It
+    never reads global skill roots, so an ambient copy cannot satisfy nor be overwritten by this
+    recovery path.
+    """
+    manifest = _manifest()
+    source = manifest["methodology_skills"]
+    states = _methodology_destination_states(root, manifest)
+    if all(state == "ok" for state in states.values()):
+        return "ok:   methodology contracts already installed"
+    if any(state != "absent" for state in states.values()):
+        return "WARN: methodology destinations are partial, conflicting, or drifted; installer was not run"
+    resolved, error = _resolved_skill_release(manifest)
+    if error or resolved != source["commit"]:
+        return "WARN: methodology release could not be verified; installer was not run"
+    with tempfile.TemporaryDirectory(prefix="agentflow-methodology-") as temporary:
+        tree = Path(temporary) / "source"
+        for command in (["git", "clone", "--no-checkout", source["source"], str(tree)],
+                        ["git", "-C", str(tree), "checkout", "--detach", source["commit"]],
+                        ["git", "-C", str(tree), "rev-parse", "HEAD"]):
+            result = _run_command(command, timeout=120)
+            if result.returncode:
+                return "WARN: exact methodology source fetch failed"
+        if result.stdout.strip() != source["commit"]:
+            return "WARN: exact methodology source checkout did not match manifest"
+        command = ["npx", f"{manifest['skill_installer']['package']}@{manifest['skill_installer']['version']}",
+                   "add", str(tree)]
+        for name in source["skills"]:
+            command.extend(("--skill", name))
+        command.extend(("-a", "claude-code", "-a", "codex", "-y"))
+        result = _run_command(command, cwd=root, timeout=120)
+        if result.returncode:
+            return "WARN: methodology contract install failed"
+    if not all(state == "ok" for state in _methodology_destination_states(root, manifest).values()):
+        return "WARN: methodology installer completed but project-local contracts do not match manifest"
+    return "DO:   installed pinned methodology contracts"
+
+
 def _install_ui_runtime(root: Path) -> str:
     manifest = _manifest()
     specs = {item.get("skill"): item for item in manifest["capabilities"]}
@@ -902,6 +963,7 @@ def _apply_enrollment(
             )
         )
         outcomes.append(_install_connor_skills(root))
+        outcomes.append(_install_methodology_skills(root))
         outcomes.append(_install_ui_runtime(root))
     return outcomes
 
@@ -934,6 +996,7 @@ def enroll_repository(
             or _tooling_problem(surfaces)
             or _managed_files_problem(root, surfaces, converge=converge)
             or _skills_problem(root, surfaces, converge=converge)
+            or _methodology_problem(root)
         )
         if problem:
             print(f"  WARN: {problem} — repository left unchanged")

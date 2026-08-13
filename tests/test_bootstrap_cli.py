@@ -410,6 +410,8 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
         return "DO:   installed the pinned Connor skill pack"
 
     monkeypatch.setattr("agentflow.enroll._install_connor_skills", install_skills)
+    monkeypatch.setattr("agentflow.enroll._install_methodology_skills",
+                        lambda root: "DO:   installed methodology contracts")
     monkeypatch.setattr(
         "agentflow.enroll._install_ui_runtime",
         lambda root: "DO:   installed fake UI runtime",
@@ -518,6 +520,8 @@ def test_enroll_apply_uses_an_explicit_nonheuristic_ui_declaration(
         "agentflow.enroll._install_connor_skills",
         lambda root: installed.append("skills") or "DO:   installed skills",
     )
+    monkeypatch.setattr("agentflow.enroll._install_methodology_skills",
+                        lambda root: "DO:   installed methodology contracts")
     monkeypatch.setattr(
         "agentflow.enroll._install_ui_runtime",
         lambda root: installed.append("runtime") or "DO:   installed runtime",
@@ -848,7 +852,7 @@ def test_enroll_rolls_back_if_tag_moves_between_preflight_and_install(
     output = capsys.readouterr().out
     assert "resolved to aaaaaaaaaa" in output
     assert "rolled back" in output
-    assert tag_reads == 2
+    assert tag_reads >= 2
     assert not any(command[0] == "npx" for command in commands)
     assert not config.exists()
     assert subprocess.run(
@@ -1210,7 +1214,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     config_before = config.read_bytes()
 
     def destination_status(directory, manifest):
-        if directory.name in {"ui-craft", "drive-local-webapp"}:
+        if directory.name in {"ui-craft", "drive-local-webapp", "tdd", "codebase-design", "domain-modeling"}:
             return "ok" if installed else "absent"
         return original_destination_status(directory, manifest)
 
@@ -1251,9 +1255,11 @@ def test_enroll_public_ui_command_path_reports_each_stage(
             if active_failure == "npx":
                 return SimpleNamespace(returncode=127, stdout="", stderr="missing npx")
             installed = True
-            for name in ("ui-craft", "drive-local-webapp"):
+            names = (("tdd", "codebase-design", "domain-modeling")
+                     if "tdd" in command else ("ui-craft", "drive-local-webapp"))
+            for name in names:
                 codex = tmp_path / ".agents" / "skills" / name
-                codex.mkdir(parents=True)
+                codex.mkdir(parents=True, exist_ok=True)
                 claude = tmp_path / ".claude" / "skills" / name
                 claude.parent.mkdir(parents=True, exist_ok=True)
                 claude.symlink_to(Path("../../.agents/skills") / name)

@@ -19,6 +19,29 @@ from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.admission import ADMISSION_MATRIX, PERMIT_BUDGET, admission_demand
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.store import ReservationLimits
+from agentflow.capability_contracts import CapabilityPreflightResult, ContractRequirement
+
+
+@pytest.mark.parametrize("provider", ("claude", "codex"))
+def test_nonready_capability_preflight_holds_before_admission_and_survives_restart(
+        make_coord, provider):
+    session = FakeSession()
+    result = CapabilityPreflightResult(
+        stage="build", provider=provider, contracts=(ContractRequirement("tdd", "v0.3.0"),),
+        state="missing", evidence=("tdd project-local destination missing",),
+        repair_command="agentflow enroll /repo --apply")
+    coord = make_coord(session, capability_preflight=lambda _record: result)
+    ident = coord.submit_stage(Submission(repo="o/r", subject="5", stage="build", pool=provider,
+                                          effort="low"))
+
+    coord.cycle(provider)
+    held = record_of(coord, ident)
+    assert held.state == "held" and held.claim and held.attempts == 0
+    assert held.capability_preflight and "environment_failure" in held.hold_reason
+    assert permits(coord, provider) == 0 and not session.family_of
+
+    restarted = make_coord(session, capability_preflight=lambda _record: result)
+    assert record_of(restarted, ident).capability_preflight == held.capability_preflight
 
 
 def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):

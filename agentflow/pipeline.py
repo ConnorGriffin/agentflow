@@ -202,7 +202,18 @@ def build_coordinator(_log=None) -> Coordinator:
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse,
                           "research": research, "attack": attack})
-    return Coordinator(adapter=router, gate=_production_gate(),
+    def capability_preflight(record):
+        if not record.capability_root:
+            return None
+        from agentflow.capability_contracts import preflight
+        from agentflow.prompts import STAGE_PROMPTS, requirements_for
+        if record.stage not in STAGE_PROMPTS:
+            return None
+        import json
+        return preflight(record.capability_root, record.stage, record.pool,
+                         requirements_for(record.stage, json.loads(record.capability_context)))
+
+    return Coordinator(adapter=router, gate=_production_gate(), capability_preflight=capability_preflight,
                        disabled_cold_stages=frozenset({"mockup"}),
                        log=_log or (lambda _line: None))
 
