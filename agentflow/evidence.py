@@ -354,6 +354,19 @@ class EvidenceLink:
             raise EvidenceError("invalid link ordinal")
 
 
+def _producer_event_id(*, repository: str, subject_kind: str, subject: str,
+                       revision: str, locator: str, content_digest: str,
+                       producer_kind: str, fact_digest: str, normalizer: str,
+                       review_action: str, links: tuple[EvidenceLink, ...]) -> str:
+    import hashlib
+    parts = ["agentflow-evidence-producer-v2", repository, subject_kind, subject,
+             revision, locator, content_digest, producer_kind, fact_digest, normalizer,
+             review_action]
+    for link in links:
+        parts.extend((str(link.ordinal), link.relation, link.target_event_id))
+    return "event-" + hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
+
+
 @dataclass(frozen=True)
 class FailureFacts:
     failure_class: str
@@ -551,8 +564,7 @@ class EvidenceStore:
 
     @staticmethod
     def _validate_graph(conn: sqlite3.Connection) -> None:
-        events = {row["event_id"]: row for row in conn.execute(
-            "SELECT event_id, event_kind, repository, producer_kind FROM events")}
+        events = {row["event_id"]: row for row in conn.execute("SELECT * FROM events")}
         links_by_source: dict[str, list[sqlite3.Row]] = {}
         for link in conn.execute(
                 "SELECT source_event_id, ordinal, relation, target_event_id "
@@ -578,13 +590,51 @@ class EvidenceStore:
                 sources, targets = _LINEAGE_MATRIX[relation]
                 if source["producer_kind"] not in sources or target_kind not in targets:
                     raise EvidenceError("invalid persisted Evidence lineage")
+        colors: dict[str, int] = {}
+        for event_id in events:
+            if colors.get(event_id, 0) != 0:
+                continue
+            colors[event_id] = 1
+            stack = [(event_id, 0)]
+            while stack:
+                source_id, position = stack[-1]
+                links = links_by_source.get(source_id, [])
+                if position == len(links):
+                    colors[source_id] = 2
+                    stack.pop()
+                    continue
+                stack[-1] = (source_id, position + 1)
+                target_id = links[position]["target_event_id"]
+                if colors.get(target_id, 0) == 1:
+                    raise EvidenceError("cycle in persisted Evidence lineage")
+                if colors.get(target_id, 0) == 0:
+                    colors[target_id] = 1
+                    stack.append((target_id, 0))
         for event in events.values():
             links = links_by_source.get(event["event_id"], [])
             if event["event_kind"] == "failure_observation" and links:
                 raise EvidenceError("invalid persisted Evidence lineage")
+            if event["event_kind"] != "producer_fact":
+                continue
+            if (event["producer_kind"] not in PRODUCER_KINDS
+                    or (event["producer_kind"] == "review_action") != bool(event["review_action"])
+                    or (event["review_action"] and event["review_action"] not in REVIEW_ACTIONS)):
+                raise EvidenceError("invalid persisted Evidence producer facts")
             required = _REQUIRED_RELATION.get(event["producer_kind"])
             if required is not None and all(link["relation"] != required for link in links):
                 raise EvidenceError("invalid persisted Evidence lineage")
+            ordered_links = tuple(EvidenceLink(
+                link["relation"], link["target_event_id"], link["ordinal"])
+                for link in links)
+            recomputed = _producer_event_id(
+                repository=event["repository"], subject_kind=event["subject_kind"],
+                subject=event["subject"], revision=event["revision"],
+                locator=event["locator"], content_digest=event["content_digest"],
+                producer_kind=event["producer_kind"], fact_digest=event["fact_digest"],
+                normalizer=event["normalizer"], review_action=event["review_action"],
+                links=ordered_links)
+            if recomputed != event["event_id"]:
+                raise EvidenceError("persisted Evidence producer identity does not match its facts")
 
     @staticmethod
     def _migration_checkpoint(label: str) -> None:
@@ -702,19 +752,6 @@ class EvidenceStore:
                  observation.failure_class, observation.signature_digest, observation.normalizer_version)
         return "event-" + hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
 
-    @staticmethod
-    def _producer_event_id(envelope: EvidenceEnvelopeV2) -> str:
-        import hashlib
-        producer = envelope.producer
-        assert producer is not None
-        parts = ["agentflow-evidence-producer-v2", envelope.source.repository,
-                 envelope.subject.subject_kind, envelope.subject.subject, envelope.subject.revision,
-                 envelope.subject.locator, envelope.subject.content_digest, producer.producer_kind,
-                 producer.fact_digest, producer.normalizer_version, producer.review_action or ""]
-        for link in envelope.links:
-            parts.extend((str(link.ordinal), link.relation, link.target_event_id))
-        return "event-" + hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
-
     def observe(self, observation: Observation | EvidenceEnvelopeV2) -> Event | ProducerEvent:
         if isinstance(observation, EvidenceEnvelopeV2):
             if observation.envelope_kind == "producer_fact":
@@ -771,7 +808,14 @@ class EvidenceStore:
     def _observe_producer(self, envelope: EvidenceEnvelopeV2) -> ProducerEvent:
         producer = envelope.producer
         assert producer is not None
-        event_id = self._producer_event_id(envelope)
+        event_id = _producer_event_id(
+            repository=envelope.source.repository,
+            subject_kind=envelope.subject.subject_kind, subject=envelope.subject.subject,
+            revision=envelope.subject.revision, locator=envelope.subject.locator,
+            content_digest=envelope.subject.content_digest,
+            producer_kind=producer.producer_kind, fact_digest=producer.fact_digest,
+            normalizer=producer.normalizer_version, review_action=producer.review_action or "",
+            links=envelope.links)
         event_values = (event_id, "producer_fact", envelope.source.repository,
                         envelope.subject.subject_kind, envelope.subject.subject,
                         envelope.subject.revision, envelope.subject.locator,

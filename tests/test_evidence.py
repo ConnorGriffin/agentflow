@@ -915,3 +915,75 @@ def test_reopen_rejects_persisted_source_kind_and_required_relation_violations(
 
     with pytest.raises(EvidenceError, match="persisted Evidence lineage"):
         EvidenceStore(path=path)
+
+
+def test_reopen_rejects_same_repository_retarget_under_the_old_producer_id(tmp_path):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
+    first_target = store.observe(_producer("obs-r1", subject, "revision", "b" * 64, 1))
+    second_target = store.observe(_producer("obs-r2", subject, "revision", "c" * 64, 2))
+    source = store.observe(_producer(
+        "obs-c", subject, "criterion", "d" * 64, 3,
+        (0, "derives_from", first_target.event_id)))
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE event_links SET target_event_id=? WHERE source_event_id=?",
+                 (second_target.event_id, source.event_id))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(EvidenceError, match="producer identity"):
+        EvidenceStore(path=path)
+
+
+def test_reopen_rejects_persisted_self_cycle(tmp_path):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
+    event = store.observe(_producer("obs-r", subject, "revision", "b" * 64, 1))
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO event_links VALUES (?,?,?,?)",
+                 (event.event_id, 0, "derives_from", event.event_id))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(EvidenceError, match="cycle"):
+        EvidenceStore(path=path)
+
+
+def test_reopen_rejects_persisted_two_node_cycle(tmp_path):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
+    first = store.observe(_producer("obs-r1", subject, "revision", "b" * 64, 1))
+    second = store.observe(_producer("obs-r2", subject, "revision", "c" * 64, 2))
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO event_links VALUES (?,?,?,?)",
+                 (first.event_id, 0, "derives_from", second.event_id))
+    conn.execute("INSERT INTO event_links VALUES (?,?,?,?)",
+                 (second.event_id, 0, "derives_from", first.event_id))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(EvidenceError, match="cycle"):
+        EvidenceStore(path=path)
+
+
+def test_valid_branched_lineage_reopens(tmp_path):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
+    revision = store.observe(_producer("obs-r", subject, "revision", "b" * 64, 1))
+    first = store.observe(_producer(
+        "obs-c1", subject, "criterion", "c" * 64, 2,
+        (0, "derives_from", revision.event_id)))
+    second = store.observe(_producer(
+        "obs-c2", subject, "criterion", "d" * 64, 3,
+        (0, "derives_from", revision.event_id)))
+    finding = store.observe(_producer(
+        "obs-f", subject, "finding", "e" * 64, 4,
+        (0, "derives_from", first.event_id),
+        (1, "derives_from", second.event_id)))
+
+    reopened = EvidenceStore(path=path)
+    assert finding in reopened.brief_for("issue/596", repository="octo/repo", now=5)
