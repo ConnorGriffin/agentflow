@@ -24,27 +24,62 @@ def _open_descriptors() -> set[str]:
     return set(os.listdir("/dev/fd"))
 
 
-@pytest.mark.parametrize("absolute", [False, True])
-def test_api_accepts_relative_and_absolute_authorized_corpus(tmp_path, absolute):
+def test_api_accepts_relative_authorized_corpus():
+    validate_fixtures(Path("docs/evidence"))
+
+
+def test_api_accepts_absolute_arbitrary_temp_corpus(tmp_path):
     corpus = _corpus(tmp_path)
-    authorized = corpus if absolute else Path(os.path.relpath(corpus, Path.cwd()))
-
-    validate_fixtures(authorized)
+    validate_fixtures(corpus)
 
 
-@pytest.mark.parametrize("absolute", [False, True])
-def test_cli_accepts_relative_and_absolute_authorized_corpus(tmp_path, absolute):
-    corpus = _corpus(tmp_path)
-    authorized = corpus if absolute else Path(os.path.relpath(corpus, Path.cwd()))
-
+def test_cli_accepts_relative_authorized_corpus():
     result = subprocess.run(
-        [sys.executable, "-m", "agentflow.evidence_contract", str(authorized)],
+        [sys.executable, "-m", "agentflow.evidence_contract", "docs/evidence"],
         text=True, capture_output=True, check=False,
     )
 
     assert result.returncode == 0
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+def test_cli_accepts_absolute_arbitrary_temp_corpus(tmp_path):
+    corpus = _corpus(tmp_path)
+
+    result = subprocess.run(
+        [sys.executable, "-m", "agentflow.evidence_contract", str(corpus)],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
+def test_api_rejects_lexical_parent_traversal_without_echo():
+    traversal = Path("docs") / ".." / "docs" / "evidence"
+    descriptors_before = _open_descriptors()
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(traversal)
+
+    assert str(caught.value) == "<corpus>: io"
+    assert ".." not in str(caught.value)
+    assert _open_descriptors() == descriptors_before
+
+
+def test_cli_rejects_lexical_parent_traversal_without_echo():
+    result = subprocess.run(
+        [sys.executable, "-m", "agentflow.evidence_contract",
+         "docs/../docs/evidence"],
+        text=True, capture_output=True, check=False,
+    )
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "evidence contract invalid: <corpus>: io\n"
+    assert ".." not in result.stderr
 
 
 def test_invalid_filename_and_duplicate_version_slug_fail_closed_in_sorted_order(tmp_path):
@@ -111,6 +146,33 @@ def test_cli_rejects_symlink_as_authorized_corpus_directory_without_echo(tmp_pat
     assert "private-corpus-link" not in result.stderr
 
 
+@pytest.mark.parametrize("interface", ["api", "cli"])
+def test_symlink_component_in_authorized_corpus_path_fails_content_safe(
+        tmp_path, interface):
+    parent = tmp_path / "private-parent"
+    parent.mkdir()
+    corpus = parent / "evidence"
+    shutil.copytree("docs/evidence", corpus)
+    parent_link = tmp_path / "parent-link"
+    parent_link.symlink_to(parent, target_is_directory=True)
+    authorized = parent_link / corpus.name
+
+    if interface == "api":
+        descriptors_before = _open_descriptors()
+        with pytest.raises(EvidenceError) as caught:
+            validate_fixtures(authorized)
+        assert str(caught.value) == "<corpus>: io"
+        assert _open_descriptors() == descriptors_before
+    else:
+        result = subprocess.run(
+            [sys.executable, "-m", "agentflow.evidence_contract", str(authorized)],
+            text=True, capture_output=True, check=False,
+        )
+        assert result.returncode == 1
+        assert result.stdout == ""
+        assert result.stderr == "evidence contract invalid: <corpus>: io\n"
+
+
 def test_api_rejects_authorized_corpus_replacement_and_closes_descriptor(
         tmp_path, monkeypatch):
     corpus = _corpus(tmp_path)
@@ -120,7 +182,8 @@ def test_api_rejects_authorized_corpus_replacement_and_closes_descriptor(
 
     def replace_before_open(path, flags, *args, **kwargs):
         nonlocal replaced
-        if not replaced and flags & os.O_DIRECTORY:
+        if (not replaced and path == corpus.name
+                and kwargs.get("dir_fd") is not None):
             corpus.rename(displaced)
             corpus.mkdir()
             replaced = True

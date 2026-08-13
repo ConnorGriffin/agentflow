@@ -367,25 +367,43 @@ def _manifest(directory_fd: int, version: int, expected: dict[str, Any]) -> None
 
 
 def _open_authorized_directory(directory: Path) -> int:
-    supplied = directory.lstat()
-    if stat.S_ISLNK(supplied.st_mode) or not stat.S_ISDIR(supplied.st_mode):
+    raw_directory = os.fspath(directory)
+    if not isinstance(raw_directory, str):
         raise OSError
-    resolved = directory.resolve(strict=True)
-    expected = resolved.stat(follow_symlinks=False)
-    if (not stat.S_ISDIR(expected.st_mode)
-            or (supplied.st_dev, supplied.st_ino) != (expected.st_dev, expected.st_ino)):
+    absolute = raw_directory.startswith(os.sep)
+    lexical_path = raw_directory[1:] if absolute else raw_directory
+    components = lexical_path.split(os.sep)
+    if not components or any(component in {"", ".", ".."} for component in components):
         raise OSError
-    descriptor: int | None = None
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+    descriptor: int | None = os.open("/" if absolute else ".", flags)
     try:
-        descriptor = os.open(
-            resolved,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
-        )
-        opened = os.fstat(descriptor)
-        if (not stat.S_ISDIR(opened.st_mode)
-                or (opened.st_dev, opened.st_ino) != (expected.st_dev, expected.st_ino)):
-            raise OSError
-        return descriptor
+        for component in components:
+            entry_name = next((name for name in os.listdir(descriptor)
+                               if name == component), None)
+            if entry_name is None:
+                raise OSError
+            expected = os.stat(entry_name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+                raise OSError
+            child: int | None = None
+            try:
+                child = os.open(entry_name, flags, dir_fd=descriptor)
+                opened = os.fstat(child)
+                if ((opened.st_dev, opened.st_ino)
+                        != (expected.st_dev, expected.st_ino)):
+                    raise OSError
+            except BaseException:
+                if child is not None:
+                    os.close(child)
+                raise
+            parent = descriptor
+            descriptor = child
+            os.close(parent)
+        authorized = descriptor
+        descriptor = None
+        return authorized
     except BaseException:
         if descriptor is not None:
             os.close(descriptor)
