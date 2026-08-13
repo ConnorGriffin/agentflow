@@ -1013,6 +1013,86 @@ def test_bounded_worker_snapshot_cleanup_permission_denial_cannot_renew(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("status, numstat", [
+    (b"?? ../../outside\x00", b""),
+    (b"?? /outside\x00", b""),
+    (b"?? linked/secret\x00", b""),
+    (b"R  renamed\x00../../outside\x00", b"0\t0\trenamed\x00"),
+    (b"R  ../../outside\x00renamed\x00", b"0\t0\t../../outside\x00"),
+], ids=["traversal", "absolute", "symlink", "rename-source", "rename-destination"])
+def test_bounded_worktree_snapshot_rejects_paths_outside_its_worktree(
+        tmp_path, monkeypatch, status, numstat):
+    """A malformed Git record cannot read external bytes or renew Build silence."""
+    from agentflow.coordinator import _launch_child
+
+    root = tmp_path / "worktree"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret").write_bytes(b"external bytes must remain unread")
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    (root / "renamed").write_bytes(b"inside")
+
+    class Process:
+        def __init__(self, output):
+            self.stdout = SimpleNamespace(read=lambda _limit: output)
+
+        def wait(self):
+            return 0
+
+        def kill(self):
+            pass
+
+    outputs = iter([status, numstat])
+    monkeypatch.setattr(_launch_child.subprocess, "Popen",
+                        lambda *_args, **_kwargs: Process(next(outputs)))
+
+    assert _launch_child._worktree_snapshot(str(root), timeout=0.5) is None
+
+
+@pytest.mark.parametrize("status, numstat", [
+    ("?? ../../outside\\0", ""),
+    ("?? /outside\\0", ""),
+    ("?? linked/secret\\0", ""),
+    ("R  renamed\\0../../outside\\0", "0\\t0\\trenamed\\0"),
+    ("R  ../../outside\\0renamed\\0", "0\\t0\\t../../outside\\0"),
+], ids=["traversal", "absolute", "symlink", "rename-source", "rename-destination"])
+def test_malicious_git_paths_cannot_renew_build_silence(
+        coord_state, tmp_path, monkeypatch, status, numstat):
+    """The public Build supervisor ignores snapshots that would leave its worktree."""
+    source, _target = _tracked_build(tmp_path)
+    fake_bin = tmp_path / "malicious-git"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    real_git = shutil.which("git")
+    assert real_git
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "case \" $* \" in\n"
+        f" *\" status \"*) printf '{status}' ;;\n"
+        f" *\" diff \"*) printf '{numstat}' ;;\n"
+        f" *) exec {shlex.quote(real_git)} \"$@\" ;;\n"
+        "esac\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    marker = tmp_path / "malicious-snapshot-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.60)\n"
+        "pathlib.Path(sys.argv[1]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(marker)], timeout=5,
+        build_lease=(0.20, 0.30, 0.45)))
+    identity = coord.submit_stage(_build("codex", "malicious-snapshot", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "malicious snapshot retained Build silence")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
 def _run_clocked_supervisor(
         tmp_path, monkeypatch, *, build_lease, exit_at, heads=(None,)):
     """Run the production supervisor interface against an exact monotonic timeline."""

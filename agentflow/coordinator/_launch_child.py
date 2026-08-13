@@ -349,9 +349,36 @@ def _hash_frame(digest, tag: bytes, value: bytes) -> None:
     digest.update(value)
 
 
+def _worktree_member(root: Path, encoded: bytes) -> tuple[int, str] | None:
+    """Open a no-symlink parent inside ``root`` for one Git-relative filename."""
+    try:
+        relative = Path(os.fsdecode(encoded))
+        if relative.is_absolute() or not relative.parts or any(
+                component in ("", ".", "..") for component in relative.parts):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        parent = os.open(root, flags)
+        for component in relative.parts[:-1]:
+            child = os.open(component, flags, dir_fd=parent)
+            os.close(parent)
+            parent = child
+    except (OSError, UnicodeError, ValueError):
+        return None
+    return parent, relative.name
+
+
 def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
     """Write one bounded digest of Git-enforced changed and untracked worktree state."""
-    root = Path(working_dir).resolve()
+    try:
+        root = Path(working_dir).resolve(strict=True)
+    except (OSError, ValueError):
+        return
+    if not root.is_dir():
+        return
     process = subprocess.Popen(
         ["git", "-C", str(root), "status", "--porcelain=v1", "-z",
          "--untracked-files=all", "--ignored=no", "--", ".",
@@ -384,38 +411,49 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     for status, encoded, prior_path in paths:
+        member = _worktree_member(root, encoded)
+        prior_member = _worktree_member(root, prior_path) if prior_path is not None else None
+        if member is None or (prior_path is not None and prior_member is None):
+            return
+        parent_fd, name = member
+        if prior_member is not None:
+            os.close(prior_member[0])
         structural_change = any(change in status for change in b"ADRC")
         if status != b"??" and encoded not in content_paths and not structural_change:
+            os.close(parent_fd)
             continue
         record = hashlib.sha256()
         _hash_frame(record, b"path", encoded)
         if prior_path is not None:
             _hash_frame(record, b"prior-path", prior_path)
-        candidate = root / os.fsdecode(encoded)
         try:
-            candidate.parent.resolve().relative_to(root)
-            before = candidate.lstat()
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except FileNotFoundError:
+            os.close(parent_fd)
             if b"D" not in status:
                 return
             _hash_frame(digest, b"deletion-record", record.digest())
             continue
         except (OSError, ValueError):
+            os.close(parent_fd)
             return
         if stat.S_ISLNK(before.st_mode):
             try:
-                target = os.fsencode(os.readlink(candidate))
+                target = os.fsencode(os.readlink(name, dir_fd=parent_fd))
             except OSError:
+                os.close(parent_fd)
                 return
             if len(target) > _WORKTREE_FILE_BYTES:
+                os.close(parent_fd)
                 return
             _hash_frame(record, b"symlink-target", target)
             total += len(target)
         elif stat.S_ISREG(before.st_mode):
             if before.st_size > _WORKTREE_FILE_BYTES:
+                os.close(parent_fd)
                 return
             try:
-                fd = os.open(candidate, flags)
+                fd = os.open(name, flags, dir_fd=parent_fd)
                 try:
                     chunks: list[bytes] = []
                     remaining = _WORKTREE_FILE_BYTES + 1
@@ -429,15 +467,19 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
                 finally:
                     os.close(fd)
             except OSError:
+                os.close(parent_fd)
                 return
             content = b"".join(chunks)
             if (len(content) > _WORKTREE_FILE_BYTES or before.st_ino != after.st_ino
                     or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns):
+                os.close(parent_fd)
                 return
             _hash_frame(record, b"file-content", content)
             total += len(content)
         else:
+            os.close(parent_fd)
             return
+        os.close(parent_fd)
         if total > _WORKTREE_TOTAL_BYTES:
             return
         record_type = (b"untracked-record" if status == b"??" else
