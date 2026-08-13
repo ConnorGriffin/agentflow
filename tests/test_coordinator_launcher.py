@@ -736,13 +736,16 @@ def test_active_bounded_worker_durable_change_renews_build_silence(coord_state, 
     script = (
         "import json,pathlib,sys,time\n"
         f"print(json.dumps({started!r}), flush=True)\n"
-        "time.sleep(.12)\n"
+        # Leave enough time for the 100ms-bounded baseline helper plus its next poll on
+        # slower CI hosts. The provider still exits after the original silent lease, so
+        # this remains a renewal test rather than a natural-exit test.
+        "time.sleep(.35)\n"
         "pathlib.Path(sys.argv[1]).write_text('after\\n')\n"
-        "time.sleep(.24)\n"
+        "time.sleep(.65)\n"
     )
     provider = lambda record: [sys.executable, "-c", script, str(target)]
     coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.22, 0.60, 1.0)))
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
     identity = coord.submit_stage(_build("codex", "worker-progress", str(source)))
     coord.cycle("codex")
 
