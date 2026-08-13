@@ -21,6 +21,8 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 605](adr-605-canonical-evaluation-rulebook.md) — One versioned canonical data contract
+  owns Evaluation v1 semantics; runtime and independent verification both consume it.
 - [ADR 596](adr-596-typed-evidence-envelopes-and-lineage.md) — Typed failure/producer
   envelopes, bounded same-repository lineage, contextual briefing closure, SQLite schema v3,
   and suffix-routed JSON contract v2.
