@@ -117,6 +117,8 @@ class IssueView:
     url: str
     labels: frozenset[str]
     comments: list[Comment]
+    id: str = ""
+    updated_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -297,6 +299,8 @@ class Comment:
     body: str
     created_at: str
     id: str = ""
+    updated_at: str = ""
+    url: str = ""
 
 
 @dataclass(frozen=True)
@@ -372,7 +376,8 @@ def _closing_of(node: dict) -> tuple[int, ...]:
 def _comments_of(node: dict) -> list[Comment]:
     return [
         Comment(body=c.get("body", "") or "", created_at=c.get("createdAt", "") or "",
-                id=c.get("id", "") or "")
+                id=c.get("id", "") or "", updated_at=c.get("updatedAt", "") or "",
+                url=c.get("url", "") or "")
         for c in node.get("comments", []) if isinstance(c, dict)
     ]
 
@@ -476,12 +481,13 @@ def issue_view(repo: str, issue: int) -> IssueView | None:
     is no proof. Every warm path (claim checks, projections, settlements) uses the single-fact
     reads above, so nothing on the hot path ever drags a comment thread it doesn't need."""
     data = _read_json(["issue", "view", str(issue), "--repo", repo,
-                       "--json", "title,body,state,url,labels,comments"])
+                       "--json", "id,title,body,state,url,updatedAt,labels,comments"])
     if not isinstance(data, dict):
         return None
     return IssueView(title=str(data.get("title") or ""), body=str(data.get("body") or ""),
                      state=str(data.get("state") or ""), url=str(data.get("url") or ""),
-                     labels=_labels_of(data), comments=_comments_of(data))
+                     labels=_labels_of(data), comments=_comments_of(data),
+                     id=str(data.get("id") or ""), updated_at=str(data.get("updatedAt") or ""))
 
 
 def pr_is_draft(repo: str, pr: int) -> bool | None:

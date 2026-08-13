@@ -238,7 +238,13 @@ class AuthorityPointer:
         _locator(self.locator, "locator")
         _digest(self.content_hash, "content_hash")
         if self.authority_kind == "github":
-            immutable = _SHA.fullmatch(self.revision)
+            # A Git commit is immutable, as is the digest-addressed source set captured
+            # from an issue and its selected replies.  The latter deliberately retains no
+            # mutable GitHub prose and lets a later adapter report an absent artifact as
+            # unavailable rather than substituting current text.
+            immutable = (_SHA.fullmatch(self.revision) or
+                         (match := _CONTENT_REVISION.fullmatch(self.revision)) is not None
+                         and match.group(1) == self.content_hash)
         elif self.authority_kind == "repository":
             match = _CONTENT_REVISION.fullmatch(self.revision)
             immutable = match is not None and match.group(1) == self.content_hash
@@ -467,6 +473,22 @@ class ProducerEvent:
     validation_states: tuple[str, ...]
     links: tuple[EvidenceLink, ...]
     contextual: bool = False
+
+
+@dataclass(frozen=True)
+class EvidenceRecord:
+    """Content-free typed facts returned by Evidence's public read interface."""
+    event_id: str
+    event_kind: str
+    subject: str
+    revision: str
+    failure_class: str
+    producer_kind: str
+    review_action: str
+    validation_states: tuple[str, ...]
+    links: tuple[EvidenceLink, ...]
+    reviewed_parent_revision: str = ""
+    fixer_revision: str = ""
 
 
 @dataclass(frozen=True)
@@ -887,6 +909,28 @@ class EvidenceStore:
             (event_id,)))
         return ProducerEvent(event_id, ids, row["producer_kind"], row["review_action"], states,
                              links, contextual)
+
+    def read(self, event_id: str) -> EvidenceRecord:
+        """Return immutable, content-free facts for one canonical Evidence event."""
+        _token(event_id, "event_id")
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+            if row is None:
+                raise EvidenceError("unknown event")
+            states = tuple(item[0] for item in conn.execute(
+                "SELECT DISTINCT validation_state FROM observations WHERE event_id=? ORDER BY validation_state",
+                (event_id,)))
+            links = tuple(EvidenceLink(item[0], item[1], item[2]) for item in conn.execute(
+                "SELECT relation, target_event_id, ordinal FROM event_links WHERE source_event_id=? ORDER BY ordinal",
+                (event_id,)))
+            lineage = conn.execute(
+                "SELECT parent_revision, fixer_revision FROM observations WHERE event_id=? "
+                "AND (parent_revision<>'' OR fixer_revision<>'') ORDER BY observation_id LIMIT 1",
+                (event_id,)).fetchone()
+            return EvidenceRecord(event_id, row["event_kind"], row["subject"], row["revision"],
+                                  row["failure_class"], row["producer_kind"], row["review_action"],
+                                  states, links, "" if lineage is None else lineage["parent_revision"],
+                                  "" if lineage is None else lineage["fixer_revision"])
 
     def evaluate(self, evaluation: Evaluation) -> Evaluation:
         with self._connect() as conn:
