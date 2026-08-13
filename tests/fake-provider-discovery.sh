@@ -21,6 +21,15 @@ if test -f "$agent_skill" && test -f "$claude_skill/SKILL.md" \
   fi
   printf '%s\n' "$marker"
 elif ! test -e "$agent_skill" && ! test -e "$claude_skill"; then
+  if find "$root/.agents/skills" "$root/.claude/skills" -name SKILL.md -print \
+      | grep -q .; then
+    echo "a SKILL.md remained under a provider discovery root" >&2
+    exit 1
+  fi
+  if test "${AGENTFLOW_PROVIDER_PROBE_FAIL:-}" = 1; then
+    echo "forced negative probe failure" >&2
+    exit 1
+  fi
   printf '%s\n' SKILL_UNAVAILABLE
 else
   echo "partial discovery fixture" >&2

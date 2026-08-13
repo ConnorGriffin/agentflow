@@ -77,8 +77,60 @@ PY
 }
 negative() {
   require_fixture
-  mv "$agent_skill" "$agent_skill.disabled"; mv "$claude_skill" "$claude_skill.disabled"
-  trap 'mv "$claude_skill.disabled" "$claude_skill"; mv "$agent_skill.disabled" "$agent_skill"' EXIT HUP INT TERM
+  holder=$(mktemp -d "$root/.agentflow-provider-probe.XXXXXX")
+  held_agent="$holder/agents-skill"
+  held_claude="$holder/claude-skill"
+  restore_fixtures() {
+    result=$1
+    trap - EXIT HUP INT TERM
+    if test -d "$held_agent" && test -d "$held_claude" \
+        && ! test -e "$agent_skill" && ! test -L "$agent_skill" \
+        && ! test -e "$claude_skill" && ! test -L "$claude_skill"; then
+      :
+    elif test -d "$held_agent" && test -d "$claude_skill" \
+        && ! test -e "$agent_skill" && ! test -L "$agent_skill" \
+        && ! test -e "$held_claude" && ! test -L "$held_claude"; then
+      if mv "$held_agent" "$agent_skill" && rmdir "$holder"; then exit "$result"; fi
+      echo "provider probe partial setup restoration failed; inspect $holder" >&2
+      exit 1
+    elif test -d "$agent_skill" && test -d "$claude_skill" \
+        && ! test -e "$held_agent" && ! test -L "$held_agent" \
+        && ! test -e "$held_claude" && ! test -L "$held_claude"; then
+      if rmdir "$holder"; then exit "$result"; fi
+      echo "provider probe holder cleanup failed at $holder" >&2
+      exit 1
+    else
+      echo "provider probe fixture restoration precondition failed; holder retained at $holder" >&2
+      exit 1
+    fi
+    if ! mv "$held_agent" "$agent_skill"; then
+      echo "provider probe fixture restoration failed; holder retained at $holder" >&2
+      exit 1
+    fi
+    if ! mv "$held_claude" "$claude_skill"; then
+      if ! mv "$agent_skill" "$held_agent"; then
+        echo "provider probe fixture rollback failed; inspect $holder and $agent_skill" >&2
+      else
+        echo "provider probe fixture restoration failed; both fixtures retained at $holder" >&2
+      fi
+      exit 1
+    fi
+    if ! rmdir "$holder"; then
+      echo "provider probe holder cleanup failed at $holder" >&2
+      exit 1
+    fi
+    exit "$result"
+  }
+  trap 'restore_fixtures $?' EXIT
+  trap 'restore_fixtures 129' HUP
+  trap 'restore_fixtures 130' INT
+  trap 'restore_fixtures 143' TERM
+  if ! mv "$agent_skill" "$held_agent"; then
+    exit 1
+  fi
+  if ! mv "$claude_skill" "$held_claude"; then
+    exit 1
+  fi
   output=$(run_provider "$1"); printf '%s\n' "$output"
   printf '%s' "$output" | validate_output "$1" unavailable
 }
