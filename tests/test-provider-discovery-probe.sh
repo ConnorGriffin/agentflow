@@ -3,6 +3,8 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 script="$root/scripts/provider-discovery-probe.sh"
 fake="$root/tests/fake-provider-discovery.sh"
+grep -Fq 'ClaudeRunner().structured_argv' "$script"
+grep -Fq 'CodexRunner().structured_argv' "$script"
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/agentflow-provider-probe.XXXXXX")
 trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 skill=agentflow-582-probe-4bab5ff0

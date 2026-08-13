@@ -37,6 +37,8 @@ from agentflow.coordinator.verification import PREPARED, payload_preview, unprep
 from agentflow.intake import (IntakeResult, IntakeRoute, apply_intake, intake_result_is_durable,
                               redraft_prompt)
 from agentflow.labels import TRIAGING, release
+from agentflow.prompts import stage_prompt_spec
+from agentflow.repo_facts import surface_declaration
 from agentflow.runner import _run
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
@@ -81,6 +83,16 @@ def _dial(draft: IntakeResult) -> str:
     return draft.complexity.value if draft.complexity else "deep"
 
 
+def _capability(record, ref: WorktreeRef) -> tuple[str, dict[str, bool]]:
+    """Recover capability facts for current and pre-#582 durable chain records."""
+    root = getattr(record, "capability_root", None) or ref.workdir
+    raw = getattr(record, "capability_context", "{}") or "{}"
+    context = json.loads(raw)
+    if "ui" not in context:
+        context["ui"] = bool(surface_declaration(root).surfaces)
+    return root, context
+
+
 def attack_submission(intake_record, draft: IntakeResult, tool: str) -> Submission | None:
     """Open the cold attack on a triage draft, assuming its ``triaging`` claim (ADR 380).
 
@@ -101,9 +113,10 @@ def attack_submission(intake_record, draft: IntakeResult, tool: str) -> Submissi
     # starts.
     base_prompt = payload.get("base_prompt") or payload.get("prompt", "")
     snapshot = payload["snapshot"]
-    prompt = attack_prompt(intake_record.repo, number,
-                           draft.title or snapshot.get("title", ""), draft.body,
-                           round=round, max_rounds=max_rounds(draft.complexity))
+    capability_root, capability_context = _capability(intake_record, ref)
+    prompt = stage_prompt_spec("attack").render(prompt=attack_prompt(
+        intake_record.repo, number, draft.title or snapshot.get("title", ""), draft.body,
+        round=round, max_rounds=max_rounds(draft.complexity)))
     return Submission(
         repo=intake_record.repo, subject=intake_record.subject, stage="attack",
         target=intake_record.target, pool=tool, complexity=_dial(draft), round=round, claim=True,
@@ -112,7 +125,8 @@ def attack_submission(intake_record, draft: IntakeResult, tool: str) -> Submissi
                               "source_ref": payload["source_ref"], "prompt": prompt,
                               "base_prompt": base_prompt, "draft": encode_result(draft)},
                              sort_keys=True),
-        transfer_from=intake_record.identity)
+        transfer_from=intake_record.identity, capability_root=capability_root,
+        capability_context=capability_context)
 
 
 def renewed_attack_submission(attack_record, tool: str) -> Submission | None:
@@ -133,9 +147,10 @@ def renewed_attack_submission(attack_record, tool: str) -> Submission | None:
     number = int(attack_record.subject)
     round = attack_record.round + 1
     snapshot = payload["snapshot"]
-    prompt = attack_prompt(attack_record.repo, number,
-                           draft.title or snapshot.get("title", ""), draft.body,
-                           round=round, max_rounds=max_rounds(draft.complexity))
+    capability_root, capability_context = _capability(attack_record, ref)
+    prompt = stage_prompt_spec("attack").render(prompt=attack_prompt(
+        attack_record.repo, number, draft.title or snapshot.get("title", ""), draft.body,
+        round=round, max_rounds=max_rounds(draft.complexity)))
     return Submission(
         repo=attack_record.repo, subject=attack_record.subject, stage="attack",
         target=attack_record.target, pool=tool, complexity=_dial(draft), round=round, claim=True,
@@ -144,7 +159,8 @@ def renewed_attack_submission(attack_record, tool: str) -> Submission | None:
                               "source_ref": payload["source_ref"], "prompt": prompt,
                               "base_prompt": payload.get("base_prompt", ""),
                               "draft": payload["draft"]}, sort_keys=True),
-        transfer_from=attack_record.identity)
+        transfer_from=attack_record.identity, capability_root=capability_root,
+        capability_context=capability_context)
 
 
 def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submission | None:
@@ -165,9 +181,11 @@ def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submis
     number = int(attack_record.subject)
     snapshot = payload["snapshot"]
     base_prompt = payload.get("base_prompt", "")
-    prompt = redraft_prompt(base_prompt, draft.title or snapshot.get("title", ""), draft.body,
-                            result.objections, round=attack_record.round + 1,
-                            max_rounds=max_rounds(draft.complexity))
+    capability_root, capability_context = _capability(attack_record, ref)
+    prompt = stage_prompt_spec("intake").render(prompt=redraft_prompt(
+        base_prompt, draft.title or snapshot.get("title", ""), draft.body,
+        result.objections, round=attack_record.round + 1,
+        max_rounds=max_rounds(draft.complexity)))
     return Submission(
         repo=attack_record.repo, subject=attack_record.subject, stage="intake",
         target=attack_record.target, pool=tool, complexity="deep", round=attack_record.round, claim=True,
@@ -175,7 +193,8 @@ def redraft_submission(attack_record, result: AttackResult, tool: str) -> Submis
         input_ptr=json.dumps({"format": PROVIDER_INPUT_V1, "snapshot": snapshot,
                               "source_ref": payload["source_ref"], "prompt": prompt,
                               "base_prompt": base_prompt}, sort_keys=True),
-        transfer_from=attack_record.identity)
+        transfer_from=attack_record.identity, capability_root=capability_root,
+        capability_context=capability_context)
 
 
 def reset_worktree(record):

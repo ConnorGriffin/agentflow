@@ -34,8 +34,13 @@ from importlib.resources import files
 from pathlib import Path
 
 from agentflow.intake import sweep_legacy_labels
+from agentflow.provider_skills import (
+    provider_skill_status,
+    skill_destination_status as _skill_destination_status,
+)
 from agentflow.repo_facts import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
                                   surface_declaration)
+from agentflow.runtime_contracts import playwright_runtime_status as _runtime_status
 
 # Directory names that hold a user-facing surface when a repo has one. Deliberately narrow:
 # a wrong guess here writes a declaration that either misses real UI or gates a backend path.
@@ -128,28 +133,6 @@ def _file_status(path: Path, expected_sha256: str) -> str:
     return "ok"
 
 
-def _skill_destination_status(directory: Path, files_manifest: list[dict]) -> str:
-    expected = {item["path"]: item["sha256"] for item in files_manifest}
-    if not directory.is_dir():
-        return "absent" if not directory.exists() and not directory.is_symlink() else "drifted"
-    actual = {
-        path.relative_to(directory).as_posix()
-        for path in directory.rglob("*")
-        if path.is_file()
-        and "node_modules" not in path.relative_to(directory).parts
-    }
-    if not set(expected).issubset(actual):
-        return "drifted"
-    if actual != set(expected):
-        return "drifted"
-    if any(
-        _file_status(directory / relative, sha256) != "ok"
-        for relative, sha256 in expected.items()
-    ):
-        return "drifted"
-    return "ok"
-
-
 def _skill_status(root: Path, name: str, files_manifest: list[dict]) -> str:
     statuses = []
     for location in (".agents/skills", ".claude/skills"):
@@ -162,7 +145,9 @@ def _skill_status(root: Path, name: str, files_manifest: list[dict]) -> str:
     return "ok"
 
 
-def _connor_skill_command(manifest: dict, source_tree: Path | None = None) -> list[str]:
+def _connor_skill_command(
+    manifest: dict, source_tree: Path | None = None, *, skill: str | None = None
+) -> list[str]:
     installer = manifest["skill_installer"]
     source = manifest["connor_skills"]
     tree = (
@@ -171,13 +156,14 @@ def _connor_skill_command(manifest: dict, source_tree: Path | None = None) -> li
         else f"{source['source']}/tree/{source['tag']}"
     )
     command = ["npx", f"{installer['package']}@{installer['version']}", "add", tree]
-    for name in source["skills"]:
+    selected = (skill,) if skill else tuple(source["skills"])
+    for name in selected:
         command.extend(("--skill", name))
-    command.extend(("-a", "claude-code", "-a", "codex", "-y"))
+    command.extend(("-a", "codex", "-y"))
     return command
 
 
-def _resolved_skill_release(source: dict) -> tuple[str | None, str | None]:
+def _resolved_release(source: dict) -> tuple[str | None, str | None]:
     tag_ref = f"refs/tags/{source['tag']}"
     peeled_ref = f"{tag_ref}^{{}}"
     result = _run_command(
@@ -196,6 +182,11 @@ def _resolved_skill_release(source: dict) -> tuple[str | None, str | None]:
     if not resolved:
         return None, f"release tag {source['tag']} was not found"
     return resolved, None
+
+
+def _resolved_skill_release(manifest: dict) -> tuple[str | None, str | None]:
+    """Resolve the public skill release through the manifest-shaped compatibility seam."""
+    return _resolved_release(manifest["connor_skills"])
 
 
 def _public_skill_destination_states(root: Path, manifest: dict) -> dict:
@@ -231,7 +222,7 @@ def _skills_problem(
     if not surfaces:
         return None
     manifest = _manifest()
-    resolved, error = _resolved_skill_release(manifest["connor_skills"])
+    resolved, error = _resolved_skill_release(manifest)
     if error:
         return f"public skill release could not be verified: {error}"
     expected = manifest["connor_skills"]["commit"]
@@ -272,27 +263,6 @@ def _instructions_status(root: Path) -> str:
     return "ok"
 
 
-def _playwright_versions(root: Path) -> tuple[str, ...]:
-    versions = []
-    for location in (".agents/skills", ".claude/skills"):
-        package = (
-            root
-            / location
-            / "drive-local-webapp"
-            / "node_modules"
-            / "playwright"
-            / "package.json"
-        )
-        try:
-            version = json.loads(package.read_text()).get("version")
-        except (FileNotFoundError, OSError, json.JSONDecodeError):
-            return ()
-        if not isinstance(version, str):
-            return ()
-        versions.append(version)
-    return tuple(versions)
-
-
 def playwright_runtime_status(
     root: Path,
     *,
@@ -300,29 +270,18 @@ def playwright_runtime_status(
     node_minimum: int,
     manifest: dict | None = None,
 ) -> tuple[str, str]:
-    """Statically inspect the complete pinned browser runtime contract."""
-    harness = root / "scripts" / "screenshots.mjs"
-    manifest = manifest or _manifest()
-    specs = {item["id"]: item for item in manifest["capabilities"]}
+    resolved_manifest = manifest or _manifest()
+    specs = {item["id"]: item for item in resolved_manifest["capabilities"]}
     drive = specs["drive-local-webapp"]
-    harness_status = _file_status(harness, specs["screenshot-harness"]["sha256"])
-    if harness_status != "ok":
-        return harness_status, f"pinned screenshot harness is {harness_status}"
     drive_status = _skill_status(root, drive["skill"], drive["files"])
     if drive_status != "ok":
         return drive_status, f"pinned drive-local-webapp contract is {drive_status}"
-    if shutil.which("node") is None:
-        return "missing", "Node runtime is not on PATH"
-    node = _run_command(["node", "--version"], timeout=10)
-    match = re.match(r"v(\d+)", node.stdout.strip())
-    if node.returncode or not match or int(match.group(1)) < node_minimum:
-        return "incompatible", f"Node {node_minimum}+ is required"
-    installed_versions = _playwright_versions(root)
-    if len(installed_versions) != 2:
-        return "missing", "installed Playwright metadata is missing from a project-local root"
-    if any(found != version for found in installed_versions):
-        return "incompatible", f"installed Playwright metadata does not pin {version}"
-    return "ok", f"pinned harness, Node {node_minimum}+, and Playwright {version} metadata are intact"
+    return _runtime_status(
+        root,
+        version=version,
+        node_minimum=node_minimum,
+        manifest=resolved_manifest,
+    )
 
 
 def _playwright_available(
@@ -458,36 +417,28 @@ def doctor(workdir: str, *, stage: str | None = None, provider: str | None = Non
                 install=None if available else install,
             )
         )
+    from agentflow.capability_contracts import preflight
     from agentflow.prompts import STAGE_PROMPTS, requirements_for
 
     selected_stages = (stage,) if stage else tuple(STAGE_PROMPTS)
     selected_providers = (provider,) if provider else ("claude", "codex")
-    selected_contexts = (
-        ((False, "headless"), (True, "ui")) if ui else ((False, "headless"),)
-    )
-    by_id = {row.id: row for row in rows}
+    repository_contexts = ((False, "headless"), (True, "ui")) if ui else ((False, "headless"),)
     matrix: list[StageCapability] = []
     for stage_name in selected_stages:
+        spec = STAGE_PROMPTS[stage_name]
+        selected_contexts = tuple(
+            (ui_context, context_name)
+            for ui_context, context_name in repository_contexts
+            if context_name in spec.contexts
+        )
         for ui_context, context_name in selected_contexts:
             for provider_name in selected_providers:
                 required_contracts = requirements_for(stage_name, {"ui": ui_context})
-                missing = [item for item in required_contracts
-                           if item.id not in by_id or not by_id[item.id].available]
-                if not providers.get(provider_name, False):
-                    state = "incompatible"
-                elif missing:
-                    state = ("drifted" if any(by_id[item.id].status == "drifted" for item in missing
-                                                if item.id in by_id) else "missing")
-                else:
-                    state = "ready"
-                evidence = ("pinned project-local contracts present",) if state == "ready" else tuple(
-                    [f"{provider_name} is not on PATH"] * (not providers.get(provider_name, False))
-                    + [f"{item.id}@{item.version} is not intact in both project-local roots" for item in missing]
-                )
+                result = preflight(root, stage_name, provider_name, required_contracts)
                 matrix.append(StageCapability(
                     stage_name, context_name, provider_name,
-                    tuple(f"{item.id}@{item.version}" for item in required_contracts), state,
-                    evidence, f"agentflow enroll {root} --apply", state == "ready"))
+                    tuple(f"{item.id}@{item.version}" for item in required_contracts), result.state,
+                    result.evidence, result.repair_command, result.ready))
     ready = (
         all(row.available for row in rows if row.required)
         and all(cell.ready for cell in matrix)
@@ -720,7 +671,7 @@ def _install_connor_skills(root: Path) -> str:
             "WARN: existing public skill destinations are partial or conflicting; "
             f"installer was not run ({rendered})"
         )
-    resolved, error = _resolved_skill_release(manifest["connor_skills"])
+    resolved, error = _resolved_skill_release(manifest)
     expected = manifest["connor_skills"]["commit"]
     if error:
         return f"WARN: public skill release could not be verified — {error}"
@@ -747,12 +698,16 @@ def _install_connor_skills(root: Path) -> str:
                 "WARN: exact skill source checkout resolved to "
                 f"{result.stdout.strip()}, expected {expected}"
             )
-        command = _connor_skill_command(manifest, source_tree)
-        result = _run_command(command, cwd=root, timeout=120)
-        if result.returncode:
-            reason = (result.stderr or result.stdout).strip().splitlines()
-            tail = reason[-1] if reason else f"exit {result.returncode}"
-            return f"WARN: Connor skill install failed — {tail}"
+        for name in names:
+            command = _connor_skill_command(manifest, source_tree, skill=name)
+            result = _run_command(command, cwd=root, timeout=120)
+            if result.returncode:
+                reason = (result.stderr or result.stdout).strip().splitlines()
+                tail = reason[-1] if reason else f"exit {result.returncode}"
+                return f"WARN: Connor skill install failed — {tail}"
+            wiring = _wire_claude_skill(root, name)
+            if wiring.startswith("WARN:"):
+                return wiring
     states = {
         name: _skill_status(root, name, specs[name]["files"]) for name in names
     }
@@ -779,9 +734,6 @@ def _install_methodology_skills(root: Path) -> str:
         return "ok:   methodology contracts already installed"
     if any(state != "absent" for state in states.values()):
         return "WARN: methodology destinations are partial, conflicting, or drifted; installer was not run"
-    resolved, error = _resolved_skill_release(source)
-    if error or resolved != source["commit"]:
-        return "WARN: methodology release could not be verified; installer was not run"
     with tempfile.TemporaryDirectory(prefix="agentflow-methodology-") as temporary:
         tree = Path(temporary) / "source"
         for command in (["git", "clone", "--no-checkout", source["source"], str(tree)],
@@ -792,14 +744,24 @@ def _install_methodology_skills(root: Path) -> str:
                 return "WARN: exact methodology source fetch failed"
         if result.stdout.strip() != source["commit"]:
             return "WARN: exact methodology source checkout did not match manifest"
-        command = ["npx", f"{manifest['skill_installer']['package']}@{manifest['skill_installer']['version']}",
-                   "add", str(tree)]
         for name in source["skills"]:
-            command.extend(("--skill", name))
-        command.extend(("-a", "claude-code", "-a", "codex", "-y"))
-        result = _run_command(command, cwd=root, timeout=120)
-        if result.returncode:
-            return "WARN: methodology contract install failed"
+            command = [
+                "npx",
+                f"{manifest['skill_installer']['package']}@{manifest['skill_installer']['version']}",
+                "add",
+                str(tree),
+                "--skill",
+                name,
+                "-a",
+                "codex",
+                "-y",
+            ]
+            result = _run_command(command, cwd=root, timeout=120)
+            if result.returncode:
+                return "WARN: methodology contract install failed"
+            wiring = _wire_claude_skill(root, name)
+            if wiring.startswith("WARN:"):
+                return wiring
     if not all(state == "ok" for state in _methodology_destination_states(root, manifest).values()):
         return "WARN: methodology installer completed but project-local contracts do not match manifest"
     return "DO:   installed pinned methodology contracts"

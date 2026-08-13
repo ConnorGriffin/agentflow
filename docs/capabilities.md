@@ -5,8 +5,17 @@ its Claude and Codex sessions. The checked-in
 `agentflow/capabilities.toml` manifest is the source of truth for those
 capabilities, their versions, and their content hashes.
 
-The manifest's `methodology_skills` entry is the sole authority for the public
-methodology release tag and commit. The release-verification discovery controls
+The manifest's `methodology_skills` entry is the sole authority for the exact
+public methodology commit
+(`08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666`). That immutable source contains
+all three declared methodology skills; the older `v0.3.0` tag does not. Each
+methodology capability also pins that commit as its version, plus its tracked
+files, hashes, and direct dependency IDs. The
+structured stage prompt graph keeps direct and conditional invocations separate
+from those dependency edges; admission computes the complete closure in stable
+declaration order.
+
+The release-verification discovery controls
 are `scripts/provider-discovery-probe.sh {claude|codex} {positive|negative}`;
 CI runs only its non-provider helper seam in
 `tests/test-provider-discovery-probe.sh`.
@@ -19,16 +28,21 @@ agentflow doctor --repo /path/to/repository --json
 ```
 
 The command exits nonzero when a required capability or any selected dispatch
-matrix cell is not ready. The default full matrix selects both `claude` and
-`codex`; `--provider` and `--stage` narrow that same readiness decision.
+matrix cell is not ready. The default matrix covers every enabled unattended
+stage and every context that repository can dispatch, for both `claude` and
+`codex`; `--provider` and `--stage` only narrow that same readiness decision.
+Mockup explicitly supports UI context only, so it is absent from a headless
+repository's matrix rather than reported as a false headless cell.
 Codebase Memory is optional.
 UI capabilities become required only when the repository declares or contains a
 user-facing surface. An explicit declaration is authoritative even when its path
 does not match AgentFlow's conservative directory heuristics.
 
 The JSON report is versioned with `schema_version`. Each capability has a
-`status` of `ok`, `missing`, or `drifted`, plus the exact repair command where
-one is available.
+`status` of `ok`, `missing`, `drifted`, or `incompatible`, plus the exact repair
+command where one is available. Each matrix cell records stage, context,
+provider, required contract IDs and versions, evidence, repair command, and
+readiness.
 
 Doctor is a static inspection command: it verifies the trusted harness and skill
 manifests before inspecting installed runtime metadata, and never executes
@@ -67,6 +81,12 @@ installer. Every tracked file in each required skill directory—including
 executable scripts, package locks, agent metadata, and referenced prompts—is
 checked against the deterministic file list and SHA-256 values in the manifest.
 Missing, changed, and unexpected files fail readiness.
+Readiness is provider-specific: Codex must discover the pinned contract from the
+project's `.agents/skills` root, while Claude must have the matching project-local
+`.claude/skills` reference. User-global, ambient, and bundled copies are ignored.
+Executable presence alone is insufficient, and a missing, drifted, release-
+incompatible, dependency-incompatible, or undiscoverable selected-provider
+contract fails closed.
 Before invoking the installer, AgentFlow resolves lightweight or annotated
 release tags with Git and requires the peeled commit to equal the manifest pin.
 It then clones and checks out that exact commit into a temporary local source;

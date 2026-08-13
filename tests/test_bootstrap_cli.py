@@ -72,6 +72,24 @@ def test_capability_manifest_pins_the_complete_public_skill_release():
         "commit": "230e71a55ab07f0cd9beaa61649b583cb9d1bde1",
         "skills": ["ui-craft", "drive-local-webapp"],
     }
+    methodology_release = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+    assert manifest["methodology_skills"] == {
+        "source": "https://github.com/ConnorGriffin/skills",
+        "commit": methodology_release,
+        "skills": ["tdd", "codebase-design", "domain-modeling"],
+    }
+    contracts = {item["id"]: item for item in manifest["capabilities"]}
+    assert {
+        name: (contracts[name]["version"], contracts[name]["dependencies"])
+        for name in ("tdd", "codebase-design", "domain-modeling",
+                     "ui-craft", "drive-local-webapp")
+    } == {
+        "tdd": (methodology_release, []),
+        "codebase-design": (methodology_release, ["domain-modeling"]),
+        "domain-modeling": (methodology_release, []),
+        "ui-craft": ("v0.3.0", ["drive-local-webapp"]),
+        "drive-local-webapp": ("v0.3.0", ["playwright"]),
+    }
     assert pins["ui-craft"] == {
         "SKILL.md": "a33d188dd0cd9b648795e959338f98fd6f9f135fd0c6cef4ddd48d0011a3f7c7",
         "agents/openai.yaml": "87e22f100ffc1d87b342ada266ccddbcc271b20709cfe5c3e7b5179c635f9b56",
@@ -866,7 +884,7 @@ def test_release_verification_accepts_lightweight_and_annotated_tags(
         or SimpleNamespace(returncode=0, stdout=stdout, stderr=""),
     )
 
-    resolved, error = _resolved_skill_release(_manifest()["connor_skills"])
+    resolved, error = _resolved_skill_release(_manifest())
 
     assert error is None
     assert resolved == "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
@@ -985,7 +1003,11 @@ def test_enroll_rolls_back_if_tag_moves_between_preflight_and_install(
     assert "resolved to aaaaaaaaaa" in output
     assert "rolled back" in output
     assert tag_reads >= 2
-    assert not any(command[0] == "npx" for command in commands)
+    assert not any(
+        command[0] == "npx"
+        and command[command.index("--skill") + 1] in {"ui-craft", "drive-local-webapp"}
+        for command in commands
+    )
     assert not config.exists()
     assert subprocess.run(
         ["git", "-C", str(tmp_path), "status", "--porcelain"],
@@ -1336,7 +1358,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     original_destination_status = __import__(
         "agentflow.enroll", fromlist=["_skill_destination_status"]
     )._skill_destination_status
-    installed = False
+    installed: set[str] = set()
     active_failure = failure
     commands = []
     before = [
@@ -1353,7 +1375,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
 
     def destination_status(directory, manifest):
         if directory.name in {"ui-craft", "drive-local-webapp", "tdd", "codebase-design", "domain-modeling"}:
-            return "ok" if installed else "absent"
+            return "ok" if directory.name in installed else "absent"
         return original_destination_status(directory, manifest)
 
     def run(command, **kwargs):
@@ -1380,27 +1402,27 @@ def test_enroll_public_ui_command_path_reports_each_stage(
         if command[-2:] == ["rev-parse", "HEAD"]:
             if active_failure == "git-rev-parse":
                 return SimpleNamespace(returncode=1, stdout="", stderr="rev-parse failed")
+            expected_commit = (
+                "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+                if "agentflow-methodology-" in command[2]
+                else "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+            )
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
                     if active_failure == "git-head-mismatch"
-                    else "230e71a55ab07f0cd9beaa61649b583cb9d1bde1\n"
+                    else f"{expected_commit}\n"
                 ),
                 stderr="",
             )
         if command[0] == "npx":
             if active_failure == "npx":
                 return SimpleNamespace(returncode=127, stdout="", stderr="missing npx")
-            installed = True
-            names = (("tdd", "codebase-design", "domain-modeling")
-                     if "tdd" in command else ("ui-craft", "drive-local-webapp"))
-            for name in names:
-                codex = tmp_path / ".agents" / "skills" / name
-                codex.mkdir(parents=True, exist_ok=True)
-                claude = tmp_path / ".claude" / "skills" / name
-                claude.parent.mkdir(parents=True, exist_ok=True)
-                claude.symlink_to(Path("../../.agents/skills") / name)
+            name = command[command.index("--skill") + 1]
+            installed.add(name)
+            codex = tmp_path / ".agents" / "skills" / name
+            codex.mkdir(parents=True, exist_ok=True)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command == ["npm", "ci"]:
             if active_failure == "npm-ci":
@@ -1431,6 +1453,9 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     monkeypatch.setattr(
         "agentflow.enroll._skill_destination_status", destination_status
     )
+    monkeypatch.setattr(
+        "agentflow.provider_skills.skill_destination_status", destination_status
+    )
     monkeypatch.setattr("agentflow.enroll._run_command", run)
 
     result = main(["enroll", str(tmp_path), "--apply"])
@@ -1445,7 +1470,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     }
     if failure in source_failures:
         assert not any(command[0] == "npx" for command in commands)
-        assert "skill source" in output
+        assert "source" in output
         npx_index = None
     else:
         npx_index = next(i for i, command in enumerate(commands) if command[0] == "npx")
@@ -1499,6 +1524,6 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     assert after == before
     assert config.read_bytes() == config_before
     active_failure = None
-    installed = False
+    installed.clear()
     commands.clear()
     assert main(["enroll", str(tmp_path), "--apply"]) == 0

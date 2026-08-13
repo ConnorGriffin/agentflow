@@ -32,6 +32,8 @@ from pathlib import Path
 from agentflow import live
 from agentflow.coordinator import Submission
 from agentflow.coordinator.verification import PREPARED, unprepared
+from agentflow.prompts import stage_prompt_spec
+from agentflow.repo_facts import surface_declaration
 from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.workspace import channel, publish
@@ -274,17 +276,20 @@ def converse_submission(repo: str, workdir: str, conversation_id: str, ordinal: 
     worktree = ask_worktree(workdir, pool, conversation_id)
     reply_at = os.path.join(worktree, ".agentflow", f"ask-reply-{ordinal}.md")
     if wants_build_issue(prompt):
-        input_ptr = BUILD_ISSUE_PROMPT.format(
+        prompt_text = BUILD_ISSUE_PROMPT.format(
             repo=repo, ordinal=ordinal, conversation_id=conversation_id, prompt=prompt,
             reply_path=reply_at,
             proposal_path=os.path.join(worktree, ".agentflow", f"ask-proposal-{ordinal}.json"))
     else:
-        input_ptr = ASK_PROMPT.format(
+        prompt_text = ASK_PROMPT.format(
             repo=repo, ordinal=ordinal, conversation_id=conversation_id, prompt=prompt,
             reply_path=reply_at)
+    input_ptr = stage_prompt_spec("converse").render(prompt=prompt_text)
     return Submission(
         repo=repo, subject=conversation_id, stage="converse", pool=pool, complexity="deep",
-        target=str(ordinal), source=worktree, input_ptr=input_ptr, claim=True, interactive=True)
+        target=str(ordinal), source=worktree, input_ptr=input_ptr, claim=True, interactive=True,
+        capability_root=workdir,
+        capability_context={"ui": bool(surface_declaration(workdir).surfaces)})
 
 
 # --- command application (daemon-side; the only writer, ADR 0033) -----------------------

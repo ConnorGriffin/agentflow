@@ -50,7 +50,11 @@ def main(argv: list[str] | None = None) -> int | None:
     doctor_command.add_argument("path", nargs="?", default=None)
     doctor_command.add_argument("--repo", dest="repo_path")
     doctor_command.add_argument("--json", action="store_true", dest="json_output")
-    doctor_command.add_argument("--stage")
+    doctor_command.add_argument(
+        "--stage",
+        choices=("intake", "build", "review", "revise", "mockup", "respond",
+                 "converse", "research", "attack"),
+    )
     doctor_command.add_argument("--provider", choices=("claude", "codex"))
     enroll_command = commands.add_parser(
         "enroll", help="configure a repository for reproducible AgentFlow use"

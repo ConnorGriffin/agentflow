@@ -13,29 +13,55 @@ prompt="Invoke the project-local skill named $skill using only native skill disc
 
 usage() { echo "usage: $0 {claude|codex} {positive|negative}" >&2; exit 64; }
 require_fixture() { test -f "$agent_skill/SKILL.md"; test -L "$claude_skill"; }
-run_claude() {
-  claude -p "$prompt" --model sonnet --output-format stream-json --verbose \
-    --permission-mode acceptEdits --setting-sources project --strict-mcp-config \
-    --settings '{"sandbox":{"enabled":true,"failIfUnavailable":true,"allowUnsandboxedCommands":false}}'
-}
-run_codex() {
-  codex exec -m gpt-5.6-terra --json --sandbox workspace-write --cd "$root" \
-    --ignore-user-config --ephemeral --skip-git-repo-check "$prompt"
+run_real_provider() {
+  AGENTFLOW_PROVIDER_PROBE_PROMPT=$prompt "$checkout/.venv/bin/python" - "$1" "$root" <<'PY'
+import os
+import sys
+
+from agentflow.runner import ClaudeRunner, CodexRunner
+
+provider, root = sys.argv[1:]
+prompt = os.environ["AGENTFLOW_PROVIDER_PROBE_PROMPT"]
+if provider == "claude":
+    argv = ClaudeRunner().structured_argv(prompt, "sonnet", root)
+elif provider == "codex":
+    argv = CodexRunner().structured_argv(prompt, "terra", root)
+else:
+    raise SystemExit(64)
+os.execvp(argv[0], argv)
+PY
 }
 run_provider() {
   if test -n "${AGENTFLOW_PROVIDER_PROBE_RUNNER:-}"; then
     "$AGENTFLOW_PROVIDER_PROBE_RUNNER" "$1" "$root" "$skill" "$marker"
     return
   fi
-  case $1 in claude) run_claude;; codex) run_codex;; *) usage;; esac
+  run_real_provider "$1"
 }
-positive() { require_fixture; output=$(run_provider "$1"); printf '%s\n' "$output"; printf '%s' "$output" | grep -Fq "$marker"; }
+positive() {
+  require_fixture
+  output=$(run_provider "$1")
+  printf '%s\n' "$output"
+  printf '%s' "$output" | grep -Fq "$marker"
+  case $1 in
+    claude)
+      printf '%s' "$output" | grep -Fq '"name":"Skill"'
+      printf '%s' "$output" | grep -Fq "\"skill\":\"$skill\""
+      ;;
+    codex)
+      ! printf '%s' "$output" | grep -Fq '"type":"command_execution"'
+      ;;
+  esac
+}
 negative() {
   require_fixture
   mv "$agent_skill" "$agent_skill.disabled"; mv "$claude_skill" "$claude_skill.disabled"
   trap 'mv "$claude_skill.disabled" "$claude_skill"; mv "$agent_skill.disabled" "$agent_skill"' EXIT HUP INT TERM
   output=$(run_provider "$1"); printf '%s\n' "$output"
-  ! printf '%s' "$output" | grep -Fq "$marker"; printf '%s' "$output" | grep -Fq SKILL_UNAVAILABLE
+  ! printf '%s' "$output" | grep -Fq "$marker"
+  printf '%s' "$output" | grep -Fq SKILL_UNAVAILABLE
+  ! printf '%s' "$output" | grep -Fq '"name":"Skill"'
+  ! printf '%s' "$output" | grep -Fq '"type":"command_execution"'
 }
 test $# = 2 || usage
 case $1 in claude|codex) ;; *) usage;; esac

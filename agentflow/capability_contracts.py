@@ -8,12 +8,14 @@ doctor report and dispatch admission cannot drift into separate registries.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 from importlib.resources import files
 import tomllib
 from pathlib import Path
 from typing import Iterable
 import shutil
+
+from agentflow.provider_skills import provider_skill_status
+from agentflow.runtime_contracts import playwright_runtime_status
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,7 @@ class ContractRequirement:
     id: str
     version: str
     runtime: bool = False
+    dependencies: tuple["ContractRequirement", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -38,14 +41,29 @@ class CapabilityPreflightResult:
 
 
 def requirements_for(invocations: Iterable[object], context: dict[str, object]) -> tuple[ContractRequirement, ...]:
-    """Expand direct prompt declarations, conditionals, and transitive edges deterministically."""
+    """Expand direct, conditional, and transitive prompt requirements deterministically."""
     seen: dict[str, ContractRequirement] = {}
+    visiting: set[str] = set()
+
+    def add(requirement: ContractRequirement) -> None:
+        if requirement.id in visiting:
+            raise ValueError(f"cyclic capability dependency at {requirement.id}")
+        prior = seen.get(requirement.id)
+        if prior is not None:
+            if (prior.version, prior.runtime) != (requirement.version, requirement.runtime):
+                raise ValueError(f"conflicting capability requirement for {requirement.id}")
+            return
+        visiting.add(requirement.id)
+        seen[requirement.id] = requirement
+        for dependency in requirement.dependencies:
+            add(dependency)
+        visiting.remove(requirement.id)
+
     for invocation in invocations:
         condition = getattr(invocation, "condition", None)
         if condition is not None and not context.get(condition, False):
             continue
-        for requirement in getattr(invocation, "requirements", ()):
-            seen.setdefault(requirement.id, requirement)
+        add(getattr(invocation, "requirement"))
     return tuple(seen.values())
 
 
@@ -70,8 +88,6 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
                     f"playwright@{pinned_version}"
                 )
                 continue
-            from agentflow.enroll import playwright_runtime_status
-
             status, detail = playwright_runtime_status(
                 root,
                 version=pinned_version,
@@ -82,24 +98,30 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
                 states.append(status)
                 evidence.append(f"{requirement.id}@{requirement.version}: {detail}")
             continue
-        destinations = [root / ".agents" / "skills" / requirement.id,
-                        root / ".claude" / "skills" / requirement.id]
-        if not all(destination.is_dir() for destination in destinations):
-            states.append("missing")
-            evidence.append(f"{requirement.id}@{requirement.version}: project-local destination missing")
+        spec = specs.get(requirement.id)
+        if spec is None:
+            states.append("incompatible")
+            evidence.append(f"{requirement.id}@{requirement.version}: no manifest contract")
             continue
-        spec = specs.get(requirement.id, {})
-        expected = {item["path"]: item["sha256"] for item in spec.get("files", [])}
-        for destination in destinations:
-            actual = {path.relative_to(destination).as_posix() for path in destination.rglob("*")
-                      if path.is_file()}
-            if actual != set(expected) or any(
-                hashlib.sha256((destination / path).read_bytes()).hexdigest() != digest
-                for path, digest in expected.items()
-            ):
-                states.append("drifted")
-                evidence.append(f"{requirement.id}@{requirement.version}: pinned files drifted")
-                break
+        if spec.get("version") != requirement.version:
+            states.append("incompatible")
+            evidence.append(
+                f"{requirement.id}@{requirement.version}: manifest pins "
+                f"{spec.get('version', 'no version')}"
+            )
+            continue
+        declared_dependencies = tuple(spec.get("dependencies", ()))
+        required_dependencies = tuple(item.id for item in requirement.dependencies)
+        if declared_dependencies != required_dependencies:
+            states.append("incompatible")
+            evidence.append(
+                f"{requirement.id}@{requirement.version}: dependency contract is incompatible"
+            )
+            continue
+        status, detail = provider_skill_status(root, provider, spec)
+        if status != "ok":
+            states.append(status)
+        evidence.append(f"{requirement.id}@{requirement.version}: {detail}")
     state = next((item for item in ("missing", "drifted", "incompatible") if item in states), "ready")
     return CapabilityPreflightResult(
         stage=stage, provider=provider, contracts=requirements, state=state,

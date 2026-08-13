@@ -23,6 +23,7 @@ adapter seam (ADR 0020).
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 from dataclasses import replace
@@ -41,7 +42,7 @@ from agentflow.labels import BUILDING, claim, release
 from agentflow.pool_control import POOLS, pool_paused
 from agentflow.pr_park import (chain_uncertainty, exact_head_review_chain, park_context,
                                park_proof_marker)
-from agentflow.prompts import UI_GAP_REASON
+from agentflow.prompts import UI_GAP_REASON, stage_prompt_spec
 from agentflow.repo_facts import repo_profile, surface_declaration, surfaces_phrase, ui_surfaces
 from agentflow.reviewer import review_worktree
 from agentflow.routing import routing
@@ -65,6 +66,15 @@ def _session_lead_prompt(prompt: str, parent_pool: str) -> str:
     return prompt + routing.session_lead_instructions(
         "review", None, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
         unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+
+
+def _review_prompt(prompt: str) -> str:
+    """Route every final provider-facing Review prompt through its structured spec."""
+    return stage_prompt_spec("review").render(prompt=prompt)
+
+
+def _capability_context(record) -> dict[str, bool]:
+    return json.loads(record.capability_context or "{}")
 
 
 def _with_durable_review_assignment(review_record, prompt: str, **assignment) -> str:
@@ -146,13 +156,14 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         complexity=routing.review_complexity(
             build_record.builder_complexity, build_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
-        claim=True, input_ptr=brief, builder_lineage=build_record.pool,
+        claim=True, input_ptr=_review_prompt(brief), builder_lineage=build_record.pool,
         branch_lineage=(build_record.branch_lineage or build_record.pool),
         builder_complexity=build_record.complexity, builder_effort=build_record.effort,
         round=completed_rounds,
         conflict_round=build_record.conflict_round,
         review=state, session_lead=True,
-        transfer_from=build_record.identity)
+        transfer_from=build_record.identity, capability_root=build_record.capability_root,
+        capability_context=_capability_context(build_record))
 
 
 def conflict_decision_review_submission(revise_record, *, head_sha: str, pr_number: int,
@@ -263,12 +274,13 @@ def review_successor_submission(review_record, verdict):
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
-        claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        claim=True, input_ptr=_review_prompt(prompt), builder_lineage=review_record.builder_lineage,
         branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state,
-        session_lead=session_lead)
+        session_lead=session_lead, capability_root=review_record.capability_root,
+        capability_context=_capability_context(review_record))
 
 
 def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=None,
@@ -339,12 +351,13 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
-        claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        claim=True, input_ptr=_review_prompt(prompt), builder_lineage=review_record.builder_lineage,
         branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         transfer_from=review_record.identity, review=state,
-        session_lead=session_lead)
+        session_lead=session_lead, capability_root=review_record.capability_root,
+        capability_context=_capability_context(review_record))
 
 
 def tainted_review_submission(review_record, reviewer_tool: str):
@@ -386,12 +399,13 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
-        claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        claim=True, input_ptr=_review_prompt(prompt), builder_lineage=review_record.builder_lineage,
         branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state,
-        session_lead=session_lead)
+        session_lead=session_lead, capability_root=review_record.capability_root,
+        capability_context=_capability_context(review_record))
 
 
 def decision_resume_review_submission(review_record, reviewer_tool: str, *, target: str,
@@ -437,12 +451,13 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
-        claim=True, input_ptr=prompt, builder_lineage=review_record.builder_lineage,
+        claim=True, input_ptr=_review_prompt(prompt), builder_lineage=review_record.builder_lineage,
         branch_lineage=review_record.branch_lineage,
         builder_complexity=review_record.builder_complexity,
         builder_effort=review_record.builder_effort, round=review_record.round,
         conflict_round=review_record.conflict_round, review=state,
-        session_lead=session_lead)
+        session_lead=session_lead, capability_root=review_record.capability_root,
+        capability_context=_capability_context(review_record))
 
 
 def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
@@ -483,10 +498,11 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         repo=cfg.repo, subject=str(issue), stage="review", target=head_sha,
         pool=reviewer_tool, complexity=routing.review_complexity(None, "deep"),
         source=str(review_worktree(cfg.workdir, reviewer_tool, pr_number, slug)),
-        claim=True, input_ptr=prompt, builder_lineage=builder_tool,
+        claim=True, input_ptr=_review_prompt(prompt), builder_lineage=builder_tool,
         branch_lineage=builder_tool,
         review=state, transfer_from=transfer_from, supersede=supersede, resume=resume,
-        session_lead=True)
+        session_lead=True, capability_root=cfg.workdir,
+        capability_context={"ui": bool(surface_declaration(cfg.workdir).surfaces)})
 
 
 def _prior_attempt_push(record, obs) -> str:
@@ -1183,12 +1199,13 @@ def _moved_head_review_submission(record, head_sha: str):
         complexity=routing.review_complexity(
             record.builder_complexity, record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, slug)),
-        claim=True, input_ptr=prompt, builder_lineage=record.builder_lineage,
+        claim=True, input_ptr=_review_prompt(prompt), builder_lineage=record.builder_lineage,
         branch_lineage=record.branch_lineage,
         builder_complexity=record.builder_complexity, builder_effort=record.builder_effort,
         round=record.round,
         review=review, session_lead=has_session_lead_provenance(record),
-        transfer_from=record.identity, supersede=True)
+        transfer_from=record.identity, supersede=True, capability_root=record.capability_root,
+        capability_context=_capability_context(record))
 
 
 def _kill_running_family(record) -> None:

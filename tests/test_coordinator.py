@@ -28,7 +28,8 @@ def test_nonready_capability_preflight_holds_before_admission_and_survives_resta
     session = FakeSession()
     events = []
     result = CapabilityPreflightResult(
-        stage="build", provider=provider, contracts=(ContractRequirement("tdd", "v0.3.0"),),
+        stage="build", provider=provider,
+        contracts=(ContractRequirement("tdd", "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"),),
         state="missing", evidence=("tdd project-local destination missing",),
         repair_command="agentflow enroll /repo --apply")
     coord = make_coord(
@@ -42,6 +43,9 @@ def test_nonready_capability_preflight_holds_before_admission_and_survives_resta
     assert held.state == "held" and held.claim and held.attempts == 0
     assert held.capability_preflight and "environment_failure" in held.hold_reason
     assert permits(coord, provider) == 0 and not session.family_of
+    from agentflow.coordinator.store import default_store_path
+    from agentflow.coordinator.telemetry import read_attempts
+    assert read_attempts(default_store_path()) == []
     assert any("environment_failure missing; claim retained" in event for event in events)
     assert not any("claim released" in event for event in events)
 

@@ -29,7 +29,7 @@ class SkillInvocation:
     conditional UI edge observable by both prompt rendering and capability admission.
     """
     name: str
-    requirements: tuple[ContractRequirement, ...]
+    requirement: ContractRequirement
     condition: str | None = None
 
 
@@ -38,6 +38,7 @@ class StagePromptSpec:
     stage: str
     template: str
     invocations: tuple[SkillInvocation, ...]
+    contexts: tuple[str, ...] = ("headless", "ui")
 
     def render(self, **values: str) -> str:
         return self.template.format(**values)
@@ -298,28 +299,37 @@ CONFLICT_REASON = (
 # This is deliberately declared after the templates: the legacy constants below remain a stable
 # import surface while every new caller crosses ``StagePromptSpec``.  Runtime edges are contracts
 # too: the UI workflow requires its local browser workflow and pinned Playwright runtime.
-_TDD = ContractRequirement("tdd", "v0.3.0")
-_DESIGN = ContractRequirement("codebase-design", "v0.3.0")
-_DOMAIN = ContractRequirement("domain-modeling", "v0.3.0")
-_UI = ContractRequirement("ui-craft", "v0.3.0")
-_DRIVE = ContractRequirement("drive-local-webapp", "v0.3.0")
+_METHODOLOGY_RELEASE = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+_TDD = ContractRequirement("tdd", _METHODOLOGY_RELEASE)
 _PLAYWRIGHT = ContractRequirement("playwright", "1.61.1", runtime=True)
+_DOMAIN = ContractRequirement("domain-modeling", _METHODOLOGY_RELEASE)
+_DESIGN = ContractRequirement("codebase-design", _METHODOLOGY_RELEASE, dependencies=(_DOMAIN,))
+_DRIVE = ContractRequirement("drive-local-webapp", "v0.3.0", dependencies=(_PLAYWRIGHT,))
+_UI = ContractRequirement("ui-craft", "v0.3.0", dependencies=(_DRIVE,))
 
 STAGE_PROMPTS = {
     "build": StagePromptSpec("build", BUILD_PROMPT, (
-        SkillInvocation("tdd", (_TDD,)),
-        SkillInvocation("codebase-design", (_DESIGN, _DOMAIN)),
-        SkillInvocation("ui-craft", (_UI, _DRIVE, _PLAYWRIGHT), "ui"),
+        SkillInvocation("tdd", _TDD),
+        SkillInvocation("codebase-design", _DESIGN),
+        SkillInvocation("ui-craft", _UI, "ui"),
     )),
     "revise": StagePromptSpec("revise", REVISE_PROMPT, (
-        SkillInvocation("ui-craft", (_UI, _DRIVE, _PLAYWRIGHT), "ui"),
+        SkillInvocation("ui-craft", _UI, "ui"),
     )),
     "mockup": StagePromptSpec("mockup", PRODUCE_PROMPT, (
-        SkillInvocation("ui-craft", (_UI, _DRIVE, _PLAYWRIGHT)),
-    )),
+        SkillInvocation("ui-craft", _UI),
+    ), contexts=("ui",)),
     "respond": StagePromptSpec("respond", RESPOND_PROMPT, (
-        SkillInvocation("ui-craft", (_UI, _DRIVE, _PLAYWRIGHT), "ui"),
+        SkillInvocation("ui-craft", _UI, "ui"),
     )),
+    # These stages compose their domain-specific text beside their submission mapping.  The
+    # pass-through template still makes the structured spec the dispatch seam without moving
+    # large, stage-private prompt bodies into this shared module or inventing method contracts.
+    "intake": StagePromptSpec("intake", "{prompt}", ()),
+    "review": StagePromptSpec("review", "{prompt}", ()),
+    "converse": StagePromptSpec("converse", "{prompt}", ()),
+    "research": StagePromptSpec("research", "{prompt}", ()),
+    "attack": StagePromptSpec("attack", "{prompt}", ()),
 }
 
 

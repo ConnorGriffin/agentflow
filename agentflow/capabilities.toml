@@ -12,12 +12,13 @@ skills = ["ui-craft", "drive-local-webapp"]
 
 [methodology_skills]
 source = "https://github.com/ConnorGriffin/skills"
-tag = "v0.3.0"
-commit = "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+commit = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
 skills = ["tdd", "codebase-design", "domain-modeling"]
 
 [[capabilities]]
 id = "tdd"
+version = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+dependencies = []
 description = "the pinned vertical public-interface test workflow"
 requirement = "methodology"
 skill = "tdd"
@@ -31,6 +32,8 @@ files = [
 
 [[capabilities]]
 id = "codebase-design"
+version = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+dependencies = ["domain-modeling"]
 description = "the pinned deep-module design workflow"
 requirement = "methodology"
 skill = "codebase-design"
@@ -43,6 +46,8 @@ files = [
 
 [[capabilities]]
 id = "domain-modeling"
+version = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+dependencies = []
 description = "the pinned domain-modeling workflow required by design work"
 requirement = "conditional-methodology"
 skill = "domain-modeling"
@@ -84,6 +89,8 @@ requirement = "always"
 
 [[capabilities]]
 id = "ui-craft"
+version = "v0.3.0"
+dependencies = ["drive-local-webapp"]
 description = "the repo-local UI surface lifecycle workflow (lock/build/critique/audit/polish/resettle)"
 requirement = "ui"
 skill = "ui-craft"
@@ -138,6 +145,8 @@ files = [
 
 [[capabilities]]
 id = "drive-local-webapp"
+version = "v0.3.0"
+dependencies = ["playwright"]
 description = "the repo-local browser verification workflow"
 requirement = "ui"
 skill = "drive-local-webapp"
