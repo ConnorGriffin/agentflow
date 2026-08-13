@@ -206,7 +206,6 @@ def review_successor_submission(review_record, verdict):
     from agentflow.coordinator import Submission
     from agentflow.review_policy import (
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, merge_follow_ups)
-    from agentflow.reviewer import with_review_assignment
 
     facts = review_source_facts(review_record)
     if (facts is None or not verdict.pushed_sha or verdict.pushed_sha != verdict.final_sha
