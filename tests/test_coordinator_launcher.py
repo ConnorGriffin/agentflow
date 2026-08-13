@@ -409,16 +409,12 @@ def _bounded_worker_command(tmp_path, *, worker="luna", effort="medium", timeout
 def test_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_path):
     """A real Build supervisor observes uncommitted work from its bounded Codex worker."""
     source, target = _tracked_build(tmp_path)
-    command = _bounded_worker_command(tmp_path)
-    started = _codex_command_event(command)
-    completed = _codex_command_event(command, completed=True)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
     script = (
         "import json,pathlib,sys,time\n"
         f"print(json.dumps({started!r}), flush=True)\n"
         "time.sleep(.12)\n"
         "pathlib.Path(sys.argv[1]).write_text('after\\n')\n"
-        "time.sleep(.12)\n"
-        f"print(json.dumps({completed!r}), flush=True)\n"
         "time.sleep(.45)\n"
     )
     provider = lambda record: [sys.executable, "-c", script, str(target)]
@@ -482,16 +478,12 @@ def test_bounded_worker_tracked_empty_addition_renews_build_silence(coord_state,
 def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_path):
     """Deleting a tracked implementation file is a durable worker progress state."""
     source, target = _tracked_build(tmp_path)
-    command = _bounded_worker_command(tmp_path)
-    started = _codex_command_event(command)
-    completed = _codex_command_event(command, completed=True)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
     script = (
         "import json,pathlib,sys,time\n"
         f"print(json.dumps({started!r}), flush=True)\n"
         "time.sleep(.12)\n"
         "pathlib.Path(sys.argv[1]).unlink()\n"
-        "time.sleep(.12)\n"
-        f"print(json.dumps({completed!r}), flush=True)\n"
         "time.sleep(.45)\n"
     )
     provider = lambda record: [sys.executable, "-c", script, str(target)]
@@ -689,34 +681,105 @@ def test_bounded_worker_changes_after_completion_do_not_renew(coord_state, tmp_p
     assert not marker.exists()
 
 
-def test_bounded_worker_change_immediately_before_completion_does_not_renew(
-        coord_state, tmp_path):
-    """A completion observed with a worker edit cannot retain the completed worker's lease."""
-    source, target = _tracked_build(tmp_path)
-    marker = tmp_path / "completion-race-crossed-silence"
+@pytest.mark.parametrize("revocation", ["completion", "stale-completion"])
+def test_bounded_worker_snapshot_rechecks_current_authorization(
+        tmp_path, monkeypatch, revocation):
+    """Completion or staleness during snapshot B wins before B can renew silence."""
+    import threading
+
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import events_path, read_session
+
+    class ChildExit(Exception):
+        pass
+
+    class Clock:
+        now = 0.0
+
+        def __call__(self):
+            return self.now
+
+    clock = Clock()
     command = _bounded_worker_command(tmp_path)
     started = _codex_command_event(command)
-    completed = _codex_command_event(command, completed=True)
-    script = (
-        "import json,pathlib,sys,time\n"
-        f"print(json.dumps({started!r}), flush=True)\n"
-        "time.sleep(.15)\n"
-        "pathlib.Path(sys.argv[1]).write_text('completed worker edit\\n')\n"
-        f"print(json.dumps({completed!r}), flush=True)\n"
-        "time.sleep(.22)\n"
-        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
-        "time.sleep(.30)\n"
-    )
-    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
-    coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.30, 0.50, 1.0)))
-    identity = coord.submit_stage(_build("codex", "completion-race", str(source)))
-    coord.cycle("codex")
+    revoked = _codex_command_event(
+        command if revocation == "completion" else "different command", completed=True)
 
-    record = _wait_for_real_child(identity, "completed worker edit retained Build silence")
-    assert target.read_text() == "completed worker edit\n"
-    assert _build_observation(record).cause is ProviderCause.TIMEOUT
-    assert not marker.exists()
+    class StartedStore:
+        def __init__(self, _path):
+            pass
+
+        def child_start(self, identity, token, family):
+            return True
+
+        def close(self):
+            pass
+
+    class Provider:
+        pid = 123
+
+        def __init__(self, *args, **kwargs):
+            output = kwargs["stdout"]
+            output.write(json.dumps(started) + "\n")
+            output.flush()
+
+        def wait(self, timeout=None):
+            if timeout is None or clock.now + timeout >= 0.22:
+                clock.now = 0.22
+                return 0
+            clock.now += timeout
+            raise subprocess.TimeoutExpired("provider", timeout)
+
+        def poll(self):
+            return None
+
+    snapshot_calls = 0
+    snapshot_b_started = threading.Event()
+    snapshot_b_release = threading.Event()
+
+    def snapshot(_working_dir):
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        if snapshot_calls == 1:
+            return b"A" * 32
+        snapshot_b_started.set()
+        assert snapshot_b_release.wait(1), "authorization revocation did not release snapshot B"
+        return b"B" * 32
+
+    def revoke_authorization():
+        assert snapshot_b_started.wait(1), "snapshot B did not reach its barrier"
+        with events.open("a") as output:
+            output.write(json.dumps(revoked) + "\n")
+        snapshot_b_release.set()
+
+    store_path = tmp_path / "records.db"
+    events = events_path(store_path, "token")
+    monkeypatch.setattr(_launch_child.os, "fork", lambda: 0)
+    monkeypatch.setattr(_launch_child.os, "setsid", lambda: None)
+    monkeypatch.setattr(_launch_child.os, "_exit",
+                        lambda code: (_ for _ in ()).throw(ChildExit(code)))
+    monkeypatch.setattr(_launch_child.os, "killpg", lambda _pid, _signum: None)
+    monkeypatch.setattr(_launch_child.signal, "signal", lambda _signum, _handler: None)
+    monkeypatch.setattr(_launch_child, "Store", StartedStore)
+    monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
+    monkeypatch.setattr(_launch_child, "_head", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", Provider)
+
+    args = [str(store_path), "attempt", "token", "5", "--build-lease", "codex",
+            "0.20", "0.50", "1.0", str(tmp_path), "provider"]
+    revoker = threading.Thread(target=revoke_authorization)
+    revoker.start()
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main(args, monotonic=clock, worktree_snapshot=snapshot)
+    revoker.join(timeout=1)
+
+    assert exited.value.args == (0,)
+    assert not revoker.is_alive()
+    session = read_session(store_path, "token")
+    assert snapshot_calls == 2
+    assert session.timed_out is True
+    assert session.exit_status == 0 and session.signal is None
 
 
 @pytest.mark.parametrize(

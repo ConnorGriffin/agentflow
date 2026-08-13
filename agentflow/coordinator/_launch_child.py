@@ -799,7 +799,8 @@ def _clear_active(marker: Path | None) -> None:
         pass
 
 
-def main(args: list[str], *, monotonic=time.monotonic) -> None:
+def main(args: list[str], *, monotonic=time.monotonic,
+         worktree_snapshot=_worktree_snapshot) -> None:
     store_path, identity, token, timeout, *tail = args
     build_lease: tuple[float, float, float] | None = None
     progress_provider = ""
@@ -929,8 +930,13 @@ def main(args: list[str], *, monotonic=time.monotonic) -> None:
                     silent_deadline = now + build_lease[0]
                 if (progress_stream.active_workers and
                         (worker_changed or now >= next_worker_poll)):
-                    snapshot = _worktree_snapshot(working_dir)
+                    snapshot = worktree_snapshot(working_dir)
                     now = monotonic()
+                    (snapshot_progressed, now, events_pending, lease_expired,
+                     snapshot_worker_changed) = progress_stream.poll(
+                        events, silent_deadline=silent_deadline,
+                        test_timeout=build_lease[1], absolute_deadline=absolute_deadline)
+                    worker_changed = worker_changed or snapshot_worker_changed
                     active_test_deadline = (min(progress_stream.active_tests.values())
                                             + build_lease[1]
                                             if progress_stream.active_tests else None)
@@ -938,14 +944,19 @@ def main(args: list[str], *, monotonic=time.monotonic) -> None:
                         min(absolute_deadline, active_test_deadline)
                         if active_test_deadline is not None
                         else min(absolute_deadline, silent_deadline))
-                    if now >= observation_deadline:
+                    if lease_expired or now >= observation_deadline:
                         timed_out = True
                         returncode = stop_provider()
                         break
-                    if (worker_snapshot is not None and snapshot is not None
-                            and snapshot != worker_snapshot):
+                    if snapshot_progressed and not events_pending:
                         silent_deadline = now + build_lease[0]
-                    worker_snapshot = snapshot
+                    if progress_stream.active_workers and not events_pending:
+                        if (worker_snapshot is not None and snapshot is not None
+                                and snapshot != worker_snapshot):
+                            silent_deadline = now + build_lease[0]
+                        worker_snapshot = snapshot
+                    else:
+                        worker_snapshot = None
                     next_worker_poll = now + head_poll_s
                 if not progress_stream.active_workers and worker_changed:
                     worker_snapshot = None
