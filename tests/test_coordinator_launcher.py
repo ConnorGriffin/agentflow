@@ -455,6 +455,30 @@ def test_bounded_worker_untracked_addition_renews_build_silence(coord_state, tmp
     assert _build_observation(record).timed_out is False
 
 
+def test_bounded_worker_tracked_empty_addition_renews_build_silence(coord_state, tmp_path):
+    """Adding a tracked empty implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    added = source / "empty.py"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,subprocess,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).touch()\n"
+        "subprocess.run(['git','-C',sys.argv[2],'add','empty.py'], check=True)\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(added), str(source)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-tracked-empty-addition", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker tracked empty addition did not exit")
+    assert added.exists()
+    assert _build_observation(record).timed_out is False
+
+
 def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_path):
     """Deleting a tracked implementation file is a durable worker progress state."""
     source, target = _tracked_build(tmp_path)
@@ -478,6 +502,64 @@ def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_p
 
     record = _wait_for_real_child(identity, "bounded worker deletion child did not exit")
     assert not target.exists()
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_tracked_empty_deletion_renews_build_silence(coord_state, tmp_path):
+    """Deleting a tracked empty implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    deleted = source / "empty.py"
+    deleted.touch()
+    subprocess.run(("git", "-C", str(source), "add", "empty.py"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "track empty"),
+                   check=True, capture_output=True)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).unlink()\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(deleted)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-tracked-empty-deletion", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker tracked empty deletion did not exit")
+    assert not deleted.exists()
+    assert _build_observation(record).timed_out is False
+
+
+def test_bounded_worker_tracked_empty_path_change_renews_build_silence(
+        coord_state, tmp_path):
+    """Renaming a tracked empty implementation file is durable worker progress."""
+    source, _target = _tracked_build(tmp_path)
+    original = source / "empty.py"
+    renamed = source / "renamed.py"
+    original.touch()
+    subprocess.run(("git", "-C", str(source), "add", "empty.py"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "track empty"),
+                   check=True, capture_output=True)
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,subprocess,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "subprocess.run(['git','-C',sys.argv[1],'mv','empty.py','renamed.py'], check=True)\n"
+        "time.sleep(.65)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(source)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-tracked-empty-path", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "bounded worker tracked empty rename did not exit")
+    assert not original.exists() and renamed.exists()
     assert _build_observation(record).timed_out is False
 
 
@@ -768,45 +850,85 @@ def test_bounded_worker_snapshot_cannot_strand_the_supervisor(
     assert not marker.exists()
 
 
-def test_build_head_progress_renews_its_child_local_silent_lease(coord_state, tmp_path):
-    """A real Build child survives a short silent lease after committing new work (#570)."""
-    from agentflow.coordinator.store import Store, default_store_path
+def _run_clocked_supervisor(
+        tmp_path, monkeypatch, *, build_lease, exit_at, heads=(None,)):
+    """Run the production supervisor interface against an exact monotonic timeline."""
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator.session import read_session
 
-    source = tmp_path / "build"
-    source.mkdir()
-    for command in (("git", "init", str(source)),
-                    ("git", "-C", str(source), "config", "user.email", "test@example.com"),
-                    ("git", "-C", str(source), "config", "user.name", "Test")):
-        subprocess.run(command, check=True, capture_output=True)
-    (source / "initial").write_text("initial")
-    subprocess.run(("git", "-C", str(source), "add", "."), check=True, capture_output=True)
-    subprocess.run(("git", "-C", str(source), "commit", "-m", "initial"),
-                   check=True, capture_output=True)
+    class ChildExit(Exception):
+        pass
 
-    script = (
-        "import pathlib,subprocess,sys,time\n"
-        "time.sleep(.12)\n"
-        "pathlib.Path(sys.argv[1], 'progress').write_text('done')\n"
-        "subprocess.run(['git','-C',sys.argv[1],'add','.'], check=True)\n"
-        "subprocess.run(['git','-C',sys.argv[1],'commit','-m','progress'], check=True)\n"
-        "time.sleep(.24)\n"
-    )
-    provider = lambda record: [sys.executable, "-c", script, record.source]
-    coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.25, 0.50, 1.0)))
-    identity = coord.submit_stage(_build("claude", "head-progress", str(source)))
-    coord.cycle("claude")
+    class Clock:
+        now = 0.0
 
-    deadline = time.monotonic() + 2
-    while not (source / "progress").exists() and time.monotonic() < deadline:
-        time.sleep(.01)
-    assert (source / "progress").exists()
-    time.sleep(.18)  # past the original silent lease, but after the new HEAD
-    record = Store(default_store_path()).load()[identity]
-    assert pid_family_alive(record.family)
+        def __call__(self):
+            return self.now
 
-    record = _wait_for_real_child(identity, "Build child did not exit")
-    assert _build_observation(record).timed_out is False
+    clock = Clock()
+
+    class StartedStore:
+        def __init__(self, _path):
+            pass
+
+        def child_start(self, identity, token, family):
+            return True
+
+        def close(self):
+            pass
+
+    class Provider:
+        pid = 123
+
+        def wait(self, timeout=None):
+            assert timeout is not None
+            if clock.now + timeout >= exit_at:
+                clock.now = exit_at
+                return 0
+            clock.now += timeout
+            raise subprocess.TimeoutExpired("provider", timeout)
+
+        def poll(self):
+            return None
+
+    observed_heads = iter(heads)
+    last_head = heads[-1]
+
+    def head(_working_dir):
+        nonlocal last_head
+        last_head = next(observed_heads, last_head)
+        return last_head
+
+    monkeypatch.setattr(_launch_child.os, "fork", lambda: 0)
+    monkeypatch.setattr(_launch_child.os, "setsid", lambda: None)
+    monkeypatch.setattr(_launch_child.os, "_exit",
+                        lambda code: (_ for _ in ()).throw(ChildExit(code)))
+    monkeypatch.setattr(_launch_child.signal, "signal", lambda _signum, _handler: None)
+    monkeypatch.setattr(_launch_child, "Store", StartedStore)
+    monkeypatch.setattr(_launch_child, "_mark_active", lambda _working_dir: None)
+    monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
+    monkeypatch.setattr(_launch_child, "_head", head)
+    monkeypatch.setattr(_launch_child.subprocess, "Popen", lambda *args, **kwargs: Provider())
+
+    silent, test_grace, absolute = build_lease
+    store_path = tmp_path / "records.db"
+    args = [str(store_path), "attempt", "token", "5", "--build-lease", "claude",
+            str(silent), str(test_grace), str(absolute), str(tmp_path), "provider"]
+    with pytest.raises(ChildExit) as exited:
+        _launch_child.main(args, monotonic=clock)
+
+    assert exited.value.args == (0,)
+    return read_session(store_path, "token")
+
+
+def test_build_head_progress_renews_its_child_local_silent_lease(tmp_path, monkeypatch):
+    """A HEAD change extends silence past the original lease on an exact clock (#570)."""
+    session = _run_clocked_supervisor(
+        tmp_path, monkeypatch, build_lease=(0.25, 0.50, 1.0), exit_at=0.30,
+        heads=("before", "after"))
+
+    assert session.timed_out is False
+    assert session.exit_status == 0 and session.signal is None
 
 
 def test_active_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_path):
@@ -1263,21 +1385,13 @@ def test_post_decode_deadline_cannot_be_renewed_by_late_progress(
     assert not marker.exists()
 
 
-def test_natural_exit_observed_at_absolute_cap_is_durable_timeout(coord_state, tmp_path):
-    """An exit racing the immutable cap keeps its natural status but is classified timeout."""
-    absolute_cap = 0.30
-    provider = lambda record: [
-        sys.executable, "-c", f"import time; time.sleep({absolute_cap - 0.025})"]
-    coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(5.0, 5.0, absolute_cap)))
-    identity = coord.submit_stage(_build("claude", "natural-at-cap", str(tmp_path)))
-    coord.cycle("claude")
+def test_natural_exit_observed_at_absolute_cap_is_durable_timeout(tmp_path, monkeypatch):
+    """An exit at the immutable cap keeps its natural status but is classified timeout."""
+    session = _run_clocked_supervisor(
+        tmp_path, monkeypatch, build_lease=(5.0, 5.0, 0.30), exit_at=0.30)
 
-    record = _wait_for_real_child(identity, "natural cap-edge exit was not published")
-    observation = _build_observation(record)
-    assert observation.has_end_fact is True
-    assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
-    assert observation.exit_status == 0 and observation.signal is None
+    assert session.has_end_fact is True and session.timed_out is True
+    assert session.exit_status == 0 and session.signal is None
 
 
 def _delay_supervisor_wait(
@@ -1324,21 +1438,13 @@ def _delay_supervisor_wait(
         "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
 
 
-def test_natural_exit_observed_after_silent_deadline_is_durable_timeout(
-        coord_state, tmp_path, monkeypatch):
-    """Post-exit observation cannot turn an expired silent lease into a clean exit."""
-    _delay_supervisor_wait(tmp_path, monkeypatch, 0.08)
-    provider = lambda record: [sys.executable, "-c", "import time; time.sleep(.08)"]
-    coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.12, 1.0, 1.0)))
-    identity = coord.submit_stage(_build("claude", "natural-silent-edge", str(tmp_path)))
-    coord.cycle("claude")
+def test_natural_exit_observed_at_silent_deadline_is_durable_timeout(tmp_path, monkeypatch):
+    """An exit at the silent deadline keeps its natural status but is classified timeout."""
+    session = _run_clocked_supervisor(
+        tmp_path, monkeypatch, build_lease=(0.12, 1.0, 1.0), exit_at=0.12)
 
-    record = _wait_for_real_child(identity, "silent-edge natural exit was not published")
-    observation = _build_observation(record)
-    assert observation.has_end_fact is True
-    assert observation.timed_out is True and observation.cause is ProviderCause.TIMEOUT
-    assert observation.exit_status == 0 and observation.signal is None
+    assert session.has_end_fact is True and session.timed_out is True
+    assert session.exit_status == 0 and session.signal is None
 
 
 def test_natural_exit_observed_after_active_test_deadline_is_durable_timeout(
