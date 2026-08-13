@@ -1539,6 +1539,41 @@ def test_a_moved_head_retires_the_stale_review_and_opens_a_bounded_successor(mak
     assert live == ["o/r|7|review|live-sha"]
 
 
+def test_a_legacy_session_led_moved_head_successor_normalizes_provenance(make_coord,
+                                                                         monkeypatch):
+    from agentflow.coordinator.providers import validate_session_lead_input
+
+    fake = FakeSession()
+    fake.gate_open = False
+    coord = make_coord(fake)
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
+        repo="o/r", subject="7",
+        source="/work/.agentflow/worktrees/claude/issue-7-home-depot-probe")
+    opening = coordinated_review.review_submission(build, "stale-sha", "codex", 26)
+    contract = opening.input_ptr[opening.input_ptr.index(
+        "\n## Session lead — benchmarked capability routing\n"):]
+    stale = coord.submit_stage(replace(opening, transfer_from=None, session_lead=False))
+    legacy = record_of(coord, stale)
+    legacy.native_helpers_marker = "codex-cli 0.144.0\n"
+    coord._store.upsert(legacy)
+    monkeypatch.setattr("agentflow.github.pr_facts", _gh_pr("OPEN", "live-sha"))
+    monkeypatch.setattr("agentflow.live.replace_projection", lambda *a, **k: None)
+    monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
+    monkeypatch.setattr(
+        coordinated_review, "pick_reviewer", lambda _tool, **_kwargs: "codex")
+
+    pipeline.reconcile_and_project(coord)
+
+    successor = record_of(coord, "o/r|7|review|live-sha")
+    assert successor.session_lead is True
+    assert successor.input_ptr.count("<!-- agentflow-review-assignment:start -->") == 1
+    assert successor.input_ptr.count(
+        "\n## Session lead — benchmarked capability routing\n") == 1
+    assert successor.input_ptr.endswith(contract)
+    validate_session_lead_input(successor)
+
+
 def test_a_running_moved_head_review_terminates_before_opening_its_successor(make_coord,
                                                                                monkeypatch):
     """A live review is stopped before its moved-head successor takes the claim (#220)."""
