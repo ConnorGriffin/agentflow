@@ -403,12 +403,17 @@ for this preflight commit.
 | Focused candidate tests | `uv run pytest -q tests/test_evaluation_contract_candidate.py` | Candidate data coverage, generic interpreter, byte, bound, lineage, and rejection-case tests pass. |
 | Repository acceptance | `uv run pytest -q` | Entire Python suite passes. |
 
-## Unresolved product decisions
+## Product decision closure
 
-1. What are the six failure-class identifiers required for the v1 corpus? #583
-   requires all six but does not name them; no fail-closed mechanical default can
-   select product labels or their case semantics. The product owner must add them to
-   a reviewed canonical contract version before fixtures claim coverage.
+At this report's pinned source revision, #583 required six failure classes but did
+not name them, so the preflight correctly left that product choice unresolved.
+[ADR 620](../adr/adr-620-evaluation-failure-classes.md) now closes it from the
+validated #573 taxonomy: `original_defect`, `plan_gap`, `slice_scope_error`,
+`reviewer_false_claim`, `speculative_preference`, and `fix_introduced_defect`.
+The #617 candidate conformance report must import ADR 620 as an additional
+normative source and map those exact identifiers and meanings before claiming
+zero unresolved dispositions. This later closure does not rewrite the pinned
+41-item source inventory above.
 
 All absent field shapes, artifacts, bindings, and computations fail closed. Any later
 request to add a metric, threshold, case class, or promotion behavior requires a new
