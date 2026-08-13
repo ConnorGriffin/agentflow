@@ -417,6 +417,7 @@ def test_bounded_worker_durable_change_renews_build_silence(coord_state, tmp_pat
         f"print(json.dumps({started!r}), flush=True)\n"
         "time.sleep(.12)\n"
         "pathlib.Path(sys.argv[1]).write_text('after\\n')\n"
+        "time.sleep(.12)\n"
         f"print(json.dumps({completed!r}), flush=True)\n"
         "time.sleep(.45)\n"
     )
@@ -442,6 +443,7 @@ def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_p
         f"print(json.dumps({started!r}), flush=True)\n"
         "time.sleep(.12)\n"
         "pathlib.Path(sys.argv[1]).unlink()\n"
+        "time.sleep(.12)\n"
         f"print(json.dumps({completed!r}), flush=True)\n"
         "time.sleep(.45)\n"
     )
@@ -478,6 +480,32 @@ def test_bounded_worker_unchanged_state_does_not_renew_build_silence(coord_state
     assert not marker.exists()
 
 
+def test_bounded_worker_chmod_only_does_not_renew_build_silence(coord_state, tmp_path):
+    """Mode-only churn is not durable implementation progress."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "chmod-worker-crossed-silence"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).chmod(0o755)\n"
+        "time.sleep(.55)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+        "time.sleep(.50)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.00, 1.5)))
+    identity = coord.submit_stage(_build("codex", "chmod-worker", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "chmod-only worker retained Build silence")
+    assert target.stat().st_mode & 0o777 == 0o755
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
 def test_bounded_worker_changes_after_completion_do_not_renew(coord_state, tmp_path):
     """A recognized invocation stops authorizing observation at its completion event."""
     source, target = _tracked_build(tmp_path)
@@ -503,6 +531,36 @@ def test_bounded_worker_changes_after_completion_do_not_renew(coord_state, tmp_p
 
     record = _wait_for_real_child(identity, "post-worker change retained Build silence")
     assert target.read_text() == "after worker\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_bounded_worker_change_immediately_before_completion_does_not_renew(
+        coord_state, tmp_path):
+    """A completion observed with a worker edit cannot retain the completed worker's lease."""
+    source, target = _tracked_build(tmp_path)
+    marker = tmp_path / "completion-race-crossed-silence"
+    command = _bounded_worker_command(tmp_path)
+    started = _codex_command_event(command)
+    completed = _codex_command_event(command, completed=True)
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.15)\n"
+        "pathlib.Path(sys.argv[1]).write_text('completed worker edit\\n')\n"
+        f"print(json.dumps({completed!r}), flush=True)\n"
+        "time.sleep(.22)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+        "time.sleep(.30)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.30, 0.50, 1.0)))
+    identity = coord.submit_stage(_build("codex", "completion-race", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "completed worker edit retained Build silence")
+    assert target.read_text() == "completed worker edit\n"
     assert _build_observation(record).cause is ProviderCause.TIMEOUT
     assert not marker.exists()
 

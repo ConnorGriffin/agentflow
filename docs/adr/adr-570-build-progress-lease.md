@@ -89,7 +89,7 @@ clock after observing it and marks the result timed out when that observation is
 silent, active-test, or absolute deadline that governed the iteration.
 
 Bounded-worker snapshots use Git's porcelain status to select tracked changes and untracked,
-non-ignored files, then hash their durable mode/content state. They never include paths outside
+non-ignored files, then hash their durable content state. They never include paths outside
 the assigned Build worktree, Git-ignored generated artifacts, or the internal `.agentflow` tree;
 the latter is excluded explicitly rather than relying on each repository's ignore configuration.
 The observation runs in its own killable process group and returns only a digest. Each observation

@@ -312,6 +312,24 @@ def _status_paths(raw: bytes) -> list[tuple[bytes, bytes]] | None:
     return paths
 
 
+def _numstat_paths(raw: bytes) -> set[bytes] | None:
+    """Decode content-changing paths from bounded, rename-disabled Git numstat output."""
+    records = raw.split(b"\0")
+    if records[-1] != b"":
+        return None
+    paths: set[bytes] = set()
+    for record in records[:-1]:
+        fields = record.split(b"\t", 2)
+        if len(fields) != 3 or not fields[2]:
+            return None
+        added, deleted, path = fields
+        if (added != b"-" and not added.isdigit()) or (deleted != b"-" and not deleted.isdigit()):
+            return None
+        if added != b"0" or deleted != b"0":
+            paths.add(path)
+    return paths
+
+
 def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
     """Write one bounded digest of Git-enforced changed and untracked worktree state."""
     root = Path(working_dir).resolve()
@@ -328,13 +346,28 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
         return
     if process.wait() != 0 or (paths := _status_paths(raw)) is None:
         return
+    process = subprocess.Popen(
+        ["git", "-c", "diff.renames=false", "-C", str(root), "diff", "--no-ext-diff",
+         "--numstat", "-z", "HEAD", "--", ".", ":(exclude).agentflow",
+         ":(exclude).agentflow/**"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    assert process.stdout is not None
+    raw = process.stdout.read(_WORKTREE_STATUS_BYTES + 1)
+    if len(raw) > _WORKTREE_STATUS_BYTES:
+        process.kill()
+        process.wait()
+        return
+    if process.wait() != 0 or (content_paths := _numstat_paths(raw)) is None:
+        return
 
-    digest = hashlib.sha256(raw)
+    digest = hashlib.sha256()
     total = 0
     flags = os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     for status, encoded in paths:
+        if status != b"??" and encoded not in content_paths:
+            continue
+        digest.update(status + b" " + encoded + b"\0")
         candidate = root / os.fsdecode(encoded)
         try:
             candidate.parent.resolve().relative_to(root)
@@ -346,7 +379,6 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
             continue
         except (OSError, ValueError):
             return
-        digest.update(encoded + b"\0" + str(stat.S_IMODE(before.st_mode)).encode() + b"\0")
         if stat.S_ISLNK(before.st_mode):
             try:
                 target = os.fsencode(os.readlink(candidate))
@@ -842,8 +874,8 @@ def main(args: list[str]) -> None:
                     break
                 if event_progressed:
                     silent_deadline = now + build_lease[0]
-                if (worker_changed or
-                        (progress_stream.active_workers and now >= next_worker_poll)):
+                if (progress_stream.active_workers and
+                        (worker_changed or now >= next_worker_poll)):
                     snapshot = _worktree_snapshot(working_dir)
                     now = time.monotonic()
                     active_test_deadline = (min(progress_stream.active_tests.values())
