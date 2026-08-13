@@ -26,7 +26,7 @@ from pathlib import Path
 from agentflow import github, worktree_ref
 from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.labels import DRAWING, MOCKUP_MARK, mockup_scope_from_labels
-from agentflow.prompts import MOCKUP_DISCLAIMER, PRODUCE_PROMPT, SCOPE_GUIDANCE
+from agentflow.prompts import MOCKUP_DISCLAIMER, SCOPE_GUIDANCE, stage_prompt_spec
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.runner import _run, remove_worktree_if_safe
 from agentflow.worktree_ref import WorktreeRef, source_facts
@@ -47,13 +47,14 @@ def mockup_submission(cfg, issue: dict, tool: str):
     branch = ref.branch
     source = ref.path
     scope = mockup_scope_from_labels([lbl["name"] for lbl in issue.get("labels", [])])
-    prompt = PRODUCE_PROMPT.format(
+    prompt = stage_prompt_spec("mockup").render(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         branch=branch, surfaces=surfaces_phrase(surface_declaration(cfg.workdir)),
         scope_guidance=SCOPE_GUIDANCE[scope], disclaimer=MOCKUP_DISCLAIMER)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="mockup", pool=tool, complexity="deep",
-        source=source, claim=True, input_ptr=prompt, builder_lineage=tool)
+        source=source, claim=True, input_ptr=prompt, builder_lineage=tool,
+        capability_root=cfg.workdir, capability_context={"ui": True})
 
 
 def _mockup_outcome_ready(record, obs) -> bool:

@@ -13,9 +13,35 @@ this module runs anything.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from agentflow.runner import MockupScope
 from agentflow.screenshot_crib import SCREENSHOT_HARNESS
 from agentflow.shell_crib import SHELL_CRIB
+from agentflow.capability_contracts import ContractRequirement, requirements_for as _requirements_for
+
+
+@dataclass(frozen=True)
+class SkillInvocation:
+    """One rendered stage instruction and its pinned contracts.
+
+    ``condition`` is a context key.  Keeping it beside the rendered instruction makes the
+    conditional UI edge observable by both prompt rendering and capability admission.
+    """
+    name: str
+    requirement: ContractRequirement
+    condition: str | None = None
+
+
+@dataclass(frozen=True)
+class StagePromptSpec:
+    stage: str
+    template: str
+    invocations: tuple[SkillInvocation, ...]
+    contexts: tuple[str, ...] = ("headless", "ui")
+
+    def render(self, **values: str) -> str:
+        return self.template.format(**values)
 
 
 # The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to
@@ -268,3 +294,52 @@ CONFLICT_REASON = (
 
 # A survivor that re-rebased clean but still can't auto-merge (review not clean, CI red, or
 # an unanswered question) hands off to a human rather than churning a revise here.
+
+
+# This is deliberately declared after the templates: the legacy constants below remain a stable
+# import surface while every new caller crosses ``StagePromptSpec``.  Runtime edges are contracts
+# too: the UI workflow requires its local browser workflow and pinned Playwright runtime.
+_METHODOLOGY_RELEASE = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+_TDD = ContractRequirement("tdd", _METHODOLOGY_RELEASE)
+_PLAYWRIGHT = ContractRequirement("playwright", "1.61.1", runtime=True)
+_DOMAIN = ContractRequirement("domain-modeling", _METHODOLOGY_RELEASE)
+_DESIGN = ContractRequirement("codebase-design", _METHODOLOGY_RELEASE, dependencies=(_DOMAIN,))
+_DRIVE = ContractRequirement("drive-local-webapp", "v0.3.0", dependencies=(_PLAYWRIGHT,))
+_UI = ContractRequirement("ui-craft", "v0.3.0", dependencies=(_DRIVE,))
+
+STAGE_PROMPTS = {
+    "build": StagePromptSpec("build", BUILD_PROMPT, (
+        SkillInvocation("tdd", _TDD),
+        SkillInvocation("codebase-design", _DESIGN),
+        SkillInvocation("ui-craft", _UI, "ui"),
+    )),
+    "revise": StagePromptSpec("revise", REVISE_PROMPT, (
+        SkillInvocation("ui-craft", _UI, "ui"),
+    )),
+    "mockup": StagePromptSpec("mockup", PRODUCE_PROMPT, (
+        SkillInvocation("ui-craft", _UI),
+    ), contexts=("ui",)),
+    "respond": StagePromptSpec("respond", RESPOND_PROMPT, (
+        SkillInvocation("ui-craft", _UI, "ui"),
+    )),
+    # These stages compose their domain-specific text beside their submission mapping.  The
+    # pass-through template still makes the structured spec the dispatch seam without moving
+    # large, stage-private prompt bodies into this shared module or inventing method contracts.
+    "intake": StagePromptSpec("intake", "{prompt}", ()),
+    "review": StagePromptSpec("review", "{prompt}", (
+        SkillInvocation("ui-craft", _UI, "ui"),
+    )),
+    "converse": StagePromptSpec("converse", "{prompt}", ()),
+    "research": StagePromptSpec("research", "{prompt}", ()),
+    "attack": StagePromptSpec("attack", "{prompt}", ()),
+}
+
+
+def stage_prompt_spec(stage: str) -> StagePromptSpec:
+    """The sole authority for a stage's rendered prompt and method contracts."""
+    return STAGE_PROMPTS[stage]
+
+
+def requirements_for(stage: str, context: dict[str, object]) -> tuple[ContractRequirement, ...]:
+    """The complete pinned contracts for one dispatchable prompt/context cell."""
+    return _requirements_for(stage_prompt_spec(stage).invocations, context)

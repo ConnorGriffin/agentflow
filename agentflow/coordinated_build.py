@@ -26,7 +26,7 @@ from pathlib import Path
 from agentflow import github, worktree_ref
 from agentflow.intake import held_build_result
 from agentflow.labels import BUILDING, complexity_from_labels, effort_from_labels
-from agentflow.prompts import BUILD_PROMPT
+from agentflow.prompts import stage_prompt_spec
 from agentflow.pool_control import POOLS, pool_paused
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
@@ -50,7 +50,7 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         return None
     sl = worktree_ref.slug(issue["title"])
     effort = effort_from_labels(labels).value
-    brief = BUILD_PROMPT.format(
+    brief = stage_prompt_spec("build").render(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort,
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
@@ -62,7 +62,8 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         complexity=complexity.value, effort=effort,
         source=WorktreeRef.for_build(cfg.workdir, parent_pool, n, sl).path, claim=True, input_ptr=brief,
         builder_lineage=parent_pool, branch_lineage=parent_pool, session_lead=True,
-        floodgates=floodgates)
+        floodgates=floodgates, capability_root=cfg.workdir,
+        capability_context={"ui": bool(surface_declaration(cfg.workdir).surfaces)})
 
 
 def resume_if_held(submission, records):
@@ -194,6 +195,10 @@ _COLLISION_STATUS = ("could not rebase past a collision with newer changes on th
 _ENVIRONMENT_STATUS = ("the machine couldn't give the coding agent a working command line — "
                        "usually too many leftover session checkouts in this repository — so it "
                        "never reached the work, and no attempt was spent")
+_CAPABILITY_STATUS = ("the selected coding provider could not prove the project-local methods "
+                      "this build requires in its actual retained checkout, so it never reached "
+                      "the work and no attempt was spent; the Build claim remains in place while "
+                      "the environment is repaired")
 # One phrase per kind of permanent provider condition, mirroring the diagnosis intake already
 # gives (issue #342); a build held for one of these is not a build that ran out of tries.
 _PERMANENT_STATUS = {
@@ -234,6 +239,8 @@ def _hold_status(reason: str | None) -> tuple[str, str]:
 
     if reason == "integration collision":
         return _COLLISION_STATUS, "Build hit an integration collision"
+    if reason and reason.startswith("environment_failure — "):
+        return _CAPABILITY_STATUS, "Build environment needs capability repair"
     if reason and reason.startswith(PERMANENT_HOLD_REASON):
         permanent = parse_permanent_hold_reason(reason)
         if permanent is EndingReason.ENVIRONMENT:
@@ -289,12 +296,17 @@ def _hold_build(record) -> str | None:
     marker = proof_marker(record.identity, marker_status, tag="build-hold")
     result = replace(result, body=marked_body(result.body, marker))
 
+    environment_failure = bool(
+        record.hold_reason and record.hold_reason.startswith("environment_failure — "))
+
     def project() -> bool:
         # A read that couldn't reach GitHub leaves the hold unprojected, so the envelope proves
         # no marker and retries next cycle rather than holding over an empty read.
         live = github.issue_headline(record.repo, number)
         if live is None:
             return False
+        if environment_failure:
+            return github.comment(record.repo, number, result.body)
         apply_intake(record.repo, number, live.title, sorted(live.labels), result)
         return True
 
@@ -308,6 +320,8 @@ def _hold_build(record) -> str | None:
         also_proven_by=legacy_marker)
     if url is None:
         return None
+    if environment_failure:
+        return url  # both the durable and visible Build claims remain owned during repair
     labels = github.issue_labels(record.repo, number)
     if labels is None:
         return None

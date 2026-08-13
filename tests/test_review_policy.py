@@ -272,7 +272,8 @@ def test_reviewer_push_opens_an_exact_head_pass_for_the_other_tool():
         repo="o/r", subject="7", target="start", change_author_tool="claude",
         review_depth="targeted", depth_reason="one journey", review_axis="combined",
         builder_lineage="claude", builder_complexity="deep", builder_effort="extra",
-        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        capability_context="{")
     verdict = Verdict(
         clean=True, reviewed_sha="start", final_sha="fixed", pushed_sha="fixed",
         fixes=("fixed the journey",), change_author_tool="claude")
@@ -284,6 +285,7 @@ def test_reviewer_push_opens_an_exact_head_pass_for_the_other_tool():
     assert successor.review.passes == 1 and successor.transfer_from == review.identity
     assert successor.builder_complexity == "deep" and successor.builder_effort == "extra"
     assert successor.effort is None
+    assert successor.capability_context == "{"
 
 
 def test_session_led_reviewer_push_keeps_the_generated_contract_terminal(monkeypatch):
@@ -307,7 +309,7 @@ def test_session_led_reviewer_push_keeps_the_generated_contract_terminal(monkeyp
         builder_lineage=opening.builder_lineage, branch_lineage=opening.branch_lineage,
         builder_complexity=opening.builder_complexity,
         builder_effort=opening.builder_effort,
-        **opening.review.record_fields())
+        capability_context="{", **opening.review.record_fields())
     monkeypatch.setattr(
         "agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr(

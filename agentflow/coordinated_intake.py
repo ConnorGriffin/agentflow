@@ -13,6 +13,8 @@ from agentflow.coordinator.verification import PREPARED, payload_preview, unprep
 from agentflow.intake import (IntakeResult, IntakeRoute, apply_intake, intake_prompt,
                               intake_result_is_durable)
 from agentflow.labels import TRIAGING, release
+from agentflow.prompts import stage_prompt_spec
+from agentflow.repo_facts import surface_declaration
 from agentflow.runner import _run
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
 
@@ -41,9 +43,12 @@ def intake_submission(cfg, issue: dict, extra: str, comments: str, tool: str) ->
                       pool=tool, complexity="deep", source=str(source_path), claim=True,
                       input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,
                                             "snapshot": snapshot, "source_ref": source_ref,
-                                            "prompt": intake_prompt(cfg.repo, issue, extra,
-                                                                    comments)},
-                                           sort_keys=True))
+                                            "prompt": stage_prompt_spec("intake").render(
+                                                prompt=intake_prompt(cfg.repo, issue, extra,
+                                                                     comments))},
+                                           sort_keys=True),
+                      capability_root=cfg.workdir,
+                      capability_context={"ui": bool(surface_declaration(cfg.workdir).surfaces)})
 
 
 def reset_worktree(record):

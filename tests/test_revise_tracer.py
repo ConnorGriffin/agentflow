@@ -929,7 +929,8 @@ def test_build_review_revise_gate_keeps_unknown_stages_waiting(make_coord):
 def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_claim():
     review = Record(identity="o/r|7|review|sha-a", stage="review", pool="codex", demand=2,
                     repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
-                    source="/home/w/.agentflow/worktrees/codex-review/pr-42-fix-thing")
+                    source="/home/w/.agentflow/worktrees/codex-review/pr-42-fix-thing",
+                    capability_context="{")
     sub = coordinated_revise.revise_submission(review, "deep", "- fix the thing")
     assert sub is not None
     assert sub.stage == "revise" and sub.target == "sha-a"            # revises away from reviewed SHA
@@ -943,6 +944,7 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
     # The retained build worktree is recovered from the review path's slug through the layout owner,
     # so the review (pr-42-fix-thing) and the builder (issue-7-fix-thing) read as the same issue.
     assert sub.source == WorktreeRef.for_build("/home/w", "claude", 7, "fix-thing").path
+    assert sub.capability_context == "{"
     # A review with no builder lineage, an unreadable source, or a missing SHA yields no submission.
     assert coordinated_revise.revise_submission(
         Record(identity="x", stage="review", pool="codex", demand=2, repo="o/r", subject="7",
@@ -1098,6 +1100,7 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert sub.effort is None and sub.builder_effort is None
     assert sub.transfer_from is None                      # a survivor owns the claim directly
     assert sub.source == "/w/.agentflow/worktrees/claude/issue-7-fix"
+    assert sub.capability_context == {"ui": False}
     assert "resolve the merge conflicts" in sub.input_ptr and "Preserve both sides" in sub.input_ptr
     # An unknown tool has no lineage to pin the Revise to.
     assert coordinated_revise.survivor_conflict_revise_submission(
@@ -1111,6 +1114,15 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert codex_branch.pool == codex_branch.builder_lineage == "claude"
     assert codex_branch.branch_lineage == "codex"
     assert codex_branch.source == "/w/.agentflow/worktrees/codex/issue-7-fix"
+
+
+def test_survivor_conflict_revise_derives_ui_from_declared_surfaces(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: frontend/\n")
+    sub = coordinated_revise.survivor_conflict_revise_submission(
+        SimpleNamespace(repo="o/r", workdir=str(tmp_path)), issue=7, slug="fix",
+        builder_tool="claude", head_sha="sha-conf", pr_number=42, conflict_round=1)
+    assert sub is not None and sub.capability_context == {"ui": True}
+    assert "frontend/" in sub.input_ptr
 
 
 def test_conflict_uncertainty_is_captured_as_a_durable_stage_outcome():
@@ -1154,7 +1166,8 @@ def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineag
         builder_lineage="claude", builder_complexity="deep", builder_effort=effort,
         review_depth="full", review_axis="decision",
         uncertainty_handoffs=1,
-        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix",
+        capability_context="{")
     verdict = Verdict(
         clean=True, reviewed_sha="head", final_sha="head", decision="keep main: shared rule owns ties")
 
@@ -1164,6 +1177,7 @@ def test_grounded_conflict_decision_resumes_the_same_conflict_on_original_lineag
     assert sub.review.uncertainty_handoffs == 1 and sub.transfer_from == review.identity
     assert sub.effort == effort and sub.builder_effort == effort
     assert "shared rule owns ties" in sub.input_ptr
+    assert sub.capability_context == "{"
 
     codex = coordinated_revise.conflict_decision_revise_submission(
         review, verdict, parent_pool="codex")

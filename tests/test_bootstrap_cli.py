@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentflow.capability_contracts import ContractRequirement
 from agentflow.cli import main
 
 
@@ -39,12 +40,18 @@ def _wire_ready_headless_repo(tmp_path, monkeypatch):
     )
     claude_skill = tmp_path / ".claude" / "skills" / "agentflow"
     claude_skill.parent.mkdir(parents=True)
-    claude_skill.symlink_to("../../.agents/skills/agentflow")
+    claude_skill.mkdir()
+    (claude_skill / "SKILL.md").write_bytes(skill.read_bytes())
     config = tmp_path.parent / f"{tmp_path.name}-config.toml"
     config.write_text(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
     )
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+    monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(
+        "agentflow.enroll._install_methodology_skills",
+        lambda _root: "ok:   methodology contracts supplied by focused fixture",
+    )
 
 
 def test_capability_manifest_pins_the_complete_public_skill_release():
@@ -65,6 +72,24 @@ def test_capability_manifest_pins_the_complete_public_skill_release():
         "tag": "v0.3.0",
         "commit": "230e71a55ab07f0cd9beaa61649b583cb9d1bde1",
         "skills": ["ui-craft", "drive-local-webapp"],
+    }
+    methodology_release = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+    assert manifest["methodology_skills"] == {
+        "source": "https://github.com/ConnorGriffin/skills",
+        "commit": methodology_release,
+        "skills": ["tdd", "codebase-design", "domain-modeling"],
+    }
+    contracts = {item["id"]: item for item in manifest["capabilities"]}
+    assert {
+        name: (contracts[name]["version"], contracts[name]["dependencies"])
+        for name in ("tdd", "codebase-design", "domain-modeling",
+                     "ui-craft", "drive-local-webapp")
+    } == {
+        "tdd": (methodology_release, []),
+        "codebase-design": (methodology_release, ["domain-modeling"]),
+        "domain-modeling": (methodology_release, []),
+        "ui-craft": ("v0.3.0", ["drive-local-webapp"]),
+        "drive-local-webapp": ("v0.3.0", ["playwright"]),
     }
     assert pins["ui-craft"] == {
         "SKILL.md": "a33d188dd0cd9b648795e959338f98fd6f9f135fd0c6cef4ddd48d0011a3f7c7",
@@ -229,7 +254,7 @@ def test_doctor_does_not_execute_a_drifted_screenshot_harness(
     states = {item["id"]: item["status"] for item in report["capabilities"]}
     assert result == 1
     assert states["screenshot-harness"] == "drifted"
-    assert states["playwright"] == "missing"
+    assert states["playwright"] == "drifted"
 
 
 def test_doctor_does_not_execute_runtime_from_a_drifted_drive_skill(
@@ -267,7 +292,7 @@ def test_doctor_does_not_execute_runtime_from_a_drifted_drive_skill(
     states = {item["id"]: item["status"] for item in report["capabilities"]}
     assert result == 1
     assert states["drive-local-webapp"] == "drifted"
-    assert states["playwright"] == "missing"
+    assert states["playwright"] == "drifted"
 
 
 def test_doctor_rejects_an_incomplete_drive_runtime_manifest(tmp_path, capsys):
@@ -284,22 +309,23 @@ def test_doctor_rejects_an_incomplete_drive_runtime_manifest(tmp_path, capsys):
 
     report = json.loads(capsys.readouterr().out)
     states = {item["id"]: item["status"] for item in report["capabilities"]}
-    assert states["drive-local-webapp"] == "drifted"
+    assert states["drive-local-webapp"] == "incompatible"
 
 
 @pytest.mark.parametrize(
     ("installed", "ready"),
     [
         (set(), False),
-        ({"claude"}, True),
-        ({"codex"}, True),
+        ({"claude"}, False),
+        ({"codex"}, False),
         ({"claude", "codex"}, True),
     ],
 )
-def test_doctor_requires_one_provider_and_recommends_the_second(
+def test_doctor_full_matrix_requires_every_selected_provider(
     tmp_path, monkeypatch, capsys, installed, ready
 ):
     _wire_ready_headless_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr("agentflow.prompts.requirements_for", lambda *_args: ())
     monkeypatch.setattr(
         "agentflow.enroll.shutil.which",
         lambda command: f"/usr/bin/{command}" if command in installed else None,
@@ -316,6 +342,117 @@ def test_doctor_requires_one_provider_and_recommends_the_second(
     assert capabilities["codex"]["required"] is False
     assert capabilities["claude"]["available"] is ("claude" in installed)
     assert capabilities["codex"]["available"] is ("codex" in installed)
+
+
+def test_doctor_provider_filter_narrows_readiness_to_the_selected_matrix(
+    tmp_path, monkeypatch, capsys
+):
+    _wire_ready_headless_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr("agentflow.prompts.requirements_for", lambda *_args: ())
+    monkeypatch.setattr(
+        "agentflow.enroll.shutil.which",
+        lambda command: "/usr/bin/claude" if command == "claude" else None,
+    )
+
+    result = main(
+        ["doctor", "--repo", str(tmp_path), "--provider", "claude", "--json"]
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert report["ready"] is True
+    assert {cell["provider"] for cell in report["stage_matrix"]} == {"claude"}
+
+
+def test_doctor_headless_repository_excludes_ui_contexts_from_dispatchable_matrix(
+    tmp_path, monkeypatch, capsys
+):
+    _wire_ready_headless_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "agentflow.prompts.requirements_for",
+        lambda _stage, context: (
+            (ContractRequirement("ui-craft", "v0.3.0"),)
+            if context["ui"]
+            else ()
+        ),
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll.shutil.which",
+        lambda command: "/usr/bin/claude" if command == "claude" else None,
+    )
+
+    result = main([
+        "doctor", "--repo", str(tmp_path), "--stage", "build",
+        "--provider", "claude", "--json",
+    ])
+
+    report = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert report["ready"] is True
+    assert {cell["context"] for cell in report["stage_matrix"]} == {"headless"}
+
+
+def test_doctor_ui_repository_includes_ui_contexts_in_dispatchable_matrix(
+    tmp_path, monkeypatch, capsys
+):
+    _wire_ready_headless_repo(tmp_path, monkeypatch)
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "AGENTS.md").write_text(
+        "# Project\n\nprofile: reviewed\nui-surfaces: frontend/\n"
+    )
+    monkeypatch.setattr(
+        "agentflow.prompts.requirements_for",
+        lambda _stage, context: (
+            (ContractRequirement("ui-craft", "v0.3.0"),)
+            if context["ui"]
+            else ()
+        ),
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll.shutil.which",
+        lambda command: "/usr/bin/claude" if command == "claude" else None,
+    )
+
+    result = main([
+        "doctor", "--repo", str(tmp_path), "--stage", "build",
+        "--provider", "claude", "--json",
+    ])
+
+    report = json.loads(capsys.readouterr().out)
+    cells = {cell["context"]: cell for cell in report["stage_matrix"]}
+    assert result == 1
+    assert report["ready"] is False
+    assert cells["headless"]["ready"] is True
+    assert cells["ui"]["ready"] is False
+    assert cells["ui"]["contracts"] == ["ui-craft@v0.3.0"]
+
+
+def test_doctor_stage_filter_fails_when_any_selected_cell_is_missing(
+    tmp_path, monkeypatch, capsys
+):
+    _wire_ready_headless_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "agentflow.enroll.shutil.which",
+        lambda command: f"/usr/bin/{command}",
+    )
+
+    result = main(
+        [
+            "doctor",
+            "--repo",
+            str(tmp_path),
+            "--stage",
+            "build",
+            "--provider",
+            "codex",
+            "--json",
+        ]
+    )
+
+    report = json.loads(capsys.readouterr().out)
+    assert result == 1
+    assert report["ready"] is False
+    assert any(not cell["ready"] for cell in report["stage_matrix"])
 
 
 @pytest.mark.parametrize(
@@ -410,6 +547,8 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
         return "DO:   installed the pinned Connor skill pack"
 
     monkeypatch.setattr("agentflow.enroll._install_connor_skills", install_skills)
+    monkeypatch.setattr("agentflow.enroll._install_methodology_skills",
+                        lambda root: "DO:   installed methodology contracts")
     monkeypatch.setattr(
         "agentflow.enroll._install_ui_runtime",
         lambda root: "DO:   installed fake UI runtime",
@@ -428,7 +567,8 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
     codex_skill = tmp_path / ".agents" / "skills" / "agentflow" / "SKILL.md"
     claude_skill = tmp_path / ".claude" / "skills" / "agentflow" / "SKILL.md"
     assert codex_skill.is_file()
-    assert claude_skill.resolve() == codex_skill
+    assert claude_skill.is_file() and not claude_skill.is_symlink()
+    assert claude_skill.read_bytes() == codex_skill.read_bytes()
     assert (tmp_path / "scripts" / "screenshots.mjs").is_file()
     assert "owner/example" in (tmp_path.parent / "config.toml").read_text()
 
@@ -518,6 +658,8 @@ def test_enroll_apply_uses_an_explicit_nonheuristic_ui_declaration(
         "agentflow.enroll._install_connor_skills",
         lambda root: installed.append("skills") or "DO:   installed skills",
     )
+    monkeypatch.setattr("agentflow.enroll._install_methodology_skills",
+                        lambda root: "DO:   installed methodology contracts")
     monkeypatch.setattr(
         "agentflow.enroll._install_ui_runtime",
         lambda root: installed.append("runtime") or "DO:   installed runtime",
@@ -583,6 +725,11 @@ def test_enroll_replaces_duplicate_instructions_with_a_recoverable_link(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
     )
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+    monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(
+        "agentflow.enroll._install_methodology_skills",
+        lambda _root: "ok:   methodology contracts supplied by focused fixture",
+    )
 
     main(["enroll", str(tmp_path), "--apply"])
     capsys.readouterr()
@@ -604,6 +751,11 @@ def test_enroll_promotes_incomplete_duplicate_instructions_without_splitting(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
     )
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+    monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(
+        "agentflow.enroll._install_methodology_skills",
+        lambda _root: "ok:   methodology contracts supplied by focused fixture",
+    )
 
     main(["enroll", str(tmp_path), "--apply"])
 
@@ -659,6 +811,10 @@ def test_skill_installer_success_for_only_one_agent_path_is_not_ready(
     (tmp_path / "frontend").mkdir()
     monkeypatch.setattr("agentflow.enroll._checkout_problem", lambda root: None)
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path.parent / "config.toml"))
+    monkeypatch.setattr(
+        "agentflow.enroll._install_methodology_skills",
+        lambda _root: "ok:   methodology contracts supplied by focused fixture",
+    )
 
     def run(command, **kwargs):
         if command[:3] == ["git", "ls-remote", "--tags"]:
@@ -848,8 +1004,12 @@ def test_enroll_rolls_back_if_tag_moves_between_preflight_and_install(
     output = capsys.readouterr().out
     assert "resolved to aaaaaaaaaa" in output
     assert "rolled back" in output
-    assert tag_reads == 2
-    assert not any(command[0] == "npx" for command in commands)
+    assert tag_reads >= 2
+    assert not any(
+        command[0] == "npx"
+        and command[command.index("--skill") + 1] in {"ui-craft", "drive-local-webapp"}
+        for command in commands
+    )
     assert not config.exists()
     assert subprocess.run(
         ["git", "-C", str(tmp_path), "status", "--porcelain"],
@@ -982,9 +1142,15 @@ def test_enroll_promotes_claude_only_instructions_and_is_idempotent(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
     )
     monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+    monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(
+        "agentflow.enroll._install_methodology_skills",
+        lambda _root: "ok:   methodology contracts supplied by focused fixture",
+    )
+    monkeypatch.setattr("agentflow.prompts.requirements_for", lambda *_args: ())
     monkeypatch.setattr(
         "agentflow.enroll.shutil.which",
-        lambda command: "/usr/bin/claude" if command == "claude" else None,
+        lambda command: f"/usr/bin/{command}",
     )
 
     assert main(["enroll", str(tmp_path), "--apply"]) == 0
@@ -1144,7 +1310,7 @@ def test_enroll_rejects_missing_ui_commands_before_mutation(
 
     main(["enroll", str(tmp_path), "--apply"])
 
-    assert "missing required UI command(s): npx" in capsys.readouterr().out
+    assert "missing required enrollment command(s): npx" in capsys.readouterr().out
     assert not config.exists()
     assert not (tmp_path / "AGENTS.md").exists()
 
@@ -1194,7 +1360,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     original_destination_status = __import__(
         "agentflow.enroll", fromlist=["_skill_destination_status"]
     )._skill_destination_status
-    installed = False
+    installed: set[str] = set()
     active_failure = failure
     commands = []
     before = [
@@ -1210,8 +1376,8 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     config_before = config.read_bytes()
 
     def destination_status(directory, manifest):
-        if directory.name in {"ui-craft", "drive-local-webapp"}:
-            return "ok" if installed else "absent"
+        if directory.name in {"ui-craft", "drive-local-webapp", "tdd", "codebase-design", "domain-modeling"}:
+            return "ok" if directory.name in installed else "absent"
         return original_destination_status(directory, manifest)
 
     def run(command, **kwargs):
@@ -1238,25 +1404,27 @@ def test_enroll_public_ui_command_path_reports_each_stage(
         if command[-2:] == ["rev-parse", "HEAD"]:
             if active_failure == "git-rev-parse":
                 return SimpleNamespace(returncode=1, stdout="", stderr="rev-parse failed")
+            expected_commit = (
+                "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+                if "agentflow-methodology-" in command[2]
+                else "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+            )
             return SimpleNamespace(
                 returncode=0,
                 stdout=(
                     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
                     if active_failure == "git-head-mismatch"
-                    else "230e71a55ab07f0cd9beaa61649b583cb9d1bde1\n"
+                    else f"{expected_commit}\n"
                 ),
                 stderr="",
             )
         if command[0] == "npx":
             if active_failure == "npx":
                 return SimpleNamespace(returncode=127, stdout="", stderr="missing npx")
-            installed = True
-            for name in ("ui-craft", "drive-local-webapp"):
-                codex = tmp_path / ".agents" / "skills" / name
-                codex.mkdir(parents=True)
-                claude = tmp_path / ".claude" / "skills" / name
-                claude.parent.mkdir(parents=True, exist_ok=True)
-                claude.symlink_to(Path("../../.agents/skills") / name)
+            name = command[command.index("--skill") + 1]
+            installed.add(name)
+            codex = tmp_path / ".agents" / "skills" / name
+            codex.mkdir(parents=True, exist_ok=True)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command == ["npm", "ci"]:
             if active_failure == "npm-ci":
@@ -1287,6 +1455,15 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     monkeypatch.setattr(
         "agentflow.enroll._skill_destination_status", destination_status
     )
+    monkeypatch.setattr(
+        "agentflow.provider_skills.skill_destination_status", destination_status
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.provider_skill_status",
+        lambda _root, provider, _spec: (
+            "ok", f"{provider} native discovery supplied by deterministic test seam"
+        ),
+    )
     monkeypatch.setattr("agentflow.enroll._run_command", run)
 
     result = main(["enroll", str(tmp_path), "--apply"])
@@ -1301,7 +1478,7 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     }
     if failure in source_failures:
         assert not any(command[0] == "npx" for command in commands)
-        assert "skill source" in output
+        assert "source" in output
         npx_index = None
     else:
         npx_index = next(i for i, command in enumerate(commands) if command[0] == "npx")
@@ -1355,6 +1532,6 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     assert after == before
     assert config.read_bytes() == config_before
     active_failure = None
-    installed = False
+    installed.clear()
     commands.clear()
     assert main(["enroll", str(tmp_path), "--apply"]) == 0

@@ -25,9 +25,10 @@ from datetime import datetime
 
 from agentflow import github
 from agentflow.balancer import BUILD_POOLS
-from agentflow.prompts import REVISE_PROMPT
+from agentflow.prompts import stage_prompt_spec
 from agentflow.pool_control import POOLS, pool_paused
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
+from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
 from agentflow.runner import _run, codex_spent_at_render
 from agentflow.stage_worktree import worktree_owns_head
@@ -66,16 +67,19 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
     from agentflow.coordinator import Submission
     if not head_sha or builder_tool not in BUILD_POOLS:
         return None
-    brief = _session_lead_prompt(REVISE_PROMPT.format(
+    declaration = surface_declaration(cfg.workdir)
+    ui = bool(declaration.surfaces)
+    brief = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=cfg.repo, findings=f"- {_CONFLICT_REVISE_FINDING}",
-        surfaces="any user-facing surface"), None, parent_pool)
+        surfaces=surfaces_phrase(declaration)), None, parent_pool)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
         pool=parent_pool, complexity="deep", conflict_round=conflict_round,
         source=WorktreeRef.for_build(cfg.workdir, builder_tool, issue, slug).path,
         claim=True, input_ptr=brief,
         builder_lineage=parent_pool, branch_lineage=builder_tool,
-        builder_complexity="deep", continuation=True, session_lead=True)
+        builder_complexity="deep", continuation=True, session_lead=True,
+        capability_root=cfg.workdir, capability_context={"ui": ui})
 
 
 def _revise_builder_source(review_record):
@@ -109,7 +113,7 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     if facts is None or not reviewed_head:
         return None
     build_worktree, pr_number = facts
-    brief = _session_lead_prompt(REVISE_PROMPT.format(
+    brief = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=review_record.repo, findings=findings or "- (see review)",
         surfaces=surfaces or "any user-facing surface"), review_record.builder_effort, parent_pool)
     return Submission(
@@ -120,7 +124,9 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
         branch_lineage=review_record.branch_lineage or review_record.builder_lineage,
         builder_complexity=complexity,
         builder_effort=review_record.builder_effort,
-        round=review_record.round, transfer_from=review_record.identity, session_lead=True)
+        round=review_record.round, transfer_from=review_record.identity, session_lead=True,
+        capability_root=review_record.capability_root,
+        capability_context=review_record.capability_context or "{}")
 
 
 def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: str = "claude"):
@@ -138,7 +144,7 @@ def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: 
         "The other tool resolved the private conflict decision. Apply this choice while preserving "
         f"all compatible behavior: {verdict.decision}"
     )
-    prompt = _session_lead_prompt(REVISE_PROMPT.format(
+    prompt = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=review_record.repo, findings=f"- {decision}",
         surfaces="any user-facing surface"), review_record.builder_effort, parent_pool)
     prior = ReviewState.from_record(review_record)
@@ -160,7 +166,8 @@ def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: 
         builder_effort=review_record.builder_effort,
         round=review_record.round, conflict_round=review_record.conflict_round,
         transfer_from=review_record.identity, continuation=True, session_lead=True,
-        review=review)
+        review=review, capability_root=review_record.capability_root,
+        capability_context=review_record.capability_context or "{}")
 
 
 def _conflict_uncertainty_outcome(record, obs) -> str | None:

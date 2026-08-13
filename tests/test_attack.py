@@ -213,6 +213,18 @@ def test_an_unreadable_answer_renews_the_attack_on_the_same_draft():
         "there is nothing to answer, so the same draft faces the next round"
 
 
+@pytest.mark.parametrize("mapper,record", [
+    (lambda r: coordinated_attack.attack_submission(r, _draft(), "claude"), _intake_record),
+    (lambda r: coordinated_attack.redraft_submission(r, AttackResult("1. x"), "claude"), _attack_record),
+    (lambda r: coordinated_attack.renewed_attack_submission(r, "claude"), _attack_record),
+])
+def test_every_attack_successor_carries_malformed_durable_context_to_admission(mapper, record):
+    predecessor = record()
+    predecessor.capability_context = "{"
+    successor = mapper(predecessor)
+    assert successor is not None and successor.capability_context == "{"
+
+
 @pytest.mark.parametrize("mapper", [
     lambda r: coordinated_attack.attack_submission(r, _draft(), "claude"),
     lambda r: coordinated_attack.redraft_submission(r, AttackResult("1. x"), "claude"),

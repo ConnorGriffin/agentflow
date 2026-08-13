@@ -23,7 +23,8 @@ import re
 from agentflow import github
 from agentflow.labels import BUILDING
 from agentflow.pr_park import park_pr_number
-from agentflow.prompts import RESPOND_PROMPT
+from agentflow.prompts import stage_prompt_spec
+from agentflow.repo_facts import surface_declaration
 from agentflow.runner import _run
 from agentflow.worktree_ref import BUILD_BRANCH_RE, WorktreeRef, source_facts
 
@@ -45,13 +46,15 @@ def respond_submission(cfg, pr_number, branch, comment, target, baseline):
     if m is None or not target or not baseline:
         return None
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
-    brief = RESPOND_PROMPT.format(
+    brief = stage_prompt_spec("respond").render(
         n=pr_number, comment=comment, baseline=baseline,
         disclaimer=respond_reply_disclaimer(str(target)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="respond", target=str(target),
         pool=tool, complexity="deep", source=WorktreeRef.for_build(cfg.workdir, tool, n, sl).path,
-        claim=True, input_ptr=brief, builder_lineage=tool)
+        claim=True, input_ptr=brief, builder_lineage=tool,
+        capability_root=cfg.workdir,
+        capability_context={"ui": bool(surface_declaration(cfg.workdir).surfaces)})
 
 
 # --- Respond stage: posted-reply outcome on the retained PR branch (live; ADR 0020) ------

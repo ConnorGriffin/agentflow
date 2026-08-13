@@ -546,6 +546,50 @@ def test_a_reverted_pool_move_never_leaves_the_destinations_reason_on_the_home_r
     assert home.refusal == "codex weekly allowance spent"
 
 
+def test_optional_provider_capability_probe_never_holds_the_healthy_home_stage(make_coord):
+    """A speculative destination check is non-finalizing even when capability is unavailable."""
+    from agentflow.capability_contracts import CapabilityPreflightResult
+
+    class _CodexIsFull:
+        def __call__(self, record) -> bool:
+            return record.pool == "claude"
+
+        def deferral_reason(self, record):
+            return "codex weekly allowance spent" if record.pool == "codex" else None
+
+    checks = []
+
+    def capability(record, materialize):
+        checks.append((record.pool, materialize))
+        if record.pool == "claude":
+            return CapabilityPreflightResult(
+                record.stage, record.pool, (), "missing", ("native receipt missing",), "repair")
+        return None
+
+    class _Ready:
+        def prepare(self, _record):
+            return True
+
+        def verify(self, _record, _obs):
+            return False
+
+    coord = make_coord(
+        adapter=StageRouter({"build": _Ready()}), gate=_CodexIsFull(),
+        launcher=NeverStartsLauncher(), capability_preflight=capability)
+    ident = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="build", pool="codex", complexity="deep",
+        source="/work/.agentflow/worktrees/codex/issue-7-x"))
+
+    coord.cycle("codex")
+    coord.cycle("claude")
+
+    home = record_of(coord, ident)
+    assert checks == [("codex", False), ("codex", True), ("claude", False)]
+    assert home.pool == "codex" and home.state == "waiting"
+    assert not home.hold_pending and home.hold_reason is None
+    assert home.claim and home.attempts == 0
+
+
 def test_the_breadcrumb_cadence_is_quiet_once_then_periodic(make_coord):
     """A refusal that clears next cycle should page nobody; one that never clears should not
     print a line a tick either. Quiet on the first miss, one line on the second, then every

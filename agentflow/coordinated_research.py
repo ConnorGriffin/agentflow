@@ -32,6 +32,8 @@ from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.handoff import DurableHandoff, Notification, Subject
 from agentflow.labels import (AWAITING_DISPOSITION, RESEARCH_PARKED, RESOLVING,
                               release as release_claim)
+from agentflow.prompts import stage_prompt_spec
+from agentflow.repo_facts import surface_declaration
 from agentflow.runner import _run
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
@@ -311,12 +313,13 @@ def research_submission(cfg, ticket: dict, tool: str, *, map_context: str = ""):
     n = int(ticket["number"])
     source = research_worktree(cfg.workdir, tool, n)
     block = f"Its parent decision map, for context:\n---\n{map_context}\n---\n\n" if map_context else ""
-    prompt = RESEARCH_PROMPT.format(
+    prompt = stage_prompt_spec("research").render(prompt=RESEARCH_PROMPT.format(
         repo=cfg.repo, n=n, title=ticket.get("title", ""), body=ticket.get("body") or "",
         map_context=block,
-        findings_path=os.path.join(source, ".agentflow", f"research-findings-{n}.md"))
+        findings_path=os.path.join(source, ".agentflow", f"research-findings-{n}.md")))
     return Submission(repo=cfg.repo, subject=str(n), stage="research", pool=tool, complexity="deep",
-                      source=source, claim=True, input_ptr=prompt)
+                      source=source, claim=True, input_ptr=prompt, capability_root=cfg.workdir,
+                      capability_context={"ui": bool(surface_declaration(cfg.workdir).surfaces)})
 
 
 # --- stage collaborators (injected into ResearchStageAdapter) ---------------------------

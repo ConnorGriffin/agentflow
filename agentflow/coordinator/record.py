@@ -84,6 +84,9 @@ class Record:
     lineage: str | None = None   # pinned tool for code-writing stages; None once free to move
     source: str | None = None    # durable working-directory/worktree pointer for provider launch
     input_ptr: str | None = None # durable pointer the provider adapter rebuilds the prompt from
+    capability_root: str | None = None  # checkout root whose project-local contracts are authoritative
+    capability_context: str = "{}"     # serialized conditional prompt context
+    capability_preflight: str = ""      # serialized non-ready preflight; retained across restart
     session_lead: bool = False   # missing historical JSON decodes false; never infer from model
     outcome: str | None = None   # stage-native durable outcome, captured before external projection
     started_at: int = 0                  # epoch when the current attempt was admitted

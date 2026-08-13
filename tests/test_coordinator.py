@@ -19,6 +19,143 @@ from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.admission import ADMISSION_MATRIX, PERMIT_BUDGET, admission_demand
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.store import ReservationLimits
+from agentflow.capability_contracts import CapabilityPreflightResult, ContractRequirement
+from agentflow.coordinator.record import Record
+
+
+@pytest.mark.parametrize("provider", ("claude", "codex"))
+def test_nonready_capability_preflight_holds_before_admission_and_survives_restart(
+        make_coord, provider):
+    session = FakeSession()
+    events = []
+    preparation = []
+
+    class _MustNotPrepare:
+        def prepare(self, _record):
+            preparation.append(True)
+            return True
+
+        def observe(self, record):
+            return session.observe(record)
+
+        def verify(self, record, observation):
+            return session.verify(record, observation)
+    result = CapabilityPreflightResult(
+        stage="build", provider=provider,
+        contracts=(ContractRequirement("tdd", "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"),),
+        state="missing", evidence=("tdd project-local destination missing",),
+        repair_command="agentflow enroll /repo --apply")
+    coord = make_coord(
+        session, adapter=_MustNotPrepare(),
+        capability_preflight=lambda _record, _materialize: result, log=events.append
+    )
+    ident = coord.submit_stage(Submission(repo="o/r", subject="5", stage="build", pool=provider,
+                                          effort="low"))
+
+    coord.cycle(provider)
+    held = record_of(coord, ident)
+    assert held.state == "held" and held.claim and held.attempts == 0
+    assert held.capability_preflight and "environment_failure" in held.hold_reason
+    assert permits(coord, provider) == 0 and not session.family_of
+    assert preparation == []
+    from agentflow.coordinator.store import default_store_path
+    from agentflow.coordinator.telemetry import read_attempts
+    assert read_attempts(default_store_path()) == []
+    assert any("environment_failure missing; claim retained" in event for event in events)
+    assert not any("claim released" in event for event in events)
+
+    restarted = make_coord(session, capability_preflight=lambda _record, _materialize: result)
+    assert record_of(restarted, ident).capability_preflight == held.capability_preflight
+
+
+@pytest.mark.parametrize("durable", ("{", "[]", "null", '"ui"'))
+def test_malformed_historical_capability_context_becomes_named_environment_failure(
+        tmp_path, durable):
+    from agentflow.pipeline import _capability_preflight
+
+    record = Record(
+        identity="o/r|5|build|-", stage="build", pool="claude", demand=1,
+        source=str(tmp_path), capability_context=durable)
+    result = _capability_preflight(record, False)
+    assert result is not None and result.state == "incompatible"
+    assert result.evidence[0].startswith("capability-context-invalid:")
+
+
+def test_historical_record_preflights_retained_source_not_unrelated_capability_root(
+        tmp_path, monkeypatch):
+    from agentflow import pipeline
+
+    main = tmp_path / "repo"
+    retained = main / ".agentflow" / "worktrees" / "claude" / "issue-5-fix"
+    unrelated = tmp_path / "unrelated-main"
+    retained.mkdir(parents=True)
+    unrelated.mkdir()
+    (retained / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: frontend/\n")
+    calls = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.materialize_launch_capabilities",
+        lambda source, destination, provider: calls.append(
+            (source, destination, provider)) or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.preflight",
+        lambda root, stage, provider, contracts: calls.append(
+            (root, stage, provider, tuple(item.id for item in contracts))) or
+            CapabilityPreflightResult(stage, provider, contracts, "ready", ("ok",), "repair"),
+    )
+    record = Record(
+        identity="o/r|5|review|sha", stage="review", pool="claude", demand=1,
+        source=str(retained), capability_root=str(unrelated), capability_context="{}")
+
+    result = pipeline._capability_preflight(record, True)
+
+    assert result is not None and result.ready
+    assert calls[0] == (unrelated, retained, "claude")
+    assert calls[1][0] == retained
+    assert calls[1][3] == ("ui-craft", "drive-local-webapp", "playwright")
+
+
+def test_pre_582_record_without_capability_facts_derives_real_worktree_root(
+        tmp_path, monkeypatch):
+    from agentflow import pipeline
+
+    main = tmp_path / "repo"
+    retained = main / ".agentflow" / "worktrees" / "claude" / "issue-5-fix"
+    retained.mkdir(parents=True)
+    (main / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: none\n")
+    calls = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.materialize_launch_capabilities",
+        lambda source, destination, provider: calls.append((source, destination)) or (True, "ok"),
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.preflight",
+        lambda root, stage, provider, contracts:
+            CapabilityPreflightResult(stage, provider, contracts, "ready", (str(root),), "repair"),
+    )
+    record = Record(
+        identity="o/r|5|build|-", stage="build", pool="claude", demand=1,
+        source=str(retained), capability_root=None, capability_context="{}")
+
+    result = pipeline._capability_preflight(record, True)
+
+    assert result is not None and result.ready
+    assert calls == [(main, retained)]
+
+
+def test_pre_582_record_without_any_safe_surface_fact_fails_closed(tmp_path):
+    from agentflow.pipeline import _capability_preflight
+
+    retained = tmp_path / "repo" / ".agentflow" / "worktrees" / "claude" / "issue-5-fix"
+    retained.mkdir(parents=True)
+    record = Record(
+        identity="o/r|5|build|-", stage="build", pool="claude", demand=1,
+        source=str(retained), capability_root=None, capability_context="{}")
+
+    result = _capability_preflight(record, False)
+
+    assert result is not None and result.state == "incompatible"
+    assert result.evidence[0].startswith("capability-context-unavailable:")
 
 
 def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):
