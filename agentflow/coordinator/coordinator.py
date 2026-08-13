@@ -1225,8 +1225,9 @@ class Coordinator:
         if held is None:
             return None
         self._records[held.identity] = held
+        claim_disposition = "retained" if held.claim else "released"
         self._emit(held, f"attempt {held.attempts}/{ATTEMPT_BUDGET} held for human — "
-                         "durable handoff proved; claim released")
+                         f"durable handoff proved; claim {claim_disposition}")
         return StageOutcome(held.identity, held.stage, "held", held.handoff_kind)
 
     # --- internal helpers ---------------------------------------------------------------

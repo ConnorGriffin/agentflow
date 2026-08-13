@@ -462,10 +462,13 @@ def doctor(workdir: str, *, stage: str | None = None, provider: str | None = Non
 
     selected_stages = (stage,) if stage else tuple(STAGE_PROMPTS)
     selected_providers = (provider,) if provider else ("claude", "codex")
+    selected_contexts = (
+        ((False, "headless"), (True, "ui")) if ui else ((False, "headless"),)
+    )
     by_id = {row.id: row for row in rows}
     matrix: list[StageCapability] = []
     for stage_name in selected_stages:
-        for ui_context, context_name in ((False, "headless"), (True, "ui")):
+        for ui_context, context_name in selected_contexts:
             for provider_name in selected_providers:
                 required_contracts = requirements_for(stage_name, {"ui": ui_context})
                 missing = [item for item in required_contracts

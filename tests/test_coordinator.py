@@ -43,7 +43,7 @@ def test_nonready_capability_preflight_holds_before_admission_and_survives_resta
     assert held.capability_preflight and "environment_failure" in held.hold_reason
     assert permits(coord, provider) == 0 and not session.family_of
     assert any("environment_failure missing; claim retained" in event for event in events)
-    assert not any("environment_failure" in event and "claim released" in event for event in events)
+    assert not any("claim released" in event for event in events)
 
     restarted = make_coord(session, capability_preflight=lambda _record: result)
     assert record_of(restarted, ident).capability_preflight == held.capability_preflight

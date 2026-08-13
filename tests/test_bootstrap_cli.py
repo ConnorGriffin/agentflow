@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agentflow.capability_contracts import ContractRequirement
 from agentflow.cli import main
 
 
@@ -342,6 +343,69 @@ def test_doctor_provider_filter_narrows_readiness_to_the_selected_matrix(
     assert result == 0
     assert report["ready"] is True
     assert {cell["provider"] for cell in report["stage_matrix"]} == {"claude"}
+
+
+def test_doctor_headless_repository_excludes_ui_contexts_from_dispatchable_matrix(
+    tmp_path, monkeypatch, capsys
+):
+    _wire_ready_headless_repo(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "agentflow.prompts.requirements_for",
+        lambda _stage, context: (
+            (ContractRequirement("ui-craft", "v0.3.0"),)
+            if context["ui"]
+            else ()
+        ),
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll.shutil.which",
+        lambda command: "/usr/bin/claude" if command == "claude" else None,
+    )
+
+    result = main([
+        "doctor", "--repo", str(tmp_path), "--stage", "build",
+        "--provider", "claude", "--json",
+    ])
+
+    report = json.loads(capsys.readouterr().out)
+    assert result == 0
+    assert report["ready"] is True
+    assert {cell["context"] for cell in report["stage_matrix"]} == {"headless"}
+
+
+def test_doctor_ui_repository_includes_ui_contexts_in_dispatchable_matrix(
+    tmp_path, monkeypatch, capsys
+):
+    _wire_ready_headless_repo(tmp_path, monkeypatch)
+    (tmp_path / "frontend").mkdir()
+    (tmp_path / "AGENTS.md").write_text(
+        "# Project\n\nprofile: reviewed\nui-surfaces: frontend/\n"
+    )
+    monkeypatch.setattr(
+        "agentflow.prompts.requirements_for",
+        lambda _stage, context: (
+            (ContractRequirement("ui-craft", "v0.3.0"),)
+            if context["ui"]
+            else ()
+        ),
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll.shutil.which",
+        lambda command: "/usr/bin/claude" if command == "claude" else None,
+    )
+
+    result = main([
+        "doctor", "--repo", str(tmp_path), "--stage", "build",
+        "--provider", "claude", "--json",
+    ])
+
+    report = json.loads(capsys.readouterr().out)
+    cells = {cell["context"]: cell for cell in report["stage_matrix"]}
+    assert result == 1
+    assert report["ready"] is False
+    assert cells["headless"]["ready"] is True
+    assert cells["ui"]["ready"] is False
+    assert cells["ui"]["contracts"] == ["ui-craft@v0.3.0"]
 
 
 def test_doctor_stage_filter_fails_when_any_selected_cell_is_missing(
