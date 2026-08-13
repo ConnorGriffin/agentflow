@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 
 from agentflow.coordinator.record import NOT_STARTED, STARTED  # re-exported for callers
+from agentflow.coordinator._launch_child import _INHERITED_WORKTREE, _NO_WORKTREE
 
 # Bounded wait for the spawned child to durably record `started` before we treat the launch
 # as one that never produced a provider family.
@@ -119,7 +120,9 @@ class LocalLauncher:
                 [sys.executable, "-m", "agentflow.coordinator._launch_child",
                  str(store.path), record.identity, str(token),
                  str(self._session_timeout_for(record)),
-                 *lease_args, record.source or "", *argv])
+                 *lease_args,
+                 _INHERITED_WORKTREE if record.source else _NO_WORKTREE,
+                 *argv], cwd=record.source or None)
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence
         # The intermediate exits at once; reap it so it does not linger. The provider

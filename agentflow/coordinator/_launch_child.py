@@ -2,7 +2,7 @@
 
 Run as
 ``python -m agentflow.coordinator._launch_child <store_path> <identity> <token> <timeout>
-[--build-lease <provider> <silent> <test> <absolute>] <working_dir> [argv...]``.
+[--build-lease <provider> <silent> <test> <absolute>] --inherited-worktree [argv...]``.
 
 It double-forks so the provider family is reparented away from the daemon (and so an ended
 provider never lingers as a zombie the daemon would misread as alive), then makes a *guarded*
@@ -37,6 +37,8 @@ from agentflow.coordinator.store import Store
 _HEAD_FILE_BYTES = 8 * 1024 * 1024
 _HEAD_OBSERVATION_S = 0.025
 _HEAD_HELPERS: set[int] = set()
+_INHERITED_WORKTREE = "--inherited-worktree"
+_NO_WORKTREE = "--no-worktree"
 
 
 def _reap_head_helpers() -> None:
@@ -853,7 +855,16 @@ def main(args: list[str]) -> None:
     if tail[:1] == ["--build-lease"]:
         progress_provider, silent, test_grace, absolute, *tail = tail[1:]
         build_lease = (float(silent), float(test_grace), float(absolute))
-    working_dir, *provider = tail
+    launch_root, *provider = tail
+    if launch_root == _INHERITED_WORKTREE:
+        try:
+            working_dir = os.getcwd()
+        except OSError:
+            return
+    elif launch_root == _NO_WORKTREE:
+        working_dir = ""
+    else:
+        return
     # Double-fork: the intermediate exits immediately so the daemon reaps it at once, while
     # the detached supervisor is reparented to init and cannot zombie under the daemon.
     if os.fork() > 0:

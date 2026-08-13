@@ -767,9 +767,10 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
     monkeypatch.setattr(_launch_child, "_worktree_snapshot", snapshot)
     monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(_launch_child.subprocess, "Popen", Provider)
+    monkeypatch.chdir(tmp_path)
 
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "codex",
-            "0.20", "0.50", "1.0", str(tmp_path), "provider"]
+            "0.20", "0.50", "1.0", _launch_child._INHERITED_WORKTREE, "provider"]
     revoker = threading.Thread(target=revoke_authorization)
     revoker.start()
     with pytest.raises(ChildExit) as exited:
@@ -1190,9 +1191,9 @@ def test_file_replaced_with_external_symlink_cannot_renew_build_silence(
     script = (
         "import json,pathlib,sys,time\n"
         f"print(json.dumps({started!r}), flush=True)\n"
-        "time.sleep(.05)\n"
+        "time.sleep(.12)\n"
         "pathlib.Path(sys.argv[1]).write_text('changed')\n"
-        "time.sleep(.19)\n"
+        "time.sleep(.46)\n"
         "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
     coord = Coordinator(launcher=LocalLauncher(
         lambda _record: [sys.executable, "-c", script, str(target), str(marker)], timeout=5,
@@ -1330,11 +1331,13 @@ def _run_clocked_supervisor(
     monkeypatch.setattr(_launch_child, "_head", head)
     monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(_launch_child.subprocess, "Popen", lambda *args, **kwargs: Provider())
+    monkeypatch.chdir(tmp_path)
 
     silent, test_grace, absolute = build_lease
     store_path = tmp_path / "records.db"
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "claude",
-            str(silent), str(test_grace), str(absolute), str(tmp_path), "provider"]
+            str(silent), str(test_grace), str(absolute), _launch_child._INHERITED_WORKTREE,
+            "provider"]
     with pytest.raises(ChildExit) as exited:
         _launch_child.main(args)
 
@@ -2092,10 +2095,11 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
     monkeypatch.setattr(_launch_child.subprocess, "Popen", start_provider)
     monkeypatch.setattr(_launch_child.os, "killpg",
                         lambda _pid, _signum: (_ for _ in ()).throw(PermissionError()))
+    monkeypatch.chdir(tmp_path)
 
     with pytest.raises(ChildExit) as exited:
-        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30", "", "", "",
-                            "provider"])
+        _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30",
+                            _launch_child._INHERITED_WORKTREE, "provider"])
 
     assert exited.value.args == (0,)
     session = read_session(tmp_path / "records.db", "token")
@@ -2129,6 +2133,105 @@ def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tm
 
     observation = ClaudeProviderAdapter().observe(record)
     assert observation.partial_output == str(source)
+
+
+def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, monkeypatch):
+    """The public launcher carries source authority in cwd, never in child argv."""
+    from agentflow.coordinator import _launch_child
+    from agentflow.coordinator import launcher as launcher_mod
+    from agentflow.coordinator.launcher import STARTED
+
+    source = tmp_path / "authorized-worktree"
+    source.mkdir()
+    observed = {}
+
+    class Child:
+        def wait(self, timeout):
+            assert timeout == 1
+
+    class Store:
+        path = tmp_path / "records.db"
+
+        def record_of(self, _identity):
+            return SimpleNamespace(start_fact=STARTED, launch_token="token", family="123")
+
+    record = SimpleNamespace(identity="attempt", launch_token="token", stage="review",
+                             source=str(source))
+
+    def launch(argv, **kwargs):
+        observed["argv"] = argv
+        observed["cwd"] = kwargs["cwd"]
+        return Child()
+
+    monkeypatch.setattr(launcher_mod.subprocess, "Popen", launch)
+    result = launcher_mod.LocalLauncher(lambda _record: ["provider"], timeout=1,
+                                        session_timeout=5).start(record, Store())
+
+    assert result.family == "123"
+    assert observed["cwd"] == str(source)
+    assert _launch_child._INHERITED_WORKTREE in observed["argv"]
+    assert str(source) not in observed["argv"]
+
+
+def test_public_launcher_ignores_forged_provider_root_for_snapshot_authority(
+        coord_state, tmp_path, monkeypatch):
+    """A provider path cannot redirect the snapshot away from LocalLauncher's inherited cwd."""
+    from agentflow.coordinator import _launch_child
+
+    source, target = _tracked_build(tmp_path)
+    forged = tmp_path / "forged-worktree"
+    forged.mkdir()
+    external = forged / "external"
+    external.write_bytes(b"external bytes must remain unread")
+    custom = tmp_path / "forged-root-instrumentation"
+    custom.mkdir()
+    external_read = tmp_path / "external-read"
+    bootstrap = tmp_path / "bootstrap-authority"
+    (custom / "sitecustomize.py").write_text(
+        "import json,os,pathlib,sys\n"
+        "_open=os.open\n"
+        "_read=os.read\n"
+        "external_fds=set()\n"
+        "with pathlib.Path(os.environ['AGENTFLOW_TEST_BOOTSTRAP_AUTHORITY']).open('a') as stream:\n"
+        " stream.write(json.dumps([os.getcwd(),sys.argv])+ '\\n')\n"
+        "def open(path,flags,*args,**kwargs):\n"
+        " result=_open(path,flags,*args,**kwargs)\n"
+        " if isinstance(path,(str,bytes,os.PathLike)) and os.fspath(path) == os.environ['AGENTFLOW_TEST_FORGED_EXTERNAL']:\n"
+        "  external_fds.add(result)\n"
+        " return result\n"
+        "def read(fd,size):\n"
+        " if fd in external_fds: pathlib.Path(os.environ['AGENTFLOW_TEST_EXTERNAL_READ']).write_text('read')\n"
+        " return _read(fd,size)\n"
+        "os.open=open\n"
+        "os.read=read\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_BOOTSTRAP_AUTHORITY", str(bootstrap))
+    monkeypatch.setenv("AGENTFLOW_TEST_FORGED_EXTERNAL", str(external))
+    monkeypatch.setenv("AGENTFLOW_TEST_EXTERNAL_READ", str(external_read))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    marker = tmp_path / "forged-root-renewed"
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.05)\n"
+        "pathlib.Path(sys.argv[1]).write_text('changed')\n"
+        "time.sleep(.19)\n"
+        "pathlib.Path(sys.argv[2]).write_text('renewed')\n")
+    coord = Coordinator(launcher=LocalLauncher(
+        lambda _record: [sys.executable, "-c", script, str(target), str(marker), str(forged)],
+        timeout=5, build_lease=(0.50, 0.60, 1.2)))
+    identity = coord.submit_stage(_build("codex", "forged-root", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "forged root redirected the worktree snapshot")
+    starts = [json.loads(line) for line in bootstrap.read_text().splitlines()]
+    cwd, argv = next(start for start in starts if _launch_child._INHERITED_WORKTREE in start[1])
+    assert cwd == str(source)
+    assert _launch_child._INHERITED_WORKTREE in argv
+    assert not external_read.exists()
+    assert marker.exists()
+    assert _build_observation(record).timed_out is False
 
 
 def test_coordinator_supervisor_marks_its_worktree_active(tmp_path, monkeypatch):
