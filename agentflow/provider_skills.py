@@ -213,10 +213,18 @@ def native_discovery_status(root: Path, provider: str) -> tuple[str, str]:
     return "ok", f"{provider} native discovery was proven for this repository and binary"
 
 
-def native_discovery_prompt(provider: str) -> str:
+def native_discovery_prompt(provider: str, mode: str = "positive") -> str:
     """Return the provider-native invocation form proven by the release contract."""
-    if provider == "codex":
+    if mode not in {"positive", "negative"}:
+        raise ValueError(f"unsupported probe mode {mode}")
+    if provider == "codex" and mode == "positive":
         return f"${NATIVE_DISCOVERY_SKILL}"
+    if provider == "codex":
+        return (
+            "Do not invoke any skill or use any tool. Report whether the exact project-local "
+            f"skill named {NATIVE_DISCOVERY_SKILL} is available in this session. If it is "
+            "unavailable, reply exactly SKILL_UNAVAILABLE."
+        )
     if provider == "claude":
         return (
             f"Invoke the project-local skill named {NATIVE_DISCOVERY_SKILL} using only native "
@@ -226,14 +234,22 @@ def native_discovery_prompt(provider: str) -> str:
     raise ValueError(f"unsupported provider {provider}")
 
 
-def _has_command_event(output: str) -> bool:
-    def contains_command(value: object) -> bool:
+def native_discovery_output_has_tool_event(output: str) -> bool:
+    """Recognize a provider event that proves the availability probe invoked a tool."""
+    def contains_tool(value: object) -> bool:
         if isinstance(value, dict):
-            if value.get("type") == "command_execution":
+            event_type = value.get("type")
+            if isinstance(event_type, str) and (
+                event_type in {
+                    "command_execution", "function_call", "mcp_tool_call",
+                    "tool_call", "web_search", "file_change",
+                }
+                or event_type.endswith("_tool_call")
+            ):
                 return True
-            return any(contains_command(item) for item in value.values())
+            return any(contains_tool(item) for item in value.values())
         if isinstance(value, list):
-            return any(contains_command(item) for item in value)
+            return any(contains_tool(item) for item in value)
         return False
 
     for line in output.splitlines():
@@ -241,9 +257,34 @@ def _has_command_event(output: str) -> bool:
             event = json.loads(line)
         except (json.JSONDecodeError, TypeError):
             continue
-        if contains_command(event):
+        if isinstance(event, dict) and event.get("type") in {"item.started", "item.completed"}:
+            item = event.get("item")
+            if (isinstance(item, dict) and isinstance(item.get("type"), str)
+                    and item["type"] not in {"agent_message", "reasoning"}):
+                return True
+        if contains_tool(event):
             return True
     return False
+
+
+def _codex_unavailable_is_terminal(output: str) -> bool:
+    unavailable = False
+    terminal = False
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") == "turn.completed":
+            terminal = True
+        item = event.get("item")
+        if (event.get("type") == "item.completed" and isinstance(item, dict)
+                and item.get("type") == "agent_message"
+                and item.get("text") == "SKILL_UNAVAILABLE"):
+            unavailable = True
+    return unavailable and terminal
 
 
 def native_discovery_output_is_proof(provider: str, output: str) -> bool:
@@ -254,7 +295,7 @@ def native_discovery_output_is_proof(provider: str, output: str) -> bool:
         return ('"name":"Skill"' in output
                 and f'"skill":"{NATIVE_DISCOVERY_SKILL}"' in output)
     if provider == "codex":
-        return not _has_command_event(output)
+        return not native_discovery_output_has_tool_event(output)
     return False
 
 
@@ -262,10 +303,14 @@ def native_discovery_output_is_unavailable(provider: str, output: str) -> bool:
     """Validate a negative probe without accepting leaked invocation evidence."""
     return (
         provider in {"claude", "codex"}
-        and "SKILL_UNAVAILABLE" in output
+        and (
+            output.strip() == "SKILL_UNAVAILABLE"
+            if provider == "claude"
+            else _codex_unavailable_is_terminal(output)
+        )
         and NATIVE_DISCOVERY_MARKER not in output
         and '"name":"Skill"' not in output
-        and not _has_command_event(output)
+        and not native_discovery_output_has_tool_event(output)
     )
 
 
@@ -273,7 +318,7 @@ def _run_native_discovery_probe(root: Path, provider: str):
     """Run the provider proof; kept as the deterministic CI seam."""
     from agentflow.runner import ClaudeRunner, CodexRunner, run_provider_discovery_probe
 
-    prompt = native_discovery_prompt(provider)
+    prompt = native_discovery_prompt(provider, "positive")
     argv = (
         ClaudeRunner().structured_argv(prompt, "sonnet", str(root))
         if provider == "claude"

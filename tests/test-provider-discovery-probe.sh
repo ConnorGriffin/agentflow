@@ -22,7 +22,8 @@ for provider in claude codex; do
   AGENTFLOW_PROVIDER_PROBE_ROOT="$fixture" AGENTFLOW_PROVIDER_PROBE_RUNNER="$fake" \
     "$script" "$provider" positive | grep -Fq AGENTFLOW_582_DISCOVERED
   AGENTFLOW_PROVIDER_PROBE_ROOT="$fixture" AGENTFLOW_PROVIDER_PROBE_RUNNER="$fake" \
-    "$script" "$provider" negative | grep -Fxq SKILL_UNAVAILABLE
+    AGENTFLOW_PROVIDER_PROBE_REQUIRE_EMPTY=1 "$script" "$provider" negative \
+    | grep -Fq SKILL_UNAVAILABLE
   assert_restored
 done
 if AGENTFLOW_PROVIDER_PROBE_ROOT="$fixture" AGENTFLOW_PROVIDER_PROBE_RUNNER="$fake" \
@@ -30,6 +31,25 @@ if AGENTFLOW_PROVIDER_PROBE_ROOT="$fixture" AGENTFLOW_PROVIDER_PROBE_RUNNER="$fa
   exit 1
 fi
 assert_restored
+mkdir -p "$fixture/.agents/skills/agentflow" "$fixture/.claude/skills/agentflow"
+printf '%s\n' '---' 'name: agentflow' '---' > "$fixture/.agents/skills/agentflow/SKILL.md"
+cp "$fixture/.agents/skills/agentflow/SKILL.md" \
+  "$fixture/.claude/skills/agentflow/SKILL.md"
+AGENTFLOW_PROVIDER_PROBE_ROOT="$fixture" AGENTFLOW_PROVIDER_PROBE_RUNNER="$fake" \
+  AGENTFLOW_PROVIDER_PROBE_PREFIX_COLLISION=1 "$script" codex negative \
+  | grep -Fq SKILL_UNAVAILABLE
+assert_restored
+for defect in TOOL_EVENT NONTERMINAL; do
+  if env AGENTFLOW_PROVIDER_PROBE_ROOT="$fixture" \
+      AGENTFLOW_PROVIDER_PROBE_RUNNER="$fake" \
+      "AGENTFLOW_PROVIDER_PROBE_$defect=1" \
+      "$script" codex negative >/dev/null 2>&1; then
+    exit 1
+  fi
+  assert_restored
+done
+grep -Fq 'AGENTFLOW_PROVIDER_PROBE_TIMEOUT' "$script"
+grep -Fq 'native_discovery_output_has_tool_event(line)' "$script"
 if "$script" unknown positive >/dev/null 2>&1; then exit 1; fi
 if "$script" codex unknown >/dev/null 2>&1; then exit 1; fi
 echo 'probe helper checks passed'
