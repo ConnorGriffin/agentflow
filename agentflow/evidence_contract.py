@@ -21,6 +21,7 @@ _FORBIDDEN = frozenset({"prompt", "prompts", "transcript", "transcripts", "sourc
 _REASON_CODES = frozenset({"duplicate-key", "shape", "type", "vocabulary", "redaction",
                            "suffix", "manifest", "json", "io"})
 _MANIFESTS = frozenset({"contract-v1.json", "contract-v2.json"})
+_MAX_FIXTURE_BYTES = 1_048_576
 _V1_FIELDS = {"observation_id", "subject", "failure_class", "validation_state",
               "signature_digest", "normalizer_version", "source", "observed_at",
               "reviewed_parent_revision", "fixer_revision"}
@@ -81,13 +82,16 @@ def _read(directory_fd: int, basename: str) -> str:
             dir_fd=directory_fd,
         )
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode):
+        if not stat.S_ISREG(details.st_mode) or details.st_size > _MAX_FIXTURE_BYTES:
             raise OSError
         body = bytearray()
         while True:
-            chunk = os.read(descriptor, 65_536)
+            remaining = _MAX_FIXTURE_BYTES - len(body)
+            chunk = os.read(descriptor, min(65_536, remaining) if remaining else 1)
             if not chunk:
                 break
+            if len(chunk) > remaining:
+                raise OSError
             body.extend(chunk)
         return body.decode("utf-8")
     except (OSError, UnicodeError) as exc:

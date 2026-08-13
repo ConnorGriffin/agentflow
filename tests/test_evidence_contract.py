@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,11 +11,17 @@ import pytest
 from agentflow.evidence import EvidenceError
 from agentflow.evidence_contract import validate_fixtures
 
+_MAX_FIXTURE_BYTES = 1_048_576
+
 
 def _corpus(tmp_path: Path) -> Path:
     target = tmp_path / "evidence"
     shutil.copytree("docs/evidence", target)
     return target
+
+
+def _open_descriptors() -> set[str]:
+    return set(os.listdir("/dev/fd"))
 
 
 def test_invalid_filename_and_duplicate_version_slug_fail_closed_in_sorted_order(tmp_path):
@@ -51,6 +58,49 @@ def test_directory_and_known_file_io_errors_use_only_sentinel_or_basename(tmp_pa
     fixture.mkdir()
     with pytest.raises(EvidenceError, match=r"positive-producer-refuted-v2\.json: io$"):
         validate_fixtures(corpus)
+
+
+def test_oversized_regular_fixture_is_sanitized_io_and_closes_descriptor(tmp_path):
+    corpus = _corpus(tmp_path)
+    basename = "positive-producer-refuted-v2.json"
+    with (corpus / basename).open("wb") as fixture:
+        fixture.truncate(_MAX_FIXTURE_BYTES + 1)
+    descriptors_before = _open_descriptors()
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+
+    assert str(caught.value) == f"{basename}: io"
+    assert _open_descriptors() == descriptors_before
+
+
+def test_fixture_growth_during_read_is_sanitized_io_and_closes_descriptor(
+        tmp_path, monkeypatch):
+    corpus = _corpus(tmp_path)
+    basename = "positive-producer-refuted-v2.json"
+    fixture = corpus / basename
+    fixture_inode = fixture.stat().st_ino
+    original_read = os.read
+    grew = False
+
+    def read_then_grow(descriptor, size):
+        nonlocal grew
+        chunk = original_read(descriptor, size)
+        if not grew and os.fstat(descriptor).st_ino == fixture_inode:
+            with fixture.open("ab") as growing_fixture:
+                growing_fixture.truncate(_MAX_FIXTURE_BYTES + 1)
+            grew = True
+        return chunk
+
+    monkeypatch.setattr(os, "read", read_then_grow)
+    descriptors_before = _open_descriptors()
+
+    with pytest.raises(EvidenceError) as caught:
+        validate_fixtures(corpus)
+
+    assert grew
+    assert str(caught.value) == f"{basename}: io"
+    assert _open_descriptors() == descriptors_before
 
 
 def test_fixture_symlink_with_traversal_target_never_reads_outside_corpus(tmp_path):
