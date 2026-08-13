@@ -277,14 +277,23 @@ def _recognized_worker(command: object) -> bool:
             and stat.S_IMODE(info.st_mode) == 0o600)
 
 
-def _reap_worktree_helpers() -> None:
+def _reap_worktree_helpers() -> bool:
+    clean = True
     for pid in tuple(_WORKTREE_HELPERS):
         try:
             waited, _ = os.waitpid(pid, os.WNOHANG)
-        except (ChildProcessError, OSError):
-            waited = pid
+        except ChildProcessError:
+            _WORKTREE_HELPERS.discard(pid)
+            clean = False
+            continue
+        except OSError:
+            clean = False
+            continue
         if waited:
             _WORKTREE_HELPERS.discard(pid)
+        else:
+            clean = False
+    return clean
 
 
 def _status_paths(raw: bytes) -> list[tuple[bytes, bytes, bytes | None]] | None:
@@ -332,6 +341,14 @@ def _numstat_paths(raw: bytes) -> set[bytes] | None:
     return paths
 
 
+def _hash_frame(digest, tag: bytes, value: bytes) -> None:
+    """Hash one unambiguous typed field without allocating its framed representation."""
+    digest.update(len(tag).to_bytes(2, "big"))
+    digest.update(tag)
+    digest.update(len(value).to_bytes(8, "big"))
+    digest.update(value)
+
+
 def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
     """Write one bounded digest of Git-enforced changed and untracked worktree state."""
     root = Path(working_dir).resolve()
@@ -370,9 +387,10 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
         structural_change = any(change in status for change in b"ADRC")
         if status != b"??" and encoded not in content_paths and not structural_change:
             continue
-        digest.update(b"path\0" + encoded + b"\0")
+        record = hashlib.sha256()
+        _hash_frame(record, b"path", encoded)
         if prior_path is not None:
-            digest.update(b"from " + prior_path + b"\0")
+            _hash_frame(record, b"prior-path", prior_path)
         candidate = root / os.fsdecode(encoded)
         try:
             candidate.parent.resolve().relative_to(root)
@@ -380,7 +398,7 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
         except FileNotFoundError:
             if b"D" not in status:
                 return
-            digest.update(encoded + b"\0deleted\0")
+            _hash_frame(digest, b"deletion-record", record.digest())
             continue
         except (OSError, ValueError):
             return
@@ -391,7 +409,7 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
                 return
             if len(target) > _WORKTREE_FILE_BYTES:
                 return
-            digest.update(target)
+            _hash_frame(record, b"symlink-target", target)
             total += len(target)
         elif stat.S_ISREG(before.st_mode):
             if before.st_size > _WORKTREE_FILE_BYTES:
@@ -416,12 +434,18 @@ def _worktree_snapshot_child(working_dir: str, write_fd: int) -> None:
             if (len(content) > _WORKTREE_FILE_BYTES or before.st_ino != after.st_ino
                     or before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns):
                 return
-            digest.update(content)
+            _hash_frame(record, b"file-content", content)
             total += len(content)
         else:
             return
         if total > _WORKTREE_TOTAL_BYTES:
             return
+        record_type = (b"untracked-record" if status == b"??" else
+                       b"rename-record" if b"R" in status else
+                       b"copy-record" if b"C" in status else
+                       b"addition-record" if b"A" in status else
+                       b"content-record")
+        _hash_frame(digest, record_type, record.digest())
     os.write(write_fd, digest.digest())
 
 
@@ -430,7 +454,8 @@ def _worktree_snapshot(working_dir: str,
     """Observe durable Git worktree state in a killable, bounded process group."""
     if not working_dir:
         return None
-    _reap_worktree_helpers()
+    if not _reap_worktree_helpers():
+        return None
     try:
         read_fd, write_fd = os.pipe()
     except OSError:
@@ -453,30 +478,51 @@ def _worktree_snapshot(working_dir: str,
         os._exit(0)
 
     os.close(write_fd)
+    cleanup_ok = True
+    helper_finished = False
+    observation_deadline = time.monotonic() + timeout
     try:
         try:
             os.setpgid(pid, pid)
         except OSError:
             pass
-        ready, _, _ = select.select([read_fd], [], [], timeout)
+        ready, _, _ = select.select(
+            [read_fd], [], [], max(0.0, observation_deadline - time.monotonic()))
         raw = os.read(read_fd, 33) if ready else b""
+        if len(raw) == hashlib.sha256().digest_size:
+            ready, _, _ = select.select(
+                [read_fd], [], [], max(0.0, observation_deadline - time.monotonic()))
+            helper_finished = bool(ready) and os.read(read_fd, 1) == b""
     except (OSError, ValueError):
         raw = b""
     finally:
-        os.close(read_fd)
         try:
-            waited, _ = os.waitpid(pid, os.WNOHANG)
-            if waited == 0:
+            os.close(read_fd)
+        except OSError:
+            cleanup_ok = False
+        try:
+            if helper_finished:
+                waited, _ = os.waitpid(pid, 0)
+                cleanup_ok = cleanup_ok and waited == pid
+            else:
+                cleanup_ok = False
+                waited, _ = os.waitpid(pid, os.WNOHANG)
+            if not helper_finished and waited == 0:
                 try:
                     os.killpg(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    cleanup_ok = False
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except OSError:
+                        cleanup_ok = False
                 waited, _ = os.waitpid(pid, os.WNOHANG)
                 if waited == 0:
                     _WORKTREE_HELPERS.add(pid)
+                    cleanup_ok = False
         except (ChildProcessError, OSError):
-            pass
-    return raw if len(raw) == hashlib.sha256().digest_size else None
+            cleanup_ok = False
+    return raw if cleanup_ok and len(raw) == hashlib.sha256().digest_size else None
 
 
 def _worktree_path(value: object, working_dir: str) -> bool:

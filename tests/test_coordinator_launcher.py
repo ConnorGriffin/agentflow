@@ -505,6 +505,55 @@ def test_bounded_worker_durable_deletion_renews_build_silence(coord_state, tmp_p
     assert _build_observation(record).timed_out is False
 
 
+def test_bounded_worker_deletion_cannot_collide_with_tracked_content(
+        coord_state, tmp_path, monkeypatch):
+    """A deletion renews after content that formerly encoded to the same snapshot bytes."""
+    source, target = _tracked_build(tmp_path)
+    collided = source / "a"
+    collided.write_text("initial")
+    subprocess.run(("git", "-C", str(source), "add", "a"),
+                   check=True, capture_output=True)
+    subprocess.run(("git", "-C", str(source), "commit", "-m", "track collision path"),
+                   check=True, capture_output=True)
+    snapshots = tmp_path / "collision-snapshots"
+    custom = tmp_path / "collision-instrumentation"
+    custom.mkdir()
+    (custom / "sitecustomize.py").write_text(
+        "import os\n"
+        "_write=os.write\n"
+        "def write(fd,data):\n"
+        " if len(data)==32:\n"
+        "  with open(os.environ['AGENTFLOW_TEST_SNAPSHOTS'],'ab') as stream: stream.write(b'x')\n"
+        " return _write(fd,data)\n"
+        "os.write=write\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_SNAPSHOTS", str(snapshots))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,os,pathlib,sys,time\n"
+        "started_at=time.monotonic()\n"
+        "target=pathlib.Path(sys.argv[1])\n"
+        "snapshots=pathlib.Path(os.environ['AGENTFLOW_TEST_SNAPSHOTS'])\n"
+        "target.write_bytes(b'a\\0deleted\\0')\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "while not snapshots.exists() or snapshots.stat().st_size < 1: time.sleep(.002)\n"
+        "target.unlink()\n"
+        "while snapshots.stat().st_size < 2: time.sleep(.002)\n"
+        "time.sleep(max(0, started_at + 1.10 - time.monotonic()))\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(collided)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(1.0, 1.50, 2.0)))
+    identity = coord.submit_stage(_build("codex", "worker-snapshot-collision", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "collision-safe bounded worker did not exit")
+    assert not collided.exists()
+    assert target.read_text() == "before\n"
+    assert _build_observation(record).timed_out is False
+
+
 def test_bounded_worker_tracked_empty_deletion_renews_build_silence(coord_state, tmp_path):
     """Deleting a tracked empty implementation file is durable worker progress."""
     source, _target = _tracked_build(tmp_path)
@@ -847,6 +896,55 @@ def test_bounded_worker_snapshot_cannot_strand_the_supervisor(
     assert invoked.exists(), "the worker snapshot did not exercise the blocking Git adapter"
     assert _build_observation(record).cause is ProviderCause.TIMEOUT
     assert elapsed < 1.2, f"{absolute_cap:.2f}s absolute cap took {elapsed:.3f}s"
+    assert not marker.exists()
+
+
+def test_bounded_worker_snapshot_cleanup_permission_denial_cannot_renew(
+        coord_state, tmp_path, monkeypatch):
+    """A digest is invalid when its still-running helper cannot be cleanly reaped."""
+    source, target = _tracked_build(tmp_path)
+    cleanup_denied = tmp_path / "snapshot-cleanup-denied"
+    marker = tmp_path / "provider-crossed-silence"
+    custom = tmp_path / "snapshot-cleanup-instrumentation"
+    custom.mkdir()
+    (custom / "sitecustomize.py").write_text(
+        "import os,pathlib,signal,time\n"
+        "_write=os.write\n"
+        "def write(fd,data):\n"
+        " result=_write(fd,data)\n"
+        " if len(data)==32: time.sleep(2)\n"
+        " return result\n"
+        "os.write=write\n"
+        "_killpg=os.killpg\n"
+        "def killpg(pid,signum):\n"
+        " if signum==signal.SIGKILL:\n"
+        "  pathlib.Path(os.environ['AGENTFLOW_TEST_CLEANUP_DENIED']).write_text('denied')\n"
+        "  raise PermissionError('deterministic snapshot cleanup denial')\n"
+        " return _killpg(pid,signum)\n"
+        "os.killpg=killpg\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_CLEANUP_DENIED", str(cleanup_denied))
+    monkeypatch.setenv(
+        "PYTHONPATH", f"{custom}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+
+    started = _codex_command_event(_bounded_worker_command(tmp_path))
+    script = (
+        "import json,pathlib,sys,time\n"
+        f"print(json.dumps({started!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('after cleanup denial\\n')\n"
+        "time.sleep(.65)\n"
+        "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.75, 1.20, 1.5)))
+    identity = coord.submit_stage(_build("codex", "worker-cleanup-denial", str(source)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "cleanup-denied worker retained Build silence")
+    assert cleanup_denied.exists(), "snapshot cleanup did not exercise permission denial"
+    assert target.read_text() == "after cleanup denial\n"
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
     assert not marker.exists()
 
 
