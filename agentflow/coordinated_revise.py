@@ -28,6 +28,7 @@ from agentflow.balancer import BUILD_POOLS
 from agentflow.prompts import stage_prompt_spec
 from agentflow.pool_control import POOLS, pool_paused
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
+from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
 from agentflow.runner import _run, codex_spent_at_render
 from agentflow.stage_worktree import worktree_owns_head
@@ -66,9 +67,11 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
     from agentflow.coordinator import Submission
     if not head_sha or builder_tool not in BUILD_POOLS:
         return None
+    declaration = surface_declaration(cfg.workdir)
+    ui = bool(declaration.surfaces)
     brief = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=cfg.repo, findings=f"- {_CONFLICT_REVISE_FINDING}",
-        surfaces="any user-facing surface"), None, parent_pool)
+        surfaces=surfaces_phrase(declaration)), None, parent_pool)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
         pool=parent_pool, complexity="deep", conflict_round=conflict_round,
@@ -76,7 +79,7 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
         claim=True, input_ptr=brief,
         builder_lineage=parent_pool, branch_lineage=builder_tool,
         builder_complexity="deep", continuation=True, session_lead=True,
-        capability_root=cfg.workdir, capability_context={"ui": True})
+        capability_root=cfg.workdir, capability_context={"ui": ui})
 
 
 def _revise_builder_source(review_record):

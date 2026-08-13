@@ -12,7 +12,10 @@ claude_skill="$root/.claude/skills/$skill"
 prompt="Invoke the project-local skill named $skill using only native skill discovery. Do not use shell commands, search files, read files, or inspect configuration. If it is unavailable, reply exactly SKILL_UNAVAILABLE."
 
 usage() { echo "usage: $0 {claude|codex} {positive|negative}" >&2; exit 64; }
-require_fixture() { test -f "$agent_skill/SKILL.md"; test -L "$claude_skill"; }
+require_fixture() {
+  test -d "$agent_skill"; test ! -L "$agent_skill"; test -f "$agent_skill/SKILL.md"
+  test -d "$claude_skill"; test ! -L "$claude_skill"; test -f "$claude_skill/SKILL.md"
+}
 run_real_provider() {
   AGENTFLOW_PROVIDER_PROBE_PROMPT=$prompt "$checkout/.venv/bin/python" - "$1" "$root" <<'PY'
 import os
@@ -40,6 +43,13 @@ run_provider() {
 }
 positive() {
   require_fixture
+  if test -z "${AGENTFLOW_PROVIDER_PROBE_RUNNER:-}"; then
+    "$checkout/.venv/bin/python" - "$root" "$1" <<'PY'
+import sys
+from agentflow.provider_skills import clear_native_discovery_receipt
+clear_native_discovery_receipt(sys.argv[1], sys.argv[2])
+PY
+  fi
   output=$(run_provider "$1")
   printf '%s\n' "$output"
   printf '%s' "$output" | grep -Fq "$marker"
@@ -52,6 +62,13 @@ positive() {
       ! printf '%s' "$output" | grep -Fq '"type":"command_execution"'
       ;;
   esac
+  if test -z "${AGENTFLOW_PROVIDER_PROBE_RUNNER:-}"; then
+    "$checkout/.venv/bin/python" - "$root" "$1" <<'PY'
+import sys
+from agentflow.provider_skills import record_native_discovery_receipt
+print(record_native_discovery_receipt(sys.argv[1], sys.argv[2]))
+PY
+  fi
 }
 negative() {
   require_fixture

@@ -40,7 +40,8 @@ def _wire_ready_headless_repo(tmp_path, monkeypatch):
     )
     claude_skill = tmp_path / ".claude" / "skills" / "agentflow"
     claude_skill.parent.mkdir(parents=True)
-    claude_skill.symlink_to("../../.agents/skills/agentflow")
+    claude_skill.mkdir()
+    (claude_skill / "SKILL.md").write_bytes(skill.read_bytes())
     config = tmp_path.parent / f"{tmp_path.name}-config.toml"
     config.write_text(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
@@ -308,7 +309,7 @@ def test_doctor_rejects_an_incomplete_drive_runtime_manifest(tmp_path, capsys):
 
     report = json.loads(capsys.readouterr().out)
     states = {item["id"]: item["status"] for item in report["capabilities"]}
-    assert states["drive-local-webapp"] == "drifted"
+    assert states["drive-local-webapp"] == "incompatible"
 
 
 @pytest.mark.parametrize(
@@ -566,7 +567,8 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
     codex_skill = tmp_path / ".agents" / "skills" / "agentflow" / "SKILL.md"
     claude_skill = tmp_path / ".claude" / "skills" / "agentflow" / "SKILL.md"
     assert codex_skill.is_file()
-    assert claude_skill.resolve() == codex_skill
+    assert claude_skill.is_file() and not claude_skill.is_symlink()
+    assert claude_skill.read_bytes() == codex_skill.read_bytes()
     assert (tmp_path / "scripts" / "screenshots.mjs").is_file()
     assert "owner/example" in (tmp_path.parent / "config.toml").read_text()
 
@@ -1455,6 +1457,12 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     )
     monkeypatch.setattr(
         "agentflow.provider_skills.skill_destination_status", destination_status
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.provider_skill_status",
+        lambda _root, provider, _spec: (
+            "ok", f"{provider} native discovery supplied by deterministic test seam"
+        ),
     )
     monkeypatch.setattr("agentflow.enroll._run_command", run)
 

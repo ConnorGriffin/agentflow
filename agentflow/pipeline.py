@@ -142,6 +142,66 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
 
 
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
+def _capability_preflight(record, materialize: bool):
+    """Validate the prepared provider launch root, including historical durable records."""
+    from agentflow.capability_contracts import CapabilityPreflightResult, preflight
+    from agentflow.prompts import STAGE_PROMPTS, requirements_for
+    from agentflow.provider_skills import materialize_launch_capabilities
+    from agentflow.repo_facts import surface_declaration
+    from agentflow.worktree_ref import WorktreeRef
+    if record.stage not in STAGE_PROMPTS:
+        return None
+    import json
+    actual_root = Path(record.source) if record.source else None
+    repair_root = actual_root or Path(record.capability_root or ".")
+    try:
+        durable_context = json.loads(record.capability_context or "{}")
+    except (TypeError, ValueError):
+        durable_context = None
+    if not isinstance(durable_context, dict):
+        return CapabilityPreflightResult(
+            record.stage, record.pool, (), "incompatible",
+            ("capability-context-invalid: durable capability_context must be a JSON object",),
+            f"agentflow enroll {repair_root} --apply")
+    source_root = Path(record.capability_root) if record.capability_root else None
+    if source_root is None and record.source:
+        parsed = WorktreeRef.parse(record.source)
+        source_root = Path(parsed.workdir) if parsed is not None else actual_root
+    # The first, non-mutating gate runs before stage preparation against the enrolled source,
+    # while deriving conditional requirements from the retained launch checkout when it exists.
+    # The second gate materializes and verifies the prepared launch root itself.
+    inspection_root = actual_root if materialize else (source_root or actual_root)
+    context_root = (
+        actual_root
+        if actual_root is not None and actual_root.is_dir() and not actual_root.is_symlink()
+        else inspection_root
+    )
+    if inspection_root is None or not inspection_root.is_dir() or inspection_root.is_symlink():
+        return CapabilityPreflightResult(
+            record.stage, record.pool, (), "missing",
+            ("launch-root-missing: record.source is not a real prepared provider launch root",),
+            f"agentflow enroll {repair_root} --apply")
+    declaration = surface_declaration(str(context_root))
+    if not declaration.declared and source_root is not None and source_root != context_root:
+        declaration = surface_declaration(str(source_root))
+    if not declaration.declared:
+        return CapabilityPreflightResult(
+            record.stage, record.pool, (), "incompatible",
+            ("capability-context-unavailable: launch root has no explicit ui-surfaces fact",),
+            f"agentflow enroll {repair_root} --apply")
+    context = dict(durable_context)
+    context["ui"] = bool(declaration.surfaces)
+    if materialize:
+        ok, detail = materialize_launch_capabilities(source_root, actual_root, record.pool)
+        if not ok:
+            return CapabilityPreflightResult(
+                record.stage, record.pool, requirements_for(record.stage, context),
+                "incompatible", (f"launch-root-materialization-failed: {detail}",),
+                f"agentflow enroll {actual_root} --apply")
+    return preflight(inspection_root, record.stage, record.pool,
+                     requirements_for(record.stage, context))
+
+
 def build_coordinator(_log=None) -> Coordinator:
     """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
@@ -202,20 +262,10 @@ def build_coordinator(_log=None) -> Coordinator:
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse,
                           "research": research, "attack": attack})
-    def capability_preflight(record):
-        if not record.capability_root:
-            return None
-        from agentflow.capability_contracts import preflight
-        from agentflow.prompts import STAGE_PROMPTS, requirements_for
-        if record.stage not in STAGE_PROMPTS:
-            return None
-        import json
-        return preflight(record.capability_root, record.stage, record.pool,
-                         requirements_for(record.stage, json.loads(record.capability_context)))
-
-    return Coordinator(adapter=router, gate=_production_gate(), capability_preflight=capability_preflight,
-                       disabled_cold_stages=frozenset({"mockup"}),
-                       log=_log or (lambda _line: None))
+    return Coordinator(
+        adapter=router, gate=_production_gate(), capability_preflight=_capability_preflight,
+        disabled_cold_stages=frozenset({"mockup"}), log=_log or (lambda _line: None),
+    )
 
 
 class _ProductionGate:

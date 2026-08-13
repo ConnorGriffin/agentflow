@@ -10,6 +10,7 @@ from __future__ import annotations
 import subprocess
 import time
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,6 +20,7 @@ from agentflow import coordinated_build, pipeline, stage_worktree, worktree_ref
 from agentflow.coordinator import BuildStageAdapter, Submission
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause
+from agentflow.coordinator.telemetry import read_attempts
 from agentflow.coordinator.record import Record
 from agentflow.loop import RepoConfig
 
@@ -702,6 +704,43 @@ def test_a_never_started_build_stays_home_when_both_pools_are_throttled(make_coo
     launched = record_of(coord, ident)
     assert launched.pool == "codex" and launched.state == "running"
     assert worktree_ref.source_facts(launched) is not None
+
+
+def test_capability_environment_failure_keeps_internal_and_visible_build_claim(
+        make_coord, monkeypatch):
+    """Build's preflight hold is visible but never masquerades as exhausted or drops Building."""
+    from agentflow.capability_contracts import CapabilityPreflightResult
+    from agentflow.labels import BUILDING
+    from agentflow import github
+
+    fake = FakeSession()
+    visible = {BUILDING}
+    comments = []
+    monkeypatch.setattr(github, "issue_headline",
+                        lambda repo, number: SimpleNamespace(title="Build me", labels=visible))
+    monkeypatch.setattr(github, "issue_comments",
+                        lambda repo, number: [SimpleNamespace(body=body) for body in comments])
+    monkeypatch.setattr(github, "comment",
+                        lambda repo, number, body: comments.append(body) or True)
+    monkeypatch.setattr(github, "issue_labels", lambda repo, number: set(visible))
+    monkeypatch.setattr(github, "remove_label",
+                        lambda repo, number, label: visible.discard(label) or True)
+    monkeypatch.setattr("agentflow.handoff._notify.notify", lambda *args: True)
+    result = CapabilityPreflightResult(
+        "build", "claude", (), "missing", ("native receipt missing",), "repair")
+    coord = make_coord(
+        fake, adapter=_adapter(fake, pr=[False], prep=[True], handoff=coordinated_build._hold_build),
+        capability_preflight=lambda _record, _materialize: result)
+    ident = coord.submit_stage(_build())
+
+    coord.cycle("claude")
+
+    held = record_of(coord, ident)
+    assert held.state == "held" and held.claim and held.attempts == 0
+    assert BUILDING in visible and not fake.family_of
+    assert comments and "continuation budget exhausted" not in comments[0]
+    assert "project-local methods" in comments[0]
+    assert read_attempts(coord._store.path) == []
 
 
 # --- live projection & claim ownership ---------------------------------------------------

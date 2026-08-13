@@ -1098,6 +1098,7 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert sub.effort is None and sub.builder_effort is None
     assert sub.transfer_from is None                      # a survivor owns the claim directly
     assert sub.source == "/w/.agentflow/worktrees/claude/issue-7-fix"
+    assert sub.capability_context == {"ui": False}
     assert "resolve the merge conflicts" in sub.input_ptr and "Preserve both sides" in sub.input_ptr
     # An unknown tool has no lineage to pin the Revise to.
     assert coordinated_revise.survivor_conflict_revise_submission(
@@ -1111,6 +1112,15 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert codex_branch.pool == codex_branch.builder_lineage == "claude"
     assert codex_branch.branch_lineage == "codex"
     assert codex_branch.source == "/w/.agentflow/worktrees/codex/issue-7-fix"
+
+
+def test_survivor_conflict_revise_derives_ui_from_declared_surfaces(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: frontend/\n")
+    sub = coordinated_revise.survivor_conflict_revise_submission(
+        SimpleNamespace(repo="o/r", workdir=str(tmp_path)), issue=7, slug="fix",
+        builder_tool="claude", head_sha="sha-conf", pr_number=42, conflict_round=1)
+    assert sub is not None and sub.capability_context == {"ui": True}
+    assert "frontend/" in sub.input_ptr
 
 
 def test_conflict_uncertainty_is_captured_as_a_durable_stage_outcome():

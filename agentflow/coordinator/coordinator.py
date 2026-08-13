@@ -23,7 +23,7 @@ import os
 import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from agentflow.coordinator.admission import (
@@ -227,7 +227,8 @@ class Coordinator:
         # Every adapter hook is optional; StageCalls owns the default for each one, so the
         # coordinator never carries a second copy of them (ADR 0030).
         self._adapter = StageCalls(adapter or _DefaultAdapter())
-        self._capability_preflight = capability_preflight or (lambda _record: None)
+        self._capability_preflight = capability_preflight or (
+            lambda _record, _materialize: None)
         # This process's daemon-lifecycle identity, stamped on every attempt it admits. A restart
         # is a new process with a new pid, so an attempt found dead under a *different* generation
         # — and leaving no supervisor end fact — was taken down with the daemon, not by the
@@ -730,25 +731,16 @@ class Coordinator:
         probe's refusal is nobody's evidence of anything: it must not count toward the breadcrumb
         or advance a clock, or a stage would escalate on how often it was speculatively tried
         somewhere it does not live (#406)."""
+        # The non-mutating provider/repository check must precede even stage preparation.  A
+        # second check below verifies the actual checkout preparation leaves for launch.
+        capability = self._capability_preflight(record, False)
+        if capability is not None and not capability.ready:
+            return self._capability_failure(record, capability, observed)
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
         # The state this cycle observes is compared against the durable one at the end, so a
         # refusal that genuinely changes nothing costs no write (#405).
         was_refused = _refusal_state(record)
-        capability = self._capability_preflight(record)
-        if capability is not None and not capability.ready:
-            record.capability_preflight = json.dumps({
-                "stage": capability.stage, "provider": capability.provider,
-                "contracts": [f"{item.id}@{item.version}" for item in capability.contracts],
-                "state": capability.state, "evidence": capability.evidence,
-                "repair_command": capability.repair_command,
-            }, sort_keys=True)
-            record.hold_reason = "environment_failure — " + record.capability_preflight
-            self._hold(record)
-            self._emit(record, f"environment_failure {capability.state}; claim retained; "
-                              f"repair: {capability.repair_command}")
-            self._finalize_hold(record)
-            return "unprepared"
         try:
             validate_session_lead_input(record)
         except SessionLeadInputError as exc:
@@ -772,6 +764,9 @@ class Coordinator:
             elif _refusal_state(record) != was_refused:
                 self._persist(record)
             return "unprepared"
+        capability = self._capability_preflight(record, True)
+        if capability is not None and not capability.ready:
+            return self._capability_failure(record, capability, observed)
         # Preparation answered yes, so whatever refused it earlier is over — clear it before the
         # later admission checks run, or a stage that is now perfectly preparable would keep
         # publishing the checkout that used to refuse it while capacity is what actually holds it.
@@ -794,6 +789,24 @@ class Coordinator:
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
+
+    def _capability_failure(self, record: Record, capability, observed: bool) -> str:
+        """Fail a real admission durably; leave speculative provider probes untouched."""
+        if not observed:
+            return "unprepared"
+        record.capability_preflight = json.dumps({
+            "stage": capability.stage, "provider": capability.provider,
+            "contracts": [f"{item.id}@{item.version}" for item in capability.contracts],
+            "state": capability.state, "evidence": capability.evidence,
+            "repair_command": capability.repair_command,
+        }, sort_keys=True)
+        record.hold_reason = "environment_failure — " + record.capability_preflight
+        if not self._hold(record):
+            return "unprepared"
+        self._emit(record, f"environment_failure {capability.state}; claim retained; "
+                          f"repair: {capability.repair_command}")
+        self._finalize_hold(record)
+        return "unprepared"
 
     def _migratable(self, pool: str, now: int) -> list[Record]:
         """Eligible stages whose home pool cannot currently launch them and that safety lets move
@@ -853,6 +866,13 @@ class Coordinator:
         destination-specific reason for a move that never happened (#405). The probe is admitted
         unobserved: a speculative trial the record did not ask for is no evidence of it being
         stuck, so it neither counts toward the breadcrumb nor advances a clock (#406)."""
+        candidate = replace(
+            record, pool=dest_pool,
+            source=_repool_source(record.source, dest_pool),
+            lineage=dest_pool if record.stage in LINEAGE_PINNED else record.lineage)
+        capability = self._capability_preflight(candidate, False)
+        if capability is not None and not capability.ready:
+            return
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
                 record.lineage, record.source, record.refusal, record.refusal_expected)
         record.pool = dest_pool

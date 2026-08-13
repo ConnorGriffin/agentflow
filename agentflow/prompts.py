@@ -326,7 +326,9 @@ STAGE_PROMPTS = {
     # pass-through template still makes the structured spec the dispatch seam without moving
     # large, stage-private prompt bodies into this shared module or inventing method contracts.
     "intake": StagePromptSpec("intake", "{prompt}", ()),
-    "review": StagePromptSpec("review", "{prompt}", ()),
+    "review": StagePromptSpec("review", "{prompt}", (
+        SkillInvocation("ui-craft", _UI, "ui"),
+    )),
     "converse": StagePromptSpec("converse", "{prompt}", ()),
     "research": StagePromptSpec("research", "{prompt}", ()),
     "attack": StagePromptSpec("attack", "{prompt}", ()),

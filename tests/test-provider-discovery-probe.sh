@@ -10,7 +10,7 @@ trap 'rm -rf "$fixture"' EXIT HUP INT TERM
 skill=agentflow-582-probe-4bab5ff0
 mkdir -p "$fixture/.agents/skills" "$fixture/.claude/skills"
 cp -R "$root/.agents/skills/$skill" "$fixture/.agents/skills/$skill"
-ln -s "../../.agents/skills/$skill" "$fixture/.claude/skills/$skill"
+cp -R "$root/.claude/skills/$skill" "$fixture/.claude/skills/$skill"
 for provider in claude codex; do
   AGENTFLOW_PROVIDER_PROBE_ROOT="$fixture" AGENTFLOW_PROVIDER_PROBE_RUNNER="$fake" \
     "$script" "$provider" positive | grep -Fq AGENTFLOW_582_DISCOVERED

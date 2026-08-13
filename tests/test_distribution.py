@@ -211,9 +211,14 @@ workdir = "{checkout}"
             capture_output=True,
             timeout=30,
         )
-        assert enroll.returncode == 0, enroll.stdout + enroll.stderr
+        # Packaging can install the exact project-local files, but this fake provider never
+        # performs the real native-discovery probe, so production readiness must fail closed.
+        assert enroll.returncode == 1, enroll.stdout + enroll.stderr
+        assert not (
+            checkout / ".git" / "agentflow-capability-receipts" / "claude.json"
+        ).exists()
         codex_skill = checkout / ".agents" / "skills" / "agentflow" / "SKILL.md"
         assert codex_skill.read_bytes() == expected_skill
-        assert (
-            checkout / ".claude" / "skills" / "agentflow" / "SKILL.md"
-        ).resolve() == codex_skill
+        claude_skill = checkout / ".claude" / "skills" / "agentflow" / "SKILL.md"
+        assert claude_skill.is_file() and not claude_skill.is_symlink()
+        assert claude_skill.read_bytes() == codex_skill.read_bytes()

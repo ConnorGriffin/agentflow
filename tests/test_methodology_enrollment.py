@@ -6,7 +6,10 @@ from pathlib import Path
 import shutil
 from types import SimpleNamespace
 
-from agentflow.enroll import doctor, enroll_repository, provider_skill_status
+from agentflow.enroll import doctor, enroll_repository
+from agentflow.provider_skills import (
+    materialize_launch_capabilities, provider_skill_status,
+    record_native_discovery_receipt, skill_destination_status)
 
 
 def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
@@ -77,7 +80,7 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
         for name in names:
             assert (repo / location / name / "SKILL.md").is_file()
 
-    (repo / ".claude" / "skills" / "tdd").unlink()
+    shutil.rmtree(repo / ".claude" / "skills" / "tdd")
     regressed = doctor(str(repo), stage="build", provider="codex")
     assert regressed.ready is False
     assert any(
@@ -86,7 +89,7 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
     )
 
 
-def test_provider_discovery_is_project_local_and_provider_specific(tmp_path):
+def test_provider_discovery_requires_provider_specific_native_receipts(tmp_path, monkeypatch):
     content = b"# method\n"
     spec = {
         "skill": "method", "files": [
@@ -101,14 +104,81 @@ def test_provider_discovery_is_project_local_and_provider_specific(tmp_path):
     ambient.mkdir(parents=True)
     (ambient / "SKILL.md").write_bytes(content)
 
-    assert provider_skill_status(tmp_path, "codex", spec)[0] == "ok"
+    receipt_dir = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key",
+        lambda _root: ("repo-key", receipt_dir),
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+
+    assert provider_skill_status(tmp_path, "codex", spec)[0] == "missing"
     assert provider_skill_status(tmp_path, "claude", spec)[0] == "missing"
+    record_native_discovery_receipt(tmp_path, "codex")
+    assert provider_skill_status(tmp_path, "codex", spec)[0] == "ok"
 
     discovery = tmp_path / ".claude" / "skills" / "method"
-    discovery.parent.mkdir(parents=True)
-    discovery.symlink_to(Path("../../.agents/skills/method"))
+    shutil.copytree(agent, discovery)
+    assert provider_skill_status(tmp_path, "claude", spec)[0] == "missing"
+    record_native_discovery_receipt(tmp_path, "claude")
     assert provider_skill_status(tmp_path, "claude", spec)[0] == "ok"
 
-    discovery.unlink()
-    discovery.mkdir()
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"changed-{provider}-sha"),
+    )
+    assert provider_skill_status(tmp_path, "codex", spec)[0] == "drifted"
+    assert provider_skill_status(tmp_path, "claude", spec)[0] == "drifted"
+
+    shutil.rmtree(discovery)
+    discovery.symlink_to(Path("../../.agents/skills/method"))
     assert provider_skill_status(tmp_path, "claude", spec)[0] == "incompatible"
+
+
+def test_skill_integrity_rejects_symlink_roots_dirs_files_and_manifest_escapes(tmp_path):
+    content = b"# method\n"
+    digest = hashlib.sha256(content).hexdigest()
+    spec = [{"path": "SKILL.md", "sha256": digest}]
+    skill = tmp_path / ".agents" / "skills" / "method"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_bytes(content)
+    assert skill_destination_status(skill, spec) == "ok"
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_bytes(content)
+    (skill / "SKILL.md").unlink()
+    (skill / "SKILL.md").symlink_to(outside / "SKILL.md")
+    assert skill_destination_status(skill, spec) == "incompatible"
+
+    (skill / "SKILL.md").unlink()
+    (skill / "SKILL.md").write_bytes(content)
+    escaped = [{"path": "../outside/SKILL.md", "sha256": digest}]
+    assert skill_destination_status(skill, escaped) == "incompatible"
+
+    shutil.rmtree(skill)
+    skill.symlink_to(outside, target_is_directory=True)
+    assert skill_destination_status(skill, spec) == "incompatible"
+
+    skill.unlink()
+    shutil.rmtree(tmp_path / ".agents" / "skills")
+    (tmp_path / ".agents" / "skills").symlink_to(outside, target_is_directory=True)
+    escaped_skill = tmp_path / ".agents" / "skills" / "method"
+    assert skill_destination_status(escaped_skill, spec) == "incompatible"
+
+
+def test_launch_materialization_rejects_provider_root_escape_before_writing(tmp_path):
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    outside = tmp_path / "outside"
+    (source / ".agents" / "skills").mkdir(parents=True)
+    destination.mkdir()
+    outside.mkdir()
+    (destination / ".agents").symlink_to(outside, target_is_directory=True)
+
+    ready, detail = materialize_launch_capabilities(source, destination, "codex")
+
+    assert ready is False and "root" in detail
+    assert not (outside / "skills").exists()

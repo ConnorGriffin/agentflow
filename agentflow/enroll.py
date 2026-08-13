@@ -138,6 +138,8 @@ def _skill_status(root: Path, name: str, files_manifest: list[dict]) -> str:
     for location in (".agents/skills", ".claude/skills"):
         directory = root / location / name
         statuses.append(_skill_destination_status(directory, files_manifest))
+    if "incompatible" in statuses:
+        return "incompatible"
     if "drifted" in statuses:
         return "drifted"
     if "absent" in statuses:
@@ -212,6 +214,12 @@ def _methodology_problem(root: Path) -> str | None:
     states = _methodology_destination_states(root, _manifest())
     if all(state == "ok" for state in states.values()) or all(state == "absent" for state in states.values()):
         return None
+    manifest = _manifest()
+    names = manifest["methodology_skills"]["skills"]
+    if all(states[(".agents/skills", name)] == "ok" for name in names) and all(
+        _legacy_claude_skill_link(root, name) for name in names
+    ):
+        return None
     rendered = ", ".join(f"{location}/{name}={state}" for (location, name), state in states.items())
     return f"existing methodology destinations are partial, conflicting, or drifted ({rendered})"
 
@@ -230,6 +238,11 @@ def _skills_problem(
         return f"public skill release tag resolved to {resolved}, expected {expected}"
     destinations = _public_skill_destination_states(root, manifest)
     if all(state == "ok" for state in destinations.values()):
+        return None
+    names = manifest["connor_skills"]["skills"]
+    if all(destinations[(".agents/skills", name)] == "ok" for name in names) and all(
+        _legacy_claude_skill_link(root, name) for name in names
+    ):
         return None
     # Converge never rewrites the vendored skill pack (no reproducible content to write —
     # it comes from a temp clone the installer owns, not `_asset_text`), but a repo that was
@@ -575,6 +588,8 @@ def _managed_files_problem(
         status = _skill_destination_status(directory, agentflow["files"])
         if status == "ok" or not (directory.exists() or directory.is_symlink()):
             continue
+        if location == ".claude/skills" and _legacy_claude_skill_link(root, "agentflow"):
+            continue  # enrollment safely replaces the former exact project-local link
         if (
             converge
             and status == "drifted"
@@ -662,6 +677,17 @@ def _install_connor_skills(root: Path) -> str:
     destinations = _public_skill_destination_states(root, manifest)
     if all(state == "ok" for state in destinations.values()):
         return "ok:   Connor skill pack already installed"
+    if all(destinations[(".agents/skills", name)] == "ok" for name in names) and all(
+        destinations[(".claude/skills", name)] == "absent"
+        or _legacy_claude_skill_link(root, name)
+        for name in names
+    ):
+        outcomes = [_wire_claude_skill(root, name) for name in names]
+        refreshed = _public_skill_destination_states(root, manifest)
+        if not any(outcome.startswith("WARN:") for outcome in outcomes) and all(
+            state == "ok" for state in refreshed.values()
+        ):
+            return "DO:   materialized the pinned Connor skill pack for Claude"
     if any(state != "absent" for state in destinations.values()):
         rendered = ", ".join(
             f"{location}/{name}={state}"
@@ -732,6 +758,17 @@ def _install_methodology_skills(root: Path) -> str:
     states = _methodology_destination_states(root, manifest)
     if all(state == "ok" for state in states.values()):
         return "ok:   methodology contracts already installed"
+    if all(states[(".agents/skills", name)] == "ok" for name in source["skills"]) and all(
+        states[(".claude/skills", name)] == "absent"
+        or _legacy_claude_skill_link(root, name)
+        for name in source["skills"]
+    ):
+        outcomes = [_wire_claude_skill(root, name) for name in source["skills"]]
+        refreshed = _methodology_destination_states(root, manifest)
+        if not any(outcome.startswith("WARN:") for outcome in outcomes) and all(
+            state == "ok" for state in refreshed.values()
+        ):
+            return "DO:   materialized pinned methodology contracts for Claude"
     if any(state != "absent" for state in states.values()):
         return "WARN: methodology destinations are partial, conflicting, or drifted; installer was not run"
     with tempfile.TemporaryDirectory(prefix="agentflow-methodology-") as temporary:
@@ -811,16 +848,26 @@ def _install_ui_runtime(root: Path) -> str:
     return "DO:   installed pinned Playwright and Chromium; self-check passed"
 
 
-def _wire_claude_skill(root: Path, name: str) -> str:
+def _legacy_claude_skill_link(root: Path, name: str) -> bool:
     target = root / ".claude" / "skills" / name
     desired = Path("../../.agents/skills") / name
-    if target.is_symlink() and target.readlink() == desired:
-        return f"ok:   {target} already links to the shared repo skill"
+    return target.is_symlink() and target.readlink() == desired
+
+
+def _wire_claude_skill(root: Path, name: str) -> str:
+    target = root / ".claude" / "skills" / name
+    source = root / ".agents" / "skills" / name
+    if target.is_dir() and not target.is_symlink():
+        return f"ok:   {target} already materializes the shared repo skill"
+    if _legacy_claude_skill_link(root, name):
+        target.unlink()
     if target.exists() or target.is_symlink():
         return f"WARN: {target} already exists — left unchanged"
+    if not source.is_dir() or source.is_symlink():
+        return f"WARN: {source} is not a safe materialization source"
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.symlink_to(desired)
-    return f"DO:   linked {target} for Claude Code"
+    shutil.copytree(source, target)
+    return f"DO:   materialized {target} for Claude Code"
 
 
 class _EnrollmentJournal:
@@ -1036,7 +1083,7 @@ def _repo_drift(root: Path) -> tuple[list[str], list[str]]:
     drift = []
     notes = []
     for item in report.capabilities:
-        if item.status not in ("drifted", "missing"):
+        if item.status not in ("drifted", "missing", "incompatible"):
             continue
         line = f"{item.id}: {item.status}"
         if item.required:

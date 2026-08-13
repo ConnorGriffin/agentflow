@@ -27,6 +27,11 @@ def test_ui_requirement_is_conditional_and_transitive():
     assert "ui-craft" not in plain
     assert {"ui-craft", "drive-local-webapp", "playwright"} <= ui
 
+    review_plain = {item.id for item in requirements_for("review", {"ui": False})}
+    review_ui = {item.id for item in requirements_for("review", {"ui": True})}
+    assert review_plain == set()
+    assert review_ui == {"ui-craft", "drive-local-webapp", "playwright"}
+
 
 def test_direct_invocations_and_transitive_dependencies_remain_distinct_and_ordered():
     direct = stage_prompt_spec("build").invocations

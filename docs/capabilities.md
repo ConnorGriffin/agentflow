@@ -18,7 +18,9 @@ declaration order.
 The release-verification discovery controls
 are `scripts/provider-discovery-probe.sh {claude|codex} {positive|negative}`;
 CI runs only its non-provider helper seam in
-`tests/test-provider-discovery-probe.sh`.
+`tests/test-provider-discovery-probe.sh`. A successful real positive probe writes
+a repository-scoped native-discovery receipt bound to the resolved provider
+executable and capability manifest. The deterministic seam writes no receipt.
 
 ## Inspect a repository
 
@@ -83,10 +85,12 @@ checked against the deterministic file list and SHA-256 values in the manifest.
 Missing, changed, and unexpected files fail readiness.
 Readiness is provider-specific: Codex must discover the pinned contract from the
 project's `.agents/skills` root, while Claude must have the matching project-local
-`.claude/skills` reference. User-global, ambient, and bundled copies are ignored.
-Executable presence alone is insufficient, and a missing, drifted, release-
-incompatible, dependency-incompatible, or undiscoverable selected-provider
-contract fails closed.
+`.claude/skills` copy. Both the exact static files and the current provider's valid
+native-discovery receipt are required. User-global, ambient, and bundled copies are
+ignored. Executable presence alone is insufficient, and a missing, drifted,
+release-incompatible, dependency-incompatible, or undiscoverable selected-provider
+contract fails closed. Project, skill-root, skill-directory, manifest-file, and
+tracked-file symlinks or path escapes are incompatible.
 Before invoking the installer, AgentFlow resolves lightweight or annotated
 release tags with Git and requires the peeled commit to equal the manifest pin.
 It then clones and checks out that exact commit into a temporary local source;
@@ -94,6 +98,13 @@ the installer never reads the movable tag. It invokes the installer only when
 all managed destinations are truly absent. A regular file, broken symlink,
 empty directory, partial install, or edited destination fails closed without
 overwrite.
+
+Admission checks the enrolled source before stage preparation, then verifies the
+prepared `record.source` checkout before permits, attempts, or provider launch.
+Pinned contracts may be materialized into a newly prepared worktree; retained
+historical worktrees are checked at their actual launch root and otherwise enter a
+named, zero-attempt environment hold. Optional provider migration probes are
+non-mutating and cannot park the active stage.
 
 Apply journals every managed repository path and the fleet configuration.
 Failure during skill installation, npm installation, Chromium installation, or
