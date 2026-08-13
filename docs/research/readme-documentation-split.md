@@ -40,16 +40,16 @@ Actions mean: **keep** = remains concise in README; **update in-place** = remain
 corrected against shipped behavior; **move** = README gets a short pointer and the named document
 owns the explanation. “New” names are proposals only; this audit does not create them.
 
-| README heading | Action | Destination/authority | Reason |
+| README heading | Action | Canonical destination | Reason |
 | --- | --- | --- | --- |
 | `# AgentFlow` | Keep | README | Front door, badges, one-sentence product identity. |
-| `## The mental model` | Update in-place | README; `CONTEXT.md`; ADR 0027/0035 | Keep the durable boundary and projection statement; remove expanding pipeline detail. |
-| `## Issue intake and routing` | Move | New `docs/pipeline.md`; code + ADR 0016/0022 | A route table is a behavior contract and will rot if duplicated in README. |
-| `## How the engine works an issue` | Move | New `docs/pipeline.md`; stage code + ADR 0028/0030/0039/0047 | The seven-stage summary belongs with lifecycle semantics and recovery rules. |
-| `## Autonomy profiles` | Update in-place | README summary; `CONTEXT.md`; ADR 0001/0002/0008/0018 | Keep the user decision, link the rationale; verify names and review fallback before rewrite. |
-| `## Wayfinder and AgentFlow` | Update in-place | README summary; ADR 0027/0037; Wayfinder docs/skill | Keep planning-vs-execution boundary and one handoff rule; move mechanics to the Wayfinder authority. |
-| `## How skills are invoked` | Move | Existing `docs/capabilities.md`; new `docs/pipeline.md` pointer if needed | Capability discovery and unattended availability are operational/generated facts, not front-door prose. |
-| `## Where the project is today` | Update in-place | README; ADR index; issue/map links | Keep only verified shipped status and explicitly labelled open boundaries; remove roadmap-like claims. |
+| `## The mental model` | Update in-place | `README.md` | Keep the durable boundary and projection statement; link `CONTEXT.md` for terms and ADR 0027/0035 for rationale. |
+| `## Issue intake and routing` | Move | New `docs/pipeline.md` | A route table is a behavior contract; the guide links code and ADR 0016/0022 instead of duplicating them in README. |
+| `## How the engine works an issue` | Move | New `docs/pipeline.md` | The seven-stage summary belongs with lifecycle semantics and recovery rules, with stage-code and ADR links as evidence. |
+| `## Autonomy profiles` | Update in-place | `README.md` | Keep the user choice summary; link `CONTEXT.md` for terms and ADR 0001/0002/0008/0018 for rationale. |
+| `## Wayfinder and AgentFlow` | Update in-place | `README.md` | Keep only the planning-vs-execution boundary and one handoff rule; ADR 0027/0037 remain the linked rationale. |
+| `## How skills are invoked` | Move | `docs/capabilities.md` | Capability discovery and unattended availability are operational/generated facts owned by the manifest and explained here. |
+| `## Where the project is today` | Update in-place | `README.md` | Keep only status proved by the merged revision and explicitly labelled open boundaries; link the map rather than restating it. |
 | `## Quick start` | Move | New `docs/getting-started.md` | Requirements, install, enroll, capacity, start, and recovery form one runnable procedure. |
 | `### Requirements` | Move | New `docs/getting-started.md` | Version/runtime prerequisites need one maintained home. |
 | `### Install` | Move | New `docs/getting-started.md` | Clone and dependency setup belong to onboarding. |
@@ -60,8 +60,8 @@ owns the explanation. “New” names are proposals only; this audit does not cr
 | `## Recover on a new machine` | Move | New `docs/getting-started.md` | It is the second onboarding path and should share prerequisites/enrollment instructions. |
 | `## Foreground notifications` | Move | Existing `docs/coordinator-operations.md` | Environment/service inheritance and sensitive notification configuration are operating rules. |
 | `## Operations and development` | Move and split | `docs/coordinator-operations.md` for operating behavior; `CONTRIBUTING.md` for development | The mixed heading becomes two README pointers. Each target owns one non-overlapping reader task. |
-| `## Support AgentFlow` | Keep | README; `SUPPORT.md` | Small sponsorship/support boundary is appropriate at the front door. |
-| `## Project policy` | Update in-place | README link list; `docs/public-beta.md`, `COMPATIBILITY.md`, `SECURITY.md`, `SUPPORT.md`, `GOVERNANCE.md` | Keep the clone-only beta sentence and links; remove duplicated promises and guarantees. |
+| `## Support AgentFlow` | Keep | `README.md` | Small sponsorship entry remains at the front door and points to `SUPPORT.md` for the full policy. |
+| `## Project policy` | Update in-place | `README.md` | Keep only the clone-only beta sentence and exact policy links; detailed promises stay in their linked files. |
 
 ## Exact proposed smaller doc set
 
@@ -104,6 +104,7 @@ The rewritten README uses these exact pointer labels and targets:
 | Learning pipeline | `docs/learning-pipeline.md`, added only when that deferred guide lands |
 | Contribute | `CONTRIBUTING.md` |
 | Product and design | `PRODUCT.md` and `DESIGN.md` |
+| Domain glossary | `CONTEXT.md` |
 | Decisions | `docs/adr/README.md` |
 | Policy and support | `docs/public-beta.md`, `COMPATIBILITY.md`, `SECURITY.md`, `SUPPORT.md`, and `GOVERNANCE.md` |
 
