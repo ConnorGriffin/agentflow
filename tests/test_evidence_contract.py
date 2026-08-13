@@ -86,3 +86,51 @@ def test_cli_error_is_one_sanitized_line_with_no_rejected_content(tmp_path):
     assert result.stdout == ""
     assert result.stderr == "evidence contract invalid: secret-value.json: suffix\n"
     assert "do-not-echo" not in result.stderr
+
+
+def test_missing_subject_kind_is_shape_not_an_inferred_subject_shape(tmp_path):
+    corpus = _corpus(tmp_path)
+    fixture = corpus / "positive-producer-lineage-v2.json"
+    body = fixture.read_text().replace('"subject_kind": "document", ', "")
+    fixture.write_text(body)
+
+    with pytest.raises(EvidenceError, match=r"positive-producer-lineage-v2\.json: shape$"):
+        validate_fixtures(corpus)
+
+
+@pytest.mark.parametrize("member,value", [
+    ("ordinal", "true"),
+    ("relation", "[]"),
+    ("target_event_id", "[]"),
+    ("envelope_kind", "[]"),
+    ("subject_kind", "[]"),
+])
+def test_invalid_link_primitives_return_sanitized_type_without_traceback(
+        tmp_path, member, value):
+    corpus = _corpus(tmp_path)
+    fixture = corpus / "positive-producer-lineage-v2.json"
+    body = fixture.read_text()
+    if member == "ordinal":
+        body = body.replace('"ordinal": 0', f'"ordinal": {value}')
+    elif member == "relation":
+        body = body.replace('"relation": "derives_from"', f'"relation": {value}')
+    elif member == "target_event_id":
+        body = body.replace('"target_event_id": "event-prior"',
+                            f'"target_event_id": {value}')
+    elif member == "envelope_kind":
+        body = body.replace('"envelope_kind": "producer_fact"',
+                            f'"envelope_kind": {value}')
+    else:
+        body = body.replace('"subject_kind": "document"', f'"subject_kind": {value}')
+    fixture.write_text(body)
+
+    with pytest.raises(EvidenceError, match=r"positive-producer-lineage-v2\.json: type$"):
+        validate_fixtures(corpus)
+    result = subprocess.run(
+        [sys.executable, "-m", "agentflow.evidence_contract", str(corpus)],
+        text=True, capture_output=True, check=False,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == "evidence contract invalid: positive-producer-lineage-v2.json: type\n"
+    assert "Traceback" not in result.stderr

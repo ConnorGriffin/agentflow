@@ -271,6 +271,24 @@ def test_same_producer_scalars_with_different_lineage_have_distinct_identities(t
     assert first.event_id != second.event_id
 
 
+def test_v2_failure_replay_rejects_complete_subject_conflict_on_legacy_identity(tmp_path):
+    store = EvidenceStore(path=tmp_path / "evidence.db")
+    facts = FailureFacts("original_defect", "observed", "a" * 64, "v2")
+    first = EvidenceEnvelopeV2(
+        "failure_observation", "obs-issue",
+        SubjectRevision("issue", "item/596", "rev-1", "issues/596", "b" * 64),
+        _source(), 1, failure=facts)
+    conflicting = EvidenceEnvelopeV2(
+        "failure_observation", "obs-document",
+        SubjectRevision("document", "item/596", "rev-1", "docs/596", "c" * 64),
+        _source(), 2, failure=facts)
+
+    admitted = store.observe(first)
+    with pytest.raises(EvidenceError, match="immutable failure facts"):
+        store.observe(conflicting)
+    assert store.brief_for("item/596", repository="octo/repo", now=3) == (admitted,)
+
+
 def test_producer_replay_collects_sorted_observations_and_rejects_changed_facts(tmp_path):
     store = EvidenceStore(path=tmp_path / "evidence.db")
     subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
@@ -819,4 +837,81 @@ def test_complete_v2_schema_fingerprint_rejects_column_and_index_tampering(tmp_p
     conn.commit()
     conn.close()
     with pytest.raises(EvidenceError, match="schema"):
+        EvidenceStore(path=path)
+
+
+def test_reopen_rejects_persisted_cross_repository_lineage_and_brief_never_traverses_it(tmp_path):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject_a = SubjectRevision("issue", "repo/a-item", "rev-1", "issues/1", "a" * 64)
+    subject_b = SubjectRevision("issue", "repo/b-item", "rev-1", "issues/2", "b" * 64)
+    source_b = AuthorityPointer("github", "repo/b", "issues/2", "a" * 40,
+                                "sha256", "b" * 64, "issue")
+    target_b = store.observe(EvidenceEnvelopeV2(
+        "producer_fact", "obs-b", subject_b, source_b, 1,
+        producer=ProducerFacts("revision", "c" * 64, "v2", "observed")))
+    source_a = store.observe(_producer("obs-a", subject_a, "revision", "d" * 64, 2))
+    conn = sqlite3.connect(path)
+    conn.execute("INSERT INTO event_links VALUES (?,?,?,?)",
+                 (source_a.event_id, 0, "derives_from", target_b.event_id))
+    conn.commit()
+    conn.close()
+
+    brief = store.brief_for("repo/a-item", repository="octo/repo", now=3)
+    assert tuple(event.event_id for event in brief) == (source_a.event_id,)
+    assert target_b.event_id not in {event.event_id for event in brief}
+    with pytest.raises(EvidenceError, match="persisted Evidence lineage"):
+        EvidenceStore(path=path)
+
+
+@pytest.mark.parametrize("tamper", ["missing-target", "invalid-relation", "sparse-ordinal"])
+def test_reopen_rejects_unresolved_invalid_or_nondense_persisted_lineage(tmp_path, tamper):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
+    target = store.observe(_producer("obs-r", subject, "revision", "b" * 64, 1))
+    source = store.observe(_producer(
+        "obs-c", subject, "criterion", "c" * 64, 2,
+        (0, "derives_from", target.event_id)))
+    conn = sqlite3.connect(path)
+    if tamper == "missing-target":
+        conn.execute("PRAGMA foreign_keys = OFF")
+        conn.execute("UPDATE event_links SET target_event_id='event-missing' "
+                     "WHERE source_event_id=?", (source.event_id,))
+    elif tamper == "invalid-relation":
+        conn.execute("UPDATE event_links SET relation='invalid' WHERE source_event_id=?",
+                     (source.event_id,))
+    else:
+        conn.execute("UPDATE event_links SET ordinal=1 WHERE source_event_id=?", (source.event_id,))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(EvidenceError, match="persisted Evidence lineage"):
+        EvidenceStore(path=path)
+
+
+@pytest.mark.parametrize("tamper", ["inapplicable-relation", "missing-required", "failure-source"])
+def test_reopen_rejects_persisted_source_kind_and_required_relation_violations(
+        tmp_path, tamper):
+    path = tmp_path / "evidence.db"
+    store = EvidenceStore(path=path)
+    subject = SubjectRevision("issue", "issue/596", "rev-1", "issues/596", "a" * 64)
+    target = store.observe(_producer("obs-r", subject, "revision", "b" * 64, 1))
+    source = store.observe(_producer(
+        "obs-c", subject, "criterion", "c" * 64, 2,
+        (0, "derives_from", target.event_id)))
+    conn = sqlite3.connect(path)
+    if tamper == "inapplicable-relation":
+        conn.execute("UPDATE event_links SET relation='addresses' WHERE source_event_id=?",
+                     (source.event_id,))
+    elif tamper == "missing-required":
+        conn.execute("UPDATE events SET producer_kind='fix' WHERE event_id=?", (source.event_id,))
+    else:
+        failure = store.observe(_observation())
+        conn.execute("INSERT INTO event_links VALUES (?,?,?,?)",
+                     (failure.event_id, 0, "derives_from", target.event_id))
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(EvidenceError, match="persisted Evidence lineage"):
         EvidenceStore(path=path)

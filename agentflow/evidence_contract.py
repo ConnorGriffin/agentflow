@@ -148,9 +148,10 @@ def _v2_reason(value: Any) -> str | None:
         errors.add("type")
         return _first(errors)
     kind = value.get("envelope_kind")
+    kind_is_string = isinstance(kind, str)
     if "envelope_kind" not in value:
         errors.add("shape")
-    elif not isinstance(kind, str):
+    elif not kind_is_string:
         errors.add("type")
     elif kind not in {"failure_observation", "producer_fact"}:
         errors.add("vocabulary")
@@ -158,7 +159,7 @@ def _v2_reason(value: Any) -> str | None:
                 if kind == "failure_observation" else
                 {"envelope_kind", "links", "observation_id", "observed_at", "producer", "source", "subject"}
                 if kind == "producer_fact" else set(value))
-    if kind in {"failure_observation", "producer_fact"} and set(value) != expected:
+    if kind_is_string and kind in {"failure_observation", "producer_fact"} and set(value) != expected:
         errors.add("shape")
     _strings(value, {"envelope_kind", "observation_id"}, errors)
     observed_at = value.get("observed_at")
@@ -170,16 +171,20 @@ def _v2_reason(value: Any) -> str | None:
     subject = value.get("subject")
     if isinstance(subject, dict):
         subject_kind = subject.get("subject_kind")
+        subject_kind_is_string = isinstance(subject_kind, str)
+        if "subject_kind" not in subject:
+            errors.add("shape")
         subject_keys = ({"subject_kind", "subject", "revision"} if subject_kind == "review" else
                         {"subject_kind", "subject", "revision", "locator", "content_digest"}
-                        if subject_kind in {"issue", "document"} else set(subject))
+                        if subject_kind_is_string and subject_kind in {"issue", "document"}
+                        else set(subject))
         _shape(subject, subject_keys, errors)
         _strings(subject, subject_keys, errors)
-        if isinstance(subject_kind, str) and subject_kind not in {"review", "issue", "document"}:
+        if subject_kind_is_string and subject_kind not in {"review", "issue", "document"}:
             errors.add("vocabulary")
         if subject_kind == "review" and isinstance(subject.get("revision"), str) and not _SHA.fullmatch(subject["revision"]):
             errors.add("vocabulary")
-        if subject_kind in {"issue", "document"}:
+        if subject_kind_is_string and subject_kind in {"issue", "document"}:
             if isinstance(subject.get("content_digest"), str) and not _DIGEST.fullmatch(subject["content_digest"]):
                 errors.add("vocabulary")
             for name in ("subject", "revision", "locator"):
@@ -236,18 +241,21 @@ def _v2_reason(value: Any) -> str | None:
                     errors.add("vocabulary")
                 relation = link.get("relation")
                 target = link.get("target_event_id")
-                if isinstance(relation, str):
+                relation_is_string = isinstance(relation, str)
+                target_is_string = isinstance(target, str)
+                if relation_is_string:
                     relations.append(relation)
                     if relation not in LINEAGE_RELATIONS:
                         errors.add("vocabulary")
                     elif producer_kind in PRODUCER_KINDS and producer_kind not in _LINEAGE_MATRIX[relation][0]:
                         errors.add("vocabulary")
-                if isinstance(target, str) and not _ID.fullmatch(target):
+                if target_is_string and not _ID.fullmatch(target):
                     errors.add("vocabulary")
-                pair = (relation, target)
-                if pair in pairs:
-                    errors.add("vocabulary")
-                pairs.add(pair)
+                if relation_is_string and target_is_string:
+                    pair = (relation, target)
+                    if pair in pairs:
+                        errors.add("vocabulary")
+                    pairs.add(pair)
             required = {"fix": "addresses", "settlement": "settles", "delegation": "delegates",
                         "slice": "derives_from"}.get(producer_kind)
             if required is not None and required not in relations:

@@ -547,6 +547,44 @@ class EvidenceStore:
             EvidenceStore._migrate_v2_to_v3(conn, v3)
         elif version == 2:
             EvidenceStore._migrate_v2_to_v3(conn, v3)
+        EvidenceStore._validate_graph(conn)
+
+    @staticmethod
+    def _validate_graph(conn: sqlite3.Connection) -> None:
+        events = {row["event_id"]: row for row in conn.execute(
+            "SELECT event_id, event_kind, repository, producer_kind FROM events")}
+        links_by_source: dict[str, list[sqlite3.Row]] = {}
+        for link in conn.execute(
+                "SELECT source_event_id, ordinal, relation, target_event_id "
+                "FROM event_links ORDER BY source_event_id, ordinal"):
+            links_by_source.setdefault(link["source_event_id"], []).append(link)
+        for source_id, links in links_by_source.items():
+            source = events.get(source_id)
+            if source is None or source["event_kind"] != "producer_fact" or len(links) > 32:
+                raise EvidenceError("invalid persisted Evidence lineage")
+            pairs: set[tuple[str, str]] = set()
+            for position, link in enumerate(links):
+                target = events.get(link["target_event_id"])
+                relation = link["relation"]
+                pair = (relation, link["target_event_id"])
+                if (link["ordinal"] != position or pair in pairs or target is None
+                        or source["repository"] != target["repository"]
+                        or relation not in _LINEAGE_MATRIX):
+                    raise EvidenceError("invalid persisted Evidence lineage")
+                pairs.add(pair)
+                target_kind = ("failure_observation"
+                               if target["event_kind"] == "failure_observation"
+                               else target["producer_kind"])
+                sources, targets = _LINEAGE_MATRIX[relation]
+                if source["producer_kind"] not in sources or target_kind not in targets:
+                    raise EvidenceError("invalid persisted Evidence lineage")
+        for event in events.values():
+            links = links_by_source.get(event["event_id"], [])
+            if event["event_kind"] == "failure_observation" and links:
+                raise EvidenceError("invalid persisted Evidence lineage")
+            required = _REQUIRED_RELATION.get(event["producer_kind"])
+            if required is not None and all(link["relation"] != required for link in links):
+                raise EvidenceError("invalid persisted Evidence lineage")
 
     @staticmethod
     def _migration_checkpoint(label: str) -> None:
@@ -697,6 +735,16 @@ class EvidenceStore:
                 observation.subject.subject_kind, observation.subject.subject, observation.subject.revision,
                 observation.subject.locator, observation.subject.content_digest, observation.failure_class, "",
                 observation.signature_digest, observation.normalizer_version, "")
+            existing_event = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+            if existing_event is not None:
+                stored_event = tuple(existing_event)
+                legacy_unknown = (stored_event[3], stored_event[6], stored_event[7]) == ("", "", "")
+                historical_fields = (0, 1, 2, 4, 5, 8, 9, 10, 11, 12)
+                if ((not legacy_unknown and stored_event != event_values)
+                        or (legacy_unknown and any(
+                            stored_event[index] != event_values[index]
+                            for index in historical_fields))):
+                    raise EvidenceError("event_id already names different immutable failure facts")
             conn.execute("INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", event_values)
             existing = conn.execute("SELECT * FROM observations WHERE observation_id=?", (observation.observation_id,)).fetchone()
             immutable = (event_id, observation.source.authority_kind, observation.source.repository,
@@ -910,7 +958,10 @@ class EvidenceStore:
             while frontier:
                 source = frontier.pop()
                 for row in conn.execute(
-                        "SELECT target_event_id FROM event_links WHERE source_event_id=?", (source,)):
+                        "SELECT links.target_event_id FROM event_links AS links "
+                        "JOIN events AS targets ON targets.event_id=links.target_event_id "
+                        "WHERE links.source_event_id=? AND targets.repository=?",
+                        (source, repository)):
                     if row[0] not in selected:
                         selected.add(row[0])
                         frontier.append(row[0])
