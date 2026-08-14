@@ -411,18 +411,26 @@ def test_successor_transfer_is_the_same_transition_for_review_to_revise(make_coo
     fake = FakeSession()
     adapter = _router(fake, pr=[False], verdict=[True], prep=[True])
     coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    review_revision = "e" * 40
     review = coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
-                                        target="head-sha"))
+                                        target=review_revision))
     coord.cycle("codex")
     fake.end(review, cause=ProviderCause.PROCESS)
     coord.cycle("codex")
 
     revise = coord.submit_stage(Submission(
-        repo="o/r", subject="7", stage="revise", pool="claude", target="head-sha",
-        builder_lineage="claude", source="/wt/issue-7", transfer_from=review))
+        repo="o/r", subject="7", stage="revise", pool="claude", target=review_revision,
+        builder_lineage="claude", source="/wt/issue-7", transfer_from=review,
+        subject_revision="f" * 40))
     records = {r.identity: r for r in _records(coord)}
     assert records[review].retired is True and records[review].claim is False
     assert records[revise].retired is False and records[revise].claim is True
+    assert records[revise].subject_revision == "f" * 40
+    review_route = (records[review].route_id, records[review].route_cell_digest,
+                    records[review].launch_config_digest)
+    revise_route = (records[revise].route_id, records[revise].route_cell_digest,
+                    records[revise].launch_config_digest)
+    assert all(review_route) and all(revise_route) and revise_route != review_route
 
 
 def test_existing_successor_assumes_claim_durably_without_duplication(make_coord):
@@ -1398,6 +1406,7 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     sub = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
     assert sub is not None
     assert sub.stage == "review" and sub.target == "head-sha-123"
+    assert sub.subject_revision == "head-sha-123"
     assert sub.pool == "codex" and sub.builder_lineage == "claude"     # cross-tool reviewer
     assert sub.transfer_from == "o/r|7|build|-"                        # assumes the build's claim
     assert sub.complexity == "deep"                                   # review is the deep net

@@ -502,15 +502,20 @@ class ExactRevisionRepositoryOverlaySource:
         except (OSError, subprocess.SubprocessError) as error:
             raise PolicyValidationError("overlay object is unreadable") from error
         if result.returncode:
-            # Missing is the only absence; an invalid revision is rejected above and a
-            # repository whose object database cannot serve a known revision also fails closed.
-            probe = subprocess.run(
-                ["git", "cat-file", "-e", f"{subject_revision}^{{commit}}"], cwd=root,
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                check=False, timeout=5)
-            if probe.returncode == 0:
+            # Only an absent entry in the exact commit tree means no overlay.  A tree that names
+            # the path but whose blob cannot be read is corrupt authority, never inferred absence.
+            try:
+                probe = subprocess.run(
+                    ["git", "ls-tree", "-z", "--full-tree", subject_revision, "--", self._PATH],
+                    cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, check=False, timeout=5)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise PolicyValidationError("overlay object is unreadable") from error
+            if probe.returncode:
+                raise PolicyValidationError("overlay revision is unavailable")
+            if not probe.stdout:
                 return None
-            raise PolicyValidationError("overlay revision is unavailable")
+            raise PolicyValidationError("overlay object is unreadable")
         if len(result.stdout) > _MAX_OVERLAY_BYTES:
             raise PolicyValidationError("overlay exceeds byte limit")
         return OverlayV1.parse(result.stdout)

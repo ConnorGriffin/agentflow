@@ -107,6 +107,7 @@ def test_submission_pins_the_source_commit(monkeypatch):
 
     assert submission is not None
     assert json.loads(submission.input_ptr)["source_ref"] == "abc123"
+    assert submission.subject_revision == "abc123"
 
 
 def test_preparation_proves_the_triaging_claim_before_admission(make_coord):

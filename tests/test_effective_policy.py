@@ -125,6 +125,39 @@ def test_repository_overlay_reads_exact_revision_not_mutable_head(tmp_path):
     assert source.read(REPOSITORY, old).canonical_bytes != overlay_path.read_bytes()
 
 
+def test_repository_overlay_distinguishes_missing_path_from_corrupt_present_object(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "absent"],
+                   check=True)
+    missing_revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True,
+        stdout=subprocess.PIPE).stdout.strip()
+    source = ExactRevisionRepositoryOverlaySource({REPOSITORY: repo})
+    assert source.read(REPOSITORY, missing_revision) is None
+
+    overlay_path = repo / ".agentflow" / "briefing-overlay-v1.json"
+    overlay_path.parent.mkdir()
+    overlay_path.write_bytes(_canonical(_overlay_value()))
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "present"], check=True)
+    present_revision = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, text=True,
+        stdout=subprocess.PIPE).stdout.strip()
+    blob = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse",
+         "HEAD:.agentflow/briefing-overlay-v1.json"], check=True, text=True,
+        stdout=subprocess.PIPE).stdout.strip()
+    (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+
+    with pytest.raises(PolicyValidationError, match="overlay object is unreadable"):
+        source.read(REPOSITORY, present_revision)
+
+
 def _actual(expected):
     authority = expected.authority
     pointer = AuthorityPointer(

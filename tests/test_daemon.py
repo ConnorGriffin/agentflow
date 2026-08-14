@@ -145,6 +145,85 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit
 
 
+def test_once_production_path_reaches_provider_command_through_composed_admission(
+        tmp_path, monkeypatch):
+    """Exercise daemon -> dispatch -> production Coordinator -> Store -> provider argv."""
+    from pathlib import Path
+
+    from agentflow import coordinated_converse, dispatch, pipeline
+    from agentflow.coordinator import Coordinator
+    from agentflow.coordinator.store import Store, default_store_path
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: none\n")
+    source_skills = repo / ".agents" / "skills"
+    source_skills.mkdir(parents=True)
+    (source_skills / ".keep").write_text("capability source root\n")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "fixture"], check=True)
+
+    worktree = Path(coordinated_converse.ask_worktree(str(repo), "codex", "production-path"))
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "--detach", str(worktree), "HEAD"],
+        check=True, stdout=subprocess.DEVNULL)
+    # Materialization is non-clobbering. Converse has no methodology requirements, so inert
+    # existing destinations make this fixture independent of globally installed skills.
+    for name in ("tdd", "codebase-design", "domain-modeling", "agentflow",
+                 "ui-craft", "drive-local-webapp"):
+        (worktree / ".agents" / "skills" / name).mkdir(parents=True, exist_ok=True)
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "provider-argv.txt"
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$AGENTFLOW_PROVIDER_MARKER\"\nexit 0\n")
+    fake_codex.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setenv("AGENTFLOW_CODEX_BIN", str(fake_codex))
+    monkeypatch.setenv("AGENTFLOW_PROVIDER_MARKER", str(marker))
+
+    seed_store = Store(default_store_path())
+    seed = Coordinator(store=seed_store)
+    identity = seed.submit_stage(coordinated_converse.converse_submission(
+        "octo/app", str(repo), "production-path", 0, "Summarize this repository.",
+        pool="codex"))
+    seed_store.close()
+
+    # Bound only external discovery, GitHub reconciliation, and publication. The named internal
+    # production seams under test remain the real implementations.
+    monkeypatch.setattr(daemon, "recover_worktrees", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(daemon, "recheck_once", lambda _cfg: "bounded external recheck")
+    monkeypatch.setattr(daemon, "publish_snapshot", lambda _repos: None)
+    monkeypatch.setattr(daemon, "log", lambda _line: None)
+    monkeypatch.setattr(dispatch, "_refresh_claude_quota", lambda _log: None)
+    monkeypatch.setattr(dispatch, "_submit_repo", lambda _cfg, _coord, _log: None)
+    monkeypatch.setattr(pipeline, "reconcile_orphaned_claims", lambda *_args, **_kwargs: 0)
+
+    cfg = RepoConfig("octo/app", str(repo))
+    daemon.run(RuntimeConfig((cfg,), (), tmp_path / "config.toml"), once=True)
+
+    deadline = time.monotonic() + 2
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert marker.exists()
+    argv = marker.read_text().splitlines()
+    assert argv[0] == "exec" and "--ignore-user-config" in argv
+    reopened = Store(default_store_path())
+    receipt = reopened.read_admission_receipt(identity)
+    record = reopened.record_of(identity)
+    assert receipt is not None and record is not None
+    assert record.state == "running" and record.start_fact == "started"
+    assert receipt.route_cell_digest == record.route_cell_digest
+    reopened.close()
+
+
 def test_sigterm_releases_lock_so_a_fresh_daemon_can_start(tmp_path):
     """A supervised stop leaves the daemon ready to start again immediately."""
     lock = tmp_path / "daemon.lock"

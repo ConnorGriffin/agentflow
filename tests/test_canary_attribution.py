@@ -37,6 +37,8 @@ from agentflow.coordinator.store import (
     AdmissionReceipt,
     AdmissionRefused,
     AdmissionResult,
+    LegacyReservationIntent,
+    LegacyReservationResult,
     NoAdmission,
     OperationalSafetyAndCanary,
     RouteAdmissionRefused,
@@ -259,6 +261,10 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
         "daemon_generation", "budget", "limits", "route_cell_digest", "briefing",
         "capability"]
     assert list(inspect.signature(Store.reserve).parameters) == ["self", "intent"]
+    assert list(inspect.signature(Store.reserve_legacy).parameters) == ["self", "intent"]
+    assert all(parameter.default is inspect.Parameter.empty for parameter in
+               inspect.signature(ReservationIntent).parameters.values())
+    assert "admitted_launch" not in AdmissionResult.__dataclass_fields__
     assert list(inspect.signature(Store.resolve_admitted_launch).parameters) == [
         "self", "stage_identity", "expected_revision", "route_id"]
     assert list(inspect.signature(Store.read_canary_attribution).parameters) == [
@@ -320,9 +326,10 @@ def test_no_admission_returns_store_owned_ten_field_successor(tmp_path):
     store = Store(path)
     assert store.upsert(before)
     durable_before = store.record_of(IDENTITY)
-    result = store.reserve(intent(token="old", now=20, generation="new-daemon"))
-    assert type(result) is AdmissionResult
-    assert result.safety_state_id is None and result.canary_attribution is None
+    result = store.reserve_legacy(LegacyReservationIntent(
+        IDENTITY, "old", 1, 20, "new-daemon", 5, None, None))
+    assert type(result) is LegacyReservationResult
+    assert result.safety_state_id is None
     successor = result.successor
     assert successor.state == RUNNING and successor.revision == 2
     assert successor.start_fact is None and re.fullmatch(r"[a-f0-9]{32}", successor.launch_token)
@@ -369,6 +376,35 @@ def test_composed_admission_is_safety_first_and_binds_durable_record(tmp_path, m
     store.close()
 
 
+def test_safety_refusal_stops_before_canary_attribution(tmp_path, monkeypatch):
+    path = tmp_path / "safety-first-refusal.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    calls = []
+
+    def refuse(_self, _context):
+        calls.append("safety")
+        raise SafetyRefused("blocked")
+
+    def must_not_attribute(_self, _context):
+        calls.append("attribution")
+        raise AssertionError("Safety refusal must stop attribution")
+
+    monkeypatch.setattr(OperationalSafety, "_participate_in_admission", refuse)
+    monkeypatch.setattr(
+        CanaryAttributionAuthority, "_participate_in_admission", must_not_attribute)
+    store = composed(path, receipts)
+    with pytest.raises(AdmissionRefused) as refused:
+        store.reserve(intent(digest=active.digest))
+    assert refused.value.code == "safety_refused"
+    assert calls == ["safety"]
+    assert store.record_of(IDENTITY).state == WAITING
+    assert store.permits_used("codex") == 0
+    assert store.read_admission_receipt(IDENTITY) is None
+    assert store.read_canary_attribution(IDENTITY) is None
+    store.close()
+
+
 def test_missing_digest_and_stale_intent_stop_before_any_participant_or_write(tmp_path, monkeypatch):
     path = tmp_path / "stop.db"
     receipts = Receipts()
@@ -379,8 +415,9 @@ def test_missing_digest_and_stale_intent_stop_before_any_participant_or_write(tm
     store = composed(path, receipts)
     with pytest.raises(AdmissionRefused) as refused:
         store.reserve(intent(digest=None))
-    assert refused.value.code == "route_mismatch"
+    assert refused.value.code == "route_cell:mismatched"
     assert store.reserve(intent(revision=0, digest=active.digest)) is None
+    assert store.reserve(intent(token="stale-token", digest=active.digest)) is None
     assert calls == [] and receipts.reads == []
     assert store.record_of(IDENTITY).state == WAITING
     assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
@@ -397,7 +434,7 @@ def test_safety_record_to_route_binding_refuses_before_receipt_read(tmp_path):
     store = composed(path, receipts)
     with pytest.raises(AdmissionRefused) as refused:
         store.reserve(intent(digest=active.digest, provider="claude"))
-    assert refused.value.code == "safety_refused"
+    assert refused.value.code == "route_cell:missing"
     assert receipts.reads == []
     assert store.record_of(IDENTITY).state == WAITING
     assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
@@ -429,7 +466,7 @@ def test_receipt_failure_rolls_back_successor_and_attribution(tmp_path, failure,
     with pytest.raises(AdmissionRefused) as refused:
         store.reserve(intent(digest=active.digest))
     assert refused.value.code == "safety_refused"
-    assert not store._promotion_receipt_callback_active.is_set()
+    assert not store._admission_callback_active.is_set()
     assert store.record_of(IDENTITY).state == WAITING
     assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
@@ -528,6 +565,65 @@ def test_hostile_receipt_reader_threads_cannot_close_or_mutate_active_store(tmp_
     store.close()
 
 
+@pytest.mark.parametrize("boundary", ("checkpoint", "safety", "attribution", "receipt"))
+def test_every_in_transaction_callback_refuses_mutation_and_rolls_back_all_outputs(
+        tmp_path, monkeypatch, boundary):
+    path = tmp_path / f"reentrant-{boundary}.db"
+
+    class ReentrantReceipts(Receipts):
+        refusal = None
+        mutation = None
+
+        def read(self, receipt_id):
+            if boundary == "receipt" and self.mutation is not None:
+                try:
+                    self.mutation()
+                except StoreUnavailable as error:
+                    self.refusal = error
+                    raise
+            return super().read(receipt_id)
+
+    receipts = ReentrantReceipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+
+    def reentrant_mutation():
+        store.consume_admitted_launch(
+            IDENTITY, 1, PRIMARY_ROUTE_ID,
+            reserve=lambda _admitted: pytest.fail("reentrant reserve callback ran"))
+
+    receipts.mutation = reentrant_mutation
+
+    def checkpoint(name):
+        if boundary == "checkpoint" and name == "after-safety":
+            reentrant_mutation()
+
+    def hostile_safety(_self, _context):
+        reentrant_mutation()
+
+    def hostile_attribution(_self, _context):
+        reentrant_mutation()
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(checkpoint))
+    if boundary == "safety":
+        monkeypatch.setattr(OperationalSafety, "_participate_in_admission", hostile_safety)
+    if boundary == "attribution":
+        monkeypatch.setattr(
+            CanaryAttributionAuthority, "_participate_in_admission", hostile_attribution)
+
+    with pytest.raises((StoreUnavailable, AdmissionRefused)) as refused:
+        store.reserve(intent(digest=active.digest))
+    if boundary == "receipt":
+        assert type(receipts.refusal) is StoreUnavailable
+    else:
+        assert "reentrant Store mutation during admission" in str(refused.value)
+    assert store.record_of(IDENTITY).state == WAITING
+    assert store.permits_used("codex") == 0
+    assert store.read_admission_receipt(IDENTITY) is None
+    assert store.read_canary_attribution(IDENTITY) is None
+    store.close()
+
+
 @pytest.mark.parametrize("cutpoint", V4_ADMISSION_PRECOMMIT_CUTPOINTS)
 def test_precommit_crash_cutpoints_roll_back_both_rows(tmp_path, monkeypatch, cutpoint):
     path = tmp_path / (cutpoint + ".db")
@@ -594,6 +690,59 @@ def test_admission_receipt_is_insert_only_and_immutable_across_reopen(tmp_path):
     reopened = composed(path, receipts)
     assert reopened.read_admission_receipt(IDENTITY) == result.admission_receipt
     reopened.close()
+
+
+@pytest.mark.parametrize("assignment", (
+    "subject_revision = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
+    "briefing_id = NULL",
+    "capability_id = 7",
+    "route_cell_digest = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'",
+))
+def test_public_receipt_read_fails_closed_on_second_connection_forgery(
+        tmp_path, assignment):
+    path = tmp_path / "forged-receipt.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    assert store.reserve(intent(digest=active.digest)) is not None
+
+    attacker = sqlite3.connect(path)
+    attacker.execute("DROP TRIGGER admission_receipts_no_update")
+    attacker.execute(f"UPDATE admission_receipts SET {assignment} WHERE stage_identity = ?",
+                     (IDENTITY,))
+    attacker.commit()
+    attacker.close()
+
+    with pytest.raises(StoreUnavailable) as unreadable:
+        store.read_admission_receipt(IDENTITY)
+    assert str(unreadable.value) == "admission receipt is unreadable"
+    store.close()
+
+
+@pytest.mark.parametrize("corruption", ("record-json", "record-utf8", "receipt-table"))
+def test_public_receipt_read_closes_json_and_database_corruption(
+        tmp_path, corruption):
+    path = tmp_path / f"corrupt-receipt-read-{corruption}.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    assert store.reserve(intent(digest=active.digest)) is not None
+
+    attacker = sqlite3.connect(path)
+    if corruption == "record-json":
+        attacker.execute("UPDATE records SET data = '{' WHERE identity = ?", (IDENTITY,))
+    elif corruption == "record-utf8":
+        attacker.execute(
+            "UPDATE records SET data = CAST(X'FF' AS BLOB) WHERE identity = ?", (IDENTITY,))
+    else:
+        attacker.execute("DROP TABLE admission_receipts")
+    attacker.commit()
+    attacker.close()
+
+    with pytest.raises(StoreUnavailable) as unreadable:
+        store.read_admission_receipt(IDENTITY)
+    assert str(unreadable.value) == "admission receipt is unreadable"
+    store.close()
 
 
 def test_receipt_id_is_opaque_and_only_its_canonical_binding_is_persisted(tmp_path):

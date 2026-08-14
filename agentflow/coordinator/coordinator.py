@@ -41,7 +41,8 @@ from agentflow.coordinator.record import (
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import (
-    SUPERVISOR_WINDOW, ReservationIntent, Store, default_store_path)
+    SUPERVISOR_WINDOW, LegacyReservationIntent, ReservationIntent, Store,
+    default_store_path)
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
@@ -583,6 +584,14 @@ class Coordinator:
                 # exist (the child records `started` before replacing itself). If nothing is
                 # alive, this is not-started: release and preserve the attempt count.
                 if not self._launcher.is_alive(record.family):
+                    receipt = self._store.read_admission_receipt(record.identity)
+                    if receipt is not None:
+                        admitted = self._store.decode_committed_launch(
+                            receipt.route_cell_digest)
+                        result = self._launcher.start(record, self._store, admitted)
+                        self._started_here.add(record.identity)
+                        self._commit_start(record, result.fact, result.family)
+                        continue
                     self._release(record)
                     record.state = WAITING
                     self._persist(record)
@@ -758,10 +767,17 @@ class Coordinator:
         probe's refusal is nobody's evidence of anything: it must not count toward the breadcrumb
         or advance a clock, or a stage would escalate on how often it was speculatively tried
         somewhere it does not live (#406)."""
-        # The non-mutating provider/repository check must precede even stage preparation.  A
-        # second check below verifies the actual checkout preparation leaves for launch.
-        capability = self._capability_preflight(record, False)
-        if capability is not None and not capability.ready:
+        # Production's source-root probe is advisory. Preparation may create or repair the final
+        # launch root, so only the one post-prepare observation is admission authority.
+        composed = self._store.composed_admission
+        if composed:
+            try:
+                capability = self._capability_preflight(record, False)
+            except Exception:
+                capability = None
+        else:
+            capability = self._capability_preflight(record, False)
+        if not composed and capability is not None and not capability.ready:
             return self._capability_failure(record, capability, observed)
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
@@ -793,6 +809,11 @@ class Coordinator:
             return "unprepared"
         capability = self._capability_preflight(record, True)
         if capability is not None and not capability.ready:
+            if composed:
+                state = capability.state if capability.state in {
+                    "missing", "drifted", "incompatible"} else "incompatible"
+                return self._admission_failure(
+                    record, f"capability_environment_failure:{state}", observed)
             return self._capability_failure(record, capability, observed)
         # Preparation answered yes, so whatever refused it earlier is over — clear it before the
         # later admission checks run, or a stage that is now perfectly preparable would keep
@@ -820,22 +841,26 @@ class Coordinator:
             if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
                 return "deferred"
             return "blocked"
-        result = (self._launcher.start(record, self._store, admission.admitted_launch)
-                  if admission.admitted_launch is not None
-                  else self._launcher.start(record, self._store))
+        if self._store.composed_admission:
+            admitted = self._store.decode_committed_launch(
+                admission.admission_receipt.route_cell_digest)
+            result = self._launcher.start(record, self._store, admitted)
+        else:
+            result = self._launcher.start(record, self._store)
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
 
     def _admission_failure(self, record: Record, code: str, observed: bool) -> str:
-        """Persist one content-free zero-consumption admission hold."""
+        """Persist a content-free retryable refusal while retaining the claim."""
         if not observed:
             return "unprepared"
-        record.hold_reason = code
-        if not self._hold(record):
+        self._note_refusal(record, code, False)
+        record.capability_preflight = ""
+        if not self._persist(record):
             return "unprepared"
-        self._emit(record, f"{code}; claim retained; no attempt or permit spent")
-        self._finalize_hold(record)
+        self._emit(record, f"{code}; retrying next cycle; claim retained; "
+                           "no attempt or permit spent")
         return "unprepared"
 
     def _capability_failure(self, record: Record, capability, observed: bool) -> str:
@@ -918,9 +943,10 @@ class Coordinator:
             record, pool=dest_pool,
             source=_repool_source(record.source, dest_pool),
             lineage=dest_pool if record.stage in LINEAGE_PINNED else record.lineage)
-        capability = self._capability_preflight(candidate, False)
-        if capability is not None and not capability.ready:
-            return
+        if not self._store.composed_admission:
+            capability = self._capability_preflight(candidate, False)
+            if capability is not None and not capability.ready:
+                return
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
                 record.lineage, record.source, record.refusal, record.refusal_expected,
                 record.route_id, record.route_cell_digest, record.launch_config_digest)
@@ -1012,18 +1038,25 @@ class Coordinator:
             if type(briefing) is HoldBriefing:
                 from agentflow.coordinator.store import AdmissionRefused
                 raise AdmissionRefused(briefing.hold_code)
-        admission = self._store.reserve(ReservationIntent(
-            identity=record.identity,
-            expected_launch_token=record.launch_token,
-            expected_revision=record.revision,
-            now=now,
-            daemon_generation=self._daemon_generation,
-            budget=PERMIT_BUDGET,
-            limits=limits,
-            route_cell_digest=record.route_cell_digest or None,
-            briefing=briefing,
-            capability=capability,
-        ))
+        common = {
+            "identity": record.identity,
+            "expected_launch_token": record.launch_token,
+            "expected_revision": record.revision,
+            "now": now,
+            "daemon_generation": self._daemon_generation,
+            "budget": PERMIT_BUDGET,
+            "limits": limits,
+        }
+        if self._store.composed_admission:
+            if not record.route_cell_digest or capability is None:
+                from agentflow.coordinator.store import AdmissionRefused
+                raise AdmissionRefused("admission_identity_migration_required")
+            admission = self._store.reserve(ReservationIntent(
+                **common, route_cell_digest=record.route_cell_digest,
+                briefing=briefing, capability=capability))
+        else:
+            admission = self._store.reserve_legacy(LegacyReservationIntent(
+                **common, route_cell_digest=record.route_cell_digest or None))
         if admission is None:
             return None
         for item in fields(Record):

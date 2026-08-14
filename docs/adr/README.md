@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 627](adr-627-composed-operational-admission.md) — One Store-owned production admission
+  transaction binds policy, capability, RouteCell, Safety, canary attribution, receipt, permit,
+  and historically recoverable launch authority.
 - [ADR 646](adr-646-immutable-route-selection.md) — Routing materializes one closed immutable
   launch artifact; OperationalSafety registers and decodes it for shared argv and supervision
   consumption without giving ordinary admission routing authority.

@@ -30,7 +30,10 @@ def _issue(complexity="standard", effort="high"):
     }
 
 
-def test_build_submission_launches_a_low_effort_fable_session_lead(make_coord, tmp_path):
+def test_build_submission_launches_a_low_effort_fable_session_lead(
+        make_coord, tmp_path, monkeypatch):
+    revision = "1" * 40
+    monkeypatch.setattr(coordinated_build, "capture_subject_revision", lambda _root: revision)
     cfg = SimpleNamespace(repo="o/r", workdir=str(tmp_path))
     submission = coordinated_build.build_submission(cfg, _issue())
     coord = make_coord()
@@ -41,6 +44,7 @@ def test_build_submission_launches_a_low_effort_fable_session_lead(make_coord, t
     prompt = command[command.index("-p") + 1]
 
     assert record.pool == "claude" and record.model == "fable"
+    assert record.subject_revision == revision
     assert command[command.index("--model") + 1] == "fable"
     assert command[command.index("--effort") + 1] == "low"
     assert "Session lead" in prompt

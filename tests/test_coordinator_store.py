@@ -18,13 +18,13 @@ import pytest
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import (
-    ReservationIntent, ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable,
+    LegacyReservationIntent, ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable,
     default_store_path)
 
 
 def intent(identity, *, token=None, revision=1, limits=None, budget=5):
-    return ReservationIntent(identity, token, revision, 100, "daemon-test", budget,
-                             limits, None)
+    return LegacyReservationIntent(identity, token, revision, 100, "daemon-test", budget,
+                                   limits, None)
 
 
 def test_default_store_lives_under_the_state_directory(coord_state):
@@ -51,21 +51,21 @@ def test_coordinator_begin_start_persists_waiting_then_uses_only_no_admission_in
     record.stall_refusal_id = ""
     record.stall_started_at = 0
     record.stall_last_observed_at = 0
-    reserve = coordinator._store.reserve
+    reserve = coordinator._store.reserve_legacy
     captured = []
 
     def observe(intent):
         captured.append(intent)
-        assert type(intent) is ReservationIntent
+        assert type(intent) is LegacyReservationIntent
         prepared = coordinator._store.record_of(record.identity)
         assert prepared == record
         assert prepared is not None and prepared.state == WAITING
         assert prepared.revision == 2 and prepared.launch_token == "prior-token"
         return reserve(intent)
 
-    monkeypatch.setattr(coordinator._store, "reserve", observe)
+    monkeypatch.setattr(coordinator._store, "reserve_legacy", observe)
     assert coordinator._begin_start(record, 100)
-    assert captured == [ReservationIntent(
+    assert captured == [LegacyReservationIntent(
         "compat", "prior-token", 2, 100, "daemon-compat", 5, None, None)]
     durable = coordinator._store.record_of("compat")
     assert durable == record and record.state == RUNNING
@@ -125,12 +125,12 @@ def test_hostile_gate_and_limits_mutations_cannot_change_waiting_authority_or_su
         descendants={"owned-child"})
     assert coordinator._store.upsert(record)
     coordinator._records[record.identity] = record
-    reserve = coordinator._store.reserve
+    reserve = coordinator._store.reserve_legacy
     captured = []
 
     def observe(intent):
         captured.append(intent)
-        assert type(intent) is ReservationIntent
+        assert type(intent) is LegacyReservationIntent
         durable = coordinator._store.record_of("authority")
         assert durable is not None
         assert _authoritative_gate_facts(durable) == (
@@ -142,11 +142,11 @@ def test_hostile_gate_and_limits_mutations_cannot_change_waiting_authority_or_su
             "authority", "owner/repo", "review", "codex", "prepared-model")
         return reserve(intent)
 
-    monkeypatch.setattr(coordinator._store, "reserve", observe)
+    monkeypatch.setattr(coordinator._store, "reserve_legacy", observe)
     assert coordinator._begin_start(record, 100)
 
     assert callback_inputs == [("gate", authoritative_facts), ("limits", authoritative_facts)]
-    assert captured == [ReservationIntent(
+    assert captured == [LegacyReservationIntent(
         "authority", "prepared-token", 2, 100, "daemon-authority", 5, limits, None)]
     successor = coordinator._store.record_of("authority")
     assert successor == record and successor is not None
@@ -242,7 +242,7 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     def race(identity):
         store = Store(path)  # a distinct instance/connection per racer
         barrier.wait()
-        if store.reserve(intent(identity)) is not None:
+        if store.reserve_legacy(intent(identity)) is not None:
             with lock:
                 reserved.append(identity)
         store.close()
@@ -257,7 +257,7 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
 
 
-def test_no_admission_same_store_mutations_serialize_outside_receipt_callback(
+def test_checkpoint_callback_blocks_concurrent_store_mutation(
         tmp_path, monkeypatch):
     path = tmp_path / "same-store.db"
     store = Store(path)
@@ -278,7 +278,7 @@ def test_no_admission_same_store_mutations_serialize_outside_receipt_callback(
 
     def first_reservation():
         try:
-            results["first"] = store.reserve(intent("A"))
+            results["first"] = store.reserve_legacy(intent("A"))
         except BaseException as error:
             errors.append(error)
 
@@ -287,28 +287,28 @@ def test_no_admission_same_store_mutations_serialize_outside_receipt_callback(
             attempting.set()
             results["upsert"] = store.upsert(
                 Record("C", "review", "codex", 1, state=WAITING))
-            results["second"] = store.reserve(intent("B"))
+            results["second"] = store.reserve_legacy(intent("B"))
         except BaseException as error:
             errors.append(error)
 
     first = threading.Thread(target=first_reservation)
     first.start()
     assert entered.wait(1)
-    assert not store._promotion_receipt_callback_active.is_set()
+    assert store._admission_callback_active.is_set()
     second = threading.Thread(target=serialized_operations)
     second.start()
     assert attempting.wait(1)
-    second.join(0.05)
-    assert second.is_alive()  # blocked on Store._lock, not immediately refused
+    second.join(1)
+    assert not second.is_alive()
     release.set()
     first.join(2)
     second.join(2)
     assert not first.is_alive() and not second.is_alive()
-    assert errors == []
-    assert results["upsert"] is True
-    assert results["first"] is not None and results["second"] is not None
-    assert store.record_of("C").state == WAITING
-    assert store.permits_used("codex") == 2
+    assert len(errors) == 1 and type(errors[0]) is StoreUnavailable
+    assert str(errors[0]) == "reentrant Store mutation during admission"
+    assert results["first"] is not None
+    assert store.record_of("C") is None
+    assert store.permits_used("codex") == 1
     store.close()
 
 
@@ -320,10 +320,10 @@ def test_reserve_refuses_a_foreign_running_reservation(tmp_path):
     store = Store(path)
     store.upsert(Record("R", "build", "claude", 1, state="waiting"))
 
-    winner = store.reserve(intent("R"))
+    winner = store.reserve_legacy(intent("R"))
     assert winner is not None
     # A racer that loaded the record while it was still waiting now tries its own reservation.
-    assert store.reserve(intent("R")) is None
+    assert store.reserve_legacy(intent("R")) is None
     assert store.record_of("R").launch_token == winner.successor.launch_token
     assert store.permits_used("claude") == 1           # exactly one running reservation
     store.close()
@@ -335,7 +335,7 @@ def test_reserve_never_overwrites_a_terminal_same_identity(tmp_path):
     store.upsert(Record("R", "intake", "claude", 1, state="completed",
                         launch_token="winner", outcome="route"))
 
-    assert store.reserve(intent("R")) is None
+    assert store.reserve_legacy(intent("R")) is None
     durable = store.record_of("R")
     assert durable.state == "completed" and durable.launch_token == "winner"
     assert durable.outcome == "route"
@@ -348,7 +348,7 @@ def test_reserve_requires_the_loaded_waiting_token_generation(tmp_path):
     store.upsert(Record("R", "review", "claude", 1, state="waiting",
                         launch_token="newer", attempts=1, eligible_at=100))
 
-    assert store.reserve(intent("R")) is None
+    assert store.reserve_legacy(intent("R")) is None
     durable = store.record_of("R")
     assert durable.attempts == 1 and durable.launch_token == "newer"
     assert durable.eligible_at == 100
@@ -371,7 +371,7 @@ def test_two_processes_racing_one_waiting_record_yield_one_reservation(tmp_path)
     def race(token):
         store = Store(path)  # a distinct instance/connection per process
         barrier.wait()
-        result = store.reserve(intent("R"))
+        result = store.reserve_legacy(intent("R"))
         with lock:
             results[token] = result
         store.close()
@@ -416,7 +416,7 @@ def test_global_stage_cap_is_atomic_across_pools(tmp_path):
     def race(record):
         store = Store(path)
         barrier.wait()
-        if store.reserve(intent(record.identity, limits=limits)) is not None:
+        if store.reserve_legacy(intent(record.identity, limits=limits)) is not None:
             with lock:
                 reserved.append(record.identity)
         store.close()
@@ -454,7 +454,7 @@ def test_machine_ceiling_is_atomic_across_stage_lanes_and_pools(tmp_path):
             lane_by_stage={"intake": "triage"},
         )
         barrier.wait()
-        if store.reserve(intent(record.identity, limits=limits)) is not None:
+        if store.reserve_legacy(intent(record.identity, limits=limits)) is not None:
             with lock:
                 reserved.append(record.identity)
         store.close()

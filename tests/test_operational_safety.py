@@ -15,7 +15,7 @@ from agentflow import config, github, routing
 from agentflow.coordinator.record import Record
 from agentflow.coordinator.store import (
     OperationalSafetyOnly,
-    ReservationIntent,
+    LegacyReservationIntent,
     SCHEMA_VERSION,
     SafetySources,
     Store,
@@ -816,7 +816,7 @@ def test_admission_refusal_consumes_no_permit_and_never_touches_running_work(saf
     admitted = Store(path, admission_mode=OperationalSafetyOnly(SafetySources(
         check_evidence=checks)))
     with pytest.raises(SafetyRefused, match="not admissible"):
-        admitted.reserve(ReservationIntent(
+        admitted.reserve_legacy(LegacyReservationIntent(
             "waiting", None, 1, 10, "daemon", 5, None, cell.digest))
     assert admitted.record_of("waiting").state == "waiting"
     assert admitted.permits_used("codex") == 0
@@ -843,7 +843,7 @@ def test_quarantine_and_admission_race_serialize_in_one_store_transaction(tmp_pa
             check_evidence=checks)))
         try:
             barrier.wait()
-            outcome["admitted"] = store.reserve(ReservationIntent(
+            outcome["admitted"] = store.reserve_legacy(LegacyReservationIntent(
                 "race", None, 1, 10, "daemon", 5, None, cell.digest)) is not None
         except SafetyRefused:
             outcome["admitted"] = False
