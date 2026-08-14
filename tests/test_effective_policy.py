@@ -213,6 +213,29 @@ def test_each_native_failure_path_maps_to_the_closed_vocabulary():
     assert _resolver().brief_for(REPOSITORY, "unknown", REVISION).hold_code == "invalid_briefing"
 
 
+def test_overlay_exception_precedes_missing_receipt_at_the_public_interface():
+    source = OverlaySource(error=RuntimeError("provider transcript secret"))
+    reader = ReceiptReader(())
+    result = EffectivePolicyResolver(
+        promotion_receipts=reader, overlay_source=source).brief_for(
+            REPOSITORY, "review", REVISION)
+    assert isinstance(result, HoldBriefing)
+    assert result.value() == {
+        "briefing_digest": result.briefing_digest,
+        "briefing_id": result.briefing_id,
+        "hold_code": "invalid_overlay",
+        "references": [],
+        "repository": REPOSITORY,
+        "schema": "briefing-v1",
+        "stage": "review",
+        "status": "hold",
+        "subject_revision": REVISION,
+    }
+    _assert_self_digest(result)
+    assert source.calls == [(REPOSITORY, REVISION)]
+    assert reader.calls == []
+
+
 @pytest.mark.parametrize("stage", [
     "", "unknown", "Review", None, True, 1, object(), ExplodingStr("review"),
 ])
@@ -289,7 +312,7 @@ def test_no_valid_promoted_receipt_means_no_ready_result_or_capabilities():
     assert result.hold_code == "missing_receipt"
     assert "capabilities" not in result.value()
     assert reader.calls == [PINNED_EVALUATION_POLICY.receipts[0].receipt_id]
-    assert source.calls == []
+    assert source.calls == [(REPOSITORY, REVISION)]
 
 
 def test_overlay_receipt_removal_restricts_output_only_after_authority_is_validated():
@@ -522,7 +545,7 @@ def _direct_ready(policy):
         policy.policy_version, policy.receipts, policy.capabilities, applicability)
 
 
-def test_briefing_schema_accepts_exact_16384_and_rejects_16385():
+def test_ready_briefing_validator_accepts_exact_16384_and_rejects_16385():
     exact_policy = _sized_policy(16384)
     exact = _direct_ready(exact_policy)
     assert isinstance(exact, ReadyBriefing)
@@ -530,6 +553,28 @@ def test_briefing_schema_accepts_exact_16384_and_rejects_16385():
     over_policy = _sized_policy(16385)
     with pytest.raises(PolicyValidationError, match="briefing overflow"):
         _direct_ready(over_policy)
+
+
+def test_brief_for_accepts_exact_16384_and_returns_overflow_at_16385(monkeypatch):
+    exact_policy = _sized_policy(16384)
+    monkeypatch.setattr(effective_policy, "_PINNED_EVALUATION_POLICY", exact_policy)
+    exact = EffectivePolicyResolver(
+        promotion_receipts=ReceiptReader(tuple(_actual(item) for item in exact_policy.receipts)),
+        overlay_source=OverlaySource(),
+    ).brief_for(REPOSITORY, "review", REVISION)
+    assert isinstance(exact, ReadyBriefing)
+    assert len(exact.canonical_bytes()) == 16384
+
+    over_policy = _sized_policy(16385)
+    monkeypatch.setattr(effective_policy, "_PINNED_EVALUATION_POLICY", over_policy)
+    over = EffectivePolicyResolver(
+        promotion_receipts=ReceiptReader(tuple(_actual(item) for item in over_policy.receipts)),
+        overlay_source=OverlaySource(),
+    ).brief_for(REPOSITORY, "review", REVISION)
+    assert isinstance(over, HoldBriefing)
+    assert over.hold_code == "briefing_overflow"
+    assert "capabilities" not in over.value()
+    _assert_self_digest(over)
 
 
 def test_authority_pointer_approval_scope_and_cross_repository_are_exactly_bound():

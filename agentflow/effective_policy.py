@@ -744,6 +744,29 @@ class EffectivePolicyResolver:
             return _hold(repository, safe_stage, safe_revision, "invalid_briefing")
 
         policy = _PINNED_EVALUATION_POLICY
+        try:
+            overlay = self._overlay_source.read(repository, safe_revision)
+        except Exception:
+            return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
+        if overlay is not None:
+            try:
+                if not isinstance(overlay, OverlayV1):
+                    raise PolicyValidationError("invalid overlay type")
+                overlay.validate()
+                if (overlay.repository != repository
+                        or overlay.policy_version != policy.policy_version):
+                    raise PolicyValidationError("overlay authority mismatch")
+                folded = self._apply_overlay(policy, overlay)
+                if folded is None:
+                    raise PolicyValidationError("invalid overlay restriction")
+            except Exception:
+                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
+            receipts, capabilities = folded
+            not_applicable = safe_stage in overlay.not_applicable_stages
+        else:
+            receipts, capabilities = policy.receipts, policy.capabilities
+            not_applicable = False
+
         resolved_by_id: dict[str, BriefingReceipt] = {}
         for expected in policy.receipts:
             try:
@@ -766,33 +789,10 @@ class EffectivePolicyResolver:
                              (expected.receipt_id,))
             resolved_by_id[candidate.receipt_id] = candidate
 
-        try:
-            overlay = self._overlay_source.read(repository, safe_revision)
-        except Exception:
-            return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
         if overlay is not None:
-            try:
-                if not isinstance(overlay, OverlayV1):
-                    raise PolicyValidationError("invalid overlay type")
-                overlay.validate()
-            except Exception:
-                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
-            if (overlay.repository != repository or overlay.policy_version != policy.policy_version):
-                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
-            try:
-                folded = self._apply_overlay(policy, overlay)
-            except Exception:
-                folded = None
-            if folded is None:
-                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
-            receipts, capabilities = folded
             if overlay.holds:
                 return _hold(repository, safe_stage, safe_revision, overlay.holds[0],
                              (overlay.overlay_digest,))
-            not_applicable = safe_stage in overlay.not_applicable_stages
-        else:
-            receipts, capabilities = policy.receipts, policy.capabilities
-            not_applicable = False
 
         if not_applicable or safe_stage not in policy.applicable_stages:
             value: dict[str, object] = {
