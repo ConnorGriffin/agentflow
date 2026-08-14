@@ -50,12 +50,33 @@ from agentflow.evidence import ApprovedAuthority, AuthorityPointer, EvidenceErro
 from agentflow.operational_safety import (
     CanaryActivationRequest,
     CanaryState,
+    LaunchConfigV1,
     OperationalSafety,
     SafetyRefused,
 )
 
 
 IDENTITY = "octo/app|641|build|-"
+PRIMARY_ROUTE_ID = "production/build/deep/default"
+MIGRATION_ROUTE_ID = "production/build/standard/default"
+
+
+def launch_config(effort: str, *, stage_profile_id="build/deep/default") -> LaunchConfigV1:
+    return LaunchConfigV1(
+        schema="agentflow-launch-v1",
+        provider="codex",
+        internal_model="gpt-5",
+        cli_model="gpt-5",
+        stage_profile_id=stage_profile_id,
+        reasoning_effort=effort,
+        turn_ceiling=64,
+        wall_ceiling_s=900,
+        build_lease=(8, 12, 20),
+        allowed_tools=None,
+        sandbox_policy="workspace-write",
+        result_schema_json=None,
+        result_schema_digest=None,
+    )
 
 
 class Receipts:
@@ -99,13 +120,13 @@ def seed(path, receipts: Receipts, *, with_receipt=True,
     store = Store(path)
     safety = OperationalSafety(store, promotion_receipts=receipts)
     predecessor = safety.register_route_cell(
-        "octo/app", "build", "codex", "gpt-5", "primary",
-        {"model": "gpt-5", "effort": "medium", "timeout": 900})
+        "octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID,
+        launch_config("medium"))
     active = predecessor
     if with_receipt:
         active = safety.register_route_cell(
-            "octo/app", "build", "codex", "gpt-5", "primary",
-            {"model": "gpt-5", "effort": "high", "timeout": 900})
+            "octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID,
+            launch_config("high"))
         request = CanaryActivationRequest(receipt_id, active.digest, predecessor.digest, 0)
         receipts.issue(request, receipt_id=receipt_id)
         safety.approve_canary(request)
@@ -147,8 +168,8 @@ def make_v2(path, *, record=None):
     holder._lock = threading.RLock()
     safety = OperationalSafety(holder)
     cell = safety.register_route_cell(
-        "octo/app", "build", "codex", "gpt-5", "migration",
-        {"model": "gpt-5", "effort": "high", "timeout": 900})
+        "octo/app", "build", "codex", "gpt-5", MIGRATION_ROUTE_ID,
+        launch_config("high", stage_profile_id="build/standard/default"))
     assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
     conn.close()
     return tuple(records), cell
@@ -209,7 +230,7 @@ def test_store_modes_are_exact_frozen_values_and_unconfigured_delegation_refuses
         sources.check_evidence = object()
     store = Store(tmp_path / "none.db")
     with pytest.raises(StoreUnavailable, match="route resolution is not configured"):
-        store.resolve_route_cell(IDENTITY, 1, "primary")
+        store.resolve_route_cell(IDENTITY, 1, PRIMARY_ROUTE_ID)
     with pytest.raises(StoreUnavailable, match="canary attribution is not configured"):
         store.read_canary_attribution(IDENTITY)
     store.close()
@@ -709,7 +730,7 @@ def test_same_owned_instances_handle_admission_resolution_and_read(tmp_path, mon
     monkeypatch.setattr(CanaryAttributionAuthority, "_participate_in_admission", remember_canary_admit)
     monkeypatch.setattr(CanaryAttributionAuthority, "_read", remember_canary_read)
     store = composed(path, receipts)
-    store.resolve_route_cell(IDENTITY, 1, "primary")
+    store.resolve_route_cell(IDENTITY, 1, PRIMARY_ROUTE_ID)
     assert store.reserve(intent(digest=active.digest)) is not None
     store.read_canary_attribution(IDENTITY)
     assert seen["safety_admit"] == seen["safety_resolve"]
