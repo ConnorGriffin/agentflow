@@ -937,9 +937,12 @@ def _check_bundle(root_fd):
         if MODULE_PATH in contents else None
     )
     digests = {path: sha256(data).hexdigest() for path, data in contents.items()}
-    for path in ARTIFACT_PATHS:
-        if path in digests and digests[path] != WHOLE_FILE_SHA256[path]:
-            failures.append(CheckFailure("E_DIGEST", path))
+    whole_digest_paths = tuple(
+        path for path in ARTIFACT_PATHS
+        if path in digests and digests[path] != WHOLE_FILE_SHA256[path]
+    )
+    for path in whole_digest_paths:
+        failures.append(CheckFailure("E_DIGEST", path))
 
     whole_files_match = (
         set(digests) == set(ARTIFACT_PATHS)
@@ -966,7 +969,11 @@ def _check_bundle(root_fd):
         path_order = {path: index for index, path in enumerate((*ARTIFACT_PATHS, SCRIPT_PATH))}
         failure = min(
             failures,
-            key=lambda error: (code_order[error.code], path_order.get(error.path, len(path_order))),
+            key=lambda error: (
+                code_order[error.code],
+                error.code != "E_DIGEST" or error.path not in whole_digest_paths,
+                path_order.get(error.path, len(path_order)),
+            ),
         )
         raise failure
 
