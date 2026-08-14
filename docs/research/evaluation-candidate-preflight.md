@@ -5,9 +5,11 @@ It creates no Evaluation artifact, fixture, code, CI change, or GitHub state.
 
 ## Authority and extraction boundary
 
-The only product authority is [#583](https://github.com/ConnorGriffin/agentflow/issues/583)
-and [ADR 605](../adr/adr-605-canonical-evaluation-rulebook.md) plus
+The product authority is [#583](https://github.com/ConnorGriffin/agentflow/issues/583),
+[ADR 605](../adr/adr-605-canonical-evaluation-rulebook.md), and
 [ADR 606](../adr/adr-606-explicit-missing-metrics-and-adjudication-lineage.md).
+[ADR 620](../adr/adr-620-evaluation-failure-classes.md) is the separately pinned,
+narrow closure of the six-class vocabulary; it adds no other product authority.
 Their requirements below are located and summarized, not copied into a second semantic
 rulebook. Existing code and tests establish mechanical implementation choices only.
 Comments, prior payloads, and this report are provenance, never product authority.
@@ -18,13 +20,16 @@ The extractor is bound to this immutable source set. The #583 source bytes are t
 UTF-8 issue-body string returned by GitHub followed by exactly one `LF` byte (`0x0a`),
 with SHA-256
 `cdbaa62e34b3943fbbd2f3f63edf0b0cf17b00e3632983f8ab31506b89238c9d`.
-The ADR source bytes are their complete repository files at source revision
-`f5580b55cf373a7e9de47d99e617b08256b7647d`:
+The ADR 605 and ADR 606 source bytes are their complete repository files at source
+revision `f5580b55cf373a7e9de47d99e617b08256b7647d`. ADR 620 source bytes are its
+complete repository file at immutable merge
+`3cd31b7d5528a6bb5bb322334a32a25ac13991b5`:
 
 | Source | Whole-file SHA-256 |
 | --- | --- |
 | `docs/adr/adr-605-canonical-evaluation-rulebook.md` | `6977d6e1ce0bf5ebcaaff4fb2f47112dd59208705fd739ab394aa26bc589e70f` |
 | `docs/adr/adr-606-explicit-missing-metrics-and-adjudication-lineage.md` | `4bde5dd87bcf4002de60c5a7a07f366fdea274e628dd24604ce5fd2495e4967b` |
+| `docs/adr/adr-620-evaluation-failure-classes.md` | `7aed248b63d8035364114a28eb184c0aa839b55c627f5de3d9d17e1af1b1cb9a` |
 
 Before extracting or accepting a candidate, run these exact rechecks from the
 repository root. Any command failure, a different revision, or a different digest is
@@ -33,9 +38,11 @@ repository root. Any command failure, a different revision, or a different diges
 ```text
 source_revision=f5580b55cf373a7e9de47d99e617b08256b7647d
 test "$(git rev-parse "$source_revision^{commit}")" = "$source_revision"
+test "$(git rev-parse "3cd31b7d5528a6bb5bb322334a32a25ac13991b5^{commit}")" = 3cd31b7d5528a6bb5bb322334a32a25ac13991b5
 test "$(gh api repos/ConnorGriffin/agentflow/issues/583 --jq .body | shasum -a 256 | awk '{print $1}')" = cdbaa62e34b3943fbbd2f3f63edf0b0cf17b00e3632983f8ab31506b89238c9d
 test "$(git show "$source_revision:docs/adr/adr-605-canonical-evaluation-rulebook.md" | shasum -a 256 | awk '{print $1}')" = 6977d6e1ce0bf5ebcaaff4fb2f47112dd59208705fd739ab394aa26bc589e70f
 test "$(git show "$source_revision:docs/adr/adr-606-explicit-missing-metrics-and-adjudication-lineage.md" | shasum -a 256 | awk '{print $1}')" = 4bde5dd87bcf4002de60c5a7a07f366fdea274e628dd24604ce5fd2495e4967b
+test "$(git show "3cd31b7d5528a6bb5bb322334a32a25ac13991b5:docs/adr/adr-620-evaluation-failure-classes.md" | shasum -a 256 | awk '{print $1}')" = 7aed248b63d8035364114a28eb184c0aa839b55c627f5de3d9d17e1af1b1cb9a
 ```
 
 `gh api ... --jq .body` supplies the body stream and its single terminating LF for
@@ -44,8 +51,9 @@ metadata, or a body with an additional trailing byte as a substitute source.
 
 ### Closed source-locator grammar
 
-The extractor accepts exactly the following locators; any other heading, paragraph,
-list item, or revision is an `E_SOURCE_LOCATOR` error.
+The extractor accepts exactly the following locators; any other heading, paragraph, or
+list item is an `E_SOURCE_LOCATOR` error. A source revision or whole-file-byte change
+is `E_SOURCE_DRIFT`.
 
 ```text
 locator       = issue-locator / adr-locator
@@ -58,9 +66,14 @@ eligibility-gate = "issue/583/eligibility-gates/n" ("1" / "2" / "3" / "4" / "5")
 acceptance    = "issue/583/acceptance/a" ("1" / "2" / "3" / "4" / "5" / "6" / "7" /
                 "8" / "9" / "10" / "11" / "12" / "13" / "14")
 out-of-scope  = "issue/583/out-of-scope/o" ("1" / "2" / "3" / "4" / "5")
-adr-locator   = "adr/605/decision/p" decision-605 / "adr/606/decision/p" decision-606
+adr-locator   = "adr/605/decision/p" decision-605 / "adr/606/decision/p" decision-606 /
+                adr-620-locator
 decision-605  = "1" / "2" / "3"
 decision-606  = "1" / "2" / "3" / "4" / "5"
+adr-620-locator = "adr/620/decision/intro/p1" /
+                  "adr/620/decision/class/r" ("1" / "2" / "3" / "4" / "5" / "6") /
+                  "adr/620/decision/orthogonality/p1" /
+                  "adr/620/decision/governance/p1"
 ```
 
 Under Outcome, `p1` is its sole prose sentence; under Scope, `p1` and `p2` are
@@ -69,6 +82,15 @@ acceptance bullets, and `o` out-of-scope bullets. `adr/605/decision/p1` through
 `p3` are the three sentences in that Decision paragraph; `adr/606/decision/p1`
 through `p5` are its five sentences. It parses only the source set bound above; it
 must reject source drift rather than silently reread a changed source.
+
+For ADR 620, `intro/p1` is the Decision sentence introducing the exact six values;
+`class/r1` through `r6` are the six Decision table rows in source order;
+`orthogonality/p1` is the full paragraph beginning `validation_state`; and
+`governance/p1` is the full paragraph beginning `The six identifiers`. These nine
+locators are closed: a changed heading, row, paragraph, table order, or source revision
+is `E_SOURCE_LOCATOR` (or `E_SOURCE_DRIFT` for bytes/revision), never an invitation to
+infer a replacement meaning. They are the ADR 620 closure and extend the pinned
+extraction universe from the 41 #583/ADR 605/ADR 606 locators to 50 locators.
 
 ### Deterministic extraction
 
@@ -85,7 +107,7 @@ owner          = canonical-contract | checker | fixture-author | runner | produc
 
 The ID is stable even if the selected text changes; the captured source digest makes
 such a change visible. Extraction preserves source order. The result is valid only
-when its ID list exactly equals the grammar's 41 locators, with no duplicate ID or
+when its ID list exactly equals the grammar's 50 locators, with no duplicate ID or
 source locator. A duplicate source item or a second record for one locator is
 `E_REQUIREMENT_DUPLICATE`; a missing locator is `E_REQUIREMENT_MISSING`. A source
 item that genuinely applies in more than one place remains one record with a
@@ -141,10 +163,20 @@ choice” is an executable implementation default below, not a new Evaluation ru
 | `eval-v1:adr/606/decision/p3` | settled / canonical-contract | A reported result may name only its null optional metrics in lexicographic order: `provider_dollars_micros`, `quality_micros`, `review_rounds`, and `tokens`; its other three metrics are required. |
 | `eval-v1:adr/606/decision/p4` | settled / checker | An adjudication is valid only when its case ID, exact case-manifest digest, and answer-key digest match the answer-key reference reached through the canonical validated case record. |
 | `eval-v1:adr/606/decision/p5` | settled / checker | The adjudication digest is the canonical digest of the receipt with its own digest field omitted. |
+| `eval-v1:adr/620/decision/intro/p1` | settled / canonical-contract | Evaluation v1 uses exactly the six failure-class identifiers in ADR 620. |
+| `eval-v1:adr/620/decision/class/r1` | settled / canonical-contract | `original_defect` is an artifact violation of a product, acceptance, security, or charter requirement before review. |
+| `eval-v1:adr/620/decision/class/r2` | settled / canonical-contract | `plan_gap` is a plan or acceptance criteria omission, contradiction, or failure to operationalize required behavior. |
+| `eval-v1:adr/620/decision/class/r3` | settled / canonical-contract | `slice_scope_error` is a wrong decomposition, ownership, or implementation boundary. |
+| `eval-v1:adr/620/decision/class/r4` | settled / canonical-contract | `reviewer_false_claim` is a reviewer assertion disproved by source, tests, or reproduction. |
+| `eval-v1:adr/620/decision/class/r5` | settled / canonical-contract | `speculative_preference` lacks product, acceptance, or charter grounding, or targets an unreachable non-trust-boundary state. |
+| `eval-v1:adr/620/decision/class/r6` | settled / canonical-contract | `fix_introduced_defect` was absent at the reviewed head and appeared in a later reviewer/reviser change. |
+| `eval-v1:adr/620/decision/orthogonality/p1` | settled / canonical-contract | `validation_state`, review action, and severity are independent of failure class and cannot select, alias, change, or imply it. |
+| `eval-v1:adr/620/decision/governance/p1` | settled / canonical-contract | The six identifiers are complete; aliases and merging are rejected, and classification cannot automatically mutate policy. |
 
-The grammar and table contain exactly 41 source locators: one Outcome sentence, two
+The grammar and table contain exactly 50 source locators: one Outcome sentence, two
 Scope sentences, six Versioned-contract bullets, five eligibility gates, fourteen
-acceptance bullets, five out-of-scope bullets, and eight ADR Decision sentences. An
+acceptance bullets, five out-of-scope bullets, eight ADR 605/606 Decision sentences,
+and nine ADR 620 Decision locators. An
 extractor seeing `a15` must fail `E_SOURCE_LOCATOR`; this prevents an invented
 acceptance item.
 
@@ -173,14 +205,21 @@ threshold, failure class, or authority boundary settled above.
    is reused for input bytes, expected bytes, and digest preimages; parsed-and-
    reserialized input must byte-equal its original bytes.
 4. Every SHA-256 value is exactly 64 lowercase hexadecimal characters
-   (`^[a-f0-9]{64}$`), without an algorithm prefix. The conformance report records
-   the whole-file SHA-256 of `contract-v1.candidate.json`. A record's own digest
-   instead covers its canonical digest-free projection: the same object with only
-   its top-level `digest` member removed. Reject a missing or non-string required
-   digest, nested members named `digest` that purport to identify their enclosing
-   object, or a mismatch. Bundle digests cover a separate digest-free bundle object
-   containing sorted `{path,digest}` entries. No digest includes itself, a mutable
-   ref, current time, absolute path, or process environment.
+   (`^[a-f0-9]{64}$`), without an algorithm prefix. A digest-bearing record's
+   preimage is its canonical top-level object with exactly its top-level `digest`
+   member omitted; no digest includes itself. Nested members named `digest` cannot
+   identify an enclosing object. Bundle digests cover a separate digest-member-omitted
+   bundle object containing sorted `{path,digest}` entries. Reject a missing
+   or non-string required digest, a prohibited nested self-identifier, or a mismatch.
+   No digest includes a mutable ref, current time, absolute path, or process environment.
+   Separately, the standalone checker's checked-in source owns two reviewed,
+   immutable 64-lowercase-hex literal constants: one whole-file SHA-256 lock for
+   `contract-v1.candidate.json` and one for `contract-v1.conformance.json`. Neither
+   literal is supplied by a candidate, conformance report, environment, configuration,
+   or test fixture. The checker checks those exact file bytes before accepting their
+   in-file bindings, so a
+   coordinated mutation that recomputes a record, bundle, source, or report binding
+   still fails `E_DIGEST` unless the independently reviewed checker lock changes.
 5. Stable IDs are ASCII `^[a-z][a-z0-9-]{0,47}$`, unique within their declared
    collection. Declared case IDs are source-controlled, never generated from a
    mutable title. Generated test IDs are `g-` plus the first 24 lowercase hex
@@ -225,21 +264,27 @@ with no-follow semantics and accepts only regular files.
 | Limit | Exact default |
 | --- | ---: |
 | one JSON artifact | 1 MiB |
-| aggregate candidate input | 16 MiB |
 | JSON nesting | 32 containers |
 | object members / array entries | 256 each |
 | definitions | 64 |
 | references per schema | 64 |
 | path depth | 12 |
-| generated cases per declared generator | 256 |
+| generated cases per generation object | 256 |
 | generated case bytes | 64 KiB each |
-| generated corpus bytes | 8 MiB |
-| checker stdout or stderr | 4 KiB each |
+| generated corpus bytes | 8 MiB (output invariant) |
+| checker stdout or stderr | 4 KiB each (output invariant) |
+
+Every limit other than the two marked output invariants is an independently reachable
+input bound: the checker fixtures include one exact-limit accepted input and one
+limit-plus-one rejected input for each. The generated-corpus and output-stream caps are
+postcondition invariants, not aggregate input limits and not manufactured exact/plus-one
+inputs. In particular, no 16 MiB aggregate candidate-input bound exists.
 
 ### Generated-case byte mapping
 
-The candidate may declare one bounded generic `generation` object, with this exact
-shape. It contains no Evaluation rule, label, metric, threshold, or expected result.
+Every candidate contains exactly one nonempty bounded generic `generation` object with
+this exact shape. It contains no Evaluation rule, label, metric, threshold, or expected
+result.
 
 ```text
 generation = {"generator":"evaluation-v1-casegen", "seed": uint64, "templates": [template, ...]}
@@ -284,17 +329,25 @@ matching closing brace, not a brace inside a string or nested value. The inserti
 therefore always one additional direct occurrence of the named member. A raw result is
 allowed to be invalid JSON: it is a generic rejection input, not a canonical semantic
 case. JSON-operation payload bytes are canonical JSON; raw-operation payload bytes are
-the exact specified byte mutation. If a generated-case record is emitted or persisted,
-it is canonical ASCII JSON containing the generated ID and the payload as lowercase
+the exact specified byte mutation. Each in-memory generated-case replay record is
+canonical ASCII JSON containing the generated ID and the payload as lowercase
 two-hex-digit-per-byte `input_bytes_hex`; this record serialization, not an intentionally
 malformed raw payload, is what “emits canonical bytes” means.
 
 Validate templates in sorted order: exact shape and canonical operand, base-case
 resolution, target syntax/range, operation preconditions, generated-ID collision, then
-per-case and aggregate size limits. Respectively fail `E_GENERATOR_TEMPLATE`,
+per-case limits and the cumulative output invariant. Respectively fail `E_GENERATOR_TEMPLATE`,
 `E_GENERATOR_TARGET`, `E_GENERATOR_PRECONDITION`, `E_GENERATOR_COLLISION`, or
 `E_GENERATOR_LIMIT`; a later template is never considered after the first failure.
 No system RNG, clock, filesystem enumeration, provider, or network input is permitted.
+During validation the checker always reconstructs every generated record from the 1..256
+templates in ascending bytewise template-ID order as canonical ASCII JSON lines with
+exactly one trailing `LF` per record. The stream digest is SHA-256 over the concatenated
+record bytes and is the required top-level 64-lowercase-hex
+`generated_stream_sha256` member of every candidate. The checker deterministically
+replays that stream, compares the binding, and performs no writes, temporary-file
+creation, or persistence. A digest mismatch is `E_DIGEST`; a replay over an output
+invariant is `E_GENERATOR_LIMIT`.
 Generated cases exercise only generic bytes, parser, reference, and bound mechanics;
 they cannot replace the required frozen corpus, independent holdouts, six failure-class
 coverage, or planted review-round scenario.
@@ -307,9 +360,9 @@ The zero-argument public checker is exactly:
 uv run python scripts/check-evaluation-contract-candidate.py
 ```
 
-It is a standalone stdlib script: it imports no `agentflow.*` module, finds the
+It is a standalone stdlib script: it imports no `agentflow.*` module and finds the
 repository root from its own checked-in `scripts/` location rather than the current
-directory, and opens only these two Evaluation candidate data files:
+directory.
 
 ```text
 docs/evaluation/design/contract-v1.candidate.json
@@ -320,32 +373,65 @@ Runtime modules and runtime artifacts are #614 work and are deliberately outside
 this checker interface.
 
 It validates the two files in lexicographic path order and stops at the first failing
-artifact: `E_ROOT`, `E_IO`, `E_LIMIT`, `E_UTF8`, `E_JSON`,
-`E_DUPLICATE_KEY`, `E_CANONICAL`, `E_SCHEMA`, `E_REF`, `E_REF_CYCLE`,
-`E_REF_UNUSED`, `E_PATH`, `E_DIGEST`, `E_ID`, `E_CROSS_REFERENCE`, `E_LINEAGE`,
-`E_ORACLE`, `E_GENERATOR_TEMPLATE`, `E_GENERATOR_TARGET`,
-`E_GENERATOR_PRECONDITION`, `E_GENERATOR_COLLISION`, `E_GENERATOR_LIMIT`,
-`E_SEMANTIC`. Within one artifact, the first rule in that order wins; within a
-collection, sort IDs/paths bytewise. It validates the
+artifact. This is the one closed total order for its 28 public codes: 27 validation
+codes followed by `E_INTERNAL`:
+
+```text
+E_ROOT < E_SOURCE_DRIFT < E_SOURCE_LOCATOR < E_REQUIREMENT_DUPLICATE <
+E_REQUIREMENT_MISSING < E_IO < E_LIMIT < E_UTF8 < E_JSON < E_DUPLICATE_KEY <
+E_CANONICAL < E_SCHEMA < E_REF < E_REF_CYCLE < E_REF_UNUSED < E_PATH < E_DIGEST <
+E_ID < E_CROSS_REFERENCE < E_LINEAGE < E_ORACLE < E_GENERATOR_TEMPLATE <
+E_GENERATOR_TARGET < E_GENERATOR_PRECONDITION < E_GENERATOR_COLLISION <
+E_GENERATOR_LIMIT < E_SEMANTIC < E_INTERNAL
+```
+
+Within one artifact, the first applicable code in that order wins; within a collection,
+IDs and paths sort bytewise. `E_INTERNAL` is reachable only for an unexpected checker
+fault after its guarded validation path, is last in the registry, and never exposes a
+traceback. It validates the
 candidate's declared semantic rules, mappings, cases, and bounds as data, then applies
 an independent mechanical interpreter to every declared case; it never uses an
 expected result as a rule source.
 
-On success stdout is precisely one canonical ASCII JSON line and stderr is empty:
+The exact output bytes, streams, paths, and exits are closed. On success stdout is
+exactly the following ASCII bytes and stderr is empty (`b""`); exit is `0`:
 
 ```json
 {"checked":2,"format":"evaluation-contract-candidate-check-v1","status":"ok"}
 ```
 
-On failure stdout is empty; stderr is precisely one canonical JSON line containing
-only `code`, `format`, `path`, and `status`, e.g.
+The success byte sequence is
+`b'{"checked":2,"format":"evaluation-contract-candidate-check-v1","status":"ok"}\x0a'`.
+For a validation failure other than `E_ROOT` or `E_INTERNAL`, stdout is empty (`b""`);
+stderr is exactly `canonical_json({"code":CODE,"format":"evaluation-contract-candidate-check-v1","path":PATH,"status":"error"}) + b"\x0a"`;
+exit is `1`. `PATH` is exactly
+`docs/evaluation/design/contract-v1.candidate.json` for a candidate-artifact error or
+`docs/evaluation/design/contract-v1.conformance.json` for a conformance-artifact error;
+this includes `E_SOURCE_DRIFT`, `E_SOURCE_LOCATOR`, `E_REQUIREMENT_DUPLICATE`, and
+`E_REQUIREMENT_MISSING` when the malformed binding or inventory is in that artifact.
+For `E_ROOT`, stdout is empty and stderr is exactly
+`b'{"code":"E_ROOT","format":"evaluation-contract-candidate-check-v1","path":"scripts/check-evaluation-contract-candidate.py","status":"error"}\x0a'`;
+exit is `1`. For `E_INTERNAL`, stdout is empty and stderr is exactly
+`b'{"code":"E_INTERNAL","format":"evaluation-contract-candidate-check-v1","path":"scripts/check-evaluation-contract-candidate.py","status":"error"}\x0a'`;
+exit is `2`. No other bytes, diagnostics, paths, or streams are permitted. An
+ordinary artifact-error line therefore has this exact shape, for example:
 
 ```json
 {"code":"E_DIGEST","format":"evaluation-contract-candidate-check-v1","path":"docs/evaluation/design/contract-v1.candidate.json","status":"error"}
 ```
 
-It exits `0` for success, `1` for a validation failure, and `2` only for an
-internal checker fault. It neither repairs nor writes a candidate file.
+It neither repairs nor writes a candidate file.
+
+The required #617 checker-fixture suite assigns exactly one isolated checker-fixture owner
+to each registry code, named `error-` plus the lowercase code with `_` changed to `-`.
+Each fixture has one intended failing condition and asserts its code, exact stream bytes,
+path, and exit. `error-e-internal` uses a test-only controlled internal-fault seam after
+the guarded validation path; it asserts the public `E_INTERNAL` bytes and exit without
+exposing a traceback. The suite also maintains an explicit reachability matrix and a
+two-fault fixture for every jointly reachable unordered pair of error codes; each asserts
+the earlier code in the closed total order. The matrix documents why any omitted pair is
+mutually unreachable under the checker interface; it may not fabricate impossible faults.
+This ownership and pair matrix is mechanical test evidence, not Evaluation fixture semantics.
 
 ## Independent case oracle
 
@@ -366,9 +452,7 @@ lineage join; a candidate cannot change a case, its answer key, and its expected
 into a self-consistent but unbound fiction.
 
 The conformance report maps each applicable authoritative requirement to exactly one
-candidate rule ID and at least one declared positive or negative case ID. It records
-the candidate's whole-file SHA-256, so mutating a semantic field, case expectation, or
-mapping without changing the reviewed report fails before comparison. The required
+candidate rule ID and at least one declared positive or negative case ID. The required
 swapped critical-miss, equality-threshold, bootstrap-replay, partial-token, and
 partial-round cases remain candidate data; the checker verifies their structure and
 independently interprets their declared mechanics. Checker tests protect that generic
@@ -405,15 +489,14 @@ for this preflight commit.
 
 ## Product decision closure
 
-At this report's pinned source revision, #583 required six failure classes but did
-not name them, so the preflight correctly left that product choice unresolved.
+At the pinned #583/ADR 605/ADR 606 source revision, #583 required six failure classes
+but did not name them, so the preflight correctly left that product choice unresolved.
 [ADR 620](../adr/adr-620-evaluation-failure-classes.md) now closes it from the
 validated #573 taxonomy: `original_defect`, `plan_gap`, `slice_scope_error`,
 `reviewer_false_claim`, `speculative_preference`, and `fix_introduced_defect`.
-The #617 candidate conformance report must import ADR 620 as an additional
-normative source and map those exact identifiers and meanings before claiming
-zero unresolved dispositions. This later closure does not rewrite the pinned
-41-item source inventory above.
+The #617 candidate conformance report must map the nine pinned ADR 620 locators,
+including those exact identifiers and meanings, before claiming zero unresolved
+dispositions. This closure extends the source inventory to its pinned 50 locators.
 
 All absent field shapes, artifacts, bindings, and computations fail closed. Any later
 request to add a metric, threshold, case class, or promotion behavior requires a new
