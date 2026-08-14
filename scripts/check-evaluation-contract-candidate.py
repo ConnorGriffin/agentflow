@@ -477,6 +477,14 @@ def _validate_candidate(candidate, module_digest):
     _validate_schema(candidate["schema_catalog"], CANDIDATE_PATH, enforce_reference_limit=False)
     for name in sorted(schemas):
         _validate_schema(schemas[name], CANDIDATE_PATH)
+    for row in candidate["artifact_registry"]:
+        if not isinstance(row, dict) or "path" not in row or "permitted_root" not in row:
+            _fail("E_SCHEMA", CANDIDATE_PATH)
+        _validate_path(row["path"], CANDIDATE_PATH)
+        _validate_path(row["permitted_root"], CANDIDATE_PATH)
+    for row in candidate["source_bindings"]:
+        if "path" in row:
+            _validate_path(row["path"], CANDIDATE_PATH)
     rules = candidate["rules"]
     rule_ids = [row.get("rule_id") for row in rules if isinstance(row, dict)]
     if len(rule_ids) != len(rules) or len(rule_ids) != len(set(rule_ids)) or not all(_valid_id(item) for item in rule_ids):
@@ -492,15 +500,8 @@ def _validate_candidate(candidate, module_digest):
         if not {row["input_schema"], row["success_schema"], row["error_schema"]} <= set(schemas):
             _fail("E_CROSS_REFERENCE", CANDIDATE_PATH)
     for row in candidate["artifact_registry"]:
-        if not isinstance(row, dict) or "path" not in row or "permitted_root" not in row:
-            _fail("E_SCHEMA", CANDIDATE_PATH)
-        _validate_path(row["path"], CANDIDATE_PATH)
-        _validate_path(row["permitted_root"], CANDIDATE_PATH)
         if "payload_schema" in row and row["payload_schema"] not in candidate["schema_catalog"]["definitions"]:
             _fail("E_CROSS_REFERENCE", CANDIDATE_PATH)
-    for row in candidate["source_bindings"]:
-        if "path" in row:
-            _validate_path(row["path"], CANDIDATE_PATH)
     if candidate["digest"] != _digest_record(candidate):
         _fail("E_DIGEST", CANDIDATE_PATH)
     _validate_generation(candidate)
@@ -654,7 +655,7 @@ def _validate_generation(candidate):
         _fail("E_DIGEST", CANDIDATE_PATH)
 
 
-def _validate_report(report, candidate, candidate_digest, module_digest, evaluate):
+def _validate_report(report, candidate, candidate_digest, module_digest, evaluate, dispatch_vectors=True):
     _require_keys(report, {"artifact_bindings", "contract_digest", "declarative_cases", "digest", "format", "requirement_coverage", "semantic_cases", "source_binding_sha256", "unresolved"}, REPORT_PATH)
     if report["format"] != "evaluation-contract-conformance-v1" or report["unresolved"] != []:
         _fail("E_SCHEMA", REPORT_PATH)
@@ -715,6 +716,10 @@ def _validate_report(report, candidate, candidate_digest, module_digest, evaluat
             _validate_positive_lineage(case["input_value"])
     if isolated_negative_codes != rejection_codes:
         _fail("E_ORACLE", REPORT_PATH)
+    if report["digest"] != _digest_record(report):
+        _fail("E_DIGEST", REPORT_PATH)
+    if not dispatch_vectors:
+        return
     for case in semantic:
         operation_id = case["operation_id"]
         contract = contracts.get(operation_id)
@@ -735,8 +740,6 @@ def _validate_report(report, candidate, candidate_digest, module_digest, evaluat
             _fail("E_SEMANTIC", MODULE_PATH)
         if _canonical(actual) != _canonical(expected):
             _fail("E_SEMANTIC", MODULE_PATH)
-    if report["digest"] != _digest_record(report):
-        _fail("E_DIGEST", REPORT_PATH)
 
 
 def _validate_positive_lineage(input_value):
@@ -938,12 +941,12 @@ def _check_bundle(root_fd):
         if path in digests and digests[path] != WHOLE_FILE_SHA256[path]:
             failures.append(CheckFailure("E_DIGEST", path))
 
-    module_binding = unavailable
-    module_lock_matches = (
-        MODULE_PATH in digests
-        and digests[MODULE_PATH] == WHOLE_FILE_SHA256[MODULE_PATH]
+    whole_files_match = (
+        set(digests) == set(ARTIFACT_PATHS)
+        and all(digests[path] == WHOLE_FILE_SHA256[path] for path in ARTIFACT_PATHS)
     )
-    if module_lock_matches and module_text is not unavailable and candidate is not unavailable:
+    module_binding = unavailable
+    if whole_files_match and module_text is not unavailable and candidate is not unavailable:
         module_binding = capture(_validate_module_binding, candidate, digests[MODULE_PATH])
 
     evaluate = unavailable
@@ -952,12 +955,11 @@ def _check_bundle(root_fd):
     if candidate is not unavailable and MODULE_PATH in digests:
         capture(_validate_candidate, candidate, digests[MODULE_PATH])
     if report is not unavailable and isinstance(candidate, dict):
-        def unavailable_evaluate(*_args):
-            raise ValueError("semantic module unavailable")
         capture(
             _validate_report, report, candidate,
             digests.get(CANDIDATE_PATH, ""), digests.get(MODULE_PATH, ""),
-            evaluate if evaluate is not unavailable else unavailable_evaluate,
+            evaluate if evaluate is not unavailable else None,
+            whole_files_match and evaluate is not unavailable,
         )
     if failures:
         code_order = {code: index for index, code in enumerate(ERROR_PRECEDENCE)}

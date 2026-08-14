@@ -39,13 +39,17 @@ PUBLIC_ERROR_CODES = (
 ERROR_PAIRS = tuple(combinations(PUBLIC_ERROR_CODES, 2))
 
 
-@pytest.fixture(scope="module")
-def checker():
-    spec = importlib.util.spec_from_file_location("evaluation_candidate_checker", SCRIPT)
+def _load_checker(script):
+    spec = importlib.util.spec_from_file_location("evaluation_candidate_checker", script)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(scope="module")
+def checker():
+    return _load_checker(SCRIPT)
 
 
 @pytest.fixture(scope="module")
@@ -847,28 +851,45 @@ def test_pair_reachability_table_is_exhaustive_and_executes_every_reachable_pair
     assert all(row["reason"] is None for row in PAIR_REACHABILITY.values())
 
 
-def _assert_module_audit_blocked(checker, monkeypatch, root):
+def _assert_module_execution_blocked(monkeypatch, root, expected_path):
+    copied_checker = _load_checker(root / "scripts/check-evaluation-contract-candidate.py")
     calls = []
+
+    def forbidden_audit(*_args):
+        calls.append("module audit")
+
+        def forbidden_evaluate(*_evaluate_args):
+            calls.append("vector execution")
+
+        return forbidden_evaluate
+
     monkeypatch.setattr(
-        checker, "_audit_and_load_module",
-        lambda *_args: calls.append("audit attempted"),
+        copied_checker, "_audit_and_load_module", forbidden_audit,
     )
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        with pytest.raises(checker.CheckFailure) as caught:
-            checker._check_bundle(root_fd)
+        with pytest.raises(copied_checker.CheckFailure) as caught:
+            copied_checker._check_bundle(root_fd)
     finally:
         os.close(root_fd)
-    assert (caught.value.code, caught.value.path) == ("E_DIGEST", STAGE_A[2])
+    assert (caught.value.code, caught.value.path) == ("E_DIGEST", expected_path)
     assert calls == []
 
 
-def test_stale_module_lock_blocks_ast_load(tmp_path, checker, bundle, monkeypatch):
+@pytest.mark.parametrize("relative", STAGE_A, ids=("candidate", "report", "module"))
+def test_stale_whole_file_lock_blocks_module_execution(
+        tmp_path, checker, bundle, monkeypatch, relative):
     state = _new_fault_bundle(tmp_path, checker, bundle)
-    _inject_fault(state, "E_DIGEST")
+    if relative == STAGE_A[0]:
+        state["candidate"]["authority_policy"]["scope_prefix"] += "fixture/"
+    elif relative == STAGE_A[1]:
+        state["report"]["requirement_coverage"][0]["reason"] += " Fixture."
+    else:
+        state["module"] += b"# stale whole-file lock\n"
+    state["stale"].add(relative)
     _bind_fault_bundle(state)
 
-    _assert_module_audit_blocked(checker, monkeypatch, state["root"])
+    _assert_module_execution_blocked(monkeypatch, state["root"], relative)
 
 
 def test_wrong_module_binding_blocks_ast_load(tmp_path, checker, bundle, monkeypatch):
@@ -884,9 +905,10 @@ def test_wrong_module_binding_blocks_ast_load(tmp_path, checker, bundle, monkeyp
     report["artifact_bindings"]["candidate_sha256"] = sha256(candidate_bytes).hexdigest()
     report["contract_digest"] = candidate["digest"]
     (root / STAGE_A[1]).write_bytes(_canonical_bytes(checker, _redigest(checker, report)))
+    shutil.copyfile(SCRIPT, root / "scripts/check-evaluation-contract-candidate.py")
     _refresh_fixture_locks(root)
 
-    _assert_module_audit_blocked(checker, monkeypatch, root)
+    _assert_module_execution_blocked(monkeypatch, root, STAGE_A[2])
 
 
 @pytest.mark.parametrize("relative", STAGE_A, ids=("candidate", "report", "module"))
@@ -932,6 +954,7 @@ def _bind_generation_stream(checker, candidate):
         payload = checker._generate_payload(bases[item["base_case_id"]], item)
         stream.extend((checker._canonical({"id": generated_id, "input_bytes_hex": payload.hex()}) + "\n").encode("ascii"))
     candidate["generated_stream_sha256"] = sha256(stream).hexdigest()
+    return len(stream)
 
 
 def test_generated_case_byte_limit_routes_through_generation_validation(checker, bundle):
@@ -947,6 +970,39 @@ def test_generated_case_byte_limit_routes_through_generation_validation(checker,
 
     plus_one = deepcopy(exact)
     plus_one["generation"]["templates"][0]["operand"] += "x"
+    with pytest.raises(checker.CheckFailure) as caught:
+        checker._validate_generation(plus_one)
+    assert caught.value.code == "E_GENERATOR_LIMIT"
+
+
+def _candidate_with_generated_corpus_size(checker, candidate, target, template_count):
+    sized = deepcopy(candidate)
+    payload_total, parity = divmod(target - 57 * template_count, 2)
+    assert parity == 0
+    payload_size, larger_count = divmod(payload_total, template_count)
+    assert 3 <= payload_size <= checker.LIMITS["generated_case_bytes"]
+    sized["generation"]["templates"] = [
+        {
+            "base_case_id": "base-canonical", "id": f"corpus-{index:03d}",
+            "operand": "x" * (payload_size + (index < larger_count) - 3),
+            "operation": "json_replace", "target": {"json_pointer": ""},
+        }
+        for index in range(template_count)
+    ]
+    assert _bind_generation_stream(checker, sized) == target
+    return sized
+
+
+def test_generated_corpus_byte_limit_routes_through_generation_validation(checker, bundle):
+    candidate, _, _ = bundle
+    exact = _candidate_with_generated_corpus_size(
+        checker, candidate, checker.LIMITS["generated_corpus_bytes"], 256,
+    )
+    checker._validate_generation(exact)
+
+    plus_one = _candidate_with_generated_corpus_size(
+        checker, candidate, checker.LIMITS["generated_corpus_bytes"] + 1, 255,
+    )
     with pytest.raises(checker.CheckFailure) as caught:
         checker._validate_generation(plus_one)
     assert caught.value.code == "E_GENERATOR_LIMIT"
