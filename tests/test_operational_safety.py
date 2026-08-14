@@ -843,7 +843,7 @@ def test_quarantine_and_admission_race_serialize_in_one_store_transaction(tmp_pa
     final.close()
 
 
-def test_store_rejects_inexact_v1_before_migration_and_inexact_v2(tmp_path):
+def test_store_rejects_inexact_v1_before_migration_and_inexact_v3(tmp_path):
     v1 = tmp_path / "v1.db"
     conn = sqlite3.connect(v1)
     conn.execute(
@@ -888,7 +888,7 @@ def test_store_advances_only_the_exact_v1_schema_without_rewriting_records(tmp_p
     store = Store(path)
     assert store.record_of("legacy") == record
     assert store.permits_used("claude") == 2
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
     store.close()
 
 

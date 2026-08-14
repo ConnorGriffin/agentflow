@@ -29,7 +29,7 @@ from uuid import uuid4
 from agentflow.state import state_dir as _state_dir, state_path
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _RECORDS_SCHEMA = (
     "CREATE TABLE records ("
     " identity TEXT PRIMARY KEY,"
@@ -123,12 +123,18 @@ class Store:
                     raise StoreUnavailable("store schema 1 does not match the migration source")
                 self._migrate_v1_to_v2(conn)
                 version = 2
+            if version == 2:
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(2):
+                    conn.close()
+                    raise StoreUnavailable("store schema 2 does not match the migration source")
+                self._migrate_v2_to_v3(conn)
+                version = 3
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(2):
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
                 conn.close()
-                raise StoreUnavailable("store schema 2 does not match the accepted schema")
+                raise StoreUnavailable("store schema 3 does not match the accepted schema")
         except sqlite3.DatabaseError as e:  # corrupt file, locked-beyond-wait, unreadable
             raise StoreUnavailable(f"cannot open continuation store: {e}") from e
         return conn
@@ -179,6 +185,10 @@ class Store:
             conn.execute(_RECORDS_SCHEMA)
             from agentflow.operational_safety import OperationalSafety
             OperationalSafety.initialize_schema(conn)
+            from agentflow.canary_attribution import initialize_schema
+            initialize_schema(conn)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+                raise sqlite3.DatabaseError("initialized coordinator schema was not accepted")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
@@ -198,6 +208,34 @@ class Store:
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
             conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migration_checkpoint(_name: str) -> None:
+        """Fault-injection seam for the Store v2-to-v3 migration tests."""
+
+    @staticmethod
+    def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+        """Add append-only CanaryAttribution state without rewriting existing owners."""
+        committed = False
+        try:
+            Store._migration_checkpoint("v2-to-v3:begin")
+            conn.execute("BEGIN IMMEDIATE")
+            Store._migration_checkpoint("v2-to-v3:create:canary_attributions")
+            from agentflow.canary_attribution import initialize_schema
+            initialize_schema(conn)
+            Store._migration_checkpoint("v2-to-v3:verify:fingerprint")
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+                raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
+            Store._migration_checkpoint("v2-to-v3:set:user-version")
+            conn.execute("PRAGMA user_version = 3")
+            Store._migration_checkpoint("v2-to-v3:commit")
+            conn.execute("COMMIT")
+            committed = True
+            Store._migration_checkpoint("v2-to-v3:committed")
+        except BaseException:
+            if not committed and conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
 
     def load(self) -> dict[str, Record]:
@@ -676,12 +714,16 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, 
 
 
 def _expected_schema_fingerprint(version: int) -> tuple[tuple[str, str, str, str], ...]:
+    if version in (2, 3):
+        from agentflow.canary_attribution import (
+            STORE_V2_SCHEMA_FINGERPRINT,
+            STORE_V3_SCHEMA_FINGERPRINT,
+        )
+        return (STORE_V2_SCHEMA_FINGERPRINT if version == 2
+                else STORE_V3_SCHEMA_FINGERPRINT)
     conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         conn.execute(_RECORDS_SCHEMA)
-        if version == 2:
-            from agentflow.operational_safety import OperationalSafety
-            OperationalSafety.initialize_schema(conn)
         return _schema_fingerprint(conn)
     finally:
         conn.close()
