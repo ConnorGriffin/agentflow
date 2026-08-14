@@ -21,6 +21,8 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 584](adr-584-human-governed-promotion.md) — Exact, human-governed
+  promotion through a read-only GitHub authority receipt.
 - [ADR 626](adr-626-manifest-rooted-evaluation-semantic-bundle.md) — One versioned,
   manifest-rooted Evaluation bundle binds declarative candidate JSON to one pure semantic
   module; validation executes that authority without reimplementing its algorithms.

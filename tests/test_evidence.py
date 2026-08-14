@@ -86,6 +86,11 @@ def _source():
                             "sha256", "b" * 64, "issue")
 
 
+def _promotion_authority():
+    return AuthorityPointer("github", "octo/repo", "pulls/42/files/docs/policy.json", "a" * 40,
+                            "sha256", "b" * 64, "repository-policy/octo/repo/0-to-1")
+
+
 def _observation(*, source=None, revision="a" * 40):
     return Observation(
         observation_id="obs-1" if source is None else "obs-2",
@@ -634,13 +639,13 @@ def test_fix_introduced_defect_keeps_parent_and_fixer_lineage_separate(tmp_path)
 
 
 def test_evaluation_nomination_and_verified_promotion_are_idempotent(tmp_path):
-    authority = _source()
+    authority = _promotion_authority()
     approved = ApprovedAuthority(authority, "approval-1", authority.revision, authority.content_hash,
                                  authority.scope, "fake", "v1", "verified")
     store = EvidenceStore(path=tmp_path / "evidence.db", verifier=FakeAuthorityVerifier((approved,)))
     event = store.observe(_observation())
     assert store.evaluate(Evaluation("evaluation-1", event.event_id, "human_validated", 2)).event_id == event.event_id
-    candidate = LessonCandidate("candidate-1", (event.event_id,), "d" * 64, 1, 3)
+    candidate = LessonCandidate("candidate-1", (event.event_id,), authority.content_hash, 1, 3)
     assert store.nominate(candidate) == candidate
     first = store.promote(candidate.candidate_id, authority, promoted_at=4)
     second = store.promote(candidate.candidate_id, authority, promoted_at=5)
@@ -719,12 +724,12 @@ def test_retention_expires_unreferenced_and_abandoned_candidates_but_keeps_effec
 
 
 def test_effective_policy_and_one_successor_retain_a_promoted_candidate(tmp_path):
-    authority = _source()
+    authority = _promotion_authority()
     approved = ApprovedAuthority(authority, "approval-1", authority.revision, authority.content_hash,
                                  authority.scope, "fake", "v1", "verified")
     store = EvidenceStore(path=tmp_path / "evidence.db", verifier=FakeAuthorityVerifier((approved,)))
     event = store.observe(_observation())
-    store.nominate(LessonCandidate("candidate-1", (event.event_id,), "d" * 64, 1, 1))
+    store.nominate(LessonCandidate("candidate-1", (event.event_id,), authority.content_hash, 1, 1))
     store.promote("candidate-1", authority, promoted_at=2)
     late = 90 * 24 * 60 * 60 + 2
     assert store.brief_for("pr/42", now=late, effective_policy_versions=(1,))

@@ -525,7 +525,8 @@ class LessonCandidate:
             raise EvidenceError("candidate event references must be unique")
         object.__setattr__(self, "event_ids", tuple(sorted(self.event_ids)))
         _digest(self.proposal_digest, "proposal_digest")
-        if not isinstance(self.policy_version, int) or self.policy_version < 1:
+        if (isinstance(self.policy_version, bool) or not isinstance(self.policy_version, int)
+                or self.policy_version < 1):
             raise EvidenceError("invalid policy_version")
         if not isinstance(self.nominated_at, int) or self.nominated_at < 0:
             raise EvidenceError("invalid nominated_at")
@@ -966,6 +967,19 @@ class EvidenceStore:
 
     def promote(self, candidate_id: str, authority: AuthorityPointer, *, promoted_at: int) -> PromotionReceipt:
         _token(candidate_id, "candidate_id")
+        if isinstance(promoted_at, bool) or not isinstance(promoted_at, int) or promoted_at < 0:
+            raise EvidenceError("invalid promoted_at")
+        # An exact durable receipt stays idempotent even when the original
+        # external source is no longer available.
+        with self._connect() as conn:
+            prior = conn.execute("SELECT * FROM receipts WHERE candidate_id=?", (candidate_id,)).fetchone()
+            if prior:
+                receipt = self._receipt(prior)
+                if not receipt.authoritative:
+                    raise EvidenceError("legacy receipt is unverifiable and cannot be promotion-active")
+                if receipt.authority.pointer != authority:
+                    raise EvidenceError("candidate was promoted under a different authority")
+                return receipt
         approved = self.verifier.verify(authority)
         if approved is None: raise EvidenceError("authority was not verified")
         if not isinstance(approved, ApprovedAuthority):
@@ -974,9 +988,11 @@ class EvidenceStore:
                 approved.approved_hash != authority.content_hash or
                 approved.approved_scope != authority.scope):
             raise EvidenceError("verifier did not approve the requested authority")
-        if not isinstance(promoted_at, int) or promoted_at < 0: raise EvidenceError("invalid promoted_at")
         with self._connect() as conn:
-            candidate = conn.execute("SELECT policy_version FROM candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+            conn.execute("BEGIN IMMEDIATE")
+            candidate = conn.execute(
+                "SELECT proposal_digest, policy_version FROM candidates WHERE candidate_id=?", (candidate_id,)
+            ).fetchone()
             if candidate is None: raise EvidenceError("unknown candidate")
             prior = conn.execute("SELECT * FROM receipts WHERE candidate_id=?", (candidate_id,)).fetchone()
             if prior:
@@ -986,14 +1002,36 @@ class EvidenceStore:
                 if receipt.authority.pointer != authority:
                     raise EvidenceError("candidate was promoted under a different authority")
                 return receipt
+            from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
+            try:
+                scope = parse_promotion_scope(authority.scope)
+            except PromotionAuthorityError as error:
+                raise EvidenceError("promotion scope was not accepted") from error
+            if (candidate["proposal_digest"] != authority.content_hash
+                    or candidate["policy_version"] != scope.new):
+                raise EvidenceError("candidate does not bind the promotion authority")
+            active_versions: list[int] = []
+            for receipt_row in conn.execute(
+                    "SELECT authority_scope FROM receipts WHERE binding_status='verified'"):
+                try:
+                    existing_scope = parse_promotion_scope(receipt_row["authority_scope"])
+                except PromotionAuthorityError as error:
+                    raise EvidenceError("persisted promotion scope was not accepted") from error
+                if (existing_scope.kind == scope.kind
+                        and existing_scope.repository == scope.repository):
+                    active_versions.append(existing_scope.new)
+            if ((not active_versions and scope.prior != 0)
+                    or (active_versions and max(active_versions) != scope.prior)):
+                raise EvidenceError("current policy version does not bind the promotion authority")
             receipt_id = f"receipt-{candidate_id}"
             conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                candidate_id, receipt_id, approved.approval_id, candidate[0], promoted_at,
+                candidate_id, receipt_id, approved.approval_id, candidate["policy_version"], promoted_at,
                 "verified", authority.authority_kind, authority.repository, authority.locator, authority.revision,
                 authority.content_hash_algorithm, authority.content_hash, authority.scope,
                 approved.verifier_id, approved.verifier_version, approved.outcome,
                 approved.approved_revision, approved.approved_hash, approved.approved_scope))
-            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id, candidate[0], approved, True)
+            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id,
+                                    candidate["policy_version"], approved, True)
 
     @staticmethod
     def _receipt(row: sqlite3.Row) -> PromotionReceipt:
