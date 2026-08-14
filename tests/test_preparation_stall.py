@@ -552,8 +552,7 @@ def test_a_missing_or_corrupt_stalled_file_reads_as_nothing_stalled(coord_state)
 
 
 def test_the_new_record_fields_default_so_older_stores_still_open(coord_state):
-    """Continuation records are JSON blobs, so the clock needs no schema migration — but a store
-    written before it existed must still load, or a fleet would have to stop to upgrade."""
+    """The record blob remains backward-compatible across the safety-table migration."""
     from agentflow.coordinator.store import SCHEMA_VERSION, Store, default_store_path
 
     store = Store(default_store_path())
@@ -567,7 +566,7 @@ def test_the_new_record_fields_default_so_older_stores_still_open(coord_state):
     finally:
         store.close()
 
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     assert restored.refusals == 0 and restored.stall_refusal_id == ""
     assert restored.stall_started_at == 0 and restored.stall_last_observed_at == 0
 

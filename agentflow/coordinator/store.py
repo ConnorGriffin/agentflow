@@ -22,13 +22,13 @@ import sqlite3
 import threading
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
 from agentflow.state import state_dir as _state_dir, state_path
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
 # daemon cycle on a lock we cannot prove will clear.
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_COORD_BUSY_MS", "2000"))
@@ -52,6 +52,13 @@ def default_store_path() -> Path:
 class StoreUnavailable(RuntimeError):
     """The store could not be read or is a schema this build does not understand. The
     coordinator treats this as fail-closed: no starts, no claim changes."""
+
+
+class SafetyAdmissionParticipant(Protocol):
+    """The narrow shared-transaction seam reserved for #627 admission wiring."""
+
+    def participate_in_admission(
+            self, conn: sqlite3.Connection, route_cell_digest: str) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -101,6 +108,9 @@ class Store:
                 conn.close()
                 raise StoreUnavailable(
                     f"store schema {version} is newer than supported {SCHEMA_VERSION}")
+            if version == 1:
+                self._migrate_v1_to_v2(conn)
+                version = 2
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
@@ -159,7 +169,22 @@ class Store:
                 " demand INTEGER NOT NULL,"
                 " data TEXT NOT NULL)"
             )
+            from agentflow.operational_safety import OperationalSafety
+            OperationalSafety.initialize_schema(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except sqlite3.DatabaseError:
+            conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v1_to_v2(conn: sqlite3.Connection) -> None:
+        """Add OperationalSafety-owned tables without rewriting continuation rows."""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            from agentflow.operational_safety import OperationalSafety
+            OperationalSafety.initialize_schema(conn)
+            conn.execute("PRAGMA user_version = 2")
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
             conn.execute("ROLLBACK")
@@ -347,7 +372,9 @@ class Store:
     def reserve(self, record: Record, budget: int,
                 limits: ReservationLimits | None = None,
                 expected_launch_token: str | None = None,
-                expected_revision: int | None = None) -> bool:
+                expected_revision: int | None = None, *,
+                operational_safety: SafetyAdmissionParticipant | None = None,
+                route_cell_digest: str | None = None) -> bool:
         """Atomically reserve ``record``'s demand on its pool, or refuse. Availability is read
         and the running row is written under one ``BEGIN IMMEDIATE``, so two coordinator
         instances racing on the same file serialize on the write lock and can never push a
@@ -405,6 +432,12 @@ class Store:
                 if int(row[0]) + record.demand > budget:
                     self._conn.execute("ROLLBACK")
                     return False
+                if (operational_safety is None) != (route_cell_digest is None):
+                    self._conn.execute("ROLLBACK")
+                    return False
+                if operational_safety is not None:
+                    operational_safety.participate_in_admission(
+                        self._conn, route_cell_digest)  # type: ignore[arg-type]
                 record.revision = (existing.revision + 1 if existing_row is not None else 1)
                 self._write(record)
                 self._conn.execute("COMMIT")
@@ -415,6 +448,9 @@ class Store:
                 except sqlite3.DatabaseError:
                     pass
                 raise StoreUnavailable(f"cannot reserve on continuation store: {e}") from e
+            except BaseException:
+                self._rollback_quietly()
+                raise
 
     def discard(self, expected: Record) -> bool:
         """Remove a never-started record from the ledger under a revision compare-and-set, freeing

@@ -643,8 +643,7 @@ def test_a_legacy_bare_bool_preparation_stays_valid_and_carries_no_reason(make_c
 
 
 def test_the_refusal_fields_default_so_records_written_before_this_change_still_load(coord_state):
-    """The two new fields are defaulted, so a store written by an older daemon opens unchanged —
-    no schema bump, no migration, no fleet stopped to upgrade a database."""
+    """The refusal fields remain defaulted across the safety-table schema migration."""
     from agentflow.coordinator.store import SCHEMA_VERSION, Store, default_store_path
 
     store = Store(default_store_path())
@@ -657,7 +656,7 @@ def test_the_refusal_fields_default_so_records_written_before_this_change_still_
     finally:
         store.close()
 
-    assert SCHEMA_VERSION == 1
+    assert SCHEMA_VERSION == 2
     assert restored.refusal == "" and restored.refusal_expected is False
 
 
