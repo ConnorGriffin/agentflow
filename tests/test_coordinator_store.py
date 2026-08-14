@@ -114,6 +114,61 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     assert Store(path).permits_used("codex") == 4  # never over the five-permit budget
 
 
+def test_no_admission_same_store_mutations_serialize_outside_receipt_callback(
+        tmp_path, monkeypatch):
+    path = tmp_path / "same-store.db"
+    store = Store(path)
+    store.upsert(Record("A", "build", "codex", 1, state=WAITING))
+    store.upsert(Record("B", "build", "codex", 1, state=WAITING))
+    entered = threading.Event()
+    release = threading.Event()
+    attempting = threading.Event()
+    results = {}
+    errors = []
+
+    def checkpoint(name):
+        if name == "after-successor-before-commit":
+            entered.set()
+            assert release.wait(2)
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(checkpoint))
+
+    def first_reservation():
+        try:
+            results["first"] = store.reserve(intent("A"))
+        except BaseException as error:
+            errors.append(error)
+
+    def serialized_operations():
+        try:
+            attempting.set()
+            results["upsert"] = store.upsert(
+                Record("C", "review", "codex", 1, state=WAITING))
+            results["second"] = store.reserve(intent("B"))
+        except BaseException as error:
+            errors.append(error)
+
+    first = threading.Thread(target=first_reservation)
+    first.start()
+    assert entered.wait(1)
+    assert not store._promotion_receipt_callback_active.is_set()
+    second = threading.Thread(target=serialized_operations)
+    second.start()
+    assert attempting.wait(1)
+    second.join(0.05)
+    assert second.is_alive()  # blocked on Store._lock, not immediately refused
+    release.set()
+    first.join(2)
+    second.join(2)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert results["upsert"] is True
+    assert results["first"] is not None and results["second"] is not None
+    assert store.record_of("C").state == WAITING
+    assert store.permits_used("codex") == 2
+    store.close()
+
+
 def test_reserve_refuses_a_foreign_running_reservation(tmp_path):
     """The same-identity compare-and-set: once one instance holds a record's running
     reservation under its launch token, a second instance still holding the stale waiting view

@@ -332,6 +332,7 @@ def test_receipt_failure_rolls_back_successor_and_attribution(tmp_path, failure,
     with pytest.raises(CanaryAttributionRefused) as refused:
         store.reserve(intent(digest=active.digest))
     assert refused.value.code == code
+    assert not store._promotion_receipt_callback_active.is_set()
     assert store.record_of(IDENTITY).state == WAITING
     assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()

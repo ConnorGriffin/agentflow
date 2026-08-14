@@ -21,6 +21,7 @@ import os
 import re
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Mapping, TypeAlias
@@ -167,7 +168,7 @@ class Store:
         # connection is shared across threads and serialized by this lock — the reservation
         # critical section is one place, matching the one-ledger design (ADR 0030).
         self._lock = threading.RLock()
-        self._admission_active = threading.Event()
+        self._promotion_receipt_callback_active = threading.Event()
         self._conn = self._connect()
         self._operational_safety: OperationalSafety | None = None
         self._canary_attribution = None
@@ -370,9 +371,20 @@ class Store:
         waiting = {pool: pr_bound_waiting(records, pool, now) for pool in permits}
         return permits, waiting
 
-    def _refuse_reentrant_admission_mutation(self) -> None:
-        if self._admission_active.is_set():
+    def _refuse_promotion_receipt_callback_mutation(self) -> None:
+        if self._promotion_receipt_callback_active.is_set():
             raise StoreUnavailable("reentrant Store mutation during admission")
+
+    @contextmanager
+    def _promotion_receipt_callback(self):
+        """Mark only the untrusted receipt-reader call as non-reentrant."""
+        if self._promotion_receipt_callback_active.is_set():
+            raise StoreUnavailable("promotion receipt callback is already active")
+        self._promotion_receipt_callback_active.set()
+        try:
+            yield
+        finally:
+            self._promotion_receipt_callback_active.clear()
 
     def upsert(self, record: Record, *, retire_descendants: bool = False) -> bool:
         """Persist one record only if its durable revision is still current.
@@ -381,7 +393,7 @@ class Store:
         ``False`` without changing durable state, so an old cycle can never replace a newer
         continuation or terminal transition.
         """
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -413,7 +425,7 @@ class Store:
         A process crash releases SQLite's transaction; the stage adapter's idempotent durable
         proof can then be retried by a fresh coordinator. Returning false rolls back cleanly.
         """
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -460,7 +472,7 @@ class Store:
         head. The superseded predecessor is left completed-and-retired, exactly as a normal
         claim-transfer leaves its completed predecessor, so it leaves the running ledger and is
         never re-admitted or re-reconciled."""
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -534,7 +546,7 @@ class Store:
         successor, and publishes a result only after commit.  Ordinary ineligibility returns
         ``None`` without calling either admission owner or writing any row.
         """
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         if type(intent) is not ReservationIntent:
             raise TypeError("reserve requires the exact ReservationIntent")
         if (not isinstance(intent.identity, str) or not intent.identity
@@ -551,7 +563,6 @@ class Store:
                     and type(intent.limits) is not ReservationLimits)):
             return None
         with self._lock:
-            self._admission_active.set()
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 existing_row = self._conn.execute(
@@ -645,8 +656,6 @@ class Store:
             except BaseException:
                 self._rollback_quietly()
                 raise
-            finally:
-                self._admission_active.clear()
 
     def resolve_route_cell(self, stage_identity: str, expected_revision: int,
                            route_id: str) -> ResolvedLaunch:
@@ -684,7 +693,7 @@ class Store:
         compare-and-set, so genuine in-flight or completed work is never freed. Returns whether the
         row was removed.
         """
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -726,7 +735,7 @@ class Store:
         a handshake timeout (rotating the token) or returned the record to ``waiting``, the
         write is refused and the caller must not become a provider — this is what stops an
         uncancelled bootstrap from starting an unreserved, uncounted provider."""
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -756,7 +765,7 @@ class Store:
         it. Otherwise rotate the reservation's launch token so any still-running child's late
         guarded write is refused, and return ``(not_started, None)``. Exactly one of this and
         :meth:`child_start` can win, so a launch never both times out and starts a provider."""
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -799,9 +808,9 @@ class Store:
         return int(row[0])
 
     def close(self) -> None:
-        self._refuse_reentrant_admission_mutation()
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
-            self._refuse_reentrant_admission_mutation()
+            self._refuse_promotion_receipt_callback_mutation()
             self._conn.close()
 
     def _write(self, record: Record) -> None:

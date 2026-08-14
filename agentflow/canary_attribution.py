@@ -289,6 +289,7 @@ class CanaryAttributionAuthority:
         self._lock = getattr(store, "_lock")
         self._operational_safety = operational_safety
         self._promotion_receipts = promotion_receipts
+        self._promotion_receipt_callback = getattr(store, "_promotion_receipt_callback")
 
     def _participate_in_admission(self, context: _AdmissionContext) -> _CanaryAdmissionResult:
         existing = self._row(context.stage_identity)
@@ -356,7 +357,8 @@ class CanaryAttributionAuthority:
 
     def _receipt(self, receipt_id: str) -> PromotionReceipt:
         try:
-            return self._promotion_receipts.read(receipt_id)
+            with self._promotion_receipt_callback():
+                return self._promotion_receipts.read(receipt_id)
         except KeyError as error:
             raise CanaryAttributionRefused("missing_receipt") from error
         except EvidenceError as error:
