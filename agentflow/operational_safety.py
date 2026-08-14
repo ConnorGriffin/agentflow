@@ -63,11 +63,20 @@ class SafetyRefused(RuntimeError):
     """The requested action is outside the bounded automatic authority."""
 
 
+class _SafetyIdentityMismatch(SafetyRefused):
+    """Private detail translated to the Store's closed ``mismatched`` code."""
+
+
+class _SafetyMissing(SafetyRefused):
+    """Private absence translated to the Store's closed ``missing`` code."""
+
+
 READ_ONLY_WITHHELD_TOOLS_V1 = ("Edit", "Write", "NotebookEdit")
 _PROFILE_COMPLEXITIES = frozenset({"standard", "deep"})
 _PROFILE_EFFORTS = frozenset({"default", "low", "medium", "high", "extra"})
+_TIERED_STAGE_PROFILE_TOKENS = frozenset({"attack", "review"})
 _STAGE_PROFILE_TOKENS = frozenset({
-    "intake", "attack", "mockup", "review", "respond", "converse", "research",
+    "intake", "mockup", "respond", "converse", "research",
 })
 
 
@@ -77,6 +86,8 @@ def _valid_stage_profile_id(value: str) -> bool:
     if parts[0] in {"build", "revise"}:
         return (len(parts) == 3 and parts[1] in _PROFILE_COMPLEXITIES
                 and parts[2] in _PROFILE_EFFORTS)
+    if parts[0] in _TIERED_STAGE_PROFILE_TOKENS:
+        return len(parts) == 2 and parts[1] in _PROFILE_COMPLEXITIES
     return len(parts) == 1 and value in _STAGE_PROFILE_TOKENS
 
 
@@ -236,7 +247,7 @@ DETERMINISTIC_CHECK_ALLOWLIST_DIGEST = _digest(
 _CHECKS = {(item.identifier, item.version): item for item in DETERMINISTIC_CHECKS}
 PROMOTION_VERIFIER = ("github-authority", "v1")
 
-ROUTE_CELL_CONTRACT = {
+ROUTE_CELL_CONTRACT_V1 = {
     "schema": "agentflow-route-cell-v1",
     "identity_fields": [
         "repository", "stage", "provider", "model", "route_id",
@@ -244,7 +255,24 @@ ROUTE_CELL_CONTRACT = {
     ],
     "launch_config": "canonical-json-sha256",
 }
-ROUTE_CELL_CONTRACT_DIGEST = _digest(ROUTE_CELL_CONTRACT)
+ROUTE_CELL_CONTRACT_V1_DIGEST = (
+    "c762ed469c4c2a311391898196713b26a2dbe2985896c262ea05a425368f63a5")
+if _digest(ROUTE_CELL_CONTRACT_V1) != ROUTE_CELL_CONTRACT_V1_DIGEST:
+    raise RuntimeError("historical RouteCell v1 contract changed")
+ROUTE_CELL_CONTRACT = {
+    "schema": "agentflow-route-cell-v2",
+    "logical_key_fields": ["repository", "stage", "provider", "route_id"],
+    "version_fields": [
+        "repository", "stage", "provider", "model", "route_id",
+        "launch_config_digest",
+    ],
+    "launch_config": "canonical-json-sha256",
+    "legacy_migration": "empty-ledger-only",
+}
+ROUTE_CELL_CONTRACT_DIGEST = (
+    "14dc4e949ec2a045816040cbfb553118475a570395bb6ffc26d0e1c40c780c47")
+if _digest(ROUTE_CELL_CONTRACT) != ROUTE_CELL_CONTRACT_DIGEST:
+    raise RuntimeError("RouteCell v2 contract changed")
 
 ACTION_STATE_MAP = {
     "rerun": "claimed -> effect_lease_claimed -> idempotent_effect -> result_committed",
@@ -279,7 +307,7 @@ RERUN_TRIGGER_ONCE_CONTRACT_DIGEST = RERUN_TRIGGER_ONCE_CONTRACT.digest
 
 
 OPERATIONAL_SAFETY_CONTRACT = {
-    "schema": "agentflow-operational-safety-v1",
+    "schema": "agentflow-operational-safety-v2",
     "coordinator_store_schema": 2,
     "route_cell_contract_digest": ROUTE_CELL_CONTRACT_DIGEST,
     "deterministic_check_allowlist_digest": DETERMINISTIC_CHECK_ALLOWLIST_DIGEST,
@@ -288,6 +316,9 @@ OPERATIONAL_SAFETY_CONTRACT = {
     "canary_receipt": "read-only #584 receipt authority binds approval declaration digest",
     "promotion_verifier": "/".join(PROMOTION_VERIFIER),
     "route_state": "recomputed cell-key+pointers+generation digest on every read",
+    "route_resolution": "coded active selection plus exact-digest historical decoder",
+    "route_key_migration": "empty ledger only; populated v1 requires operator reconciliation",
+    "reservation_serialization": "active pointer check and reserve share SQLite write lock",
     "rerun_effect_owner": "exact ActionIdempotentRerunEffect concrete type",
     "rerun_transport_contract_digest": RERUN_TRIGGER_ONCE_CONTRACT_DIGEST,
     "rerun_transaction": "short lease CAS -> external idempotent effect -> short result CAS",
@@ -295,7 +326,12 @@ OPERATIONAL_SAFETY_CONTRACT = {
     "reopen_proof": "authority-read pass bound to safety_state_id+route_cell+declaration",
     "admission_seam": "participate_in_admission(existing_store_connection, route_cell_digest)",
 }
-OPERATIONAL_SAFETY_CONTRACT_DIGEST = _digest(OPERATIONAL_SAFETY_CONTRACT)
+OPERATIONAL_SAFETY_CONTRACT_V1_DIGEST = (
+    "ba8bf92fa7216d7fd59ef25b42d494de381f6a2a11afab1e0c44b174bfa9ddc0")
+OPERATIONAL_SAFETY_CONTRACT_DIGEST = (
+    "5ef205f7d655a85ef9fa0526ef154d61ba50712d6234e17d7f345d2e6c76d36d")
+if _digest(OPERATIONAL_SAFETY_CONTRACT) != OPERATIONAL_SAFETY_CONTRACT_DIGEST:
+    raise RuntimeError("OperationalSafety v2 contract changed")
 
 _RERUN_LEASE_NS = 30_000_000_000
 _RERUN_POLL_SECONDS = 0.01
@@ -317,9 +353,29 @@ class RouteCell:
             "repository": self.repository,
             "stage": self.stage,
             "provider": self.provider,
-            "model": self.model,
             "route_id": self.route_id,
         })
+
+
+def materialize_route_cell(
+        repository: str, stage: str, provider: str, model: str,
+        route_id: str, launch_config: LaunchConfigV1) -> tuple[RouteCell, bytes]:
+    """Purely bind one immutable launch artifact to its v2 logical route."""
+    if type(launch_config) is not LaunchConfigV1:
+        raise SafetyRefused("route registration requires the exact launch configuration v1")
+    config_bytes = encode_launch_config(launch_config)
+    config_digest = sha256(config_bytes).hexdigest()
+    body = {
+        "repository": repository,
+        "stage": stage,
+        "provider": provider,
+        "model": model,
+        "route_id": route_id,
+        "launch_config_digest": config_digest,
+    }
+    cell = RouteCell(**body, digest=_digest(body))
+    decode_admitted_launch(ResolvedLaunch(cell, config_bytes))
+    return cell, config_bytes
 
 
 @dataclass(frozen=True)
@@ -353,17 +409,21 @@ def decode_admitted_launch(resolved: ResolvedLaunch) -> AdmittedLaunch:
             or sha256(resolved.config_bytes).hexdigest() != cell.launch_config_digest):
         raise SafetyRefused("admitted launch digests do not bind its content")
     if config.provider != cell.provider or config.internal_model != cell.model:
-        raise SafetyRefused("launch configuration provider/model mismatch")
+        raise _SafetyIdentityMismatch("launch configuration provider/model mismatch")
     if cell.route_id != f"production/{config.stage_profile_id}":
-        raise SafetyRefused("launch configuration route identity mismatch")
+        raise _SafetyIdentityMismatch("launch configuration route identity mismatch")
     profile = config.stage_profile_id.split("/")
     efforts = {"default", "low", "medium", "high", "extra"}
     if cell.stage in {"build", "revise"}:
         if (len(profile) != 3 or profile[0] != cell.stage
                 or profile[1] not in {"standard", "deep"} or profile[2] not in efforts):
-            raise SafetyRefused("launch configuration stage profile mismatch")
+            raise _SafetyIdentityMismatch("launch configuration stage profile mismatch")
+    elif cell.stage in {"attack", "review"}:
+        if (len(profile) != 2 or profile[0] != cell.stage
+                or profile[1] not in {"standard", "deep"}):
+            raise _SafetyIdentityMismatch("launch configuration stage profile mismatch")
     elif config.stage_profile_id != cell.stage:
-        raise SafetyRefused("launch configuration stage profile mismatch")
+        raise _SafetyIdentityMismatch("launch configuration stage profile mismatch")
     return AdmittedLaunch(cell, config)
 
 
@@ -648,6 +708,7 @@ class OperationalSafety:
         if rerun_effect is not None:
             self._validate_rerun_effect(rerun_effect)
         self._rerun_effect = rerun_effect
+        self._require_v2_route_ledger()
 
     @staticmethod
     def initialize_schema(conn: sqlite3.Connection) -> None:
@@ -694,20 +755,17 @@ class OperationalSafety:
     def register_route_cell(
             self, repository: str, stage: str, provider: str, model: str,
             route_id: str, launch_config: LaunchConfigV1) -> RouteCell:
-        if type(launch_config) is not LaunchConfigV1:
-            raise SafetyRefused("route registration requires the exact launch configuration v1")
-        config_bytes = encode_launch_config(launch_config)
-        config_digest = sha256(config_bytes).hexdigest()
+        cell, config_bytes = materialize_route_cell(
+            repository, stage, provider, model, route_id, launch_config)
+        config_digest = cell.launch_config_digest
         body = {
-            "repository": repository,
-            "stage": stage,
-            "provider": provider,
-            "model": model,
-            "route_id": route_id,
-            "launch_config_digest": config_digest,
+            "repository": cell.repository,
+            "stage": cell.stage,
+            "provider": cell.provider,
+            "model": cell.model,
+            "route_id": cell.route_id,
+            "launch_config_digest": cell.launch_config_digest,
         }
-        cell = RouteCell(**body, digest=_digest(body))
-        decode_admitted_launch(ResolvedLaunch(cell, config_bytes))
         with self._transaction():
             row = self._conn.execute(
                 "SELECT content FROM safety_launch_configs WHERE digest = ?",
@@ -746,16 +804,69 @@ class OperationalSafety:
         return cell
 
     def resolve(self, repository: str, stage: str, provider: str,
-                model: str, route_id: str) -> ResolvedLaunch:
+                model: str, route_id: str, *,
+                conn: sqlite3.Connection | None = None) -> ResolvedLaunch:
         cell_key = _digest({
             "repository": repository, "stage": stage, "provider": provider,
-            "model": model, "route_id": route_id,
+            "route_id": route_id,
         })
+        connection = conn or self._conn
         with self._lock:
-            canary = self._canary_pointer_state(cell_key, conn=self._conn)
-            cell = self._cell(canary.active_route_cell_digest, conn=self._conn)
-            config = self._launch_config(cell.launch_config_digest, conn=self._conn)
+            canary = self._canary_pointer_state(cell_key, conn=connection)
+            cell = self._cell(canary.active_route_cell_digest, conn=connection)
+            if (cell.repository, cell.stage, cell.provider, cell.model, cell.route_id) != (
+                    repository, stage, provider, model, route_id):
+                raise _SafetyIdentityMismatch(
+                    "active RouteCell does not match the selected identity")
+            config = self._launch_config(cell.launch_config_digest, conn=connection)
         return ResolvedLaunch(cell, config)
+
+    def resolve_digest(self, route_cell_digest: str, *,
+                       conn: sqlite3.Connection | None = None) -> ResolvedLaunch:
+        """Read one exact immutable version without consulting its active pointer."""
+        connection = conn or self._conn
+        with self._lock:
+            cell = self._cell(route_cell_digest, conn=connection)
+            config = self._launch_config(cell.launch_config_digest, conn=connection)
+        return ResolvedLaunch(cell, config)
+
+    def _require_v2_route_ledger(self) -> None:
+        """Refuse ambiguous materialized v1 keys without changing durable state."""
+        try:
+            rows = self._conn.execute(
+                "SELECT cell_key, repository, stage, provider, model, route_id"
+                " FROM safety_route_cells").fetchall()
+        except sqlite3.DatabaseError as error:
+            raise SafetyRefused("RouteCell ledger is unreadable") from error
+        if not rows:
+            populated = self._conn.execute(
+                "SELECT"
+                " (SELECT COUNT(*) FROM safety_route_state) +"
+                " (SELECT COUNT(*) FROM safety_canary_state) +"
+                " (SELECT COUNT(*) FROM safety_observations) +"
+                " (SELECT COUNT(*) FROM safety_actions) +"
+                " (SELECT COUNT(*) FROM safety_action_results) +"
+                " (SELECT COUNT(*) FROM safety_rerun_claims) +"
+                " (SELECT COUNT(*) FROM safety_alerts) +"
+                " (SELECT COUNT(*) FROM canary_attributions)").fetchone()[0]
+            if populated:
+                raise SafetyRefused(
+                    "legacy RouteCell ledger requires operator reconciliation")
+            return
+        for row in rows:
+            v1_key = _digest({
+                "repository": row[1], "stage": row[2], "provider": row[3],
+                "model": row[4], "route_id": row[5],
+            })
+            v2_key = _digest({
+                "repository": row[1], "stage": row[2], "provider": row[3],
+                "route_id": row[5],
+            })
+            if row[0] == v1_key and row[0] != v2_key:
+                raise SafetyRefused(
+                    "legacy RouteCell ledger requires operator reconciliation")
+            if row[0] != v2_key:
+                raise SafetyRefused("RouteCell ledger key is unreadable")
 
     def observe(self, request: ObservationRequest) -> tuple[ActionIntent, ...]:
         observation = self._authorize_observation(request)
@@ -1398,7 +1509,7 @@ class OperationalSafety:
             " launch_config_digest, data FROM safety_route_cells WHERE digest = ?",
             (digest,)).fetchone()
         if row is None:
-            raise SafetyRefused("unknown RouteCell")
+            raise _SafetyMissing("unknown RouteCell")
         try:
             body = json.loads(row[8])
         except (TypeError, ValueError) as error:

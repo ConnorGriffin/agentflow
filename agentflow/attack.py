@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from agentflow.intake import _fill
 from agentflow.shell_crib import SHELL_CRIB
+from agentflow.stage_result_contracts import ATTACK_RESULT_SCHEMA
 
 # How many times one draft may be attacked before the argument goes to the maintainer instead.
 # Scaled by the complexity dial the draft itself carries — the dial triage already stamps *is*
@@ -46,21 +47,6 @@ def max_rounds(complexity) -> int:
     """
     key = getattr(complexity, "value", complexity)
     return _ROUNDS_BY_COMPLEXITY.get(key, MAX_ATTACK_ROUNDS)
-
-# The provider-neutral shape the attacker's terminal answer must match. Each runner adapter
-# translates it into that CLI's native structured-output surface, so the parser validates a real
-# object rather than scavenging JSON out of reasoning prose — the same contract intake uses.
-ATTACK_RESULT_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "objections": {"type": "string"},
-        "remedied": {"type": "boolean"},
-        "fork": {"type": "string"},
-    },
-    "required": ["objections", "remedied", "fork"],
-}
-
 
 @dataclass(frozen=True, slots=True)
 class AttackResult:

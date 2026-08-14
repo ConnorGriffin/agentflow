@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Mapping, TypeAlias
 from uuid import uuid4
 
 from agentflow.state import state_dir as _state_dir, state_path
+from agentflow.coordinator.errors import StoreUnavailable
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 from agentflow.operational_safety import (
     AdmittedLaunch,
@@ -35,9 +36,11 @@ from agentflow.operational_safety import (
     CheckEvidenceAuthority,
     OperationalSafety,
     PromotionReceiptAuthority as SafetyPromotionReceiptAuthority,
-    ResolvedLaunch,
     SafetyRefused,
     decode_admitted_launch,
+    materialize_route_cell,
+    _SafetyIdentityMismatch,
+    _SafetyMissing,
     _AdmissionContext,
     _SafetyAdmissionResult,
 )
@@ -90,11 +93,6 @@ def default_store_path() -> Path:
     return state_path("coordinator", "records.db")
 
 
-class StoreUnavailable(RuntimeError):
-    """The store could not be read or is a schema this build does not understand. The
-    coordinator treats this as fail-closed: no starts, no claim changes."""
-
-
 RouteAdmissionCode = Literal["missing", "stale", "mismatched", "unreadable", "quarantined"]
 ROUTE_ADMISSION_REFUSAL_CODES = {
     "missing", "stale", "mismatched", "unreadable", "quarantined",
@@ -111,6 +109,13 @@ class RouteAdmissionRefused(RuntimeError):
             raise TypeError("unknown route admission refusal code")
         self.code = code
         super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
+class RouteSelectionIdentity:
+    route_id: str
+    route_cell_digest: str
+    launch_config_digest: str
 
 
 @dataclass(frozen=True)
@@ -677,22 +682,6 @@ class Store:
                 self._rollback_quietly()
                 raise
 
-    def resolve_route_cell(self, stage_identity: str, expected_revision: int,
-                           route_id: str) -> ResolvedLaunch:
-        """Resolve through this Store's exact sealed OperationalSafety instance."""
-        if self._operational_safety is None:
-            raise StoreUnavailable("route resolution is not configured")
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT data FROM records WHERE identity = ?", (stage_identity,)).fetchone()
-            if row is None:
-                raise StoreUnavailable("route resolution record is unavailable")
-            record = self._decode(row[0])
-            if record.revision != expected_revision:
-                raise StoreUnavailable("route resolution record revision changed")
-            return self._operational_safety.resolve(
-                record.repo, record.stage, record.pool, record.model, route_id)
-
     def resolve_admitted_launch(self, stage_identity: str, expected_revision: int,
                                 route_id: str) -> AdmittedLaunch:
         """Resolve and decode one active route, exposing only a closed refusal code."""
@@ -700,60 +689,103 @@ class Store:
             raise RouteAdmissionRefused("unreadable")
         with self._lock:
             try:
-                row = self._conn.execute(
-                    "SELECT data FROM records WHERE identity = ?", (stage_identity,)).fetchone()
-                if row is None:
-                    raise RouteAdmissionRefused("missing")
-                record = self._decode(row[0])
-                if record.revision != expected_revision:
-                    raise RouteAdmissionRefused("stale")
-                identity = (record.repo, record.stage, record.pool, record.model)
-                from agentflow.routing import logical_route_id_for_record
-                if logical_route_id_for_record(record) != route_id:
-                    raise RouteAdmissionRefused("mismatched")
-                route = self._conn.execute(
-                    "SELECT 1 FROM safety_route_cells WHERE repository = ? AND stage = ?"
-                    " AND provider = ? AND model = ? AND route_id = ?",
-                    (*identity, route_id)).fetchone()
-                if route is None:
-                    raise RouteAdmissionRefused("missing")
-                resolved = self._operational_safety.resolve(*identity, route_id)
-                cell = resolved.route_cell
-                if (cell.repository, cell.stage, cell.provider, cell.model, cell.route_id) != (
-                        *identity, route_id):
-                    raise RouteAdmissionRefused("mismatched")
-                state = self._operational_safety.route_state(resolved.route_cell.digest)
-                if state.quarantined:
-                    raise RouteAdmissionRefused("quarantined")
-                return decode_admitted_launch(resolved)
+                return self._resolve_active_admitted(
+                    stage_identity, expected_revision, route_id, conn=self._conn)
             except RouteAdmissionRefused:
                 raise
             except (SafetyRefused, StoreUnavailable, sqlite3.DatabaseError, ValueError, TypeError):
                 raise RouteAdmissionRefused("unreadable") from None
 
+    def _resolve_active_admitted(self, stage_identity: str, expected_revision: int,
+                                 route_id: str, *, conn: sqlite3.Connection) -> AdmittedLaunch:
+        row = conn.execute(
+            "SELECT data FROM records WHERE identity = ?", (stage_identity,)).fetchone()
+        if row is None:
+            raise RouteAdmissionRefused("missing")
+        record = self._decode(row[0])
+        if record.revision != expected_revision:
+            raise RouteAdmissionRefused("stale")
+        identity = (record.repo, record.stage, record.pool, record.model)
+        from agentflow.routing import logical_route_id_for_record
+        if logical_route_id_for_record(record) != route_id:
+            raise RouteAdmissionRefused("mismatched")
+        route = conn.execute(
+            "SELECT 1 FROM safety_route_cells WHERE repository = ? AND stage = ?"
+            " AND provider = ? AND route_id = ?",
+            (record.repo, record.stage, record.pool, route_id)).fetchone()
+        if route is None:
+            raise RouteAdmissionRefused("missing")
+        try:
+            resolved = self._operational_safety.resolve(  # type: ignore[union-attr]
+                *identity, route_id, conn=conn)
+        except _SafetyIdentityMismatch:
+            raise RouteAdmissionRefused("mismatched") from None
+        except SafetyRefused:
+            raise
+        cell = resolved.route_cell
+        if (cell.repository, cell.stage, cell.provider, cell.model, cell.route_id) != (
+                *identity, route_id):
+            raise RouteAdmissionRefused("mismatched")
+        state = self._operational_safety.route_state(  # type: ignore[union-attr]
+            resolved.route_cell.digest)
+        if state.quarantined:
+            raise RouteAdmissionRefused("quarantined")
+        return decode_admitted_launch(resolved)
+
+    def decode_committed_launch(self, route_cell_digest: str) -> AdmittedLaunch:
+        """Decode one exact durable RouteCell version without requiring it to stay active."""
+        if self._operational_safety is None:
+            raise RouteAdmissionRefused("unreadable")
+        with self._lock:
+            try:
+                return decode_admitted_launch(
+                    self._operational_safety.resolve_digest(route_cell_digest, conn=self._conn))
+            except _SafetyIdentityMismatch:
+                raise RouteAdmissionRefused("mismatched") from None
+            except _SafetyMissing:
+                raise RouteAdmissionRefused("missing") from None
+            except SafetyRefused:
+                raise RouteAdmissionRefused("unreadable") from None
+            except (sqlite3.DatabaseError, ValueError, TypeError):
+                raise RouteAdmissionRefused("unreadable") from None
+
     def consume_admitted_launch(self, stage_identity: str, expected_revision: int,
                                 route_id: str, *, reserve, before_reserve=None):
-        """Invoke an injected reserve seam only while the decoded active digest stays exact."""
+        """Reserve only after the selected active pointer is verified under SQLite write lock."""
+        admitted = self.resolve_admitted_launch(
+            stage_identity, expected_revision, route_id)
+        if before_reserve is not None:
+            before_reserve()
         with self._lock:
-            admitted = self.resolve_admitted_launch(
-                stage_identity, expected_revision, route_id)
-            if before_reserve is not None:
-                before_reserve()
             try:
-                current = self.resolve_admitted_launch(
-                    stage_identity, expected_revision, route_id)
-            except RouteAdmissionRefused as error:
-                if error.code in {"missing", "stale", "mismatched", "quarantined"}:
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    current = self._resolve_active_admitted(
+                        stage_identity, expected_revision, route_id, conn=self._conn)
+                except RouteAdmissionRefused as error:
+                    if error.code in {"missing", "stale", "mismatched", "quarantined"}:
+                        raise RouteAdmissionRefused("stale") from None
+                    raise
+                if current.route_cell.digest != admitted.route_cell.digest:
                     raise RouteAdmissionRefused("stale") from None
+                result = reserve(admitted)
+                self._conn.execute("COMMIT")
+                return result
+            except BaseException:
+                self._rollback_quietly()
                 raise
-            if current.route_cell.digest != admitted.route_cell.digest:
-                raise RouteAdmissionRefused("stale")
-            return reserve(admitted)
 
-    def register_route_selection(self, selection):
-        """Register one exact routing-owned selection through this Store's sealed owner."""
-        if self._operational_safety is None:
-            raise StoreUnavailable("route registration is not configured")
+    def route_selection_identity(self, selection) -> RouteSelectionIdentity:
+        """Return current-routing-validated immutable digests without touching SQLite."""
+        current = self._rematerialize_route_selection(selection)
+        cell, _ = materialize_route_cell(
+            current.repository, current.stage, current.provider, current.model,
+            current.route_id, current.launch_config)
+        return RouteSelectionIdentity(
+            cell.route_id, cell.digest, cell.launch_config_digest)
+
+    @staticmethod
+    def _rematerialize_route_selection(selection):
         from agentflow.routing import (
             RouteSelection, RoutingConfigError, rematerialize_route_selection,
         )
@@ -765,9 +797,16 @@ class Store:
             raise SafetyRefused("route selection is not admitted by current routing") from error
         if current != selection:
             raise SafetyRefused("route selection differs from current routing authority")
+        return current
+
+    def register_route_selection(self, selection):
+        """Register one exact routing-owned selection through this Store's sealed owner."""
+        if self._operational_safety is None:
+            raise StoreUnavailable("route registration is not configured")
+        current = self._rematerialize_route_selection(selection)
         return self._operational_safety.register_route_cell(
-            selection.repository, selection.stage, selection.provider, selection.model,
-            selection.route_id, selection.launch_config)
+            current.repository, current.stage, current.provider, current.model,
+            current.route_id, current.launch_config)
 
     def route_cell_state(self, route_cell_digest: str):
         """Read verified RouteCell state through this Store's sealed owner."""

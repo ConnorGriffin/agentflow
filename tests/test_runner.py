@@ -430,14 +430,19 @@ def test_codex_wires_the_result_schema_to_its_native_output_schema_file(tmp_path
     assert "--output-schema" not in CodexRunner().structured_argv("build it", "terra", str(wt))
 
 
-def test_provider_adapters_supply_the_stage_schema_for_intake_and_review(tmp_path):
+def test_provider_adapters_supply_each_structured_stage_schema(tmp_path):
+    from agentflow.attack import ATTACK_RESULT_SCHEMA
     from agentflow.coordinator.providers import ClaudeProviderAdapter, CodexProviderAdapter
     from agentflow.coordinator.record import Record
     from agentflow.intake import INTAKE_RESULT_SCHEMA
     from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
 
     repo = _repo_with_origin(tmp_path)
-    cases = {"intake": INTAKE_RESULT_SCHEMA, "review": REVIEW_VERDICT_SCHEMA}
+    cases = {
+        "intake": INTAKE_RESULT_SCHEMA,
+        "attack": ATTACK_RESULT_SCHEMA,
+        "review": REVIEW_VERDICT_SCHEMA,
+    }
     for stage, schema in cases.items():
         claude = ClaudeProviderAdapter().command(Record(
             f"claude-{stage}", stage, "claude", 0,

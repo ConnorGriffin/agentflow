@@ -44,10 +44,12 @@ from agentflow.operational_safety import (
     ObservationRequest,
     OperationalSafety,
     OPERATIONAL_SAFETY_CONTRACT_DIGEST,
+    OPERATIONAL_SAFETY_CONTRACT_V1_DIGEST,
     PROMOTION_VERIFIER,
     RERUN_TRIGGER_ONCE_CONTRACT,
     RERUN_TRIGGER_ONCE_CONTRACT_DIGEST,
     ROUTE_CELL_CONTRACT_DIGEST,
+    ROUTE_CELL_CONTRACT_V1_DIGEST,
     SafetyRefused,
     TriggerOnceByActionIdTransportV1,
     _state_id,
@@ -283,10 +285,14 @@ def test_dependency_and_registry_receipts_are_exact():
     }
     assert DETERMINISTIC_CHECK_ALLOWLIST_DIGEST == (
         "66af2cb2c82a3cba92170e0d920f7a4ea9cae8509f482969f90883a42ca47458")
-    assert ROUTE_CELL_CONTRACT_DIGEST == (
+    assert ROUTE_CELL_CONTRACT_V1_DIGEST == (
         "c762ed469c4c2a311391898196713b26a2dbe2985896c262ea05a425368f63a5")
-    assert OPERATIONAL_SAFETY_CONTRACT_DIGEST == (
+    assert ROUTE_CELL_CONTRACT_DIGEST == (
+        "14dc4e949ec2a045816040cbfb553118475a570395bb6ffc26d0e1c40c780c47")
+    assert OPERATIONAL_SAFETY_CONTRACT_V1_DIGEST == (
         "ba8bf92fa7216d7fd59ef25b42d494de381f6a2a11afab1e0c44b174bfa9ddc0")
+    assert OPERATIONAL_SAFETY_CONTRACT_DIGEST == (
+        "5ef205f7d655a85ef9fa0526ef154d61ba50712d6234e17d7f345d2e6c76d36d")
     assert PROMOTION_VERIFIER == ("github-authority", "v1")
     assert RERUN_TRIGGER_ONCE_CONTRACT_DIGEST == (
         "4bc192810ab1119c2b1ec49942fbceb0eddd50e012d765a148e0664cb02e7658")

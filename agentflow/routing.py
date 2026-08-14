@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Literal
 
 from agentflow.operational_safety import LaunchConfigV1, SafetyRefused
+from agentflow.stage_result_contracts import stage_result_schema
+from agentflow.work_classification import Complexity, Effort
 
 
 class RoutingConfigError(ValueError):
@@ -203,6 +205,10 @@ class CapabilityRouting:
             return f"build/{complexity or 'deep'}/{effort or 'default'}"
         if stage == "revise":
             return f"revise/{builder_complexity or complexity or 'deep'}/{effort or 'default'}"
+        if stage == "attack":
+            return f"attack/{complexity or 'deep'}"
+        if stage == "review":
+            return f"review/{builder_complexity or complexity or 'deep'}"
         return stage
 
     def select_route(self, repository: str, stage: str, provider: str, model: str, *,
@@ -226,11 +232,14 @@ class CapabilityRouting:
             raise RoutingConfigError("build route selection requires complexity")
         if stage == "revise" and builder_complexity is None and complexity is None:
             raise RoutingConfigError("revise route selection requires complexity")
+        if stage == "attack" and complexity is None:
+            raise RoutingConfigError("attack route selection requires complexity")
+        if stage == "review" and builder_complexity is None and complexity is None:
+            raise RoutingConfigError(f"{stage} route selection requires complexity")
         if provider not in {"claude", "codex"} or self.provider_for(model) != provider:
             raise RoutingConfigError(
                 f"provider {provider!r} cannot launch model {model!r}")
         from agentflow.coordinator.profiles import profile_for_facts
-        from agentflow.coordinator.providers import stage_result_schema
         from agentflow.operational_safety import canonical_result_schema
 
         profile_id = self._stage_profile_id(
@@ -478,11 +487,8 @@ def reachable_route_selections(config) -> tuple[RouteSelection, ...]:
     """Enumerate every launch identity reachable from the production registries."""
     from agentflow.coordinator.admission import MODEL_FOR, STAGE_NATIVE_HANDOFF
     from agentflow.pool_control import POOLS
-    from agentflow.runner import Complexity, Effort
-
-    workspace = {repo.repo for repo in config.workspace_repositories}
-    repositories = sorted(
-        (repo.repo for repo in config.repositories if repo.repo not in workspace))
+    ordinary_repositories = {repo.repo for repo in config.repositories}
+    workspace_repositories = {repo.repo for repo in config.workspace_repositories}
     complexities = tuple(item.value for item in Complexity)
     efforts = tuple(item.value for item in Effort)
     facts: list[tuple[str, str | None, str | None, str | None]] = []
@@ -499,7 +505,7 @@ def reachable_route_selections(config) -> tuple[RouteSelection, ...]:
             facts.append((stage, "deep", None, None))
 
     selected: list[RouteSelection] = []
-    for repository in repositories:
+    for repository in sorted(ordinary_repositories):
         for stage, complexity, effort, builder_complexity in facts:
             for provider in POOLS:
                 model = (routing.model_for_stage(
@@ -509,12 +515,18 @@ def reachable_route_selections(config) -> tuple[RouteSelection, ...]:
                     repository, stage, provider, model,
                     complexity=complexity, effort=effort,
                     builder_complexity=builder_complexity))
-    return tuple(selected)
+    for repository in sorted(workspace_repositories - ordinary_repositories):
+        for provider in POOLS:
+            model = (routing.model_for_stage("converse", provider, "deep")
+                     or MODEL_FOR[(provider, "deep")])
+            selected.append(routing.select_route(
+                repository, "converse", provider, model, complexity="deep"))
+    return tuple(dict.fromkeys(selected))
 
 
 def reconcile_route_cells(config, store):
     """Idempotently register all currently reachable governed RouteCells."""
-    from agentflow.coordinator.store import StoreUnavailable
+    from agentflow.coordinator.errors import StoreUnavailable
     import sqlite3
     registered = []
     for selection in reachable_route_selections(config):
@@ -548,6 +560,14 @@ def rematerialize_route_selection(selection: RouteSelection) -> RouteSelection:
         kwargs["builder_complexity"] = profile[1]
         if profile[2] != "default":
             kwargs["effort"] = profile[2]
+    elif selection.stage in {"attack", "review"}:
+        if (len(profile) != 2 or profile[0] != selection.stage
+                or profile[1] not in {"standard", "deep"}):
+            raise SafetyRefused(
+                f"{selection.stage} route selection has an invalid profile identity")
+        kwargs["complexity"] = profile[1]
+        if selection.stage == "review":
+            kwargs["builder_complexity"] = profile[1]
     return routing.select_route(
         selection.repository, selection.stage, selection.provider, selection.model, **kwargs)
 

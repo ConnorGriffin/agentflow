@@ -17,7 +17,7 @@ import re
 
 from agentflow import github
 from agentflow.intake import STATE_LABELS
-from agentflow.runner import Complexity, Effort, MockupScope
+from agentflow.work_classification import Complexity, Effort, MockupScope
 
 _COMPLEXITY_LABEL = re.compile(r"^agentflow:complexity:(standard|deep)$")
 _EFFORT_LABEL = re.compile(r"^agentflow:effort:(low|medium|high|extra)$")

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+from hashlib import sha256
 import json
 from pathlib import Path
+import sqlite3
 import threading
 
 import pytest
@@ -74,6 +76,12 @@ def test_routing_materializes_profile_specific_frozen_launch_policy(monkeypatch)
     assert revise.route_id == "production/revise/standard/default"
     assert revise.launch_config.stage_profile_id == "revise/standard/default"
     assert revise.launch_config.cli_model == "gpt-5.6-sol"
+    assert routing.select_route(
+        "octo/app", "review", "codex", "luna",
+        complexity="standard").route_id == "production/review/standard"
+    assert routing.select_route(
+        "octo/app", "attack", "claude", "opus",
+        complexity="deep").route_id == "production/attack/deep"
     with pytest.raises(FrozenInstanceError):
         build.route_id = "production/build/deep/low"
 
@@ -98,6 +106,23 @@ def test_launch_config_v1_has_fixed_canonical_bytes_and_digest():
     assert launch_config_digest(config) == (
         "cf04245ad4043213cfab37298355414e711e49847f022ddd9a081e057f3c2c58")
     assert decode_launch_config(expected) == config
+
+
+def test_structured_route_selections_seal_shared_stage_contracts():
+    from agentflow.stage_result_contracts import stage_result_schema
+
+    for stage in ("intake", "attack", "review"):
+        selection = routing.select_route(
+            "octo/app", stage, "codex", "sol", complexity="deep")
+        expected = json.dumps(
+            stage_result_schema(stage), sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False)
+        assert selection.launch_config.result_schema_json == expected
+        assert selection.launch_config.result_schema_digest == sha256(
+            expected.encode()).hexdigest()
+    assert routing.select_route(
+        "octo/app", "build", "codex", "sol", complexity="deep",
+        effort="high").launch_config.result_schema_json is None
 
 
 @pytest.mark.parametrize(("change", "value"), [
@@ -135,13 +160,15 @@ def test_launch_config_v1_refuses_missing_duplicate_and_noncanonical_members():
             decode_launch_config(invalid)
 
 
-def test_reconciliation_seeds_every_governed_route_once_and_excludes_workspace(tmp_path):
+def test_reconciliation_covers_governed_and_converse_only_workspace_routes(tmp_path):
     governed = RepoConfig("octo/app", str(tmp_path))
-    workspace = RepoConfig("octo/workspace", str(tmp_path))
+    overlap = RepoConfig("octo/overlap", str(tmp_path))
+    workspace = RepoConfig("octo/workspace-only", str(tmp_path))
     config = RuntimeConfig(
-        (governed, workspace), (workspace,), Path(tmp_path / "config.toml"))
+        (governed, overlap), (overlap, workspace), Path(tmp_path / "config.toml"))
+    path = tmp_path / "coordinator.db"
     store = Store(
-        tmp_path / "coordinator.db",
+        path,
         admission_mode=OperationalSafetyOnly(SafetySources()),
     )
 
@@ -150,7 +177,14 @@ def test_reconciliation_seeds_every_governed_route_once_and_excludes_workspace(t
     second = reconcile_route_cells(config, store)
 
     assert first == second
-    assert {cell.repository for cell in first} == {"octo/app"}
+    assert {cell.repository for cell in first} == {
+        "octo/app", "octo/overlap", "octo/workspace-only"}
+    workspace_cells = [cell for cell in first if cell.repository == "octo/workspace-only"]
+    assert {cell.stage for cell in workspace_cells} == {"converse"}
+    assert {cell.provider for cell in workspace_cells} == {"claude", "codex"}
+    overlap_cells = [cell for cell in first if cell.repository == "octo/overlap"]
+    assert {cell.stage for cell in overlap_cells} > {"converse"}
+    assert len({cell.digest for cell in first}) == len(first)
     assert {cell.route_id for cell in first} == {
         selection.route_id for selection in expected
     }
@@ -160,6 +194,96 @@ def test_reconciliation_seeds_every_governed_route_once_and_excludes_workspace(t
     assert "production/revise/deep/default" in {cell.route_id for cell in first}
     assert all(store.route_cell_state(cell.digest).route_cell_digest == cell.digest
                for cell in first)
+    digests = {cell.digest for cell in first}
+    store.close()
+
+    reopened = Store(path, admission_mode=OperationalSafetyOnly(SafetySources()))
+    assert {reopened.decode_committed_launch(digest).route_cell.digest
+            for digest in digests} == digests
+    reopened.close()
+
+
+def test_route_identity_v2_keeps_model_versioned_and_provider_logical(tmp_path):
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    sol = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
+    luna = routing.select_route(
+        "octo/app", "review", "codex", "luna", complexity="deep")
+    claude = routing.select_route(
+        "octo/app", "review", "claude", "opus", complexity="deep")
+
+    sol_cell = store.register_route_selection(sol)
+    luna_cell = store.register_route_selection(luna)
+    claude_cell = store.register_route_selection(claude)
+
+    assert sol_cell.key == luna_cell.key
+    assert sol_cell.digest != luna_cell.digest
+    assert claude_cell.key != sol_cell.key
+    assert store.route_cell_state(sol_cell.digest).route_cell_digest == sol_cell.digest
+    with pytest.raises(SafetyRefused, match="not active"):
+        store.route_cell_state(luna_cell.digest)
+    store.close()
+
+
+def test_review_and_attack_tiers_are_independent_active_routes(tmp_path):
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    for stage in ("review", "attack"):
+        standard = routing.select_route(
+            "octo/app", stage, "codex", "terra", complexity="standard")
+        deep = routing.select_route(
+            "octo/app", stage, "codex", "sol", complexity="deep")
+        standard_cell = store.register_route_selection(standard)
+        deep_cell = store.register_route_selection(deep)
+        assert standard.launch_config.stage_profile_id == f"{stage}/standard"
+        assert deep.launch_config.stage_profile_id == f"{stage}/deep"
+        assert standard.route_id != deep.route_id
+        assert standard_cell.key != deep_cell.key
+        assert store.route_cell_state(standard_cell.digest).route_cell_digest == standard_cell.digest
+        assert store.route_cell_state(deep_cell.digest).route_cell_digest == deep_cell.digest
+    store.close()
+
+
+def test_store_selection_identity_is_pure_and_matches_registration(tmp_path):
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    selection = routing.select_route(
+        "octo/app", "attack", "codex", "sol", complexity="deep")
+    before = tuple(store._conn.execute(
+        "SELECT (SELECT COUNT(*) FROM safety_launch_configs),"
+        " (SELECT COUNT(*) FROM safety_route_cells),"
+        " (SELECT COUNT(*) FROM safety_route_state),"
+        " (SELECT COUNT(*) FROM safety_canary_state)").fetchone())
+    sql_actions = []
+
+    def deny_sql(action, *_args):
+        sql_actions.append(action)
+        return sqlite3.SQLITE_DENY
+
+    store._conn.set_authorizer(deny_sql)
+
+    identity = store.route_selection_identity(selection)
+    store._conn.set_authorizer(None)
+
+    after = tuple(store._conn.execute(
+        "SELECT (SELECT COUNT(*) FROM safety_launch_configs),"
+        " (SELECT COUNT(*) FROM safety_route_cells),"
+        " (SELECT COUNT(*) FROM safety_route_state),"
+        " (SELECT COUNT(*) FROM safety_canary_state)").fetchone())
+    registered = store.register_route_selection(selection)
+    assert before == after == (0, 0, 0, 0)
+    assert sql_actions == []
+    assert (identity.route_id, identity.route_cell_digest,
+            identity.launch_config_digest) == (
+                registered.route_id, registered.digest,
+                registered.launch_config_digest)
     store.close()
 
 
@@ -184,6 +308,14 @@ def test_store_resolves_one_decoded_envelope_and_closes_refusal_codes(tmp_path):
         stored.identity, stored.revision, selection.route_id)
     assert admitted.route_cell.repository == "octo/app"
     assert admitted.launch_config == selection.launch_config
+
+    def reserve(envelope):
+        assert store._conn.in_transaction
+        return envelope.route_cell.digest
+
+    assert store.consume_admitted_launch(
+        stored.identity, stored.revision, selection.route_id,
+        reserve=reserve) == admitted.route_cell.digest
 
     with pytest.raises(RouteAdmissionRefused) as stale:
         store.resolve_admitted_launch(stored.identity, stored.revision - 1, selection.route_id)
@@ -460,6 +592,66 @@ def test_changed_config_keeps_route_identity_inactive_and_survives_reopen(monkey
     reopened.close()
 
 
+def test_exact_digest_decoder_reads_inactive_historical_version_after_reopen(
+        monkeypatch, tmp_path):
+    path = tmp_path / "coordinator.db"
+    store = Store(path, admission_mode=OperationalSafetyOnly(SafetySources()))
+    first = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
+    first_cell = store.register_route_selection(first)
+    monkeypatch.setenv("AGENTFLOW_SESSION_TIMEOUT", "321")
+    changed = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
+    changed_cell = store.register_route_selection(changed)
+    with store._operational_safety._transaction():
+        store._operational_safety._activate_pointer(
+            first_cell.key, first_cell.digest, changed_cell.digest)
+        store._conn.execute(
+            "UPDATE safety_canary_state SET active_digest = ?, generation = generation + 1"
+            " WHERE cell_key = ?", (changed_cell.digest, first_cell.key))
+    expected = store.decode_committed_launch(first_cell.digest)
+    store.close()
+
+    reopened = Store(path, admission_mode=OperationalSafetyOnly(SafetySources()))
+    assert reopened.decode_committed_launch(first_cell.digest) == expected
+    with pytest.raises(RouteAdmissionRefused) as missing:
+        reopened.decode_committed_launch("0" * 64)
+    assert missing.value.code == "missing"
+
+    mismatched_config = replace(
+        first.launch_config, provider="claude", internal_model="opus", cli_model="opus")
+    config_bytes = encode_launch_config(mismatched_config)
+    config_digest = sha256(config_bytes).hexdigest()
+    body = {
+        "repository": first.repository,
+        "stage": first.stage,
+        "provider": first.provider,
+        "model": first.model,
+        "route_id": first.route_id,
+        "launch_config_digest": config_digest,
+    }
+    body_text = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    cell_digest = sha256(body_text.encode()).hexdigest()
+    reopened._conn.execute(
+        "INSERT INTO safety_launch_configs VALUES (?, ?)",
+        (config_digest, config_bytes))
+    reopened._conn.execute(
+        "INSERT INTO safety_route_cells VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (cell_digest, first_cell.key, first.repository, first.stage, first.provider,
+         first.model, first.route_id, config_digest, body_text))
+    with pytest.raises(RouteAdmissionRefused) as mismatched:
+        reopened.decode_committed_launch(cell_digest)
+    assert mismatched.value.code == "mismatched"
+
+    reopened._conn.execute(
+        "UPDATE safety_launch_configs SET content = ? WHERE digest = ?",
+        (b"{}", changed_cell.launch_config_digest))
+    with pytest.raises(RouteAdmissionRefused) as unreadable:
+        reopened.decode_committed_launch(changed_cell.digest)
+    assert unreadable.value.code == "unreadable"
+    reopened.close()
+
+
 def test_store_closes_quarantined_and_unreadable_route_refusals(tmp_path):
     class Checks:
         def __init__(self):
@@ -514,9 +706,11 @@ def test_store_closes_quarantined_and_unreadable_route_refusals(tmp_path):
     corrupt.close()
 
 
-def test_activation_between_resolve_and_reserve_is_stale_without_capacity(monkeypatch, tmp_path):
+def test_two_store_activation_between_resolve_and_reserve_is_stale_without_capacity(
+        monkeypatch, tmp_path):
+    path = tmp_path / "coordinator.db"
     store = Store(
-        tmp_path / "coordinator.db",
+        path,
         admission_mode=OperationalSafetyOnly(SafetySources()),
     )
     record = Record(
@@ -530,22 +724,29 @@ def test_activation_between_resolve_and_reserve_is_stale_without_capacity(monkey
     changed = routing.select_route(
         "octo/app", "review", "codex", "sol", complexity="deep")
     changed_cell = store.register_route_selection(changed)
+    other_store = Store(path, admission_mode=OperationalSafetyOnly(SafetySources()))
     reservations = []
 
     def activate_changed_cell():
-        owner = store._operational_safety
-        owner._activate_pointer(first_cell.key, first_cell.digest, changed_cell.digest)
-        store._conn.execute(
-            "UPDATE safety_canary_state SET active_digest = ?, generation = generation + 1"
-            " WHERE cell_key = ?",
-            (changed_cell.digest, first_cell.key))
+        owner = other_store._operational_safety
+        with owner._transaction():
+            owner._activate_pointer(first_cell.key, first_cell.digest, changed_cell.digest)
+            other_store._conn.execute(
+                "UPDATE safety_canary_state SET active_digest = ?, generation = generation + 1"
+                " WHERE cell_key = ?",
+                (changed_cell.digest, first_cell.key))
+
+    def reserve(admitted):
+        assert store._conn.in_transaction
+        reservations.append(admitted)
 
     with pytest.raises(RouteAdmissionRefused) as stale:
         store.consume_admitted_launch(
             stored.identity, stored.revision, first.route_id,
-            reserve=reservations.append, before_reserve=activate_changed_cell)
+            reserve=reserve, before_reserve=activate_changed_cell)
     assert stale.value.code == "stale"
     assert reservations == []
+    other_store.close()
     store.close()
 
 
@@ -625,3 +826,95 @@ def test_selection_and_launch_reject_cross_identity_facts(monkeypatch, tmp_path)
     with pytest.raises(SafetyRefused):
         LocalLauncher()._session_timeout_for(stored, crossed)
     store.close()
+
+
+def test_populated_mapping_v1_ledger_requires_operator_reconciliation_without_mutation(
+        tmp_path):
+    from agentflow.canary_attribution import (
+        ATTRIBUTION_CONTRACT_VERSION,
+        ROW_DIGEST_DOMAIN,
+        _schema_row_valid,
+    )
+
+    path = tmp_path / "coordinator.db"
+    legacy = Store(path)
+    config_bytes = b'{"effort":"high","model":"gpt-5","timeout":900}'
+    config_digest = sha256(config_bytes).hexdigest()
+    body = {
+        "repository": "octo/app",
+        "stage": "build",
+        "provider": "codex",
+        "model": "gpt-5",
+        "route_id": "primary",
+        "launch_config_digest": config_digest,
+    }
+    body_text = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    cell_digest = sha256(body_text.encode()).hexdigest()
+    key_source = {
+        "repository": "octo/app", "stage": "build", "provider": "codex",
+        "model": "gpt-5", "route_id": "primary",
+    }
+    cell_key = sha256(json.dumps(
+        key_source, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    state_source = {
+        "cell_key": cell_key, "active": cell_digest,
+        "quarantined": cell_digest, "generation": 0,
+    }
+    state_id = sha256(json.dumps(
+        state_source, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    legacy._conn.execute(
+        "INSERT INTO safety_launch_configs VALUES (?, ?)",
+        (config_digest, config_bytes))
+    legacy._conn.execute(
+        "INSERT INTO safety_route_cells VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (cell_digest, cell_key, "octo/app", "build", "codex", "gpt-5",
+         "primary", config_digest, body_text))
+    legacy._conn.execute(
+        "INSERT INTO safety_route_state VALUES (?, ?, ?, ?, ?, 0)",
+        (cell_key, cell_digest, cell_digest, "action-legacy", state_id))
+    legacy._conn.execute(
+        "INSERT INTO safety_canary_state VALUES (?, ?, NULL, NULL, NULL, 0, 0)",
+        (cell_key, cell_digest))
+    legacy._conn.execute(
+        "INSERT INTO safety_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        ("action-legacy", "legacy-quarantine", "quarantine", cell_digest,
+         "d" * 64, "legacy/evidence", "operator-reconciles-v1", "{}"))
+    attribution_facts = {
+        "stage_identity": "legacy-stage",
+        "repository": "octo/app",
+        "route_cell_digest": cell_digest,
+        "receipt_binding": "b" * 64,
+        "method_revision": "a" * 40,
+        "cohort_id": cell_key,
+        "contract_version": ATTRIBUTION_CONTRACT_VERSION,
+    }
+    attribution_digest = sha256(json.dumps(
+        {"domain": ROW_DIGEST_DOMAIN, **attribution_facts},
+        sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    attribution_row = (*attribution_facts.values(), attribution_digest)
+    legacy._conn.execute(
+        "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        attribution_row)
+    before = tuple(legacy._conn.execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()), tuple(
+            legacy._conn.execute("SELECT * FROM safety_route_cells").fetchall()), tuple(
+            legacy._conn.execute("SELECT * FROM safety_route_state").fetchall()), tuple(
+            legacy._conn.execute("SELECT * FROM safety_canary_state").fetchall()), tuple(
+            legacy._conn.execute("SELECT * FROM safety_actions").fetchall()), tuple(
+            legacy._conn.execute("SELECT * FROM canary_attributions").fetchall())
+    legacy.close()
+
+    with pytest.raises(SafetyRefused, match="requires operator reconciliation"):
+        Store(path, admission_mode=OperationalSafetyOnly(SafetySources()))
+
+    reopened = Store(path)
+    after = tuple(reopened._conn.execute(
+        "SELECT name, sql FROM sqlite_master ORDER BY name").fetchall()), tuple(
+            reopened._conn.execute("SELECT * FROM safety_route_cells").fetchall()), tuple(
+            reopened._conn.execute("SELECT * FROM safety_route_state").fetchall()), tuple(
+            reopened._conn.execute("SELECT * FROM safety_canary_state").fetchall()), tuple(
+            reopened._conn.execute("SELECT * FROM safety_actions").fetchall()), tuple(
+            reopened._conn.execute("SELECT * FROM canary_attributions").fetchall())
+    assert after == before
+    assert _schema_row_valid(*after[-1][0]) == 1
+    reopened.close()

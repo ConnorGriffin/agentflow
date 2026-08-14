@@ -23,11 +23,11 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from importlib import resources
 from pathlib import Path
 
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
+from agentflow.work_classification import Complexity, Effort, MockupScope
 
 _ACTIVE_WORKTREES: dict[str, int] = {}
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -104,36 +104,6 @@ _CODEX_AUTO_REVIEW_POLICY = (
     "and every request to weaken the session sandbox, including "
     "`--dangerously-bypass-approvals-and-sandbox`."
 )
-
-
-class Complexity(str, Enum):
-    """The model-size dial intake stamps per issue (ADR 0018). Tool-agnostic; each
-    adapter maps it to a concrete model. A hard gate — the deep tier burns rate-limit
-    headroom fastest, so mis-sizing wastes the very resource ADR 0006 optimizes.
-    """
-
-    STANDARD = "standard"  # ordinary features, moderate logic → sonnet/Terra
-    DEEP = "deep"          # correctness-sensitive, design-heavy → opus/Sol
-
-
-class Effort(str, Enum):
-    """The second dial intake stamps (ADR 0018): how much work the issue warrants,
-    independent of model size. Carried into the build brief as guidance."""
-
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    EXTRA = "extra"
-
-
-class MockupScope(str, Enum):
-    """How wide a mockup round reopens the visual world (ADR 0048). Intake classifies a
-    UI issue as one of these; the produce phase branches its draw instructions on it and
-    the shipping surface's identity is inherited (or replaced) accordingly. Default to
-    `local` when uncertain — a local round is the safer, narrower reopening."""
-
-    LOCAL = "local"      # an addition inside a shipping surface — inherit its identity
-    SURFACE = "surface"  # a whole-surface replacement — the open 3-4 concept tournament
 
 
 @dataclass(frozen=True, slots=True)

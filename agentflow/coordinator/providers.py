@@ -28,6 +28,7 @@ from agentflow.coordinator.session import read_session
 from agentflow.coordinator.store import default_store_path
 from agentflow.coordinator.telemetry import (
     AttemptUsage, claude_usage, codex_usage, lead_codex_worker_usage)
+from agentflow.stage_result_contracts import stage_result_schema
 
 
 class ProviderCause(str, Enum):
@@ -566,23 +567,6 @@ _SESSION_LEAD_START = re.compile(
 
 class SessionLeadInputError(ValueError):
     """A durable session-lead input cannot be safely refreshed before launch."""
-
-
-def stage_result_schema(stage: str) -> dict | None:
-    """The provider-neutral result contract a stage's terminal decision must match, or None
-    for a code-writing stage that emits no structured decision. Intake, Review and the attack own
-    their schemas (domain validation lives with their parsers); this seam only names which stage
-    uses which, so no provider-specific schema detail leaks into coordinator policy."""
-    if stage == "intake":
-        from agentflow.intake import INTAKE_RESULT_SCHEMA
-        return INTAKE_RESULT_SCHEMA
-    if stage == "review":
-        from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
-        return REVIEW_VERDICT_SCHEMA
-    if stage == "attack":
-        from agentflow.attack import ATTACK_RESULT_SCHEMA
-        return ATTACK_RESULT_SCHEMA
-    return None
 
 
 def _durable_prompt(record) -> str:

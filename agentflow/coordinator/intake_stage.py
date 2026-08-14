@@ -7,7 +7,7 @@ import json
 from agentflow.coordinator.recovery import targeted_repair
 from agentflow.coordinator.stage_adapter import StageAdapter
 from agentflow.intake import IntakeResult, IntakeRoute, parse_intake
-from agentflow.runner import Complexity, Effort, MockupScope
+from agentflow.work_classification import Complexity, Effort, MockupScope
 
 
 def encode_result(result: IntakeResult) -> str:
