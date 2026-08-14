@@ -22,11 +22,25 @@ do, and they are the one place that judgment lives.
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
 _MARKER = "/.agentflow/worktrees/"
+
+
+def capture_subject_revision(workdir: str, ref: str = "origin/main") -> str:
+    """Resolve one exact source commit for durable stage submission; never update the ref."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", workdir, "rev-parse", "--verify", f"{ref}^{{commit}}"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, check=False, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    revision = result.stdout.strip()
+    return revision if result.returncode == 0 and re.fullmatch(r"[a-f0-9]{40}", revision) else ""
 
 
 class WorktreeKind(str, Enum):

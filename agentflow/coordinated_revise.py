@@ -74,6 +74,7 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
         surfaces=surfaces_phrase(declaration)), None, parent_pool)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
+        subject_revision=head_sha,
         pool=parent_pool, complexity="deep", conflict_round=conflict_round,
         source=WorktreeRef.for_build(cfg.workdir, builder_tool, issue, slug).path,
         claim=True, input_ptr=brief,
@@ -118,7 +119,8 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
         surfaces=surfaces or "any user-facing surface"), review_record.builder_effort, parent_pool)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=reviewed_head, pool=parent_pool, complexity=complexity,
+        target=reviewed_head, subject_revision=reviewed_head,
+        pool=parent_pool, complexity=complexity,
         effort=review_record.builder_effort, source=build_worktree, claim=True, input_ptr=brief,
         builder_lineage=parent_pool,
         branch_lineage=review_record.branch_lineage or review_record.builder_lineage,
@@ -157,7 +159,7 @@ def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: 
         change_author_tool=parent_pool, handoff=decision)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
-        target=review_record.target, pool=parent_pool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=parent_pool,
         complexity=review_record.builder_complexity or "deep",
         effort=review_record.builder_effort, source=build_worktree,
         claim=True, input_ptr=prompt, builder_lineage=parent_pool,

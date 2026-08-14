@@ -273,7 +273,8 @@ def run_cycle(repos, *, submit_new: bool = True, coordinator=None, _log=None) ->
     """
     _log = _log or (lambda _m: None)
     _refresh_claude_quota(_log)
-    coord = coordinator if coordinator is not None else pipeline.build_coordinator(_log)
+    coord = coordinator if coordinator is not None else pipeline.build_coordinator(
+        _log, repositories={cfg.repo: cfg.workdir for cfg in repos})
     if submit_new:
         threads = [_spawn(lambda cfg=cfg: _submit_repo(cfg, coord, _log)) for cfg in repos]
         for thread in threads:

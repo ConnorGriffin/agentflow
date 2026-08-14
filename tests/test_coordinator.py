@@ -1,8 +1,7 @@
 """The coordinator's public seam (ADR 0030): idempotent logical-stage submission and pool
 cycling, with the admission matrix, continuation priority, atomic permit reservation, and
 provider observations kept private. Everything here is driven through ``submit_stage`` and
-``cycle`` — the only two calls stage orchestration makes. Also asserts the dormant guarantee:
-nothing here is wired into the daemon yet.
+``cycle`` — the only two calls stage orchestration makes.
 """
 
 from __future__ import annotations
@@ -18,9 +17,35 @@ from conftest import FakeSession, NeverStartsLauncher, permits, record_of
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.admission import ADMISSION_MATRIX, PERMIT_BUDGET, admission_demand
 from agentflow.coordinator.providers import ProviderCause
-from agentflow.coordinator.store import ReservationLimits
+from agentflow.coordinator.store import ReservationLimits, Store
 from agentflow.capability_contracts import CapabilityPreflightResult, ContractRequirement
 from agentflow.coordinator.record import Record
+
+
+def test_submission_binds_one_subject_revision_and_route_through_store_seam_before_persistence(
+        make_coord, monkeypatch):
+    calls = []
+    original = Store.route_selection_identity
+
+    def public_identity(store, selection):
+        calls.append(selection)
+        return original(store, selection)
+
+    monkeypatch.setattr(Store, "route_selection_identity", public_identity)
+    coord = make_coord(FakeSession())
+    revision = "a" * 40
+
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject="627", stage="build", pool="claude", effort="low",
+        subject_revision=revision))
+
+    record = coord.stage_record(identity)
+    assert record is not None
+    assert record.subject_revision == revision
+    assert record.route_id == "production/build/deep/low"
+    assert len(record.route_cell_digest) == 64
+    assert len(record.launch_config_digest) == 64
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("provider", ("claude", "codex"))

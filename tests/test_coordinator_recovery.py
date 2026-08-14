@@ -312,9 +312,13 @@ def test_a_daemon_restart_resume_is_not_counted_as_a_repair(make_coord):
     budget and park work a live provider never actually failed."""
     fake = RepairingSession()
     coord = make_coord(fake, daemon_generation="gen-1")
-    identity = coord.submit_stage(_review(pool="codex"))
+    revision = "9" * 40
+    identity = coord.submit_stage(_review(pool="codex", subject_revision=revision))
     coord.cycle("codex")
     assert permits(coord, "codex") == 2                 # a codex review is running
+    before = record_of(coord, identity)
+    route = (before.route_id, before.route_cell_digest, before.launch_config_digest)
+    assert all(route)
 
     fake.kill(identity)                                 # a restart kills the family — no end fact
     restarted = make_coord(fake, daemon_generation="gen-2")
@@ -322,6 +326,8 @@ def test_a_daemon_restart_resume_is_not_counted_as_a_repair(make_coord):
 
     rec = record_of(restarted, identity)
     assert rec.restart_resumes == 1 and rec.repairs == 0
+    assert rec.subject_revision == revision
+    assert (rec.route_id, rec.route_cell_digest, rec.launch_config_digest) == route
 
 
 # --- a stage with no classifier keeps the historical behavior ----------------------------

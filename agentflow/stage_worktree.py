@@ -73,7 +73,7 @@ def worktree_ready(record):
         if remote:
             add += ["-b", branch, str(wt), f"origin/{branch}"]
         elif record.stage in {"build", "mockup"}:
-            add += ["-b", branch, str(wt), "origin/main"]
+            add += ["-b", branch, str(wt), record.subject_revision]
         else:
             return unprepared("branch-absent",
                               f"branch {branch} exists neither locally nor on origin, and a "

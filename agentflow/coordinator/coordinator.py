@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import json
+import re
+import subprocess
 import threading
 import time
 from copy import deepcopy
@@ -30,6 +32,7 @@ from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage, pr_bound_waiting)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
+from agentflow.coordinator.errors import StoreUnavailable
 from agentflow.coordinator.providers import (EndingReason, ProviderCause, SessionLeadInputError,
                                              validate_session_lead_input)
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
@@ -39,7 +42,8 @@ from agentflow.coordinator.record import (
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import (
-    SUPERVISOR_WINDOW, ReservationIntent, Store, default_store_path)
+    SUPERVISOR_WINDOW, LegacyReservationIntent, ReservationIntent, Store,
+    default_store_path)
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
@@ -185,6 +189,7 @@ class Submission:
     review: ReviewState | None = None
     capability_root: str | None = None
     capability_context: dict[str, bool] | str | None = None
+    subject_revision: str = ""
 
 
 @dataclass(frozen=True)
@@ -220,8 +225,13 @@ class Coordinator:
 
     def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None, log=None,
                  daemon_generation: str | None = None,
-                 disabled_cold_stages: frozenset[str] = frozenset()) -> None:
-        self._store = Store(default_store_path())
+                 disabled_cold_stages: frozenset[str] = frozenset(), store=None,
+                 route_selector=None, briefing_resolver=None) -> None:
+        # Production injects its one composed Store; bare coordinators retain the historical
+        # no-admission Store for focused coordinator tests and legacy state readability.
+        self._store = store or Store(default_store_path())
+        self._route_selector = route_selector or routing.select_route
+        self._briefing_resolver = briefing_resolver
         self._launcher = launcher or LocalLauncher()
         self._gate = gate or _admit_everything
         # Every adapter hook is optional; StageCalls owns the default for each one, so the
@@ -264,6 +274,14 @@ class Coordinator:
                 stage, submission.pool, submission.complexity, submission.builder_complexity)
             or MODEL_FOR.get((submission.pool, submission.complexity), "opus")
         )
+        subject_revision = submission.subject_revision or _subject_revision(submission)
+        route = None
+        if subject_revision:
+            selection = self._route_selector(
+                submission.repo, stage, submission.pool, model,
+                complexity=submission.complexity, effort=submission.effort,
+                builder_complexity=submission.builder_complexity)
+            route = self._store.route_selection_identity(selection)
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
@@ -294,6 +312,10 @@ class Coordinator:
             capability_context=(submission.capability_context
                                 if isinstance(submission.capability_context, str)
                                 else json.dumps(submission.capability_context or {}, sort_keys=True)),
+            subject_revision=subject_revision,
+            route_id=route.route_id if route is not None else "",
+            route_cell_digest=route.route_cell_digest if route is not None else "",
+            launch_config_digest=route.launch_config_digest if route is not None else "",
             session_lead=submission.session_lead,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
@@ -558,6 +580,29 @@ class Coordinator:
                 # exist (the child records `started` before replacing itself). If nothing is
                 # alive, this is not-started: release and preserve the attempt count.
                 if not self._launcher.is_alive(record.family):
+                    try:
+                        receipt = self._store.read_admission_receipt(record.identity)
+                    except StoreUnavailable:
+                        record.hold_reason = refused_before_start_hold_reason(
+                            "admission authority is unreadable")
+                        if self._hold(record):
+                            self._emit(
+                                record,
+                                f"attempt {record.attempts}/{ATTEMPT_BUDGET} refused before "
+                                "provider start — admission authority is unreadable; handoff "
+                                "pending; claim retained",
+                            )
+                            outcome = self._finalize_hold(record)
+                            if outcome is not None:
+                                outcomes.append(outcome)
+                        continue
+                    if receipt is not None:
+                        admitted = self._store.decode_committed_launch(
+                            receipt.route_cell_digest)
+                        result = self._launcher.start(record, self._store, admitted)
+                        self._started_here.add(record.identity)
+                        self._commit_start(record, result.fact, result.family)
+                        continue
                     self._release(record)
                     record.state = WAITING
                     self._persist(record)
@@ -733,10 +778,17 @@ class Coordinator:
         probe's refusal is nobody's evidence of anything: it must not count toward the breadcrumb
         or advance a clock, or a stage would escalate on how often it was speculatively tried
         somewhere it does not live (#406)."""
-        # The non-mutating provider/repository check must precede even stage preparation.  A
-        # second check below verifies the actual checkout preparation leaves for launch.
-        capability = self._capability_preflight(record, False)
-        if capability is not None and not capability.ready:
+        # Production's source-root probe is advisory. Preparation may create or repair the final
+        # launch root, so only the one post-prepare observation is admission authority.
+        composed = self._store.composed_admission
+        if composed:
+            try:
+                capability = self._capability_preflight(record, False)
+            except Exception:
+                capability = None
+        else:
+            capability = self._capability_preflight(record, False)
+        if not composed and capability is not None and not capability.ready:
             return self._capability_failure(record, capability, observed)
         # A stage adapter that owns branch/worktree recovery may reject admission before it
         # happens; a preparation failure consumes neither a permit nor an attempt (ADR 0028).
@@ -768,6 +820,11 @@ class Coordinator:
             return "unprepared"
         capability = self._capability_preflight(record, True)
         if capability is not None and not capability.ready:
+            if composed:
+                state = capability.state if capability.state in {
+                    "missing", "drifted", "incompatible"} else "incompatible"
+                return self._admission_failure(
+                    record, f"capability_environment_failure:{state}", observed)
             return self._capability_failure(record, capability, observed)
         # Preparation answered yes, so whatever refused it earlier is over — clear it before the
         # later admission checks run, or a stage that is now perfectly preparable would keep
@@ -778,7 +835,15 @@ class Coordinator:
             record.refusals = 0
             self._clear_stall(record)
             self._stall_logged.pop(record.identity, None)
-        if not self._begin_start(record, now):
+        ready_fact = capability.ready_fact if capability is not None else None
+        try:
+            admission = self._begin_start(record, now, capability=ready_fact)
+        except Exception as error:
+            from agentflow.coordinator.store import AdmissionRefused
+            if isinstance(error, AdmissionRefused):
+                return self._admission_failure(record, error.code, observed)
+            raise
+        if admission is None:
             if _refusal_state(record) != was_refused:
                 self._persist(record)
             # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
@@ -787,10 +852,27 @@ class Coordinator:
             if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
                 return "deferred"
             return "blocked"
-        result = self._launcher.start(record, self._store)
+        if self._store.composed_admission:
+            admitted = self._store.decode_committed_launch(
+                admission.admission_receipt.route_cell_digest)
+            result = self._launcher.start(record, self._store, admitted)
+        else:
+            result = self._launcher.start(record, self._store)
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
+
+    def _admission_failure(self, record: Record, code: str, observed: bool) -> str:
+        """Persist a content-free retryable refusal while retaining the claim."""
+        if not observed:
+            return "unprepared"
+        self._note_refusal(record, code, False)
+        record.capability_preflight = ""
+        if not self._persist(record):
+            return "unprepared"
+        self._emit(record, f"{code}; retrying next cycle; claim retained; "
+                           "no attempt or permit spent")
+        return "unprepared"
 
     def _capability_failure(self, record: Record, capability, observed: bool) -> str:
         """Fail a real admission durably; leave speculative provider probes untouched."""
@@ -872,11 +954,13 @@ class Coordinator:
             record, pool=dest_pool,
             source=_repool_source(record.source, dest_pool),
             lineage=dest_pool if record.stage in LINEAGE_PINNED else record.lineage)
-        capability = self._capability_preflight(candidate, False)
-        if capability is not None and not capability.ready:
-            return
+        if not self._store.composed_admission:
+            capability = self._capability_preflight(candidate, False)
+            if capability is not None and not capability.ready:
+                return
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
-                record.lineage, record.source, record.refusal, record.refusal_expected)
+                record.lineage, record.source, record.refusal, record.refusal_expected,
+                record.route_id, record.route_cell_digest, record.launch_config_digest)
         record.pool = dest_pool
         record.model = (
             routing.model_for_stage(
@@ -886,6 +970,15 @@ class Coordinator:
         demand = admission_demand(
             record.stage, dest_pool, record.model, record.complexity, record.effort)
         record.demand = demand if demand is not None else PERMIT_BUDGET
+        if record.subject_revision:
+            selection = self._route_selector(
+                record.repo, record.stage, record.pool, record.model,
+                complexity=record.complexity, effort=record.effort,
+                builder_complexity=record.builder_complexity)
+            route = self._store.route_selection_identity(selection)
+            record.route_id = route.route_id
+            record.route_cell_digest = route.route_cell_digest
+            record.launch_config_digest = route.launch_config_digest
         current_author = record.change_author_tool or record.builder_lineage
         record.auto_merge_allowed = not (current_author is not None and dest_pool == current_author)
         if record.stage in LINEAGE_PINNED:
@@ -893,7 +986,8 @@ class Coordinator:
             record.source = _repool_source(record.source, dest_pool)
         if self._admit(record, now, observed=False) != STARTED:
             (record.pool, record.model, record.demand, record.auto_merge_allowed,
-             record.lineage, record.source, record.refusal, record.refusal_expected) = home
+             record.lineage, record.source, record.refusal, record.refusal_expected,
+             record.route_id, record.route_cell_digest, record.launch_config_digest) = home
             record.state = WAITING
             self._persist(record)
 
@@ -907,16 +1001,16 @@ class Coordinator:
         consuming permits; reviewed-profile same-tool fallback is selected before submission."""
         return pr_bound_waiting(self._records.values(), pool, now)
 
-    def _begin_start(self, record: Record, now: int) -> bool:
+    def _begin_start(self, record: Record, now: int, *, capability=None):
         if (record.state != WAITING or record.hold_pending
                 or record.attempts >= ATTEMPT_BUDGET):
-            return False
+            return None
         if record.pool not in {"claude", "codex"}:
-            return False  # no permit ledger to charge an unknown pool (ADR 0029)
+            return None  # no permit ledger to charge an unknown pool (ADR 0029)
         if record.stage in LINEAGE_PINNED and record.pool != record.lineage:
-            return False  # a code-writing stage may not silently leave its pinned lineage
+            return None  # a code-writing stage may not silently leave its pinned lineage
         if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
-            return False  # new issue work defers while a PR-bound stage waits to start (#293)
+            return None  # new issue work defers while a PR-bound stage waits to start (#293)
         if not self._gate(deepcopy(record)):
             # An independent admission gate refusal (headroom, ceiling, cap, pacing) used to be
             # silent: a record pinned to a pool the weekly ratchet blocks sat `waiting` with its
@@ -931,7 +1025,7 @@ class Coordinator:
             reason = reason_of(deepcopy(record)) if reason_of is not None else None
             self._note_refusal(record, reason or "", False)
             self._emit_deferral(record, now, reason)
-            return False
+            return None
         # Store derives and commits the reservation successor. Default NoAdmission mode preserves
         # the shipped coordinator behavior; #627 remains the owner of composed Safety/Attribution
         # mode, RouteCell resolution, and briefing/capability admission receipts.
@@ -943,22 +1037,39 @@ class Coordinator:
         # this attempt; the winner's durable row remains authoritative and no reservation is
         # attempted from the stale object.
         if not self._persist(record):
-            return False
-        admission = self._store.reserve(ReservationIntent(
-            identity=record.identity,
-            expected_launch_token=record.launch_token,
-            expected_revision=record.revision,
-            now=now,
-            daemon_generation=self._daemon_generation,
-            budget=PERMIT_BUDGET,
-            limits=limits,
-            route_cell_digest=None,
-        ))
+            return None
+        briefing = None
+        if self._briefing_resolver is not None and record.stage != "converse":
+            briefing = self._briefing_resolver.brief_for(
+                record.repo, record.stage, record.subject_revision)
+            from agentflow.effective_policy import HoldBriefing
+            if type(briefing) is HoldBriefing:
+                from agentflow.coordinator.store import AdmissionRefused
+                raise AdmissionRefused(briefing.hold_code)
+        common = {
+            "identity": record.identity,
+            "expected_launch_token": record.launch_token,
+            "expected_revision": record.revision,
+            "now": now,
+            "daemon_generation": self._daemon_generation,
+            "budget": PERMIT_BUDGET,
+            "limits": limits,
+        }
+        if self._store.composed_admission:
+            if not record.route_cell_digest or capability is None:
+                from agentflow.coordinator.store import AdmissionRefused
+                raise AdmissionRefused("admission_identity_migration_required")
+            admission = self._store.reserve(ReservationIntent(
+                **common, briefing=briefing, capability=capability,
+                route_cell_digest=record.route_cell_digest))
+        else:
+            admission = self._store.reserve_legacy(LegacyReservationIntent(
+                **common, route_cell_digest=record.route_cell_digest or None))
         if admission is None:
-            return False
+            return None
         for item in fields(Record):
             setattr(record, item.name, getattr(admission.successor, item.name))
-        return True
+        return admission
 
     def _emit_deferral(self, record: Record, now: int, reason: str | None) -> None:
         """Log why the admission gate refused this waiting record (#436), from the reason
@@ -1341,6 +1452,39 @@ def _identity(repo: str, subject: str, stage: str, target: str | None, round: in
     if uncertainty_handoffs:
         parts.append(f"u{uncertainty_handoffs}")
     return "|".join(parts)
+
+
+_COMMIT_REVISION = re.compile(r"^[a-f0-9]{40}$")
+
+
+def _subject_revision(submission: Submission) -> str:
+    """Capture the one source commit before the first durable write."""
+    if type(submission.target) is str and _COMMIT_REVISION.fullmatch(submission.target):
+        return submission.target
+    if type(submission.input_ptr) is str:
+        try:
+            source_ref = json.loads(submission.input_ptr).get("source_ref")
+        except (TypeError, ValueError, AttributeError):
+            source_ref = None
+        if type(source_ref) is str and _COMMIT_REVISION.fullmatch(source_ref):
+            return source_ref
+    candidates = []
+    if submission.source:
+        candidates.append((submission.source, "HEAD"))
+    if submission.capability_root:
+        candidates.append((submission.capability_root, "origin/main"))
+    for root, ref in candidates:
+        try:
+            result = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        revision = result.stdout.strip()
+        if result.returncode == 0 and _COMMIT_REVISION.fullmatch(revision):
+            return revision
+    return ""
 
 
 def _refusal_state(record: Record):

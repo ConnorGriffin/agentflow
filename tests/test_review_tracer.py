@@ -411,18 +411,26 @@ def test_successor_transfer_is_the_same_transition_for_review_to_revise(make_coo
     fake = FakeSession()
     adapter = _router(fake, pr=[False], verdict=[True], prep=[True])
     coord = make_coord(fake, adapter=adapter, gate=tracer.build_review_revise_gate)
+    review_revision = "e" * 40
     review = coord.submit_stage(_review("7", pool="codex", builder_lineage="claude",
-                                        target="head-sha"))
+                                        target=review_revision))
     coord.cycle("codex")
     fake.end(review, cause=ProviderCause.PROCESS)
     coord.cycle("codex")
 
     revise = coord.submit_stage(Submission(
-        repo="o/r", subject="7", stage="revise", pool="claude", target="head-sha",
-        builder_lineage="claude", source="/wt/issue-7", transfer_from=review))
+        repo="o/r", subject="7", stage="revise", pool="claude", target=review_revision,
+        builder_lineage="claude", source="/wt/issue-7", transfer_from=review,
+        subject_revision="f" * 40))
     records = {r.identity: r for r in _records(coord)}
     assert records[review].retired is True and records[review].claim is False
     assert records[revise].retired is False and records[revise].claim is True
+    assert records[revise].subject_revision == "f" * 40
+    review_route = (records[review].route_id, records[review].route_cell_digest,
+                    records[review].launch_config_digest)
+    revise_route = (records[revise].route_id, records[revise].route_cell_digest,
+                    records[revise].launch_config_digest)
+    assert all(review_route) and all(revise_route) and revise_route != review_route
 
 
 def test_existing_successor_assumes_claim_durably_without_duplication(make_coord):
@@ -1398,6 +1406,7 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     sub = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
     assert sub is not None
     assert sub.stage == "review" and sub.target == "head-sha-123"
+    assert sub.subject_revision == "head-sha-123"
     assert sub.pool == "codex" and sub.builder_lineage == "claude"     # cross-tool reviewer
     assert sub.transfer_from == "o/r|7|build|-"                        # assumes the build's claim
     assert sub.complexity == "deep"                                   # review is the deep net
@@ -1865,7 +1874,7 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
     monkeypatch.setattr(loop, "pick_reviewer", lambda author, **kwargs: "claude")
     claimed = []
     monkeypatch.setattr(loop, "claim", lambda repo, issue, _label: claimed.append(issue) or True)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/w"), 42) == "review submitted"
@@ -1954,7 +1963,7 @@ def test_manual_review_resume_keeps_the_three_pass_ceiling_and_park_truth(
         lambda *_args, **_kwargs: (ReviewAssignment(reason="one journey"), ()))
     monkeypatch.setattr(loop, "pick_reviewer", lambda _author, **_kwargs: "codex")
     monkeypatch.setattr(loop, "claim", lambda *_args: True)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/work"), 42) == "review submitted"

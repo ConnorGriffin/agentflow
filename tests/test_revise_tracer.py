@@ -934,6 +934,7 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
     sub = coordinated_revise.revise_submission(review, "deep", "- fix the thing")
     assert sub is not None
     assert sub.stage == "revise" and sub.target == "sha-a"            # revises away from reviewed SHA
+    assert sub.subject_revision == "sha-a"
     assert sub.pool == "claude" and sub.builder_lineage == "claude"   # the builder's tool lineage
     assert sub.complexity == "deep"                                   # the original builder complexity
     assert sub.round == review.round                                  # stays in the review's round
@@ -1087,7 +1088,7 @@ def test_completed_conflict_revise_reopens_a_review_with_the_discard_lens(make_c
     assert record_of(coord, conflict).retired is True
 
 
-def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
+def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding(make_coord):
     """The pure survivor conflict-Revise mapping: pinned to the builder's tool and retained
     worktree, bound to the conflicting head, marked a continuation, carrying the ADR's finding."""
     cfg = SimpleNamespace(repo="o/r", workdir="/w")
@@ -1097,11 +1098,18 @@ def test_conflict_revise_submission_maps_to_the_builder_lineage_and_finding():
     assert sub is not None
     assert sub.stage == "revise" and sub.pool == "claude" and sub.builder_lineage == "claude"
     assert sub.target == "sha-conf" and sub.conflict_round == 1 and sub.continuation is True
+    assert sub.subject_revision == "sha-conf"
     assert sub.effort is None and sub.builder_effort is None
     assert sub.transfer_from is None                      # a survivor owns the claim directly
     assert sub.source == "/w/.agentflow/worktrees/claude/issue-7-fix"
     assert sub.capability_context == {"ui": False}
     assert "resolve the merge conflicts" in sub.input_ptr and "Preserve both sides" in sub.input_ptr
+    coord = make_coord()
+    identity = coord.submit_stage(sub)
+    durable = record_of(coord, identity)
+    assert durable is not None
+    assert durable.subject_revision == "sha-conf"
+    assert all((durable.route_id, durable.route_cell_digest, durable.launch_config_digest))
     # An unknown tool has no lineage to pin the Revise to.
     assert coordinated_revise.survivor_conflict_revise_submission(
         cfg, issue=7, slug="fix", builder_tool="gemini", head_sha="sha-conf", pr_number=42,

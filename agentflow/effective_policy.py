@@ -10,7 +10,9 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import re
+import subprocess
 from types import MappingProxyType
+from pathlib import Path
 import unicodedata
 from typing import Any, Mapping, Protocol
 
@@ -475,6 +477,50 @@ class RepositoryOverlaySource(Protocol):
     def read(self, repository: str, subject_revision: str) -> OverlayV1 | None: ...
 
 
+class ExactRevisionRepositoryOverlaySource:
+    """Read the sole production overlay object without observing a mutable checkout.
+
+    ``git show <revision>:<path>`` addresses the object directly in the enrolled local
+    repository.  It neither changes HEAD nor needs a network; the resolver deliberately
+    translates every malformed/unavailable result to its existing ``invalid_overlay`` hold.
+    """
+
+    _PATH = ".agentflow/briefing-overlay-v1.json"
+
+    def __init__(self, repositories: Mapping[str, str | Path]) -> None:
+        self._repositories = {name: Path(path) for name, path in repositories.items()}
+
+    def read(self, repository: str, subject_revision: str) -> OverlayV1 | None:
+        root = self._repositories.get(repository)
+        if root is None or not _SUBJECT_REVISION.fullmatch(subject_revision):
+            raise PolicyValidationError("overlay repository or revision is unavailable")
+        try:
+            result = subprocess.run(
+                ["git", "show", f"{subject_revision}:{self._PATH}"], cwd=root,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise PolicyValidationError("overlay object is unreadable") from error
+        if result.returncode:
+            # Only an absent entry in the exact commit tree means no overlay.  A tree that names
+            # the path but whose blob cannot be read is corrupt authority, never inferred absence.
+            try:
+                probe = subprocess.run(
+                    ["git", "ls-tree", "-z", "--full-tree", subject_revision, "--", self._PATH],
+                    cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, check=False, timeout=5)
+            except (OSError, subprocess.SubprocessError) as error:
+                raise PolicyValidationError("overlay object is unreadable") from error
+            if probe.returncode:
+                raise PolicyValidationError("overlay revision is unavailable")
+            if not probe.stdout:
+                return None
+            raise PolicyValidationError("overlay object is unreadable")
+        if len(result.stdout) > _MAX_OVERLAY_BYTES:
+            raise PolicyValidationError("overlay exceeds byte limit")
+        return OverlayV1.parse(result.stdout)
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicabilityFacts:
     repository_scope: str
@@ -610,6 +656,18 @@ class HoldBriefing(BriefingV1):
             "status": self.status,
             "subject_revision": self.subject_revision,
         }
+
+
+def validate_briefing(value: object) -> bool:
+    """Revalidate one closed briefing after it crosses a process/owner boundary."""
+    if type(value) not in {ReadyBriefing, NotApplicableBriefing, HoldBriefing}:
+        return False
+    try:
+        _briefing_identity(value, value.status)
+        _validate_finished(value.value())
+    except Exception:
+        return False
+    return True
 
 
 def _finish(value: dict[str, object]) -> tuple[str, str, bytes]:

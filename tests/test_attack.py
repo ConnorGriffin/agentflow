@@ -133,7 +133,8 @@ def test_the_published_brief_says_what_the_argument_cost():
 
 class _Record:
     def __init__(self, stage, *, round=0, source="", input_ptr="", pool="claude",
-                 identity="o/r|380|x|-", outcome=None, target=None):
+                 identity="o/r|380|x|-", outcome=None, target=None,
+                 subject_revision="a" * 40):
         self.repo = "o/r"
         self.subject = "380"
         self.target = target
@@ -148,6 +149,7 @@ class _Record:
         self.effort = None
         self.builder_complexity = None
         self.hold_reason = None
+        self.subject_revision = subject_revision
 
 
 def _draft(complexity=Complexity.DEEP):
@@ -175,6 +177,7 @@ def _attack_record(draft=None, *, round=1, **kwargs):
 def test_a_ready_draft_opens_a_cold_attack_that_assumes_the_claim():
     submission = coordinated_attack.attack_submission(_intake_record(), _draft(), "codex")
     assert submission.stage == "attack" and submission.round == 1
+    assert submission.subject_revision == "a" * 40
     assert submission.transfer_from == "o/r|380|intake|-"
     payload = json.loads(submission.input_ptr)
     assert payload["base_prompt"] == "THE GROUNDING PROMPT", \

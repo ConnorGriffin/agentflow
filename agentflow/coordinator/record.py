@@ -54,6 +54,13 @@ class Record:
     repo: str = ""         # the originating repo — kept for the ADR 0028 logs and claim ownership
     subject: str = ""      # the issue/PR subject — kept for the ADR 0028 logs and claim ownership
     target: str | None = None  # immutable target (head SHA / comment id), part of the identity
+    # #627 binds a logical stage to the one source observation and one immutable route chosen
+    # at submission.  Empty values are readable legacy sentinels only; composed admission
+    # refuses them rather than reconstructing them from mutable state.
+    subject_revision: str = ""
+    route_id: str = ""
+    route_cell_digest: str = ""
+    launch_config_digest: str = ""
     continuation: bool = False   # eligible ahead of cold work on its pool (ADR 0028 order)
     eligible_at: int = 0         # when a paused continuation may be admitted again
     created_at: int = 0          # epoch of first submission: continuation-queue tie-breaker, and
