@@ -917,7 +917,8 @@ class ClaudeRunner(_WorktreeRunner):
     _REASONING_LADDER = ("low", "medium", "high", "xhigh", "max")
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
-                        schema: dict | None = None, profile=None) -> list[str]:
+                        schema: dict | None = None, profile=None,
+                        cli_model: str | None = None) -> list[str]:
         """Build the structured Claude command run only by the coordinator launcher.
 
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
@@ -946,7 +947,7 @@ class ClaudeRunner(_WorktreeRunner):
         from agentflow.routing import routing
         deny: tuple[str, ...] = ()
         argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model",
-                routing.cli_identifier("claude", model),
+                cli_model or routing.cli_identifier("claude", model),
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
                 "--strict-mcp-config"]
@@ -980,7 +981,8 @@ class CodexRunner(_WorktreeRunner):
     _REASONING_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
-                        schema: dict | None = None, profile=None) -> list[str]:
+                        schema: dict | None = None, profile=None,
+                        cli_model: str | None = None) -> list[str]:
         """Build the structured Codex command run only by the coordinator launcher.
 
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
@@ -1013,7 +1015,8 @@ class CodexRunner(_WorktreeRunner):
         approval_policy = 'approval_policy="on-request"'
         read_only = profile is not None and profile.allowed_tools is not None
         sandbox = "read-only" if read_only else "workspace-write"
-        argv = [codex_bin, "exec", "-m", routing.cli_identifier("codex", model), "--json",
+        argv = [codex_bin, "exec", "-m",
+                cli_model or routing.cli_identifier("codex", model), "--json",
                 "--sandbox", sandbox, "--cd", worktree,
                 "--ignore-user-config", "-c", approval_policy,
                 "-c", 'approvals_reviewer="auto_review"',

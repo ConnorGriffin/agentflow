@@ -202,6 +202,21 @@ def _build_lease(complexity: str | None, effort: str | None) -> tuple[int, int, 
                                                             _BUILD_LEASE_DEFAULT["deep"]))
 
 
+def profile_for_facts(stage: str, complexity: str | None = None,
+                      effort: str | None = None,
+                      builder_complexity: str | None = None) -> StageProfile:
+    """Resolve one production profile without requiring a coordinator Record."""
+    if stage == "build":
+        _wall, turns = _build_ceiling(complexity, effort)
+        lease = _build_lease(complexity, effort)
+        return StageProfile(None, lease[2], turns, "low", lease)
+    if stage == "revise":
+        wall, turns = _build_ceiling(builder_complexity or complexity, effort)
+        return StageProfile(None, wall, turns, "low")
+    wall, turns = _STAGE_CEILINGS.get(stage, _DEFAULT_CEILING)
+    return StageProfile(_READ_ONLY_TOOLS.get(stage), wall, turns)
+
+
 def profile_for(record) -> StageProfile:
     """Resolve the session profile for a record from its ``(stage, complexity, effort)``.
 
@@ -211,13 +226,5 @@ def profile_for(record) -> StageProfile:
     surface (``allowed_tools is None``). Both session leads run at low reasoning; their worker
     reasoning rung is prompt-level routing policy, not a provider flag on the parent.
     """
-    stage = record.stage
-    if stage == "build":
-        _wall, turns = _build_ceiling(record.complexity, record.effort)
-        lease = _build_lease(record.complexity, record.effort)
-        return StageProfile(None, lease[2], turns, "low", lease)
-    if stage == "revise":
-        wall, turns = _build_ceiling(record.builder_complexity or record.complexity, record.effort)
-        return StageProfile(None, wall, turns, "low")
-    wall, turns = _STAGE_CEILINGS.get(stage, _DEFAULT_CEILING)
-    return StageProfile(_READ_ONLY_TOOLS.get(stage), wall, turns)
+    return profile_for_facts(
+        record.stage, record.complexity, record.effort, record.builder_complexity)

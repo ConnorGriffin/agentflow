@@ -73,9 +73,12 @@ class LocalLauncher:
         self._session_timeout = session_timeout
         self._build_lease = build_lease
 
-    def _session_timeout_for(self, record) -> float:
+    def _session_timeout_for(self, record, admitted=None) -> float:
         """The wall-clock ceiling for this launch: an explicit constructor override, else the
         ``AGENTFLOW_SESSION_TIMEOUT`` ops override, else the record's stage-profile wall ceiling."""
+        if admitted is not None:
+            from agentflow.coordinator.providers import _validated_admitted_launch
+            return float(_validated_admitted_launch(record, admitted).wall_ceiling_s)
         if self._session_timeout is not None:
             return self._session_timeout
         override = os.environ.get("AGENTFLOW_SESSION_TIMEOUT")
@@ -84,12 +87,15 @@ class LocalLauncher:
         from agentflow.coordinator.profiles import profile_for
         return float(profile_for(record).wall_ceiling_s)
 
-    def _build_lease_for(self, record) -> tuple[float, float, float] | None:
+    def _build_lease_for(self, record, admitted=None) -> tuple[float, float, float] | None:
         """Return Build's progress lease unless an operator pinned a fixed timeout.
 
         Constructor and environment overrides are intentionally a complete replacement for
         supervision policy: they retain the fixed, non-renewable timeout operators already use.
         """
+        if admitted is not None:
+            from agentflow.coordinator.providers import _validated_admitted_launch
+            return _validated_admitted_launch(record, admitted).build_lease
         if record.stage != "build" or self._session_timeout is not None:
             return None
         if os.environ.get("AGENTFLOW_SESSION_TIMEOUT"):
@@ -105,21 +111,22 @@ class LocalLauncher:
         family it started, so it also answers the liveness the coordinator reconciles on."""
         return pid_family_alive(family)
 
-    def start(self, record, store) -> StartResult:
+    def start(self, record, store, admitted=None) -> StartResult:
         token = record.launch_token
         try:
-            command = self._provider_command(record)
+            command = (self._provider_command(record, admitted) if admitted is not None
+                       else self._provider_command(record))
         except OSError:
             return StartResult(NOT_STARTED)
         argv = [str(a) for a in command]
-        lease = self._build_lease_for(record)
+        lease = self._build_lease_for(record, admitted)
         lease_args = (["--build-lease", record.pool,
                        *(str(value) for value in lease)] if lease else [])
         try:
             child = subprocess.Popen(
                 [sys.executable, "-m", "agentflow.coordinator._launch_child",
                  str(store.path), record.identity, str(token),
-                 str(self._session_timeout_for(record)),
+                 str(self._session_timeout_for(record, admitted)),
                  *lease_args,
                  _INHERITED_WORKTREE if record.source else _NO_WORKTREE,
                  *argv], cwd=record.source or None)

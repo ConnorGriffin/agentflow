@@ -14,7 +14,7 @@ import json
 import sqlite3
 import threading
 import time
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Literal, Mapping, Protocol
 from uuid import uuid4
 
 from agentflow.evidence import EvidenceError, PromotionReceipt
@@ -35,6 +35,14 @@ def _digest(value: object) -> str:
     return sha256(_canonical_bytes(value)).hexdigest()
 
 
+def canonical_result_schema(schema: Mapping[str, object] | None) -> tuple[str | None, str | None]:
+    """Return the canonical compact provider-neutral schema and its lowercase SHA-256."""
+    if schema is None:
+        return None, None
+    text = _launch_canonical_text(schema)
+    return text, sha256(text.encode("utf-8")).hexdigest()
+
+
 def _state_id(cell_key: str, active: str, quarantined: str | None,
               generation: int) -> str:
     return _digest({"cell_key": cell_key, "active": active,
@@ -53,6 +61,131 @@ DEPENDENCY_RECEIPTS = {
 
 class SafetyRefused(RuntimeError):
     """The requested action is outside the bounded automatic authority."""
+
+
+@dataclass(frozen=True, slots=True)
+class LaunchConfigV1:
+    """The complete immutable launch policy registered for one RouteCell."""
+
+    schema: Literal["agentflow-launch-v1"]
+    provider: Literal["claude", "codex"]
+    internal_model: str
+    cli_model: str
+    stage_profile_id: str
+    reasoning_effort: str | None
+    turn_ceiling: int
+    wall_ceiling_s: int
+    build_lease: tuple[int, int, int] | None
+    allowed_tools: tuple[str, ...] | None
+    sandbox_policy: Literal["read-only", "workspace-write"]
+    result_schema_json: str | None
+    result_schema_digest: str | None
+
+    def __post_init__(self) -> None:
+        if type(self.schema) is not str or self.schema != "agentflow-launch-v1":
+            raise SafetyRefused("invalid launch configuration schema")
+        if type(self.provider) is not str or self.provider not in {"claude", "codex"}:
+            raise SafetyRefused("invalid launch configuration provider")
+        for name in ("internal_model", "cli_model", "stage_profile_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise SafetyRefused(f"invalid launch configuration {name}")
+        if self.reasoning_effort is not None and (
+                type(self.reasoning_effort) is not str or not self.reasoning_effort):
+            raise SafetyRefused("invalid launch configuration reasoning_effort")
+        for name in ("turn_ceiling", "wall_ceiling_s"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise SafetyRefused(f"invalid launch configuration {name}")
+        if self.build_lease is not None and (
+                type(self.build_lease) is not tuple or len(self.build_lease) != 3
+                or any(type(value) is not int or value <= 0 for value in self.build_lease)
+                or not (self.build_lease[0] <= self.build_lease[1] <= self.build_lease[2])
+                or not self.stage_profile_id.startswith("build/")):
+            raise SafetyRefused("invalid launch configuration build_lease")
+        if self.allowed_tools is not None and (
+                type(self.allowed_tools) is not tuple or not self.allowed_tools
+                or any(type(tool) is not str or not tool for tool in self.allowed_tools)):
+            raise SafetyRefused("invalid launch configuration allowed_tools")
+        if (type(self.sandbox_policy) is not str
+                or self.sandbox_policy not in {"read-only", "workspace-write"}):
+            raise SafetyRefused("invalid launch configuration sandbox_policy")
+        if ((self.allowed_tools is not None) != (self.sandbox_policy == "read-only")):
+            raise SafetyRefused("launch sandbox and tool policy disagree")
+        if (self.result_schema_json is None) != (self.result_schema_digest is None):
+            raise SafetyRefused("launch result schema fields must be null together")
+        if self.result_schema_json is not None:
+            if type(self.result_schema_json) is not str or type(self.result_schema_digest) is not str:
+                raise SafetyRefused("invalid launch result schema fields")
+            try:
+                schema = _load_unique_json(self.result_schema_json)
+            except (TypeError, ValueError, UnicodeError) as error:
+                raise SafetyRefused("invalid launch result schema JSON") from error
+            if (not isinstance(schema, dict)
+                    or _launch_canonical_text(schema) != self.result_schema_json
+                    or sha256(self.result_schema_json.encode("utf-8")).hexdigest()
+                    != self.result_schema_digest):
+                raise SafetyRefused("invalid launch result schema digest")
+
+
+_LAUNCH_CONFIG_FIELDS = tuple(LaunchConfigV1.__dataclass_fields__)
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate object member")
+        result[key] = value
+    return result
+
+
+def _reject_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant {value}")
+
+
+def _load_unique_json(value: str) -> object:
+    return json.loads(value, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+
+
+def _launch_canonical_text(value: object) -> str:
+    return json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False)
+
+
+def encode_launch_config(config: LaunchConfigV1) -> bytes:
+    if type(config) is not LaunchConfigV1:
+        raise SafetyRefused("launch configuration must be the exact v1 value")
+    return _launch_canonical_text(asdict(config)).encode("utf-8")
+
+
+def launch_config_digest(config: LaunchConfigV1) -> str:
+    return sha256(encode_launch_config(config)).hexdigest()
+
+
+def decode_launch_config(content: bytes) -> LaunchConfigV1:
+    """Decode only exact canonical ``agentflow-launch-v1`` bytes."""
+    if type(content) is not bytes:
+        raise SafetyRefused("launch configuration must be UTF-8 bytes")
+    try:
+        raw = _load_unique_json(content.decode("utf-8"))
+    except (UnicodeError, ValueError, TypeError) as error:
+        raise SafetyRefused("launch configuration is unreadable") from error
+    if not isinstance(raw, dict) or set(raw) != set(_LAUNCH_CONFIG_FIELDS):
+        raise SafetyRefused("launch configuration fields are not closed v1")
+    values = dict(raw)
+    if isinstance(values["build_lease"], list):
+        values["build_lease"] = tuple(values["build_lease"])
+    if isinstance(values["allowed_tools"], list):
+        values["allowed_tools"] = tuple(values["allowed_tools"])
+    try:
+        config = LaunchConfigV1(**values)
+    except TypeError as error:
+        raise SafetyRefused("launch configuration fields are malformed") from error
+    if encode_launch_config(config) != content:
+        raise SafetyRefused("launch configuration is not canonical UTF-8 JSON")
+    return config
 
 
 @dataclass(frozen=True)
@@ -171,6 +304,45 @@ class RouteCell:
 class ResolvedLaunch:
     route_cell: RouteCell
     config_bytes: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class AdmittedLaunch:
+    """One verified, decoded envelope shared by argv construction and supervision."""
+
+    route_cell: RouteCell
+    launch_config: LaunchConfigV1
+
+
+def decode_admitted_launch(resolved: ResolvedLaunch) -> AdmittedLaunch:
+    if type(resolved) is not ResolvedLaunch or type(resolved.route_cell) is not RouteCell:
+        raise SafetyRefused("resolved launch has an invalid shape")
+    cell = resolved.route_cell
+    config = decode_launch_config(resolved.config_bytes)
+    body = {
+        "repository": cell.repository,
+        "stage": cell.stage,
+        "provider": cell.provider,
+        "model": cell.model,
+        "route_id": cell.route_id,
+        "launch_config_digest": cell.launch_config_digest,
+    }
+    if (_digest(body) != cell.digest
+            or sha256(resolved.config_bytes).hexdigest() != cell.launch_config_digest):
+        raise SafetyRefused("admitted launch digests do not bind its content")
+    if config.provider != cell.provider or config.internal_model != cell.model:
+        raise SafetyRefused("launch configuration provider/model mismatch")
+    if cell.route_id != f"production/{config.stage_profile_id}":
+        raise SafetyRefused("launch configuration route identity mismatch")
+    profile = config.stage_profile_id.split("/")
+    efforts = {"default", "low", "medium", "high", "extra"}
+    if cell.stage in {"build", "revise"}:
+        if (len(profile) != 3 or profile[0] != cell.stage
+                or profile[1] not in {"standard", "deep"} or profile[2] not in efforts):
+            raise SafetyRefused("launch configuration stage profile mismatch")
+    elif config.stage_profile_id != cell.stage:
+        raise SafetyRefused("launch configuration stage profile mismatch")
+    return AdmittedLaunch(cell, config)
 
 
 @dataclass(frozen=True)
@@ -499,8 +671,10 @@ class OperationalSafety:
 
     def register_route_cell(
             self, repository: str, stage: str, provider: str, model: str,
-            route_id: str, launch_config: Mapping[str, object]) -> RouteCell:
-        config_bytes = _canonical_bytes(launch_config)
+            route_id: str, launch_config: Mapping[str, object] | LaunchConfigV1) -> RouteCell:
+        config_bytes = (encode_launch_config(launch_config)
+                        if type(launch_config) is LaunchConfigV1
+                        else _canonical_bytes(launch_config))
         config_digest = sha256(config_bytes).hexdigest()
         body = {
             "repository": repository,
@@ -511,6 +685,8 @@ class OperationalSafety:
             "launch_config_digest": config_digest,
         }
         cell = RouteCell(**body, digest=_digest(body))
+        if type(launch_config) is LaunchConfigV1:
+            decode_admitted_launch(ResolvedLaunch(cell, config_bytes))
         with self._transaction():
             row = self._conn.execute(
                 "SELECT content FROM safety_launch_configs WHERE digest = ?",
@@ -1240,7 +1416,9 @@ class OperationalSafety:
             decoded = json.loads(content)
         except (TypeError, ValueError, UnicodeDecodeError) as error:
             raise SafetyRefused("stored launch configuration is unreadable") from error
-        if not isinstance(decoded, dict) or _canonical_bytes(decoded) != content:
+        if isinstance(decoded, dict) and decoded.get("schema") == "agentflow-launch-v1":
+            decode_launch_config(content)
+        elif not isinstance(decoded, dict) or _canonical_bytes(decoded) != content:
             raise SafetyRefused("stored launch configuration is not canonical")
         return content
 

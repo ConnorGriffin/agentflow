@@ -24,18 +24,20 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping, TypeAlias
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, TypeAlias
 from uuid import uuid4
 
 from agentflow.state import state_dir as _state_dir, state_path
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 from agentflow.operational_safety import (
+    AdmittedLaunch,
     ActionIdempotentRerunEffect,
     CheckEvidenceAuthority,
     OperationalSafety,
     PromotionReceiptAuthority as SafetyPromotionReceiptAuthority,
     ResolvedLaunch,
     SafetyRefused,
+    decode_admitted_launch,
     _AdmissionContext,
     _SafetyAdmissionResult,
 )
@@ -91,6 +93,24 @@ def default_store_path() -> Path:
 class StoreUnavailable(RuntimeError):
     """The store could not be read or is a schema this build does not understand. The
     coordinator treats this as fail-closed: no starts, no claim changes."""
+
+
+RouteAdmissionCode = Literal["missing", "stale", "mismatched", "unreadable", "quarantined"]
+ROUTE_ADMISSION_REFUSAL_CODES = {
+    "missing", "stale", "mismatched", "unreadable", "quarantined",
+}
+
+
+class RouteAdmissionRefused(RuntimeError):
+    """Closed Store-boundary refusal; private diagnostics never cross this seam."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: RouteAdmissionCode) -> None:
+        if type(code) is not str or code not in ROUTE_ADMISSION_REFUSAL_CODES:
+            raise TypeError("unknown route admission refusal code")
+        self.code = code
+        super().__init__(code)
 
 
 @dataclass(frozen=True)
@@ -672,6 +692,77 @@ class Store:
                 raise StoreUnavailable("route resolution record revision changed")
             return self._operational_safety.resolve(
                 record.repo, record.stage, record.pool, record.model, route_id)
+
+    def resolve_admitted_launch(self, stage_identity: str, expected_revision: int,
+                                route_id: str) -> AdmittedLaunch:
+        """Resolve and decode one active route, exposing only a closed refusal code."""
+        if self._operational_safety is None:
+            raise RouteAdmissionRefused("unreadable")
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (stage_identity,)).fetchone()
+                if row is None:
+                    raise RouteAdmissionRefused("missing")
+                record = self._decode(row[0])
+                if record.revision != expected_revision:
+                    raise RouteAdmissionRefused("stale")
+                routes = self._conn.execute(
+                    "SELECT repository, stage, provider, model FROM safety_route_cells"
+                    " WHERE route_id = ?", (route_id,)).fetchall()
+                if not routes:
+                    raise RouteAdmissionRefused("missing")
+                identity = (record.repo, record.stage, record.pool, record.model)
+                if identity not in routes:
+                    raise RouteAdmissionRefused("mismatched")
+                resolved = self._operational_safety.resolve(*identity, route_id)
+                state = self._operational_safety.route_state(resolved.route_cell.digest)
+                if state.quarantined:
+                    raise RouteAdmissionRefused("quarantined")
+                return decode_admitted_launch(resolved)
+            except RouteAdmissionRefused:
+                raise
+            except (SafetyRefused, StoreUnavailable, sqlite3.DatabaseError, ValueError, TypeError):
+                raise RouteAdmissionRefused("unreadable") from None
+
+    def consume_admitted_launch(self, stage_identity: str, expected_revision: int,
+                                route_id: str, *, reserve, before_reserve=None):
+        """Invoke an injected reserve seam only while the decoded active digest stays exact."""
+        with self._lock:
+            admitted = self.resolve_admitted_launch(
+                stage_identity, expected_revision, route_id)
+            if before_reserve is not None:
+                before_reserve()
+            try:
+                current = self.resolve_admitted_launch(
+                    stage_identity, expected_revision, route_id)
+            except RouteAdmissionRefused as error:
+                if error.code in {"missing", "stale", "mismatched", "quarantined"}:
+                    raise RouteAdmissionRefused("stale") from None
+                raise
+            if current.route_cell.digest != admitted.route_cell.digest:
+                raise RouteAdmissionRefused("stale")
+            return reserve(admitted)
+
+    def register_route_selection(self, selection):
+        """Register one exact routing-owned selection through this Store's sealed owner."""
+        if self._operational_safety is None:
+            raise StoreUnavailable("route registration is not configured")
+        from agentflow.routing import RouteSelection, routing
+        if type(selection) is not RouteSelection:
+            raise TypeError("route registration requires the exact frozen selection")
+        if routing.cli_identifier(selection.provider, selection.model) \
+                != selection.launch_config.cli_model:
+            raise SafetyRefused("route selection CLI model does not match routing")
+        return self._operational_safety.register_route_cell(
+            selection.repository, selection.stage, selection.provider, selection.model,
+            selection.route_id, selection.launch_config)
+
+    def route_cell_state(self, route_cell_digest: str):
+        """Read verified RouteCell state through this Store's sealed owner."""
+        if self._operational_safety is None:
+            raise StoreUnavailable("route state is not configured")
+        return self._operational_safety.route_state(route_cell_digest)
 
     def read_canary_attribution(
             self, stage_identity: str) -> CanaryAttribution | None:
