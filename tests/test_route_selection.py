@@ -206,6 +206,30 @@ def test_store_resolves_one_decoded_envelope_and_closes_refusal_codes(tmp_path):
     store.close()
 
 
+def test_store_resolution_uses_only_durable_route_selector_facts(monkeypatch, tmp_path):
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    record = Record(
+        "stage-persisted-646", "review", "codex", 1,
+        repo="octo/app", model="sol", complexity="deep")
+    stored, *_ = store.submit(record)
+    selection = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
+    store.register_route_selection(selection)
+    monkeypatch.setenv("AGENTFLOW_SESSION_TIMEOUT", "not-an-integer")
+    monkeypatch.setattr(routing, "_models", {})
+    monkeypatch.setattr(routing, "select_route", lambda *_args, **_kwargs: pytest.fail(
+        "Store reread current routing"))
+
+    admitted = store.resolve_admitted_launch(
+        stored.identity, stored.revision, selection.route_id)
+
+    assert admitted.launch_config == selection.launch_config
+    store.close()
+
+
 def test_store_registration_refuses_values_not_rematerialized_by_routing(tmp_path):
     store = Store(
         tmp_path / "coordinator.db",

@@ -552,9 +552,11 @@ def rematerialize_route_selection(selection: RouteSelection) -> RouteSelection:
         selection.repository, selection.stage, selection.provider, selection.model, **kwargs)
 
 
-def select_route_for_record(record) -> RouteSelection:
-    """Materialize the current routing identity a durable record requires."""
-    return routing.select_route(
-        record.repo, record.stage, record.pool, record.model,
-        complexity=record.complexity, effort=record.effort,
-        builder_complexity=record.builder_complexity)
+def logical_route_id_for_record(record) -> str:
+    """Derive only a durable record's logical route identity.
+
+    This deliberately reads no provider/model registry, profile, schema, or environment value:
+    an admitted RouteCell retains its registered artifact after any of those policy inputs move.
+    """
+    return "production/" + CapabilityRouting._stage_profile_id(
+        record.stage, record.complexity, record.effort, record.builder_complexity)
