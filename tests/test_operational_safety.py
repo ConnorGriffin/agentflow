@@ -17,6 +17,7 @@ from agentflow.coordinator.store import SCHEMA_VERSION, Store, StoreUnavailable
 from agentflow.evidence import (
     ApprovedAuthority,
     AuthorityPointer,
+    EvidenceError,
     EvidenceStore,
     PromotionReceipt,
     PromotionReceiptReader,
@@ -34,8 +35,10 @@ from agentflow.operational_safety import (
     ObservationRequest,
     OperationalSafety,
     OPERATIONAL_SAFETY_CONTRACT_DIGEST,
+    PROMOTION_VERIFIER,
     ROUTE_CELL_CONTRACT_DIGEST,
     SafetyRefused,
+    _state_id,
 )
 
 
@@ -67,17 +70,20 @@ class Checks:
 class Receipts:
     def __init__(self) -> None:
         self.receipts: dict[str, PromotionReceipt] = {}
+        self.unavailable = False
 
     def issue(self, request: CanaryActivationRequest, *,
               scope: str = "fleet-policy/0-to-1",
-              authoritative: bool = True) -> PromotionReceipt:
+              authoritative: bool = True,
+              verifier_id: str = "github-authority",
+              verifier_version: str = "v1") -> PromotionReceipt:
         pointer = AuthorityPointer(
             "github", "octo/governance", "pulls/584/files/canary.json",
             "a" * 40, "sha256", request.digest, scope,
         )
         approved = ApprovedAuthority(
             pointer, "approval-585", pointer.revision, pointer.content_hash,
-            pointer.scope, "github-merged-pr", "1", "verified",
+            pointer.scope, verifier_id, verifier_version, "verified",
         )
         receipt = PromotionReceipt(
             request.promotion_receipt_id, "candidate-585", approved.approval_id,
@@ -87,6 +93,8 @@ class Receipts:
         return receipt
 
     def read(self, receipt_id: str) -> PromotionReceipt:
+        if self.unavailable:
+            raise EvidenceError("receipt storage unavailable")
         return self.receipts[receipt_id]
 
 
@@ -98,19 +106,31 @@ class Reruns:
         self.entered = threading.Event()
         self.release = threading.Event()
         self.block = False
+        self.on_apply = None
+        self.transaction_states: list[bool] = []
+        self.conn = None
 
     def evidence_for(self, action_id: str) -> EffectEvidence | None:
+        if self.conn is not None:
+            self.transaction_states.append(self.conn.in_transaction)
         return self.effects.get(action_id)
 
     def apply(self, intent) -> EffectEvidence:
+        if self.conn is not None:
+            self.transaction_states.append(self.conn.in_transaction)
         if self.crash == "before_effect":
             raise RuntimeError("crash before effect")
+        existing = self.effects.get(intent.action_id)
+        if existing is not None:
+            return existing
         self.applied.append(intent.action_id)
         evidence = EffectEvidence(
             f"transport/reruns/{intent.action_id}",
             f"provider accepted action_id={intent.action_id}",
         )
         self.effects[intent.action_id] = evidence
+        if self.on_apply is not None:
+            self.on_apply()
         self.entered.set()
         if self.block:
             assert self.release.wait(2)
@@ -171,6 +191,25 @@ def passing_evidence(checks, cell, state):
     return tuple(refs)
 
 
+def write_promotion_receipt_db(path, *, verifier_id="github-authority",
+                               verifier_version="v1", content_hash="b" * 64,
+                               receipt_id="receipt-585"):
+    conn = sqlite3.connect(path)
+    conn.executescript(_V4_SCHEMA)
+    conn.execute("INSERT INTO candidates VALUES (?, ?, ?, ?)", (
+        "candidate-585", content_hash, 1, 1))
+    conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        "candidate-585", receipt_id, "approval-585", 1, 2, "verified",
+        "github", "octo/governance", "pulls/584/files/canary.json", "a" * 40,
+        "sha256", content_hash, "fleet-policy/0-to-1", verifier_id, verifier_version,
+        "verified", "a" * 40, content_hash, "fleet-policy/0-to-1",
+        "github-merged-pr-v1",
+    ))
+    conn.execute("PRAGMA user_version = 4")
+    conn.commit()
+    conn.close()
+
+
 def test_dependency_and_registry_receipts_are_exact():
     assert DEPENDENCY_RECEIPTS == {
         "issue_582_merge": "a58dc0c84a7459774631048a67b3e71f8328d144",
@@ -185,9 +224,10 @@ def test_dependency_and_registry_receipts_are_exact():
     assert ROUTE_CELL_CONTRACT_DIGEST == (
         "c762ed469c4c2a311391898196713b26a2dbe2985896c262ea05a425368f63a5")
     assert OPERATIONAL_SAFETY_CONTRACT_DIGEST == (
-        "c362e0e7552990353c17f2f1b4c7daee5b8b821ca154df650fad8d8d0c281354")
+        "4a78101a35168ae33fab177d2eda21a33928caa5b9e124bdb8b478691dbffae6")
+    assert PROMOTION_VERIFIER == ("github-authority", "v1")
     assert ACTION_STATE_MAP == {
-        "rerun": "claimed -> single_flight_effect_reconciled -> result_committed",
+        "rerun": "claimed -> effect_lease_claimed -> idempotent_effect -> result_committed",
         "quarantine": "claimed -> exact_cell_quarantined + result_committed",
         "rollback": "claimed -> predecessor_pointer_restored + result_committed",
     }
@@ -242,6 +282,71 @@ def test_every_route_read_recomputes_content_digests(safety, target, reader):
             owner.participate_in_admission(store._conn, cell.digest)
 
 
+@pytest.mark.parametrize("reader", ["resolve", "admission"])
+@pytest.mark.parametrize("column", [
+    "cell_key", "active_digest", "quarantined_digest",
+    "quarantine_action_id", "safety_state_id", "generation",
+])
+def test_every_route_state_column_is_revalidated_on_read_and_admission(
+        safety, column, reader):
+    owner, store, _checks, _receipts, _reruns = safety
+    cell = route(owner)
+    row = store._conn.execute(
+        "SELECT cell_key, active_digest, quarantined_digest, quarantine_action_id,"
+        " safety_state_id, generation FROM safety_route_state WHERE cell_key = ?",
+        (cell.key,)).fetchone()
+    if column == "cell_key":
+        store._conn.execute(
+            "UPDATE safety_route_state SET cell_key = ? WHERE cell_key = ?",
+            ("f" * 64, cell.key))
+    elif column == "active_digest":
+        other = route(owner, route_id="other-cell")
+        store._conn.execute(
+            "UPDATE safety_route_state SET active_digest = ?, safety_state_id = ?"
+            " WHERE cell_key = ?",
+            (other.digest, _state_id(cell.key, other.digest, None, row[5]), cell.key))
+    elif column == "quarantined_digest":
+        store._conn.execute(
+            "UPDATE safety_route_state SET quarantined_digest = ?, safety_state_id = ?"
+            " WHERE cell_key = ?",
+            (cell.digest, _state_id(cell.key, cell.digest, cell.digest, row[5]), cell.key))
+    elif column == "quarantine_action_id":
+        store._conn.execute(
+            "UPDATE safety_route_state SET quarantine_action_id = ? WHERE cell_key = ?",
+            ("forged-action", cell.key))
+    elif column == "safety_state_id":
+        store._conn.execute(
+            "UPDATE safety_route_state SET safety_state_id = ? WHERE cell_key = ?",
+            ("forged-state", cell.key))
+    else:
+        store._conn.execute(
+            "UPDATE safety_route_state SET generation = ?, safety_state_id = ?"
+            " WHERE cell_key = ?",
+            (-1, _state_id(cell.key, cell.digest, None, -1), cell.key))
+
+    with pytest.raises(SafetyRefused):
+        if reader == "resolve":
+            owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
+        else:
+            owner.participate_in_admission(store._conn, cell.digest)
+
+
+@pytest.mark.parametrize("reader", ["resolve", "admission"])
+def test_route_and_canary_active_pointers_must_agree(safety, reader):
+    owner, store, _checks, _receipts, _reruns = safety
+    cell = route(owner)
+    other = route(owner, route_id="other-cell")
+    store._conn.execute(
+        "UPDATE safety_canary_state SET active_digest = ? WHERE cell_key = ?",
+        (other.digest, cell.key))
+
+    with pytest.raises(SafetyRefused, match="active pointers disagree"):
+        if reader == "resolve":
+            owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
+        else:
+            owner.participate_in_admission(store._conn, cell.digest)
+
+
 def test_authority_controls_semantic_failure_and_unreadable_is_transport_only(safety):
     owner, _store, checks, _receipts, _reruns = safety
     cell = route(owner)
@@ -271,6 +376,7 @@ def test_rerun_intent_crash_recovery_and_concurrent_reconcilers_are_single_fligh
     seed = Store(path)
     checks, reruns = Checks(), Reruns()
     seed_owner = OperationalSafety(seed, check_evidence=checks, rerun_effect=reruns)
+    reruns.conn = seed._conn
     cell = route(seed_owner)
     intent = observe(seed_owner, checks, cell, "fail", "semantic/first")[0]
 
@@ -278,13 +384,18 @@ def test_rerun_intent_crash_recovery_and_concurrent_reconcilers_are_single_fligh
     with pytest.raises(RuntimeError, match="before effect"):
         seed_owner.reconcile(intent.action_id)
     assert reruns.applied == [] and seed_owner.action_result(intent.action_id) is None
+    assert seed._conn.execute(
+        "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
     reruns.crash = "after_effect"
     with pytest.raises(RuntimeError, match="after effect"):
         seed_owner.reconcile(intent.action_id)
     assert reruns.applied == [intent.action_id]
+    assert seed._conn.execute(
+        "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
     reruns.crash = ""
     recovered = seed_owner.reconcile(intent.action_id)
     assert reruns.applied == [intent.action_id]
+    assert reruns.transaction_states and not any(reruns.transaction_states)
 
     second = observe(seed_owner, checks, cell, "fail", "semantic/second")[0]
     assert second.action_id == intent.action_id  # same exact scope has one rerun
@@ -293,6 +404,7 @@ def test_rerun_intent_crash_recovery_and_concurrent_reconcilers_are_single_fligh
     other_request = request(cell, "semantic/other", subject="issue-586")
     checks.issue(other_request, "fail")
     other_intent = seed_owner.observe(other_request)[0]
+    reruns.conn = None
     seed.close()
     reruns.block = True
     reruns.entered.clear()
@@ -313,12 +425,67 @@ def test_rerun_intent_crash_recovery_and_concurrent_reconcilers_are_single_fligh
     second_thread = threading.Thread(target=reconcile)
     first.start()
     assert reruns.entered.wait(2)
+    writer_finished = threading.Event()
+    writer_errors = []
+
+    def write_unrelated_record():
+        store = Store(path)
+        try:
+            store.upsert(Record("unrelated", "review", "claude", 1, state="waiting"))
+        except BaseException as error:
+            writer_errors.append(error)
+        finally:
+            store.close()
+            writer_finished.set()
+
+    writer = threading.Thread(target=write_unrelated_record)
+    writer.start()
+    assert writer_finished.wait(1.5), "external effect retained the global Store write lock"
+    assert writer_errors == []
     second_thread.start()
     reruns.release.set()
     first.join()
     second_thread.join()
+    writer.join()
     assert errors == [] and len(results) == 2 and results[0] == results[1]
     assert reruns.applied.count(other_intent.action_id) == 1
+
+
+def test_rerun_effect_may_reenter_the_same_store_without_nested_transaction(tmp_path):
+    store = Store(tmp_path / "coordinator.db")
+    checks, reruns = Checks(), Reruns()
+    owner = OperationalSafety(store, check_evidence=checks, rerun_effect=reruns)
+    cell = route(owner)
+    intent = observe(owner, checks, cell, "fail", "reentrant/failure")[0]
+    reruns.conn = store._conn
+    reruns.on_apply = lambda: store.upsert(
+        Record("reentrant", "review", "claude", 1, state="waiting"))
+
+    result = owner.reconcile(intent.action_id)
+
+    assert result.action_id == intent.action_id
+    assert store.record_of("reentrant").state == "waiting"
+    assert reruns.transaction_states and not any(reruns.transaction_states)
+    store.close()
+
+
+def test_expired_durable_rerun_lease_recovers_after_process_crash(tmp_path):
+    store = Store(tmp_path / "coordinator.db")
+    checks, reruns = Checks(), Reruns()
+    owner = OperationalSafety(store, check_evidence=checks, rerun_effect=reruns)
+    cell = route(owner)
+    intent = observe(owner, checks, cell, "fail", "abandoned/failure")[0]
+    store._conn.execute(
+        "INSERT INTO safety_rerun_claims VALUES (?, ?, ?, ?)",
+        (intent.action_id, "dead-process", 4, 0))
+
+    result = owner.reconcile(intent.action_id)
+
+    assert result.action_id == intent.action_id
+    assert reruns.applied == [intent.action_id]
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
+    store.close()
 
 
 def test_concurrent_duplicate_observation_claims_return_one_durable_intent(tmp_path):
@@ -387,7 +554,9 @@ def test_canary_receipt_binding_duplicate_rollback_and_generation_cas(safety):
 
     fresh = approval(receipts, later, good, 1, "receipt-canary-2")
     owner.approve_canary(fresh)
+    receipts.unavailable = True
     assert owner.rollback_canary(first) == result
+    receipts.unavailable = False
     assert owner.canary_state(later.digest).active_route_cell_digest == later.digest
     assert owner.canary_state(other.digest).active_route_cell_digest == other.digest
     quarantine(owner, checks, later, revision="later")
@@ -405,28 +574,63 @@ def test_repository_promotion_receipt_cannot_cross_route_repository(safety):
         owner.approve_canary(item)
 
 
+@pytest.mark.parametrize("verifier_id,verifier_version", [
+    ("fake-authority", "v1"), ("github-authority", "v2"),
+])
+def test_canary_requires_exact_584_production_verifier(
+        safety, tmp_path, verifier_id, verifier_version):
+    _owner, store, checks, _receipts, reruns = safety
+    owner = OperationalSafety(store, check_evidence=checks, rerun_effect=reruns)
+    good = route(owner)
+    bad = route(owner, config_value={"model": "gpt-5", "effort": "medium"})
+    item = CanaryActivationRequest("receipt-verifier", bad.digest, good.digest, 0)
+    path = tmp_path / "wrong-verifier.db"
+    write_promotion_receipt_db(
+        path, verifier_id=verifier_id, verifier_version=verifier_version,
+        content_hash=item.digest, receipt_id=item.promotion_receipt_id)
+    owner = OperationalSafety(
+        store, check_evidence=checks,
+        promotion_receipts=PromotionReceiptReader(path=path), rerun_effect=reruns)
+    with pytest.raises(SafetyRefused, match="does not bind"):
+        owner.approve_canary(item)
+
+
 def test_promotion_receipt_authority_is_exact_schema_and_read_only(tmp_path):
     path = tmp_path / "evidence.db"
-    conn = sqlite3.connect(path)
-    conn.executescript(_V4_SCHEMA)
-    conn.execute("INSERT INTO candidates VALUES (?, ?, ?, ?)", (
-        "candidate-585", "b" * 64, 1, 1))
-    conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-        "candidate-585", "receipt-585", "approval-585", 1, 2, "verified",
-        "github", "octo/governance", "pulls/584/files/canary.json", "a" * 40,
-        "sha256", "b" * 64, "fleet-policy/0-to-1", "github-merged-pr", "1",
-        "verified", "a" * 40, "b" * 64, "fleet-policy/0-to-1",
-        "github-merged-pr-v1",
-    ))
-    conn.execute("PRAGMA user_version = 4")
-    conn.commit()
-    conn.close()
+    write_promotion_receipt_db(path)
 
     reader = PromotionReceiptReader(path=path)
     assert reader.read("receipt-585").authoritative
     with reader._connect() as read_only:
         with pytest.raises(sqlite3.OperationalError, match="readonly"):
             read_only.execute("UPDATE receipts SET approval_id='forged'")
+
+
+@pytest.mark.parametrize("change", ["migration", "schema", "replacement"])
+def test_promotion_receipt_reader_revalidates_every_new_connection(tmp_path, change):
+    path = tmp_path / "evidence.db"
+    write_promotion_receipt_db(path)
+    reader = PromotionReceiptReader(path=path)
+    assert reader.read("receipt-585").authoritative
+
+    if change == "replacement":
+        path.rename(tmp_path / "original.db")
+        replacement = sqlite3.connect(path)
+        replacement.execute("CREATE TABLE receipts (receipt_id TEXT)")
+        replacement.execute("PRAGMA user_version = 4")
+        replacement.commit()
+        replacement.close()
+    else:
+        conn = sqlite3.connect(path)
+        if change == "migration":
+            conn.execute("PRAGMA user_version = 5")
+        else:
+            conn.execute("ALTER TABLE receipts ADD COLUMN forged TEXT")
+        conn.commit()
+        conn.close()
+
+    with pytest.raises(EvidenceError, match="not accepted"):
+        reader.read("receipt-585")
 
 
 def test_admission_refusal_consumes_no_permit_and_never_touches_running_work(safety):
@@ -560,7 +764,7 @@ def test_real_adapter_and_sql_write_set_boundaries_deny_on_touch(safety, monkeyp
     allowed = {name for name in (
         "safety_launch_configs", "safety_route_cells", "safety_route_state",
         "safety_observations", "safety_actions", "safety_action_results",
-        "safety_alerts", "safety_canary_state",
+        "safety_alerts", "safety_canary_state", "safety_rerun_claims",
     )}
 
     def authorizer(action, arg1, _arg2, _db, _trigger):

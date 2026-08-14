@@ -12,7 +12,9 @@ from dataclasses import asdict, dataclass
 from hashlib import sha256
 import json
 import sqlite3
+import time
 from typing import Mapping, Protocol
+from uuid import uuid4
 
 from agentflow.evidence import EvidenceError, PromotionReceipt
 from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
@@ -76,6 +78,7 @@ DETERMINISTIC_CHECKS = (
 DETERMINISTIC_CHECK_ALLOWLIST_DIGEST = _digest(
     [asdict(item) for item in DETERMINISTIC_CHECKS])
 _CHECKS = {(item.identifier, item.version): item for item in DETERMINISTIC_CHECKS}
+PROMOTION_VERIFIER = ("github-authority", "v1")
 
 ROUTE_CELL_CONTRACT = {
     "schema": "agentflow-route-cell-v1",
@@ -88,7 +91,7 @@ ROUTE_CELL_CONTRACT = {
 ROUTE_CELL_CONTRACT_DIGEST = _digest(ROUTE_CELL_CONTRACT)
 
 ACTION_STATE_MAP = {
-    "rerun": "claimed -> single_flight_effect_reconciled -> result_committed",
+    "rerun": "claimed -> effect_lease_claimed -> idempotent_effect -> result_committed",
     "quarantine": "claimed -> exact_cell_quarantined + result_committed",
     "rollback": "claimed -> predecessor_pointer_restored + result_committed",
 }
@@ -100,11 +103,17 @@ OPERATIONAL_SAFETY_CONTRACT = {
     "action_state_map": ACTION_STATE_MAP,
     "observation_authority": "evidence_ref -> exact code-owned declaration result",
     "canary_receipt": "read-only #584 receipt authority binds approval declaration digest",
+    "promotion_verifier": "/".join(PROMOTION_VERIFIER),
+    "route_state": "recomputed cell-key+pointers+generation digest on every read",
+    "rerun_transaction": "short lease CAS -> external idempotent effect -> short result CAS",
     "rollback_trigger": "committed exact-cell quarantine result",
     "reopen_proof": "authority-read pass bound to safety_state_id+route_cell+declaration",
     "admission_seam": "participate_in_admission(existing_store_connection, route_cell_digest)",
 }
 OPERATIONAL_SAFETY_CONTRACT_DIGEST = _digest(OPERATIONAL_SAFETY_CONTRACT)
+
+_RERUN_LEASE_NS = 30_000_000_000
+_RERUN_POLL_SECONDS = 0.01
 
 
 @dataclass(frozen=True)
@@ -234,7 +243,7 @@ class EffectEvidence:
 
 
 class RerunEffect(Protocol):
-    """Transport-only adapter for the sole external automatic effect."""
+    """Transport-only adapter whose ``apply`` is idempotent by ``intent.action_id``."""
 
     def evidence_for(self, action_id: str) -> EffectEvidence | None: ...
 
@@ -245,6 +254,16 @@ class RerunEffect(Protocol):
 class RouteSafetyState:
     route_cell_digest: str
     quarantined: bool
+    safety_state_id: str
+    generation: int
+
+
+@dataclass(frozen=True)
+class _RoutePointerState:
+    cell_key: str
+    active_digest: str
+    quarantined_digest: str | None
+    quarantine_action_id: str | None
     safety_state_id: str
     generation: int
 
@@ -316,6 +335,10 @@ class OperationalSafety:
             "CREATE TABLE IF NOT EXISTS safety_action_results ("
             " action_id TEXT PRIMARY KEY, evidence_ref TEXT NOT NULL, proof TEXT NOT NULL,"
             " FOREIGN KEY(action_id) REFERENCES safety_actions(action_id))",
+            "CREATE TABLE IF NOT EXISTS safety_rerun_claims ("
+            " action_id TEXT PRIMARY KEY, owner_token TEXT NOT NULL,"
+            " generation INTEGER NOT NULL, expires_at_ns INTEGER NOT NULL,"
+            " FOREIGN KEY(action_id) REFERENCES safety_actions(action_id))",
             "CREATE TABLE IF NOT EXISTS safety_alerts ("
             " alert_id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE NOT NULL,"
             " kind TEXT NOT NULL, route_cell_digest TEXT NOT NULL, evidence_ref TEXT NOT NULL)",
@@ -375,6 +398,8 @@ class OperationalSafety:
                 self._conn.execute(
                     "INSERT INTO safety_canary_state VALUES (?, ?, NULL, NULL, NULL, 0, 0)",
                     (cell.key, cell.digest))
+            else:
+                self._canary_pointer_state(cell.key, conn=self._conn)
         return cell
 
     def resolve(self, repository: str, stage: str, provider: str,
@@ -384,12 +409,8 @@ class OperationalSafety:
             "model": model, "route_id": route_id,
         })
         with self._lock:
-            row = self._conn.execute(
-                "SELECT active_digest FROM safety_route_state WHERE cell_key = ?",
-                (cell_key,)).fetchone()
-            if row is None:
-                raise SafetyRefused("route cell is not active")
-            cell = self._cell(row[0], conn=self._conn)
+            canary = self._canary_pointer_state(cell_key, conn=self._conn)
+            cell = self._cell(canary.active_route_cell_digest, conn=self._conn)
             config = self._launch_config(cell.launch_config_digest, conn=self._conn)
         return ResolvedLaunch(cell, config)
 
@@ -446,25 +467,90 @@ class OperationalSafety:
             return tuple(created)
 
     def reconcile(self, action_id: str) -> ActionResult:
-        with self._transaction():
-            intent = self._action(action_id)
-            existing = self._action_result(action_id)
-            if intent.kind != "rerun":
-                if existing is None:
-                    raise SafetyRefused("internal action has no committed result")
-                return existing
-            if existing is not None:
-                return existing
-            if self._rerun_effect is None:
-                raise SafetyRefused("rerun effect adapter is unavailable")
+        intent, owner_token = self._claim_rerun_effect(action_id)
+        if owner_token is None:
+            result = self.action_result(action_id)
+            if result is None:
+                raise SafetyRefused("internal action has no committed result")
+            return result
+        if self._rerun_effect is None:
+            self._release_rerun_effect(action_id, owner_token)
+            raise SafetyRefused("rerun effect adapter is unavailable")
+        try:
             evidence = self._rerun_effect.evidence_for(action_id)
             if evidence is None:
                 evidence = self._rerun_effect.apply(intent)
             if (not evidence.evidence_ref or not evidence.proof
                     or action_id not in evidence.proof):
                 raise SafetyRefused("rerun effect evidence does not bind the action ID")
-            self._complete_action(intent.action_id, evidence.evidence_ref, evidence.proof)
-            return self._action_result(action_id)  # type: ignore[return-value]
+        except BaseException:
+            self._release_rerun_effect(action_id, owner_token)
+            raise
+        try:
+            with self._transaction():
+                existing = self._action_result(action_id)
+                if existing is not None:
+                    self._conn.execute(
+                        "DELETE FROM safety_rerun_claims WHERE action_id = ?",
+                        (action_id,))
+                    return existing
+                claim = self._conn.execute(
+                    "SELECT owner_token FROM safety_rerun_claims WHERE action_id = ?",
+                    (action_id,)).fetchone()
+                if claim is None or claim[0] != owner_token:
+                    raise SafetyRefused("rerun effect lease was superseded")
+                self._complete_action(intent.action_id, evidence.evidence_ref, evidence.proof)
+                self._conn.execute(
+                    "DELETE FROM safety_rerun_claims WHERE action_id = ? AND owner_token = ?",
+                    (action_id, owner_token))
+                return self._action_result(action_id)  # type: ignore[return-value]
+        except BaseException:
+            self._release_rerun_effect(action_id, owner_token)
+            raise
+
+    def _claim_rerun_effect(self, action_id: str) -> tuple[ActionIntent, str | None]:
+        """Return the intent plus this caller's durable lease, waiting for active owners."""
+        owner_token = uuid4().hex
+        while True:
+            with self._transaction():
+                intent = self._action(action_id)
+                existing = self._action_result(action_id)
+                if intent.kind != "rerun":
+                    if existing is None:
+                        raise SafetyRefused("internal action has no committed result")
+                    return intent, None
+                if existing is not None:
+                    self._conn.execute(
+                        "DELETE FROM safety_rerun_claims WHERE action_id = ?",
+                        (action_id,))
+                    return intent, None
+                now = time.time_ns()
+                claim = self._conn.execute(
+                    "SELECT owner_token, generation, expires_at_ns"
+                    " FROM safety_rerun_claims WHERE action_id = ?",
+                    (action_id,)).fetchone()
+                if claim is None:
+                    self._conn.execute(
+                        "INSERT INTO safety_rerun_claims VALUES (?, ?, 0, ?)",
+                        (action_id, owner_token, now + _RERUN_LEASE_NS))
+                    return intent, owner_token
+                if claim[2] <= now:
+                    changed = self._conn.execute(
+                        "UPDATE safety_rerun_claims SET owner_token = ?, generation = ?,"
+                        " expires_at_ns = ? WHERE action_id = ? AND owner_token = ?"
+                        " AND generation = ? AND expires_at_ns = ?",
+                        (owner_token, claim[1] + 1, now + _RERUN_LEASE_NS,
+                         action_id, claim[0], claim[1], claim[2])).rowcount
+                    if changed == 1:
+                        return intent, owner_token
+            time.sleep(_RERUN_POLL_SECONDS)
+
+    def _release_rerun_effect(self, action_id: str, owner_token: str) -> None:
+        with self._transaction():
+            self._conn.execute(
+                "DELETE FROM safety_rerun_claims"
+                " WHERE action_id = ? AND owner_token = ?",
+                (action_id, owner_token))
 
     def action(self, action_id: str) -> ActionIntent:
         with self._lock:
@@ -483,14 +569,15 @@ class OperationalSafety:
         return tuple(SafetyAlert(*row) for row in rows)
 
     def route_state(self, route_cell_digest: str) -> RouteSafetyState:
-        cell = self._cell(route_cell_digest)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT active_digest, quarantined_digest, safety_state_id, generation"
-                " FROM safety_route_state WHERE cell_key = ?", (cell.key,)).fetchone()
-        if row is None or row[0] != route_cell_digest:
-            raise SafetyRefused("route cell is not active")
-        return RouteSafetyState(route_cell_digest, row[1] == route_cell_digest, row[2], row[3])
+            cell = self._cell(route_cell_digest, conn=self._conn)
+            state = self._route_pointer_state(cell.key, conn=self._conn)
+            self._canary_pointer_state(cell.key, conn=self._conn)
+            if state.active_digest != route_cell_digest:
+                raise SafetyRefused("route cell is not active")
+            return RouteSafetyState(
+                route_cell_digest, state.quarantined_digest == route_cell_digest,
+                state.safety_state_id, state.generation)
 
     def reopen(self, route_cell_digest: str, expected_safety_state_id: str,
                evidence_refs: tuple[str, ...]) -> RouteSafetyState:
@@ -521,13 +608,12 @@ class OperationalSafety:
             raise SafetyRefused("fresh capability-parity and route-health evidence required")
         cell = self._cell(route_cell_digest)
         with self._transaction():
-            row = self._conn.execute(
-                "SELECT active_digest, quarantined_digest, generation FROM safety_route_state"
-                " WHERE cell_key = ? AND safety_state_id = ?",
-                (cell.key, expected_safety_state_id)).fetchone()
-            if row is None or row[0] != route_cell_digest or row[1] != route_cell_digest:
+            state = self._route_pointer_state(cell.key, conn=self._conn)
+            if (state.safety_state_id != expected_safety_state_id
+                    or state.active_digest != route_cell_digest
+                    or state.quarantined_digest != route_cell_digest):
                 raise SafetyRefused("quarantine compare-and-swap refused")
-            generation = row[2] + 1
+            generation = state.generation + 1
             state_id = _state_id(cell.key, route_cell_digest, None, generation)
             self._conn.execute(
                 "UPDATE safety_route_state SET quarantined_digest = NULL,"
@@ -543,13 +629,11 @@ class OperationalSafety:
             raise SafetyRefused("canary predecessor must be a different version of one cell")
         receipt = self._approved_canary(approval, bad.repository)
         with self._transaction():
-            row = self._conn.execute(
-                "SELECT active_digest, disabled_generation, generation"
-                " FROM safety_canary_state WHERE cell_key = ?", (bad.key,)).fetchone()
-            if (row is None or row[0] != predecessor.digest
-                    or row[1] != approval.approved_disabled_generation):
+            state = self._canary_pointer_state(bad.key, conn=self._conn)
+            if (state.active_route_cell_digest != predecessor.digest
+                    or state.disabled_generation != approval.approved_disabled_generation):
                 raise SafetyRefused("canary approval is stale")
-            generation = row[2] + 1
+            generation = state.generation + 1
             self._conn.execute(
                 "UPDATE safety_canary_state SET active_digest = ?, active_receipt_id = ?,"
                 " active_receipt_digest = ?, predecessor_digest = ?, generation = ?"
@@ -560,56 +644,74 @@ class OperationalSafety:
         return self.canary_state(bad.digest)
 
     def rollback_canary(self, approval: CanaryActivationRequest) -> ActionResult:
+        rollback_scope = _digest({
+            "approval_digest": approval.digest,
+            "promotion_receipt_id": approval.promotion_receipt_id,
+        })
+        action_id = self._action_id(
+            "rollback", rollback_scope, approval.bad_route_cell_digest)
+        with self._lock:
+            existing = self._action_result(action_id)
+            if existing is not None:
+                intent = self._action(action_id)
+                expected_payload = {
+                    "scope_identity": rollback_scope,
+                    "receipt_id": approval.promotion_receipt_id,
+                    "bad_route_cell_digest": approval.bad_route_cell_digest,
+                    "predecessor_route_cell_digest": approval.predecessor_route_cell_digest,
+                    "disabled_generation": approval.approved_disabled_generation,
+                }
+                if (intent.kind != "rollback"
+                        or intent.route_cell_digest != approval.bad_route_cell_digest
+                        or intent.declaration_digest != approval.digest
+                        or intent.payload != expected_payload):
+                    raise SafetyRefused("rollback result does not bind the exact request")
+                return existing
         bad = self._cell(approval.bad_route_cell_digest)
         predecessor = self._cell(approval.predecessor_route_cell_digest)
         if bad.key != predecessor.key:
             raise SafetyRefused("canary rollback crosses route cells")
         receipt = self._approved_canary(approval, bad.repository)
-        rollback_scope = _digest({
-            "approval_digest": approval.digest,
-            "promotion_receipt_id": receipt.receipt_id,
-        })
-        action_id = self._action_id("rollback", rollback_scope, bad.digest)
+        if receipt.receipt_id != approval.promotion_receipt_id:
+            raise SafetyRefused("promotion receipt does not bind the rollback request")
         with self._transaction():
             existing = self._action_result(action_id)
             if existing is not None:
                 self._action(action_id)
                 return existing
-            row = self._conn.execute(
-                "SELECT active_digest, active_receipt_id, active_receipt_digest,"
-                " predecessor_digest, disabled_generation, generation FROM safety_canary_state"
-                " WHERE cell_key = ?", (bad.key,)).fetchone()
-            if (row is None or row[0] != bad.digest or row[1] != receipt.receipt_id
-                    or row[2] != approval.digest or row[3] != predecessor.digest
-                    or row[4] != approval.approved_disabled_generation):
+            state = self._canary_pointer_state(bad.key, conn=self._conn)
+            if (state.active_route_cell_digest != bad.digest
+                    or state.active_receipt_id != receipt.receipt_id
+                    or state.active_receipt_digest != approval.digest
+                    or state.predecessor_route_cell_digest != predecessor.digest
+                    or state.disabled_generation != approval.approved_disabled_generation):
                 raise SafetyRefused("canary rollback compare-and-swap refused")
-            safety = self._conn.execute(
-                "SELECT active_digest, quarantined_digest, quarantine_action_id"
-                " FROM safety_route_state"
-                " WHERE cell_key = ?", (bad.key,)).fetchone()
-            if (safety is None or safety[0] != bad.digest or safety[1] != bad.digest
-                    or not safety[2]):
+            safety = self._route_pointer_state(bad.key, conn=self._conn)
+            if (safety.active_digest != bad.digest
+                    or safety.quarantined_digest != bad.digest
+                    or not safety.quarantine_action_id):
                 raise SafetyRefused("canary rollback requires its committed quarantine")
-            quarantine_result = self._action_result(safety[2])
+            quarantine_result = self._action_result(safety.quarantine_action_id)
             if quarantine_result is None:
                 raise SafetyRefused("canary rollback requires its committed quarantine result")
             proof = _canonical_text({
                 "approval_digest": approval.digest,
                 "promotion_receipt_id": receipt.receipt_id,
-                "quarantine_action_id": safety[2],
+                "quarantine_action_id": safety.quarantine_action_id,
                 "quarantine_result_proof": quarantine_result.proof,
             })
             intent = self._claim_action(
                 "rollback", rollback_scope, bad.digest,
                 approval.digest, quarantine_result.evidence_ref,
-                f"fresh human approval naming disabled generation {row[4] + 1}",
+                f"fresh human approval naming disabled generation "
+                f"{state.disabled_generation + 1}",
                 {"scope_identity": rollback_scope,
                  "receipt_id": receipt.receipt_id,
                  "bad_route_cell_digest": bad.digest,
                  "predecessor_route_cell_digest": predecessor.digest,
-                 "disabled_generation": row[4]})
-            disabled = row[4] + 1
-            generation = row[5] + 1
+                 "disabled_generation": state.disabled_generation})
+            disabled = state.disabled_generation + 1
+            generation = state.generation + 1
             self._conn.execute(
                 "UPDATE safety_canary_state SET active_digest = ?, active_receipt_id = NULL,"
                 " active_receipt_digest = NULL, predecessor_digest = NULL,"
@@ -622,15 +724,9 @@ class OperationalSafety:
             return self._action_result(intent.action_id)  # type: ignore[return-value]
 
     def canary_state(self, route_cell_digest: str) -> CanaryState:
-        cell = self._cell(route_cell_digest)
         with self._lock:
-            row = self._conn.execute(
-                "SELECT cell_key, active_digest, active_receipt_id, active_receipt_digest,"
-                " predecessor_digest, disabled_generation, generation FROM safety_canary_state"
-                " WHERE cell_key = ?", (cell.key,)).fetchone()
-        if row is None:
-            raise SafetyRefused("unknown canary cell")
-        return CanaryState(*row)
+            cell = self._cell(route_cell_digest, conn=self._conn)
+            return self._canary_pointer_state(cell.key, conn=self._conn)
 
     def participate_in_admission(
             self, conn: sqlite3.Connection, route_cell_digest: str) -> str:
@@ -642,12 +738,12 @@ class OperationalSafety:
         if conn is not self._conn:
             raise SafetyRefused("admission must use OperationalSafety's Store transaction")
         cell = self._cell(route_cell_digest, conn=conn)
-        row = conn.execute(
-            "SELECT active_digest, quarantined_digest, safety_state_id"
-            " FROM safety_route_state WHERE cell_key = ?", (cell.key,)).fetchone()
-        if row is None or row[0] != route_cell_digest or row[1] == route_cell_digest:
+        state = self._route_pointer_state(cell.key, conn=conn)
+        self._canary_pointer_state(cell.key, conn=conn)
+        if (state.active_digest != route_cell_digest
+                or state.quarantined_digest == route_cell_digest):
             raise SafetyRefused("route cell is not admissible")
-        return row[2]
+        return state.safety_state_id
 
     def _authorize_observation(self, request: ObservationRequest) -> _AuthorizedObservation:
         declaration = _CHECKS.get((request.check_id, request.check_version))
@@ -712,7 +808,9 @@ class OperationalSafety:
             scope = parse_promotion_scope(pointer.scope)
         except PromotionAuthorityError as error:
             raise SafetyRefused("promotion receipt scope was refused") from error
-        if (pointer.content_hash_algorithm != "sha256"
+        if ((receipt.authority.verifier_id, receipt.authority.verifier_version)
+                != PROMOTION_VERIFIER
+                or pointer.content_hash_algorithm != "sha256"
                 or pointer.content_hash != approval.digest
                 or receipt.policy_version != scope.new
                 or (scope.kind == "repository" and scope.repository != repository)):
@@ -722,18 +820,16 @@ class OperationalSafety:
     def _quarantine(self, observation: _AuthorizedObservation,
                     declaration: DeterministicCheck) -> ActionIntent:
         cell = self._cell(observation.request.route_cell_digest, conn=self._conn)
+        state = self._route_pointer_state(cell.key, conn=self._conn)
+        if state.active_digest != cell.digest:
+            raise SafetyRefused("stale RouteCell cannot quarantine the active route")
         intent = self._claim_action(
             "quarantine", observation.scope_identity, cell.digest, declaration.digest,
             observation.evidence_ref,
             "fresh capability-parity and route-health proof for this safety state",
             {"scope_identity": observation.scope_identity})
-        row = self._conn.execute(
-            "SELECT active_digest, quarantined_digest, generation FROM safety_route_state"
-            " WHERE cell_key = ?", (cell.key,)).fetchone()
-        if row is None or row[0] != cell.digest:
-            raise SafetyRefused("stale RouteCell cannot quarantine the active route")
-        if row[1] is None:
-            generation = row[2] + 1
+        if state.quarantined_digest is None:
+            generation = state.generation + 1
             state_id = _state_id(cell.key, cell.digest, cell.digest, generation)
             self._conn.execute(
                 "UPDATE safety_route_state SET quarantined_digest = ?,"
@@ -839,13 +935,13 @@ class OperationalSafety:
             (alert_id, key, kind, route_cell_digest, evidence_ref))
 
     def _activate_pointer(self, cell_key: str, expected: str, replacement: str) -> None:
-        row = self._conn.execute(
-            "SELECT quarantined_digest, generation FROM safety_route_state"
-            " WHERE cell_key = ? AND active_digest = ?", (cell_key, expected)).fetchone()
-        if row is None:
+        state = self._route_pointer_state(cell_key, conn=self._conn)
+        replacement_cell = self._cell(replacement, conn=self._conn)
+        if state.active_digest != expected or replacement_cell.key != cell_key:
             raise SafetyRefused("active RouteCell pointer changed")
-        generation = row[1] + 1
-        quarantined = row[0] if row[0] == replacement else None
+        generation = state.generation + 1
+        quarantined = (state.quarantined_digest
+                       if state.quarantined_digest == replacement else None)
         state_id = _state_id(cell_key, replacement, quarantined, generation)
         changed = self._conn.execute(
             "UPDATE safety_route_state SET active_digest = ?, quarantined_digest = ?,"
@@ -854,6 +950,84 @@ class OperationalSafety:
             (replacement, quarantined, state_id, generation, cell_key, expected)).rowcount
         if changed != 1:
             raise SafetyRefused("active RouteCell compare-and-swap refused")
+
+    def _route_pointer_state(
+            self, cell_key: str, *,
+            conn: sqlite3.Connection | None = None) -> _RoutePointerState:
+        connection = conn or self._conn
+        row = connection.execute(
+            "SELECT cell_key, active_digest, quarantined_digest, quarantine_action_id,"
+            " safety_state_id, generation FROM safety_route_state WHERE cell_key = ?",
+            (cell_key,)).fetchone()
+        if row is None:
+            raise SafetyRefused("route cell is not active")
+        state = _RoutePointerState(*row)
+        if (state.cell_key != cell_key or isinstance(state.generation, bool)
+                or not isinstance(state.generation, int) or state.generation < 0
+                or state.safety_state_id != _state_id(
+                    state.cell_key, state.active_digest,
+                    state.quarantined_digest, state.generation)):
+            raise SafetyRefused("stored RouteCell safety state was not accepted")
+        active = self._cell(state.active_digest, conn=connection)
+        if active.key != state.cell_key:
+            raise SafetyRefused("active RouteCell pointer crosses cell keys")
+        if state.quarantined_digest is None:
+            if state.quarantine_action_id is not None:
+                raise SafetyRefused("unquarantined RouteCell retains a quarantine action")
+            return state
+        if (state.quarantined_digest != state.active_digest
+                or not state.quarantine_action_id):
+            raise SafetyRefused("quarantine pointer is not the exact active RouteCell")
+        quarantined = self._cell(state.quarantined_digest, conn=connection)
+        if quarantined.key != state.cell_key:
+            raise SafetyRefused("quarantine pointer crosses cell keys")
+        intent = self._action(state.quarantine_action_id)
+        result = self._action_result(state.quarantine_action_id)
+        if (intent.kind != "quarantine"
+                or intent.route_cell_digest != state.quarantined_digest
+                or result is None):
+            raise SafetyRefused("quarantine pointer lacks its committed action result")
+        return state
+
+    def _validate_canary_state(
+            self, state: CanaryState, *, conn: sqlite3.Connection) -> None:
+        active = self._cell(state.active_route_cell_digest, conn=conn)
+        if active.key != state.cell_key:
+            raise SafetyRefused("canary active pointer crosses cell keys")
+        receipt_fields = (
+            state.active_receipt_id, state.active_receipt_digest,
+            state.predecessor_route_cell_digest,
+        )
+        if all(item is None for item in receipt_fields):
+            return
+        if any(item is None for item in receipt_fields):
+            raise SafetyRefused("canary receipt state is incomplete")
+        predecessor = self._cell(
+            state.predecessor_route_cell_digest, conn=conn)  # type: ignore[arg-type]
+        if predecessor.key != state.cell_key or predecessor.digest == active.digest:
+            raise SafetyRefused("canary predecessor pointer crosses cell keys")
+
+    def _canary_pointer_state(
+            self, cell_key: str, *, conn: sqlite3.Connection) -> CanaryState:
+        route_state = self._route_pointer_state(cell_key, conn=conn)
+        row = conn.execute(
+            "SELECT cell_key, active_digest, active_receipt_id, active_receipt_digest,"
+            " predecessor_digest, disabled_generation, generation"
+            " FROM safety_canary_state WHERE cell_key = ?", (cell_key,)).fetchone()
+        if row is None:
+            raise SafetyRefused("unknown canary cell")
+        state = CanaryState(*row)
+        if (state.cell_key != cell_key
+                or isinstance(state.disabled_generation, bool)
+                or not isinstance(state.disabled_generation, int)
+                or state.disabled_generation < 0
+                or isinstance(state.generation, bool)
+                or not isinstance(state.generation, int) or state.generation < 0):
+            raise SafetyRefused("stored canary generation was not accepted")
+        if state.active_route_cell_digest != route_state.active_digest:
+            raise SafetyRefused("canary and RouteCell active pointers disagree")
+        self._validate_canary_state(state, conn=conn)
+        return state
 
     def _cell(self, digest: str, *, conn: sqlite3.Connection | None = None) -> RouteCell:
         connection = conn or self._conn

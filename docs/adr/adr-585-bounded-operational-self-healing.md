@@ -29,8 +29,11 @@ one exact quarantine from authority-read evidence references, activates a receip
 rolls it back to its declared predecessor, and participates in the existing Store reservation
 transaction. Its injected interfaces are `CheckEvidenceAuthority.read(evidence_ref)`,
 `PromotionReceiptAuthority.read(receipt_id)`, and the transport-only `RerunEffect.evidence_for` /
-`apply`. The production promotion implementation is `PromotionReceiptReader`, which opens the exact
-#584 Evidence schema read-only and adds no EvidenceStore verb or promotion write. There is no
+`apply`; `apply` is idempotent by `ActionIntent.action_id`. The production promotion implementation
+is `PromotionReceiptReader`, which opens the #584 Evidence store read-only, starts one read snapshot,
+and revalidates exact schema v4 on every connection before reading a receipt. It adds no EvidenceStore
+verb or promotion write. OperationalSafety accepts only receipts produced by the exact #584
+`github-authority/v1` verifier. There is no
 filesystem, GitHub, prompt, fixture, rubric, policy, routing, effort, autonomy, or merge adapter.
 
 A RouteCell binds repository, stage, provider, model, route ID, and a canonical-JSON SHA-256 launch
@@ -38,7 +41,12 @@ configuration artifact. Artifacts and RouteCells are append-only and content-add
 RouteCell read reparses canonical JSON, recomputes its digest and cell key, compares all duplicated
 columns, and then reparses and recomputes the referenced launch-configuration digest. Dispatch
 resolution reads only the active pointer; rollback changes that pointer and never configuration
-bytes. Any tamper or non-canonical stored value fails closed. The RouteCell contract digest is
+bytes. Every route-state read recomputes `safety_state_id` from cell key, active digest, quarantined
+digest, and generation. The active RouteCell must resolve back to that exact cell key. A quarantine
+must name the active digest, retain its quarantine action ID, and bind a committed quarantine result;
+an unquarantined row may retain neither pointer nor action. Resolution, state reads, canary reads,
+reopen, pointer changes, and admission all use that verifier. Any tamper, cross-cell pointer, or
+non-canonical stored value fails closed. The RouteCell contract digest is
 `c762ed469c4c2a311391898196713b26a2dbe2985896c262ea05a425368f63a5`.
 
 The code-owned deterministic-check allowlist contains capability parity v1 and route health v1.
@@ -65,17 +73,20 @@ and quarantined digest plus `safety_state_id`, and rereads fresh passing capabil
 route-health results from `CheckEvidenceAuthority`; each must bind that state, RouteCell, evidence
 reference, and the corresponding code-owned declaration digest. Callers supply no proof objects.
 
-Every action first has one unique durable intent. Rerun reconciliation holds the coordinator
-Store's `BEGIN IMMEDIATE` while it rereads the intent/result, asks for authoritative effect evidence,
-optionally applies, and commits the result. Concurrent Store owners are therefore single-flight.
-A crash before the effect rolls back for a later retry; a crash after an externally durable effect
-rolls back the local transaction, and the later reconciler discovers that effect by action ID
-before applying. Quarantine and rollback effects live entirely in the Store, so their intent,
-state change, and result commit in one transaction. The action-state map is:
+Every action first has one unique durable intent. Rerun reconciliation uses three boundaries: a
+short Store transaction CAS-claims a versioned, expiring `safety_rerun_claims` lease; the owner asks
+for authoritative effect evidence and, if absent, invokes the action-ID-idempotent effect with no
+Store lock or transaction held; a second short Store transaction CAS-validates the lease, commits
+the result, and deletes the claim. Concurrent reconcilers wait outside transactions while the lease
+is live. Unrelated Store writers and reentrant writes from the effect therefore proceed. A caught
+failure releases the lease immediately; a process crash leaves a durable lease that can be reclaimed
+after expiry. Recovery always asks `evidence_for(action_id)` before applying, so a crash after the
+logical effect cannot duplicate it. Quarantine and rollback effects live entirely in the Store, so
+their intent, state change, and result commit in one transaction. The action-state map is:
 
 | Kind | States |
 |---|---|
-| rerun | `claimed → single_flight_effect_reconciled → result_committed` |
+| rerun | `claimed → effect_lease_claimed → idempotent_effect → result_committed` |
 | quarantine | `claimed → exact_cell_quarantined + result_committed` |
 | rollback | `claimed → predecessor_pointer_restored + result_committed` |
 
@@ -86,19 +97,21 @@ accepted fleet/repository scope, and policy version. Rollback accepts no caller 
 compares active digest and receipt in one Store transaction, requires the committed quarantine
 action and result of that active bad RouteCell, derives its durable proof from those authorities,
 restores only the predecessor, increments the disabled generation, and appends its action result.
-An exact duplicate rollback (approval digest plus receipt ID) returns its existing durable result
-before the active-pointer compare-and-swap, including after a later approved canary activates.
+An exact duplicate rollback (approval digest plus receipt ID) validates and returns its existing
+durable action/result before any receipt-store access or active-pointer compare-and-swap, including
+when receipt storage is unavailable or a later approved canary has activated.
 A subsequent approval must name the incremented generation; an older approval or rollback cannot
 overwrite a later canary or cross a RouteCell key.
 
 Coordinator Store schema v2 adds append-only launch configuration, RouteCell, observation, action,
-result, and alert tables plus RouteCell admission and canary activation state. Before migration,
+result, alert, and rerun-lease tables plus RouteCell admission and canary activation state. Before
+migration,
 the Store accepts only the exact v1 records schema. Before accepting or advancing to v2, it compares
 every non-SQLite table/index/trigger definition with the exact expected schema and fails closed on
 missing, altered, or additional objects. The v1→v2 migration adds the safety tables without
 rewriting existing continuation records or changing running permits.
 The complete OperationalSafety contract digest is
-`c362e0e7552990353c17f2f1b4c7daee5b8b821ca154df650fad8d8d0c281354`.
+`4a78101a35168ae33fab177d2eda21a33928caa5b9e124bdb8b478691dbffae6`.
 
 Capability parity remains before admission under ADR 582. A non-ready pre-launch capability result
 retains its claim on environment-failure hold and consumes no permit, attempt, continuation, attempt

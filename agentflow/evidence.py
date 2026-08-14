@@ -608,20 +608,26 @@ class PromotionReceiptReader:
 
     def __init__(self, *, path: Path) -> None:
         self.path = path
-        try:
-            with self._connect() as conn:
-                if (conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
-                        or _schema_fingerprint(conn) != _schema_fingerprint_for(_V4_SCHEMA)):
-                    raise EvidenceError("promotion receipt store was not accepted")
-        except sqlite3.Error as error:
-            raise EvidenceError("promotion receipt store is unavailable") from error
+        with self._connect():
+            pass
 
     def _connect(self) -> sqlite3.Connection:
         encoded = quote(self.path.resolve().as_posix(), safe="/")
-        conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only = ON")
-        return conn
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            if (conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                    or _schema_fingerprint(conn) != _schema_fingerprint_for(_V4_SCHEMA)):
+                conn.close()
+                raise EvidenceError("promotion receipt store was not accepted")
+            return conn
+        except sqlite3.Error as error:
+            if conn is not None:
+                conn.close()
+            raise EvidenceError("promotion receipt store is unavailable") from error
 
     def read(self, receipt_id: str) -> PromotionReceipt:
         _token(receipt_id, "receipt_id")
