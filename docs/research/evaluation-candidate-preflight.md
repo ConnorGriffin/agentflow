@@ -1,6 +1,6 @@
 # Research: Evaluation v1 candidate preflight
 
-Status: implementation preflight for [#618](https://github.com/ConnorGriffin/agentflow/issues/618).
+Status: implementation preflight for [#617](https://github.com/ConnorGriffin/agentflow/issues/617).
 It creates no Evaluation artifact, fixture, code, CI change, or GitHub state.
 
 ## Authority and extraction boundary

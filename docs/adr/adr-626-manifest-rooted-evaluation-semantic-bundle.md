@@ -13,7 +13,7 @@ provenance work on [#622](https://github.com/ConnorGriffin/agentflow/issues/622)
 demonstrated that this boundary needs a custom schema and opcode VM, duplicates
 algorithmic policy in the checker, and still does not close cold execution.
 
-The settled Evaluation decisions from that provenance remain inputs to #622.
+The settled Evaluation decisions from that provenance remain inputs to #617.
 Only their abandoned schema/opcode representation is rejected.
 
 ## Decision
