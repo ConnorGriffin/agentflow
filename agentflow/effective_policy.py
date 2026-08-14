@@ -690,7 +690,7 @@ _PINNED_AUTHORITY = BriefingAuthority(
     verifier_version="v1",
     outcome="verified",
 )
-PINNED_EVALUATION_POLICY = FleetPolicyV1(
+_PINNED_EVALUATION_POLICY = FleetPolicyV1(
     policy_version=1,
     receipts=(BriefingReceipt(
         receipt_id="receipt-evaluation-contract-v1",
@@ -706,6 +706,9 @@ PINNED_EVALUATION_POLICY = FleetPolicyV1(
         contract_digest=DEPENDENCY_PINS["evaluation_module_sha256"],
     ),),
 )
+# Public inspection may read this recursively immutable contract.  Resolver authority uses the
+# private binding above, so rebinding this convenience name cannot alter effective policy.
+PINNED_EVALUATION_POLICY = _PINNED_EVALUATION_POLICY
 
 EFFECTIVE_POLICY_CONTRACT: Mapping[str, object] = MappingProxyType({
     "canonical_encoder": MappingProxyType({
@@ -727,120 +730,127 @@ EFFECTIVE_POLICY_CONTRACT_DIGEST = sha256(
 class EffectivePolicyResolver:
     """Resolve one immutable stage briefing without persistence or authority writes."""
 
+    __slots__ = ("_promotion_receipts", "_overlay_source")
+
     def __init__(self, *, promotion_receipts: PromotionReceiptReader,
-                 overlay_source: RepositoryOverlaySource,
-                 fleet_policy: FleetPolicyV1 | None = PINNED_EVALUATION_POLICY) -> None:
+                 overlay_source: RepositoryOverlaySource) -> None:
         self._promotion_receipts = promotion_receipts
         self._overlay_source = overlay_source
-        self._fleet_policy = fleet_policy
 
     def brief_for(self, repo: str, stage: str, subject_revision: str) -> BriefingV1:
-        try:
-            repository = _repository(repo)
-            if stage not in STAGES or not isinstance(subject_revision, str) \
-                    or not _SUBJECT_REVISION.fullmatch(subject_revision):
-                return _hold(repo if isinstance(repo, str) else "invalid/repository",
-                             stage if isinstance(stage, str) else "respond",
-                             subject_revision if isinstance(subject_revision, str) else "0" * 40,
-                             "invalid_briefing")
-        except PolicyValidationError:
-            return _hold("invalid/repository", stage if stage in STAGES else "respond",
-                         subject_revision if isinstance(subject_revision, str)
-                         and _SUBJECT_REVISION.fullmatch(subject_revision) else "0" * 40,
-                         "invalid_briefing")
-        policy = self._fleet_policy
-        if policy is None:
-            return _hold(repository, stage, subject_revision, "missing_policy")
-        if not isinstance(policy, FleetPolicyV1):
-            return _hold(repository, stage, subject_revision, "incompatible_policy")
+        repository, safe_stage, safe_revision, valid = self._validated_request(
+            repo, stage, subject_revision)
+        if not valid:
+            return _hold(repository, safe_stage, safe_revision, "invalid_briefing")
+
+        policy = _PINNED_EVALUATION_POLICY
+        resolved_by_id: dict[str, BriefingReceipt] = {}
+        for expected in policy.receipts:
+            try:
+                actual = self._promotion_receipts.read(expected.receipt_id)
+            except Exception:
+                return _hold(repository, safe_stage, safe_revision, "missing_receipt",
+                             (expected.receipt_id,))
+            try:
+                candidate = self._receipt_value(actual)
+            except Exception:
+                return _hold(repository, safe_stage, safe_revision, "invalid_receipt",
+                             (expected.receipt_id,))
+            if candidate != expected:
+                return _hold(repository, safe_stage, safe_revision, "invalid_receipt",
+                             (expected.receipt_id,))
+            scope_kind, scope_repository, _, new = _scope(candidate.authority.scope)
+            if (new != policy.policy_version or (scope_kind == "repository"
+                    and scope_repository != repository)):
+                return _hold(repository, safe_stage, safe_revision, "invalid_receipt",
+                             (expected.receipt_id,))
+            resolved_by_id[candidate.receipt_id] = candidate
 
         try:
-            overlay = self._overlay_source.read(repository, subject_revision)
+            overlay = self._overlay_source.read(repository, safe_revision)
         except Exception:
-            return _hold(repository, stage, subject_revision, "invalid_overlay")
+            return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
         if overlay is not None:
             try:
                 if not isinstance(overlay, OverlayV1):
                     raise PolicyValidationError("invalid overlay type")
                 overlay.validate()
             except Exception:
-                return _hold(repository, stage, subject_revision, "invalid_overlay")
+                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
             if (overlay.repository != repository or overlay.policy_version != policy.policy_version):
-                return _hold(repository, stage, subject_revision, "invalid_overlay")
+                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
             try:
                 folded = self._apply_overlay(policy, overlay)
             except Exception:
                 folded = None
             if folded is None:
-                return _hold(repository, stage, subject_revision, "invalid_overlay")
+                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
             receipts, capabilities = folded
             if overlay.holds:
-                return _hold(repository, stage, subject_revision, overlay.holds[0],
+                return _hold(repository, safe_stage, safe_revision, overlay.holds[0],
                              (overlay.overlay_digest,))
-            not_applicable = stage in overlay.not_applicable_stages
+            not_applicable = safe_stage in overlay.not_applicable_stages
         else:
             receipts, capabilities = policy.receipts, policy.capabilities
             not_applicable = False
 
-        if not_applicable or stage not in policy.applicable_stages:
+        if not_applicable or safe_stage not in policy.applicable_stages:
             value: dict[str, object] = {
                 "briefing_digest": "", "briefing_id": "", "reason": "stage_not_applicable",
-                "repository": repository, "schema": "briefing-v1", "stage": stage,
-                "status": "not_applicable", "subject_revision": subject_revision,
+                "repository": repository, "schema": "briefing-v1", "stage": safe_stage,
+                "status": "not_applicable", "subject_revision": safe_revision,
             }
             try:
                 digest, identity, encoded = _finish(value)
                 if len(encoded) > _MAX_BRIEFING_BYTES:
-                    return _hold(repository, stage, subject_revision, "briefing_overflow")
-                return NotApplicableBriefing(repository, stage, subject_revision, digest, identity)
+                    return _hold(repository, safe_stage, safe_revision, "briefing_overflow")
+                return NotApplicableBriefing(
+                    repository, safe_stage, safe_revision, digest, identity)
             except Exception:
-                return _hold(repository, stage, subject_revision, "invalid_briefing")
-
-        resolved: list[BriefingReceipt] = []
-        for expected in receipts:
-            try:
-                actual = self._promotion_receipts.read(expected.receipt_id)
-            except Exception:
-                return _hold(repository, stage, subject_revision, "missing_receipt",
-                             (expected.receipt_id,))
-            try:
-                candidate = self._receipt_value(actual)
-            except Exception:
-                return _hold(repository, stage, subject_revision, "invalid_receipt",
-                             (expected.receipt_id,))
-            if candidate != expected:
-                return _hold(repository, stage, subject_revision, "invalid_receipt",
-                             (expected.receipt_id,))
-            scope_kind, scope_repository, _, new = _scope(candidate.authority.scope)
-            if (new != policy.policy_version or (scope_kind == "repository"
-                    and scope_repository != repository)):
-                return _hold(repository, stage, subject_revision, "invalid_receipt",
-                             (expected.receipt_id,))
-            resolved.append(candidate)
+                return _hold(repository, safe_stage, safe_revision, "invalid_briefing")
 
         scope = receipts[0].authority.scope if receipts else f"fleet-policy/0-to-{policy.policy_version}"
-        applicability = ApplicabilityFacts(scope, stage, subject_revision)
+        applicability = ApplicabilityFacts(scope, safe_stage, safe_revision)
+        resolved = tuple(resolved_by_id[item.receipt_id] for item in receipts)
         value = {
             "applicability": applicability.value(), "briefing_digest": "", "briefing_id": "",
             "capabilities": [item.value() for item in capabilities],
             "policy_version": policy.policy_version,
             "receipts": [item.value() for item in resolved], "repository": repository,
-            "schema": "briefing-v1", "stage": stage, "status": "ready",
-            "subject_revision": subject_revision,
+            "schema": "briefing-v1", "stage": safe_stage, "status": "ready",
+            "subject_revision": safe_revision,
         }
         try:
             _sorted_unique(tuple(value["receipts"]), "receipts", 64)
             _sorted_unique(tuple(value["capabilities"]), "capabilities", 64)
             digest, identity, encoded = _finish(value)
             if len(encoded) > _MAX_BRIEFING_BYTES:
-                return _hold(repository, stage, subject_revision, "briefing_overflow")
-            result = ReadyBriefing(repository, stage, subject_revision, digest, identity,
-                                   policy.policy_version, tuple(resolved), capabilities, applicability)
+                return _hold(repository, safe_stage, safe_revision, "briefing_overflow")
+            result = ReadyBriefing(repository, safe_stage, safe_revision, digest, identity,
+                                   policy.policy_version, resolved, capabilities, applicability)
             if result.canonical_bytes() != encoded:
                 raise PolicyValidationError("briefing reconstruction changed bytes")
             return result
         except Exception:
-            return _hold(repository, stage, subject_revision, "invalid_briefing")
+            return _hold(repository, safe_stage, safe_revision, "invalid_briefing")
+
+    @staticmethod
+    def _validated_request(repo: object, stage: object,
+                           subject_revision: object) -> tuple[str, str, str, bool]:
+        repository = "invalid/repository"
+        repository_valid = False
+        try:
+            repository = str(_repository(repo))
+            repository_valid = True
+        except Exception:
+            pass
+        stage_valid = type(stage) is str and stage in STAGES
+        revision_valid = (type(subject_revision) is str
+                          and _SUBJECT_REVISION.fullmatch(subject_revision) is not None)
+        safe_stage = stage if stage_valid else "respond"
+        safe_revision = subject_revision if revision_valid else "0" * 40
+        return repository, safe_stage, safe_revision, (
+            repository_valid and stage_valid and revision_valid)
 
     @staticmethod
     def _apply_overlay(policy: FleetPolicyV1, overlay: OverlayV1

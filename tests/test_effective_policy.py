@@ -10,6 +10,7 @@ import json
 
 import pytest
 
+import agentflow.effective_policy as effective_policy
 from agentflow.effective_policy import (
     EFFECTIVE_POLICY_CONTRACT,
     EFFECTIVE_POLICY_CONTRACT_DIGEST,
@@ -35,6 +36,11 @@ from agentflow.evidence import ApprovedAuthority, AuthorityPointer, PromotionRec
 
 REPOSITORY = "octo/repo"
 REVISION = "a" * 40
+
+
+class ExplodingStr(str):
+    def __eq__(self, other):
+        raise RuntimeError("untrusted string comparison")
 
 
 def _canonical(value):
@@ -107,14 +113,12 @@ def _actual(expected):
                             expected.policy_version, approved, expected.authoritative)
 
 
-def _resolver(*, policy=PINNED_EVALUATION_POLICY, overlay=None, overlay_error=None,
-              receipts=None, receipt_error=None):
-    receipts = tuple(_actual(item) for item in policy.receipts) if receipts is None \
-        and isinstance(policy, FleetPolicyV1) else (receipts or ())
+def _resolver(*, overlay=None, overlay_error=None, receipts=None, receipt_error=None):
+    receipts = tuple(_actual(item) for item in PINNED_EVALUATION_POLICY.receipts) \
+        if receipts is None else receipts
     return EffectivePolicyResolver(
         promotion_receipts=ReceiptReader(receipts, receipt_error),
         overlay_source=OverlaySource(overlay, overlay_error),
-        fleet_policy=policy,
     )
 
 
@@ -167,6 +171,8 @@ def test_pins_contract_and_only_read_only_authorities_are_imported_or_called():
         EFFECTIVE_POLICY_CONTRACT["schema"] = "mutable"
     with pytest.raises(TypeError):
         EFFECTIVE_POLICY_CONTRACT["canonical_encoder"]["sort_keys"] = False
+    assert tuple(inspect.signature(EffectivePolicyResolver).parameters) == (
+        "promotion_receipts", "overlay_source")
 
 
 @pytest.mark.parametrize("stage", STAGES)
@@ -196,10 +202,6 @@ def test_overlay_can_add_each_closed_hold_code(hold_code):
 
 
 def test_each_native_failure_path_maps_to_the_closed_vocabulary():
-    assert _resolver(policy=None).brief_for(REPOSITORY, "review", REVISION).hold_code \
-        == "missing_policy"
-    assert _resolver(policy=object()).brief_for(REPOSITORY, "review", REVISION).hold_code \
-        == "incompatible_policy"
     assert _resolver(overlay_error=OSError("secret")).brief_for(
         REPOSITORY, "review", REVISION).hold_code == "invalid_overlay"
     assert _resolver(receipt_error=OSError("secret")).brief_for(
@@ -209,6 +211,96 @@ def test_each_native_failure_path_maps_to_the_closed_vocabulary():
     assert _resolver(receipts=(wrong,)).brief_for(
         REPOSITORY, "review", REVISION).hold_code == "invalid_receipt"
     assert _resolver().brief_for(REPOSITORY, "unknown", REVISION).hold_code == "invalid_briefing"
+
+
+@pytest.mark.parametrize("stage", [
+    "", "unknown", "Review", None, True, 1, object(), ExplodingStr("review"),
+])
+def test_invalid_stage_never_raises_and_returns_exact_closed_immutable_hold(stage):
+    result = _resolver().brief_for(REPOSITORY, stage, REVISION)
+    assert isinstance(result, HoldBriefing)
+    assert result.value() == {
+        "briefing_digest": result.briefing_digest,
+        "briefing_id": result.briefing_id,
+        "hold_code": "invalid_briefing",
+        "references": [],
+        "repository": REPOSITORY,
+        "schema": "briefing-v1",
+        "stage": "respond",
+        "status": "hold",
+        "subject_revision": REVISION,
+    }
+    _assert_self_digest(result)
+    with pytest.raises((AttributeError, TypeError)):
+        result.hold_code = "missing_policy"
+
+
+@pytest.mark.parametrize("revision", [
+    "", "a" * 39, "a" * 41, "A" * 40, "g" * 40, "sha256:" + "a" * 64,
+    None, True, 1, 1.0, object(), ExplodingStr("a" * 40),
+])
+def test_malformed_subject_revision_never_raises_and_returns_exact_closed_hold(revision):
+    result = _resolver().brief_for(REPOSITORY, "review", revision)
+    assert isinstance(result, HoldBriefing)
+    assert result.value() == {
+        "briefing_digest": result.briefing_digest,
+        "briefing_id": result.briefing_id,
+        "hold_code": "invalid_briefing",
+        "references": [],
+        "repository": REPOSITORY,
+        "schema": "briefing-v1",
+        "stage": "review",
+        "status": "hold",
+        "subject_revision": "0" * 40,
+    }
+    _assert_self_digest(result)
+
+
+def test_fleet_policy_injection_is_impossible_and_public_alias_rebinding_has_no_authority(
+        monkeypatch):
+    malicious = FleetPolicyV1(
+        1, (), (CapabilityRequirement("attacker", "v1", "f" * 64),))
+    reader = ReceiptReader(tuple(_actual(item) for item in PINNED_EVALUATION_POLICY.receipts))
+    source = OverlaySource()
+    with pytest.raises(TypeError):
+        EffectivePolicyResolver(
+            promotion_receipts=reader, overlay_source=source, fleet_policy=malicious)
+    resolver = EffectivePolicyResolver(promotion_receipts=reader, overlay_source=source)
+    with pytest.raises(AttributeError):
+        resolver._fleet_policy = malicious
+    monkeypatch.setattr(effective_policy, "PINNED_EVALUATION_POLICY", malicious)
+    result = resolver.brief_for(REPOSITORY, "review", REVISION)
+    assert isinstance(result, ReadyBriefing)
+    assert result.capabilities == (
+        CapabilityRequirement(
+            "evaluation-semantics-v1", "evaluation-contract-v1",
+            "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554"),)
+
+
+def test_no_valid_promoted_receipt_means_no_ready_result_or_capabilities():
+    source = OverlaySource(_overlay(
+        remove_receipt_ids=[PINNED_EVALUATION_POLICY.receipts[0].receipt_id],
+        remove_capability_contract_ids=[PINNED_EVALUATION_POLICY.capabilities[0].contract_id]))
+    reader = ReceiptReader(())
+    result = EffectivePolicyResolver(
+        promotion_receipts=reader, overlay_source=source).brief_for(
+            REPOSITORY, "review", REVISION)
+    assert isinstance(result, HoldBriefing)
+    assert result.hold_code == "missing_receipt"
+    assert "capabilities" not in result.value()
+    assert reader.calls == [PINNED_EVALUATION_POLICY.receipts[0].receipt_id]
+    assert source.calls == []
+
+
+def test_overlay_receipt_removal_restricts_output_only_after_authority_is_validated():
+    overlay = _overlay(remove_receipt_ids=[PINNED_EVALUATION_POLICY.receipts[0].receipt_id])
+    reader = ReceiptReader(tuple(_actual(item) for item in PINNED_EVALUATION_POLICY.receipts))
+    result = EffectivePolicyResolver(
+        promotion_receipts=reader, overlay_source=OverlaySource(overlay)).brief_for(
+            REPOSITORY, "review", REVISION)
+    assert isinstance(result, ReadyBriefing)
+    assert result.receipts == ()
+    assert reader.calls == [PINNED_EVALUATION_POLICY.receipts[0].receipt_id]
 
 
 def test_overlay_fold_only_removes_narrows_holds_or_marks_stage_not_applicable():
@@ -223,10 +315,11 @@ def test_overlay_fold_only_removes_narrows_holds_or_marks_stage_not_applicable()
         remove_capability_contract_ids=["evaluation-semantics-v1"],
         narrow_bounds=[{"bound_name": "calls", "contract_id": "tool-v1", "maximum": 4}],
     )
-    result = _resolver(policy=policy, overlay=overlay).brief_for(REPOSITORY, "build", REVISION)
-    assert isinstance(result, ReadyBriefing)
-    assert result.receipts == ()
-    assert result.capabilities == (
+    result = EffectivePolicyResolver._apply_overlay(policy, overlay)
+    assert result is not None
+    receipts, folded_capabilities = result
+    assert receipts == ()
+    assert folded_capabilities == (
         CapabilityRequirement("tool-v1", "v1", "b" * 64, True,
                               (Bound("tokens", 20), Bound("calls", 4))),)
 
@@ -251,8 +344,7 @@ def test_widened_bound_wrong_repository_or_version_is_invalid_overlay():
                                         key=lambda item: _canonical(item.value()))))
     widened = _overlay(narrow_bounds=[
         {"bound_name": "calls", "contract_id": "tool-v1", "maximum": 11}])
-    assert _resolver(policy=policy, overlay=widened).brief_for(
-        REPOSITORY, "review", REVISION).hold_code == "invalid_overlay"
+    assert EffectivePolicyResolver._apply_overlay(policy, widened) is None
     for overlay in (_overlay(repository="other/repo"), _overlay(policy_version=2)):
         assert _resolver(overlay=overlay).brief_for(
             REPOSITORY, "review", REVISION).hold_code == "invalid_overlay"
@@ -360,10 +452,6 @@ def test_capability_bounds_accept_32_and_reject_33_and_policy_arrays_64_65():
     capabilities = tuple(CapabilityRequirement(f"c{index:02d}", "v1", f"{index:064x}")
                          for index in range(64))
     assert len(FleetPolicyV1(1, (), capabilities).capabilities) == 64
-    result = _resolver(policy=FleetPolicyV1(1, (), capabilities)).brief_for(
-        REPOSITORY, "review", REVISION)
-    assert isinstance(result, ReadyBriefing)
-    assert len(result.capabilities) == 64
     with pytest.raises(PolicyValidationError):
         FleetPolicyV1(1, (), capabilities + (
             CapabilityRequirement("c64", "v1", "f" * 64),))
@@ -386,9 +474,6 @@ def test_receipt_array_accepts_64_and_rejects_65_then_obeys_final_size_limit():
                             key=lambda item: _canonical(item.value())))
     policy = FleetPolicyV1(1, receipts, ())
     assert len(policy.receipts) == 64
-    result = _resolver(policy=policy).brief_for(REPOSITORY, "review", REVISION)
-    assert isinstance(result, HoldBriefing)
-    assert result.hold_code == "briefing_overflow"
     extra = _receipt(64, 0)
     with pytest.raises(PolicyValidationError):
         FleetPolicyV1(1, tuple(sorted(receipts + (extra,),
@@ -421,15 +506,30 @@ def _sized_policy(target):
     return FleetPolicyV1(1, tuple(receipts), ())
 
 
-def test_briefing_exact_16384_is_accepted_and_16385_is_overflow():
+def _direct_ready(policy):
+    applicability = ApplicabilityFacts("fleet-policy/0-to-1", "review", REVISION)
+    value = {
+        "applicability": applicability.value(), "capabilities": [
+            item.value() for item in policy.capabilities],
+        "policy_version": policy.policy_version,
+        "receipts": [item.value() for item in policy.receipts],
+        "repository": REPOSITORY, "schema": "briefing-v1", "stage": "review",
+        "status": "ready", "subject_revision": REVISION,
+    }
+    digest = sha256(_canonical(value)).hexdigest()
+    return ReadyBriefing(
+        REPOSITORY, "review", REVISION, digest, f"briefing-v1:{digest}",
+        policy.policy_version, policy.receipts, policy.capabilities, applicability)
+
+
+def test_briefing_schema_accepts_exact_16384_and_rejects_16385():
     exact_policy = _sized_policy(16384)
-    exact = _resolver(policy=exact_policy).brief_for(REPOSITORY, "review", REVISION)
+    exact = _direct_ready(exact_policy)
     assert isinstance(exact, ReadyBriefing)
     assert len(exact.canonical_bytes()) == 16384
     over_policy = _sized_policy(16385)
-    over = _resolver(policy=over_policy).brief_for(REPOSITORY, "review", REVISION)
-    assert isinstance(over, HoldBriefing)
-    assert over.hold_code == "briefing_overflow"
+    with pytest.raises(PolicyValidationError, match="briefing overflow"):
+        _direct_ready(over_policy)
 
 
 def test_authority_pointer_approval_scope_and_cross_repository_are_exactly_bound():
@@ -448,8 +548,7 @@ def test_authority_pointer_approval_scope_and_cross_repository_are_exactly_bound
         expected.authority, scope="repository-policy/other/repo/0-to-1",
         approved_scope="repository-policy/other/repo/0-to-1")
     cross = replace(expected, authority=cross_authority)
-    policy = FleetPolicyV1(1, (cross,), PINNED_EVALUATION_POLICY.capabilities)
-    assert _resolver(policy=policy).brief_for(
+    assert _resolver(receipts=(_actual(cross),)).brief_for(
         REPOSITORY, "review", REVISION).hold_code == "invalid_receipt"
 
 
