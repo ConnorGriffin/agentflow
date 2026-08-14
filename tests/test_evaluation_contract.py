@@ -220,6 +220,28 @@ def test_python_internal_forgery_cannot_bypass_byte_path_or_digest_validation(
     assert (caught.value.code, caught.value.basename) == expected
 
 
+def test_foreign_authority_path_is_rejected_before_malicious_equality_runs():
+    equality_calls = []
+
+    class MaliciousEquality(PurePosixPath):
+        def __eq__(self, _other):
+            equality_calls.append("called")
+            raise RuntimeError("secret-equality")
+
+    forged = _fresh_contract()
+    object.__setattr__(
+        forged,
+        "_EvaluationContractV1__contract_path",
+        MaliciousEquality("docs/evaluation/contract-v1.json"),
+    )
+
+    with pytest.raises(EvaluationContractError) as caught:
+        _unused = forged.contract_version
+    assert (caught.value.code, caught.value.basename) == ("E_ROOT", "<contract>")
+    assert equality_calls == []
+    assert "secret-equality" not in str(caught.value)
+
+
 def test_missing_internal_state_is_a_sanitized_contract_failure():
     forged = object.__new__(evaluation_contract.EvaluationContractV1)
     with pytest.raises(EvaluationContractError) as caught:
@@ -272,6 +294,30 @@ def test_path_like_coercion_failures_are_sanitized(contract, tmp_path):
     )
     assert "secret-path" not in str(contract_path.value)
     assert "secret-path" not in str(bundle_root.value)
+
+
+def test_runtime_error_fspath_is_sanitized_by_both_public_loaders(contract, tmp_path):
+    class RuntimePath:
+        def __fspath__(self):
+            raise RuntimeError("secret-runtime-path")
+
+    with pytest.raises(EvaluationContractError) as contract_path:
+        load_evaluation_contract(RuntimePath())
+    assert (contract_path.value.code, contract_path.value.basename) == (
+        "E_ROOT", "<contract>",
+    )
+
+    with pytest.raises(EvaluationContractError) as bundle_root:
+        load_evaluation_bundle(
+            contract,
+            RuntimePath(),
+            PurePosixPath("docs/evaluation/v1/sources/source-a.json"),
+        )
+    assert (bundle_root.value.code, bundle_root.value.basename) == (
+        "E_ROOT", "<bundle>",
+    )
+    assert "secret-runtime-path" not in str(contract_path.value)
+    assert "secret-runtime-path" not in str(bundle_root.value)
 
 
 @pytest.mark.parametrize(

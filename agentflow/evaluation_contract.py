@@ -246,7 +246,7 @@ def _decode_json(data: bytes, basename: str, limits: Mapping[str, int] | None = 
 def _open_directory(path: Path, sentinel: str) -> int:
     try:
         raw = os.fspath(path)
-    except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+    except Exception:
         _error("E_ROOT", sentinel)
     if not isinstance(raw, str):
         _error("E_ROOT", sentinel)
@@ -258,7 +258,7 @@ def _open_directory(path: Path, sentinel: str) -> int:
                 os.close(descriptor)
                 raise OSError
             return descriptor
-        except (OSError, UnicodeError, ValueError):
+        except Exception:
             _error("E_ROOT", sentinel)
     absolute = raw.startswith(os.sep)
     components = (raw[1:] if absolute else raw).split(os.sep)
@@ -281,7 +281,7 @@ def _open_directory(path: Path, sentinel: str) -> int:
         result = descriptor
         descriptor = None
         return result
-    except (OSError, UnicodeError, ValueError):
+    except Exception:
         _error("E_ROOT", sentinel)
     finally:
         if descriptor is not None:
@@ -325,7 +325,7 @@ def _read_at(root_fd: int, relative: PurePosixPath, maximum: int, basename: str)
             os.close(file_fd)
     except EvaluationContractError:
         raise
-    except (OSError, UnicodeError, ValueError):
+    except Exception:
         _error("E_IO", basename)
     finally:
         if opened is not None:
@@ -345,7 +345,7 @@ def _safe_relative(value: object, limits: Mapping[str, int], basename: str) -> P
             or not _SAFE_PATH.fullmatch(text)
             or any(part in {"", ".", ".."} for part in path.parts)
         )
-    except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+    except Exception:
         _error("E_PATH", basename)
     if unsafe:
         _error("E_PATH", basename)
@@ -702,7 +702,9 @@ def _validate_authority_state(
 ) -> tuple[dict[str, Any], Callable[[dict[str, Any], str, Any], Any]]:
     """Re-establish byte, schema, state, and executable authority at every use."""
     try:
-        if contract_path != _contract_path:
+        if type(contract_path) is not PurePosixPath:
+            _error("E_ROOT", "<contract>")
+        if contract_path.as_posix() != _contract_path.as_posix():
             _error("E_ROOT", "<contract>")
         if type(contract_bytes) is not bytes or type(module_bytes) is not bytes:
             _error("E_DIGEST", "<contract>")
@@ -848,7 +850,7 @@ def load_evaluation_contract(path: Path) -> EvaluationContractV1:
     """Load the one fixed production contract and its repository-relative module binding."""
     try:
         supplied = Path(path)
-    except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+    except Exception:
         _error("E_ROOT", "<contract>")
     if tuple(supplied.parts[-3:]) != _CONTRACT_SUFFIX:
         _error("E_ROOT", supplied.name or "<contract>")
@@ -870,7 +872,7 @@ def load_evaluation_contract(path: Path) -> EvaluationContractV1:
         return EvaluationContractV1(contract_data, module_data)
     except EvaluationContractError:
         raise
-    except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+    except Exception:
         _error("E_INTERNAL", "<contract>")
     finally:
         os.close(root_fd)
@@ -1004,7 +1006,7 @@ def load_evaluation_bundle(
         entry = _safe_relative(entrypoint, limits, "<bundle>")
         try:
             root_path = Path(root)
-        except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+        except Exception:
             _error("E_ROOT", "<bundle>")
         root_fd = _open_directory(root_path, "<bundle>")
         definitions = authority["schema_catalog"]["definitions"]
@@ -1137,7 +1139,7 @@ def load_evaluation_bundle(
         return ValidatedEvaluationBundleV1(entrypoint=entry, artifacts=artifacts)
     except EvaluationContractError:
         raise
-    except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+    except Exception:
         _error("E_INTERNAL", "<bundle>")
     finally:
         if root_fd is not None:
