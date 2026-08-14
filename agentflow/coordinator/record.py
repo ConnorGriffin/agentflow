@@ -23,30 +23,6 @@ HELD = "held"
 STARTED = "started"
 NOT_STARTED = "not_started"
 
-
-def logical_stage_identity(repo: str, subject: str, stage: str, target: str | None,
-                           round: int = 0, conflict_round: int = 0, resume: int = 0,
-                           review_axis: str = "combined", review_passes: int = 0,
-                           review_sequence: int = 0,
-                           uncertainty_handoffs: int = 0) -> str:
-    """The coordinator's one canonical logical-stage identity constructor."""
-    parts = [repo, str(subject), stage, target or "-"]
-    if round:
-        parts.append(f"r{round}")
-    if conflict_round:
-        parts.append(f"c{conflict_round}")
-    if resume:
-        parts.append(f"s{resume}")
-    if stage == "review" and review_axis != "combined":
-        parts.append(f"a{review_axis}")
-    if stage == "review" and review_passes:
-        parts.append(f"p{review_passes}")
-    if stage == "review" and review_sequence:
-        parts.append(f"q{review_sequence}")
-    if uncertainty_handoffs:
-        parts.append(f"u{uncertainty_handoffs}")
-    return "|".join(parts)
-
 # --- the preparation-refusal clock (#406) -------------------------------------------------
 # A stage refused *before* launch reserves nothing and consumes no attempt, so exhaustion never
 # calls anyone: one scratch file stalled a review for half an hour with the operator none the

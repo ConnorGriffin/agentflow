@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, asdict, replace
+from dataclasses import FrozenInstanceError, asdict
 import inspect
 import json
 import re
-import shutil
 import sqlite3
 import threading
 
@@ -18,7 +17,6 @@ from agentflow.canary_attribution import (
     CANARY_ATTRIBUTION_CONTRACT_DIGEST,
     CANARY_ATTRIBUTION_RECEIPT_BINDING_VECTORS,
     CANARY_ATTRIBUTION_REFUSAL_CODES,
-    CANARY_ATTRIBUTION_SCHEMA_FINGERPRINT,
     DEPENDENCY_PINS,
     ROW_DIGEST_DOMAIN,
     STORE_V2_SCHEMA_FINGERPRINT,
@@ -32,16 +30,13 @@ from agentflow.canary_attribution import (
     _digest,
     _receipt_binding_source,
     _schema_row_valid,
-    register_sql_functions,
 )
-from agentflow.coordinator.record import RUNNING, WAITING, Record, logical_stage_identity
+from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import (
     AdmissionResult,
     NoAdmission,
     OperationalSafetyAndCanary,
-    OperationalSafetyOnly,
     ReservationIntent,
-    ReservationLimits,
     SCHEMA_VERSION,
     SUPERVISOR_WINDOW,
     SafetySources,
@@ -60,7 +55,7 @@ from agentflow.operational_safety import (
 )
 
 
-IDENTITY = logical_stage_identity("octo/app", "641", "build", None)
+IDENTITY = "octo/app|641|build|-"
 
 
 class Receipts:
@@ -131,16 +126,46 @@ def composed(path, receipts):
 
 
 def make_v2(path, *, record=None):
+    records = [
+        Record("legacy-a", "review", "claude", 2, state=WAITING, revision=3),
+        Record("legacy-b", "build", "codex", 1, state=RUNNING, revision=8),
+    ]
+    if record is not None:
+        records.append(record)
+    records.sort(key=lambda item: item.identity)
     conn = sqlite3.connect(path, isolation_level=None)
     conn.execute("BEGIN IMMEDIATE")
     conn.execute(_RECORDS_SCHEMA)
     OperationalSafety.initialize_schema(conn)
-    if record is not None:
+    for item in records:
         conn.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?)", (
-            record.identity, record.pool, record.state, record.demand, Store._encode(record)))
+            item.identity, item.pool, item.state, item.demand, Store._encode(item)))
     conn.execute("PRAGMA user_version = 2")
     conn.execute("COMMIT")
+    holder = type("V2Store", (), {})()
+    holder._conn = conn
+    holder._lock = threading.RLock()
+    safety = OperationalSafety(holder)
+    cell = safety.register_route_cell(
+        "octo/app", "build", "codex", "gpt-5", "migration",
+        {"model": "gpt-5", "effort": "high", "timeout": 900})
     assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
+    conn.close()
+    return tuple(records), cell
+
+
+def assert_v2_snapshot(path, records, cell):
+    conn = sqlite3.connect(path, isolation_level=None)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
+    payloads = conn.execute("SELECT data FROM records ORDER BY identity").fetchall()
+    assert tuple(Store._decode(row[0]) for row in payloads) == records
+    assert conn.execute(
+        "SELECT active_digest FROM safety_route_state ORDER BY cell_key").fetchall() == [
+            (cell.digest,)]
+    assert conn.execute(
+        "SELECT active_digest FROM safety_canary_state ORDER BY cell_key").fetchall() == [
+            (cell.digest,)]
     conn.close()
 
 
@@ -149,9 +174,9 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
     assert STORE_V2_SCHEMA_FINGERPRINT_DIGEST == (
         "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e")
     assert STORE_V3_SCHEMA_FINGERPRINT_DIGEST == (
-        "135795b5c28ade801c7a2687eda89370e92d5bee5b16049baa4e17392cf0602b")
+        "3a51988512b246ec34c469fc469b63cbcdabaf5d537c9a8552ae7c75d127bda5")
     assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == (
-        "993403fa31faf2445044bce73c9d94c8e693667dd998ad82eb4b6fca218820b6")
+        "4c0ff263ee994228ffae0641a26959ca8f5f497285f800d0b7d980399e508157")
     assert _digest(STORE_V2_SCHEMA_FINGERPRINT) == STORE_V2_SCHEMA_FINGERPRINT_DIGEST
     assert _digest(STORE_V3_SCHEMA_FINGERPRINT) == STORE_V3_SCHEMA_FINGERPRINT_DIGEST
     assert _digest(CANARY_ATTRIBUTION_CONTRACT) == CANARY_ATTRIBUTION_CONTRACT_DIGEST
@@ -312,6 +337,47 @@ def test_receipt_failure_rolls_back_successor_and_attribution(tmp_path, failure,
     store.close()
 
 
+def test_hostile_receipt_reader_cannot_reenter_store_mutations_or_split_commit(tmp_path):
+    path = tmp_path / "reentrant-reader.db"
+
+    class HostileReceipts(Receipts):
+        store = None
+
+        def __init__(self):
+            super().__init__()
+            self.refusals = []
+
+        def read(self, receipt_id):
+            if self.store is not None:
+                attacker = Record("attacker", "build", "codex", 1, state=WAITING)
+                for operation in (
+                    lambda: self.store.upsert(attacker),
+                    lambda: self.store.reserve(intent(digest=active.digest)),
+                ):
+                    try:
+                        operation()
+                    except StoreUnavailable as error:
+                        self.refusals.append(str(error))
+            return super().read(receipt_id)
+
+    receipts = HostileReceipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    receipts.store = store
+    result = store.reserve(intent(digest=active.digest))
+    assert type(result) is AdmissionResult
+    assert receipts.refusals == [
+        "reentrant Store mutation during admission",
+        "reentrant Store mutation during admission",
+    ]
+    assert store.record_of("attacker") is None
+    assert store.record_of(IDENTITY) == result.successor
+    assert store.read_canary_attribution(IDENTITY) == result.canary_attribution
+    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 1
+    assert not store._conn.in_transaction
+    store.close()
+
+
 @pytest.mark.parametrize("cutpoint", [
     "after-attribution-before-successor", "after-successor-before-commit"])
 def test_precommit_crash_cutpoints_roll_back_both_rows(tmp_path, monkeypatch, cutpoint):
@@ -327,9 +393,12 @@ def test_precommit_crash_cutpoints_roll_back_both_rows(tmp_path, monkeypatch, cu
     store = composed(path, receipts)
     with pytest.raises(RuntimeError, match="crash"):
         store.reserve(intent(digest=active.digest))
-    assert store.record_of(IDENTITY).state == WAITING
-    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lambda _name: None))
+    reopened = composed(path, receipts)
+    assert reopened.record_of(IDENTITY).state == WAITING
+    assert reopened._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
+    reopened.close()
 
 
 def test_commit_lost_ack_reopens_with_successor_and_attribution(tmp_path, monkeypatch):
@@ -415,18 +484,32 @@ def test_runtime_receipt_binding_uses_every_receipt_and_declaration_field():
     assert _receipt_binding_source(receipt, state) == source
 
 
-def test_schema_is_insertion_only_source_bound_and_content_free(tmp_path):
+def test_schema_is_row_closed_and_insert_or_replace_cannot_delete_original(tmp_path):
     path = tmp_path / "closed.db"
     receipts = Receipts()
     active, _ = seed(path, receipts)
     store = composed(path, receipts)
     result = store.reserve(intent(digest=active.digest))
     assert result is not None
+    assert store._conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
+    original = store._conn.execute("SELECT * FROM canary_attributions").fetchone()
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         store._conn.execute("UPDATE canary_attributions SET cohort_id = ?",
                             ("f" * 64,))
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         store._conn.execute("DELETE FROM canary_attributions")
+    replacement = asdict(result.canary_attribution)
+    replacement["receipt_binding"] = "f" * 64
+    replacement["attribution_digest"] = _digest({
+        "domain": ROW_DIGEST_DOMAIN,
+        **{name: value for name, value in replacement.items()
+           if name != "attribution_digest"},
+    })
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store._conn.execute(
+            "INSERT OR REPLACE INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(replacement.values()))
+    assert store._conn.execute("SELECT * FROM canary_attributions").fetchone() == original
     for values in (
         ("ignore-previous-instructions", "a" * 40, "b" * 64),
         ("a" * 64, "prompt/findings/provider/source", "b" * 64),
@@ -441,6 +524,10 @@ def test_schema_is_insertion_only_source_bound_and_content_free(tmp_path):
         assert _schema_row_valid(*fields.values(), digest) == 0
     assert _schema_fingerprint(store._conn) == STORE_V3_SCHEMA_FINGERPRINT
     store.close()
+    reopened = composed(path, receipts)
+    assert reopened._conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
+    assert reopened._conn.execute("SELECT * FROM canary_attributions").fetchone() == original
+    reopened.close()
 
 
 def test_public_read_revalidates_a_tampered_row_without_external_reads(tmp_path):
@@ -458,6 +545,22 @@ def test_public_read_revalidates_a_tampered_row_without_external_reads(tmp_path)
     with pytest.raises(CanaryAttributionRefused) as refused:
         store.read_canary_attribution(IDENTITY)
     assert refused.value.code == "corrupt_attribution"
+    assert receipts.reads == reads
+    store.close()
+
+
+def test_public_read_is_row_only_when_records_data_changes(tmp_path):
+    path = tmp_path / "row-only.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    result = store.reserve(intent(digest=active.digest))
+    assert result is not None and result.canary_attribution is not None
+    reads = list(receipts.reads)
+    store._conn.execute(
+        "UPDATE records SET data = ? WHERE identity = ?",
+        ('{"mutable":"records authority removed"}', IDENTITY))
+    assert store.read_canary_attribution(IDENTITY) == result.canary_attribution
     assert receipts.reads == reads
     store.close()
 
@@ -566,11 +669,12 @@ def test_direct_v2_to_v3_migration_preserves_records_and_has_zero_attributions(t
     record = Record(
         IDENTITY, "build", "codex", 1, repo="octo/app", subject="641",
         model="gpt-5", state=WAITING, revision=7)
-    make_v2(path, record=record)
+    records, cell = make_v2(path, record=record)
     store = Store(path)
     assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert _schema_fingerprint(store._conn) == STORE_V3_SCHEMA_FINGERPRINT
-    assert store.record_of(IDENTITY) == record
+    assert tuple(store.load()[item.identity] for item in records) == records
+    assert OperationalSafety(store).route_state(cell.digest).route_cell_digest == cell.digest
     assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
 
@@ -578,7 +682,7 @@ def test_direct_v2_to_v3_migration_preserves_records_and_has_zero_attributions(t
 @pytest.mark.parametrize("observation", V2_TO_V3_FAULT_OBSERVATIONS)
 def test_every_declared_migration_fault_observation_is_atomic(tmp_path, monkeypatch, observation):
     path = tmp_path / (observation.replace(":", "-") + ".db")
-    make_v2(path)
+    records, cell = make_v2(path)
 
     def crash(name):
         if name == observation:
@@ -587,15 +691,19 @@ def test_every_declared_migration_fault_observation_is_atomic(tmp_path, monkeypa
     monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(crash))
     with pytest.raises(RuntimeError, match="migration fault"):
         Store(path)
-    conn = sqlite3.connect(path, isolation_level=None)
-    register_sql_functions(conn)
+    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(lambda _name: None))
     if observation == "v2-to-v3:after-commit":
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
-        assert _schema_fingerprint(conn) == STORE_V3_SCHEMA_FINGERPRINT
+        reopened = Store(path)
+        assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert _schema_fingerprint(reopened._conn) == STORE_V3_SCHEMA_FINGERPRINT
+        assert tuple(reopened.load()[item.identity] for item in records) == records
+        assert OperationalSafety(reopened).route_state(
+            cell.digest).route_cell_digest == cell.digest
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
+        reopened.close()
     else:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
-        assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
-    conn.close()
+        assert_v2_snapshot(path, records, cell)
 
 
 def test_v2_migration_rejects_wrong_source_fingerprint_without_ddl(tmp_path):

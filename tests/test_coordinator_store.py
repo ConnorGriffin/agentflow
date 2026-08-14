@@ -16,7 +16,7 @@ import threading
 import pytest
 
 from agentflow.coordinator import Coordinator
-from agentflow.coordinator.record import Record
+from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import (
     ReservationIntent, ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable,
     default_store_path)
@@ -31,6 +31,35 @@ def test_default_store_lives_under_the_state_directory(coord_state):
     # coord_state points AGENTFLOW_STATE at an isolated directory; the store is placed there,
     # never at a caller-supplied path.
     assert default_store_path().is_relative_to(coord_state)
+
+
+def test_coordinator_begin_start_uses_no_admission_intent_without_premutation(
+        coord_state, monkeypatch):
+    coordinator = Coordinator(daemon_generation="daemon-compat")
+    record = Record(
+        "compat", "review", "codex", 1, state=WAITING, lineage="codex",
+        launch_token="prior-token", start_fact="not_started", family="old-family",
+        process_alive=True, attempt_committed=True, started_at=4, deadline=5)
+    assert coordinator._store.upsert(record)
+    coordinator._records[record.identity] = record
+    before = record.__dict__.copy()
+    reserve = coordinator._store.reserve
+    captured = []
+
+    def observe(intent):
+        captured.append(intent)
+        assert record.__dict__ == before
+        return reserve(intent)
+
+    monkeypatch.setattr(coordinator._store, "reserve", observe)
+    assert coordinator._begin_start(record, 100)
+    assert captured == [ReservationIntent(
+        "compat", "prior-token", 1, 100, "daemon-compat", 5, None, None)]
+    durable = coordinator._store.record_of("compat")
+    assert durable == record and record.state == RUNNING
+    assert record.launch_token != "prior-token"
+    assert coordinator._store.permits_used("codex") == 1
+    coordinator._store.close()
 
 
 def test_absent_store_is_created_versioned_and_round_trips(tmp_path):

@@ -23,8 +23,7 @@ import os
 import json
 import threading
 import time
-from dataclasses import dataclass, replace
-from uuid import uuid4
+from dataclasses import dataclass, fields, replace
 
 from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
@@ -35,10 +34,11 @@ from agentflow.coordinator.providers import (EndingReason, ProviderCause, Sessio
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import (
     COMPLETED, HELD, RUNNING, STALL_LOG_EVERY, STALL_OBSERVATION_MAX_GAP, STALL_PARK_AFTER,
-    STALL_STALLED_AFTER, WAITING, Record, logical_stage_identity as _identity, stalled_for)
+    STALL_STALLED_AFTER, WAITING, Record, stalled_for)
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
-from agentflow.coordinator.store import Store, default_store_path
+from agentflow.coordinator.store import (
+    SUPERVISOR_WINDOW, ReservationIntent, Store, default_store_path)
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
@@ -49,7 +49,6 @@ from agentflow.review_policy import ReviewState
 # supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
 # stable deadline after a restart.
 CONTINUATION_BUDGET = ATTEMPT_BUDGET - 1  # the two automatic continuations after the first try
-SUPERVISOR_WINDOW = 2 * 3600              # observe-until horizon stamped at admission, for the log
 # A daemon restart/reboot that kills a running family costs no attempt — the same attempt resumes in
 # place. That resume is bounded per stage identity so a family that keeps dying with no provider end
 # fact still parks eventually instead of spinning forever at zero budget cost.
@@ -932,32 +931,25 @@ class Coordinator:
             self._note_refusal(record, reason or "", False)
             self._emit_deferral(record, now, reason)
             return False
-        # Flip to a reservation and atomically claim demand plus any global admission limits
-        # on the ledger; concurrent instances cannot push a pool, machine, or stage lane past
-        # its reviewed budget (ADR 0029/0030). The fresh
-        # launch token binds this reservation to exactly one bootstrap child: only a child
-        # holding it may record `started`, so a timed-out launch disowned back to waiting can
-        # never be adopted by an uncancelled child (ADR 0030 handshake boundary).
-        expected_launch_token = record.launch_token
-        expected_revision = record.revision
-        record.state = RUNNING
-        record.start_fact = None
-        record.launch_token = uuid4().hex
-        record.family = None
-        record.process_alive = False
-        record.attempt_committed = False  # a fresh attempt has not been consumed yet
-        record.daemon_generation = self._daemon_generation  # who admitted this attempt (restart marker)
-        record.started_at = now
-        record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
+        # Store derives and commits the reservation successor. Default NoAdmission mode preserves
+        # the shipped coordinator behavior; #627 remains the owner of composed Safety/Attribution
+        # mode, RouteCell resolution, and briefing/capability admission receipts.
         reservation_limits = getattr(self._gate, "reservation_limits", None)
         limits = reservation_limits(record) if reservation_limits is not None else None
-        if not self._store.reserve(
-                record, PERMIT_BUDGET, limits,
-                expected_launch_token=expected_launch_token,
-                expected_revision=expected_revision):
-            record.state = WAITING  # the pool cannot fit this demand right now
-            record.start_fact = None
+        admission = self._store.reserve(ReservationIntent(
+            identity=record.identity,
+            expected_launch_token=record.launch_token,
+            expected_revision=record.revision,
+            now=now,
+            daemon_generation=self._daemon_generation,
+            budget=PERMIT_BUDGET,
+            limits=limits,
+            route_cell_digest=None,
+        ))
+        if admission is None:
             return False
+        for item in fields(Record):
+            setattr(record, item.name, getattr(admission.successor, item.name))
         return True
 
     def _emit_deferral(self, record: Record, now: int, reason: str | None) -> None:
@@ -1312,6 +1304,35 @@ class Coordinator:
         prefix identifies the logical stage; the tail carries the attempt, cause, and claim
         disposition. Provider prose and secrets never reach here — only typed causes do."""
         self._log(f"{record.repo}: {record.subject}: {record.stage}: {tail}")
+
+
+def _identity(repo: str, subject: str, stage: str, target: str | None, round: int = 0,
+              conflict_round: int = 0, resume: int = 0, review_axis: str = "combined",
+              review_passes: int = 0, review_sequence: int = 0,
+              uncertainty_handoffs: int = 0) -> str:
+    # The auto-revise round joins the identity once one exists, so an evidence-only revision —
+    # whose re-review binds to the *same* head SHA — still opens a genuinely new stage rather
+    # than colliding with the retired prior review's record. A conflict Revise's own round joins
+    # it too (ADR 0038), so each conflict resolution is a fresh stage that never collides with a
+    # finding-driven revise on the same head SHA. A deliberate maintainer resume joins its resume
+    # number the same way: an exhausted Build must not reuse its terminal record (#245), and a
+    # manual Review must not collide with an automatic moved-head retarget (#501).
+    parts = [repo, str(subject), stage, target or "-"]
+    if round:
+        parts.append(f"r{round}")
+    if conflict_round:
+        parts.append(f"c{conflict_round}")
+    if resume:
+        parts.append(f"s{resume}")
+    if stage == "review" and review_axis != "combined":
+        parts.append(f"a{review_axis}")
+    if stage == "review" and review_passes:
+        parts.append(f"p{review_passes}")
+    if stage == "review" and review_sequence:
+        parts.append(f"q{review_sequence}")
+    if uncertainty_handoffs:
+        parts.append(f"u{uncertainty_handoffs}")
+    return "|".join(parts)
 
 
 def _refusal_state(record: Record):

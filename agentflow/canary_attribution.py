@@ -14,7 +14,6 @@ import re
 import sqlite3
 from typing import Protocol
 
-from agentflow.coordinator.record import logical_stage_identity
 from agentflow.evidence import EvidenceError, PromotionReceipt
 from agentflow.operational_safety import (
     CanaryState,
@@ -58,12 +57,6 @@ CANARY_ATTRIBUTION_SCHEMA = (
     "stage_identity, repository, route_cell_digest, receipt_binding, method_revision,"
     " cohort_id, contract_version, attribution_digest) = 1))"
 )
-_SOURCE_BOUND_SCHEMA = (
-    "CREATE TRIGGER canary_attributions_source_bound BEFORE INSERT ON canary_attributions "
-    "WHEN NOT EXISTS (SELECT 1 FROM records WHERE identity = NEW.stage_identity AND "
-    "canary_record_identity_valid(NEW.stage_identity, NEW.repository, data) = 1) "
-    "BEGIN SELECT RAISE(ABORT, 'canary attribution is not bound to its Record'); END"
-)
 _NO_UPDATE_SCHEMA = (
     "CREATE TRIGGER canary_attributions_no_update BEFORE UPDATE ON canary_attributions "
     "BEGIN SELECT RAISE(ABORT, 'canary_attributions is append-only'); END"
@@ -74,7 +67,6 @@ _NO_DELETE_SCHEMA = (
 )
 CANARY_ATTRIBUTION_SCHEMA_STATEMENTS = (
     ("v2-to-v3:create:canary_attributions", CANARY_ATTRIBUTION_SCHEMA),
-    ("v2-to-v3:create:source-bound-trigger", _SOURCE_BOUND_SCHEMA),
     ("v2-to-v3:create:no-update-trigger", _NO_UPDATE_SCHEMA),
     ("v2-to-v3:create:no-delete-trigger", _NO_DELETE_SCHEMA),
 )
@@ -136,18 +128,13 @@ CANARY_ATTRIBUTION_SCHEMA_FINGERPRINT = (
     ("trigger", "canary_attributions_no_update", "canary_attributions",
      "createtriggercanary_attributions_no_updatebeforeupdateoncanary_attributionsbeginselectraise("
      "abort,'canary_attributionsisappend-only');end"),
-    ("trigger", "canary_attributions_source_bound", "canary_attributions",
-     "createtriggercanary_attributions_source_boundbeforeinsertoncanary_attributionswhen"
-     "notexists(select1fromrecordswhereidentity=new.stage_identityandcanary_record_identity_valid("
-     "new.stage_identity,new.repository,data)=1)beginselectraise(abort,'canaryattributionisnotbound"
-     "toitsrecord');end"),
 )
 STORE_V3_SCHEMA_FINGERPRINT = tuple(sorted(
     STORE_V2_SCHEMA_FINGERPRINT + CANARY_ATTRIBUTION_SCHEMA_FINGERPRINT))
 STORE_V2_SCHEMA_FINGERPRINT_DIGEST = (
     "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e")
 STORE_V3_SCHEMA_FINGERPRINT_DIGEST = (
-    "135795b5c28ade801c7a2687eda89370e92d5bee5b16049baa4e17392cf0602b")
+    "3a51988512b246ec34c469fc469b63cbcdabaf5d537c9a8552ae7c75d127bda5")
 if (_digest(STORE_V2_SCHEMA_FINGERPRINT) != STORE_V2_SCHEMA_FINGERPRINT_DIGEST
         or _digest(STORE_V3_SCHEMA_FINGERPRINT) != STORE_V3_SCHEMA_FINGERPRINT_DIGEST):
     raise RuntimeError(
@@ -185,10 +172,11 @@ CANARY_ATTRIBUTION_CONTRACT = {
     "persistence": ["stage_identity", "repository", "route_cell_digest", "receipt_binding",
                     "method_revision", "cohort_id", "contract_version", "attribution_digest"],
     "writes": ["INSERT canary_attributions", "successor records write"],
+    "immutability": "recursive delete/update triggers enabled and verified per Store connection",
     "refusal_codes": sorted(CANARY_ATTRIBUTION_REFUSAL_CODES),
 }
 CANARY_ATTRIBUTION_CONTRACT_DIGEST = (
-    "993403fa31faf2445044bce73c9d94c8e693667dd998ad82eb4b6fca218820b6")
+    "4c0ff263ee994228ffae0641a26959ca8f5f497285f800d0b7d980399e508157")
 if _digest(CANARY_ATTRIBUTION_CONTRACT) != CANARY_ATTRIBUTION_CONTRACT_DIGEST:
     raise RuntimeError("CanaryAttribution contract changed")
 
@@ -281,8 +269,6 @@ class PromotionReceiptAuthority(Protocol):
 def register_sql_functions(conn: sqlite3.Connection) -> None:
     conn.create_function(
         "canary_attribution_row_valid", 8, _schema_row_valid, deterministic=True)
-    conn.create_function(
-        "canary_record_identity_valid", 3, _record_identity_valid, deterministic=True)
 
 
 def initialize_schema(conn: sqlite3.Connection, *, checkpoint=None) -> None:
@@ -354,25 +340,17 @@ class CanaryAttributionAuthority:
     def _row(self, stage_identity: str) -> CanaryAttribution | None:
         try:
             row = self._conn.execute(
-                "SELECT a.stage_identity, a.repository, a.route_cell_digest,"
-                " a.receipt_binding, a.method_revision, a.cohort_id, a.contract_version,"
-                " a.attribution_digest, r.data FROM canary_attributions AS a"
-                " JOIN records AS r ON r.identity = a.stage_identity"
-                " WHERE a.stage_identity = ?", (stage_identity,)).fetchone()
+                "SELECT stage_identity, repository, route_cell_digest, receipt_binding,"
+                " method_revision, cohort_id, contract_version, attribution_digest"
+                " FROM canary_attributions WHERE stage_identity = ?", (stage_identity,)).fetchone()
         except sqlite3.DatabaseError as error:
             raise CanaryAttributionRefused("corrupt_attribution") from error
         if row is None:
             return None
         try:
-            attribution = CanaryAttribution(*row[:8])
+            attribution = CanaryAttribution(*row)
             _validate_attribution(attribution)
-            record_data = json.loads(row[8])
-            if record_data.get("identity") != attribution.stage_identity:
-                raise ValueError("identity")
-            if record_data.get("repo") != attribution.repository:
-                raise ValueError("repository")
-        except (TypeError, ValueError, json.JSONDecodeError,
-                CanaryAttributionRefused) as error:
+        except (TypeError, ValueError, CanaryAttributionRefused) as error:
             raise CanaryAttributionRefused("corrupt_attribution") from error
         return attribution
 
@@ -483,22 +461,6 @@ def _schema_row_valid(*values: object) -> int:
     except (CanaryAttributionRefused, TypeError, ValueError):
         return 0
     return 1
-
-
-def _record_identity_valid(identity: object, repository: object, payload: object) -> int:
-    try:
-        if not isinstance(payload, str):
-            return 0
-        record = json.loads(payload)
-        expected = logical_stage_identity(
-            record["repo"], record["subject"], record["stage"], record.get("target"),
-            record.get("round", 0), record.get("conflict_round", 0),
-            record.get("resume", 0), record.get("review_axis", "combined"),
-            record.get("review_passes", 0), record.get("review_sequence", 0),
-            record.get("uncertainty_handoffs", 0))
-        return int(identity == expected and repository == record["repo"])
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return 0
 
 
 if any(_digest(vector["source"]) != vector["binding"]
