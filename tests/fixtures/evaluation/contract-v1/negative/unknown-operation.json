@@ -1,0 +1,1 @@
+{"case_id":"unknown-operation","classification":"negative","coverage":["EVAL_V1_OPERATION"],"expected_result":{"code":"EVAL_V1_OPERATION","operation_id":"op-v1-unknown","path":"/operation_id","status":"error"},"input_value":{},"operation_id":"op-v1-unknown"}
