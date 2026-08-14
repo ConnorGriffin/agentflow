@@ -71,3 +71,4 @@ exclude = [
 
 [tool.hatch.build.targets.wheel.force-include]
 "standards/CHARTER.md" = "agentflow/_data/CHARTER.md"
+"agentflow/_data/evaluation-authority-bootstrap-v1.json" = "agentflow/_data/evaluation-authority-bootstrap-v1.json"
