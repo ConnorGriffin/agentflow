@@ -773,6 +773,9 @@ class Store:
                 result = reserve(admitted)
                 self._conn.execute("COMMIT")
                 return result
+            except (json.JSONDecodeError, sqlite3.DatabaseError):
+                self._rollback_quietly()
+                raise RouteAdmissionRefused("unreadable") from None
             except BaseException:
                 self._rollback_quietly()
                 raise
