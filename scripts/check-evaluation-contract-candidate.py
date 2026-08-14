@@ -24,9 +24,9 @@ MODULE_PATH = "agentflow/evaluation_semantics_v1.py"
 SCRIPT_PATH = "scripts/check-evaluation-contract-candidate.py"
 ARTIFACT_PATHS = (CANDIDATE_PATH, REPORT_PATH, MODULE_PATH)
 WHOLE_FILE_SHA256 = {
-    CANDIDATE_PATH: "162a4fe0d0a5cf7d9d23eede686b956eb6c30b3a7638e63398fa88dc33f5cb1f",
-    REPORT_PATH: "3f94d7f0479d646eba9c40ffe9ee9cf9bbcdb81aa29da69f3d30bbee254d7455",
-    MODULE_PATH: "63749bf9a5fedf0b36b3271f6dff35e4962fb4d68c2882bf679f17e838a7c38c",
+    CANDIDATE_PATH: "53359f35de57047441defa76a477564580b956f968ab6425356cca3a1c5a8409",
+    REPORT_PATH: "1c477cc45b49cc66e4b7751d4961617d6674c809179f2f370691058ba5d53915",
+    MODULE_PATH: "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554",
 }
 ERROR_PRECEDENCE = (
     "E_ROOT", "E_SOURCE_DRIFT", "E_SOURCE_LOCATOR", "E_REQUIREMENT_DUPLICATE",
@@ -776,10 +776,12 @@ def _audit_and_load_module(source: bytes):
                 and isinstance(statement.value.value, str)):
             continue
         if isinstance(statement, ast.ImportFrom):
-            if statement.level != 0 or len(statement.names) != 1 or statement.names[0].asname is not None:
+            if statement.level != 0 or len(statement.names) != 1:
                 _fail("E_SEMANTIC", MODULE_PATH)
             binding = (statement.module, statement.names[0].name)
             if binding not in allowed_imports:
+                _fail("E_SEMANTIC", MODULE_PATH)
+            if statement.names[0].asname is not None and not statement.names[0].asname.startswith("_"):
                 _fail("E_SEMANTIC", MODULE_PATH)
             seen_imports.add(binding)
             continue
@@ -834,7 +836,7 @@ def _audit_and_load_module(source: bytes):
         _fail("E_SEMANTIC", MODULE_PATH)
     public_callables = sorted(name for name, value in namespace.items() if not name.startswith("_") and callable(value))
     evaluate = namespace.get("evaluate_v1")
-    if public_callables != ["Fraction", "evaluate_v1", "sha256"] or not callable(evaluate):
+    if public_callables != ["evaluate_v1"] or not callable(evaluate):
         _fail("E_SEMANTIC", MODULE_PATH)
     if len(inspect.signature(evaluate).parameters) != 3:
         _fail("E_SEMANTIC", MODULE_PATH)

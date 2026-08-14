@@ -20,9 +20,9 @@ STAGE_A = (
     "agentflow/evaluation_semantics_v1.py",
 )
 STAGE_A_DIGESTS = (
-    "162a4fe0d0a5cf7d9d23eede686b956eb6c30b3a7638e63398fa88dc33f5cb1f",
-    "3f94d7f0479d646eba9c40ffe9ee9cf9bbcdb81aa29da69f3d30bbee254d7455",
-    "63749bf9a5fedf0b36b3271f6dff35e4962fb4d68c2882bf679f17e838a7c38c",
+    "53359f35de57047441defa76a477564580b956f968ab6425356cca3a1c5a8409",
+    "1c477cc45b49cc66e4b7751d4961617d6674c809179f2f370691058ba5d53915",
+    "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554",
 )
 SUCCESS = b'{"checked":3,"format":"evaluation-contract-candidate-check-v1","status":"ok"}\n'
 
@@ -344,6 +344,25 @@ def test_every_semantic_vector_dispatches_through_exact_interface(checker, bundl
     assert set(candidate["operation_ids"].values()) <= set(calls)
 
 
+def test_score_gates_uses_contract_present_state(checker, bundle):
+    candidate, report, source = bundle
+    evaluate = checker._audit_and_load_module(source)
+    case = next(case for case in report["semantic_cases"] if case["operation_id"] == "op-v1-score-gates")
+    contract = deepcopy(candidate)
+    contract["missingness_policy"]["present_state"] = "current"
+    input_value = deepcopy(case["input_value"])
+
+    def replace_present(value):
+        if isinstance(value, dict):
+            return {key: replace_present(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace_present(item) for item in value]
+        return "current" if value == "present" else value
+
+    input_value = replace_present(input_value)
+    assert evaluate(contract, case["operation_id"], input_value) == case["expected_result"]
+
+
 def test_input_and_expectation_cannot_be_rebound_around_whole_file_lock(tmp_path, checker, bundle):
     candidate, report, source = bundle
     evaluate = checker._audit_and_load_module(source)
@@ -381,6 +400,7 @@ def test_module_interface_ast_import_and_capability_audit(checker, bundle):
     "source",
     [
         b"import os\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
+        b"from fractions import Fraction\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
         b"def helper():\n    return open('x')\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
         b"def public():\n    return 1\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
         b"def evaluate_v1(contract, operation_id):\n    return {}\n",
@@ -393,7 +413,7 @@ def test_module_audit_rejects_import_capability_surface_and_interface(checker, s
 
 def test_module_source_exact_limit_passes_and_plus_one_fails(checker):
     prefix = (
-        b'"""x"""\n\nfrom fractions import Fraction\nfrom hashlib import sha256\n\n'
+        b'"""x"""\n\nfrom fractions import Fraction as _Fraction\nfrom hashlib import sha256 as _sha256\n\n'
         b"def evaluate_v1(contract, operation_id, input_value):\n    return input_value\n"
     )
     exact = prefix + b"#" + b"x" * (checker.LIMITS["module_source_bytes"] - len(prefix) - 2) + b"\n"

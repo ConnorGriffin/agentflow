@@ -1,7 +1,7 @@
 """Pure procedural authority for the Evaluation v1 semantic bundle."""
 
-from fractions import Fraction
-from hashlib import sha256
+from fractions import Fraction as _Fraction
+from hashlib import sha256 as _sha256
 
 
 def _error(contract, operation_id, code_key, path):
@@ -28,7 +28,7 @@ def _ratio(value):
         raise ValueError("ratio")
     if denominator <= 0:
         raise ValueError("ratio")
-    result = Fraction(numerator, denominator)
+    result = _Fraction(numerator, denominator)
     if result.numerator != numerator or result.denominator != denominator:
         raise ValueError("ratio")
     return result
@@ -65,7 +65,7 @@ def _digest_without(record, omitted_key):
     for key in record:
         if key != omitted_key:
             preimage[key] = record[key]
-    return sha256(_canonical(preimage).encode("ascii")).hexdigest()
+    return _sha256(_canonical(preimage).encode("ascii")).hexdigest()
 
 
 def _initial_state(policy, partition, seed):
@@ -77,7 +77,7 @@ def _initial_state(policy, partition, seed):
         + seed.to_bytes(policy["seed_bytes"], policy["byte_order"])
     )
     state = int.from_bytes(
-        sha256(seed_bytes).digest()[: policy["state_bytes"]], policy["byte_order"]
+        _sha256(seed_bytes).digest()[: policy["state_bytes"]], policy["byte_order"]
     )
     if state == 0:
         state = policy["zero_state"]
@@ -136,7 +136,7 @@ def _rate(arms, status):
     for arm in arms:
         if arm["status"] == status:
             count += 1
-    return Fraction(count, len(arms))
+    return _Fraction(count, len(arms))
 
 
 def _metric_mean(arms, name, present_state):
@@ -145,7 +145,7 @@ def _metric_mean(arms, name, present_state):
         metric = arm[name]
         if metric["state"] == present_state:
             total += metric["value"]
-    return Fraction(total, len(arms))
+    return _Fraction(total, len(arms))
 
 
 def _metric_sum(arms, name, present_state):
@@ -389,7 +389,7 @@ def _operation_bootstrap(contract, operation_id, input_value):
     state = _initial_state(policy["prng"], partition, seed)
     draws = []
     for ordinal in range(policy["draw_count"]):
-        total = Fraction(0, 1)
+        total = _Fraction(0, 1)
         for unused in range(len(values)):
             state, index = _sample_index(state, len(values), policy["prng"])
             total += values[index]
@@ -454,25 +454,25 @@ def _operation_score(contract, operation_id, input_value):
         cand = attempt["candidate"]
         base_quality = base["quality_micros"]["value"] if base["quality_micros"]["state"] == contract["missingness_policy"]["present_state"] else metric_policy["eligibility_missing_quality_value"]
         cand_quality = cand["quality_micros"]["value"] if cand["quality_micros"]["state"] == contract["missingness_policy"]["present_state"] else metric_policy["eligibility_missing_quality_value"]
-        quality_differences.append(Fraction(cand_quality - base_quality, metric_policy["quality_scale"]))
-        if cand["critical_miss"]["state"] == "present" and cand["critical_miss"]["value"] is True and not (base["critical_miss"]["state"] == "present" and base["critical_miss"]["value"] is True):
+        quality_differences.append(_Fraction(cand_quality - base_quality, metric_policy["quality_scale"]))
+        if cand["critical_miss"]["state"] == present_state and cand["critical_miss"]["value"] is True and not (base["critical_miss"]["state"] == present_state and base["critical_miss"]["value"] is True):
             new_critical_misses += 1
-        if base["tokens"]["state"] != "present" or cand["tokens"]["state"] != "present" or base["tokens"]["value"] <= 0:
+        if base["tokens"]["state"] != present_state or cand["tokens"]["state"] != present_state or base["tokens"]["value"] <= 0:
             token_complete = False
         else:
-            token_savings.append((Fraction(base["tokens"]["value"] - cand["tokens"]["value"], base["tokens"]["value"]), attempt["case_id"], attempt["repetition"]))
-        if base["review_rounds"]["state"] != "present" or cand["review_rounds"]["state"] != "present":
+            token_savings.append((_Fraction(base["tokens"]["value"] - cand["tokens"]["value"], base["tokens"]["value"]), attempt["case_id"], attempt["repetition"]))
+        if base["review_rounds"]["state"] != present_state or cand["review_rounds"]["state"] != present_state:
             round_complete = False
         else:
-            round_savings.append((Fraction(base["review_rounds"]["value"] - cand["review_rounds"]["value"], 1), attempt["case_id"], attempt["repetition"]))
+            round_savings.append((_Fraction(base["review_rounds"]["value"] - cand["review_rounds"]["value"], 1), attempt["case_id"], attempt["repetition"]))
         if attempt["hard_case"]:
             if attempt["case_id"] not in hard_by_case:
                 hard_by_case[attempt["case_id"]] = {"passes": 0, "new_miss": False}
-            if cand["semantic_pass"]["state"] != "present":
+            if cand["semantic_pass"]["state"] != present_state:
                 blocked = True
             elif cand["semantic_pass"]["value"]:
                 hard_by_case[attempt["case_id"]]["passes"] += 1
-            if cand["critical_miss"]["state"] == "present" and cand["critical_miss"]["value"] is True and not (base["critical_miss"]["state"] == "present" and base["critical_miss"]["value"] is True):
+            if cand["critical_miss"]["state"] == present_state and cand["critical_miss"]["value"] is True and not (base["critical_miss"]["state"] == present_state and base["critical_miss"]["value"] is True):
                 hard_by_case[attempt["case_id"]]["new_miss"] = True
     hard_gate = True
     for case_id in sorted(hard_by_case):
@@ -486,7 +486,7 @@ def _operation_score(contract, operation_id, input_value):
     fp_baseline = _metric_mean(baseline, "grounded_false_positive_count", present_state)
     fp_candidate = _metric_mean(candidate, "grounded_false_positive_count", present_state)
     quality_gate = lower_bound >= _ratio(policy["quality_lower_bound_minimum"]) and fp_candidate <= fp_baseline
-    quality_gain = sum(quality_differences, Fraction(0, 1)) / len(quality_differences)
+    quality_gain = sum(quality_differences, _Fraction(0, 1)) / len(quality_differences)
     token_median = _median(token_savings) if token_complete else None
     round_median = _median(round_savings) if round_complete else None
     improvement_gate = quality_gain >= _ratio(policy["quality_gain_minimum"])
@@ -542,8 +542,8 @@ def _operation_score(contract, operation_id, input_value):
         "provider_dollars": {"baseline": _metric_sum(baseline, "provider_dollars_micros", present_state), "candidate": _metric_sum(candidate, "provider_dollars_micros", present_state)},
         "round_saving_median": {"state": metric_policy["present_median_state"] if round_median is not None else metric_policy["unavailable_median_state"], "value": _ratio_value(round_median) if round_median is not None else metric_policy["unavailable_median_sentinel"]},
         "token_saving_median": {"state": metric_policy["present_median_state"] if token_median is not None else metric_policy["unavailable_median_state"], "value": _ratio_value(token_median) if token_median is not None else metric_policy["unavailable_median_sentinel"]},
-        "unjudged_rates": {arm: _ratio_value(Fraction(unjudged[arm], len(attempts))) for arm in sorted(unjudged)},
-        "verification_failed_rates": {arm: _ratio_value(Fraction(verification_failed[arm], len(attempts))) for arm in sorted(verification_failed)},
+        "unjudged_rates": {arm: _ratio_value(_Fraction(unjudged[arm], len(attempts))) for arm in sorted(unjudged)},
+        "verification_failed_rates": {arm: _ratio_value(_Fraction(verification_failed[arm], len(attempts))) for arm in sorted(verification_failed)},
     }
     return _ok(operation_id, {"scorecard": {"gates": gates, "metrics": metric_value, "status": status}})
 
@@ -567,7 +567,7 @@ def _operation_evidence(contract, operation_id, input_value):
     if operations[1]["input_id"] != event_id:
         return _error(contract, operation_id, "publication", "/operation_results/1/input_id")
     preimage = {policy["lesson_preimage_digest_field"]: aggregate["digest"], policy["lesson_preimage_events_field"]: [event_id]}
-    lesson_id = policy["lesson_id_prefix"] + sha256(_canonical(preimage).encode("ascii")).hexdigest()[: policy["lesson_id_hex_length"]]
+    lesson_id = policy["lesson_id_prefix"] + _sha256(_canonical(preimage).encode("ascii")).hexdigest()[: policy["lesson_id_hex_length"]]
     locator = aggregate["evidence_locator"]
     digest_revision = policy["digest_revision_prefix"] + aggregate["digest"]
     subject = {
