@@ -36,12 +36,16 @@ reference through a typed objection event.
 
 The read-only miner accepts only reproduced, model-judged, or human-validated evidence
 and requires two canonical events before it returns a versioned lesson candidate for one
-named upstream method. It cannot evaluate evidence, nominate candidates, or edit policy.
+named upstream method. It is injected with a storage-owned `EvidenceReceiptReader` that exposes
+only immutable, content-free event receipts through the miner's `EvidenceReceiptQuery` protocol.
+The reader is separate from `EvidenceStore`, follows the separate-reader boundary reserved for
+#628's `PromotionReceiptReader`, and cannot evaluate evidence, nominate candidates, or edit policy.
 
 ## Consequences
 
 Producer callers supply classification and validation; the adapter does not infer either.
 The miner reads those facts and the upstream method from Evidence rather than accepting
-caller-supplied classifications or methods. The database remains the Evidence interface
-from ADR 580, and no pipeline source content, prompts, transcripts, or policy mutations
-are retained.
+caller-supplied classifications or methods. The five `EvidenceStore` verbs remain the sole
+governed Evidence interface from ADR 580; the storage-owned receipt reader is a bounded,
+content-free query seam rather than table access or a sixth verb. No pipeline source content,
+prompts, transcripts, or policy mutations are retained.

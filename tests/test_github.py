@@ -364,8 +364,10 @@ def test_api_reports_failure_as_none(monkeypatch):
 # --- GraphQL query constants -----------------------------------------------------
 
 @pytest.mark.parametrize("query", [github._ROLLUP_QUERY, github._MAPS_QUERY,
-                                   github._MAPS_DISCOVERY_QUERY],
-                          ids=["_ROLLUP_QUERY", "_MAPS_QUERY", "_MAPS_DISCOVERY_QUERY"])
+                                   github._MAPS_DISCOVERY_QUERY,
+                                   github._PROMOTION_AUTHORITY_QUERY],
+                          ids=["_ROLLUP_QUERY", "_MAPS_QUERY", "_MAPS_DISCOVERY_QUERY",
+                               "_PROMOTION_AUTHORITY_QUERY"])
 def test_graphql_query_constants_have_balanced_braces(query):
     assert query.count("{") == query.count("}")
 

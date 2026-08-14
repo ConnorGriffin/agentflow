@@ -21,6 +21,8 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 584](adr-584-human-governed-promotion.md) — Exact, human-governed
+  promotion through a read-only GitHub authority receipt and SQLite schema v4 binding marker.
 - [ADR 626](adr-626-manifest-rooted-evaluation-semantic-bundle.md) — One versioned,
   manifest-rooted Evaluation bundle binds declarative candidate JSON to one pure semantic
   module; validation executes that authority without reimplementing its algorithms.
@@ -31,8 +33,8 @@ ADRs in that format.
 - [ADR 605](adr-605-canonical-evaluation-rulebook.md) — One versioned authority and no
   duplicated Evaluation policy; its one-data-file clause is superseded by ADR 626.
 - [ADR 596](adr-596-typed-evidence-envelopes-and-lineage.md) — Typed failure/producer
-  envelopes, bounded same-repository lineage, contextual briefing closure, SQLite schema v3,
-  and suffix-routed JSON contract v2.
+  envelopes, bounded same-repository lineage, contextual briefing closure, the SQLite schema v3
+  foundation extended by ADR 584, and suffix-routed JSON contract v2.
 - [ADR 582](adr-582-capability-parity-and-environment-failure.md) — Methodology capability parity
   and named environment-failure recovery.
 

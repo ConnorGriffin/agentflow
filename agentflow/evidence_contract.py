@@ -21,6 +21,7 @@ _FORBIDDEN = frozenset({"prompt", "prompts", "transcript", "transcripts", "sourc
 _REASON_CODES = frozenset({"duplicate-key", "shape", "type", "vocabulary", "redaction",
                            "suffix", "manifest", "json", "io"})
 _MANIFESTS = frozenset({"contract-v1.json", "contract-v2.json"})
+_AUXILIARY_FILES = frozenset({"promotion-scope-registry-v1.json"})
 _MAX_FIXTURE_BYTES = 1_048_576
 _V1_FIELDS = {"observation_id", "subject", "failure_class", "validation_state",
               "signature_digest", "normalizer_version", "source", "observed_at",
@@ -419,7 +420,7 @@ def validate_fixtures(directory: Path) -> None:
         routed: list[tuple[str, str, str, int]] = []
         seen: set[tuple[int, str]] = set()
         for basename in basenames:
-            if basename in _MANIFESTS | {"README.md"}:
+            if basename in _MANIFESTS | _AUXILIARY_FILES | {"README.md"}:
                 continue
             match = _FIXTURE.fullmatch(basename)
             if match is None:

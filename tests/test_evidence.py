@@ -8,8 +8,8 @@ import sqlite3
 from agentflow.evidence import (AuthorityPointer, EvidenceEnvelopeV2, EvidenceLink,
                                 EvidenceStore, Event, FailureFacts, Observation, ProducerEvent, ProducerFacts,
                                 SubjectRevision, ApprovedAuthority, Evaluation,
-                                EvidenceError, FakeAuthorityVerifier, LessonCandidate,
-                                _V2_SCHEMA, _V3_SCHEMA, _schema_fingerprint,
+                                EvidenceError, EvidenceReceiptReader, FakeAuthorityVerifier, LessonCandidate,
+                                _V2_SCHEMA, _V3_SCHEMA, _V4_SCHEMA, _schema_fingerprint,
                                 _schema_fingerprint_for)
 from agentflow.evidence_contract import validate_fixtures
 
@@ -40,6 +40,10 @@ V2_TO_V3_CHECKPOINTS = (
         "events_failure_identity", "observations_by_event", "evaluations_by_event",
         "candidate_events_by_event", "event_links_by_target")),
     "verify:fingerprint", "set:user-version",
+)
+V3_TO_V4_CHECKPOINTS = (
+    "v3-to-v4:after-add-contract", "v3-to-v4:after-demote-receipts",
+    "v3-to-v4:verify:fingerprint", "v3-to-v4:set:user-version",
 )
 
 
@@ -81,9 +85,36 @@ def _old_v2(path):
     conn.close()
 
 
+def _old_v3(path):
+    conn = sqlite3.connect(path)
+    conn.executescript(_V3_SCHEMA)
+    conn.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        "event-legacy", "failure_observation", "octo/repo", "", "pr/42", "a" * 40,
+        "", "", "original_defect", "", "c" * 64, "v1", ""))
+    conn.execute("INSERT INTO observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        "obs-legacy", "event-legacy", "github", "octo/repo", "issues/42", "a" * 40,
+        "sha256", "b" * 64, "issue", "observed", 1, "", "", "", "", ""))
+    conn.execute("INSERT INTO candidates VALUES (?,?,?,?)",
+                 ("candidate-legacy", "b" * 64, 1, 2))
+    conn.execute("INSERT INTO candidate_events VALUES (?,?)",
+                 ("candidate-legacy", "event-legacy"))
+    conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        "candidate-legacy", "receipt-legacy", "approval-legacy", 1, 3, "verified",
+        "github", "octo/repo", "issues/42", "a" * 40, "sha256", "b" * 64, "issue",
+        "fake", "v1", "verified", "a" * 40, "b" * 64, "issue"))
+    conn.execute("PRAGMA user_version = 3")
+    conn.commit()
+    conn.close()
+
+
 def _source():
     return AuthorityPointer("github", "octo/repo", "issues/42", "a" * 40,
                             "sha256", "b" * 64, "issue")
+
+
+def _promotion_authority():
+    return AuthorityPointer("github", "octo/repo", "pulls/42/files/docs/policy.json", "a" * 40,
+                            "sha256", "b" * 64, "repository-policy/octo/repo/0-to-1")
 
 
 def _observation(*, source=None, revision="a" * 40):
@@ -443,7 +474,7 @@ def test_recent_evaluation_and_candidate_reference_root_events_until_all_expire(
     assert store.brief_for("issue/596", repository="octo/repo", now=age + 200) == ()
 
 
-def test_exact_v2_migrates_to_exact_v3_with_legacy_subject_sentinels(tmp_path):
+def test_exact_v2_migrates_to_exact_v4_with_legacy_subject_sentinels(tmp_path):
     path = tmp_path / "evidence.db"
     _old_v2(path)
     authority = _source()
@@ -451,8 +482,8 @@ def test_exact_v2_migrates_to_exact_v3_with_legacy_subject_sentinels(tmp_path):
                                  authority.content_hash, authority.scope, "fake", "v2", "verified")
     store = EvidenceStore(path=path, verifier=FakeAuthorityVerifier((approved,)))
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
-    assert _schema_fingerprint(conn) == _schema_fingerprint_for(_V3_SCHEMA)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert _schema_fingerprint(conn) == _schema_fingerprint_for(_V4_SCHEMA)
     assert conn.execute("SELECT * FROM events").fetchone() == (
         "event-bd4f1b3ab721f07da0aef1f7531c5fb8", "failure_observation", "octo/repo",
         "", "pr/42", "a" * 40, "", "", "original_defect", "", "c" * 64, "v1", "",
@@ -472,7 +503,7 @@ def test_exact_v2_migrates_to_exact_v3_with_legacy_subject_sentinels(tmp_path):
     assert conn.execute("SELECT * FROM receipts").fetchall() == [
         ("candidate-1", "receipt-candidate-1", "approval-1", 1, 4,
          "legacy_unverifiable", None, None, None, None, None, None, None, None,
-         None, None, None, None, None)]
+         None, None, None, None, None, "")]
     assert not conn.execute("SELECT name FROM sqlite_master WHERE name LIKE 'v2_%'").fetchall()
     conn.close()
     migrated = Event("event-bd4f1b3ab721f07da0aef1f7531c5fb8", 1, ("obs-1",))
@@ -486,12 +517,12 @@ def test_exact_v2_migrates_to_exact_v3_with_legacy_subject_sentinels(tmp_path):
         store.promote("candidate-1", authority, promoted_at=5)
 
 
-def test_new_store_creates_exact_v3_with_required_foreign_key_actions(tmp_path):
+def test_new_store_creates_exact_v4_with_required_foreign_key_actions(tmp_path):
     path = tmp_path / "evidence.db"
     EvidenceStore(path=path)
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
-    assert _schema_fingerprint(conn) == _schema_fingerprint_for(_V3_SCHEMA)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert _schema_fingerprint(conn) == _schema_fingerprint_for(_V4_SCHEMA)
     links = {row[3]: row[6] for row in conn.execute("PRAGMA foreign_key_list(event_links)")}
     assert links == {"target_event_id": "RESTRICT", "source_event_id": "CASCADE"}
     conn.close()
@@ -524,8 +555,62 @@ def test_every_v2_to_v3_fault_rolls_back_exactly_and_remains_reopenable(
     monkeypatch.setattr(EvidenceStore, "_migration_checkpoint", staticmethod(lambda label: None))
     EvidenceStore(path=path)
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     conn.close()
+
+
+@pytest.mark.parametrize("checkpoint", V3_TO_V4_CHECKPOINTS)
+def test_every_v3_to_v4_fault_rolls_back_before_legacy_receipts_can_activate(
+        tmp_path, monkeypatch, checkpoint):
+    path = tmp_path / "evidence.db"
+    _old_v3(path)
+    conn = sqlite3.connect(path)
+    fingerprint = _schema_fingerprint(conn)
+    conn.close()
+
+    def fail(label):
+        if label == checkpoint:
+            raise RuntimeError(f"injected at {label}")
+
+    monkeypatch.setattr(EvidenceStore, "_migration_checkpoint", staticmethod(fail))
+    with pytest.raises(RuntimeError, match="injected"):
+        EvidenceStore(path=path)
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert _schema_fingerprint(conn) == fingerprint
+    assert conn.execute("SELECT binding_status FROM receipts").fetchone()[0] == "verified"
+    conn.close()
+
+
+def test_v3_verified_receipt_migrates_to_unverifiable_and_cannot_replay(tmp_path):
+    path = tmp_path / "evidence.db"
+    _old_v3(path)
+    store = EvidenceStore(path=path)
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+    assert conn.execute(
+        "SELECT binding_status, promotion_contract FROM receipts").fetchone() == (
+            "legacy_unverifiable", "")
+    conn.close()
+    with pytest.raises(EvidenceError, match="legacy receipt"):
+        store.promote("candidate-legacy", _source(), promoted_at=4)
+
+
+def test_evidence_store_exposes_exactly_five_public_verbs():
+    public = {name for name in dir(EvidenceStore)
+              if not name.startswith("_") and callable(getattr(EvidenceStore, name))}
+    assert public == {"observe", "evaluate", "nominate", "promote", "brief_for"}
+    assert not hasattr(EvidenceStore, "_read")
+
+
+def test_read_only_receipt_query_is_separate_from_the_governed_store(tmp_path):
+    store = EvidenceStore(path=tmp_path / "evidence.db")
+    event = store.observe(_observation())
+    receipts = EvidenceReceiptReader(path=store.path)
+    public = {name for name in dir(EvidenceReceiptReader)
+              if not name.startswith("_") and callable(getattr(EvidenceReceiptReader, name))}
+    assert public == {"read"}
+    assert receipts.read(event.event_id).event_id == event.event_id
 
 
 @pytest.mark.parametrize("outcome,digest", [("merge", "1" * 64), ("park", "2" * 64)])
@@ -634,13 +719,13 @@ def test_fix_introduced_defect_keeps_parent_and_fixer_lineage_separate(tmp_path)
 
 
 def test_evaluation_nomination_and_verified_promotion_are_idempotent(tmp_path):
-    authority = _source()
+    authority = _promotion_authority()
     approved = ApprovedAuthority(authority, "approval-1", authority.revision, authority.content_hash,
                                  authority.scope, "fake", "v1", "verified")
     store = EvidenceStore(path=tmp_path / "evidence.db", verifier=FakeAuthorityVerifier((approved,)))
     event = store.observe(_observation())
     assert store.evaluate(Evaluation("evaluation-1", event.event_id, "human_validated", 2)).event_id == event.event_id
-    candidate = LessonCandidate("candidate-1", (event.event_id,), "d" * 64, 1, 3)
+    candidate = LessonCandidate("candidate-1", (event.event_id,), authority.content_hash, 1, 3)
     assert store.nominate(candidate) == candidate
     first = store.promote(candidate.candidate_id, authority, promoted_at=4)
     second = store.promote(candidate.candidate_id, authority, promoted_at=5)
@@ -719,12 +804,12 @@ def test_retention_expires_unreferenced_and_abandoned_candidates_but_keeps_effec
 
 
 def test_effective_policy_and_one_successor_retain_a_promoted_candidate(tmp_path):
-    authority = _source()
+    authority = _promotion_authority()
     approved = ApprovedAuthority(authority, "approval-1", authority.revision, authority.content_hash,
                                  authority.scope, "fake", "v1", "verified")
     store = EvidenceStore(path=tmp_path / "evidence.db", verifier=FakeAuthorityVerifier((approved,)))
     event = store.observe(_observation())
-    store.nominate(LessonCandidate("candidate-1", (event.event_id,), "d" * 64, 1, 1))
+    store.nominate(LessonCandidate("candidate-1", (event.event_id,), authority.content_hash, 1, 1))
     store.promote("candidate-1", authority, promoted_at=2)
     late = 90 * 24 * 60 * 60 + 2
     assert store.brief_for("pr/42", now=late, effective_policy_versions=(1,))
@@ -754,7 +839,7 @@ def test_exact_e79a_v1_migrates_atomically_preserving_data_and_marking_receipt_l
                                  authority.scope, "fake", "v1", "verified")
     store = EvidenceStore(path=path, verifier=FakeAuthorityVerifier((approved,)))
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
     assert conn.execute("SELECT count(*) FROM events").fetchone()[0] == 1
     assert conn.execute("SELECT count(*) FROM observations").fetchone()[0] == 1
     assert conn.execute("SELECT count(*) FROM evaluations").fetchone()[0] == 1
@@ -789,7 +874,7 @@ def test_v1_migration_rolls_back_version_and_data_on_injected_failure(tmp_path, 
     conn.close()
     monkeypatch.setattr(EvidenceStore, "_migration_checkpoint", staticmethod(lambda label: None))
     EvidenceStore(path=path)
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 3
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_chained_migration_second_leg_failure_lands_on_exact_v2(tmp_path, monkeypatch):
@@ -810,7 +895,7 @@ def test_chained_migration_second_leg_failure_lands_on_exact_v2(tmp_path, monkey
     conn.close()
     monkeypatch.setattr(EvidenceStore, "_migration_checkpoint", staticmethod(lambda label: None))
     EvidenceStore(path=path)
-    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 3
+    assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] == 4
 
 
 def test_tampered_exact_v1_schema_is_not_a_migration_source(tmp_path):

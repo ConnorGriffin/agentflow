@@ -1,20 +1,23 @@
 """Redacted, provider-neutral evidence behind one governed interface.
 
-The database is deliberately private.  Callers use :class:`EvidenceStore` and
-its five verbs; a later GitHub adapter can satisfy ``AuthorityVerifier`` without
-changing the durable evidence model.
+The database is deliberately private. Governed callers use :class:`EvidenceStore` and its five
+verbs; storage-owned read-only adapters expose bounded content-free receipts outside that verb
+surface. The GitHub adapter satisfies ``AuthorityVerifier`` without changing the durable evidence
+model.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import quote
 import re
 import sqlite3
 
 from agentflow.state import state_path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+_PROMOTION_CONTRACT = "github-merged-pr-v1"
 FAILURE_CLASSES = frozenset({"original_defect", "plan_gap", "slice_scope_error",
                              "reviewer_false_claim", "speculative_preference",
                              "fix_introduced_defect"})
@@ -177,6 +180,11 @@ CREATE INDEX observations_by_event ON observations(event_id);
 CREATE INDEX evaluations_by_event ON evaluations(event_id);
 CREATE INDEX candidate_events_by_event ON candidate_events(event_id);
 CREATE INDEX event_links_by_target ON event_links(target_event_id);
+"""
+
+_V4_SCHEMA = _V3_SCHEMA + """
+ALTER TABLE receipts ADD COLUMN promotion_contract TEXT NOT NULL DEFAULT ''
+  CHECK(promotion_contract IN ('','github-merged-pr-v1'));
 """
 
 
@@ -477,7 +485,7 @@ class ProducerEvent:
 
 @dataclass(frozen=True)
 class EvidenceRecord:
-    """Content-free typed facts returned by Evidence's public read interface."""
+    """Content-free typed facts returned by the separate read-only receipt reader."""
     event_id: str
     event_kind: str
     subject: str
@@ -525,7 +533,8 @@ class LessonCandidate:
             raise EvidenceError("candidate event references must be unique")
         object.__setattr__(self, "event_ids", tuple(sorted(self.event_ids)))
         _digest(self.proposal_digest, "proposal_digest")
-        if not isinstance(self.policy_version, int) or self.policy_version < 1:
+        if (isinstance(self.policy_version, bool) or not isinstance(self.policy_version, int)
+                or self.policy_version < 1):
             raise EvidenceError("invalid policy_version")
         if not isinstance(self.nominated_at, int) or self.nominated_at < 0:
             raise EvidenceError("invalid nominated_at")
@@ -541,8 +550,61 @@ class PromotionReceipt:
     authoritative: bool
 
 
+class EvidenceReceiptReader:
+    """Read immutable Evidence event receipts without widening ``EvidenceStore``.
+
+    This adapter owns its read-only SQLite connection and is injected into consumers that need
+    content-free facts. It cannot evaluate, nominate, promote, retain, or otherwise mutate
+    Evidence.
+    """
+    def __init__(self, *, path: Path) -> None:
+        self.path = path
+        try:
+            with self._connect() as conn:
+                if (conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                        or _schema_fingerprint(conn) != _schema_fingerprint_for(_V4_SCHEMA)):
+                    raise EvidenceError("evidence receipt store was not accepted")
+        except sqlite3.Error as error:
+            raise EvidenceError("evidence receipt store is unavailable") from error
+
+    def _connect(self) -> sqlite3.Connection:
+        encoded = quote(self.path.resolve().as_posix(), safe="/")
+        conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
+    def read(self, event_id: str) -> EvidenceRecord:
+        """Return one immutable, content-free event receipt."""
+        _token(event_id, "event_id")
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+                if row is None:
+                    raise EvidenceError("unknown event receipt")
+                states = tuple(item[0] for item in conn.execute(
+                    "SELECT DISTINCT validation_state FROM observations WHERE event_id=? "
+                    "ORDER BY validation_state", (event_id,)))
+                links = tuple(EvidenceLink(item[0], item[1], item[2]) for item in conn.execute(
+                    "SELECT relation, target_event_id, ordinal FROM event_links "
+                    "WHERE source_event_id=? ORDER BY ordinal", (event_id,)))
+                lineage = conn.execute(
+                    "SELECT parent_revision, fixer_revision FROM observations WHERE event_id=? "
+                    "AND (parent_revision<>'' OR fixer_revision<>'') "
+                    "ORDER BY observation_id LIMIT 1", (event_id,)).fetchone()
+                return EvidenceRecord(
+                    event_id, row["event_kind"], row["subject"], row["revision"],
+                    row["failure_class"], row["producer_kind"], row["review_action"], states,
+                    links, "" if lineage is None else lineage["parent_revision"],
+                    "" if lineage is None else lineage["fixer_revision"],
+                )
+        except sqlite3.Error as error:
+            raise EvidenceError("evidence receipt store is unavailable") from error
+
+
 class EvidenceStore:
-    """The sole caller-facing Evidence interface; its schema is fail-closed."""
+    """The sole governed five-verb Evidence interface; its schema is fail-closed."""
     def __init__(self, *, path: Path | None = None, verifier: AuthorityVerifier | None = None) -> None:
         self.path = path or state_path("evidence", "evidence.db")
         self.verifier = verifier or FakeAuthorityVerifier()
@@ -558,34 +620,45 @@ class EvidenceStore:
     @staticmethod
     def _initialize(conn: sqlite3.Connection) -> None:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1, 2, SCHEMA_VERSION):
+        if version not in (0, 1, 2, 3, SCHEMA_VERSION):
             raise EvidenceError("unsupported evidence schema version")
         existing = _schema_fingerprint(conn)
         v1 = _schema_fingerprint_for(_V1_SCHEMA)
         v2 = _schema_fingerprint_for(_V2_SCHEMA)
         v3 = _schema_fingerprint_for(_V3_SCHEMA)
+        v4 = _schema_fingerprint_for(_V4_SCHEMA)
         if version == 0 and existing:
             raise EvidenceError("unversioned evidence database is not safe to open")
         if version == 1 and existing != v1:
             raise EvidenceError("evidence v1 schema does not match the known migration source")
         if version == 2 and existing != v2:
             raise EvidenceError("evidence v2 schema does not match the known migration source")
-        if version == SCHEMA_VERSION and existing != v3:
+        if version == 3 and existing != v3:
+            raise EvidenceError("evidence v3 schema does not match the known migration source")
+        if version == SCHEMA_VERSION and existing != v4:
             raise EvidenceError("evidence schema does not match its version")
         if version == 0:
-            _execute_schema(conn, _V3_SCHEMA)
-            if _schema_fingerprint(conn) != v3:
+            _execute_schema(conn, _V4_SCHEMA)
+            if _schema_fingerprint(conn) != v4:
                 raise EvidenceError("evidence schema did not initialize exactly")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         elif version == 1:
             EvidenceStore._migrate_v1_to_v2(conn, v2)
             EvidenceStore._migrate_v2_to_v3(conn, v3)
+            EvidenceStore._migrate_v3_to_v4(conn, v4)
         elif version == 2:
             EvidenceStore._migrate_v2_to_v3(conn, v3)
+            EvidenceStore._migrate_v3_to_v4(conn, v4)
+        elif version == 3:
+            EvidenceStore._migrate_v3_to_v4(conn, v4)
         EvidenceStore._validate_graph(conn)
 
     @staticmethod
     def _validate_graph(conn: sqlite3.Connection) -> None:
+        for receipt in conn.execute("SELECT binding_status, promotion_contract FROM receipts"):
+            if ((receipt["binding_status"] == "verified")
+                    != (receipt["promotion_contract"] == _PROMOTION_CONTRACT)):
+                raise EvidenceError("invalid persisted promotion binding")
         events = {row["event_id"]: row for row in conn.execute("SELECT * FROM events")}
         links_by_source: dict[str, list[sqlite3.Row]] = {}
         for link in conn.execute(
@@ -768,6 +841,27 @@ class EvidenceStore:
             conn.execute("PRAGMA foreign_keys = ON")
 
     @staticmethod
+    def _migrate_v3_to_v4(conn: sqlite3.Connection,
+                          expected: tuple[tuple[str, str, str, str], ...]) -> None:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""ALTER TABLE receipts ADD COLUMN promotion_contract TEXT NOT NULL
+                DEFAULT '' CHECK(promotion_contract IN ('','github-merged-pr-v1'))""")
+            EvidenceStore._migration_checkpoint("v3-to-v4:after-add-contract")
+            conn.execute("UPDATE receipts SET binding_status='legacy_unverifiable' "
+                         "WHERE binding_status='verified'")
+            EvidenceStore._migration_checkpoint("v3-to-v4:after-demote-receipts")
+            if _schema_fingerprint(conn) != expected:
+                raise EvidenceError("evidence migration did not produce v4 exactly")
+            EvidenceStore._migration_checkpoint("v3-to-v4:verify:fingerprint")
+            conn.execute("PRAGMA user_version = 4")
+            EvidenceStore._migration_checkpoint("v3-to-v4:set:user-version")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+    @staticmethod
     def _event_id(observation: Observation) -> str:
         import hashlib
         parts = (observation.source.repository, observation.subject.subject, observation.subject.revision,
@@ -910,28 +1004,6 @@ class EvidenceStore:
         return ProducerEvent(event_id, ids, row["producer_kind"], row["review_action"], states,
                              links, contextual)
 
-    def read(self, event_id: str) -> EvidenceRecord:
-        """Return immutable, content-free facts for one canonical Evidence event."""
-        _token(event_id, "event_id")
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
-            if row is None:
-                raise EvidenceError("unknown event")
-            states = tuple(item[0] for item in conn.execute(
-                "SELECT DISTINCT validation_state FROM observations WHERE event_id=? ORDER BY validation_state",
-                (event_id,)))
-            links = tuple(EvidenceLink(item[0], item[1], item[2]) for item in conn.execute(
-                "SELECT relation, target_event_id, ordinal FROM event_links WHERE source_event_id=? ORDER BY ordinal",
-                (event_id,)))
-            lineage = conn.execute(
-                "SELECT parent_revision, fixer_revision FROM observations WHERE event_id=? "
-                "AND (parent_revision<>'' OR fixer_revision<>'') ORDER BY observation_id LIMIT 1",
-                (event_id,)).fetchone()
-            return EvidenceRecord(event_id, row["event_kind"], row["subject"], row["revision"],
-                                  row["failure_class"], row["producer_kind"], row["review_action"],
-                                  states, links, "" if lineage is None else lineage["parent_revision"],
-                                  "" if lineage is None else lineage["fixer_revision"])
-
     def evaluate(self, evaluation: Evaluation) -> Evaluation:
         with self._connect() as conn:
             self._event(conn, evaluation.event_id)
@@ -966,6 +1038,19 @@ class EvidenceStore:
 
     def promote(self, candidate_id: str, authority: AuthorityPointer, *, promoted_at: int) -> PromotionReceipt:
         _token(candidate_id, "candidate_id")
+        if isinstance(promoted_at, bool) or not isinstance(promoted_at, int) or promoted_at < 0:
+            raise EvidenceError("invalid promoted_at")
+        # An exact durable receipt stays idempotent even when the original
+        # external source is no longer available.
+        with self._connect() as conn:
+            prior = conn.execute("SELECT * FROM receipts WHERE candidate_id=?", (candidate_id,)).fetchone()
+            if prior:
+                receipt = self._receipt(prior)
+                if not receipt.authoritative:
+                    raise EvidenceError("legacy receipt is unverifiable and cannot be promotion-active")
+                if receipt.authority.pointer != authority:
+                    raise EvidenceError("candidate was promoted under a different authority")
+                return receipt
         approved = self.verifier.verify(authority)
         if approved is None: raise EvidenceError("authority was not verified")
         if not isinstance(approved, ApprovedAuthority):
@@ -974,9 +1059,11 @@ class EvidenceStore:
                 approved.approved_hash != authority.content_hash or
                 approved.approved_scope != authority.scope):
             raise EvidenceError("verifier did not approve the requested authority")
-        if not isinstance(promoted_at, int) or promoted_at < 0: raise EvidenceError("invalid promoted_at")
         with self._connect() as conn:
-            candidate = conn.execute("SELECT policy_version FROM candidates WHERE candidate_id=?", (candidate_id,)).fetchone()
+            conn.execute("BEGIN IMMEDIATE")
+            candidate = conn.execute(
+                "SELECT proposal_digest, policy_version FROM candidates WHERE candidate_id=?", (candidate_id,)
+            ).fetchone()
             if candidate is None: raise EvidenceError("unknown candidate")
             prior = conn.execute("SELECT * FROM receipts WHERE candidate_id=?", (candidate_id,)).fetchone()
             if prior:
@@ -986,20 +1073,45 @@ class EvidenceStore:
                 if receipt.authority.pointer != authority:
                     raise EvidenceError("candidate was promoted under a different authority")
                 return receipt
+            from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
+            try:
+                scope = parse_promotion_scope(authority.scope)
+            except PromotionAuthorityError as error:
+                raise EvidenceError("promotion scope was not accepted") from error
+            if (candidate["proposal_digest"] != authority.content_hash
+                    or candidate["policy_version"] != scope.new):
+                raise EvidenceError("candidate does not bind the promotion authority")
+            active_versions: list[int] = []
+            for receipt_row in conn.execute(
+                    "SELECT authority_scope FROM receipts WHERE binding_status='verified'"):
+                try:
+                    existing_scope = parse_promotion_scope(receipt_row["authority_scope"])
+                except PromotionAuthorityError as error:
+                    raise EvidenceError("persisted promotion scope was not accepted") from error
+                if (existing_scope.kind == scope.kind
+                        and existing_scope.repository == scope.repository):
+                    active_versions.append(existing_scope.new)
+            if ((not active_versions and scope.prior != 0)
+                    or (active_versions and max(active_versions) != scope.prior)):
+                raise EvidenceError("current policy version does not bind the promotion authority")
             receipt_id = f"receipt-{candidate_id}"
-            conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
-                candidate_id, receipt_id, approved.approval_id, candidate[0], promoted_at,
+            conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+                candidate_id, receipt_id, approved.approval_id, candidate["policy_version"], promoted_at,
                 "verified", authority.authority_kind, authority.repository, authority.locator, authority.revision,
                 authority.content_hash_algorithm, authority.content_hash, authority.scope,
                 approved.verifier_id, approved.verifier_version, approved.outcome,
-                approved.approved_revision, approved.approved_hash, approved.approved_scope))
-            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id, candidate[0], approved, True)
+                approved.approved_revision, approved.approved_hash, approved.approved_scope,
+                _PROMOTION_CONTRACT))
+            return PromotionReceipt(receipt_id, candidate_id, approved.approval_id,
+                                    candidate["policy_version"], approved, True)
 
     @staticmethod
     def _receipt(row: sqlite3.Row) -> PromotionReceipt:
         if row["binding_status"] == "legacy_unverifiable":
             return PromotionReceipt(row["receipt_id"], row["candidate_id"], row["approval_id"],
                                     row["policy_version"], None, False)
+        if row["promotion_contract"] != _PROMOTION_CONTRACT:
+            raise EvidenceError("promotion receipt binding was not accepted")
         pointer = AuthorityPointer(row["authority_kind"], row["authority_repository"],
             row["authority_locator"], row["authority_revision"], row["authority_hash_algorithm"],
             row["authority_hash"], row["authority_scope"])

@@ -30,6 +30,8 @@ names. Both halves of that seam are enforced by architectural tests in ``tests/t
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import shlex
 import subprocess
@@ -154,6 +156,24 @@ class PrFacts:
     head_ref_oid: str
     state: str
     closing_issues: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class PromotionAuthorityRead:
+    """One exact merged-PR authority snapshot, including the checked-in artifact bytes."""
+    repository: str
+    pull_number: int
+    merged: bool
+    merge_commit: str
+    head_commit: str
+    tree: str
+    artifact_path: str
+    artifact_revision: str
+    artifact_bytes: bytes
+    linked_issue_closed: bool
+    linked_issue_completed: bool
+    merged_by: str
+    merged_by_permission: str
 
 
 @dataclass(frozen=True)
@@ -514,6 +534,92 @@ def pr_facts(repo: str, pr: int) -> PrFacts | None:
                    head_ref_oid=str(data.get("headRefOid") or ""),
                    state=str(data.get("state") or ""),
                    closing_issues=_closing_of(data))
+
+
+_PROMOTION_AUTHORITY_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "number state merged mergedAt headRefOid mergedBy{login} "
+    "mergeCommit{oid tree{oid}} "
+    "closingIssuesReferences(first:100){totalCount nodes{state stateReason}}"
+    "}}}")
+
+
+def promotion_authority_read(repository: str, pull_number: int, artifact_path: str,
+                             revision: str) -> PromotionAuthorityRead | None:
+    """Read one exact promotion authority, or ``None`` when any fact is unavailable.
+
+    GitHub wire shapes and artifact decoding stay inside this module. The artifact is read at
+    ``revision`` through the Contents API, never from the working tree or current default branch.
+    """
+    try:
+        owner, separator, name = repository.partition("/")
+        if (not separator or not owner or not name or "/" in name
+                or isinstance(pull_number, bool) or not isinstance(pull_number, int)
+                or pull_number < 1 or not artifact_path or not revision):
+            return None
+        data = _read_json([
+            "api", "graphql", "-f", f"query={_PROMOTION_AUTHORITY_QUERY}",
+            "-f", f"owner={owner}", "-f", f"name={name}", "-F", f"number={pull_number}",
+        ])
+        if not isinstance(data, dict) or data.get("errors"):
+            return None
+        pull = (((data.get("data") or {}).get("repository") or {}).get("pullRequest"))
+        if (not isinstance(pull, dict) or isinstance(pull.get("number"), bool)
+                or pull.get("number") != pull_number):
+            return None
+        merge = pull.get("mergeCommit")
+        actor = pull.get("mergedBy")
+        tree = merge.get("tree") if isinstance(merge, dict) else None
+        if not isinstance(merge, dict) or not isinstance(tree, dict) or not isinstance(actor, dict):
+            return None
+        merged_by = actor.get("login")
+        if not isinstance(merged_by, str) or not merged_by:
+            return None
+        permission = _read_json([
+            "api", f"repos/{repository}/collaborators/{quote(merged_by, safe='')}/permission",
+        ])
+        encoded_path = quote(artifact_path, safe="/")
+        encoded_revision = quote(revision, safe="")
+        artifact = _read_json([
+            "api", f"repos/{repository}/contents/{encoded_path}?ref={encoded_revision}",
+        ])
+        if (not isinstance(permission, dict) or not isinstance(artifact, dict)
+                or artifact.get("type") != "file" or artifact.get("encoding") != "base64"
+                or not isinstance(artifact.get("content"), str)):
+            return None
+        encoded = "".join(artifact["content"].splitlines())
+        artifact_bytes = base64.b64decode(encoded, validate=True)
+        if (isinstance(artifact.get("size"), bool) or not isinstance(artifact.get("size"), int)
+                or artifact["size"] != len(artifact_bytes)):
+            return None
+        references = pull.get("closingIssuesReferences")
+        nodes = references.get("nodes") if isinstance(references, dict) else None
+        total = references.get("totalCount") if isinstance(references, dict) else None
+        if (not isinstance(nodes, list) or isinstance(total, bool) or not isinstance(total, int)
+                or total != len(nodes)
+                or any(not isinstance(node, dict) for node in nodes)):
+            return None
+        completed = any(node.get("state") == "CLOSED" and node.get("stateReason") == "COMPLETED"
+                        for node in nodes)
+        return PromotionAuthorityRead(
+            repository=repository,
+            pull_number=pull_number,
+            merged=pull.get("merged") is True and pull.get("state") == "MERGED"
+            and bool(pull.get("mergedAt")),
+            merge_commit=str(merge.get("oid") or ""),
+            head_commit=str(pull.get("headRefOid") or ""),
+            tree=str(tree.get("oid") or ""),
+            artifact_path=artifact_path,
+            artifact_revision=revision,
+            artifact_bytes=artifact_bytes,
+            linked_issue_closed=completed,
+            linked_issue_completed=completed,
+            merged_by=merged_by,
+            merged_by_permission=str(permission.get("permission") or ""),
+        )
+    except (AttributeError, binascii.Error, TypeError, ValueError):
+        return None
 
 
 def pr_content(repo: str, pr: int) -> PrContent | None:

@@ -27,11 +27,13 @@ provenance. Retention first expires age/policy relations, then marks remaining o
 evaluation, and candidate roots plus their target closure before sweeping unmarked links and
 events.
 
-New stores create exact SQLite schema v3. Only an exact schema-v2 fingerprint may enter the
+ADR 596 introduced exact SQLite schema v3. Only an exact schema-v2 fingerprint may enter the
 transactional v2→v3 migration. An exact v1 store commits the existing v1→v2 migration before a
 distinct v2→v3 transaction; a first-leg fault leaves exact v1 and a second-leg fault leaves exact,
 row-preserving, reopenable v2. Migrated empty subject metadata is an immutable `legacy_unknown`
 sentinel and is never backfilled or treated as knowledge the old schema did not retain.
+ADR 584 subsequently extends new stores to schema v4 with a promotion-contract receipt marker and
+an exact transactional v3→v4 migration; the v3 envelope and lineage contract is unchanged.
 
 JSON contract v1 remains byte-compatible. Contract v2 is a separately routed normative tagged
 wire contract with fail-closed duplicate-key, redaction, shape, type, vocabulary, suffix,
