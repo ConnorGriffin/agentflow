@@ -525,6 +525,18 @@ def test_error_registry_and_output_invariants_are_closed(checker, bundle):
         assert len(_error(checker, code, checker.CANDIDATE_PATH)) <= checker.LIMITS["stdout_or_stderr_bytes"]
 
 
+def test_public_output_guard_accepts_exact_limit_and_rejects_plus_one(checker):
+    maximum = checker.LIMITS["stdout_or_stderr_bytes"]
+    exact = "x" * (maximum - len(b'""\n'))
+    assert len(checker._bounded_output(exact)) == maximum
+
+    with pytest.raises(checker.CheckFailure) as plus_one:
+        checker._bounded_output(exact + "x")
+    assert (plus_one.value.code, plus_one.value.path) == (
+        "E_LIMIT", checker.SCRIPT_PATH,
+    )
+
+
 def _fault_name(code):
     return "error-" + code.lower().replace("_", "-")
 
@@ -846,6 +858,10 @@ def _assert_public_failure(state, result, expected_code):
     assert result.returncode == expected_exit
     assert result.stdout == b""
     assert result.stderr == _error(checker, expected_code, state["paths"][expected_code])
+    assert len(result.stderr) <= checker.LIMITS["stdout_or_stderr_bytes"]
+    assert result.stderr.count(b"\n") == 1
+    assert b"Traceback" not in result.stderr
+    assert b"Exception" not in result.stderr
 
 
 @pytest.mark.parametrize("code", PUBLIC_ERROR_CODES, ids=_fault_name)
@@ -863,6 +879,8 @@ def test_isolated_public_checker_fixture(tmp_path, checker, bundle, code):
 def test_isolated_fixture_owner_names_are_closed_and_hyphenated():
     names = tuple(_fault_name(code) for code in PUBLIC_ERROR_CODES)
     assert len(names) == len(set(names)) == 28
+    assert set(FAULT_INJECTORS) == set(PUBLIC_ERROR_CODES)
+    assert len(FAULT_INJECTORS) == 28
     assert all(name.startswith("error-e-") and "_" not in name for name in names)
 
 

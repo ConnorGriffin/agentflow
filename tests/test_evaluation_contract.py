@@ -150,6 +150,130 @@ def test_contract_values_are_immutable(contract):
         immutable["contract_version"] = "changed"
 
 
+def _fresh_contract():
+    return evaluation_contract.EvaluationContractV1(CONTRACT.read_bytes(), MODULE.read_bytes())
+
+
+def test_authority_has_no_token_and_exact_bytes_can_reconstruct_it():
+    assert not hasattr(evaluation_contract, "_AUTHORITY_TOKEN")
+    rebuilt = _fresh_contract()
+    assert rebuilt.contract_version == "evaluation-contract-v1"
+    assert rebuilt.semantic_module_sha256 == MODULE_SHA256
+
+
+def test_every_public_contract_and_bundle_operation_revalidates_immutable_state(tmp_path):
+    candidate = json.loads(CONTRACT.read_text())
+    candidate["contract_version"] = "forged-contract-v1"
+    operations = (
+        lambda authority: authority.contract_version,
+        lambda authority: authority.operation_ids,
+        lambda authority: authority.limits,
+        lambda authority: authority.semantic_module_path,
+        lambda authority: authority.semantic_module_sha256,
+        lambda authority: authority.evaluate("unknown-operation", {}),
+        lambda authority: load_evaluation_bundle(
+            authority, tmp_path, PurePosixPath("docs/evaluation/v1/sources/source-a.json"),
+        ),
+    )
+
+    for operation in operations:
+        forged = _fresh_contract()
+        object.__setattr__(
+            forged,
+            "_EvaluationContractV1__contract_value",
+            evaluation_contract._freeze(candidate),
+        )
+        with pytest.raises(EvaluationContractError) as caught:
+            operation(forged)
+        assert (caught.value.code, caught.value.basename) == (
+            "E_DIGEST", "contract-v1.json",
+        )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value", "expected"),
+    (
+        (
+            "_EvaluationContractV1__contract_bytes",
+            CONTRACT.read_bytes()[:-1] + b" ",
+            ("E_DIGEST", "contract-v1.json"),
+        ),
+        (
+            "_EvaluationContractV1__module_bytes",
+            MODULE.read_bytes()[:-1] + b" ",
+            ("E_DIGEST", "evaluation_semantics_v1.py"),
+        ),
+        (
+            "_EvaluationContractV1__contract_path",
+            PurePosixPath("forged/contract-v1.json"),
+            ("E_ROOT", "<contract>"),
+        ),
+    ),
+)
+def test_python_internal_forgery_cannot_bypass_byte_path_or_digest_validation(
+    attribute, value, expected,
+):
+    forged = _fresh_contract()
+    object.__setattr__(forged, attribute, value)
+    with pytest.raises(EvaluationContractError) as caught:
+        _unused = forged.contract_version
+    assert (caught.value.code, caught.value.basename) == expected
+
+
+def test_missing_internal_state_is_a_sanitized_contract_failure():
+    forged = object.__new__(evaluation_contract.EvaluationContractV1)
+    with pytest.raises(EvaluationContractError) as caught:
+        _unused = forged.contract_version
+    assert (caught.value.code, caught.value.basename) == ("E_DIGEST", "<contract>")
+
+
+def test_dispatch_uses_sealed_auditor_when_module_global_is_replaced(contract, monkeypatch):
+    calls = []
+
+    def replacement(_source):
+        calls.append("replacement")
+        return lambda *_args: {
+            "operation_id": "redirected", "status": "ok", "value": {},
+        }
+
+    monkeypatch.setattr(evaluation_contract, "_audit_module", replacement)
+    operation_id = contract.operation_ids["schedule"]
+    result = contract.evaluate(
+        operation_id, {"case_id_pages": [], "partition": 1.5, "seed": 0},
+    )
+
+    assert calls == []
+    assert _thaw(result) == {
+        "code": "EVAL_V1_PAIRING",
+        "operation_id": operation_id,
+        "path": "/partition",
+        "status": "error",
+    }
+
+
+def test_path_like_coercion_failures_are_sanitized(contract, tmp_path):
+    class HostilePath:
+        def __fspath__(self):
+            raise KeyError("secret-path")
+
+    with pytest.raises(EvaluationContractError) as contract_path:
+        load_evaluation_contract(HostilePath())
+    assert (contract_path.value.code, contract_path.value.basename) == (
+        "E_ROOT", "<contract>",
+    )
+    with pytest.raises(EvaluationContractError) as bundle_root:
+        load_evaluation_bundle(
+            contract,
+            HostilePath(),
+            PurePosixPath("docs/evaluation/v1/sources/source-a.json"),
+        )
+    assert (bundle_root.value.code, bundle_root.value.basename) == (
+        "E_ROOT", "<bundle>",
+    )
+    assert "secret-path" not in str(contract_path.value)
+    assert "secret-path" not in str(bundle_root.value)
+
+
 @pytest.mark.parametrize(
     ("mutation", "code"),
     (
@@ -395,8 +519,9 @@ def test_module_source_exact_limit_and_plus_one(contract):
 
 
 def test_scoped_counts_accept_each_corpus_exactly_and_reject_plus_one(contract):
+    candidate = json.loads(CONTRACT.read_text())
     row = next(
-        item for item in contract._EvaluationContractV1__contract_value["artifact_registry"]
+        item for item in candidate["artifact_registry"]
         if item["kind"] == "case-manifest"
     )
     counts: dict[tuple[str, str], int] = {}
@@ -493,7 +618,7 @@ def test_nul_surrogate_wrong_terminal_and_internal_boundaries_are_sanitized(
     }
     with pytest.raises(EvaluationContractError) as terminal:
         evaluation_contract._validate_result_missingness(
-            contract,
+            json.loads(CONTRACT.read_text()),
             PurePosixPath("result.json"),
             {"terminal_edge": {"path": terminal_path.as_posix()}},
             loaded,
@@ -510,12 +635,3 @@ def test_nul_surrogate_wrong_terminal_and_internal_boundaries_are_sanitized(
             contract, tmp_path, PurePosixPath("docs/evaluation/v1/sources/source-a.json"),
         )
     assert (internal_key.value.code, internal_key.value.basename) == ("E_INTERNAL", "<bundle>")
-
-
-@pytest.mark.parametrize("code", evaluation_contract._DECLARED_REJECTION_CODES)
-def test_every_declared_rejection_code_is_closed_and_sanitized(code):
-    with pytest.raises(EvaluationContractError) as caught:
-        evaluation_contract._error(code, "bad\0\ud800/name")
-    assert caught.value.code == code
-    assert caught.value.basename == "<contract>"
-    assert "bad" not in str(caught.value)

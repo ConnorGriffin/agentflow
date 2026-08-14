@@ -23,7 +23,6 @@ _MODULE_INTERFACE = "evaluation-semantics-v1"
 _MODULE_SHA256 = "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554"
 _MAX_JSON_BYTES = 1_048_576
 _MAX_MODULE_BYTES = 65_536
-_AUTHORITY_TOKEN = object()
 _SENTINELS = frozenset({"<contract>", "<bundle>", "<module>"})
 _SAFE_BASENAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,159}$")
 _SAFE_ID = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
@@ -247,7 +246,7 @@ def _decode_json(data: bytes, basename: str, limits: Mapping[str, int] | None = 
 def _open_directory(path: Path, sentinel: str) -> int:
     try:
         raw = os.fspath(path)
-    except (OSError, TypeError, UnicodeError, ValueError):
+    except (KeyError, OSError, TypeError, UnicodeError, ValueError):
         _error("E_ROOT", sentinel)
     if not isinstance(raw, str):
         _error("E_ROOT", sentinel)
@@ -346,7 +345,7 @@ def _safe_relative(value: object, limits: Mapping[str, int], basename: str) -> P
             or not _SAFE_PATH.fullmatch(text)
             or any(part in {"", ".", ".."} for part in path.parts)
         )
-    except (UnicodeError, ValueError):
+    except (KeyError, OSError, TypeError, UnicodeError, ValueError):
         _error("E_PATH", basename)
     if unsafe:
         _error("E_PATH", basename)
@@ -478,14 +477,21 @@ def _value_matches(value: Any, node: Mapping[str, Any], definitions: Mapping[str
     return True
 
 
-def _audit_module(source: bytes) -> Callable[[dict[str, Any], str, Any], Any]:
-    if len(source) > _MAX_MODULE_BYTES:
+def _audit_module(
+    source: bytes,
+    _fraction: type[Fraction] = Fraction,
+    _hash: Callable[[bytes], Any] = sha256,
+    _maximum: int = _MAX_MODULE_BYTES,
+    _path: PurePosixPath = _MODULE_PATH,
+    _signature: Callable[[Any], inspect.Signature] = inspect.signature,
+) -> Callable[[dict[str, Any], str, Any], Any]:
+    if len(source) > _maximum:
         _error("E_LIMIT", "<module>")
     if source.startswith(b"\xef\xbb\xbf") or b"\r" in source:
         _error("E_UTF8", "<module>")
     try:
         text = source.decode("utf-8")
-        tree = ast.parse(text, filename=_MODULE_PATH.as_posix())
+        tree = ast.parse(text, filename=_path.as_posix())
     except (UnicodeDecodeError, SyntaxError):
         _error("E_SEMANTIC", "<module>")
     allowed_imports = {("fractions", "Fraction"), ("hashlib", "sha256")}
@@ -536,95 +542,22 @@ def _audit_module(source: bytes) -> Callable[[dict[str, Any], str, Any], Any]:
 
     def restricted_import(name: str, globals: Any = None, locals: Any = None, fromlist: tuple[str, ...] = (), level: int = 0) -> Any:
         if level == 0 and name == "fractions" and tuple(fromlist) == ("Fraction",):
-            return type("Fractions", (), {"Fraction": Fraction})
+            return type("Fractions", (), {"Fraction": _fraction})
         if level == 0 and name == "hashlib" and tuple(fromlist) == ("sha256",):
-            return type("Hashlib", (), {"sha256": sha256})
+            return type("Hashlib", (), {"sha256": _hash})
         raise ImportError(name)
 
     allowed_builtins["__import__"] = restricted_import
     namespace: dict[str, Any] = {"__builtins__": allowed_builtins, "__name__": "_evaluation_semantics_v1"}
     try:
-        exec(compile(tree, _MODULE_PATH.as_posix(), "exec", dont_inherit=True, optimize=0), namespace)
+        exec(compile(tree, _path.as_posix(), "exec", dont_inherit=True, optimize=0), namespace)
     except Exception:
         _error("E_SEMANTIC", "<module>")
     evaluate = namespace.get("evaluate_v1")
     callables = sorted(name for name, value in namespace.items() if not name.startswith("_") and callable(value))
-    if callables != ["evaluate_v1"] or not callable(evaluate) or len(inspect.signature(evaluate).parameters) != 3:
+    if callables != ["evaluate_v1"] or not callable(evaluate) or len(_signature(evaluate).parameters) != 3:
         _error("E_SEMANTIC", "<module>")
     return evaluate
-
-
-class EvaluationContractV1:
-    """Sealed authority for one byte-pinned contract and semantic function."""
-
-    __slots__ = (
-        "__contract_bytes", "__contract_value", "__contract_version", "__limits",
-        "__module_bytes", "__module_digest", "__operation_ids",
-    )
-
-    def __init__(
-        self,
-        contract_bytes: bytes,
-        contract_value: Mapping[str, Any],
-        module_bytes: bytes,
-        token: object,
-    ) -> None:
-        if token is not _AUTHORITY_TOKEN:
-            raise TypeError("EvaluationContractV1 is loader-created")
-        object.__setattr__(self, "_EvaluationContractV1__contract_bytes", bytes(contract_bytes))
-        object.__setattr__(self, "_EvaluationContractV1__contract_value", _freeze(contract_value))
-        object.__setattr__(self, "_EvaluationContractV1__contract_version", contract_value["contract_version"])
-        object.__setattr__(self, "_EvaluationContractV1__limits", _freeze(contract_value["limits"]))
-        object.__setattr__(self, "_EvaluationContractV1__module_bytes", bytes(module_bytes))
-        object.__setattr__(self, "_EvaluationContractV1__module_digest", _MODULE_SHA256)
-        object.__setattr__(self, "_EvaluationContractV1__operation_ids", _freeze(contract_value["operation_ids"]))
-
-    def __setattr__(self, _name: str, _value: Any) -> None:
-        raise AttributeError("EvaluationContractV1 is immutable")
-
-    @property
-    def contract_version(self) -> str:
-        return self.__contract_version
-
-    @property
-    def operation_ids(self) -> Mapping[str, str]:
-        return self.__operation_ids
-
-    @property
-    def limits(self) -> Mapping[str, int]:
-        return self.__limits
-
-    @property
-    def semantic_module_path(self) -> PurePosixPath:
-        return _MODULE_PATH
-
-    @property
-    def semantic_module_sha256(self) -> str:
-        return self.__module_digest
-
-    def evaluate(self, operation_id: str, input_value: Any) -> Any:
-        """Call the exact bound ``evaluate_v1``, validate its result, and freeze it."""
-        try:
-            result = _audit_module(self.__module_bytes)(
-                _thaw(self.__contract_value), operation_id, input_value,
-            )
-        except Exception:
-            _error("E_SEMANTIC", "<module>")
-        try:
-            contracts = {row["operation_id"]: row for row in self.__contract_value["operation_contracts"]}
-            operation = contracts.get(operation_id)
-            if operation is None:
-                schema_name = next(iter(contracts.values()))["error_schema"]
-            else:
-                schema_name = operation["success_schema"] if isinstance(result, dict) and result.get("status") == "ok" else operation["error_schema"]
-            schema = self.__contract_value["schemas"][schema_name]
-            if not _value_matches(result, schema["root"], schema["definitions"]):
-                _error("E_SEMANTIC", "<module>")
-            return _freeze(result)
-        except EvaluationContractError:
-            raise
-        except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
-            _error("E_SEMANTIC", "<module>")
 
 
 @dataclass(frozen=True)
@@ -730,11 +663,192 @@ def _validate_contract(candidate: Any, module_digest: str) -> None:
         _error("E_DIGEST", basename)
 
 
+def _immutable_state_matches(frozen: Any, plain: Any) -> bool:
+    stack = [(frozen, plain)]
+    while stack:
+        immutable, value = stack.pop()
+        if isinstance(value, dict):
+            if not isinstance(immutable, MappingProxyType) or set(immutable) != set(value):
+                return False
+            stack.extend((immutable[key], item) for key, item in value.items())
+        elif isinstance(value, list):
+            if not isinstance(immutable, tuple) or len(immutable) != len(value):
+                return False
+            stack.extend(zip(immutable, value))
+        elif type(immutable) is not type(value) or immutable != value:
+            return False
+    return True
+
+
+def _validate_authority_state(
+    contract_bytes: Any,
+    module_bytes: Any,
+    contract_value: Any,
+    contract_path: Any,
+    *,
+    _audit: Callable[[bytes], Callable[[dict[str, Any], str, Any], Any]] = _audit_module,
+    _contract_path: PurePosixPath = PurePosixPath(*_CONTRACT_SUFFIX),
+    _contract_digest: str = _CONTRACT_SHA256,
+    _contract_validator: Callable[[Any, str], None] = _validate_contract,
+    _decoder: Callable[[bytes, str, Mapping[str, int] | None], Any] = _decode_json,
+    _immutable_match: Callable[[Any, Any], bool] = _immutable_state_matches,
+    _module_digest: str = _MODULE_SHA256,
+    _module_interface: str = _MODULE_INTERFACE,
+    _module_path: PurePosixPath = _MODULE_PATH,
+    _max_contract_bytes: int = _MAX_JSON_BYTES,
+    _max_module_bytes: int = _MAX_MODULE_BYTES,
+    _sha256: Callable[[bytes], Any] = sha256,
+    _signature: Callable[[Any], inspect.Signature] = inspect.signature,
+) -> tuple[dict[str, Any], Callable[[dict[str, Any], str, Any], Any]]:
+    """Re-establish byte, schema, state, and executable authority at every use."""
+    try:
+        if contract_path != _contract_path:
+            _error("E_ROOT", "<contract>")
+        if type(contract_bytes) is not bytes or type(module_bytes) is not bytes:
+            _error("E_DIGEST", "<contract>")
+        if len(contract_bytes) > _max_contract_bytes or len(module_bytes) > _max_module_bytes:
+            _error("E_LIMIT", "<contract>" if len(contract_bytes) > _max_contract_bytes else "<module>")
+        if _sha256(contract_bytes).hexdigest() != _contract_digest:
+            _error("E_DIGEST", "contract-v1.json")
+        if _sha256(module_bytes).hexdigest() != _module_digest:
+            _error("E_DIGEST", _module_path.name)
+        candidate = _decoder(contract_bytes, "contract-v1.json", None)
+        _contract_validator(candidate, _module_digest)
+        binding = candidate["semantic_module"]
+        if binding != {
+            "interface_version": _module_interface,
+            "path": _module_path.as_posix(),
+            "source_sha256": _module_digest,
+        }:
+            _error("E_SEMANTIC", "<module>")
+        if not _immutable_match(contract_value, candidate):
+            _error("E_DIGEST", "contract-v1.json")
+        evaluate = _audit(module_bytes)
+        code = getattr(evaluate, "__code__", None)
+        if (
+            not callable(evaluate)
+            or getattr(evaluate, "__name__", None) != "evaluate_v1"
+            or getattr(evaluate, "__module__", None) != "_evaluation_semantics_v1"
+            or code is None
+            or code.co_name != "evaluate_v1"
+            or code.co_filename != _module_path.as_posix()
+            or tuple(_signature(evaluate).parameters) != (
+                "contract", "operation_id", "input_value",
+            )
+        ):
+            _error("E_SEMANTIC", "<module>")
+        return candidate, evaluate
+    except EvaluationContractError:
+        raise
+    except (AttributeError, KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+        _error("E_DIGEST", "<contract>")
+
+
+class EvaluationContractV1:
+    """Self-validating authority for the byte-pinned Evaluation v1 bundle."""
+
+    __slots__ = ("__contract_bytes", "__contract_path", "__contract_value", "__module_bytes")
+
+    def __init__(
+        self,
+        contract_bytes: bytes,
+        module_bytes: bytes,
+        _decoder: Callable[[bytes, str, Mapping[str, int] | None], Any] = _decode_json,
+        _freezer: Callable[[Any], Any] = _freeze,
+        _contract_path: PurePosixPath = PurePosixPath(*_CONTRACT_SUFFIX),
+    ) -> None:
+        try:
+            if type(contract_bytes) is not bytes or type(module_bytes) is not bytes:
+                _error("E_DIGEST", "<contract>")
+            value = _decoder(contract_bytes, "contract-v1.json", None)
+            object.__setattr__(self, "_EvaluationContractV1__contract_bytes", contract_bytes)
+            object.__setattr__(
+                self, "_EvaluationContractV1__contract_path", _contract_path,
+            )
+            object.__setattr__(self, "_EvaluationContractV1__contract_value", _freezer(value))
+            object.__setattr__(self, "_EvaluationContractV1__module_bytes", module_bytes)
+            self.__validated()
+        except EvaluationContractError:
+            raise
+        except (AttributeError, KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+            _error("E_DIGEST", "<contract>")
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError("EvaluationContractV1 is immutable")
+
+    def __validated(
+        self,
+        _validator: Callable[
+            [Any, Any, Any, Any],
+            tuple[dict[str, Any], Callable[[dict[str, Any], str, Any], Any]],
+        ] = _validate_authority_state,
+    ) -> tuple[dict[str, Any], Callable[[dict[str, Any], str, Any], Any]]:
+        try:
+            return _validator(
+                object.__getattribute__(self, "_EvaluationContractV1__contract_bytes"),
+                object.__getattribute__(self, "_EvaluationContractV1__module_bytes"),
+                object.__getattribute__(self, "_EvaluationContractV1__contract_value"),
+                object.__getattribute__(self, "_EvaluationContractV1__contract_path"),
+            )
+        except EvaluationContractError:
+            raise
+        except (AttributeError, KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+            _error("E_DIGEST", "<contract>")
+
+    @property
+    def contract_version(self) -> str:
+        candidate, _evaluate = self.__validated()
+        return candidate["contract_version"]
+
+    @property
+    def operation_ids(self) -> Mapping[str, str]:
+        candidate, _evaluate = self.__validated()
+        return _freeze(candidate["operation_ids"])
+
+    @property
+    def limits(self) -> Mapping[str, int]:
+        candidate, _evaluate = self.__validated()
+        return _freeze(candidate["limits"])
+
+    @property
+    def semantic_module_path(self) -> PurePosixPath:
+        candidate, _evaluate = self.__validated()
+        return PurePosixPath(candidate["semantic_module"]["path"])
+
+    @property
+    def semantic_module_sha256(self) -> str:
+        candidate, _evaluate = self.__validated()
+        return candidate["semantic_module"]["source_sha256"]
+
+    def evaluate(self, operation_id: str, input_value: Any) -> Any:
+        """Dispatch original caller input through the revalidated exact ``evaluate_v1``."""
+        candidate, evaluate = self.__validated()
+        try:
+            result = evaluate(candidate, operation_id, input_value)
+        except Exception:
+            _error("E_SEMANTIC", "<module>")
+        try:
+            contracts = {row["operation_id"]: row for row in candidate["operation_contracts"]}
+            operation = contracts.get(operation_id)
+            if operation is None:
+                schema_name = next(iter(contracts.values()))["error_schema"]
+            else:
+                schema_name = operation["success_schema"] if isinstance(result, dict) and result.get("status") == "ok" else operation["error_schema"]
+            schema = candidate["schemas"][schema_name]
+            if not _value_matches(result, schema["root"], schema["definitions"]):
+                _error("E_SEMANTIC", "<module>")
+            return _freeze(result)
+        except EvaluationContractError:
+            raise
+        except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+            _error("E_SEMANTIC", "<module>")
+
+
 def load_evaluation_contract(path: Path) -> EvaluationContractV1:
     """Load the one fixed production contract and its repository-relative module binding."""
     try:
         supplied = Path(path)
-    except (OSError, TypeError, UnicodeError, ValueError):
+    except (KeyError, OSError, TypeError, UnicodeError, ValueError):
         _error("E_ROOT", "<contract>")
     if tuple(supplied.parts[-3:]) != _CONTRACT_SUFFIX:
         _error("E_ROOT", supplied.name or "<contract>")
@@ -753,7 +867,7 @@ def load_evaluation_contract(path: Path) -> EvaluationContractV1:
             _error("E_DIGEST", _MODULE_PATH.name)
         _validate_contract(candidate, module_digest)
         _audit_module(module_data)
-        return EvaluationContractV1(contract_data, candidate, module_data, _AUTHORITY_TOKEN)
+        return EvaluationContractV1(contract_data, module_data)
     except EvaluationContractError:
         raise
     except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
@@ -762,9 +876,8 @@ def load_evaluation_contract(path: Path) -> EvaluationContractV1:
         os.close(root_fd)
 
 
-def _registry_match(contract: EvaluationContractV1, path: PurePosixPath) -> tuple[dict[str, Any], dict[str, str]]:
+def _registry_match(authority: Mapping[str, Any], path: PurePosixPath) -> tuple[dict[str, Any], dict[str, str]]:
     matches: list[tuple[dict[str, Any], dict[str, str]]] = []
-    authority = contract._EvaluationContractV1__contract_value
     for immutable_row in authority["artifact_registry"]:
         row = _thaw(immutable_row)
         pattern = re.escape(row["path"])
@@ -798,7 +911,7 @@ def _typed_refs(value: Any, node: Mapping[str, Any], definitions: Mapping[str, A
 
 
 def _validate_result_missingness(
-    contract: EvaluationContractV1,
+    authority: Mapping[str, Any],
     path: PurePosixPath,
     value: dict[str, Any],
     loaded: Mapping[
@@ -806,7 +919,6 @@ def _validate_result_missingness(
         tuple[dict[str, Any], dict[str, str], dict[str, Any], str, str, dict[str, str]],
     ],
 ) -> None:
-    authority = contract._EvaluationContractV1__contract_value
     policy = authority["missingness_policy"]
     terminal_path = PurePosixPath(value["terminal_edge"]["path"])
     terminal_record = loaded.get(terminal_path)
@@ -883,37 +995,43 @@ def load_evaluation_bundle(
     entrypoint: PurePosixPath,
 ) -> ValidatedEvaluationBundleV1:
     """Validate one manifest-rooted artifact closure without caller-supplied authority facts."""
-    if type(contract) is not EvaluationContractV1:
-        _error("E_SCHEMA", "<contract>")
-    entry = _safe_relative(entrypoint, contract.limits, "<bundle>")
-    root_fd = _open_directory(Path(root), "<bundle>")
-    authority = contract._EvaluationContractV1__contract_value
-    definitions = authority["schema_catalog"]["definitions"]
-    registry = authority["artifact_registry"]
-    group_maxima = {
-        "contract": 1,
-        "corpus": next(row["max_instances"] for row in registry if row["kind"] == "corpus-manifest"),
-        "run": next(row["max_instances"] for row in registry if row["kind"] == "run-manifest"),
-    }
-    graph_limit = sum(row["max_instances"] * group_maxima[row["count_scope"]] for row in registry)
-    loaded: dict[PurePosixPath, tuple[dict[str, Any], dict[str, str], dict[str, Any], str, str, dict[str, str]]] = {}
-    identities: dict[PurePosixPath, tuple[str, str, str]] = {}
-    edges: dict[PurePosixPath, tuple[PurePosixPath, ...]] = {}
-    counts: dict[tuple[str, str], int] = {}
-    queued: set[PurePosixPath] = {entry}
-    pending: list[tuple[PurePosixPath, dict[str, Any], dict[str, str]]] = []
-    work: list[tuple[PurePosixPath, dict[str, Any] | None, dict[str, str]]] = [(entry, None, {})]
-
-    def path_identity(captures: Mapping[str, str], fallback: str) -> str:
-        for key in ("artifact-id", "case-id", "corpus-id", "run-id", "partition"):
-            if key in captures:
-                return captures[key]
-        return fallback
-
+    root_fd: int | None = None
     try:
+        if type(contract) is not EvaluationContractV1:
+            _error("E_SCHEMA", "<contract>")
+        authority, _evaluate = contract._EvaluationContractV1__validated()
+        limits = authority["limits"]
+        entry = _safe_relative(entrypoint, limits, "<bundle>")
+        try:
+            root_path = Path(root)
+        except (KeyError, OSError, TypeError, UnicodeError, ValueError):
+            _error("E_ROOT", "<bundle>")
+        root_fd = _open_directory(root_path, "<bundle>")
+        definitions = authority["schema_catalog"]["definitions"]
+        registry = authority["artifact_registry"]
+        group_maxima = {
+            "contract": 1,
+            "corpus": next(row["max_instances"] for row in registry if row["kind"] == "corpus-manifest"),
+            "run": next(row["max_instances"] for row in registry if row["kind"] == "run-manifest"),
+        }
+        graph_limit = sum(row["max_instances"] * group_maxima[row["count_scope"]] for row in registry)
+        loaded: dict[PurePosixPath, tuple[dict[str, Any], dict[str, str], dict[str, Any], str, str, dict[str, str]]] = {}
+        identities: dict[PurePosixPath, tuple[str, str, str]] = {}
+        edges: dict[PurePosixPath, tuple[PurePosixPath, ...]] = {}
+        counts: dict[tuple[str, str], int] = {}
+        queued: set[PurePosixPath] = {entry}
+        pending: list[tuple[PurePosixPath, dict[str, Any], dict[str, str]]] = []
+        work: list[tuple[PurePosixPath, dict[str, Any] | None, dict[str, str]]] = [(entry, None, {})]
+
+        def path_identity(captures: Mapping[str, str], fallback: str) -> str:
+            for key in ("artifact-id", "case-id", "corpus-id", "run-id", "partition"):
+                if key in captures:
+                    return captures[key]
+            return fallback
+
         while work:
             path, expected, inherited = work.pop()
-            row, captures = _registry_match(contract, path)
+            row, captures = _registry_match(authority, path)
             if "payload_schema" not in row:
                 _error("E_SCHEMA", path.name)
             expected_id = path_identity(captures, path.stem)
@@ -936,9 +1054,9 @@ def load_evaluation_bundle(
             _increment_scoped_count(counts, row, group_id)
             if len(loaded) >= graph_limit:
                 _error("E_LIMIT", "<bundle>")
-            data = _read_at(root_fd, path, contract.limits["json_artifact_bytes"], path.name)
+            data = _read_at(root_fd, path, limits["json_artifact_bytes"], path.name)
             digest = sha256(data).hexdigest()
-            value = _decode_json(data, path.name, contract.limits)
+            value = _decode_json(data, path.name, limits)
             schema = definitions[row["payload_schema"]]
             if not _value_matches(value, schema, definitions):
                 _error("E_SCHEMA", path.name)
@@ -981,7 +1099,7 @@ def load_evaluation_bundle(
 
         for path, (row, _captures, value, _digest_value, _artifact_id, _scope) in loaded.items():
             if row["kind"] == "pre-adjudication-result":
-                _validate_result_missingness(contract, path, value, loaded)
+                _validate_result_missingness(authority, path, value, loaded)
             if row["kind"] != "adjudication-receipt":
                 continue
             case_ref = value["case"]
@@ -1022,4 +1140,5 @@ def load_evaluation_bundle(
     except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
         _error("E_INTERNAL", "<bundle>")
     finally:
-        os.close(root_fd)
+        if root_fd is not None:
+            os.close(root_fd)
