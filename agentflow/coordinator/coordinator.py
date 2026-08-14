@@ -23,6 +23,7 @@ import os
 import json
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass, fields, replace
 
 from agentflow.coordinator.admission import (
@@ -835,7 +836,7 @@ class Coordinator:
         capacity is re-placed instead of freezing at zero attempts (ADR 0020)."""
         if self._store.permits_used(record.pool) + record.demand > PERMIT_BUDGET:
             return True
-        return not self._gate(record)
+        return not self._gate(deepcopy(record))
 
     @staticmethod
     def _may_migrate(record: Record, dest_pool: str) -> bool:
@@ -916,7 +917,7 @@ class Coordinator:
             return False  # a code-writing stage may not silently leave its pinned lineage
         if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
             return False  # new issue work defers while a PR-bound stage waits to start (#293)
-        if not self._gate(record):
+        if not self._gate(deepcopy(record)):
             # An independent admission gate refusal (headroom, ceiling, cap, pacing) used to be
             # silent: a record pinned to a pool the weekly ratchet blocks sat `waiting` with its
             # claim held for days with zero log lines while intake logged its own deferral every
@@ -927,7 +928,7 @@ class Coordinator:
             # lands in the slot preparation just cleared; `_admit` persists whatever the cycle
             # finally settled on, so a capacity reason that has not changed costs no write (#405).
             reason_of = getattr(self._gate, "deferral_reason", None)
-            reason = reason_of(record) if reason_of is not None else None
+            reason = reason_of(deepcopy(record)) if reason_of is not None else None
             self._note_refusal(record, reason or "", False)
             self._emit_deferral(record, now, reason)
             return False
@@ -935,7 +936,7 @@ class Coordinator:
         # the shipped coordinator behavior; #627 remains the owner of composed Safety/Attribution
         # mode, RouteCell resolution, and briefing/capability admission receipts.
         reservation_limits = getattr(self._gate, "reservation_limits", None)
-        limits = reservation_limits(record) if reservation_limits is not None else None
+        limits = reservation_limits(deepcopy(record)) if reservation_limits is not None else None
         # Preparation is Coordinator-owned and may legitimately rewrite the WAITING row (for
         # example, a pool/model migration or refusal/stall clearing).  Commit that exact state
         # through the existing CAS seam before Store reloads it for admission.  A lost CAS ends
@@ -969,7 +970,7 @@ class Coordinator:
         if not reason:
             return
         permitted = getattr(self._gate, "should_emit_deferral", None)
-        if permitted is not None and not permitted(record):
+        if permitted is not None and not permitted(deepcopy(record)):
             return
         waited = ""
         if now > record.created_at > 0:

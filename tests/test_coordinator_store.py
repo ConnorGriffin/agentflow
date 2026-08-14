@@ -78,6 +78,133 @@ def test_coordinator_begin_start_persists_waiting_then_uses_only_no_admission_in
     coordinator._store.close()
 
 
+def _corrupt_gate_snapshot(record):
+    record.state = RUNNING
+    record.identity = "forged-identity"
+    record.repo = "forged/repo"
+    record.stage = "build"
+    record.pool = "claude"
+    record.model = "forged-model"
+    record.demand = 99
+    record.revision = 999
+    record.launch_token = "forged-token"
+    record.descendants.add("forged-child")
+
+
+def _authoritative_gate_facts(record):
+    return (
+        record.state, record.identity, record.repo, record.stage, record.pool, record.model,
+        record.demand, record.revision, record.launch_token, frozenset(record.descendants),
+    )
+
+
+def test_hostile_gate_and_limits_mutations_cannot_change_waiting_authority_or_successor(
+        coord_state, monkeypatch):
+    authoritative_facts = (
+        WAITING, "authority", "owner/repo", "review", "codex", "prepared-model", 1, 1,
+        "prepared-token", frozenset({"owned-child"}),
+    )
+    callback_inputs = []
+    limits = ReservationLimits(10, 10, "review", {"review": "review"})
+
+    class HostileGate:
+        def __call__(self, snapshot):
+            callback_inputs.append(("gate", _authoritative_gate_facts(snapshot)))
+            _corrupt_gate_snapshot(snapshot)
+            return True
+
+        def reservation_limits(self, snapshot):
+            callback_inputs.append(("limits", _authoritative_gate_facts(snapshot)))
+            _corrupt_gate_snapshot(snapshot)
+            return limits
+
+    coordinator = Coordinator(gate=HostileGate(), daemon_generation="daemon-authority")
+    record = Record(
+        "authority", "review", "codex", 1, repo="owner/repo", model="prepared-model",
+        state=WAITING, lineage="codex", launch_token="prepared-token",
+        descendants={"owned-child"})
+    assert coordinator._store.upsert(record)
+    coordinator._records[record.identity] = record
+    reserve = coordinator._store.reserve
+    captured = []
+
+    def observe(intent):
+        captured.append(intent)
+        assert type(intent) is ReservationIntent
+        durable = coordinator._store.record_of("authority")
+        assert durable is not None
+        assert _authoritative_gate_facts(durable) == (
+            WAITING, "authority", "owner/repo", "review", "codex", "prepared-model", 1, 2,
+            "prepared-token", frozenset({"owned-child"}),
+        )
+        # These are the only durable facts from which Store may build an admission context.
+        assert (durable.identity, durable.repo, durable.stage, durable.pool, durable.model) == (
+            "authority", "owner/repo", "review", "codex", "prepared-model")
+        return reserve(intent)
+
+    monkeypatch.setattr(coordinator._store, "reserve", observe)
+    assert coordinator._begin_start(record, 100)
+
+    assert callback_inputs == [("gate", authoritative_facts), ("limits", authoritative_facts)]
+    assert captured == [ReservationIntent(
+        "authority", "prepared-token", 2, 100, "daemon-authority", 5, limits, None)]
+    successor = coordinator._store.record_of("authority")
+    assert successor == record and successor is not None
+    assert successor.state == RUNNING and successor.revision == 3
+    assert (successor.identity, successor.repo, successor.stage, successor.pool,
+            successor.model, successor.demand, successor.descendants) == (
+                "authority", "owner/repo", "review", "codex", "prepared-model", 1,
+                {"owned-child"})
+    assert successor.launch_token not in {"prepared-token", "forged-token"}
+    coordinator._store.close()
+
+
+def test_hostile_false_gate_hooks_preserve_declared_deferral_without_importing_mutations(
+        coord_state):
+    seen = []
+    lines = []
+
+    class HostileGate:
+        def __call__(self, snapshot):
+            seen.append(("gate", _authoritative_gate_facts(snapshot)))
+            _corrupt_gate_snapshot(snapshot)
+            return False
+
+        def deferral_reason(self, snapshot):
+            seen.append(("reason", _authoritative_gate_facts(snapshot)))
+            _corrupt_gate_snapshot(snapshot)
+            return "declared capacity"
+
+        def should_emit_deferral(self, snapshot):
+            seen.append(("emit", _authoritative_gate_facts(snapshot)))
+            _corrupt_gate_snapshot(snapshot)
+            return True
+
+    coordinator = Coordinator(gate=HostileGate(), log=lines.append)
+    record = Record(
+        "deferral", "review", "codex", 1, repo="owner/repo", model="prepared-model",
+        state=WAITING, lineage="codex", launch_token="prepared-token",
+        descendants={"owned-child"})
+    assert coordinator._store.upsert(record)
+    coordinator._records[record.identity] = record
+    prepared_facts = _authoritative_gate_facts(record)
+
+    assert coordinator._admit(record, 100) == "blocked"
+    durable = coordinator._store.record_of("deferral")
+    assert durable is not None and durable.state == WAITING
+    assert (durable.identity, durable.repo, durable.stage, durable.pool, durable.model,
+            durable.demand, durable.launch_token, durable.descendants) == (
+                "deferral", "owner/repo", "review", "codex", "prepared-model", 1,
+                "prepared-token", {"owned-child"})
+    assert durable.refusal == "declared capacity"
+    assert seen[0] == ("gate", prepared_facts)
+    assert seen[1] == ("reason", prepared_facts)
+    assert seen[2][0] == "emit"
+    assert seen[2][1][1:7] == prepared_facts[1:7]
+    assert any("declared capacity" in line for line in lines)
+    coordinator._store.close()
+
+
 def test_absent_store_is_created_versioned_and_round_trips(tmp_path):
     path = tmp_path / "state" / "coord.db"  # a directory that does not exist yet
     assert not path.exists()
