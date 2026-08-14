@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, replace
+from dataclasses import replace
 from hashlib import sha256
 import json
 from pathlib import Path, PurePosixPath
@@ -8,6 +8,7 @@ import shutil
 
 import pytest
 
+import agentflow.evaluation_contract as evaluation_contract
 from agentflow.evaluation_contract import (
     EvaluationContractError,
     load_evaluation_bundle,
@@ -81,22 +82,27 @@ def test_pinned_bytes_and_closed_fixture_directory_are_exact():
 
 
 def test_every_declared_fixture_calls_exact_evaluate_v1_and_returns_immutable_result(contract):
-    calls: list[tuple[str, object]] = []
-    exact = contract._evaluate_v1
-
-    def recording_evaluate(candidate, operation_id, input_value):
-        calls.append((operation_id, input_value))
-        return exact(candidate, operation_id, input_value)
-
-    instrumented = replace(contract, _evaluate_v1=recording_evaluate)
     cases = [json.loads(path.read_text()) for path in _case_files()]
-    results = [instrumented.evaluate(case["operation_id"], case["input_value"]) for case in cases]
+    results = [contract.evaluate(case["operation_id"], case["input_value"]) for case in cases]
 
-    assert len(calls) == len(cases) == 33
-    assert [operation for operation, _value in calls] == [case["operation_id"] for case in cases]
+    assert len(cases) == 33
     assert [_thaw(result) for result in results] == [case["expected_result"] for case in cases]
     with pytest.raises(TypeError):
         results[0]["status"] = "changed"
+
+
+def test_evaluate_dispatches_exact_module_before_local_input_rejection(contract):
+    result = contract.evaluate(
+        contract.operation_ids["schedule"],
+        {"case_id_pages": [], "partition": 1.5, "seed": 0},
+    )
+
+    assert _thaw(result) == {
+        "code": "EVAL_V1_PAIRING",
+        "operation_id": contract.operation_ids["schedule"],
+        "path": "/partition",
+        "status": "error",
+    }
 
 
 def test_negative_fixture_mutations_cover_each_declared_rejection_code(contract):
@@ -129,8 +135,19 @@ def test_contract_values_are_immutable(contract):
     assert contract.semantic_module_sha256 == MODULE_SHA256
     with pytest.raises(TypeError):
         contract.operation_ids["schedule"] = "changed"
-    with pytest.raises(FrozenInstanceError):
+    with pytest.raises(AttributeError):
         contract.contract_version = "changed"
+    with pytest.raises(TypeError):
+        replace(contract)
+    assert not hasattr(contract, "_contract")
+    assert not hasattr(contract, "_evaluate_v1")
+    assert not hasattr(contract, "_EvaluationContractV1__evaluate")
+    assert contract._EvaluationContractV1__contract_bytes == CONTRACT.read_bytes()
+    assert contract._EvaluationContractV1__module_bytes == MODULE.read_bytes()
+    immutable = contract._EvaluationContractV1__contract_value
+    assert not isinstance(immutable, dict)
+    with pytest.raises(TypeError):
+        immutable["contract_version"] = "changed"
 
 
 @pytest.mark.parametrize(
@@ -188,7 +205,7 @@ def test_bundle_derives_role_visibility_root_and_returns_no_raw_payload(contract
     assert len(bundle.artifacts) == 1
     artifact = bundle.artifacts[0]
     assert (artifact.kind, artifact.role_family, artifact.visibility) == ("source-bundle", "public-source", "public")
-    assert artifact.artifact_root == PurePosixPath("docs/evaluation")
+    assert artifact.permitted_root == PurePosixPath("docs/evaluation")
     with pytest.raises(TypeError):
         artifact.value["root_digest"] = "2" * 64
 
@@ -250,17 +267,255 @@ def test_bundle_rejects_cycles_digest_kind_path_symlink_nonregular_and_root(cont
     assert unsafe.value.code == "E_PATH"
 
 
-def test_bundle_json_byte_limit_accepts_exact_limit_and_rejects_plus_one(contract, tmp_path):
-    relative = "docs/evaluation/v1/sources/source-a.json"
-    target = tmp_path / relative
-    target.parent.mkdir(parents=True)
+def test_json_byte_limit_accepts_exact_limit_and_rejects_plus_one(contract):
     maximum = contract.limits["json_artifact_bytes"]
-    target.write_bytes(b'"' + b"x" * (maximum - 3) + b'"\n')
-    with pytest.raises(EvaluationContractError) as exact:
-        load_evaluation_bundle(contract, tmp_path, PurePosixPath(relative))
-    assert exact.value.code == "E_SCHEMA"
+    exact = b'"' + b"x" * (maximum - 3) + b'"\n'
+    assert len(exact) == maximum
+    assert evaluation_contract._decode_json(exact, "exact.json", contract.limits) == "x" * (maximum - 3)
 
-    target.write_bytes(b'"' + b"x" * (maximum - 2) + b'"\n')
+    oversized = b'"' + b"x" * (maximum - 2) + b'"\n'
+    with pytest.raises(EvaluationContractError) as caught:
+        evaluation_contract._decode_json(oversized, "plus-one.json", contract.limits)
+    assert caught.value.code == "E_LIMIT"
+
+
+def test_numeric_expansion_and_parser_recursion_are_bounded(contract):
+    with pytest.raises(EvaluationContractError) as exponent:
+        evaluation_contract._decode_json(b"1e999999999\n", "number.json", contract.limits)
+    assert exponent.value.code == "E_LIMIT"
+
+    deeply_nested = b"[" * 2_000 + b"0" + b"]" * 2_000 + b"\n"
+    with pytest.raises(EvaluationContractError) as recursion:
+        evaluation_contract._decode_json(deeply_nested, "nested.json", contract.limits)
+    assert recursion.value.code == "E_LIMIT"
+
+
+def test_nesting_and_collection_entry_exact_limits_and_plus_one(contract):
+    nesting = contract.limits["json_nesting"]
+    exact_nested = b"[" * nesting + b"0" + b"]" * nesting + b"\n"
+    assert evaluation_contract._decode_json(exact_nested, "exact.json", contract.limits) is not None
+    with pytest.raises(EvaluationContractError) as nested_plus_one:
+        evaluation_contract._decode_json(
+            b"[" * (nesting + 1) + b"0" + b"]" * (nesting + 1) + b"\n",
+            "plus-one.json",
+            contract.limits,
+        )
+    assert nested_plus_one.value.code == "E_LIMIT"
+
+    entries = contract.limits["object_or_array_entries"]
+    exact_collection = ("[" + ",".join("0" for _ in range(entries)) + "]\n").encode()
+    assert len(evaluation_contract._decode_json(exact_collection, "exact.json", contract.limits)) == entries
+    plus_collection = ("[" + ",".join("0" for _ in range(entries + 1)) + "]\n").encode()
+    with pytest.raises(EvaluationContractError) as entries_plus_one:
+        evaluation_contract._decode_json(plus_collection, "plus-one.json", contract.limits)
+    assert entries_plus_one.value.code == "E_LIMIT"
+
+
+def _schema(definitions: dict[str, object], root: object) -> dict[str, object]:
+    return {
+        "definitions": definitions,
+        "root": root,
+        "schema_version": "evaluation-schema-v1",
+    }
+
+
+def _reference(name: str) -> dict[str, str]:
+    return {"ref": f"#/definitions/{name}", "type": "ref"}
+
+
+def test_definition_and_reference_exact_limits_and_plus_one(contract):
+    definition_limit = contract.limits["definitions"]
+    definitions: dict[str, object] = {
+        f"d{index}": _reference(f"d{index + 1}")
+        for index in range(definition_limit - 1)
+    }
+    definitions[f"d{definition_limit - 1}"] = {
+        "max_length": 1,
+        "min_length": 0,
+        "pattern": "^x?$",
+        "type": "string",
+    }
+    evaluation_contract._validate_schema(
+        _schema(definitions, _reference("d0")), contract.limits, "exact.json",
+    )
+    definitions_plus_one = dict(definitions)
+    definitions_plus_one[f"d{definition_limit}"] = definitions[f"d{definition_limit - 1}"]
+    with pytest.raises(EvaluationContractError) as too_many_definitions:
+        evaluation_contract._validate_schema(
+            _schema(definitions_plus_one, _reference("d0")), contract.limits, "plus-one.json",
+        )
+    assert too_many_definitions.value.code == "E_LIMIT"
+
+    reference_limit = contract.limits["references_per_schema"]
+    leaf = definitions[f"d{definition_limit - 1}"]
+    properties = {f"p{index}": _reference("leaf") for index in range(reference_limit)}
+    root = {
+        "additional_properties": False,
+        "properties": properties,
+        "required": sorted(properties),
+        "type": "object",
+    }
+    evaluation_contract._validate_schema(
+        _schema({"leaf": leaf}, root), contract.limits, "exact.json",
+    )
+    properties_plus_one = dict(properties)
+    properties_plus_one[f"p{reference_limit}"] = _reference("leaf")
+    root_plus_one = {**root, "properties": properties_plus_one, "required": sorted(properties_plus_one)}
+    with pytest.raises(EvaluationContractError) as too_many_references:
+        evaluation_contract._validate_schema(
+            _schema({"leaf": leaf}, root_plus_one), contract.limits, "plus-one.json",
+        )
+    assert too_many_references.value.code == "E_LIMIT"
+
+
+def test_path_byte_and_depth_exact_limits_and_plus_one(contract):
+    byte_limit = contract.limits["path_bytes"]
+    assert evaluation_contract._safe_relative("a" * byte_limit, contract.limits, "exact.json")
+    with pytest.raises(EvaluationContractError) as bytes_plus_one:
+        evaluation_contract._safe_relative("a" * (byte_limit + 1), contract.limits, "plus-one.json")
+    assert bytes_plus_one.value.code == "E_PATH"
+
+    depth_limit = contract.limits["path_depth"]
+    assert len(evaluation_contract._safe_relative("/".join("a" for _ in range(depth_limit)), contract.limits, "exact.json").parts) == depth_limit
+    with pytest.raises(EvaluationContractError) as depth_plus_one:
+        evaluation_contract._safe_relative("/".join("a" for _ in range(depth_limit + 1)), contract.limits, "plus-one.json")
+    assert depth_plus_one.value.code == "E_PATH"
+
+
+def test_module_source_exact_limit_and_plus_one(contract):
+    maximum = contract.limits["module_source_bytes"]
+    source = MODULE.read_bytes()
+    padding = maximum - len(source)
+    exact = source + b"#" + b"x" * (padding - 2) + b"\n"
+    assert len(exact) == maximum
+    assert callable(evaluation_contract._audit_module(exact))
     with pytest.raises(EvaluationContractError) as plus_one:
-        load_evaluation_bundle(contract, tmp_path, PurePosixPath(relative))
+        evaluation_contract._audit_module(exact + b" ")
     assert plus_one.value.code == "E_LIMIT"
+
+
+def test_scoped_counts_accept_each_corpus_exactly_and_reject_plus_one(contract):
+    row = next(
+        item for item in contract._EvaluationContractV1__contract_value["artifact_registry"]
+        if item["kind"] == "case-manifest"
+    )
+    counts: dict[tuple[str, str], int] = {}
+    for corpus_id in ("corpus-a", "corpus-b"):
+        group_id, context = evaluation_contract._scope_group(
+            row, {"corpus-id": corpus_id, "case-id": "case-a"}, {}, "case-a.json",
+        )
+        assert context == {"corpus-id": corpus_id}
+        for _unused in range(row["max_instances"]):
+            evaluation_contract._increment_scoped_count(counts, row, group_id)
+    assert counts[("case-manifest", "corpus-a")] == row["max_instances"]
+    assert counts[("case-manifest", "corpus-b")] == row["max_instances"]
+    with pytest.raises(EvaluationContractError) as plus_one:
+        evaluation_contract._increment_scoped_count(counts, row, "corpus-a")
+    assert plus_one.value.code == "E_LIMIT"
+
+
+def test_long_acyclic_bundle_graph_is_iterative(contract, tmp_path):
+    child = None
+    total = 1_100
+    for index in reversed(range(total)):
+        artifact_id = f"index-{index}"
+        relative = f"evaluation/v1/indexes/{artifact_id}.json"
+        entries = [] if child is None else [child]
+        path, digest = _write_artifact(
+            tmp_path,
+            relative,
+            {
+                "children": [],
+                "entries": entries,
+                "entry_count": 1,
+                "group_id": "group-a",
+                "group_kind": "run",
+                "level": 0,
+                "ordinal": index,
+            },
+        )
+        child = {
+            "digest": digest,
+            "id": artifact_id,
+            "kind": "artifact-index",
+            "path": path.as_posix(),
+        }
+
+    bundle = load_evaluation_bundle(
+        contract, tmp_path, PurePosixPath("evaluation/v1/indexes/index-0.json"),
+    )
+    assert len(bundle.artifacts) == total
+
+
+def test_role_specific_identity_rejects_a_case_ref_using_corpus_capture(contract, tmp_path):
+    case_path = "docs/evaluation/v1/corpora/corpus-a/cases/case-b.json"
+    entry, _digest = _write_artifact(
+        tmp_path,
+        "evaluation/v1/indexes/index-a.json",
+        {
+            "children": [],
+            "entries": [{
+                "digest": "0" * 64,
+                "id": "corpus-a",
+                "kind": "case-manifest",
+                "path": case_path,
+            }],
+            "entry_count": 1,
+            "group_id": "group-a",
+            "group_kind": "run",
+            "level": 0,
+            "ordinal": 0,
+        },
+    )
+    with pytest.raises(EvaluationContractError) as identity:
+        load_evaluation_bundle(contract, tmp_path, entry)
+    assert (identity.value.code, identity.value.basename) == ("E_ID", "case-b.json")
+
+
+def test_nul_surrogate_wrong_terminal_and_internal_boundaries_are_sanitized(
+    contract, tmp_path, monkeypatch,
+):
+    with pytest.raises(EvaluationContractError) as nul_root:
+        load_evaluation_bundle(
+            contract, Path("\0"), PurePosixPath("docs/evaluation/v1/sources/source-a.json"),
+        )
+    assert (nul_root.value.code, nul_root.value.basename) == ("E_ROOT", "<bundle>")
+
+    with pytest.raises(EvaluationContractError) as surrogate:
+        load_evaluation_bundle(contract, tmp_path, PurePosixPath("\ud800.json"))
+    assert (surrogate.value.code, surrogate.value.basename) == ("E_PATH", "<bundle>")
+
+    terminal_path = PurePosixPath("docs/evaluation/v1/corpora/corpus-a/answers/case-a.json")
+    loaded = {
+        terminal_path: (
+            {"kind": "answer-key"}, {}, {}, "0" * 64, "case-a", {"corpus-id": "corpus-a"},
+        ),
+    }
+    with pytest.raises(EvaluationContractError) as terminal:
+        evaluation_contract._validate_result_missingness(
+            contract,
+            PurePosixPath("result.json"),
+            {"terminal_edge": {"path": terminal_path.as_posix()}},
+            loaded,
+        )
+    assert (terminal.value.code, terminal.value.basename) == ("E_LINEAGE", "result.json")
+
+    with pytest.raises(EvaluationContractError) as semantic_key:
+        contract.evaluate(contract.operation_ids["schedule"], {})
+    assert (semantic_key.value.code, semantic_key.value.basename) == ("E_SEMANTIC", "<module>")
+
+    monkeypatch.setattr(evaluation_contract, "_registry_match", lambda *_args: {}["missing"])
+    with pytest.raises(EvaluationContractError) as internal_key:
+        load_evaluation_bundle(
+            contract, tmp_path, PurePosixPath("docs/evaluation/v1/sources/source-a.json"),
+        )
+    assert (internal_key.value.code, internal_key.value.basename) == ("E_INTERNAL", "<bundle>")
+
+
+@pytest.mark.parametrize("code", evaluation_contract._DECLARED_REJECTION_CODES)
+def test_every_declared_rejection_code_is_closed_and_sanitized(code):
+    with pytest.raises(EvaluationContractError) as caught:
+        evaluation_contract._error(code, "bad\0\ud800/name")
+    assert caught.value.code == code
+    assert caught.value.basename == "<contract>"
+    assert "bad" not in str(caught.value)

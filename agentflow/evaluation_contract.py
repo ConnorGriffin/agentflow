@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import ast
-from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from decimal import Decimal
 from fractions import Fraction
 from hashlib import sha256
@@ -24,11 +23,22 @@ _MODULE_INTERFACE = "evaluation-semantics-v1"
 _MODULE_SHA256 = "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554"
 _MAX_JSON_BYTES = 1_048_576
 _MAX_MODULE_BYTES = 65_536
+_AUTHORITY_TOKEN = object()
 _SENTINELS = frozenset({"<contract>", "<bundle>", "<module>"})
 _SAFE_BASENAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,159}$")
 _SAFE_ID = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
 _SAFE_PATH = re.compile(r"^[a-z0-9][a-z0-9._/-]*$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
+_DECLARED_REJECTION_CODES = (
+    "E_ROOT", "E_SOURCE_DRIFT", "E_SOURCE_LOCATOR", "E_REQUIREMENT_DUPLICATE",
+    "E_REQUIREMENT_MISSING", "E_IO", "E_LIMIT", "E_UTF8", "E_JSON",
+    "E_DUPLICATE_KEY", "E_CANONICAL", "E_SCHEMA", "E_REF", "E_REF_CYCLE",
+    "E_REF_UNUSED", "E_PATH", "E_DIGEST", "E_ID", "E_CROSS_REFERENCE",
+    "E_LINEAGE", "E_ORACLE", "E_GENERATOR_TEMPLATE", "E_GENERATOR_TARGET",
+    "E_GENERATOR_PRECONDITION", "E_GENERATOR_COLLISION", "E_GENERATOR_LIMIT",
+    "E_SEMANTIC", "E_INTERNAL",
+)
+_DECLARED_REJECTION_SET = frozenset(_DECLARED_REJECTION_CODES)
 _SCHEMA_KEYS = {
     "object": frozenset({"type", "required", "properties", "additional_properties"}),
     "array": frozenset({"type", "items", "min_items", "max_items"}),
@@ -44,12 +54,18 @@ class EvaluationContractError(ValueError):
     """A bounded contract failure containing no rejected content or absolute path."""
 
     def __init__(self, code: str, basename: str) -> None:
-        self.code = code
-        self.basename = basename if basename in _SENTINELS or _SAFE_BASENAME.fullmatch(basename) else "<contract>"
+        self.code = code if isinstance(code, str) and code in _DECLARED_REJECTION_SET else "E_INTERNAL"
+        self.basename = basename if isinstance(basename, str) and (
+            basename in _SENTINELS or _SAFE_BASENAME.fullmatch(basename)
+        ) else "<contract>"
         super().__init__(f"{self.code}: {self.basename}")
 
 
 class _DuplicateKey(ValueError):
+    pass
+
+
+class _NumberLimit(ValueError):
     pass
 
 
@@ -68,6 +84,48 @@ def _pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _reject_constant(_value: str) -> None:
     raise ValueError
+
+
+_JSON_NUMBER = re.compile(
+    r"-?(?:0|[1-9][0-9]*)(?:\.([0-9]+))?(?:[eE]([+-]?)([0-9]+))?\Z"
+)
+
+
+def _bounded_decimal(token: str, maximum: int) -> Decimal:
+    """Parse a JSON decimal only when its fixed-point form is already bounded."""
+    match = _JSON_NUMBER.fullmatch(token)
+    if match is None or len(token.encode("ascii")) > maximum:
+        raise _NumberLimit
+    exponent_digits = match.group(3)
+    exponent = 0
+    if exponent_digits is not None:
+        if len(exponent_digits) > len(str(maximum)) or int(exponent_digits) > maximum:
+            raise _NumberLimit
+        exponent = int(exponent_digits)
+        if match.group(2) == "-":
+            exponent = -exponent
+    coefficient_digits = len(token.split("e", 1)[0].split("E", 1)[0].replace("-", "").replace(".", ""))
+    fractional_digits = len(match.group(1) or "")
+    digits_before_point = coefficient_digits - fractional_digits + exponent
+    sign_bytes = int(token.startswith("-"))
+    if digits_before_point <= 0:
+        fixed_bytes = sign_bytes + 2 - digits_before_point + coefficient_digits
+    elif digits_before_point >= coefficient_digits:
+        fixed_bytes = sign_bytes + digits_before_point
+    else:
+        fixed_bytes = sign_bytes + coefficient_digits + 1
+    if fixed_bytes > maximum:
+        raise _NumberLimit
+    return Decimal(token)
+
+
+def _bounded_integer(token: str, maximum: int) -> int:
+    if len(token.encode("ascii")) > maximum:
+        raise _NumberLimit
+    try:
+        return int(token)
+    except ValueError as exc:
+        raise _NumberLimit from exc
 
 
 def _canonical_string(value: str) -> str:
@@ -126,14 +184,30 @@ def _freeze(value: Any) -> Any:
     return value
 
 
-def _depth_and_entries(value: Any, limits: Mapping[str, int], depth: int = 0) -> None:
-    if isinstance(value, (dict, list)):
-        depth += 1
-        if depth > limits["json_nesting"] or len(value) > limits["object_or_array_entries"]:
-            _error("E_LIMIT", "<contract>")
-        children = value.values() if isinstance(value, dict) else value
-        for child in children:
-            _depth_and_entries(child, limits, depth)
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
+
+
+def _depth_and_entries(value: Any, limits: Mapping[str, int], basename: str = "<contract>") -> int:
+    nodes = 0
+    stack: list[tuple[Any, int]] = [(value, 0)]
+    while stack:
+        current, parent_depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_JSON_BYTES + 1:
+            _error("E_LIMIT", basename)
+        if not isinstance(current, (dict, list)):
+            continue
+        depth = parent_depth + 1
+        if depth > limits["json_nesting"] or len(current) > limits["object_or_array_entries"]:
+            _error("E_LIMIT", basename)
+        children = current.values() if isinstance(current, dict) else current
+        stack.extend((child, depth) for child in children)
+    return nodes
 
 
 def _decode_json(data: bytes, basename: str, limits: Mapping[str, int] | None = None) -> Any:
@@ -145,17 +219,22 @@ def _decode_json(data: bytes, basename: str, limits: Mapping[str, int] | None = 
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         _error("E_UTF8", basename)
+    active_limits = limits or {"json_nesting": 32, "object_or_array_entries": 256}
     try:
         value = json.loads(
-            text, object_pairs_hook=_pairs, parse_float=Decimal,
+            text,
+            object_pairs_hook=_pairs,
+            parse_float=lambda token: _bounded_decimal(token, len(data)),
+            parse_int=lambda token: _bounded_integer(token, len(data)),
             parse_constant=_reject_constant,
         )
     except _DuplicateKey:
         _error("E_DUPLICATE_KEY", basename)
+    except (_NumberLimit, RecursionError):
+        _error("E_LIMIT", basename)
     except (ValueError, json.JSONDecodeError):
         _error("E_JSON", basename)
-    active_limits = limits or {"json_nesting": 32, "object_or_array_entries": 256}
-    _depth_and_entries(value, active_limits)
+    _depth_and_entries(value, active_limits, basename)
     try:
         canonical = (_canonical(value) + "\n").encode("ascii")
     except (UnicodeError, ValueError):
@@ -166,7 +245,10 @@ def _decode_json(data: bytes, basename: str, limits: Mapping[str, int] | None = 
 
 
 def _open_directory(path: Path, sentinel: str) -> int:
-    raw = os.fspath(path)
+    try:
+        raw = os.fspath(path)
+    except (OSError, TypeError, UnicodeError, ValueError):
+        _error("E_ROOT", sentinel)
     if not isinstance(raw, str):
         _error("E_ROOT", sentinel)
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -177,7 +259,7 @@ def _open_directory(path: Path, sentinel: str) -> int:
                 os.close(descriptor)
                 raise OSError
             return descriptor
-        except OSError:
+        except (OSError, UnicodeError, ValueError):
             _error("E_ROOT", sentinel)
     absolute = raw.startswith(os.sep)
     components = (raw[1:] if absolute else raw).split(os.sep)
@@ -200,7 +282,7 @@ def _open_directory(path: Path, sentinel: str) -> int:
         result = descriptor
         descriptor = None
         return result
-    except OSError:
+    except (OSError, UnicodeError, ValueError):
         _error("E_ROOT", sentinel)
     finally:
         if descriptor is not None:
@@ -244,7 +326,7 @@ def _read_at(root_fd: int, relative: PurePosixPath, maximum: int, basename: str)
             os.close(file_fd)
     except EvaluationContractError:
         raise
-    except OSError:
+    except (OSError, UnicodeError, ValueError):
         _error("E_IO", basename)
     finally:
         if opened is not None:
@@ -254,67 +336,74 @@ def _read_at(root_fd: int, relative: PurePosixPath, maximum: int, basename: str)
 def _safe_relative(value: object, limits: Mapping[str, int], basename: str) -> PurePosixPath:
     if not isinstance(value, (str, PurePosixPath)):
         _error("E_PATH", basename)
-    text = value.as_posix() if isinstance(value, PurePosixPath) else value
-    path = PurePosixPath(text)
-    if (
-        path.is_absolute() or not path.parts or text != path.as_posix()
-        or len(text.encode("utf-8")) > limits["path_bytes"]
-        or len(path.parts) > limits["path_depth"]
-        or not _SAFE_PATH.fullmatch(text)
-        or any(part in {"", ".", ".."} for part in path.parts)
-    ):
+    try:
+        text = value.as_posix() if isinstance(value, PurePosixPath) else value
+        path = PurePosixPath(text)
+        unsafe = (
+            path.is_absolute() or not path.parts or text != path.as_posix()
+            or len(text.encode("utf-8")) > limits["path_bytes"]
+            or len(path.parts) > limits["path_depth"]
+            or not _SAFE_PATH.fullmatch(text)
+            or any(part in {"", ".", ".."} for part in path.parts)
+        )
+    except (UnicodeError, ValueError):
+        _error("E_PATH", basename)
+    if unsafe:
         _error("E_PATH", basename)
     return path
 
 
 def _schema_references(node: Any) -> list[str]:
     references: list[str] = []
-    if isinstance(node, dict):
-        if node.get("type") == "ref" and isinstance(node.get("ref"), str):
-            references.append(node["ref"].removeprefix("#/definitions/"))
-        for child in node.values():
-            references.extend(_schema_references(child))
-    elif isinstance(node, list):
-        for child in node:
-            references.extend(_schema_references(child))
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            if current.get("type") == "ref" and isinstance(current.get("ref"), str):
+                references.append(current["ref"].removeprefix("#/definitions/"))
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
     return references
 
 
 def _validate_schema_node(node: Any, definitions: Mapping[str, Any], references: list[str], basename: str) -> None:
-    if not isinstance(node, dict) or node.get("type") not in _SCHEMA_KEYS:
-        _error("E_SCHEMA", basename)
-    kind = node["type"]
-    if set(node) != _SCHEMA_KEYS[kind]:
-        _error("E_SCHEMA", basename)
-    if kind == "object":
-        if node["additional_properties"] is not False or not isinstance(node["required"], list) or not isinstance(node["properties"], dict):
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, dict) or current.get("type") not in _SCHEMA_KEYS:
             _error("E_SCHEMA", basename)
-        if node["required"] != sorted(set(node["required"])) or not set(node["required"]) <= set(node["properties"]):
+        kind = current["type"]
+        if set(current) != _SCHEMA_KEYS[kind]:
             _error("E_SCHEMA", basename)
-        for child in node["properties"].values():
-            _validate_schema_node(child, definitions, references, basename)
-    elif kind == "array":
-        bounds = (node["min_items"], node["max_items"])
-        if any(isinstance(item, bool) or not isinstance(item, int) for item in bounds) or not 0 <= bounds[0] <= bounds[1]:
-            _error("E_SCHEMA", basename)
-        _validate_schema_node(node["items"], definitions, references, basename)
-    elif kind == "string":
-        bounds = (node["min_length"], node["max_length"])
-        if not isinstance(node["pattern"], str) or any(isinstance(item, bool) or not isinstance(item, int) for item in bounds) or not 0 <= bounds[0] <= bounds[1]:
-            _error("E_SCHEMA", basename)
-        try:
-            re.compile(node["pattern"])
-        except re.error:
-            _error("E_SCHEMA", basename)
-    elif kind == "integer":
-        bounds = (node["minimum"], node["maximum"])
-        if any(isinstance(item, bool) or not isinstance(item, int) for item in bounds) or bounds[0] > bounds[1]:
-            _error("E_SCHEMA", basename)
-    elif kind == "ref":
-        match = re.fullmatch(r"#/definitions/([a-z][a-z0-9-]{0,47})", node["ref"] if isinstance(node["ref"], str) else "")
-        if match is None or match.group(1) not in definitions:
-            _error("E_REF", basename)
-        references.append(match.group(1))
+        if kind == "object":
+            if current["additional_properties"] is not False or not isinstance(current["required"], list) or not isinstance(current["properties"], dict):
+                _error("E_SCHEMA", basename)
+            if current["required"] != sorted(set(current["required"])) or not set(current["required"]) <= set(current["properties"]):
+                _error("E_SCHEMA", basename)
+            stack.extend(current["properties"].values())
+        elif kind == "array":
+            bounds = (current["min_items"], current["max_items"])
+            if any(isinstance(item, bool) or not isinstance(item, int) for item in bounds) or not 0 <= bounds[0] <= bounds[1]:
+                _error("E_SCHEMA", basename)
+            stack.append(current["items"])
+        elif kind == "string":
+            bounds = (current["min_length"], current["max_length"])
+            if not isinstance(current["pattern"], str) or any(isinstance(item, bool) or not isinstance(item, int) for item in bounds) or not 0 <= bounds[0] <= bounds[1]:
+                _error("E_SCHEMA", basename)
+            try:
+                re.compile(current["pattern"])
+            except re.error:
+                _error("E_SCHEMA", basename)
+        elif kind == "integer":
+            bounds = (current["minimum"], current["maximum"])
+            if any(isinstance(item, bool) or not isinstance(item, int) for item in bounds) or bounds[0] > bounds[1]:
+                _error("E_SCHEMA", basename)
+        elif kind == "ref":
+            match = re.fullmatch(r"#/definitions/([a-z][a-z0-9-]{0,47})", current["ref"] if isinstance(current["ref"], str) else "")
+            if match is None or match.group(1) not in definitions:
+                _error("E_REF", basename)
+            references.append(match.group(1))
 
 
 def _validate_schema(schema: Any, limits: Mapping[str, int], basename: str, *, catalog: bool = False) -> None:
@@ -331,46 +420,62 @@ def _validate_schema(schema: Any, limits: Mapping[str, int], basename: str, *, c
         _validate_schema_node(node, definitions, references, basename)
     if not catalog and len(references) > limits["references_per_schema"]:
         _error("E_LIMIT", basename)
-    graph = {name: _schema_references(node) for name, node in definitions.items()}
-    visiting: set[str] = set()
+    graph = {name: tuple(_schema_references(node)) for name, node in definitions.items()}
+    roots = tuple(_schema_references(schema["root"]))
+    if len(graph) > limits["definitions"] or (
+        not catalog and sum(map(len, graph.values())) + len(roots) > limits["references_per_schema"]
+    ):
+        _error("E_LIMIT", basename)
     visited: set[str] = set()
-
-    def visit(name: str) -> None:
-        if name in visiting:
-            _error("E_REF_CYCLE", basename)
-        if name not in visited:
-            visiting.add(name)
-            for target in graph[name]:
-                visit(target)
-            visiting.remove(name)
-            visited.add(name)
-
-    for target in _schema_references(schema["root"]):
-        visit(target)
+    active: set[str] = set()
+    for root in roots:
+        if root in visited:
+            continue
+        stack: list[tuple[str, bool]] = [(root, False)]
+        while stack:
+            name, leaving = stack.pop()
+            if leaving:
+                active.remove(name)
+                visited.add(name)
+                continue
+            if name in active:
+                _error("E_REF_CYCLE", basename)
+            if name in visited:
+                continue
+            active.add(name)
+            stack.append((name, True))
+            stack.extend((target, False) for target in reversed(graph[name]))
     if set(definitions) - visited:
         _error("E_REF_UNUSED", basename)
 
 
 def _value_matches(value: Any, node: Mapping[str, Any], definitions: Mapping[str, Any]) -> bool:
-    kind = node["type"]
-    if kind == "ref":
-        return _value_matches(value, definitions[node["ref"].rsplit("/", 1)[-1]], definitions)
-    if kind == "object":
-        return (
-            isinstance(value, dict) and set(node["required"]) <= set(value) <= set(node["properties"])
-            and all(_value_matches(value[key], node["properties"][key], definitions) for key in value)
-        )
-    if kind == "array":
-        return isinstance(value, list) and node["min_items"] <= len(value) <= node["max_items"] and all(
-            _value_matches(item, node["items"], definitions) for item in value
-        )
-    if kind == "string":
-        return isinstance(value, str) and node["min_length"] <= len(value) <= node["max_length"] and re.fullmatch(node["pattern"], value) is not None
-    if kind == "integer":
-        return isinstance(value, int) and not isinstance(value, bool) and node["minimum"] <= value <= node["maximum"]
-    if kind == "boolean":
-        return isinstance(value, bool)
-    return value is None
+    stack: list[tuple[Any, Mapping[str, Any]]] = [(value, node)]
+    while stack:
+        current, schema = stack.pop()
+        kind = schema["type"]
+        if kind == "ref":
+            stack.append((current, definitions[schema["ref"].rsplit("/", 1)[-1]]))
+        elif kind == "object":
+            if not isinstance(current, dict) or not set(schema["required"]) <= set(current) <= set(schema["properties"]):
+                return False
+            stack.extend((item, schema["properties"][key]) for key, item in current.items())
+        elif kind == "array":
+            if not isinstance(current, list) or not schema["min_items"] <= len(current) <= schema["max_items"]:
+                return False
+            stack.extend((item, schema["items"]) for item in current)
+        elif kind == "string":
+            if not isinstance(current, str) or not schema["min_length"] <= len(current) <= schema["max_length"] or re.fullmatch(schema["pattern"], current) is None:
+                return False
+        elif kind == "integer":
+            if not isinstance(current, int) or isinstance(current, bool) or not schema["minimum"] <= current <= schema["maximum"]:
+                return False
+        elif kind == "boolean":
+            if not isinstance(current, bool):
+                return False
+        elif current is not None:
+            return False
+    return True
 
 
 def _audit_module(source: bytes) -> Callable[[dict[str, Any], str, Any], Any]:
@@ -449,37 +554,77 @@ def _audit_module(source: bytes) -> Callable[[dict[str, Any], str, Any], Any]:
     return evaluate
 
 
-@dataclass(frozen=True)
 class EvaluationContractV1:
-    contract_version: str
-    operation_ids: Mapping[str, str]
-    limits: Mapping[str, int]
-    semantic_module_path: PurePosixPath
-    semantic_module_sha256: str
-    _contract: dict[str, Any] = field(repr=False, compare=False)
-    _evaluate_v1: Callable[[dict[str, Any], str, Any], Any] = field(repr=False, compare=False)
+    """Sealed authority for one byte-pinned contract and semantic function."""
+
+    __slots__ = (
+        "__contract_bytes", "__contract_value", "__contract_version", "__limits",
+        "__module_bytes", "__module_digest", "__operation_ids",
+    )
+
+    def __init__(
+        self,
+        contract_bytes: bytes,
+        contract_value: Mapping[str, Any],
+        module_bytes: bytes,
+        token: object,
+    ) -> None:
+        if token is not _AUTHORITY_TOKEN:
+            raise TypeError("EvaluationContractV1 is loader-created")
+        object.__setattr__(self, "_EvaluationContractV1__contract_bytes", bytes(contract_bytes))
+        object.__setattr__(self, "_EvaluationContractV1__contract_value", _freeze(contract_value))
+        object.__setattr__(self, "_EvaluationContractV1__contract_version", contract_value["contract_version"])
+        object.__setattr__(self, "_EvaluationContractV1__limits", _freeze(contract_value["limits"]))
+        object.__setattr__(self, "_EvaluationContractV1__module_bytes", bytes(module_bytes))
+        object.__setattr__(self, "_EvaluationContractV1__module_digest", _MODULE_SHA256)
+        object.__setattr__(self, "_EvaluationContractV1__operation_ids", _freeze(contract_value["operation_ids"]))
+
+    def __setattr__(self, _name: str, _value: Any) -> None:
+        raise AttributeError("EvaluationContractV1 is immutable")
+
+    @property
+    def contract_version(self) -> str:
+        return self.__contract_version
+
+    @property
+    def operation_ids(self) -> Mapping[str, str]:
+        return self.__operation_ids
+
+    @property
+    def limits(self) -> Mapping[str, int]:
+        return self.__limits
+
+    @property
+    def semantic_module_path(self) -> PurePosixPath:
+        return _MODULE_PATH
+
+    @property
+    def semantic_module_sha256(self) -> str:
+        return self.__module_digest
 
     def evaluate(self, operation_id: str, input_value: Any) -> Any:
         """Call the exact bound ``evaluate_v1``, validate its result, and freeze it."""
-        contracts = {row["operation_id"]: row for row in self._contract["operation_contracts"]}
-        operation = contracts.get(operation_id)
-        supplied = deepcopy(input_value)
-        before = _canonical(supplied)
         try:
-            result = self._evaluate_v1(self._contract, operation_id, supplied)
+            result = _audit_module(self.__module_bytes)(
+                _thaw(self.__contract_value), operation_id, input_value,
+            )
         except Exception:
             _error("E_SEMANTIC", "<module>")
-        if _canonical(supplied) != before:
+        try:
+            contracts = {row["operation_id"]: row for row in self.__contract_value["operation_contracts"]}
+            operation = contracts.get(operation_id)
+            if operation is None:
+                schema_name = next(iter(contracts.values()))["error_schema"]
+            else:
+                schema_name = operation["success_schema"] if isinstance(result, dict) and result.get("status") == "ok" else operation["error_schema"]
+            schema = self.__contract_value["schemas"][schema_name]
+            if not _value_matches(result, schema["root"], schema["definitions"]):
+                _error("E_SEMANTIC", "<module>")
+            return _freeze(result)
+        except EvaluationContractError:
+            raise
+        except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
             _error("E_SEMANTIC", "<module>")
-        if operation is None:
-            error_schema_name = next(iter(contracts.values()))["error_schema"]
-            schema = self._contract["schemas"][error_schema_name]
-        else:
-            schema_name = operation["success_schema"] if isinstance(result, dict) and result.get("status") == "ok" else operation["error_schema"]
-            schema = self._contract["schemas"][schema_name]
-        if not _value_matches(result, schema["root"], schema["definitions"]):
-            _error("E_SEMANTIC", "<module>")
-        return _freeze(result)
 
 
 @dataclass(frozen=True)
@@ -490,8 +635,12 @@ class ValidatedEvaluationArtifactV1:
     sha256: str
     role_family: str
     visibility: str
-    artifact_root: PurePosixPath
+    _declared_root: PurePosixPath
     value: Any
+
+    @property
+    def permitted_root(self) -> PurePosixPath:
+        return self._declared_root
 
 
 @dataclass(frozen=True)
@@ -521,6 +670,8 @@ def _validate_contract(candidate: Any, module_digest: str) -> None:
         "path_bytes", "path_depth", "references_per_schema", "stdout_or_stderr_bytes",
     }
     if candidate["contract_version"] != "evaluation-contract-v1" or not isinstance(limits, dict) or set(limits) != required_limits or any(isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in limits.values()):
+        _error("E_SCHEMA", basename)
+    if candidate.get("checker_boundary", {}).get("error_precedence") != list(_DECLARED_REJECTION_CODES):
         _error("E_SCHEMA", basename)
     if limits["json_artifact_bytes"] != _MAX_JSON_BYTES or limits["module_source_bytes"] != _MAX_MODULE_BYTES:
         _error("E_LIMIT", basename)
@@ -552,6 +703,15 @@ def _validate_contract(candidate: Any, module_digest: str) -> None:
         required = {"count_scope", "group_key", "kind", "max_instances", "path", "permitted_root", "role_family", "visibility"}
         if not isinstance(row, dict) or set(row) not in (required, required | {"payload_schema"}):
             _error("E_SCHEMA", basename)
+        expected_group = {"contract": "contract-id", "corpus": "corpus-id", "run": "run-id"}
+        if (
+            row["count_scope"] not in expected_group
+            or row["group_key"] != expected_group[row["count_scope"]]
+            or isinstance(row["max_instances"], bool)
+            or not isinstance(row["max_instances"], int)
+            or row["max_instances"] <= 0
+        ):
+            _error("E_SCHEMA", basename)
         if row["kind"] in kinds or not _SAFE_ID.fullmatch(row["kind"]):
             _error("E_ID", basename)
         kinds.add(row["kind"])
@@ -572,7 +732,10 @@ def _validate_contract(candidate: Any, module_digest: str) -> None:
 
 def load_evaluation_contract(path: Path) -> EvaluationContractV1:
     """Load the one fixed production contract and its repository-relative module binding."""
-    supplied = Path(path)
+    try:
+        supplied = Path(path)
+    except (OSError, TypeError, UnicodeError, ValueError):
+        _error("E_ROOT", "<contract>")
     if tuple(supplied.parts[-3:]) != _CONTRACT_SUFFIX:
         _error("E_ROOT", supplied.name or "<contract>")
     root_path = supplied
@@ -589,23 +752,21 @@ def load_evaluation_contract(path: Path) -> EvaluationContractV1:
         if module_digest != _MODULE_SHA256:
             _error("E_DIGEST", _MODULE_PATH.name)
         _validate_contract(candidate, module_digest)
-        evaluate_v1 = _audit_module(module_data)
-        return EvaluationContractV1(
-            contract_version=candidate["contract_version"],
-            operation_ids=_freeze(candidate["operation_ids"]),
-            limits=_freeze(candidate["limits"]),
-            semantic_module_path=_MODULE_PATH,
-            semantic_module_sha256=module_digest,
-            _contract=candidate,
-            _evaluate_v1=evaluate_v1,
-        )
+        _audit_module(module_data)
+        return EvaluationContractV1(contract_data, candidate, module_data, _AUTHORITY_TOKEN)
+    except EvaluationContractError:
+        raise
+    except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+        _error("E_INTERNAL", "<contract>")
     finally:
         os.close(root_fd)
 
 
 def _registry_match(contract: EvaluationContractV1, path: PurePosixPath) -> tuple[dict[str, Any], dict[str, str]]:
     matches: list[tuple[dict[str, Any], dict[str, str]]] = []
-    for row in contract._contract["artifact_registry"]:
+    authority = contract._EvaluationContractV1__contract_value
+    for immutable_row in authority["artifact_registry"]:
+        row = _thaw(immutable_row)
         pattern = re.escape(row["path"])
         names = re.findall(r"\{([a-z][a-z0-9-]*)\}", row["path"])
         for name in names:
@@ -619,33 +780,39 @@ def _registry_match(contract: EvaluationContractV1, path: PurePosixPath) -> tupl
 
 
 def _typed_refs(value: Any, node: Mapping[str, Any], definitions: Mapping[str, Any]) -> list[dict[str, Any]]:
-    if node["type"] == "ref":
-        name = node["ref"].rsplit("/", 1)[-1]
-        if name == "typed-ref-v1":
-            return [value]
-        return _typed_refs(value, definitions[name], definitions)
-    if node["type"] == "object":
-        result: list[dict[str, Any]] = []
-        for key, item in value.items():
-            result.extend(_typed_refs(item, node["properties"][key], definitions))
-        return result
-    if node["type"] == "array":
-        result = []
-        for item in value:
-            result.extend(_typed_refs(item, node["items"], definitions))
-        return result
-    return []
+    result: list[dict[str, Any]] = []
+    stack: list[tuple[Any, Mapping[str, Any]]] = [(value, node)]
+    while stack:
+        current, schema = stack.pop()
+        if schema["type"] == "ref":
+            name = schema["ref"].rsplit("/", 1)[-1]
+            if name == "typed-ref-v1":
+                result.append(current)
+            else:
+                stack.append((current, definitions[name]))
+        elif schema["type"] == "object":
+            stack.extend((item, schema["properties"][key]) for key, item in current.items())
+        elif schema["type"] == "array":
+            stack.extend((item, schema["items"]) for item in current)
+    return result
 
 
 def _validate_result_missingness(
     contract: EvaluationContractV1,
     path: PurePosixPath,
     value: dict[str, Any],
-    loaded: Mapping[PurePosixPath, tuple[dict[str, Any], dict[str, str], dict[str, Any], str, str]],
+    loaded: Mapping[
+        PurePosixPath,
+        tuple[dict[str, Any], dict[str, str], dict[str, Any], str, str, dict[str, str]],
+    ],
 ) -> None:
-    policy = contract._contract["missingness_policy"]
+    authority = contract._EvaluationContractV1__contract_value
+    policy = authority["missingness_policy"]
     terminal_path = PurePosixPath(value["terminal_edge"]["path"])
-    terminal = loaded[terminal_path][2]
+    terminal_record = loaded.get(terminal_path)
+    if terminal_record is None or terminal_record[0]["kind"] != "lifecycle-edge":
+        _error("E_LINEAGE", path.name)
+    terminal = terminal_record[2]
     metrics = value["metrics"]
     if terminal["state"] != policy["reported_status"]:
         expected = policy["unavailable_metric_names"]
@@ -680,75 +847,155 @@ def _validate_result_missingness(
         _error("E_LINEAGE", path.name)
 
 
+def _scope_group(
+    row: Mapping[str, Any], captures: Mapping[str, str], inherited: Mapping[str, str], basename: str,
+) -> tuple[str, dict[str, str]]:
+    context = dict(inherited)
+    for key in ("corpus-id", "run-id"):
+        if key in captures:
+            prior = context.get(key)
+            if prior is not None and prior != captures[key]:
+                _error("E_CROSS_REFERENCE", basename)
+            context[key] = captures[key]
+    group_key = row["group_key"]
+    if row["count_scope"] == "contract":
+        if group_key != "contract-id":
+            _error("E_SCHEMA", basename)
+        return "contract-id", context
+    group_id = context.get(group_key, "")
+    if not group_id:
+        _error("E_CROSS_REFERENCE", basename)
+    return group_id, context
+
+
+def _increment_scoped_count(
+    counts: dict[tuple[str, str], int], row: Mapping[str, Any], group_id: str,
+) -> None:
+    counter = (row["kind"], group_id)
+    counts[counter] = counts.get(counter, 0) + 1
+    if counts[counter] > row["max_instances"]:
+        _error("E_LIMIT", "<bundle>")
+
+
 def load_evaluation_bundle(
     contract: EvaluationContractV1,
     root: Path,
     entrypoint: PurePosixPath,
 ) -> ValidatedEvaluationBundleV1:
     """Validate one manifest-rooted artifact closure without caller-supplied authority facts."""
-    if not isinstance(contract, EvaluationContractV1):
+    if type(contract) is not EvaluationContractV1:
         _error("E_SCHEMA", "<contract>")
     entry = _safe_relative(entrypoint, contract.limits, "<bundle>")
     root_fd = _open_directory(Path(root), "<bundle>")
-    definitions = contract._contract["schema_catalog"]["definitions"]
-    loaded: dict[PurePosixPath, tuple[dict[str, Any], dict[str, str], dict[str, Any], str, str]] = {}
-    active: set[PurePosixPath] = set()
+    authority = contract._EvaluationContractV1__contract_value
+    definitions = authority["schema_catalog"]["definitions"]
+    registry = authority["artifact_registry"]
+    group_maxima = {
+        "contract": 1,
+        "corpus": next(row["max_instances"] for row in registry if row["kind"] == "corpus-manifest"),
+        "run": next(row["max_instances"] for row in registry if row["kind"] == "run-manifest"),
+    }
+    graph_limit = sum(row["max_instances"] * group_maxima[row["count_scope"]] for row in registry)
+    loaded: dict[PurePosixPath, tuple[dict[str, Any], dict[str, str], dict[str, Any], str, str, dict[str, str]]] = {}
     identities: dict[PurePosixPath, tuple[str, str, str]] = {}
+    edges: dict[PurePosixPath, tuple[PurePosixPath, ...]] = {}
+    counts: dict[tuple[str, str], int] = {}
+    queued: set[PurePosixPath] = {entry}
+    pending: list[tuple[PurePosixPath, dict[str, Any], dict[str, str]]] = []
+    work: list[tuple[PurePosixPath, dict[str, Any] | None, dict[str, str]]] = [(entry, None, {})]
 
-    def visit(path: PurePosixPath, expected: dict[str, Any] | None = None) -> None:
-        if path in active:
-            _error("E_REF_CYCLE", path.name)
-        row, captures = _registry_match(contract, path)
-        if "payload_schema" not in row:
-            _error("E_SCHEMA", path.name)
-        if expected is not None:
-            if expected["kind"] != row["kind"] or expected["path"] != path.as_posix():
-                _error("E_CROSS_REFERENCE", path.name)
-            identity = (expected["id"], expected["kind"], expected["digest"])
-            previous = identities.get(path)
-            if previous is not None and previous != identity:
-                _error("E_CROSS_REFERENCE", path.name)
-            identities[path] = identity
-            if captures and expected["id"] not in captures.values():
-                _error("E_ID", path.name)
-        if path in loaded:
-            return
-        active.add(path)
-        try:
+    def path_identity(captures: Mapping[str, str], fallback: str) -> str:
+        for key in ("artifact-id", "case-id", "corpus-id", "run-id", "partition"):
+            if key in captures:
+                return captures[key]
+        return fallback
+
+    try:
+        while work:
+            path, expected, inherited = work.pop()
+            row, captures = _registry_match(contract, path)
+            if "payload_schema" not in row:
+                _error("E_SCHEMA", path.name)
+            expected_id = path_identity(captures, path.stem)
+            if expected is not None:
+                if expected["kind"] != row["kind"] or expected["path"] != path.as_posix():
+                    _error("E_CROSS_REFERENCE", path.name)
+                if expected["id"] != expected_id:
+                    _error("E_ID", path.name)
+                identity = (expected["id"], expected["kind"], expected["digest"])
+                previous = identities.get(path)
+                if previous is not None and previous != identity:
+                    _error("E_CROSS_REFERENCE", path.name)
+                identities[path] = identity
+                pending.append((path, expected, captures))
+            group_id, scope_context = _scope_group(row, captures, inherited, path.name)
+            if path in loaded:
+                if loaded[path][5] != scope_context:
+                    _error("E_CROSS_REFERENCE", path.name)
+                continue
+            _increment_scoped_count(counts, row, group_id)
+            if len(loaded) >= graph_limit:
+                _error("E_LIMIT", "<bundle>")
             data = _read_at(root_fd, path, contract.limits["json_artifact_bytes"], path.name)
             digest = sha256(data).hexdigest()
-            if expected is not None and digest != expected["digest"]:
-                _error("E_DIGEST", path.name)
             value = _decode_json(data, path.name, contract.limits)
             schema = definitions[row["payload_schema"]]
             if not _value_matches(value, schema, definitions):
                 _error("E_SCHEMA", path.name)
-            loaded[path] = (row, captures, value, digest, expected["id"] if expected else next(iter(captures.values()), path.stem))
-            for reference in _typed_refs(value, schema, definitions):
+            loaded[path] = (row, captures, value, digest, expected_id, scope_context)
+            references = _typed_refs(value, schema, definitions)
+            child_paths: list[PurePosixPath] = []
+            for reference in references:
                 reference_path = _safe_relative(reference["path"], contract.limits, path.name)
-                visit(reference_path, reference)
-        finally:
-            active.remove(path)
+                child_paths.append(reference_path)
+                if reference_path not in queued:
+                    if len(queued) >= graph_limit:
+                        _error("E_LIMIT", "<bundle>")
+                    queued.add(reference_path)
+                work.append((reference_path, reference, scope_context))
+            edges[path] = tuple(child_paths)
 
-    try:
-        visit(entry)
-        counts: dict[str, int] = {}
-        maxima = {row["kind"]: row["max_instances"] for row in contract._contract["artifact_registry"]}
-        for row, _captures, _value, _digest_value, _artifact_id in loaded.values():
-            counts[row["kind"]] = counts.get(row["kind"], 0) + 1
-            if counts[row["kind"]] > maxima[row["kind"]]:
-                _error("E_LIMIT", "<bundle>")
-        for path, (row, _captures, value, _digest_value, _artifact_id) in loaded.items():
+        visited: set[PurePosixPath] = set()
+        active: set[PurePosixPath] = set()
+        for root_path in loaded:
+            if root_path in visited:
+                continue
+            traversal: list[tuple[PurePosixPath, bool]] = [(root_path, False)]
+            while traversal:
+                node, leaving = traversal.pop()
+                if leaving:
+                    active.remove(node)
+                    visited.add(node)
+                    continue
+                if node in active:
+                    _error("E_REF_CYCLE", node.name)
+                if node in visited:
+                    continue
+                active.add(node)
+                traversal.append((node, True))
+                traversal.extend((child, False) for child in reversed(edges.get(node, ())))
+
+        for path, expected, _captures in pending:
+            if loaded[path][3] != expected["digest"]:
+                _error("E_DIGEST", path.name)
+
+        for path, (row, _captures, value, _digest_value, _artifact_id, _scope) in loaded.items():
             if row["kind"] == "pre-adjudication-result":
                 _validate_result_missingness(contract, path, value, loaded)
             if row["kind"] != "adjudication-receipt":
                 continue
             case_ref = value["case"]
             case_path = PurePosixPath(case_ref["path"])
-            case_row, _case_captures, case_value, case_digest, _case_id = loaded[case_path]
+            case_record = loaded.get(case_path)
+            if case_record is None:
+                _error("E_LINEAGE", path.name)
+            case_row, _case_captures, case_value, case_digest, _case_id, _case_scope = case_record
             answer_ref = case_value["answer_key"]
             answer_path = PurePosixPath(answer_ref["path"])
-            answer_row, _answer_captures, _answer_value, answer_digest, _answer_id = loaded[answer_path]
+            answer_record = loaded.get(answer_path)
+            if answer_record is None:
+                _error("E_LINEAGE", path.name)
+            answer_row, _answer_captures, _answer_value, answer_digest, _answer_id, _answer_scope = answer_record
             if (
                 case_row["kind"] != "case-manifest" or answer_row["kind"] != "answer-key"
                 or value["case_manifest_digest"] != case_digest
@@ -764,11 +1011,15 @@ def load_evaluation_bundle(
                 sha256=digest,
                 role_family=row["role_family"],
                 visibility=row["visibility"],
-                artifact_root=PurePosixPath(row["permitted_root"]),
+                _declared_root=PurePosixPath(row["permitted_root"]),
                 value=_freeze(value),
             )
-            for path, (row, _captures, value, digest, artifact_id) in sorted(loaded.items(), key=lambda item: item[0].as_posix().encode("ascii"))
+            for path, (row, _captures, value, digest, artifact_id, _scope) in sorted(loaded.items(), key=lambda item: item[0].as_posix().encode("ascii"))
         )
         return ValidatedEvaluationBundleV1(entrypoint=entry, artifacts=artifacts)
+    except EvaluationContractError:
+        raise
+    except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+        _error("E_INTERNAL", "<bundle>")
     finally:
         os.close(root_fd)
