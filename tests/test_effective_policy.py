@@ -173,6 +173,8 @@ def test_pins_contract_and_only_read_only_authorities_are_imported_or_called():
         EFFECTIVE_POLICY_CONTRACT["canonical_encoder"]["sort_keys"] = False
     assert tuple(inspect.signature(EffectivePolicyResolver).parameters) == (
         "promotion_receipts", "overlay_source")
+    assert tuple(inspect.signature(EffectivePolicyResolver.brief_for).parameters) == (
+        "self", "repo", "stage", "subject_revision")
 
 
 @pytest.mark.parametrize("stage", STAGES)
@@ -279,11 +281,12 @@ def test_malformed_subject_revision_never_raises_and_returns_exact_closed_hold(r
     _assert_self_digest(result)
 
 
-def test_fleet_policy_injection_is_impossible_and_public_alias_rebinding_has_no_authority(
+def test_fleet_policy_authority_is_sealed_against_rebinding_attachment_and_subclassing(
         monkeypatch):
+    expected_policy = PINNED_EVALUATION_POLICY
     malicious = FleetPolicyV1(
         1, (), (CapabilityRequirement("attacker", "v1", "f" * 64),))
-    reader = ReceiptReader(tuple(_actual(item) for item in PINNED_EVALUATION_POLICY.receipts))
+    reader = ReceiptReader(tuple(_actual(item) for item in expected_policy.receipts))
     source = OverlaySource()
     with pytest.raises(TypeError):
         EffectivePolicyResolver(
@@ -291,13 +294,18 @@ def test_fleet_policy_injection_is_impossible_and_public_alias_rebinding_has_no_
     resolver = EffectivePolicyResolver(promotion_receipts=reader, overlay_source=source)
     with pytest.raises(AttributeError):
         resolver._fleet_policy = malicious
+    with pytest.raises(TypeError, match="sealed"):
+        type("BypassResolver", (EffectivePolicyResolver,), {})
     monkeypatch.setattr(effective_policy, "PINNED_EVALUATION_POLICY", malicious)
+    monkeypatch.setattr(effective_policy, "_PINNED_EVALUATION_POLICY", malicious)
     result = resolver.brief_for(REPOSITORY, "review", REVISION)
     assert isinstance(result, ReadyBriefing)
-    assert result.capabilities == (
-        CapabilityRequirement(
-            "evaluation-semantics-v1", "evaluation-contract-v1",
-            "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554"),)
+    assert result.receipts == expected_policy.receipts
+    assert result.capabilities == expected_policy.capabilities
+    assert reader.calls == [expected_policy.receipts[0].receipt_id]
+    closure = inspect.getclosurevars(EffectivePolicyResolver.brief_for).nonlocals
+    assert closure["policy"] is expected_policy
+    assert not hasattr(effective_policy, "_bind_authoritative_policy")
 
 
 def test_no_valid_promoted_receipt_means_no_ready_result_or_capabilities():
@@ -556,21 +564,26 @@ def test_ready_briefing_validator_accepts_exact_16384_and_rejects_16385():
 
 
 def test_brief_for_accepts_exact_16384_and_returns_overflow_at_16385(monkeypatch):
+    implementation = inspect.getclosurevars(
+        EffectivePolicyResolver.brief_for).nonlocals["implementation"]
+
+    def resolve_with_internal_boundary_policy(policy):
+        def brief_for(self, repo, stage, subject_revision):
+            return implementation(self, repo, stage, subject_revision, policy)
+
+        monkeypatch.setattr(EffectivePolicyResolver, "brief_for", brief_for)
+        return EffectivePolicyResolver(
+            promotion_receipts=ReceiptReader(tuple(_actual(item) for item in policy.receipts)),
+            overlay_source=OverlaySource(),
+        ).brief_for(REPOSITORY, "review", REVISION)
+
     exact_policy = _sized_policy(16384)
-    monkeypatch.setattr(effective_policy, "_PINNED_EVALUATION_POLICY", exact_policy)
-    exact = EffectivePolicyResolver(
-        promotion_receipts=ReceiptReader(tuple(_actual(item) for item in exact_policy.receipts)),
-        overlay_source=OverlaySource(),
-    ).brief_for(REPOSITORY, "review", REVISION)
+    exact = resolve_with_internal_boundary_policy(exact_policy)
     assert isinstance(exact, ReadyBriefing)
     assert len(exact.canonical_bytes()) == 16384
 
     over_policy = _sized_policy(16385)
-    monkeypatch.setattr(effective_policy, "_PINNED_EVALUATION_POLICY", over_policy)
-    over = EffectivePolicyResolver(
-        promotion_receipts=ReceiptReader(tuple(_actual(item) for item in over_policy.receipts)),
-        overlay_source=OverlaySource(),
-    ).brief_for(REPOSITORY, "review", REVISION)
+    over = resolve_with_internal_boundary_policy(over_policy)
     assert isinstance(over, HoldBriefing)
     assert over.hold_code == "briefing_overflow"
     assert "capabilities" not in over.value()

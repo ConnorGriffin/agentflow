@@ -706,8 +706,8 @@ _PINNED_EVALUATION_POLICY = FleetPolicyV1(
         contract_digest=DEPENDENCY_PINS["evaluation_module_sha256"],
     ),),
 )
-# Public inspection may read this recursively immutable contract.  Resolver authority uses the
-# private binding above, so rebinding this convenience name cannot alter effective policy.
+# Public inspection may read this recursively immutable contract.  Both module names are aliases;
+# resolver authority captures the same object below and never resolves either name at call time.
 PINNED_EVALUATION_POLICY = _PINNED_EVALUATION_POLICY
 
 EFFECTIVE_POLICY_CONTRACT: Mapping[str, object] = MappingProxyType({
@@ -727,6 +727,14 @@ EFFECTIVE_POLICY_CONTRACT_DIGEST = sha256(
     _canonical_bytes(EFFECTIVE_POLICY_CONTRACT)).hexdigest()
 
 
+def _bind_authoritative_policy(implementation: Any, policy: FleetPolicyV1) -> Any:
+    def brief_for(self: EffectivePolicyResolver, repo: str, stage: str,
+                  subject_revision: str) -> BriefingV1:
+        return implementation(self, repo, stage, subject_revision, policy)
+
+    return brief_for
+
+
 class EffectivePolicyResolver:
     """Resolve one immutable stage briefing without persistence or authority writes."""
 
@@ -737,13 +745,16 @@ class EffectivePolicyResolver:
         self._promotion_receipts = promotion_receipts
         self._overlay_source = overlay_source
 
-    def brief_for(self, repo: str, stage: str, subject_revision: str) -> BriefingV1:
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        raise TypeError("EffectivePolicyResolver is sealed")
+
+    def _brief_for(self, repo: str, stage: str, subject_revision: str,
+                   policy: FleetPolicyV1) -> BriefingV1:
         repository, safe_stage, safe_revision, valid = self._validated_request(
             repo, stage, subject_revision)
         if not valid:
             return _hold(repository, safe_stage, safe_revision, "invalid_briefing")
 
-        policy = _PINNED_EVALUATION_POLICY
         try:
             overlay = self._overlay_source.read(repository, safe_revision)
         except Exception:
@@ -901,3 +912,9 @@ class EffectivePolicyResolver:
         )
         return BriefingReceipt(receipt.receipt_id, receipt.candidate_id, receipt.approval_id,
                                receipt.policy_version, receipt.authoritative, approved)
+
+    brief_for = _bind_authoritative_policy(_brief_for, _PINNED_EVALUATION_POLICY)
+    del _brief_for
+
+
+del _bind_authoritative_policy
