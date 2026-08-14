@@ -130,10 +130,10 @@ def intent(identity=IDENTITY, *, revision=1, token=None, digest=None, now=1_000,
     }
     briefing_digest, briefing_id, _ = _finish(value)
     return ReservationIntent(
-        identity, token, revision, now, generation, budget, limits, digest,
+        identity, token, revision, now, generation, budget, limits,
         NotApplicableBriefing(
             "octo/app", "build", subject_revision, briefing_digest, briefing_id),
-        _ready_fact("build", provider, b"manifest", ()))
+        _ready_fact("build", provider, b"manifest", ()), digest)
 
 
 def seed(path, receipts: Receipts, *, with_receipt=True,
@@ -258,12 +258,14 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
         "bd818fa1d65c92def671192464207e6bc3904a34")
     assert [field.name for field in inspect.signature(ReservationIntent).parameters.values()] == [
         "identity", "expected_launch_token", "expected_revision", "now",
-        "daemon_generation", "budget", "limits", "route_cell_digest", "briefing",
-        "capability"]
+        "daemon_generation", "budget", "limits", "briefing", "capability",
+        "route_cell_digest"]
     assert list(inspect.signature(Store.reserve).parameters) == ["self", "intent"]
     assert list(inspect.signature(Store.reserve_legacy).parameters) == ["self", "intent"]
     assert all(parameter.default is inspect.Parameter.empty for parameter in
                inspect.signature(ReservationIntent).parameters.values())
+    assert list(AdmissionResult.__dataclass_fields__) == [
+        "successor", "admission_receipt", "safety_state_id", "canary_attribution"]
     assert "admitted_launch" not in AdmissionResult.__dataclass_fields__
     assert list(inspect.signature(Store.resolve_admitted_launch).parameters) == [
         "self", "stage_identity", "expected_revision", "route_id"]
@@ -692,14 +694,16 @@ def test_admission_receipt_is_insert_only_and_immutable_across_reopen(tmp_path):
     reopened.close()
 
 
-@pytest.mark.parametrize("assignment", (
-    "subject_revision = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'",
-    "briefing_id = NULL",
-    "capability_id = 7",
-    "route_cell_digest = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff'",
+@pytest.mark.parametrize(("column", "value", "read_identity"), (
+    ("stage_identity", "forged-stage", "forged-stage"),
+    ("subject_revision", "b" * 40, IDENTITY),
+    ("route_id", "production/build/deep/high", IDENTITY),
+    ("route_cell_digest", "f" * 64, IDENTITY),
+    ("launch_config_digest", "e" * 64, IDENTITY),
+    ("safety_state_id", "d" * 64, IDENTITY),
 ))
 def test_public_receipt_read_fails_closed_on_second_connection_forgery(
-        tmp_path, assignment):
+        tmp_path, column, value, read_identity):
     path = tmp_path / "forged-receipt.db"
     receipts = Receipts()
     active, _ = seed(path, receipts)
@@ -708,14 +712,23 @@ def test_public_receipt_read_fails_closed_on_second_connection_forgery(
 
     attacker = sqlite3.connect(path)
     attacker.execute("DROP TRIGGER admission_receipts_no_update")
-    attacker.execute(f"UPDATE admission_receipts SET {assignment} WHERE stage_identity = ?",
-                     (IDENTITY,))
+    attacker.execute(
+        f"UPDATE admission_receipts SET {column} = ? WHERE stage_identity = ?",
+        (value, IDENTITY))
     attacker.commit()
+    tables = ("records", "admission_receipts", "canary_attributions", "safety_route_state")
+    before = tuple(tuple(attacker.execute(f"SELECT * FROM {table}").fetchall())
+                   for table in tables)
     attacker.close()
 
     with pytest.raises(StoreUnavailable) as unreadable:
-        store.read_admission_receipt(IDENTITY)
+        store.read_admission_receipt(read_identity)
     assert str(unreadable.value) == "admission receipt is unreadable"
+    auditor = sqlite3.connect(path)
+    after = tuple(tuple(auditor.execute(f"SELECT * FROM {table}").fetchall())
+                  for table in tables)
+    auditor.close()
+    assert after == before
     store.close()
 
 

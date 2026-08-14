@@ -14,23 +14,31 @@ an operator to resubmit work after deploying the missing authority.
 
 This decision composes these exact prerequisite merges:
 
+- #582 durable capability discovery and launch-root materialization:
+  `a58dc0c84a7459774631048a67b3e71f8328d144`.
+- #585 OperationalSafety and immutable launch authority:
+  `bd818fa1d65c92def671192464207e6bc3904a34`.
 - #628 effective-policy briefing resolver:
-  `ab9c1ffa6f86de149db46f0dca96e89499159172`.
+  `ab9c1ffa6f86de149db46f0dca96e89499159172`, with effective-policy contract
+  SHA-256 `ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef`.
+- #641 Store-owned canary attribution:
+  `80f5a144621a990953d8ccacc08dd93a76090eaa`.
 - #645 capability-ready admission facts:
   `46e0109a10e08a9ea6a8dc0621dcafde5a1d3d2f`.
 - #646 immutable RouteCell selection and historical decoder:
   `4ffde0671ff496feb6cad697e7536bb8e4dc0454`.
-- #641 Store-owned canary attribution:
-  `80f5a144621a990953d8ccacc08dd93a76090eaa`.
 - #648 production Evaluation authority:
-  `b1ae64543761b808f7c0d357eded8551d684db3a`.
+  `b1ae64543761b808f7c0d357eded8551d684db3a`, with promoted Evaluation artifact
+  SHA-256 `a0e90b5b41c87ff67f257315cc6578b0b181249037f1ced2bac827cd3670d1ec`
+  and Evaluation receipt SHA-256
+  `f39ec2e8a6eeff7718ad3db5a58a1bc762aec46f7e59c9cddd6f4b0121707562`.
 
 The composed public contracts are pinned as follows:
 
 - capability manifest SHA-256:
   `cba84e63be53884e6ed566a534883912f7d22156aad7e4a5590515140d18fcad`;
   each `capability-ready-v1` fact additionally carries and validates its own canonical digest.
-- effective-policy contract:
+- effective-policy contract (the #628 pin above):
   `ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef`.
 - RouteCell v2 contract:
   `14dc4e949ec2a045816040cbfb553118475a570395bb6ffc26d0e1c40c780c47`.
@@ -40,9 +48,9 @@ The composed public contracts are pinned as follows:
   `f7f64e3fb9a3913713d121d24af39c3f208d39b3cb6afb04b1457dd54b8d0d2f`.
 - exact coordinator Store v4 schema fingerprint:
   `39733092eb2c3a6110fe0d8299d0aa1fb356021448ee3c6cd46e534902f91060`.
-- promoted Evaluation candidate and module SHA-256 values consumed by #628/#648:
-  `53359f35de57047441defa76a477564580b956f968ab6425356cca3a1c5a8409` and
-  `185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554`.
+- promoted #648 Evaluation artifact and receipt SHA-256 values:
+  `a0e90b5b41c87ff67f257315cc6578b0b181249037f1ced2bac827cd3670d1ec` and
+  `f39ec2e8a6eeff7718ad3db5a58a1bc762aec46f7e59c9cddd6f4b0121707562`.
 
 ## Decision
 

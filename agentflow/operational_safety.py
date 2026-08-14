@@ -1055,6 +1055,29 @@ class OperationalSafety:
                 route_cell_digest, state.quarantined_digest == route_cell_digest,
                 state.safety_state_id, state.generation)
 
+    def _admission_state_matches(
+            self, route_cell_digest: str, safety_state_id: str) -> bool:
+        """Bind a receipt to current Safety state or its durable canary predecessor.
+
+        A committed launch may outlive one approved active-pointer change.  The canary ledger
+        retains that exact predecessor, while the RouteCell state generation makes its prior
+        unquarantined state identifier deterministic.  No arbitrary registered or stale route
+        is accepted as historical authority.
+        """
+        with self._lock:
+            cell = self._cell(route_cell_digest, conn=self._conn)
+            state = self._route_pointer_state(cell.key, conn=self._conn)
+            canary = self._canary_pointer_state(cell.key, conn=self._conn)
+            if state.active_digest == route_cell_digest:
+                return (state.quarantined_digest is None
+                        and safety_state_id == state.safety_state_id)
+            return (
+                canary.predecessor_route_cell_digest == route_cell_digest
+                and state.generation > 0
+                and safety_state_id == _state_id(
+                    cell.key, route_cell_digest, None, state.generation - 1)
+            )
+
     def reopen(self, route_cell_digest: str, expected_safety_state_id: str,
                evidence_refs: tuple[str, ...]) -> RouteSafetyState:
         required = {(item.identifier, item.version)

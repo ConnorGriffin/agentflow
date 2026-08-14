@@ -274,18 +274,13 @@ class Coordinator:
             or MODEL_FOR.get((submission.pool, submission.complexity), "opus")
         )
         subject_revision = submission.subject_revision or _subject_revision(submission)
-        selection = None
+        route = None
         if subject_revision:
             selection = self._route_selector(
                 submission.repo, stage, submission.pool, model,
                 complexity=submission.complexity, effort=submission.effort,
                 builder_complexity=submission.builder_complexity)
-            # RouteCell is content-addressed by the #646 owner.  Its digest is derivable from
-            # the selected immutable launch config without consulting an active pointer.
-            from agentflow.operational_safety import materialize_route_cell
-            cell, _config_bytes = materialize_route_cell(
-                selection.repository, selection.stage, selection.provider, selection.model,
-                selection.route_id, selection.launch_config)
+            route = self._store.route_selection_identity(selection)
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
@@ -317,9 +312,9 @@ class Coordinator:
                                 if isinstance(submission.capability_context, str)
                                 else json.dumps(submission.capability_context or {}, sort_keys=True)),
             subject_revision=subject_revision,
-            route_id=selection.route_id if selection is not None else "",
-            route_cell_digest=cell.digest if selection is not None else "",
-            launch_config_digest=cell.launch_config_digest if selection is not None else "",
+            route_id=route.route_id if route is not None else "",
+            route_cell_digest=route.route_cell_digest if route is not None else "",
+            launch_config_digest=route.launch_config_digest if route is not None else "",
             session_lead=submission.session_lead,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
@@ -964,13 +959,10 @@ class Coordinator:
                 record.repo, record.stage, record.pool, record.model,
                 complexity=record.complexity, effort=record.effort,
                 builder_complexity=record.builder_complexity)
-            from agentflow.operational_safety import materialize_route_cell
-            cell, _ = materialize_route_cell(
-                selection.repository, selection.stage, selection.provider, selection.model,
-                selection.route_id, selection.launch_config)
-            record.route_id = selection.route_id
-            record.route_cell_digest = cell.digest
-            record.launch_config_digest = cell.launch_config_digest
+            route = self._store.route_selection_identity(selection)
+            record.route_id = route.route_id
+            record.route_cell_digest = route.route_cell_digest
+            record.launch_config_digest = route.launch_config_digest
         current_author = record.change_author_tool or record.builder_lineage
         record.auto_merge_allowed = not (current_author is not None and dest_pool == current_author)
         if record.stage in LINEAGE_PINNED:
@@ -1052,8 +1044,8 @@ class Coordinator:
                 from agentflow.coordinator.store import AdmissionRefused
                 raise AdmissionRefused("admission_identity_migration_required")
             admission = self._store.reserve(ReservationIntent(
-                **common, route_cell_digest=record.route_cell_digest,
-                briefing=briefing, capability=capability))
+                **common, briefing=briefing, capability=capability,
+                route_cell_digest=record.route_cell_digest))
         else:
             admission = self._store.reserve_legacy(LegacyReservationIntent(
                 **common, route_cell_digest=record.route_cell_digest or None))

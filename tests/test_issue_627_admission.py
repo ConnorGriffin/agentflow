@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -9,7 +10,14 @@ import pytest
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
 from agentflow.coordinator import Coordinator, Submission
 from agentflow.coordinator.launcher import STARTED, StartResult
-from agentflow.coordinator.store import OperationalSafetyAndCanary, SafetySources, Store
+from agentflow.coordinator.record import RUNNING, Record
+from agentflow.coordinator.store import (
+    AdmissionRefused,
+    OperationalSafetyAndCanary,
+    ReservationIntent,
+    SafetySources,
+    Store,
+)
 from agentflow.effective_policy import NotApplicableBriefing, _finish, _hold
 from agentflow.evidence import ApprovedAuthority, AuthorityPointer, PromotionReceipt
 from agentflow.operational_safety import CanaryActivationRequest, OperationalSafety
@@ -153,6 +161,74 @@ def _assert_zero_outputs(store, launcher, identity, code):
     assert store.permits_used("codex") == 0 and launcher.launches == []
     assert store.read_admission_receipt(identity) is None
     assert store.read_canary_attribution(identity) is None
+
+
+def _full_capacity_store(tmp_path, *, register):
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        register=register)
+    waiting = store.record_of(identity)
+    blocker = Record(
+        "octo/app|capacity-blocker|review|-", "review", "codex", 5,
+        repo="octo/app", subject="capacity-blocker", model="gpt-5", state=RUNNING)
+    assert store.upsert(blocker)
+    briefing = _Briefings().brief_for(
+        waiting.repo, waiting.stage, waiting.subject_revision)
+    capability = _ready(waiting.stage, waiting.pool).ready_fact
+    reservation = ReservationIntent(
+        waiting.identity, waiting.launch_token, waiting.revision, 1_000,
+        "daemon-capacity-order", 5, None, briefing, capability,
+        waiting.route_cell_digest)
+    return coordinator, store, launcher, waiting, reservation
+
+
+def test_missing_route_authority_precedes_full_capacity_without_outputs(tmp_path):
+    _coordinator_owner, store, launcher, waiting, reservation = _full_capacity_store(
+        tmp_path, register=False)
+
+    with pytest.raises(AdmissionRefused) as refused:
+        store.reserve(reservation)
+
+    assert refused.value.code == "route_cell:missing"
+    assert store.record_of(waiting.identity) == waiting
+    assert store.permits_used("codex") == 5 and launcher.launches == []
+    assert store.read_admission_receipt(waiting.identity) is None
+    assert store.read_canary_attribution(waiting.identity) is None
+    store.close()
+
+
+def test_valid_route_with_full_capacity_is_retryable_without_outputs(tmp_path):
+    _coordinator_owner, store, launcher, waiting, reservation = _full_capacity_store(
+        tmp_path, register=True)
+
+    assert store.reserve(reservation) is None
+
+    assert store.record_of(waiting.identity) == waiting
+    assert store.permits_used("codex") == 5 and launcher.launches == []
+    assert store.read_admission_receipt(waiting.identity) is None
+    assert store.read_canary_attribution(waiting.identity) is None
+    store.close()
+
+
+def test_adr_627_pins_every_prerequisite_and_public_contract_digest():
+    adr = (Path(__file__).parents[1]
+           / "docs/adr/adr-627-composed-operational-admission.md").read_text()
+    pins = {
+        "#582": "a58dc0c84a7459774631048a67b3e71f8328d144",
+        "#585": "bd818fa1d65c92def671192464207e6bc3904a34",
+        "#628": "ab9c1ffa6f86de149db46f0dca96e89499159172",
+        "effective-policy": "ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef",
+        "#641": "80f5a144621a990953d8ccacc08dd93a76090eaa",
+        "#645": "46e0109a10e08a9ea6a8dc0621dcafde5a1d3d2f",
+        "#646": "4ffde0671ff496feb6cad697e7536bb8e4dc0454",
+        "#648": "b1ae64543761b808f7c0d357eded8551d684db3a",
+        "Evaluation artifact":
+            "a0e90b5b41c87ff67f257315cc6578b0b181249037f1ced2bac827cd3670d1ec",
+        "Evaluation receipt":
+            "f39ec2e8a6eeff7718ad3db5a58a1bc762aec46f7e59c9cddd6f4b0121707562",
+    }
+    for label, digest in pins.items():
+        assert label in adr and digest in adr
 
 
 def test_source_failure_is_advisory_when_final_prepared_root_is_ready(tmp_path):

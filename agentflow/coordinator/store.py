@@ -133,9 +133,9 @@ V2_TO_V3_FAULT_OBSERVATIONS = (
 V4_ADMISSION_PRECOMMIT_CUTPOINTS = (
     "after-begin",
     "after-waiting-cas",
-    "after-capacity",
     "after-identity-validation",
     "after-route-validation",
+    "after-capacity",
     "after-safety",
     "after-attribution-before-successor",
     "after-receipt-before-successor",
@@ -231,9 +231,9 @@ class ReservationIntent:
     daemon_generation: str
     budget: int
     limits: ReservationLimits | None
-    route_cell_digest: str
     briefing: "ReadyBriefing | NotApplicableBriefing | None"
     capability: "CapabilityReadyFact"
+    route_cell_digest: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,9 +268,9 @@ class AdmissionReceipt:
 @dataclass(frozen=True, slots=True)
 class AdmissionResult:
     successor: Record
+    admission_receipt: AdmissionReceipt
     safety_state_id: str
     canary_attribution: CanaryAttribution | None
-    admission_receipt: AdmissionReceipt
 
 
 @dataclass(frozen=True, slots=True)
@@ -788,33 +788,6 @@ class Store:
                     self._conn.execute("ROLLBACK")
                     return None
                 self._call_admission_callback(self._admission_checkpoint, "after-waiting-cas")
-                if intent.limits is not None:
-                    limits = intent.limits
-                    rows = self._conn.execute(
-                        "SELECT data FROM records WHERE state = ? AND identity != ?",
-                        (RUNNING, existing.identity),
-                    ).fetchall()
-                    running = [self._decode(row[0]) for row in rows]
-                    roots = [item for item in running if item.root is None]
-                    if len(roots) >= limits.machine_ceiling:
-                        self._conn.execute("ROLLBACK")
-                        return None
-                    lane_count = sum(
-                        limits.lane_by_stage.get(item.stage, item.stage) == limits.stage_lane
-                        for item in roots
-                    )
-                    if lane_count >= limits.stage_cap:
-                        self._conn.execute("ROLLBACK")
-                        return None
-                row = self._conn.execute(
-                    "SELECT COALESCE(SUM(demand), 0) FROM records"
-                    " WHERE pool = ? AND state = ? AND identity != ?",
-                    (existing.pool, RUNNING, existing.identity),
-                ).fetchone()
-                if int(row[0]) + existing.demand > intent.budget:
-                    self._conn.execute("ROLLBACK")
-                    return None
-                self._call_admission_callback(self._admission_checkpoint, "after-capacity")
                 admitted_launch = None
                 if composed:
                     if (not existing.subject_revision or not existing.route_id
@@ -842,6 +815,33 @@ class Store:
                         raise AdmissionRefused("route_cell:mismatched")
                     self._call_admission_callback(
                         self._admission_checkpoint, "after-route-validation")
+                if intent.limits is not None:
+                    limits = intent.limits
+                    rows = self._conn.execute(
+                        "SELECT data FROM records WHERE state = ? AND identity != ?",
+                        (RUNNING, existing.identity),
+                    ).fetchall()
+                    running = [self._decode(row[0]) for row in rows]
+                    roots = [item for item in running if item.root is None]
+                    if len(roots) >= limits.machine_ceiling:
+                        self._conn.execute("ROLLBACK")
+                        return None
+                    lane_count = sum(
+                        limits.lane_by_stage.get(item.stage, item.stage) == limits.stage_lane
+                        for item in roots
+                    )
+                    if lane_count >= limits.stage_cap:
+                        self._conn.execute("ROLLBACK")
+                        return None
+                row = self._conn.execute(
+                    "SELECT COALESCE(SUM(demand), 0) FROM records"
+                    " WHERE pool = ? AND state = ? AND identity != ?",
+                    (existing.pool, RUNNING, existing.identity),
+                ).fetchone()
+                if int(row[0]) + existing.demand > intent.budget:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                self._call_admission_callback(self._admission_checkpoint, "after-capacity")
                 if (self._operational_safety is not None
                         and (not isinstance(intent.route_cell_digest, str)
                              or not intent.route_cell_digest)):
@@ -916,7 +916,7 @@ class Store:
                 self._call_admission_callback(self._admission_checkpoint, "after-commit")
                 if composed:
                     return AdmissionResult(
-                        successor, safety_state_id, attribution, receipt)  # type: ignore[arg-type]
+                        successor, receipt, safety_state_id, attribution)  # type: ignore[arg-type]
                 return LegacyReservationResult(successor, safety_state_id)
             except sqlite3.DatabaseError as e:
                 self._rollback_quietly()
@@ -1004,9 +1004,15 @@ class Store:
                 record = self._decode(row[0])
                 receipt = AdmissionReceipt(*row[1:])
                 self._validate_admission_receipt(stage_identity, record, receipt)
+                safety = self._operational_safety
+                if safety is None:
+                    safety = OperationalSafety(self)
+                if not safety._admission_state_matches(
+                        receipt.route_cell_digest, receipt.safety_state_id):
+                    raise ValueError("admission receipt differs from durable safety state")
                 return receipt
             except (sqlite3.DatabaseError, json.JSONDecodeError, UnicodeError, TypeError,
-                    ValueError, AttributeError, KeyError) as error:
+                    ValueError, AttributeError, KeyError, SafetyRefused) as error:
                 raise StoreUnavailable("admission receipt is unreadable") from error
 
     @staticmethod

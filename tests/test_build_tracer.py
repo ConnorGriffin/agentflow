@@ -609,13 +609,24 @@ def _gate_blocking(*pools):
 _SRC = "/work/o-r/.agentflow/worktrees/codex/issue-7-fix"
 
 
-def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlocking(make_coord):
+def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlocking(
+        make_coord, monkeypatch):
     """A waiting, zero-attempt build pinned to codex whose codex launch gate is blocked (weekly
     pacing) while claude has headroom migrates to claude within a single cycle and starts, rather
     than freezing forever behind its own live claim. Reproduces a guarded-project
     incident: before
     the fix the build could neither launch on codex nor fall back to claude, and its live claim
     shielded the building label from reclaim."""
+    from agentflow.coordinator.store import Store
+
+    identities = []
+    original = Store.route_selection_identity
+
+    def public_identity(store, selection):
+        identities.append((selection.provider, selection.model))
+        return original(store, selection)
+
+    monkeypatch.setattr(Store, "route_selection_identity", public_identity)
     fake = FakeSession()
     coord = make_coord(fake, gate=_gate_blocking("codex"),
                        adapter=_adapter(fake, pr=[False], prep=[True]))
@@ -640,6 +651,7 @@ def test_a_never_started_build_migrates_off_a_throttled_pool_instead_of_deadlock
     assert moved.subject_revision == revision
     assert (moved.route_id, moved.route_cell_digest, moved.launch_config_digest) != frozen_route
     assert all((moved.route_id, moved.route_cell_digest, moved.launch_config_digest))
+    assert identities == [("codex", "sol"), ("claude", "fable")]
 
 
 def test_durable_legacy_sol_build_migrates_but_marked_sol_parent_stays_pinned(make_coord):
