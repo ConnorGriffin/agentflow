@@ -153,7 +153,7 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         cross_tool_covered=reviewer_tool != author)
     return Submission(
         repo=build_record.repo, subject=build_record.subject, stage="review",
-        target=head_sha, pool=reviewer_tool,
+        target=head_sha, subject_revision=head_sha, pool=reviewer_tool,
         complexity=routing.review_complexity(
             build_record.builder_complexity, build_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr_number, slug)),
@@ -271,7 +271,7 @@ def review_successor_submission(review_record, verdict):
         uncertainty_handoffs=prior.uncertainty_handoffs)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=verdict.final_sha, pool=next_tool,
+        target=verdict.final_sha, subject_revision=verdict.final_sha, pool=next_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
@@ -348,7 +348,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         uncertainty_handoffs=prior.uncertainty_handoffs + (1 if uncertainty else 0))
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=next_tool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=next_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, next_tool, pr, _review_slug(review_record))),
@@ -396,7 +396,7 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         cross_tool_covered=True, tainted=True, taint_cleared=False, handoff=handoff)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=reviewer_tool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=reviewer_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
@@ -448,7 +448,7 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
         cross_tool_covered=reviewer_tool != author, handoff=handoff, uncertainty=None)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="review",
-        target=review_record.target, pool=reviewer_tool,
+        target=review_record.target, subject_revision=review_record.target or "", pool=reviewer_tool,
         complexity=routing.review_complexity(
             review_record.builder_complexity, review_record.complexity),
         source=str(review_worktree(workdir, reviewer_tool, pr, _review_slug(review_record))),
@@ -497,6 +497,7 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
         cross_tool_covered=reviewer_tool != author)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="review", target=head_sha,
+        subject_revision=head_sha,
         pool=reviewer_tool, complexity=routing.review_complexity(None, "deep"),
         source=str(review_worktree(cfg.workdir, reviewer_tool, pr_number, slug)),
         claim=True, input_ptr=_review_prompt(prompt), builder_lineage=builder_tool,
@@ -1196,6 +1197,7 @@ def _moved_head_review_submission(record, head_sha: str):
     review = replace(review, reviewed_from_sha=record.target)
     return Submission(
         repo=record.repo, subject=record.subject, stage="review", target=head_sha,
+        subject_revision=head_sha,
         pool=reviewer_tool,
         complexity=routing.review_complexity(
             record.builder_complexity, record.complexity),

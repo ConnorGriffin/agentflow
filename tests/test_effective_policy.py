@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from hashlib import sha256
 import inspect
 import json
+import subprocess
 
 import pytest
 
@@ -23,6 +24,7 @@ from agentflow.effective_policy import (
     BriefingReceipt,
     CapabilityRequirement,
     EffectivePolicyResolver,
+    ExactRevisionRepositoryOverlaySource,
     FleetPolicyV1,
     HoldBriefing,
     NarrowBound,
@@ -98,6 +100,29 @@ class ReceiptReader:
         if self.error:
             raise self.error
         return self.receipts[receipt_id]
+
+
+def test_repository_overlay_reads_exact_revision_not_mutable_head(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"],
+                   check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    overlay_path = repo / ".agentflow" / "briefing-overlay-v1.json"
+    overlay_path.parent.mkdir()
+    overlay_path.write_bytes(_canonical(_overlay_value(holds=["missing_policy"])))
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "old overlay"], check=True)
+    old = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+        text=True, stdout=subprocess.PIPE).stdout.strip()
+    overlay_path.write_bytes(_canonical(_overlay_value(holds=[])))
+    subprocess.run(["git", "-C", str(repo), "commit", "-qam", "new overlay"], check=True)
+
+    source = ExactRevisionRepositoryOverlaySource({REPOSITORY: repo})
+    assert source.read(REPOSITORY, old).holds == ("missing_policy",)
+    assert source.read(REPOSITORY, old).canonical_bytes != overlay_path.read_bytes()
 
 
 def _actual(expected):

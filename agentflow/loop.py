@@ -227,7 +227,7 @@ def build_issue(cfg: RepoConfig, n: int, *, floodgates: bool = False) -> str:
     # instead of silently reusing the terminal held record.
     records = pipeline.tracer.load_records()
     resumed = coordinated_build.resume_if_held(submission, records)
-    coordinator = pipeline.build_coordinator()
+    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
     identity = coordinator.submit_stage(resumed)
     record = coordinator.stage_record(identity)
     # Claim the issue and report a launch only when admission actually produced runnable work. An
@@ -606,7 +606,7 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
         return "review submission unavailable"
     if predecessor is None and not claim(cfg.repo, issue, BUILDING):
         return "could not claim PR review"
-    coordinator = pipeline.build_coordinator()
+    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
     status = "same-tool review submitted; maintainer merge required" if force_same_tool \
@@ -643,7 +643,7 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
         return "review submission unavailable"
     if not claim(cfg.repo, n, BUILDING):
         return "could not claim survivor Review"
-    coordinator = pipeline.build_coordinator()
+    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
     if not supersede_clean_review(comments):
@@ -707,7 +707,7 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
         return None                                       # unreconstructable → caller parks
     if not claim(cfg.repo, n, BUILDING):
         return f"#{pr}: conflict — could not claim conflict revise"
-    coordinator = pipeline.build_coordinator()
+    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
     supersede_clean_review(comments)   # the Revise is durably open either way; retried next cycle

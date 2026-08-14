@@ -33,7 +33,10 @@ from agentflow.coordinator import (AttackStageAdapter, BuildStageAdapter, Conver
                                    ResearchStageAdapter, RespondStageAdapter, ReviewStageAdapter,
                                    ReviseStageAdapter, StageRouter, tracer)
 from agentflow.coordinator.admission import MACHINE_CEILING, STAGE_CAPS
-from agentflow.coordinator.store import ReservationLimits, StoreUnavailable, default_store_path
+from agentflow.coordinator.store import (
+    OperationalSafetyAndCanary, ReservationLimits, SafetySources, Store, StoreUnavailable,
+    default_store_path,
+)
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
 from agentflow.labels import BUILDING, DRAWING, RESOLVING, TRIAGING
 from agentflow.pr_park import park_pr
@@ -44,6 +47,14 @@ from agentflow.worktree_ref import source_facts
 
 
 _ORPHAN_CLAIM_GRACE_SECONDS = 60 * 60
+
+
+def production_store() -> Store:
+    """Build the one production admission owner; callers never open sealed sub-owners."""
+    from agentflow.evidence import PromotionReceiptReader
+    reader = PromotionReceiptReader.for_production()
+    return Store(default_store_path(), admission_mode=OperationalSafetyAndCanary(
+        SafetySources(), reader))
 
 
 def owned_issues(cfg, *, store_path=None, lane=None) -> set[int]:
@@ -202,7 +213,7 @@ def _capability_preflight(record, materialize: bool):
                      requirements_for(record.stage, context))
 
 
-def build_coordinator(_log=None) -> Coordinator:
+def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None) -> Coordinator:
     """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
     adapter verifies a durable starting/final-head verdict and retains the detached bounded-fix
@@ -262,9 +273,21 @@ def build_coordinator(_log=None) -> Coordinator:
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse,
                           "research": research, "attack": attack})
+    if store is None and repositories is not None:
+        from agentflow.effective_policy import (
+            EffectivePolicyResolver, ExactRevisionRepositoryOverlaySource,
+        )
+        from agentflow.evidence import PromotionReceiptReader
+        receipt_reader = PromotionReceiptReader.for_production()
+        store = Store(default_store_path(), admission_mode=OperationalSafetyAndCanary(
+            SafetySources(), receipt_reader))
+        briefing_resolver = EffectivePolicyResolver(
+            promotion_receipts=receipt_reader,
+            overlay_source=ExactRevisionRepositoryOverlaySource(repositories))
     return Coordinator(
         adapter=router, gate=_production_gate(), capability_preflight=_capability_preflight,
         disabled_cold_stages=frozenset({"mockup"}), log=_log or (lambda _line: None),
+        store=store, briefing_resolver=briefing_resolver,
     )
 
 

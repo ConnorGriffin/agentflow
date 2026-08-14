@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import os
 import json
+import re
+import subprocess
 import threading
 import time
 from copy import deepcopy
@@ -185,6 +187,7 @@ class Submission:
     review: ReviewState | None = None
     capability_root: str | None = None
     capability_context: dict[str, bool] | str | None = None
+    subject_revision: str = ""
 
 
 @dataclass(frozen=True)
@@ -220,8 +223,13 @@ class Coordinator:
 
     def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None, log=None,
                  daemon_generation: str | None = None,
-                 disabled_cold_stages: frozenset[str] = frozenset()) -> None:
-        self._store = Store(default_store_path())
+                 disabled_cold_stages: frozenset[str] = frozenset(), store=None,
+                 route_selector=None, briefing_resolver=None) -> None:
+        # Production injects its one composed Store; bare coordinators retain the historical
+        # no-admission Store for focused coordinator tests and legacy state readability.
+        self._store = store or Store(default_store_path())
+        self._route_selector = route_selector or routing.select_route
+        self._briefing_resolver = briefing_resolver
         self._launcher = launcher or LocalLauncher()
         self._gate = gate or _admit_everything
         # Every adapter hook is optional; StageCalls owns the default for each one, so the
@@ -264,6 +272,19 @@ class Coordinator:
                 stage, submission.pool, submission.complexity, submission.builder_complexity)
             or MODEL_FOR.get((submission.pool, submission.complexity), "opus")
         )
+        subject_revision = submission.subject_revision or _subject_revision(submission)
+        selection = None
+        if subject_revision:
+            selection = self._route_selector(
+                submission.repo, stage, submission.pool, model,
+                complexity=submission.complexity, effort=submission.effort,
+                builder_complexity=submission.builder_complexity)
+            # RouteCell is content-addressed by the #646 owner.  Its digest is derivable from
+            # the selected immutable launch config without consulting an active pointer.
+            from agentflow.operational_safety import materialize_route_cell
+            cell, _config_bytes = materialize_route_cell(
+                selection.repository, selection.stage, selection.provider, selection.model,
+                selection.route_id, selection.launch_config)
         demand = admission_demand(
             stage, submission.pool, model, submission.complexity, submission.effort)
         identity = _identity(submission.repo, submission.subject, stage, submission.target,
@@ -294,6 +315,10 @@ class Coordinator:
             capability_context=(submission.capability_context
                                 if isinstance(submission.capability_context, str)
                                 else json.dumps(submission.capability_context or {}, sort_keys=True)),
+            subject_revision=subject_revision,
+            route_id=selection.route_id if selection is not None else "",
+            route_cell_digest=cell.digest if selection is not None else "",
+            launch_config_digest=cell.launch_config_digest if selection is not None else "",
             session_lead=submission.session_lead,
             auto_merge_allowed=auto_merge, root=submission.descendant_of,
             interactive=submission.interactive, continuation=submission.continuation,
@@ -778,7 +803,15 @@ class Coordinator:
             record.refusals = 0
             self._clear_stall(record)
             self._stall_logged.pop(record.identity, None)
-        if not self._begin_start(record, now):
+        ready_fact = capability.ready_fact if capability is not None else None
+        try:
+            admission = self._begin_start(record, now, capability=ready_fact)
+        except Exception as error:
+            from agentflow.coordinator.store import AdmissionRefused
+            if isinstance(error, AdmissionRefused):
+                return self._admission_failure(record, error.code, observed)
+            raise
+        if admission is None:
             if _refusal_state(record) != was_refused:
                 self._persist(record)
             # An issue-bound stage held back so a waiting PR-bound stage can take the pool is a
@@ -787,10 +820,23 @@ class Coordinator:
             if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
                 return "deferred"
             return "blocked"
-        result = self._launcher.start(record, self._store)
+        result = (self._launcher.start(record, self._store, admission.admitted_launch)
+                  if admission.admitted_launch is not None
+                  else self._launcher.start(record, self._store))
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
+
+    def _admission_failure(self, record: Record, code: str, observed: bool) -> str:
+        """Persist one content-free zero-consumption admission hold."""
+        if not observed:
+            return "unprepared"
+        record.hold_reason = code
+        if not self._hold(record):
+            return "unprepared"
+        self._emit(record, f"{code}; claim retained; no attempt or permit spent")
+        self._finalize_hold(record)
+        return "unprepared"
 
     def _capability_failure(self, record: Record, capability, observed: bool) -> str:
         """Fail a real admission durably; leave speculative provider probes untouched."""
@@ -876,7 +922,8 @@ class Coordinator:
         if capability is not None and not capability.ready:
             return
         home = (record.pool, record.model, record.demand, record.auto_merge_allowed,
-                record.lineage, record.source, record.refusal, record.refusal_expected)
+                record.lineage, record.source, record.refusal, record.refusal_expected,
+                record.route_id, record.route_cell_digest, record.launch_config_digest)
         record.pool = dest_pool
         record.model = (
             routing.model_for_stage(
@@ -886,6 +933,18 @@ class Coordinator:
         demand = admission_demand(
             record.stage, dest_pool, record.model, record.complexity, record.effort)
         record.demand = demand if demand is not None else PERMIT_BUDGET
+        if record.subject_revision:
+            selection = self._route_selector(
+                record.repo, record.stage, record.pool, record.model,
+                complexity=record.complexity, effort=record.effort,
+                builder_complexity=record.builder_complexity)
+            from agentflow.operational_safety import materialize_route_cell
+            cell, _ = materialize_route_cell(
+                selection.repository, selection.stage, selection.provider, selection.model,
+                selection.route_id, selection.launch_config)
+            record.route_id = selection.route_id
+            record.route_cell_digest = cell.digest
+            record.launch_config_digest = cell.launch_config_digest
         current_author = record.change_author_tool or record.builder_lineage
         record.auto_merge_allowed = not (current_author is not None and dest_pool == current_author)
         if record.stage in LINEAGE_PINNED:
@@ -893,7 +952,8 @@ class Coordinator:
             record.source = _repool_source(record.source, dest_pool)
         if self._admit(record, now, observed=False) != STARTED:
             (record.pool, record.model, record.demand, record.auto_merge_allowed,
-             record.lineage, record.source, record.refusal, record.refusal_expected) = home
+             record.lineage, record.source, record.refusal, record.refusal_expected,
+             record.route_id, record.route_cell_digest, record.launch_config_digest) = home
             record.state = WAITING
             self._persist(record)
 
@@ -907,16 +967,16 @@ class Coordinator:
         consuming permits; reviewed-profile same-tool fallback is selected before submission."""
         return pr_bound_waiting(self._records.values(), pool, now)
 
-    def _begin_start(self, record: Record, now: int) -> bool:
+    def _begin_start(self, record: Record, now: int, *, capability=None):
         if (record.state != WAITING or record.hold_pending
                 or record.attempts >= ATTEMPT_BUDGET):
-            return False
+            return None
         if record.pool not in {"claude", "codex"}:
-            return False  # no permit ledger to charge an unknown pool (ADR 0029)
+            return None  # no permit ledger to charge an unknown pool (ADR 0029)
         if record.stage in LINEAGE_PINNED and record.pool != record.lineage:
-            return False  # a code-writing stage may not silently leave its pinned lineage
+            return None  # a code-writing stage may not silently leave its pinned lineage
         if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
-            return False  # new issue work defers while a PR-bound stage waits to start (#293)
+            return None  # new issue work defers while a PR-bound stage waits to start (#293)
         if not self._gate(deepcopy(record)):
             # An independent admission gate refusal (headroom, ceiling, cap, pacing) used to be
             # silent: a record pinned to a pool the weekly ratchet blocks sat `waiting` with its
@@ -931,7 +991,7 @@ class Coordinator:
             reason = reason_of(deepcopy(record)) if reason_of is not None else None
             self._note_refusal(record, reason or "", False)
             self._emit_deferral(record, now, reason)
-            return False
+            return None
         # Store derives and commits the reservation successor. Default NoAdmission mode preserves
         # the shipped coordinator behavior; #627 remains the owner of composed Safety/Attribution
         # mode, RouteCell resolution, and briefing/capability admission receipts.
@@ -943,7 +1003,15 @@ class Coordinator:
         # this attempt; the winner's durable row remains authoritative and no reservation is
         # attempted from the stale object.
         if not self._persist(record):
-            return False
+            return None
+        briefing = None
+        if self._briefing_resolver is not None and record.stage != "converse":
+            briefing = self._briefing_resolver.brief_for(
+                record.repo, record.stage, record.subject_revision)
+            from agentflow.effective_policy import HoldBriefing
+            if type(briefing) is HoldBriefing:
+                from agentflow.coordinator.store import AdmissionRefused
+                raise AdmissionRefused(briefing.hold_code)
         admission = self._store.reserve(ReservationIntent(
             identity=record.identity,
             expected_launch_token=record.launch_token,
@@ -952,13 +1020,15 @@ class Coordinator:
             daemon_generation=self._daemon_generation,
             budget=PERMIT_BUDGET,
             limits=limits,
-            route_cell_digest=None,
+            route_cell_digest=record.route_cell_digest or None,
+            briefing=briefing,
+            capability=capability,
         ))
         if admission is None:
-            return False
+            return None
         for item in fields(Record):
             setattr(record, item.name, getattr(admission.successor, item.name))
-        return True
+        return admission
 
     def _emit_deferral(self, record: Record, now: int, reason: str | None) -> None:
         """Log why the admission gate refused this waiting record (#436), from the reason
@@ -1341,6 +1411,39 @@ def _identity(repo: str, subject: str, stage: str, target: str | None, round: in
     if uncertainty_handoffs:
         parts.append(f"u{uncertainty_handoffs}")
     return "|".join(parts)
+
+
+_COMMIT_REVISION = re.compile(r"^[a-f0-9]{40}$")
+
+
+def _subject_revision(submission: Submission) -> str:
+    """Capture the one source commit before the first durable write."""
+    if type(submission.target) is str and _COMMIT_REVISION.fullmatch(submission.target):
+        return submission.target
+    if type(submission.input_ptr) is str:
+        try:
+            source_ref = json.loads(submission.input_ptr).get("source_ref")
+        except (TypeError, ValueError, AttributeError):
+            source_ref = None
+        if type(source_ref) is str and _COMMIT_REVISION.fullmatch(source_ref):
+            return source_ref
+    candidates = []
+    if submission.source:
+        candidates.append((submission.source, "HEAD"))
+    if submission.capability_root:
+        candidates.append((submission.capability_root, "origin/main"))
+    for root, ref in candidates:
+        try:
+            result = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--verify", f"{ref}^{{commit}}"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, check=False, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        revision = result.stdout.strip()
+        if result.returncode == 0 and _COMMIT_REVISION.fullmatch(revision):
+            return revision
+    return ""
 
 
 def _refusal_state(record: Record):

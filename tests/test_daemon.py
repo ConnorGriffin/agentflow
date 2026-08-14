@@ -117,11 +117,18 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
     """--once runs exactly one cycle without entering the poll loop."""
     events = []
 
+    class RouteStore:
+        def close(self):
+            events.append(("routes-closed", None))
+
     with (
         mock.patch("agentflow.daemon.STATE_DIR", tmp_path),
         mock.patch("agentflow.daemon.LOCK", tmp_path / "daemon.lock"),
         mock.patch("agentflow.daemon.recover_worktrees",
                    side_effect=lambda repos: events.append(("recover", list(repos)))),
+        mock.patch("agentflow.pipeline.production_store", return_value=RouteStore()),
+        mock.patch("agentflow.routing.reconcile_route_cells",
+                   side_effect=lambda config, store: events.append(("routes", config))),
         mock.patch("agentflow.daemon.dispatch_cycle",
                    side_effect=lambda repos: events.append(("cycle", list(repos)))),
         mock.patch("agentflow.daemon.publish_snapshot",
@@ -130,7 +137,11 @@ def test_main_once_runs_one_cycle_and_exits(tmp_path):
     ):
         daemon.run(RuntimeConfig((A, B), (), tmp_path / "config.toml"), once=True)
 
-    assert events == [("recover", [A, B]), ("cycle", [A, B]), ("publish", [A, B])]
+    assert events == [
+        ("routes", RuntimeConfig((A, B), (), tmp_path / "config.toml")),
+        ("routes-closed", None),
+        ("recover", [A, B]), ("cycle", [A, B]), ("publish", [A, B]),
+    ]
     assert not (tmp_path / "daemon.lock").exists()  # lock released on exit
 
 

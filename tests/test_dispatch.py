@@ -909,6 +909,9 @@ def test_no_rollout_switch_or_direct_provider_call_survives_in_production_orches
         root / "runner.py",
         root / "codex_worker.py",
         root / "coordinator" / "quota_poll.py",
+        root / "coordinator" / "coordinator.py",
+        root / "effective_policy.py",
+        root / "worktree_ref.py",
     }
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())

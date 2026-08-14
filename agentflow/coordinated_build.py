@@ -31,7 +31,7 @@ from agentflow.pool_control import POOLS, pool_paused
 from agentflow.repo_facts import surface_declaration, surfaces_phrase
 from agentflow.routing import routing
 from agentflow.runner import _run, codex_spent_at_render
-from agentflow.worktree_ref import WorktreeRef, source_facts
+from agentflow.worktree_ref import WorktreeRef, capture_subject_revision, source_facts
 
 
 def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgates: bool = False):
@@ -59,6 +59,7 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool=parent_pool,
+        subject_revision=capture_subject_revision(cfg.workdir),
         complexity=complexity.value, effort=effort,
         source=WorktreeRef.for_build(cfg.workdir, parent_pool, n, sl).path, claim=True, input_ptr=brief,
         builder_lineage=parent_pool, branch_lineage=parent_pool, session_lead=True,

@@ -39,7 +39,7 @@ from agentflow.shell_crib import SHELL_CRIB
 from agentflow.workspace import channel, publish
 from agentflow.workspace.projection import workspace_projection
 from agentflow.workspace.store import ACCEPTED, WorkspaceStore, project_slug
-from agentflow.worktree_ref import WorktreeKind, WorktreeRef
+from agentflow.worktree_ref import WorktreeKind, WorktreeRef, capture_subject_revision
 
 # The prompt a Conversation turn runs. The turn's isolated worktree is the session's only durable
 # write path; it must land its answer at exactly this per-turn artifact, which is the outcome the
@@ -211,7 +211,8 @@ def _ask_worktree_ready(record):
     if fetch.returncode != 0:
         return unprepared("fetch-failed",
                           f"`git -C {workdir} fetch origin` exited {fetch.returncode}")
-    added = _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), "origin/main"])
+    added = _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt),
+                  record.subject_revision])
     if added.returncode != 0:
         return unprepared("worktree-add-failed",
                           f"`git worktree add --detach` at {wt} exited {added.returncode}")
@@ -288,6 +289,7 @@ def converse_submission(repo: str, workdir: str, conversation_id: str, ordinal: 
     return Submission(
         repo=repo, subject=conversation_id, stage="converse", pool=pool, complexity="deep",
         target=str(ordinal), source=worktree, input_ptr=input_ptr, claim=True, interactive=True,
+        subject_revision=capture_subject_revision(workdir),
         capability_root=workdir,
         capability_context={"ui": bool(surface_declaration(workdir).surfaces)})
 

@@ -51,6 +51,7 @@ def respond_submission(cfg, pr_number, branch, comment, target, baseline):
         disclaimer=respond_reply_disclaimer(str(target)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="respond", target=str(target),
+        subject_revision=baseline,
         pool=tool, complexity="deep", source=WorktreeRef.for_build(cfg.workdir, tool, n, sl).path,
         claim=True, input_ptr=brief, builder_lineage=tool,
         capability_root=cfg.workdir,

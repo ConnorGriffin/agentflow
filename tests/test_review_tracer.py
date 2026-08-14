@@ -1865,7 +1865,7 @@ def test_manual_review_recovers_a_parked_claimless_exact_head_review(make_coord,
     monkeypatch.setattr(loop, "pick_reviewer", lambda author, **kwargs: "claude")
     claimed = []
     monkeypatch.setattr(loop, "claim", lambda repo, issue, _label: claimed.append(issue) or True)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/w"), 42) == "review submitted"
@@ -1954,7 +1954,7 @@ def test_manual_review_resume_keeps_the_three_pass_ceiling_and_park_truth(
         lambda *_args, **_kwargs: (ReviewAssignment(reason="one journey"), ()))
     monkeypatch.setattr(loop, "pick_reviewer", lambda _author, **_kwargs: "codex")
     monkeypatch.setattr(loop, "claim", lambda *_args: True)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda: coord)
+    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coord)
     monkeypatch.setattr(pipeline, "reconcile_and_project", lambda _coord: None)
 
     assert loop.review_pr(RepoConfig("o/r", "/work"), 42) == "review submitted"

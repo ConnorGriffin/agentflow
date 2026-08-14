@@ -136,7 +136,8 @@ def workspace_cycle(repos: list[RepoConfig], _log=log) -> None:
     if not repos:
         return
     try:
-        coord = pipeline.build_coordinator(_log=_log)
+        coord = pipeline.build_coordinator(
+            _log=_log, repositories={cfg.repo: cfg.workdir for cfg in repos})
         workdir_for = {c.repo: c.workdir for c in repos}
         coordinated_converse.drain_commands(coord, workdir_for, _log=_log)
         for pool in ("claude", "codex"):
@@ -465,6 +466,15 @@ def run(config: RuntimeConfig, *, once: bool = False) -> None:
                 "capacity helper not configured — Codex capacity and "
                 "operator-activity detection are unavailable"
             )
+        # Route registration is the first operation after daemon ownership. Admission itself
+        # never registers or activates a cell, and no recovery/dispatch may run against an
+        # unreconciled production registry.
+        from agentflow import pipeline, routing
+        route_store = pipeline.production_store()
+        try:
+            routing.reconcile_route_cells(config, route_store)
+        finally:
+            route_store.close()
         recover_worktrees(repos)
         if once:
             log(f"--once: running one cycle over repos={[c.repo for c in repos]}")

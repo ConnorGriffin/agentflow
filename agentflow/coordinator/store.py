@@ -17,6 +17,7 @@ no provider and clears no claim (ADR 0028's "unreadable store fails closed").
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 import os
 import re
 import sqlite3
@@ -47,8 +48,10 @@ from agentflow.operational_safety import (
 
 if TYPE_CHECKING:
     from agentflow.canary_attribution import CanaryAttribution, PromotionReceiptAuthority
+    from agentflow.capability_contracts import CapabilityReadyFact
+    from agentflow.effective_policy import NotApplicableBriefing, ReadyBriefing
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 _RECORDS_SCHEMA = (
     "CREATE TABLE records ("
     " identity TEXT PRIMARY KEY,"
@@ -57,6 +60,51 @@ _RECORDS_SCHEMA = (
     " demand INTEGER NOT NULL,"
     " data TEXT NOT NULL)"
 )
+_ADMISSION_RECEIPTS_SCHEMA = (
+    "CREATE TABLE admission_receipts ("
+    " stage_identity TEXT PRIMARY KEY,"
+    " subject_revision TEXT NOT NULL,"
+    " briefing_id TEXT,"
+    " briefing_digest TEXT,"
+    " capability_id TEXT NOT NULL,"
+    " capability_digest TEXT NOT NULL,"
+    " route_id TEXT NOT NULL,"
+    " route_cell_digest TEXT NOT NULL,"
+    " launch_config_digest TEXT NOT NULL,"
+    " safety_state_id TEXT NOT NULL)"
+)
+_ADMISSION_RECEIPTS_NO_UPDATE = (
+    "CREATE TRIGGER admission_receipts_no_update BEFORE UPDATE ON admission_receipts "
+    "BEGIN SELECT RAISE(ABORT, 'admission_receipts is append-only'); END"
+)
+_ADMISSION_RECEIPTS_NO_DELETE = (
+    "CREATE TRIGGER admission_receipts_no_delete BEFORE DELETE ON admission_receipts "
+    "BEGIN SELECT RAISE(ABORT, 'admission_receipts is append-only'); END"
+)
+_ADMISSION_RECEIPTS_FINGERPRINT = (
+    ("table", "admission_receipts", "admission_receipts",
+     "createtableadmission_receipts(stage_identitytextprimarykey,subject_revisiontextnotnull,"
+     "briefing_idtext,briefing_digesttext,capability_idtextnotnull,capability_digesttextnotnull,"
+     "route_idtextnotnull,route_cell_digesttextnotnull,launch_config_digesttextnotnull,"
+     "safety_state_idtextnotnull)"),
+    ("trigger", "admission_receipts_no_delete", "admission_receipts",
+     "createtriggeradmission_receipts_no_deletebeforedeleteonadmission_receiptsbeginselectraise("
+     "abort,'admission_receiptsisappend-only');end"),
+    ("trigger", "admission_receipts_no_update", "admission_receipts",
+     "createtriggeradmission_receipts_no_updatebeforeupdateonadmission_receiptsbeginselectraise("
+     "abort,'admission_receiptsisappend-only');end"),
+)
+
+
+def _store_v4_fingerprint():
+    from agentflow.canary_attribution import STORE_V3_SCHEMA_FINGERPRINT
+    return tuple(sorted(STORE_V3_SCHEMA_FINGERPRINT + _ADMISSION_RECEIPTS_FINGERPRINT))
+
+
+STORE_V4_SCHEMA_FINGERPRINT = _store_v4_fingerprint()
+STORE_V4_SCHEMA_FINGERPRINT_DIGEST = sha256(json.dumps(
+    STORE_V4_SCHEMA_FINGERPRINT, sort_keys=True, separators=(",", ":"),
+    ensure_ascii=True, allow_nan=False).encode()).hexdigest()
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
 # daemon cycle on a lock we cannot prove will clear.
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_COORD_BUSY_MS", "2000"))
@@ -78,6 +126,17 @@ V2_TO_V3_FAULT_OBSERVATIONS = (
     "v2-to-v3:after-user-version",
     "v2-to-v3:before-commit",
     "v2-to-v3:after-commit",
+)
+V4_ADMISSION_PRECOMMIT_CUTPOINTS = (
+    "after-begin",
+    "after-waiting-cas",
+    "after-capacity",
+    "after-identity-validation",
+    "after-route-validation",
+    "after-safety",
+    "after-attribution-before-successor",
+    "after-receipt-before-successor",
+    "after-successor-before-commit",
 )
 
 
@@ -107,6 +166,29 @@ class RouteAdmissionRefused(RuntimeError):
     def __init__(self, code: RouteAdmissionCode) -> None:
         if type(code) is not str or code not in ROUTE_ADMISSION_REFUSAL_CODES:
             raise TypeError("unknown route admission refusal code")
+        self.code = code
+        super().__init__(code)
+
+
+ADMISSION_REFUSAL_CODES = frozenset({
+    "admission_identity_migration_required",
+    "briefing_mismatch",
+    "capability_mismatch",
+    "route_mismatch",
+    "safety_refused",
+    "briefing_overflow", "incompatible_policy", "invalid_briefing", "invalid_overlay",
+    "invalid_receipt", "missing_policy", "missing_receipt",
+})
+
+
+class AdmissionRefused(RuntimeError):
+    """One content-free refusal vocabulary crossing Store's admission boundary."""
+
+    __slots__ = ("code",)
+
+    def __init__(self, code: str) -> None:
+        if type(code) is not str or code not in ADMISSION_REFUSAL_CODES:
+            raise TypeError("unknown admission refusal code")
         self.code = code
         super().__init__(code)
 
@@ -143,6 +225,26 @@ class ReservationIntent:
     budget: int
     limits: ReservationLimits | None
     route_cell_digest: str | None
+    # These facts are deliberately optional at the type boundary so v3 Store databases and
+    # their historical tests remain readable.  OperationalSafetyAndCanary admission rejects
+    # their absence; only a legacy NoAdmission Store may reserve without them.
+    briefing: "ReadyBriefing | NotApplicableBriefing | None" = None
+    capability: "CapabilityReadyFact | None" = None
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionReceipt:
+    """The immutable authority tuple committed with one logical-stage admission."""
+
+    subject_revision: str
+    briefing_id: str | None
+    briefing_digest: str | None
+    capability_id: str
+    capability_digest: str
+    route_id: str
+    route_cell_digest: str
+    launch_config_digest: str
+    safety_state_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +252,8 @@ class AdmissionResult:
     successor: Record
     safety_state_id: str | None
     canary_attribution: CanaryAttribution | None
+    admission_receipt: AdmissionReceipt | None = None
+    admitted_launch: AdmittedLaunch | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,12 +350,18 @@ class Store:
                     raise StoreUnavailable("store schema 2 does not match the migration source")
                 self._migrate_v2_to_v3(conn)
                 version = 3
+            if version == 3:
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+                    conn.close()
+                    raise StoreUnavailable("store schema 3 does not match the migration source")
+                self._migrate_v3_to_v4(conn)
+                version = 4
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
                 conn.close()
-                raise StoreUnavailable("store schema 3 does not match the accepted schema")
+                raise StoreUnavailable("store schema 4 does not match the accepted schema")
         except sqlite3.DatabaseError as e:  # corrupt file, locked-beyond-wait, unreadable
             raise StoreUnavailable(f"cannot open continuation store: {e}") from e
         return conn
@@ -311,7 +421,10 @@ class Store:
             OperationalSafety.initialize_schema(conn)
             from agentflow.canary_attribution import initialize_schema
             initialize_schema(conn)
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+            conn.execute(_ADMISSION_RECEIPTS_SCHEMA)
+            conn.execute(_ADMISSION_RECEIPTS_NO_UPDATE)
+            conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
                 raise sqlite3.DatabaseError("initialized coordinator schema was not accepted")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
@@ -360,6 +473,23 @@ class Store:
             Store._migration_checkpoint("v2-to-v3:after-commit")
         except BaseException:
             if not committed and conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
+        """Add the insert-only authority receipt without rewriting historical Records."""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(_ADMISSION_RECEIPTS_SCHEMA)
+            conn.execute(_ADMISSION_RECEIPTS_NO_UPDATE)
+            conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
+                raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
+            conn.execute("PRAGMA user_version = 4")
+            conn.execute("COMMIT")
+        except BaseException:
+            if conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
 
@@ -590,6 +720,7 @@ class Store:
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                self._admission_checkpoint("after-begin")
                 existing_row = self._conn.execute(
                     "SELECT data FROM records WHERE identity = ?", (intent.identity,)).fetchone()
                 if existing_row is None:
@@ -603,6 +734,7 @@ class Store:
                         or intent.budget < 0):
                     self._conn.execute("ROLLBACK")
                     return None
+                self._admission_checkpoint("after-waiting-cas")
                 if intent.limits is not None:
                     limits = intent.limits
                     rows = self._conn.execute(
@@ -629,6 +761,31 @@ class Store:
                 if int(row[0]) + existing.demand > intent.budget:
                     self._conn.execute("ROLLBACK")
                     return None
+                self._admission_checkpoint("after-capacity")
+                composed = self._canary_attribution is not None
+                admitted_launch = None
+                if composed:
+                    if (not existing.subject_revision or not existing.route_id
+                            or not existing.route_cell_digest
+                            or not existing.launch_config_digest):
+                        raise AdmissionRefused("admission_identity_migration_required")
+                    if intent.route_cell_digest != existing.route_cell_digest:
+                        raise AdmissionRefused("route_mismatch")
+                    briefing_id, briefing_digest = self._validate_briefing(existing, intent.briefing)
+                    capability = self._validate_capability(existing, intent.capability)
+                    self._admission_checkpoint("after-identity-validation")
+                    try:
+                        admitted_launch = self._resolve_active_admitted(
+                            existing.identity, existing.revision, existing.route_id,
+                            conn=self._conn)
+                    except (RouteAdmissionRefused, SafetyRefused) as error:
+                        raise AdmissionRefused("safety_refused") from error
+                    if (admitted_launch.route_cell.digest != existing.route_cell_digest
+                            or admitted_launch.route_cell.launch_config_digest
+                            != existing.launch_config_digest
+                            or admitted_launch.route_cell.route_id != existing.route_id):
+                        raise AdmissionRefused("route_mismatch")
+                    self._admission_checkpoint("after-route-validation")
                 if (self._operational_safety is not None
                         and (not isinstance(intent.route_cell_digest, str)
                              or not intent.route_cell_digest)):
@@ -644,19 +801,41 @@ class Store:
                         provider=existing.pool,
                         model=existing.model,
                         route_cell_digest=intent.route_cell_digest)  # type: ignore[arg-type]
-                    safety = self._operational_safety._participate_in_admission(context)
+                    try:
+                        safety = self._operational_safety._participate_in_admission(context)
+                    except SafetyRefused as error:
+                        if composed:
+                            raise AdmissionRefused("safety_refused") from error
+                        raise
                     if (type(safety) is not _SafetyAdmissionResult
                             or not isinstance(safety.safety_state_id, str)
                             or not safety.safety_state_id):
+                        if composed:
+                            raise AdmissionRefused("safety_refused")
                         raise SafetyRefused("OperationalSafety returned an invalid admission result")
                     safety_state_id = safety.safety_state_id
+                    self._admission_checkpoint("after-safety")
                     if self._canary_attribution is not None:
-                        from agentflow.canary_attribution import _CanaryAdmissionResult
-                        canary = self._canary_attribution._participate_in_admission(context)
+                        from agentflow.canary_attribution import (
+                            CanaryAttributionRefused, _CanaryAdmissionResult,
+                        )
+                        try:
+                            canary = self._canary_attribution._participate_in_admission(context)
+                        except CanaryAttributionRefused as error:
+                            raise AdmissionRefused("safety_refused") from error
                         if type(canary) is not _CanaryAdmissionResult:
-                            raise SafetyRefused("CanaryAttribution returned an invalid admission result")
+                            raise AdmissionRefused("safety_refused")
                         attribution = canary.attribution
                 self._admission_checkpoint("after-attribution-before-successor")
+                receipt = None
+                if composed:
+                    receipt = AdmissionReceipt(
+                        existing.subject_revision, briefing_id, briefing_digest,
+                        capability.capability_id, capability.capability_digest,
+                        existing.route_id, existing.route_cell_digest,
+                        existing.launch_config_digest, safety_state_id)  # type: ignore[arg-type]
+                    self._insert_or_validate_admission_receipt(existing.identity, receipt)
+                    self._admission_checkpoint("after-receipt-before-successor")
                 successor = replace(
                     existing,
                     state=RUNNING,
@@ -674,13 +853,83 @@ class Store:
                 self._admission_checkpoint("after-successor-before-commit")
                 self._conn.execute("COMMIT")
                 self._admission_checkpoint("after-commit")
-                return AdmissionResult(successor, safety_state_id, attribution)
+                return AdmissionResult(
+                    successor, safety_state_id, attribution, receipt, admitted_launch)
             except sqlite3.DatabaseError as e:
                 self._rollback_quietly()
                 raise StoreUnavailable(f"cannot reserve on continuation store: {e}") from e
             except BaseException:
                 self._rollback_quietly()
                 raise
+
+    @staticmethod
+    def _validate_briefing(existing: Record, briefing) -> tuple[str | None, str | None]:
+        from agentflow.effective_policy import (
+            NotApplicableBriefing, ReadyBriefing, validate_briefing,
+        )
+        if existing.stage == "converse":
+            if briefing is not None:
+                raise AdmissionRefused("briefing_mismatch")
+            return None, None
+        if type(briefing) not in {ReadyBriefing, NotApplicableBriefing}:
+            raise AdmissionRefused("briefing_mismatch")
+        if (briefing.repository != existing.repo or briefing.stage != existing.stage
+                or briefing.subject_revision != existing.subject_revision):
+            raise AdmissionRefused("briefing_mismatch")
+        if not validate_briefing(briefing):
+            raise AdmissionRefused("briefing_mismatch")
+        return briefing.briefing_id, briefing.briefing_digest
+
+    @staticmethod
+    def _validate_capability(existing: Record, capability):
+        from agentflow.capability_contracts import validate_capability_ready_fact
+        if (not validate_capability_ready_fact(capability)
+                or capability.stage != existing.stage
+                or capability.provider != existing.pool):
+            raise AdmissionRefused("capability_mismatch")
+        return capability
+
+    def _insert_or_validate_admission_receipt(
+            self, stage_identity: str, receipt: AdmissionReceipt) -> None:
+        row = self._conn.execute(
+            "SELECT subject_revision, briefing_id, briefing_digest, capability_id, "
+            "capability_digest, route_id, route_cell_digest, launch_config_digest, "
+            "safety_state_id FROM admission_receipts WHERE stage_identity = ?",
+            (stage_identity,),
+        ).fetchone()
+        values = tuple(getattr(receipt, item.name) for item in fields(AdmissionReceipt))
+        if row is not None:
+            prior = AdmissionReceipt(*row)
+            if (prior.subject_revision, prior.briefing_id, prior.briefing_digest) != (
+                    receipt.subject_revision, receipt.briefing_id, receipt.briefing_digest):
+                raise AdmissionRefused("briefing_mismatch")
+            if (prior.capability_id, prior.capability_digest) != (
+                    receipt.capability_id, receipt.capability_digest):
+                raise AdmissionRefused("capability_mismatch")
+            if (prior.route_id, prior.route_cell_digest, prior.launch_config_digest) != (
+                    receipt.route_id, receipt.route_cell_digest, receipt.launch_config_digest):
+                raise AdmissionRefused("route_mismatch")
+            if prior.safety_state_id != receipt.safety_state_id:
+                raise AdmissionRefused("safety_refused")
+            return
+        self._conn.execute(
+            "INSERT INTO admission_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (stage_identity, *values),
+        )
+
+    def read_admission_receipt(self, stage_identity: str) -> AdmissionReceipt | None:
+        """Read one immutable admission authority tuple through Store's public interface."""
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT subject_revision, briefing_id, briefing_digest, capability_id, "
+                    "capability_digest, route_id, route_cell_digest, launch_config_digest, "
+                    "safety_state_id FROM admission_receipts WHERE stage_identity = ?",
+                    (stage_identity,),
+                ).fetchone()
+            except sqlite3.DatabaseError as error:
+                raise StoreUnavailable(f"cannot read admission receipt: {error}") from error
+        return AdmissionReceipt(*row) if row is not None else None
 
     def resolve_admitted_launch(self, stage_identity: str, expected_revision: int,
                                 route_id: str) -> AdmittedLaunch:
@@ -1046,13 +1295,16 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, 
 
 
 def _expected_schema_fingerprint(version: int) -> tuple[tuple[str, str, str, str], ...]:
-    if version in (2, 3):
+    if version in (2, 3, 4):
         from agentflow.canary_attribution import (
             STORE_V2_SCHEMA_FINGERPRINT,
             STORE_V3_SCHEMA_FINGERPRINT,
         )
-        return (STORE_V2_SCHEMA_FINGERPRINT if version == 2
-                else STORE_V3_SCHEMA_FINGERPRINT)
+        if version == 2:
+            return STORE_V2_SCHEMA_FINGERPRINT
+        if version == 3:
+            return STORE_V3_SCHEMA_FINGERPRINT
+        return STORE_V4_SCHEMA_FINGERPRINT
     conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         conn.execute(_RECORDS_SCHEMA)

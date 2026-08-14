@@ -40,6 +40,7 @@ def intake_submission(cfg, issue: dict, extra: str, comments: str, tool: str) ->
     if not source_ref:
         return None
     return Submission(repo=cfg.repo, subject=str(n), stage="intake", target=target,
+                      subject_revision=source_ref,
                       pool=tool, complexity="deep", source=str(source_path), claim=True,
                       input_ptr=json.dumps({"format": PROVIDER_INPUT_V1,
                                             "snapshot": snapshot, "source_ref": source_ref,

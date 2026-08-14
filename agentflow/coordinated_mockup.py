@@ -53,6 +53,7 @@ def mockup_submission(cfg, issue: dict, tool: str):
         scope_guidance=SCOPE_GUIDANCE[scope], disclaimer=MOCKUP_DISCLAIMER)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="mockup", pool=tool, complexity="deep",
+        subject_revision=worktree_ref.capture_subject_revision(cfg.workdir),
         source=source, claim=True, input_ptr=prompt, builder_lineage=tool,
         capability_root=cfg.workdir, capability_context={"ui": True})
 

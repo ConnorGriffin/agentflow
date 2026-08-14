@@ -301,6 +301,7 @@ def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktr
                 else frozenset({"agentflow:needs-mockup"}))
 
     monkeypatch.setattr("agentflow.stage_worktree._run", git)
+    monkeypatch.setattr("agentflow.worktree_ref.capture_subject_revision", lambda _workdir: "a" * 40)
     monkeypatch.setattr("agentflow.github.issue_labels", issue_labels)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
     adapter = MockupStageAdapter(
@@ -324,7 +325,7 @@ def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktr
     coord.cycle("claude")
     assert record_of(coord, ident).attempts == 1 and permits(coord, "claude") == 5
     added = next(call for call in calls if "worktree" in call and "add" in call)
-    assert "origin/main" in added
+    assert "a" * 40 in added
 
 
 def test_drawing_ownership_comes_only_from_durable_mockup_records():
