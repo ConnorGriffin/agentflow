@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import sqlite3
 
@@ -17,6 +18,7 @@ from agentflow.coordinator.store import (
     ReservationIntent,
     SafetySources,
     Store,
+    StoreUnavailable,
 )
 from agentflow.effective_policy import NotApplicableBriefing, _finish, _hold
 from agentflow.evidence import ApprovedAuthority, AuthorityPointer, PromotionReceipt
@@ -85,11 +87,13 @@ class _Prepared:
 class _StartedLauncher:
     def __init__(self) -> None:
         self.launches = []
+        self.identities = []
         self.alive = set()
 
     def start(self, record, store, admitted=None):
         assert admitted is not None
         self.launches.append(admitted)
+        self.identities.append(record.identity)
         family = str(970000 + len(self.launches))
         record.start_fact = STARTED
         record.family = family
@@ -163,6 +167,37 @@ def _assert_zero_outputs(store, launcher, identity, code):
     assert store.read_canary_attribution(identity) is None
 
 
+def _corrupt_committed_authority(path, identity, authority):
+    target = {
+        "receipt": ("admission_receipts", "admission_receipts_no_update", "receipt_digest"),
+        "history": (
+            "safety_admission_history", "safety_admission_history_no_update",
+            "history_digest"),
+    }[authority]
+    table, trigger, column = target
+    attacker = sqlite3.connect(path)
+    trigger_sql = attacker.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (trigger,),
+    ).fetchone()[0]
+    attacker.execute(f"DROP TRIGGER {trigger}")
+    attacker.execute(
+        f"UPDATE {table} SET {column} = ? WHERE stage_identity = ?",
+        ("f" * 64, identity),
+    )
+    attacker.execute(trigger_sql)
+    attacker.commit()
+    rows = (
+        tuple(attacker.execute(
+            "SELECT * FROM admission_receipts WHERE stage_identity = ?", (identity,)
+        ).fetchall()),
+        tuple(attacker.execute(
+            "SELECT * FROM safety_admission_history WHERE stage_identity = ?", (identity,)
+        ).fetchall()),
+    )
+    attacker.close()
+    return rows
+
+
 def _full_capacity_store(tmp_path, *, register):
     coordinator, store, launcher, _adapter, identity = _coordinator(
         tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
@@ -226,6 +261,8 @@ def test_adr_627_pins_every_prerequisite_and_public_contract_digest():
             "a0e90b5b41c87ff67f257315cc6578b0b181249037f1ced2bac827cd3670d1ec",
         "Evaluation receipt":
             "f39ec2e8a6eeff7718ad3db5a58a1bc762aec46f7e59c9cddd6f4b0121707562",
+        "Store v4 schema":
+            "a2dd624722d0d4cbe93ffcf381f4de5cf6f52db1ebaa307453f51ede90986f7b",
     }
     for label, digest in pins.items():
         assert label in adr and digest in adr
@@ -426,8 +463,9 @@ def test_durable_launch_config_mismatch_returns_named_code_without_consumption(t
     store.close()
 
 
-def test_lost_admission_ack_reopens_and_launches_historical_receipt_after_pointer_change(
-        tmp_path, monkeypatch):
+@pytest.mark.parametrize("activation_count", (0, 1, 3))
+def test_lost_admission_ack_reopens_exact_launch_after_later_approved_activations(
+        tmp_path, monkeypatch, activation_count):
     receipts = _Receipts()
     capability_calls = []
 
@@ -455,19 +493,24 @@ def test_lost_admission_ack_reopens_and_launches_historical_receipt_after_pointe
 
     authority_store = Store(path)
     authority = OperationalSafety(authority_store, promotion_receipts=receipts)
-    candidate_selection = routing.select_route(
+    selection = routing.select_route(
         committed.repo, committed.stage, committed.pool, "gpt-5.6-sol",
         complexity=committed.complexity, effort=committed.effort,
         builder_complexity=committed.builder_complexity)
-    candidate = authority.register_route_cell(
-        candidate_selection.repository, candidate_selection.stage,
-        candidate_selection.provider, candidate_selection.model,
-        candidate_selection.route_id, candidate_selection.launch_config)
-    request = CanaryActivationRequest(
-        "receipt-pointer-change", candidate.digest, historical_digest, 0)
-    receipts.issue(request)
-    state = authority.approve_canary(request)
-    assert state.active_route_cell_digest == candidate.digest
+    active_digest = historical_digest
+    for ordinal in range(activation_count):
+        model = f"gpt-5.6-sol-{ordinal}"
+        config = replace(
+            selection.launch_config, internal_model=model, cli_model=model)
+        candidate = authority.register_route_cell(
+            selection.repository, selection.stage, selection.provider, model,
+            selection.route_id, config)
+        request = CanaryActivationRequest(
+            f"receipt-pointer-change-{ordinal}", candidate.digest, active_digest, 0)
+        receipts.issue(request)
+        state = authority.approve_canary(request)
+        assert state.active_route_cell_digest == candidate.digest
+        active_digest = candidate.digest
     authority_store.close()
 
     monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lambda _name: None))
@@ -490,7 +533,130 @@ def test_lost_admission_ack_reopens_and_launches_historical_receipt_after_pointe
     assert len(recovered_launcher.launches) == 1
     launched = recovered_launcher.launches[0]
     assert launched.route_cell.digest == historical_digest
-    assert launched.route_cell.digest != candidate.digest
+    if activation_count:
+        assert launched.route_cell.digest != active_digest
     assert reopened.read_admission_receipt(identity) == receipt
     assert reopened.record_of(identity).start_fact == STARTED
     reopened.close()
+
+
+@pytest.mark.parametrize("authority", ("receipt", "history"))
+def test_unreadable_committed_authority_holds_without_start_or_attempt_and_continues_sibling(
+        tmp_path, monkeypatch, authority):
+    receipts = _Receipts()
+    coordinator, store, first_launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        receipts=receipts)
+
+    def lose_ack(name):
+        if name == "after-commit":
+            raise RuntimeError("lost admission acknowledgement")
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lose_ack))
+    with pytest.raises(RuntimeError, match="lost admission acknowledgement"):
+        coordinator.cycle("codex")
+    assert first_launcher.launches == []
+    sibling = coordinator.submit_stage(Submission(
+        repo="octo/app", subject="sibling", stage="build", pool="codex",
+        complexity="deep", subject_revision=REVISION))
+    path = store.path
+    store.close()
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lambda _name: None))
+    reopened = Store(path, admission_mode=OperationalSafetyAndCanary(
+        SafetySources(), receipts))
+    forensic_rows = _corrupt_committed_authority(path, identity, authority)
+    recovered_launcher = _StartedLauncher()
+    recovered = Coordinator(
+        store=reopened, launcher=recovered_launcher, adapter=_Prepared(),
+        capability_preflight=lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing_resolver=_Briefings(), route_selector=routing.select_route,
+        daemon_generation="daemon-after-crash")
+
+    outcomes = recovered.cycle("codex")
+
+    held = reopened.record_of(identity)
+    started_sibling = reopened.record_of(sibling)
+    assert held.state == "held" and not held.claim and not held.hold_pending
+    assert held.attempts == 0 and not held.attempt_committed and held.start_fact is None
+    assert held.handoff_proof and outcomes[0].identity == identity
+    assert started_sibling.state == "running" and started_sibling.start_fact == STARTED
+    assert recovered_launcher.identities == [sibling]
+    assert reopened.permits_used("codex") == started_sibling.demand
+    with pytest.raises(StoreUnavailable, match="admission receipt is unreadable"):
+        reopened.read_admission_receipt(identity)
+    assert forensic_rows == (
+        tuple(reopened._conn.execute(
+            "SELECT * FROM admission_receipts WHERE stage_identity = ?", (identity,)
+        ).fetchall()),
+        tuple(reopened._conn.execute(
+            "SELECT * FROM safety_admission_history WHERE stage_identity = ?", (identity,)
+        ).fetchall()),
+    )
+    reopened.close()
+
+
+def test_unreadable_committed_authority_pending_hold_survives_handoff_crash(
+        tmp_path, monkeypatch):
+    receipts = _Receipts()
+    coordinator, store, first_launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        receipts=receipts)
+
+    def lose_ack(name):
+        if name == "after-commit":
+            raise RuntimeError("lost admission acknowledgement")
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lose_ack))
+    with pytest.raises(RuntimeError, match="lost admission acknowledgement"):
+        coordinator.cycle("codex")
+    assert first_launcher.launches == []
+    path = store.path
+    store.close()
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lambda _name: None))
+    reopened = Store(path, admission_mode=OperationalSafetyAndCanary(
+        SafetySources(), receipts))
+    forensic_rows = _corrupt_committed_authority(path, identity, "history")
+
+    class CrashHandoff(_Prepared):
+        def finalize_hold(self, _record):
+            raise RuntimeError("handoff crash")
+
+    crash_launcher = _StartedLauncher()
+    crashing = Coordinator(
+        store=reopened, launcher=crash_launcher, adapter=CrashHandoff(),
+        capability_preflight=lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing_resolver=_Briefings(), route_selector=routing.select_route,
+        daemon_generation="daemon-after-crash")
+    with pytest.raises(RuntimeError, match="handoff crash"):
+        crashing.cycle("codex")
+    pending = reopened.record_of(identity)
+    assert pending.state == "waiting" and pending.claim and pending.hold_pending
+    assert pending.attempts == 0 and not pending.attempt_committed
+    assert reopened.permits_used("codex") == 0 and crash_launcher.launches == []
+    reopened.close()
+
+    final_store = Store(path, admission_mode=OperationalSafetyAndCanary(
+        SafetySources(), receipts))
+    final_launcher = _StartedLauncher()
+    final = Coordinator(
+        store=final_store, launcher=final_launcher, adapter=_Prepared(),
+        capability_preflight=lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing_resolver=_Briefings(), route_selector=routing.select_route,
+        daemon_generation="daemon-after-second-crash")
+    outcomes = final.cycle("codex")
+
+    held = final_store.record_of(identity)
+    assert held.state == "held" and not held.claim and not held.hold_pending
+    assert held.attempts == 0 and held.handoff_proof and outcomes[0].identity == identity
+    assert final_launcher.launches == [] and final_store.permits_used("codex") == 0
+    assert forensic_rows == (
+        tuple(final_store._conn.execute(
+            "SELECT * FROM admission_receipts WHERE stage_identity = ?", (identity,)
+        ).fetchall()),
+        tuple(final_store._conn.execute(
+            "SELECT * FROM safety_admission_history WHERE stage_identity = ?", (identity,)
+        ).fetchall()),
+    )
+    final_store.close()

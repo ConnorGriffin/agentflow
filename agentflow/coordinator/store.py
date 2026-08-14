@@ -44,6 +44,8 @@ from agentflow.operational_safety import (
     _SafetyMissing,
     _AdmissionContext,
     _SafetyAdmissionResult,
+    _SAFETY_ADMISSION_HISTORY_FINGERPRINT,
+    _digest,
 )
 
 if TYPE_CHECKING:
@@ -71,7 +73,8 @@ _ADMISSION_RECEIPTS_SCHEMA = (
     " route_id TEXT NOT NULL,"
     " route_cell_digest TEXT NOT NULL,"
     " launch_config_digest TEXT NOT NULL,"
-    " safety_state_id TEXT NOT NULL)"
+    " safety_state_id TEXT NOT NULL,"
+    " receipt_digest TEXT NOT NULL)"
 )
 _ADMISSION_RECEIPTS_NO_UPDATE = (
     "CREATE TRIGGER admission_receipts_no_update BEFORE UPDATE ON admission_receipts "
@@ -86,7 +89,7 @@ _ADMISSION_RECEIPTS_FINGERPRINT = (
      "createtableadmission_receipts(stage_identitytextprimarykey,subject_revisiontextnotnull,"
      "briefing_idtext,briefing_digesttext,capability_idtextnotnull,capability_digesttextnotnull,"
      "route_idtextnotnull,route_cell_digesttextnotnull,launch_config_digesttextnotnull,"
-     "safety_state_idtextnotnull)"),
+     "safety_state_idtextnotnull,receipt_digesttextnotnull)"),
     ("trigger", "admission_receipts_no_delete", "admission_receipts",
      "createtriggeradmission_receipts_no_deletebeforedeleteonadmission_receiptsbeginselectraise("
      "abort,'admission_receiptsisappend-only');end"),
@@ -98,7 +101,10 @@ _ADMISSION_RECEIPTS_FINGERPRINT = (
 
 def _store_v4_fingerprint():
     from agentflow.canary_attribution import STORE_V3_SCHEMA_FINGERPRINT
-    return tuple(sorted(STORE_V3_SCHEMA_FINGERPRINT + _ADMISSION_RECEIPTS_FINGERPRINT))
+    return tuple(sorted(
+        STORE_V3_SCHEMA_FINGERPRINT
+        + _ADMISSION_RECEIPTS_FINGERPRINT
+        + _SAFETY_ADMISSION_HISTORY_FINGERPRINT))
 
 
 STORE_V4_SCHEMA_FINGERPRINT = _store_v4_fingerprint()
@@ -140,6 +146,10 @@ V4_ADMISSION_PRECOMMIT_CUTPOINTS = (
     "after-attribution-before-successor",
     "after-receipt-before-successor",
     "after-successor-before-commit",
+)
+V3_TO_V4_FAULT_OBSERVATIONS = (
+    "v3-to-v4:after-begin",
+    "v3-to-v4:after-commit",
 )
 
 
@@ -446,6 +456,7 @@ class Store:
             OperationalSafety.initialize_schema(conn)
             from agentflow.canary_attribution import initialize_schema
             initialize_schema(conn)
+            OperationalSafety._initialize_admission_history_schema(conn)
             conn.execute(_ADMISSION_RECEIPTS_SCHEMA)
             conn.execute(_ADMISSION_RECEIPTS_NO_UPDATE)
             conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
@@ -503,9 +514,12 @@ class Store:
 
     @staticmethod
     def _migrate_v3_to_v4(conn: sqlite3.Connection) -> None:
-        """Add the insert-only authority receipt without rewriting historical Records."""
+        """Add the two insert-only admission facts without rewriting historical Records."""
+        committed = False
         try:
             conn.execute("BEGIN IMMEDIATE")
+            Store._migration_checkpoint("v3-to-v4:after-begin")
+            OperationalSafety._initialize_admission_history_schema(conn)
             conn.execute(_ADMISSION_RECEIPTS_SCHEMA)
             conn.execute(_ADMISSION_RECEIPTS_NO_UPDATE)
             conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
@@ -513,8 +527,10 @@ class Store:
                 raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
             conn.execute("PRAGMA user_version = 4")
             conn.execute("COMMIT")
+            committed = True
+            Store._migration_checkpoint("v3-to-v4:after-commit")
         except BaseException:
-            if conn.in_transaction:
+            if not committed and conn.in_transaction:
                 conn.execute("ROLLBACK")
             raise
 
@@ -957,12 +973,16 @@ class Store:
         row = self._conn.execute(
             "SELECT subject_revision, briefing_id, briefing_digest, capability_id, "
             "capability_digest, route_id, route_cell_digest, launch_config_digest, "
-            "safety_state_id FROM admission_receipts WHERE stage_identity = ?",
+            "safety_state_id, receipt_digest FROM admission_receipts "
+            "WHERE stage_identity = ?",
             (stage_identity,),
         ).fetchone()
         values = tuple(getattr(receipt, item.name) for item in fields(AdmissionReceipt))
+        digest = self._admission_receipt_digest(stage_identity, receipt)
         if row is not None:
-            prior = AdmissionReceipt(*row)
+            prior = AdmissionReceipt(*row[:-1])
+            if row[-1] != self._admission_receipt_digest(stage_identity, prior):
+                raise AdmissionRefused("invalid_receipt")
             if (prior.subject_revision, prior.briefing_id, prior.briefing_digest) != (
                     receipt.subject_revision, receipt.briefing_id, receipt.briefing_digest):
                 raise AdmissionRefused("briefing_mismatch")
@@ -976,9 +996,17 @@ class Store:
                 raise AdmissionRefused("safety_refused")
             return
         self._conn.execute(
-            "INSERT INTO admission_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (stage_identity, *values),
+            "INSERT INTO admission_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (stage_identity, *values, digest),
         )
+
+    @staticmethod
+    def _admission_receipt_digest(
+            stage_identity: str, receipt: AdmissionReceipt) -> str:
+        facts = {"stage_identity": stage_identity}
+        facts.update((item.name, getattr(receipt, item.name))
+                     for item in fields(AdmissionReceipt))
+        return _digest(facts)
 
     def read_admission_receipt(self, stage_identity: str) -> AdmissionReceipt | None:
         """Read one immutable admission authority tuple through Store's public interface."""
@@ -989,7 +1017,8 @@ class Store:
                 row = self._conn.execute(
                     "SELECT r.data, a.subject_revision, a.briefing_id, a.briefing_digest, "
                     "a.capability_id, a.capability_digest, a.route_id, "
-                    "a.route_cell_digest, a.launch_config_digest, a.safety_state_id "
+                    "a.route_cell_digest, a.launch_config_digest, a.safety_state_id, "
+                    "a.receipt_digest "
                     "FROM admission_receipts AS a JOIN records AS r "
                     "ON r.identity = a.stage_identity WHERE a.stage_identity = ?",
                     (stage_identity,),
@@ -1002,14 +1031,15 @@ class Store:
                         raise ValueError("orphan admission receipt")
                     return None
                 record = self._decode(row[0])
-                receipt = AdmissionReceipt(*row[1:])
+                receipt = AdmissionReceipt(*row[1:-1])
                 self._validate_admission_receipt(stage_identity, record, receipt)
+                if row[-1] != self._admission_receipt_digest(stage_identity, receipt):
+                    raise ValueError("admission receipt digest mismatch")
                 safety = self._operational_safety
                 if safety is None:
                     safety = OperationalSafety(self)
-                if not safety._admission_state_matches(
-                        receipt.route_cell_digest, receipt.safety_state_id):
-                    raise ValueError("admission receipt differs from durable safety state")
+                safety._validate_admission_history(
+                    stage_identity, receipt.route_cell_digest, receipt.safety_state_id)
                 return receipt
             except (sqlite3.DatabaseError, json.JSONDecodeError, UnicodeError, TypeError,
                     ValueError, AttributeError, KeyError, SafetyRefused) as error:

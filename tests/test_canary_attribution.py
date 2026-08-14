@@ -50,6 +50,7 @@ from agentflow.coordinator.store import (
     SafetySources,
     Store,
     StoreUnavailable,
+    V3_TO_V4_FAULT_OBSERVATIONS,
     V2_TO_V3_FAULT_OBSERVATIONS,
     V4_ADMISSION_PRECOMMIT_CUTPOINTS,
     _RECORDS_SCHEMA,
@@ -242,7 +243,7 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
     assert STORE_V3_SCHEMA_FINGERPRINT_DIGEST == (
         "3a51988512b246ec34c469fc469b63cbcdabaf5d537c9a8552ae7c75d127bda5")
     assert STORE_V4_SCHEMA_FINGERPRINT_DIGEST == (
-        "39733092eb2c3a6110fe0d8299d0aa1fb356021448ee3c6cd46e534902f91060")
+        "a2dd624722d0d4cbe93ffcf381f4de5cf6f52db1ebaa307453f51ede90986f7b")
     assert CANARY_ATTRIBUTION_CONTRACT_V1_DIGEST == (
         "4c0ff263ee994228ffae0641a26959ca8f5f497285f800d0b7d980399e508157")
     assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == (
@@ -275,6 +276,9 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
         "self", "stage_identity"]
     assert not hasattr(CanaryAttributionAuthority, "participate_in_admission")
     assert not hasattr(OperationalSafety, "participate_in_admission")
+    assert not hasattr(OperationalSafety, "validate_admission_history")
+    assert not hasattr(Store, "prune_admission_receipts")
+    assert not hasattr(OperationalSafety, "prune_admission_history")
     assert CANARY_ATTRIBUTION_REFUSAL_CODES == {
         "unreadable_canary_state", "missing_receipt", "unreadable_receipt",
         "wrong_verifier", "wrong_scope", "wrong_binding", "corrupt_attribution",
@@ -646,6 +650,8 @@ def test_precommit_crash_cutpoints_roll_back_both_rows(tmp_path, monkeypatch, cu
     assert reopened.record_of(IDENTITY).state == WAITING
     assert reopened._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     assert reopened._conn.execute("SELECT COUNT(*) FROM admission_receipts").fetchone()[0] == 0
+    assert reopened._conn.execute(
+        "SELECT COUNT(*) FROM safety_admission_history").fetchone()[0] == 0
     reopened.close()
 
 
@@ -671,39 +677,71 @@ def test_commit_lost_ack_reopens_with_successor_and_attribution(tmp_path, monkey
     assert attribution is not None and attribution.route_cell_digest == active.digest
     receipt = reopened.read_admission_receipt(IDENTITY)
     assert receipt is not None and receipt.route_cell_digest == active.digest
+    assert reopened._conn.execute(
+        "SELECT COUNT(*) FROM safety_admission_history").fetchone()[0] == 1
     assert receipts.reads == ["receipt-candidate-alpha"]
     reopened.close()
 
 
-def test_admission_receipt_is_insert_only_and_immutable_across_reopen(tmp_path):
+def test_admission_receipt_and_safety_history_are_insert_only_across_connections_and_reopen(
+        tmp_path):
     path = tmp_path / "admission-receipt.db"
     receipts = Receipts()
     active, _ = seed(path, receipts)
     store = composed(path, receipts)
     result = store.reserve(intent(digest=active.digest))
     assert result is not None and result.admission_receipt == store.read_admission_receipt(IDENTITY)
+    assert [row[1] for row in store._conn.execute(
+        "PRAGMA table_info(admission_receipts)")] == [
+            "stage_identity", "subject_revision", "briefing_id", "briefing_digest",
+            "capability_id", "capability_digest", "route_id", "route_cell_digest",
+            "launch_config_digest", "safety_state_id", "receipt_digest"]
+    assert [row[1] for row in store._conn.execute(
+        "PRAGMA table_info(safety_admission_history)")] == [
+            "stage_identity", "route_cell_digest", "safety_state_id", "history_digest"]
+    receipt_row = store._conn.execute(
+        "SELECT * FROM admission_receipts WHERE stage_identity = ?", (IDENTITY,)
+    ).fetchone()
+    assert receipt_row[-1] == _digest({
+        "stage_identity": IDENTITY,
+        **asdict(result.admission_receipt),
+    })
+    history_row = store._conn.execute(
+        "SELECT * FROM safety_admission_history WHERE stage_identity = ?", (IDENTITY,)
+    ).fetchone()
+    assert history_row[-1] == _digest({
+        "stage_identity": IDENTITY,
+        "route_cell_digest": result.admission_receipt.route_cell_digest,
+        "safety_state_id": result.admission_receipt.safety_state_id,
+    })
+    peer = composed(path, receipts)
+    assert peer.read_admission_receipt(IDENTITY) == result.admission_receipt
+    peer.close()
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         store._conn.execute(
             "UPDATE admission_receipts SET route_cell_digest = ? WHERE stage_identity = ?",
             ("f" * 64, IDENTITY))
     with pytest.raises(sqlite3.IntegrityError, match="append-only"):
         store._conn.execute("DELETE FROM admission_receipts WHERE stage_identity = ?", (IDENTITY,))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store._conn.execute(
+            "UPDATE safety_admission_history SET safety_state_id = ? WHERE stage_identity = ?",
+            ("f" * 64, IDENTITY))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store._conn.execute(
+            "DELETE FROM safety_admission_history WHERE stage_identity = ?", (IDENTITY,))
     store.close()
     reopened = composed(path, receipts)
     assert reopened.read_admission_receipt(IDENTITY) == result.admission_receipt
     reopened.close()
 
 
-@pytest.mark.parametrize(("column", "value", "read_identity"), (
-    ("stage_identity", "forged-stage", "forged-stage"),
-    ("subject_revision", "b" * 40, IDENTITY),
-    ("route_id", "production/build/deep/high", IDENTITY),
-    ("route_cell_digest", "f" * 64, IDENTITY),
-    ("launch_config_digest", "e" * 64, IDENTITY),
-    ("safety_state_id", "d" * 64, IDENTITY),
+@pytest.mark.parametrize(("column", "value"), (
+    ("safety_state_id", "d" * 64),
+    ("receipt_digest", "e" * 64),
 ))
 def test_public_receipt_read_fails_closed_on_second_connection_forgery(
-        tmp_path, column, value, read_identity):
+        tmp_path, column, value):
     path = tmp_path / "forged-receipt.db"
     receipts = Receipts()
     active, _ = seed(path, receipts)
@@ -722,11 +760,56 @@ def test_public_receipt_read_fails_closed_on_second_connection_forgery(
     attacker.close()
 
     with pytest.raises(StoreUnavailable) as unreadable:
-        store.read_admission_receipt(read_identity)
+        store.read_admission_receipt(IDENTITY)
     assert str(unreadable.value) == "admission receipt is unreadable"
     auditor = sqlite3.connect(path)
     after = tuple(tuple(auditor.execute(f"SELECT * FROM {table}").fetchall())
                   for table in tables)
+    auditor.close()
+    assert after == before
+    store.close()
+
+
+@pytest.mark.parametrize("corruption", ("missing", "digest", "mismatch"))
+def test_public_receipt_read_fails_closed_on_safety_history_corruption(
+        tmp_path, corruption):
+    path = tmp_path / f"forged-safety-history-{corruption}.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    assert store.reserve(intent(digest=active.digest)) is not None
+
+    attacker = sqlite3.connect(path)
+    if corruption == "missing":
+        attacker.execute("DROP TRIGGER safety_admission_history_no_delete")
+        attacker.execute(
+            "DELETE FROM safety_admission_history WHERE stage_identity = ?", (IDENTITY,))
+    else:
+        attacker.execute("DROP TRIGGER safety_admission_history_no_update")
+        if corruption == "digest":
+            attacker.execute(
+                "UPDATE safety_admission_history SET history_digest = ? "
+                "WHERE stage_identity = ?", ("f" * 64, IDENTITY))
+        else:
+            forged_state = "f" * 64
+            forged_digest = _digest({
+                "stage_identity": IDENTITY,
+                "route_cell_digest": active.digest,
+                "safety_state_id": forged_state,
+            })
+            attacker.execute(
+                "UPDATE safety_admission_history SET safety_state_id = ?, history_digest = ? "
+                "WHERE stage_identity = ?", (forged_state, forged_digest, IDENTITY))
+    attacker.commit()
+    before = tuple(attacker.execute(
+        "SELECT * FROM safety_admission_history").fetchall())
+    attacker.close()
+
+    with pytest.raises(StoreUnavailable, match="admission receipt is unreadable"):
+        store.read_admission_receipt(IDENTITY)
+    auditor = sqlite3.connect(path)
+    after = tuple(auditor.execute(
+        "SELECT * FROM safety_admission_history").fetchall())
     auditor.close()
     assert after == before
     store.close()
@@ -918,6 +1001,7 @@ def test_reservation_write_set_is_only_receipt_attribution_and_successor_write(t
     assert set(writes) == {
         (sqlite3.SQLITE_INSERT, "canary_attributions"),
         (sqlite3.SQLITE_INSERT, "admission_receipts"),
+        (sqlite3.SQLITE_INSERT, "safety_admission_history"),
         (sqlite3.SQLITE_INSERT, "records"),
         (sqlite3.SQLITE_UPDATE, "records")}
     store.close()
@@ -1015,6 +1099,8 @@ def test_direct_v2_to_v4_migration_preserves_records_and_has_zero_receipts(tmp_p
         "SELECT active_digest FROM safety_route_state").fetchone()[0] == cell.digest
     assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     assert store._conn.execute("SELECT COUNT(*) FROM admission_receipts").fetchone()[0] == 0
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM safety_admission_history").fetchone()[0] == 0
     store.close()
 
 
@@ -1037,7 +1123,47 @@ def test_current_v3_schema_migrates_directly_to_exact_v4_without_record_rewrite(
     assert store._conn.execute("SELECT data FROM records ORDER BY identity").fetchall() == before
     assert tuple(store.load()[item.identity] for item in records) == records
     assert store.read_admission_receipt(IDENTITY) is None
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM safety_admission_history").fetchone()[0] == 0
     store.close()
+
+
+@pytest.mark.parametrize("observation", V3_TO_V4_FAULT_OBSERVATIONS)
+def test_every_v3_to_v4_fault_observation_is_atomic(tmp_path, monkeypatch, observation):
+    path = tmp_path / (observation.replace(":", "-") + ".db")
+    records, _cell = make_v2(path)
+    conn = Store._open(path)
+    Store._migrate_v2_to_v3(conn)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert _schema_fingerprint(conn) == STORE_V3_SCHEMA_FINGERPRINT
+    before = conn.execute("SELECT data FROM records ORDER BY identity").fetchall()
+    conn.close()
+
+    def crash(name):
+        if name == observation:
+            raise RuntimeError("migration fault")
+
+    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(crash))
+    with pytest.raises(RuntimeError, match="migration fault"):
+        Store(path)
+    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(lambda _name: None))
+
+    check = sqlite3.connect(path)
+    if observation == "v3-to-v4:after-commit":
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert _schema_fingerprint(check) == STORE_V4_SCHEMA_FINGERPRINT
+        assert check.execute("SELECT data FROM records ORDER BY identity").fetchall() == before
+        assert check.execute("SELECT COUNT(*) FROM admission_receipts").fetchone()[0] == 0
+        assert check.execute(
+            "SELECT COUNT(*) FROM safety_admission_history").fetchone()[0] == 0
+    else:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert _schema_fingerprint(check) == STORE_V3_SCHEMA_FINGERPRINT
+        assert check.execute("SELECT data FROM records ORDER BY identity").fetchall() == before
+        assert check.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name IN "
+            "('admission_receipts', 'safety_admission_history')").fetchone()[0] == 0
+    check.close()
 
 
 @pytest.mark.parametrize("observation", V2_TO_V3_FAULT_OBSERVATIONS)

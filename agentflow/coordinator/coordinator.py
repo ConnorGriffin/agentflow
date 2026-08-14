@@ -32,6 +32,7 @@ from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
     STAGE_NATIVE_HANDOFF, admission_demand, normalize_stage, pr_bound_waiting)
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
+from agentflow.coordinator.errors import StoreUnavailable
 from agentflow.coordinator.providers import (EndingReason, ProviderCause, SessionLeadInputError,
                                              validate_session_lead_input)
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
@@ -579,7 +580,22 @@ class Coordinator:
                 # exist (the child records `started` before replacing itself). If nothing is
                 # alive, this is not-started: release and preserve the attempt count.
                 if not self._launcher.is_alive(record.family):
-                    receipt = self._store.read_admission_receipt(record.identity)
+                    try:
+                        receipt = self._store.read_admission_receipt(record.identity)
+                    except StoreUnavailable:
+                        record.hold_reason = refused_before_start_hold_reason(
+                            "admission authority is unreadable")
+                        if self._hold(record):
+                            self._emit(
+                                record,
+                                f"attempt {record.attempts}/{ATTEMPT_BUDGET} refused before "
+                                "provider start — admission authority is unreadable; handoff "
+                                "pending; claim retained",
+                            )
+                            outcome = self._finalize_hold(record)
+                            if outcome is not None:
+                                outcomes.append(outcome)
+                        continue
                     if receipt is not None:
                         admitted = self._store.decode_committed_launch(
                             receipt.route_cell_digest)

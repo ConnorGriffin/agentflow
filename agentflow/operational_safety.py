@@ -21,6 +21,41 @@ from agentflow.evidence import EvidenceError, PromotionReceipt
 from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
 
 
+_SAFETY_ADMISSION_HISTORY_SCHEMA = (
+    "CREATE TABLE safety_admission_history ("
+    " stage_identity TEXT PRIMARY KEY,"
+    " route_cell_digest TEXT NOT NULL,"
+    " safety_state_id TEXT NOT NULL,"
+    " history_digest TEXT NOT NULL)"
+)
+_SAFETY_ADMISSION_HISTORY_NO_UPDATE = (
+    "CREATE TRIGGER safety_admission_history_no_update "
+    "BEFORE UPDATE ON safety_admission_history "
+    "BEGIN SELECT RAISE(ABORT, 'safety_admission_history is append-only'); END"
+)
+_SAFETY_ADMISSION_HISTORY_NO_DELETE = (
+    "CREATE TRIGGER safety_admission_history_no_delete "
+    "BEFORE DELETE ON safety_admission_history "
+    "BEGIN SELECT RAISE(ABORT, 'safety_admission_history is append-only'); END"
+)
+_SAFETY_ADMISSION_HISTORY_SCHEMA_STATEMENTS = (
+    _SAFETY_ADMISSION_HISTORY_SCHEMA,
+    _SAFETY_ADMISSION_HISTORY_NO_UPDATE,
+    _SAFETY_ADMISSION_HISTORY_NO_DELETE,
+)
+_SAFETY_ADMISSION_HISTORY_FINGERPRINT = (
+    ("table", "safety_admission_history", "safety_admission_history",
+     "createtablesafety_admission_history(stage_identitytextprimarykey,"
+     "route_cell_digesttextnotnull,safety_state_idtextnotnull,history_digesttextnotnull)"),
+    ("trigger", "safety_admission_history_no_delete", "safety_admission_history",
+     "createtriggersafety_admission_history_no_deletebeforedeleteon"
+     "safety_admission_historybeginselectraise(abort,'safety_admission_historyisappend-only');end"),
+    ("trigger", "safety_admission_history_no_update", "safety_admission_history",
+     "createtriggersafety_admission_history_no_updatebeforeupdateon"
+     "safety_admission_historybeginselectraise(abort,'safety_admission_historyisappend-only');end"),
+)
+
+
 def _canonical_text(value: object) -> str:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
@@ -752,6 +787,12 @@ class OperationalSafety:
         for statement in statements:
             conn.execute(statement)
 
+    @staticmethod
+    def _initialize_admission_history_schema(conn: sqlite3.Connection) -> None:
+        """Add the v4 admission history inside Store's existing schema transaction."""
+        for statement in _SAFETY_ADMISSION_HISTORY_SCHEMA_STATEMENTS:
+            conn.execute(statement)
+
     def register_route_cell(
             self, repository: str, stage: str, provider: str, model: str,
             route_id: str, launch_config: LaunchConfigV1) -> RouteCell:
@@ -1055,29 +1096,6 @@ class OperationalSafety:
                 route_cell_digest, state.quarantined_digest == route_cell_digest,
                 state.safety_state_id, state.generation)
 
-    def _admission_state_matches(
-            self, route_cell_digest: str, safety_state_id: str) -> bool:
-        """Bind a receipt to current Safety state or its durable canary predecessor.
-
-        A committed launch may outlive one approved active-pointer change.  The canary ledger
-        retains that exact predecessor, while the RouteCell state generation makes its prior
-        unquarantined state identifier deterministic.  No arbitrary registered or stale route
-        is accepted as historical authority.
-        """
-        with self._lock:
-            cell = self._cell(route_cell_digest, conn=self._conn)
-            state = self._route_pointer_state(cell.key, conn=self._conn)
-            canary = self._canary_pointer_state(cell.key, conn=self._conn)
-            if state.active_digest == route_cell_digest:
-                return (state.quarantined_digest is None
-                        and safety_state_id == state.safety_state_id)
-            return (
-                canary.predecessor_route_cell_digest == route_cell_digest
-                and state.generation > 0
-                and safety_state_id == _state_id(
-                    cell.key, route_cell_digest, None, state.generation - 1)
-            )
-
     def reopen(self, route_cell_digest: str, expected_safety_state_id: str,
                evidence_refs: tuple[str, ...]) -> RouteSafetyState:
         required = {(item.identifier, item.version)
@@ -1239,7 +1257,54 @@ class OperationalSafety:
         if (state.active_digest != context.route_cell_digest
                 or state.quarantined_digest == context.route_cell_digest):
             raise SafetyRefused("route cell is not admissible")
+        self._insert_or_validate_admission_history(
+            context.stage_identity, context.route_cell_digest, state.safety_state_id)
         return _SafetyAdmissionResult(state.safety_state_id)
+
+    @staticmethod
+    def _admission_history_digest(
+            stage_identity: str, route_cell_digest: str, safety_state_id: str) -> str:
+        return _digest({
+            "stage_identity": stage_identity,
+            "route_cell_digest": route_cell_digest,
+            "safety_state_id": safety_state_id,
+        })
+
+    def _insert_or_validate_admission_history(
+            self, stage_identity: str, route_cell_digest: str,
+            safety_state_id: str) -> None:
+        """Participate in Store admission without owning the surrounding transaction."""
+        digest = self._admission_history_digest(
+            stage_identity, route_cell_digest, safety_state_id)
+        expected = (route_cell_digest, safety_state_id, digest)
+        row = self._conn.execute(
+            "SELECT route_cell_digest, safety_state_id, history_digest "
+            "FROM safety_admission_history WHERE stage_identity = ?",
+            (stage_identity,),).fetchone()
+        if row is not None:
+            if row != expected:
+                raise SafetyRefused("stored admission history was not accepted")
+            return
+        self._conn.execute(
+            "INSERT INTO safety_admission_history VALUES (?, ?, ?, ?)",
+            (stage_identity, *expected))
+
+    def _validate_admission_history(
+            self, stage_identity: str, route_cell_digest: str,
+            safety_state_id: str) -> None:
+        """Validate the permanent admitted tuple without consulting mutable routing."""
+        row = self._conn.execute(
+            "SELECT route_cell_digest, safety_state_id, history_digest "
+            "FROM safety_admission_history WHERE stage_identity = ?",
+            (stage_identity,),).fetchone()
+        expected = (
+            route_cell_digest,
+            safety_state_id,
+            self._admission_history_digest(
+                stage_identity, route_cell_digest, safety_state_id),
+        )
+        if row != expected:
+            raise SafetyRefused("stored admission history was not accepted")
 
     def _authorize_observation(self, request: ObservationRequest) -> _AuthorizedObservation:
         declaration = _CHECKS.get((request.check_id, request.check_version))
