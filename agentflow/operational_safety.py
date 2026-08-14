@@ -423,6 +423,23 @@ class CanaryState:
     generation: int
 
 
+@dataclass(frozen=True, slots=True)
+class _AdmissionContext:
+    """Store-derived facts passed to sealed admission owners."""
+
+    stage_identity: str
+    repository: str
+    stage: str
+    provider: str
+    model: str
+    route_cell_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SafetyAdmissionResult:
+    safety_state_id: str
+
+
 class OperationalSafety:
     """One owner for bounded operational action and RouteCell state."""
 
@@ -879,22 +896,19 @@ class OperationalSafety:
             cell = self._cell(route_cell_digest, conn=self._conn)
             return self._canary_pointer_state(cell.key, conn=self._conn)
 
-    def participate_in_admission(
-            self, conn: sqlite3.Connection, route_cell_digest: str) -> str:
-        """Validate one exact RouteCell inside Store's already-open transaction.
-
-        This is the shared transaction seam declared for #627.  It does not resolve
-        briefings, mutate records, reserve permits, or wire coordinator dispatch.
-        """
-        if conn is not self._conn:
-            raise SafetyRefused("admission must use OperationalSafety's Store transaction")
-        cell = self._cell(route_cell_digest, conn=conn)
-        state = self._route_pointer_state(cell.key, conn=conn)
-        self._canary_pointer_state(cell.key, conn=conn)
-        if (state.active_digest != route_cell_digest
-                or state.quarantined_digest == route_cell_digest):
+    def _participate_in_admission(
+            self, context: _AdmissionContext) -> _SafetyAdmissionResult:
+        """Validate Store-derived Record facts before any later admission owner runs."""
+        cell = self._cell(context.route_cell_digest, conn=self._conn)
+        if ((cell.repository, cell.stage, cell.provider, cell.model)
+                != (context.repository, context.stage, context.provider, context.model)):
+            raise SafetyRefused("route cell does not bind the durable record")
+        state = self._route_pointer_state(cell.key, conn=self._conn)
+        self._canary_pointer_state(cell.key, conn=self._conn)
+        if (state.active_digest != context.route_cell_digest
+                or state.quarantined_digest == context.route_cell_digest):
             raise SafetyRefused("route cell is not admissible")
-        return state.safety_state_id
+        return _SafetyAdmissionResult(state.safety_state_id)
 
     def _authorize_observation(self, request: ObservationRequest) -> _AuthorizedObservation:
         declaration = _CHECKS.get((request.check_id, request.check_version))

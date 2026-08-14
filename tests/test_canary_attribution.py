@@ -1,9 +1,12 @@
-"""Contract tests for the Store-owned canary attribution admission participant."""
+"""The superseding #641 Store-owned canary-attribution contract."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import FrozenInstanceError, asdict, replace
 import inspect
+import json
+import re
+import shutil
 import sqlite3
 import threading
 
@@ -13,770 +16,599 @@ from agentflow.canary_attribution import (
     ATTRIBUTION_CONTRACT_VERSION,
     CANARY_ATTRIBUTION_CONTRACT,
     CANARY_ATTRIBUTION_CONTRACT_DIGEST,
+    CANARY_ATTRIBUTION_RECEIPT_BINDING_VECTORS,
     CANARY_ATTRIBUTION_REFUSAL_CODES,
-    CANARY_ATTRIBUTION_SCHEMA,
-    CANARY_ATTRIBUTION_VECTORS,
+    CANARY_ATTRIBUTION_SCHEMA_FINGERPRINT,
     DEPENDENCY_PINS,
+    ROW_DIGEST_DOMAIN,
     STORE_V2_SCHEMA_FINGERPRINT,
     STORE_V2_SCHEMA_FINGERPRINT_DIGEST,
     STORE_V3_SCHEMA_FINGERPRINT,
     STORE_V3_SCHEMA_FINGERPRINT_DIGEST,
+    CanaryAttribution,
     CanaryAttributionAuthority,
     CanaryAttributionRefused,
+    _canonical_bytes,
     _digest,
+    _receipt_binding_source,
+    _schema_row_valid,
     register_sql_functions,
 )
-from agentflow.coordinator.record import ENABLED_STAGES, Record
+from agentflow.coordinator.record import RUNNING, WAITING, Record, logical_stage_identity
 from agentflow.coordinator.store import (
+    AdmissionResult,
+    NoAdmission,
+    OperationalSafetyAndCanary,
+    OperationalSafetyOnly,
+    ReservationIntent,
+    ReservationLimits,
     SCHEMA_VERSION,
+    SUPERVISOR_WINDOW,
+    SafetySources,
     Store,
     StoreUnavailable,
+    V2_TO_V3_FAULT_OBSERVATIONS,
     _RECORDS_SCHEMA,
-    _expected_schema_fingerprint,
     _schema_fingerprint,
 )
-from agentflow.evidence import (
-    ApprovedAuthority,
-    AuthorityPointer,
-    EvidenceError,
-    PromotionReceipt,
-    valid_promotion_receipt_id,
-)
+from agentflow.evidence import ApprovedAuthority, AuthorityPointer, EvidenceError, PromotionReceipt
 from agentflow.operational_safety import (
     CanaryActivationRequest,
+    CanaryState,
     OperationalSafety,
-    OPERATIONAL_SAFETY_CONTRACT_DIGEST,
-    ROUTE_CELL_CONTRACT_DIGEST,
+    SafetyRefused,
 )
 
 
-SUBJECT_REVISION = "b" * 40
-STAGE_IDENTITY = "octo/app|641|build|" + SUBJECT_REVISION
+IDENTITY = logical_stage_identity("octo/app", "641", "build", None)
 
 
 class Receipts:
     def __init__(self) -> None:
-        self.receipts: dict[str, PromotionReceipt] = {}
-        self.calls: list[str] = []
-        self.unavailable = False
+        self.values: dict[str, PromotionReceipt] = {}
+        self.reads: list[str] = []
+        self.failure: Exception | None = None
 
     def issue(self, request: CanaryActivationRequest, *,
+              receipt_id: str | None = None, revision: str = "a" * 40,
               scope: str = "fleet-policy/0-to-1",
-              revision: str = "a" * 40) -> PromotionReceipt:
+              verifier=("github-authority", "v1")) -> PromotionReceipt:
+        receipt_id = receipt_id or request.promotion_receipt_id
         pointer = AuthorityPointer(
             "github", "octo/governance", "pulls/584/files/canary.json",
-            revision, "sha256", request.digest, scope,
-        )
-        authority = ApprovedAuthority(
+            revision, "sha256", request.digest, scope)
+        approved = ApprovedAuthority(
             pointer, "approval-641", pointer.revision, pointer.content_hash,
-            pointer.scope, "github-authority", "v1", "verified",
-        )
+            pointer.scope, verifier[0], verifier[1], "verified")
         receipt = PromotionReceipt(
-            request.promotion_receipt_id, "candidate-641", authority.approval_id,
-            1, authority, True,
-        )
-        self.receipts[receipt.receipt_id] = receipt
+            receipt_id, receipt_id.removeprefix("receipt-"), approved.approval_id,
+            1 if scope == "fleet-policy/0-to-1" else 3, approved, True)
+        self.values[receipt_id] = receipt
         return receipt
 
     def read(self, receipt_id: str) -> PromotionReceipt:
-        self.calls.append(receipt_id)
-        if self.unavailable:
-            raise EvidenceError("receipt storage unavailable")
-        return self.receipts[receipt_id]
+        self.reads.append(receipt_id)
+        if self.failure is not None:
+            raise self.failure
+        return self.values[receipt_id]
 
 
-def route(owner: OperationalSafety, *, effort: str):
-    return owner.register_route_cell(
-        "octo/app", "build", "codex", "gpt-5", "primary",
-        {"model": "gpt-5", "effort": effort, "timeout": 900},
-    )
+def intent(identity=IDENTITY, *, revision=1, token=None, digest=None, now=1_000,
+           generation="daemon-641", budget=5, limits=None):
+    return ReservationIntent(
+        identity, token, revision, now, generation, budget, limits, digest)
 
 
-def canary(tmp_path, *, scope: str = "fleet-policy/0-to-1"):
-    store = Store(tmp_path / "coordinator.db")
-    receipts = Receipts()
+def seed(path, receipts: Receipts, *, with_receipt=True,
+         receipt_id="receipt-candidate-alpha", record: Record | None = None):
+    store = Store(path)
     safety = OperationalSafety(store, promotion_receipts=receipts)
-    predecessor = route(safety, effort="high")
-    active = route(safety, effort="medium")
-    request = CanaryActivationRequest(
-        "receipt-641", active.digest, predecessor.digest, 0)
-    receipt = receipts.issue(request, scope=scope)
-    state = safety.approve_canary(request)
-    receipts.calls.clear()
-    authority = CanaryAttributionAuthority(store, safety, receipts)
-    return store, safety, receipts, predecessor, active, state, receipt, authority
+    predecessor = safety.register_route_cell(
+        "octo/app", "build", "codex", "gpt-5", "primary",
+        {"model": "gpt-5", "effort": "medium", "timeout": 900})
+    active = predecessor
+    if with_receipt:
+        active = safety.register_route_cell(
+            "octo/app", "build", "codex", "gpt-5", "primary",
+            {"model": "gpt-5", "effort": "high", "timeout": 900})
+        request = CanaryActivationRequest(receipt_id, active.digest, predecessor.digest, 0)
+        receipts.issue(request, receipt_id=receipt_id)
+        safety.approve_canary(request)
+    record = record or Record(
+        IDENTITY, "build", "codex", 1, repo="octo/app", subject="641",
+        model="gpt-5", state=WAITING)
+    assert store.upsert(record)
+    store.close()
+    # Activation itself reads the #584 receipt. Admission assertions start from the public
+    # Store call boundary and therefore count only reads caused by reservation.
+    receipts.reads.clear()
+    return active, record
 
 
-def participate(store: Store, authority: CanaryAttributionAuthority,
-                identity: str = STAGE_IDENTITY, repository: str = "octo/app",
-                revision: str = SUBJECT_REVISION, route_digest: str = ""):
-    store._conn.execute("BEGIN IMMEDIATE")
-    try:
-        value = authority.participate_in_admission(
-            store._conn, identity, repository, revision, route_digest)
-        store._conn.execute("COMMIT")
-        return value
-    except BaseException:
-        if store._conn.in_transaction:
-            store._conn.execute("ROLLBACK")
-        raise
+def composed(path, receipts):
+    sources = SafetySources(promotion_receipts=receipts)
+    return Store(path, admission_mode=OperationalSafetyAndCanary(sources, receipts))
 
 
-def exact_v2(path) -> tuple[Record, Record]:
-    waiting = Record("waiting", "build", "codex", 1, state="waiting", revision=3)
-    running = Record("running", "review", "claude", 2, state="running", revision=7)
-    conn = sqlite3.connect(path)
+def make_v2(path, *, record=None):
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("BEGIN IMMEDIATE")
     conn.execute(_RECORDS_SCHEMA)
     OperationalSafety.initialize_schema(conn)
-    for record in (waiting, running):
+    if record is not None:
         conn.execute("INSERT INTO records VALUES (?, ?, ?, ?, ?)", (
             record.identity, record.pool, record.state, record.demand, Store._encode(record)))
     conn.execute("PRAGMA user_version = 2")
-    conn.commit()
+    conn.execute("COMMIT")
     assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
     conn.close()
-    return waiting, running
 
 
-def attribution_row(*, identity=STAGE_IDENTITY, repository="octo/app",
-                    revision=SUBJECT_REVISION, route_digest="5" * 64,
-                    receipt_id="receipt-641", method_revision="6" * 40,
-                    cohort_id="7" * 64):
-    facts = {
-        "stage_identity": identity,
-        "repository": repository,
-        "subject_revision": revision,
-        "route_cell_digest": route_digest,
-        "receipt_id": receipt_id,
-        "method_revision": method_revision,
-        "cohort_id": cohort_id,
-        "contract_version": ATTRIBUTION_CONTRACT_VERSION,
-    }
-    return tuple(facts.values()) + (_digest(facts),)
-
-
-def test_contract_dependencies_vectors_schema_and_public_interface_are_exact():
-    assert DEPENDENCY_PINS == {
-        "issue_584_merge": "ef08dd3d2f691aa154ddaa193e6161b559099396",
-        "evidence_schema": 4,
-        "promotion_contract": "github-merged-pr-v1",
-        "issue_584_evidence_blob": "abe7473358c646d85ebc2bb51ea0154fff89bb19",
-        "issue_585_merge": "bd818fa1d65c92def671192464207e6bc3904a34",
-        "issue_585_receipt_reader_blob": "02e7d525a4cba5c4cdd95e26143673ea186e5519",
-        "promotion_verifier": "github-authority/v1",
-        "route_cell_contract_digest": ROUTE_CELL_CONTRACT_DIGEST,
-        "operational_safety_contract_digest": OPERATIONAL_SAFETY_CONTRACT_DIGEST,
-        "coordinator_store_schema": 2,
-        "coordinator_store_schema_fingerprint_digest":
-            "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e",
-        "coordinator_store_target_schema": 3,
-        "coordinator_store_target_fingerprint_digest":
-            "c8ed40cef9b93df395c4c57f62eb25b0b67422c000c22ece690c32f76a3f3921",
-        "coordinator_stage_vocabulary_digest": _digest(ENABLED_STAGES),
-        "evidence_promotion_receipt_id_grammar": "evidence-promotion-receipt-id-v1",
-    }
-    assert STORE_V2_SCHEMA_FINGERPRINT == _expected_schema_fingerprint(2)
+def test_contract_schema_pins_and_closed_interfaces_are_exact():
+    assert SCHEMA_VERSION == 3
     assert STORE_V2_SCHEMA_FINGERPRINT_DIGEST == (
         "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e")
-    assert STORE_V3_SCHEMA_FINGERPRINT == _expected_schema_fingerprint(3)
     assert STORE_V3_SCHEMA_FINGERPRINT_DIGEST == (
-        "c8ed40cef9b93df395c4c57f62eb25b0b67422c000c22ece690c32f76a3f3921")
-    assert CANARY_ATTRIBUTION_CONTRACT["schema"] == ATTRIBUTION_CONTRACT_VERSION
-    assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == _digest(CANARY_ATTRIBUTION_CONTRACT) == (
-        "ffc5b2b7c9c259dbb884841b96e0120428913f5b9c1a8c635463db18758c5571")
-    for vector in CANARY_ATTRIBUTION_VECTORS:
-        assert vector["attribution"]["receipt_id"] == vector["receipt"]["receipt_id"]
-        assert (vector["attribution"]["method_revision"]
-                == vector["receipt"]["approved_revision"])
-        assert vector["attribution"]["cohort_id"] == vector["active_route_cell"]["cell_key"]
+        "135795b5c28ade801c7a2687eda89370e92d5bee5b16049baa4e17392cf0602b")
+    assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == (
+        "993403fa31faf2445044bce73c9d94c8e693667dd998ad82eb4b6fca218820b6")
+    assert _digest(STORE_V2_SCHEMA_FINGERPRINT) == STORE_V2_SCHEMA_FINGERPRINT_DIGEST
+    assert _digest(STORE_V3_SCHEMA_FINGERPRINT) == STORE_V3_SCHEMA_FINGERPRINT_DIGEST
+    assert _digest(CANARY_ATTRIBUTION_CONTRACT) == CANARY_ATTRIBUTION_CONTRACT_DIGEST
+    assert DEPENDENCY_PINS == CANARY_ATTRIBUTION_CONTRACT["dependencies"]
+    assert DEPENDENCY_PINS["issue_584_merge"] == (
+        "ef08dd3d2f691aa154ddaa193e6161b559099396")
+    assert DEPENDENCY_PINS["issue_585_merge"] == (
+        "bd818fa1d65c92def671192464207e6bc3904a34")
+    assert [field.name for field in inspect.signature(ReservationIntent).parameters.values()] == [
+        "identity", "expected_launch_token", "expected_revision", "now",
+        "daemon_generation", "budget", "limits", "route_cell_digest"]
+    assert list(inspect.signature(Store.reserve).parameters) == ["self", "intent"]
+    assert list(inspect.signature(Store.resolve_route_cell).parameters) == [
+        "self", "stage_identity", "expected_revision", "route_id"]
+    assert list(inspect.signature(Store.read_canary_attribution).parameters) == [
+        "self", "stage_identity"]
+    assert not hasattr(CanaryAttributionAuthority, "participate_in_admission")
+    assert not hasattr(OperationalSafety, "participate_in_admission")
     assert CANARY_ATTRIBUTION_REFUSAL_CODES == {
-        "wrong_connection", "outside_transaction", "unreadable_canary_state",
-        "missing_receipt", "unreadable_receipt", "wrong_verifier", "wrong_scope",
-        "wrong_binding", "corrupt_attribution", "conflicting_attribution",
-    }
-    assert list(inspect.signature(
-        CanaryAttributionAuthority.participate_in_admission).parameters) == [
-            "self", "connection", "logical_stage_identity", "repository",
-            "subject_revision", "route_cell_digest",
-        ]
-    assert set(vars(CanaryAttributionAuthority)) & {
-        "permit", "reserve", "transition", "report", "rollback", "promote", "nominate",
-    } == set()
+        "unreadable_canary_state", "missing_receipt", "unreadable_receipt",
+        "wrong_verifier", "wrong_scope", "wrong_binding", "corrupt_attribution",
+        "conflicting_attribution"}
 
 
-@pytest.mark.parametrize("scope", [
-    "fleet-policy/0-to-1", "repository-policy/octo/app/0-to-1",
-])
-def test_fresh_attribution_maps_exact_receipt_revision_and_active_cell_key(tmp_path, scope):
-    store, _safety, receipts, _predecessor, active, state, receipt, authority = canary(
-        tmp_path, scope=scope)
-
-    value = participate(store, authority, route_digest=active.digest)
-
-    assert value is not None
-    assert value.receipt_id == state.active_receipt_id == receipt.receipt_id
-    assert value.method_revision == receipt.authority.approved_revision
-    assert value.cohort_id == state.cell_key == active.key
-    assert value.contract_version == ATTRIBUTION_CONTRACT_VERSION
-    assert value.attribution_digest == _digest({
-        key: item for key, item in asdict(value).items() if key != "attribution_digest"})
-    assert receipts.calls == [receipt.receipt_id]
-    assert authority.read(STAGE_IDENTITY) == value
-    store.close()
-
-
-def test_no_active_canary_returns_none_and_historical_predecessor_is_refused_first(tmp_path):
+def test_store_modes_are_exact_frozen_values_and_unconfigured_delegation_refuses(tmp_path):
+    with pytest.raises(FrozenInstanceError):
+        NoAdmission().anything = True
+    sources = SafetySources()
+    with pytest.raises(FrozenInstanceError):
+        sources.check_evidence = object()
     store = Store(tmp_path / "none.db")
+    with pytest.raises(StoreUnavailable, match="route resolution is not configured"):
+        store.resolve_route_cell(IDENTITY, 1, "primary")
+    with pytest.raises(StoreUnavailable, match="canary attribution is not configured"):
+        store.read_canary_attribution(IDENTITY)
+    store.close()
+
+
+def test_no_admission_returns_store_owned_ten_field_successor(tmp_path):
+    path = tmp_path / "none.db"
+    before = Record(
+        IDENTITY, "build", "codex", 2, repo="octo/app", subject="641", target="abc",
+        model="gpt-5", state=WAITING, start_fact="not_started", launch_token="old",
+        family="55", process_alive=True, attempt_committed=True,
+        daemon_generation="old-daemon", started_at=4, deadline=5,
+        outcome="preserved", attempts=2, descendants={"child"})
+    store = Store(path)
+    assert store.upsert(before)
+    durable_before = store.record_of(IDENTITY)
+    result = store.reserve(intent(token="old", now=20, generation="new-daemon"))
+    assert type(result) is AdmissionResult
+    assert result.safety_state_id is None and result.canary_attribution is None
+    successor = result.successor
+    assert successor.state == RUNNING and successor.revision == 2
+    assert successor.start_fact is None and re.fullmatch(r"[a-f0-9]{32}", successor.launch_token)
+    assert successor.family is None and successor.process_alive is False
+    assert successor.attempt_committed is False
+    assert successor.daemon_generation == "new-daemon"
+    assert successor.started_at == 20 and successor.deadline == 20 + SUPERVISOR_WINDOW
+    changed = {"state", "revision", "start_fact", "launch_token", "family",
+               "process_alive", "attempt_committed", "daemon_generation",
+               "started_at", "deadline"}
+    assert {key: value for key, value in asdict(successor).items() if key not in changed} == {
+        key: value for key, value in asdict(durable_before).items() if key not in changed}
+    assert store.record_of(IDENTITY) == successor
+    store.close()
+
+
+def test_composed_admission_is_safety_first_and_binds_durable_record(tmp_path, monkeypatch):
+    path = tmp_path / "composed.db"
     receipts = Receipts()
-    safety = OperationalSafety(store, promotion_receipts=receipts)
-    only = route(safety, effort="high")
-    authority = CanaryAttributionAuthority(store, safety, receipts)
-    assert participate(store, authority, route_digest=only.digest) is None
-    assert authority.read(STAGE_IDENTITY) is None and receipts.calls == []
-    store.close()
+    active, _ = seed(path, receipts)
+    calls = []
+    safety_method = OperationalSafety._participate_in_admission
+    canary_method = CanaryAttributionAuthority._participate_in_admission
 
-    (store, _safety, receipts, predecessor, _active, _state,
-     _receipt, authority) = canary(tmp_path / "active")
-    store._conn.execute("BEGIN IMMEDIATE")
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.participate_in_admission(
-            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, predecessor.digest)
-    assert refused.value.code == "wrong_binding"
-    assert receipts.calls == []
-    assert store._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 0
-    store._conn.execute("ROLLBACK")
-    store.close()
+    def safety(self, context):
+        calls.append(("safety", context))
+        return safety_method(self, context)
 
+    def canary(self, context):
+        calls.append(("canary", context))
+        return canary_method(self, context)
 
-def test_exact_connection_open_transaction_and_operational_safety_binding_are_required(tmp_path):
-    store, safety, receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.participate_in_admission(
-            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    assert refused.value.code == "outside_transaction"
-
-    receipts.calls.clear()
-    safety.canary_state = lambda _digest: (_ for _ in ()).throw(
-        AssertionError("deferred transaction performed an external read"))
-    store._conn.execute("BEGIN")
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.participate_in_admission(
-            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    assert refused.value.code == "outside_transaction" and receipts.calls == []
-    store._conn.execute("ROLLBACK")
-
-    other = Store(tmp_path / "other.db")
-    other._conn.execute("BEGIN IMMEDIATE")
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.participate_in_admission(
-            other._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    assert refused.value.code == "wrong_connection"
-    other._conn.execute("ROLLBACK")
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        CanaryAttributionAuthority(other, safety, receipts)
-    assert refused.value.code == "wrong_connection"
-    other.close()
+    monkeypatch.setattr(OperationalSafety, "_participate_in_admission", safety)
+    monkeypatch.setattr(CanaryAttributionAuthority, "_participate_in_admission", canary)
+    store = composed(path, receipts)
+    result = store.reserve(intent(digest=active.digest))
+    assert result is not None and result.safety_state_id
+    assert result.canary_attribution == store.read_canary_attribution(IDENTITY)
+    assert [name for name, _ in calls] == ["safety", "canary"]
+    context = calls[0][1]
+    assert asdict(context) == {
+        "stage_identity": IDENTITY, "repository": "octo/app", "stage": "build",
+        "provider": "codex", "model": "gpt-5", "route_cell_digest": active.digest}
     store.close()
 
 
-def test_cursor_transaction_paths_cannot_reuse_stale_immediate_authority_before_reads(tmp_path):
-    store, safety, receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
-    # Constructing sqlite3.Cursor directly bypasses Connection.cursor and any cursor factory.
-    # The Store connection's transaction authority must still observe every statement.
-    cursor = sqlite3.Cursor(store._conn)
-    cursor.execute("BEGIN IMMEDIATE")
-    assert authority.participate_in_admission(
-        store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest) is not None
-    cursor.execute("ROLLBACK")
-
-    receipts.calls.clear()
-    safety.canary_state = lambda _digest: (_ for _ in ()).throw(
-        AssertionError("cursor-deferred transaction performed an external read"))
-    store._conn.execute("BEGIN IMMEDIATE")
-    cursor.execute("COMMIT")
-    cursor.execute("BEGIN")
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.participate_in_admission(
-            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    assert refused.value.code == "outside_transaction" and receipts.calls == []
-    cursor.execute("ROLLBACK")
+def test_missing_digest_and_stale_intent_stop_before_any_participant_or_write(tmp_path, monkeypatch):
+    path = tmp_path / "stop.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    calls = []
+    monkeypatch.setattr(OperationalSafety, "_participate_in_admission",
+                        lambda *_: calls.append("safety"))
+    store = composed(path, receipts)
+    assert store.reserve(intent(digest=None)) is None
+    assert store.reserve(intent(revision=0, digest=active.digest)) is None
+    assert calls == [] and receipts.reads == []
+    assert store.record_of(IDENTITY).state == WAITING
+    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
 
 
-def test_caller_rollback_crash_and_lost_ack_replay_the_transaction_boundary(tmp_path):
-    store, safety, receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
-    store._conn.execute("BEGIN IMMEDIATE")
-    inserted = authority.participate_in_admission(
-        store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    assert inserted is not None
-    store._conn.execute("ROLLBACK")
-    assert authority.read(STAGE_IDENTITY) is None
-
-    store._conn.execute("BEGIN IMMEDIATE")
-    committed = authority.participate_in_admission(
-        store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    store._conn.execute("COMMIT")
-    # Simulated acknowledgement loss happens after the caller's commit. Recovery must not
-    # consult either external authority and must return the committed bytes.
-    receipts.calls.clear()
-    receipts.unavailable = True
-    safety.canary_state = lambda _digest: (_ for _ in ()).throw(RuntimeError("source lost"))
-    replayed = participate(store, authority, route_digest=active.digest)
-    assert replayed == committed and receipts.calls == []
+def test_safety_record_to_route_binding_refuses_before_receipt_read(tmp_path):
+    path = tmp_path / "binding.db"
+    receipts = Receipts()
+    record = Record(
+        IDENTITY, "build", "claude", 1, repo="octo/app", subject="641",
+        model="opus", state=WAITING)
+    active, _ = seed(path, receipts, record=record)
+    store = composed(path, receipts)
+    with pytest.raises(SafetyRefused, match="durable record"):
+        store.reserve(intent(digest=active.digest))
+    assert receipts.reads == []
+    assert store.record_of(IDENTITY).state == WAITING
+    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
 
 
-@pytest.mark.parametrize("change", ["repository", "revision", "route"])
-def test_replay_rejects_different_caller_owned_facts_without_external_reads(tmp_path, change):
-    store, safety, receipts, predecessor, active, _state, _receipt, authority = canary(tmp_path)
-    participate(store, authority, route_digest=active.digest)
-    receipts.calls.clear()
-    safety.canary_state = lambda _digest: (_ for _ in ()).throw(RuntimeError("must not read"))
-    arguments = {"repository": "octo/app", "revision": SUBJECT_REVISION,
-                 "route_digest": active.digest}
-    arguments[change if change != "route" else "route_digest"] = {
-        "repository": "octo/other", "revision": "c" * 40,
-        "route": predecessor.digest,
-    }[change]
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        participate(store, authority, **arguments)
-    assert refused.value.code == "conflicting_attribution" and receipts.calls == []
+def test_active_cell_without_receipt_admits_without_attribution(tmp_path):
+    path = tmp_path / "no-receipt.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts, with_receipt=False)
+    store = composed(path, receipts)
+    result = store.reserve(intent(digest=active.digest))
+    assert result is not None and result.safety_state_id
+    assert result.canary_attribution is None and receipts.reads == []
+    assert store.read_canary_attribution(IDENTITY) is None
     store.close()
 
 
-def test_two_connections_race_one_identical_committed_row(tmp_path):
-    (seed, _seed_safety, receipts, _predecessor, active, _state,
-     _receipt, _seed_authority) = canary(tmp_path)
-    seed.close()
-    # canary() uses this exact path; separate Store objects model separate coordinators.
-    path = tmp_path / "coordinator.db"
-    start = threading.Barrier(2)
-    values = []
-    errors = []
-    lock = threading.Lock()
-
-    def race():
-        store = Store(path)
-        safety = OperationalSafety(store)
-        authority = CanaryAttributionAuthority(store, safety, receipts)
-        try:
-            start.wait()
-            value = participate(store, authority, route_digest=active.digest)
-            with lock:
-                values.append(value)
-        except BaseException as error:
-            with lock:
-                errors.append(error)
-        finally:
-            store.close()
-
-    threads = [threading.Thread(target=race), threading.Thread(target=race)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    final = Store(path)
-    assert errors == [] and len(values) == 2 and values[0] == values[1]
-    assert final._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 1
-    final.close()
-
-
-def test_two_deferred_transactions_refuse_deterministically_before_external_reads(tmp_path):
-    (seed, _seed_safety, receipts, _predecessor, active, _state,
-     _receipt, _seed_authority) = canary(tmp_path)
-    seed.close()
-    path = tmp_path / "coordinator.db"
-    start = threading.Barrier(2)
-    codes = []
-    errors = []
-    lock = threading.Lock()
-
-    def race():
-        store = Store(path)
-        safety = OperationalSafety(store)
-        safety.canary_state = lambda _digest: (_ for _ in ()).throw(
-            AssertionError("deferred transaction performed an external read"))
-        authority = CanaryAttributionAuthority(store, safety, receipts)
-        try:
-            store._conn.execute("BEGIN")
-            start.wait()
-            authority.participate_in_admission(
-                store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-        except CanaryAttributionRefused as refused:
-            with lock:
-                codes.append(refused.code)
-        except BaseException as error:
-            with lock:
-                errors.append(error)
-        finally:
-            if store._conn.in_transaction:
-                store._conn.execute("ROLLBACK")
-            store.close()
-
-    threads = [threading.Thread(target=race), threading.Thread(target=race)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert errors == [] and codes == ["outside_transaction", "outside_transaction"]
-    assert receipts.calls == []
-    final = Store(path)
-    assert final._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 0
-    final.close()
-
-
-def test_racing_different_derived_treatment_facts_replay_the_winner_row(tmp_path):
-    (seed, _seed_safety, _seed_receipts, predecessor, active, state,
-     _receipt, _seed_authority) = canary(tmp_path)
-    seed.close()
-    path = tmp_path / "coordinator.db"
-    request_a = CanaryActivationRequest("receipt-641", active.digest, predecessor.digest, 0)
-    request_b = CanaryActivationRequest("receipt-642", active.digest, predecessor.digest, 0)
-    readers = (Receipts(), Receipts())
-    readers[0].issue(request_a, revision="a" * 40)
-    readers[1].issue(request_b, revision="c" * 40)
-    states = (
-        state,
-        replace(state, cell_key="d" * 64, active_receipt_id="receipt-642",
-                active_receipt_digest=request_b.digest),
-    )
-    start = threading.Barrier(2)
-    values = []
-    errors = []
-    lock = threading.Lock()
-
-    def race(index):
-        store = Store(path)
-        safety = OperationalSafety(store)
-        safety.canary_state = lambda _digest: states[index]
-        authority = CanaryAttributionAuthority(store, safety, readers[index])
-        try:
-            start.wait()
-            value = participate(store, authority, route_digest=active.digest)
-            with lock:
-                values.append(value)
-        except BaseException as error:
-            with lock:
-                errors.append(error)
-        finally:
-            store.close()
-
-    threads = [threading.Thread(target=race, args=(index,)) for index in range(2)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-    assert errors == [] and len(values) == 2 and values[0] == values[1]
-    winner = values[0]
-    assert winner is not None
-    assert (winner.receipt_id, winner.method_revision, winner.cohort_id) in {
-        ("receipt-641", "a" * 40, state.cell_key),
-        ("receipt-642", "c" * 40, "d" * 64),
-    }
-    assert sum(len(reader.calls) for reader in readers) == 1
-
-
-@pytest.mark.parametrize("fault", [
-    "missing", "unreadable", "wrong_verifier", "wrong_scope", "wrong_policy",
-    "wrong_binding",
+@pytest.mark.parametrize("failure,code", [
+    (KeyError("lost"), "missing_receipt"),
+    (EvidenceError("receipt storage unavailable"), "unreadable_receipt"),
 ])
-def test_receipt_refusals_are_closed_and_write_nothing(tmp_path, fault):
-    store, _safety, receipts, _predecessor, active, _state, receipt, authority = canary(tmp_path)
-    assert receipt.authority is not None
-    if fault == "missing":
-        receipts.receipts.clear()
-        expected = "missing_receipt"
-    elif fault == "unreadable":
-        receipts.unavailable = True
-        expected = "unreadable_receipt"
-    elif fault == "wrong_policy":
-        receipts.receipts[receipt.receipt_id] = replace(receipt, policy_version=2)
-        expected = "wrong_scope"
-    else:
-        old = receipt.authority
-        scope = ("repository-policy/octo/other/0-to-1"
-                 if fault == "wrong_scope" else old.pointer.scope)
-        content_hash = "c" * 64 if fault == "wrong_binding" else old.pointer.content_hash
-        pointer = replace(old.pointer, scope=scope, content_hash=content_hash)
-        approved = ApprovedAuthority(
-            pointer, old.approval_id, pointer.revision, pointer.content_hash,
-            pointer.scope,
-            "other" if fault == "wrong_verifier" else old.verifier_id,
-            old.verifier_version, "verified",
-        )
-        receipts.receipts[receipt.receipt_id] = replace(receipt, authority=approved)
-        expected = fault
-    store._conn.execute("BEGIN IMMEDIATE")
+def test_receipt_failure_rolls_back_successor_and_attribution(tmp_path, failure, code):
+    path = tmp_path / (code + ".db")
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    receipts.failure = failure
+    store = composed(path, receipts)
     with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.participate_in_admission(
-            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    assert refused.value.code == expected
-    assert store._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 0
-    store._conn.execute("ROLLBACK")
+        store.reserve(intent(digest=active.digest))
+    assert refused.value.code == code
+    assert store.record_of(IDENTITY).state == WAITING
+    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
 
 
-def test_unreadable_canary_state_refuses_without_receipt_or_write(tmp_path):
-    store, safety, receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
-    safety.canary_state = lambda _digest: (_ for _ in ()).throw(RuntimeError("corrupt"))
-    store._conn.execute("BEGIN IMMEDIATE")
-    with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.participate_in_admission(
-            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
-    assert refused.value.code == "unreadable_canary_state"
-    assert receipts.calls == []
-    assert store._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 0
-    store._conn.execute("ROLLBACK")
+@pytest.mark.parametrize("cutpoint", [
+    "after-attribution-before-successor", "after-successor-before-commit"])
+def test_precommit_crash_cutpoints_roll_back_both_rows(tmp_path, monkeypatch, cutpoint):
+    path = tmp_path / (cutpoint + ".db")
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+
+    def crash(name):
+        if name == cutpoint:
+            raise RuntimeError("crash")
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(crash))
+    store = composed(path, receipts)
+    with pytest.raises(RuntimeError, match="crash"):
+        store.reserve(intent(digest=active.digest))
+    assert store.record_of(IDENTITY).state == WAITING
+    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
 
 
-@pytest.mark.parametrize("column", [
-    "stage_identity", "repository", "subject_revision", "route_cell_digest", "receipt_id",
-    "method_revision", "cohort_id", "contract_version", "attribution_digest",
-])
-def test_every_persisted_field_is_digest_verified_and_tamper_fails_closed(tmp_path, column):
-    store, _safety, _receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
-    value = participate(store, authority, route_digest=active.digest)
-    assert value is not None
+def test_commit_lost_ack_reopens_with_successor_and_attribution(tmp_path, monkeypatch):
+    path = tmp_path / "lost-ack.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+
+    def lost_ack(name):
+        if name == "after-commit":
+            raise RuntimeError("lost ack")
+
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lost_ack))
+    store = composed(path, receipts)
+    with pytest.raises(RuntimeError, match="lost ack"):
+        store.reserve(intent(digest=active.digest))
+    store.close()
+    monkeypatch.setattr(Store, "_admission_checkpoint", staticmethod(lambda _name: None))
+    receipts.failure = EvidenceError("source lost")
+    reopened = composed(path, receipts)
+    assert reopened.record_of(IDENTITY).state == RUNNING
+    attribution = reopened.read_canary_attribution(IDENTITY)
+    assert attribution is not None and attribution.route_cell_digest == active.digest
+    assert receipts.reads == ["receipt-candidate-alpha"]
+    reopened.close()
+
+
+def test_receipt_id_is_opaque_and_only_its_canonical_binding_is_persisted(tmp_path):
+    path = tmp_path / "opaque.db"
+    receipts = Receipts()
+    raw = "receipt-secret:token-123"
+    active, _ = seed(path, receipts, receipt_id=raw)
+    store = composed(path, receipts)
+    result = store.reserve(intent(digest=active.digest))
+    assert result is not None and result.canary_attribution is not None
+    columns = [row[1] for row in store._conn.execute("PRAGMA table_info(canary_attributions)")]
+    assert columns == ["stage_identity", "repository", "route_cell_digest", "receipt_binding",
+                       "method_revision", "cohort_id", "contract_version",
+                       "attribution_digest"]
+    persisted = store._conn.execute("SELECT * FROM canary_attributions").fetchone()
+    assert raw not in json.dumps(persisted)
+    assert persisted[3] == result.canary_attribution.receipt_binding
+    store.close()
+
+
+def test_fixed_receipt_binding_vectors_are_executable_and_mutation_sensitive():
+    expected = {
+        "fleet": "4c646f5570ebb5490786f6ce1aaff7920f0ead4bdd42b49c1523ff0c98536be4",
+        "repository-overlay":
+            "512d07706dc708b9f1293ec8ff04f707b02c10d6b570888459d60b9a5618e4be"}
+    for vector in CANARY_ATTRIBUTION_RECEIPT_BINDING_VECTORS:
+        assert _digest(vector["source"]) == expected[vector["name"]] == vector["binding"]
+        assert _canonical_bytes(vector["source"]) == json.dumps(
+            vector["source"], sort_keys=True, separators=(",", ":"),
+            ensure_ascii=True, allow_nan=False).encode()
+        changed = json.loads(json.dumps(vector["source"]))
+        changed["active_declaration"]["generation"] += 1
+        assert _digest(changed) != vector["binding"]
+
+
+def test_runtime_receipt_binding_uses_every_receipt_and_declaration_field():
+    source = CANARY_ATTRIBUTION_RECEIPT_BINDING_VECTORS[0]["source"]
+    receipt_source = source["receipt"]
+    authority_source = receipt_source["authority"]
+    pointer = AuthorityPointer(*(
+        authority_source[name] for name in (
+            "authority_kind", "repository", "locator", "revision",
+            "content_hash_algorithm", "content_hash", "scope")))
+    approved = ApprovedAuthority(
+        pointer, authority_source["approval_id"], authority_source["approved_revision"],
+        authority_source["approved_hash"], authority_source["approved_scope"],
+        authority_source["verifier_id"], authority_source["verifier_version"],
+        authority_source["outcome"])
+    receipt = PromotionReceipt(
+        receipt_source["receipt_id"], receipt_source["candidate_id"],
+        receipt_source["approval_id"], receipt_source["policy_version"], approved,
+        receipt_source["authoritative"])
+    declaration = source["active_declaration"]
+    state = CanaryState(
+        declaration["cell_key"], declaration["active_route_cell_digest"],
+        declaration["active_receipt_id"], declaration["active_receipt_digest"],
+        declaration["predecessor_route_cell_digest"], declaration["disabled_generation"],
+        declaration["generation"])
+    assert _receipt_binding_source(receipt, state) == source
+
+
+def test_schema_is_insertion_only_source_bound_and_content_free(tmp_path):
+    path = tmp_path / "closed.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    result = store.reserve(intent(digest=active.digest))
+    assert result is not None
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store._conn.execute("UPDATE canary_attributions SET cohort_id = ?",
+                            ("f" * 64,))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        store._conn.execute("DELETE FROM canary_attributions")
+    for values in (
+        ("ignore-previous-instructions", "a" * 40, "b" * 64),
+        ("a" * 64, "prompt/findings/provider/source", "b" * 64),
+        ("a" * 64, "a" * 40, "secret:token-123"),
+    ):
+        fields = {
+            "stage_identity": IDENTITY, "repository": "octo/app",
+            "route_cell_digest": active.digest, "receipt_binding": values[0],
+            "method_revision": values[1], "cohort_id": values[2],
+            "contract_version": ATTRIBUTION_CONTRACT_VERSION}
+        digest = _digest({"domain": ROW_DIGEST_DOMAIN, **fields})
+        assert _schema_row_valid(*fields.values(), digest) == 0
+    assert _schema_fingerprint(store._conn) == STORE_V3_SCHEMA_FINGERPRINT
+    store.close()
+
+
+def test_public_read_revalidates_a_tampered_row_without_external_reads(tmp_path):
+    path = tmp_path / "tamper.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    assert store.reserve(intent(digest=active.digest)) is not None
+    reads = list(receipts.reads)
+    store._conn.create_function("canary_attribution_row_valid", 8, lambda *_: 1,
+                                deterministic=True)
     store._conn.execute("DROP TRIGGER canary_attributions_no_update")
-    store._conn.execute("PRAGMA ignore_check_constraints = ON")
-    replacement = STAGE_IDENTITY + "-tampered" if column == "stage_identity" else "tampered"
-    store._conn.execute(
-        f"UPDATE canary_attributions SET {column} = ? WHERE stage_identity = ?",
-        (replacement, STAGE_IDENTITY),
-    )
-    lookup = replacement if column == "stage_identity" else STAGE_IDENTITY
+    store._conn.execute("UPDATE canary_attributions SET attribution_digest = ?",
+                        ("f" * 64,))
     with pytest.raises(CanaryAttributionRefused) as refused:
-        authority.read(lookup)
+        store.read_canary_attribution(IDENTITY)
     assert refused.value.code == "corrupt_attribution"
+    assert receipts.reads == reads
     store.close()
 
 
-def test_sql_authorizer_allows_only_attribution_insert_and_interfaces_touch_no_adapters(
-        tmp_path, monkeypatch):
-    store, _safety, receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
+def test_reservation_write_set_is_only_attribution_insert_and_successor_write(tmp_path):
+    path = tmp_path / "writes.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
     writes = []
 
-    def authorizer(action, arg1, _arg2, _db, _trigger):
+    def authorizer(action, table, column, database, trigger):
         if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE}:
-            writes.append((action, arg1))
-            return sqlite3.SQLITE_OK if (action, arg1) == (
-                sqlite3.SQLITE_INSERT, "canary_attributions") else sqlite3.SQLITE_DENY
+            writes.append((action, table))
         return sqlite3.SQLITE_OK
 
-    def denied(*_args, **_kwargs):
-        pytest.fail("out-of-scope adapter was touched")
-
     store._conn.set_authorizer(authorizer)
-    monkeypatch.setattr("builtins.open", denied)
-    monkeypatch.setattr("pathlib.Path.write_text", denied)
-    monkeypatch.setattr("agentflow.evidence.EvidenceStore.promote", denied)
-    value = participate(store, authority, route_digest=active.digest)
-    assert value is not None and writes == [(sqlite3.SQLITE_INSERT, "canary_attributions")]
-    assert receipts.calls == ["receipt-641"]
-    store._conn.set_authorizer(None)
+    try:
+        assert store.reserve(intent(digest=active.digest)) is not None
+    finally:
+        store._conn.set_authorizer(None)
+    assert set(writes) == {
+        (sqlite3.SQLITE_INSERT, "canary_attributions"),
+        (sqlite3.SQLITE_INSERT, "records"),
+        (sqlite3.SQLITE_UPDATE, "records")}
     store.close()
 
 
-def test_schema_is_closed_content_free_and_has_no_update_delete_surface(tmp_path):
-    store = Store(tmp_path / "schema.db")
-    columns = tuple(row[1] for row in store._conn.execute(
-        "PRAGMA table_info(canary_attributions)"))
-    assert columns == (
-        "stage_identity", "repository", "subject_revision", "route_cell_digest",
-        "receipt_id", "method_revision", "cohort_id", "contract_version",
-        "attribution_digest",
-    )
-    assert store._conn.execute(
-        "SELECT sql FROM sqlite_master WHERE name='canary_attributions'").fetchone()[0] == (
-            CANARY_ATTRIBUTION_SCHEMA)
-    assert store._conn.execute(
-        "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND tbl_name="
-        "'canary_attributions'").fetchone()[0] == 2
-    store._conn.execute(
-        "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        attribution_row())
-    store.close()
+def test_two_composed_stores_racing_one_intent_publish_one_winner_row(tmp_path):
+    path = tmp_path / "race.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+    lock = threading.Lock()
 
-    external = sqlite3.connect(tmp_path / "schema.db")
-    register_sql_functions(external)
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        external.execute(
-            "UPDATE canary_attributions SET receipt_id='receipt-642'"
-            " WHERE stage_identity=?", (STAGE_IDENTITY,))
-    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
-        external.execute(
-            "DELETE FROM canary_attributions WHERE stage_identity=?", (STAGE_IDENTITY,))
-    assert external.execute(
-        "SELECT receipt_id FROM canary_attributions WHERE stage_identity=?",
-        (STAGE_IDENTITY,)).fetchone()[0] == "receipt-641"
-    external.close()
+    def race():
+        store = composed(path, receipts)
+        try:
+            barrier.wait()
+            value = store.reserve(intent(digest=active.digest))
+            with lock:
+                results.append(value)
+        except BaseException as error:
+            with lock:
+                errors.append(error)
+        finally:
+            store.close()
 
-
-@pytest.mark.parametrize("field,value", [
-    ("identity", "secret:token-123"),
-    ("identity", "ignore-previous-instructions"),
-    ("identity", "octo/app|641|build|prose"),
-    ("identity", "octo/app|641|build|prompt"),
-    ("identity", "octo/app|641|build|finding"),
-    ("identity", "octo/app|641|build|provider-output"),
-    ("identity", "octo/app|641|build|source-content"),
-    ("receipt", "secret:token-123"),
-    ("receipt", "ignore-previous-instructions"),
-    ("receipt", "receipt-prompt"),
-    ("receipt", "receipt-finding"),
-    ("receipt", "receipt-provider-output"),
-    ("receipt", "receipt-source-content"),
-])
-def test_schema_guard_rejects_content_like_values_even_with_matching_digest(
-        tmp_path, field, value):
-    store = Store(tmp_path / "closed.db")
-    arguments = {"identity": STAGE_IDENTITY, "receipt_id": "receipt-641"}
-    arguments["identity" if field == "identity" else "receipt_id"] = value
-    with pytest.raises(sqlite3.IntegrityError, match="canary_attributions_closed"):
-        store._conn.execute(
-            "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            attribution_row(**arguments))
-    store.close()
+    threads = [threading.Thread(target=race) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    assert sum(value is not None for value in results) == 1
+    final = composed(path, receipts)
+    assert final.record_of(IDENTITY).state == RUNNING
+    assert final._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 1
+    assert len(receipts.reads) == 1
+    final.close()
 
 
-@pytest.mark.parametrize("identity,receipt_id", [
-    (STAGE_IDENTITY, "receipt-641"),
-    ("octo/app|642|review|" + "c" * 40 + "|r1|afix", "receipt-vector-fleet"),
-    ("octo/app|643|respond|IC_comment_1", "receipt-vector-overlay"),
-    ("octo/app|644|research|-", "receipt-lesson-" + "d" * 32),
-    ("octo/app|conv-1|converse|0", "receipt-candidate-alpha"),
-    ("octo/app|123e4567-e89b-42d3-a456-426614174000|converse|1",
-     "receipt-candidate-alpha"),
-])
-def test_closed_identity_and_receipt_grammars_accept_declared_structured_vectors(
-        tmp_path, identity, receipt_id):
-    store = Store(tmp_path / (receipt_id + ".db"))
-    store._conn.execute(
-        "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        attribution_row(identity=identity, receipt_id=receipt_id))
-    assert store._conn.execute(
-        "SELECT receipt_id FROM canary_attributions WHERE stage_identity=?",
-        (identity,)).fetchone()[0] == receipt_id
+def test_same_owned_instances_handle_admission_resolution_and_read(tmp_path, monkeypatch):
+    path = tmp_path / "same.db"
+    receipts = Receipts()
+    active, _ = seed(path, receipts)
+    seen = {}
+    safety_admit = OperationalSafety._participate_in_admission
+    safety_resolve = OperationalSafety.resolve
+    canary_admit = CanaryAttributionAuthority._participate_in_admission
+    canary_read = CanaryAttributionAuthority._read
+
+    def remember_safety_admit(self, context):
+        seen["safety_admit"] = id(self)
+        return safety_admit(self, context)
+
+    def remember_safety_resolve(self, *args):
+        seen["safety_resolve"] = id(self)
+        return safety_resolve(self, *args)
+
+    def remember_canary_admit(self, context):
+        seen["canary_admit"] = id(self)
+        return canary_admit(self, context)
+
+    def remember_canary_read(self, identity):
+        seen["canary_read"] = id(self)
+        return canary_read(self, identity)
+
+    monkeypatch.setattr(OperationalSafety, "_participate_in_admission", remember_safety_admit)
+    monkeypatch.setattr(OperationalSafety, "resolve", remember_safety_resolve)
+    monkeypatch.setattr(CanaryAttributionAuthority, "_participate_in_admission", remember_canary_admit)
+    monkeypatch.setattr(CanaryAttributionAuthority, "_read", remember_canary_read)
+    store = composed(path, receipts)
+    store.resolve_route_cell(IDENTITY, 1, "primary")
+    assert store.reserve(intent(digest=active.digest)) is not None
+    store.read_canary_attribution(IDENTITY)
+    assert seen["safety_admit"] == seen["safety_resolve"]
+    assert seen["canary_admit"] == seen["canary_read"]
     store.close()
 
 
-def test_stage_and_receipt_grammars_are_bound_to_the_authoritative_sources():
-    assert "converse" in ENABLED_STAGES
-    assert valid_promotion_receipt_id("receipt-candidate-alpha")
-    for content_like in (
-            "secret:token-123", "ignore-previous-instructions", "receipt-candidate-secret",
-            "receipt-candidate-prompt", "receipt-provider-output", "receipt-source-content"):
-        assert not valid_promotion_receipt_id(content_like)
-
-
-@pytest.mark.parametrize("identity,repository,revision", [
-    ("stage identity contains prose", "octo/app", SUBJECT_REVISION),
-    (STAGE_IDENTITY, "octo/app/extra", SUBJECT_REVISION),
-    (STAGE_IDENTITY, "octo/app", "not-a-commit"),
-])
-def test_content_bearing_or_noncanonical_caller_facts_never_persist(
-        tmp_path, identity, repository, revision):
-    store, _safety, _receipts, _predecessor, active, _state, _receipt, authority = canary(
-        tmp_path)
-    store._conn.execute("BEGIN IMMEDIATE")
-    with pytest.raises(CanaryAttributionRefused):
-        authority.participate_in_admission(
-            store._conn, identity, repository, revision, active.digest)
-    assert store._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 0
-    store._conn.execute("ROLLBACK")
-    store.close()
-
-
-def test_exact_v2_migrates_to_complete_v3_without_rewriting_records_or_safety(tmp_path):
-    path = tmp_path / "v2.db"
-    waiting, running = exact_v2(path)
+def test_direct_v2_to_v3_migration_preserves_records_and_has_zero_attributions(tmp_path):
+    path = tmp_path / "migration.db"
+    record = Record(
+        IDENTITY, "build", "codex", 1, repo="octo/app", subject="641",
+        model="gpt-5", state=WAITING, revision=7)
+    make_v2(path, record=record)
     store = Store(path)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
-    assert _schema_fingerprint(store._conn) == _expected_schema_fingerprint(3)
-    assert store.record_of(waiting.identity) == waiting
-    assert store.record_of(running.identity) == running
-    assert store.permits_used("claude") == 2
-    assert store._conn.execute("SELECT count(*) FROM safety_route_state").fetchone()[0] == 0
-    assert store._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 0
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    assert _schema_fingerprint(store._conn) == STORE_V3_SCHEMA_FINGERPRINT
+    assert store.record_of(IDENTITY) == record
+    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
 
 
-@pytest.mark.parametrize("checkpoint", [
-    "v2-to-v3:begin",
-    "v2-to-v3:create:canary_attributions",
-    "v2-to-v3:create:no-update-trigger",
-    "v2-to-v3:create:no-delete-trigger",
-    "v2-to-v3:verify:fingerprint",
-    "v2-to-v3:set:user-version",
-    "v2-to-v3:commit",
-])
-def test_every_precommit_v2_to_v3_fault_rolls_back_to_exact_v2(
-        tmp_path, monkeypatch, checkpoint):
-    path = tmp_path / f"{checkpoint.rsplit(':', 1)[-1]}.db"
-    exact_v2(path)
+@pytest.mark.parametrize("observation", V2_TO_V3_FAULT_OBSERVATIONS)
+def test_every_declared_migration_fault_observation_is_atomic(tmp_path, monkeypatch, observation):
+    path = tmp_path / (observation.replace(":", "-") + ".db")
+    make_v2(path)
 
-    def fail(name):
-        if name == checkpoint:
-            raise RuntimeError(name)
+    def crash(name):
+        if name == observation:
+            raise RuntimeError("migration fault")
 
-    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(fail))
-    with pytest.raises(RuntimeError, match=checkpoint):
+    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(crash))
+    with pytest.raises(RuntimeError, match="migration fault"):
         Store(path)
-    conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
-    assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
-    assert conn.execute(
-        "SELECT name FROM sqlite_master WHERE name='canary_attributions'").fetchone() is None
+    conn = sqlite3.connect(path, isolation_level=None)
+    register_sql_functions(conn)
+    if observation == "v2-to-v3:after-commit":
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert _schema_fingerprint(conn) == STORE_V3_SCHEMA_FINGERPRINT
+    else:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
     conn.close()
 
 
-def test_postcommit_migration_lost_ack_recovers_exact_v3(tmp_path, monkeypatch):
-    path = tmp_path / "lost-ack.db"
-    exact_v2(path)
-
-    def fail(name):
-        if name == "v2-to-v3:committed":
-            raise RuntimeError(name)
-
-    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(fail))
-    with pytest.raises(RuntimeError, match="committed"):
-        Store(path)
+def test_v2_migration_rejects_wrong_source_fingerprint_without_ddl(tmp_path):
+    path = tmp_path / "wrong-source.db"
+    make_v2(path)
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
-    assert _schema_fingerprint(conn) == _expected_schema_fingerprint(3)
-    conn.close()
-    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(lambda _name: None))
-    Store(path).close()
-
-
-def test_tampered_v2_is_not_a_migration_source_and_target_mismatch_rolls_back(
-        tmp_path, monkeypatch):
-    source = tmp_path / "tampered-source.db"
-    exact_v2(source)
-    conn = sqlite3.connect(source)
-    conn.execute("ALTER TABLE safety_actions ADD COLUMN attacker TEXT")
+    conn.execute("ALTER TABLE records ADD COLUMN forged TEXT")
     conn.commit()
     conn.close()
     with pytest.raises(StoreUnavailable, match="migration source"):
-        Store(source)
-    check = sqlite3.connect(source)
+        Store(path)
+    check = sqlite3.connect(path)
     assert check.execute("PRAGMA user_version").fetchone()[0] == 2
     assert check.execute(
-        "SELECT name FROM sqlite_master WHERE name='canary_attributions'").fetchone() is None
-    check.close()
-
-    target = tmp_path / "tampered-target.db"
-    exact_v2(target)
-
-    def wrong_schema(conn, *, checkpoint=None):
-        conn.execute(CANARY_ATTRIBUTION_SCHEMA)
-        conn.execute("CREATE TABLE attacker (value TEXT)")
-
-    monkeypatch.setattr("agentflow.canary_attribution.initialize_schema", wrong_schema)
-    with pytest.raises(StoreUnavailable, match="cannot open continuation store"):
-        Store(target)
-    check = sqlite3.connect(target)
-    assert check.execute("PRAGMA user_version").fetchone()[0] == 2
-    assert _schema_fingerprint(check) == STORE_V2_SCHEMA_FINGERPRINT
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='canary_attributions'").fetchone()[0] == 0
     check.close()

@@ -18,7 +18,13 @@ import pytest
 from agentflow.coordinator import Coordinator
 from agentflow.coordinator.record import Record
 from agentflow.coordinator.store import (
-    ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable, default_store_path)
+    ReservationIntent, ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable,
+    default_store_path)
+
+
+def intent(identity, *, token=None, revision=1, limits=None, budget=5):
+    return ReservationIntent(identity, token, revision, 100, "daemon-test", budget,
+                             limits, None)
 
 
 def test_default_store_lives_under_the_state_directory(coord_state):
@@ -51,19 +57,22 @@ def test_reserve_is_atomic_across_instances(tmp_path):
     (four permits) between them — availability and the running write share one critical
     section, so a sixth permit is impossible."""
     path = tmp_path / "coord.db"
-    Store(path).close()  # initialize the schema once
+    seed = Store(path)
+    for i in range(8):
+        seed.upsert(Record(f"R{i}", "review", "codex", 2, state="waiting"))
+    seed.close()
 
-    records = [Record(f"R{i}", "review", "codex", 2, state="running") for i in range(8)]
+    records = [f"R{i}" for i in range(8)]
     barrier = threading.Barrier(len(records))
     reserved: list[str] = []
     lock = threading.Lock()
 
-    def race(record):
+    def race(identity):
         store = Store(path)  # a distinct instance/connection per racer
         barrier.wait()
-        if store.reserve(record, budget=5):
+        if store.reserve(intent(identity)) is not None:
             with lock:
-                reserved.append(record.identity)
+                reserved.append(identity)
         store.close()
 
     threads = [threading.Thread(target=race, args=(r,)) for r in records]
@@ -84,12 +93,11 @@ def test_reserve_refuses_a_foreign_running_reservation(tmp_path):
     store = Store(path)
     store.upsert(Record("R", "build", "claude", 1, state="waiting"))
 
-    assert store.reserve(
-        Record("R", "build", "claude", 1, state="running", launch_token="A"), budget=5)
+    winner = store.reserve(intent("R"))
+    assert winner is not None
     # A racer that loaded the record while it was still waiting now tries its own reservation.
-    assert not store.reserve(
-        Record("R", "build", "claude", 1, state="running", launch_token="B"), budget=5)
-    assert store.record_of("R").launch_token == "A"   # loser did not overwrite the winner
+    assert store.reserve(intent("R")) is None
+    assert store.record_of("R").launch_token == winner.successor.launch_token
     assert store.permits_used("claude") == 1           # exactly one running reservation
     store.close()
 
@@ -100,8 +108,7 @@ def test_reserve_never_overwrites_a_terminal_same_identity(tmp_path):
     store.upsert(Record("R", "intake", "claude", 1, state="completed",
                         launch_token="winner", outcome="route"))
 
-    stale = Record("R", "intake", "claude", 1, state="running", launch_token="stale")
-    assert store.reserve(stale, budget=5) is False
+    assert store.reserve(intent("R")) is None
     durable = store.record_of("R")
     assert durable.state == "completed" and durable.launch_token == "winner"
     assert durable.outcome == "route"
@@ -114,9 +121,7 @@ def test_reserve_requires_the_loaded_waiting_token_generation(tmp_path):
     store.upsert(Record("R", "review", "claude", 1, state="waiting",
                         launch_token="newer", attempts=1, eligible_at=100))
 
-    stale = Record("R", "review", "claude", 1, state="running",
-                   launch_token="stale", attempts=0)
-    assert store.reserve(stale, budget=5, expected_launch_token=None) is False
+    assert store.reserve(intent("R")) is None
     durable = store.record_of("R")
     assert durable.attempts == 1 and durable.launch_token == "newer"
     assert durable.eligible_at == 100
@@ -138,11 +143,10 @@ def test_two_processes_racing_one_waiting_record_yield_one_reservation(tmp_path)
 
     def race(token):
         store = Store(path)  # a distinct instance/connection per process
-        record = Record("R", "build", "claude", 1, state="running", launch_token=token)
         barrier.wait()
-        won = store.reserve(record, budget=5)
+        result = store.reserve(intent("R"))
         with lock:
-            results[token] = won
+            results[token] = result
         store.close()
 
     threads = [threading.Thread(target=race, args=(t,)) for t in ("TA", "TB")]
@@ -151,8 +155,9 @@ def test_two_processes_racing_one_waiting_record_yield_one_reservation(tmp_path)
     for thread in threads:
         thread.join()
 
-    assert sum(results.values()) == 1               # exactly one reservation taken
-    winner = next(tok for tok, won in results.items() if won)
+    assert sum(result is not None for result in results.values()) == 1
+    winner = next(result.successor.launch_token for result in results.values()
+                  if result is not None)
     final = Store(path)
     reread = final.record_of("R")
     assert reread.state == "running" and reread.launch_token == winner
@@ -164,12 +169,15 @@ def test_global_stage_cap_is_atomic_across_pools(tmp_path):
     """Review and Build share Build's lane. Distinct coordinators racing on distinct pools
     still reserve at most the lane cap because the decision lives in the shared transaction."""
     path = tmp_path / "coord.db"
-    Store(path).close()
+    seed = Store(path)
     records = [
         Record(f"R{i}", "review" if i % 2 else "build",
-               "claude" if i % 2 else "codex", 1, state="running")
+               "claude" if i % 2 else "codex", 1, state="waiting")
         for i in range(8)
     ]
+    for record in records:
+        seed.upsert(record)
+    seed.close()
     limits = ReservationLimits(
         machine_ceiling=8, stage_cap=2, stage_lane="build",
         lane_by_stage={"build": "build", "review": "build", "revise": "build"},
@@ -181,7 +189,7 @@ def test_global_stage_cap_is_atomic_across_pools(tmp_path):
     def race(record):
         store = Store(path)
         barrier.wait()
-        if store.reserve(record, budget=5, limits=limits):
+        if store.reserve(intent(record.identity, limits=limits)) is not None:
             with lock:
                 reserved.append(record.identity)
         store.close()
@@ -197,13 +205,16 @@ def test_global_stage_cap_is_atomic_across_pools(tmp_path):
 
 def test_machine_ceiling_is_atomic_across_stage_lanes_and_pools(tmp_path):
     path = tmp_path / "coord.db"
-    Store(path).close()
+    seed = Store(path)
     stages = ("intake", "build", "mockup", "respond")
     records = [
         Record(f"R{i}", stages[i % len(stages)],
-               "claude" if i % 2 else "codex", 1, state="running")
+               "claude" if i % 2 else "codex", 1, state="waiting")
         for i in range(8)
     ]
+    for record in records:
+        seed.upsert(record)
+    seed.close()
     barrier = threading.Barrier(len(records))
     reserved = []
     lock = threading.Lock()
@@ -216,7 +227,7 @@ def test_machine_ceiling_is_atomic_across_stage_lanes_and_pools(tmp_path):
             lane_by_stage={"intake": "triage"},
         )
         barrier.wait()
-        if store.reserve(record, budget=5, limits=limits):
+        if store.reserve(intent(record.identity, limits=limits)) is not None:
             with lock:
                 reserved.append(record.identity)
         store.close()

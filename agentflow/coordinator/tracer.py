@@ -22,15 +22,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from agentflow.coordinator.record import (
-    ENABLED_STAGES,
-    RUNNING,
-    STALL_STALLED_AFTER,
-    Record,
-    stalled_for,
-)
+from agentflow.coordinator.record import RUNNING, STALL_STALLED_AFTER, Record, stalled_for
 from agentflow.coordinator.store import Store, default_store_path
 from agentflow.worktree_ref import WorktreeRef
+
+
+# The logical stages enabled behind the coordinator — the one source
+# :func:`build_review_revise_gate` consumes. The six pipeline stages (issues #103–#108), the
+# Conversation-turn stage (``converse``) an Ask submits per operator message (ADR 0034), the
+# unattended ``research`` stage the daemon dispatches for an AFK-able planning ticket (ADR 0037),
+# and the cold ``attack`` stage that argues with a triage draft before it is ever published
+# (ADR 380).
+ENABLED_STAGES = ("intake", "build", "review", "revise", "mockup", "respond", "converse",
+                  "research", "attack")
 
 
 def build_review_revise_gate(record: Record) -> bool:

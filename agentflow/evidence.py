@@ -80,32 +80,6 @@ _ID = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$")
 _DIGEST = re.compile(r"^[a-f0-9]{32,128}$")
 _SHA = re.compile(r"^[a-f0-9]{40,64}$")
 _CONTENT_REVISION = re.compile(r"^sha256:([a-f0-9]{64})$")
-_CONTENT_FREE_PROMOTION_CANDIDATE = re.compile(
-    r"^(?:lesson-[a-f0-9]{32}|candidate-[A-Za-z0-9][A-Za-z0-9._]{0,117}|"
-    r"vector-(?:fleet|overlay)|[1-9][0-9]{0,19}|successor)$")
-_CONTENT_LIKE_CANDIDATE_NAMES = frozenset({
-    "content", "finding", "findings", "ignore", "instructions", "prompt", "prompts",
-    "prose", "provider", "secret", "source", "token",
-})
-PROMOTION_RECEIPT_ID_GRAMMAR_VERSION = "evidence-promotion-receipt-id-v1"
-
-
-def valid_promotion_receipt_id(value: object) -> bool:
-    """Whether ``value`` is a content-free ID produced by Evidence promotion.
-
-    #584 receipts are exactly ``receipt-{candidate_id}``.  The accepted candidate forms retain
-    Evidence's generated lesson IDs and its structured candidate IDs while excluding prose-like
-    identifiers from stores whose schema promises content-free persistence.
-    """
-    if not isinstance(value, str) or not value.startswith("receipt-"):
-        return False
-    candidate_id = value.removeprefix("receipt-")
-    if _ID.fullmatch(candidate_id) is None or _CONTENT_FREE_PROMOTION_CANDIDATE.fullmatch(
-            candidate_id) is None:
-        return False
-    name = (candidate_id.removeprefix("candidate-")
-            if candidate_id.startswith("candidate-") else candidate_id)
-    return name.lower() not in _CONTENT_LIKE_CANDIDATE_NAMES
 
 _V1_SCHEMA = """
 CREATE TABLE events (event_id TEXT PRIMARY KEY, repository TEXT NOT NULL,
@@ -1103,9 +1077,6 @@ class EvidenceStore:
 
     def promote(self, candidate_id: str, authority: AuthorityPointer, *, promoted_at: int) -> PromotionReceipt:
         _token(candidate_id, "candidate_id")
-        receipt_id = f"receipt-{candidate_id}"
-        if not valid_promotion_receipt_id(receipt_id):
-            raise EvidenceError("candidate_id cannot produce a content-free promotion receipt")
         if isinstance(promoted_at, bool) or not isinstance(promoted_at, int) or promoted_at < 0:
             raise EvidenceError("invalid promoted_at")
         # An exact durable receipt stays idempotent even when the original
@@ -1162,6 +1133,7 @@ class EvidenceStore:
             if ((not active_versions and scope.prior != 0)
                     or (active_versions and max(active_versions) != scope.prior)):
                 raise EvidenceError("current policy version does not bind the promotion authority")
+            receipt_id = f"receipt-{candidate_id}"
             conn.execute("INSERT INTO receipts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 candidate_id, receipt_id, approved.approval_id, candidate["policy_version"], promoted_at,
                 "verified", authority.authority_kind, authority.repository, authority.locator, authority.revision,

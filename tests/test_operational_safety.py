@@ -13,7 +13,14 @@ import pytest
 
 from agentflow import config, github, routing
 from agentflow.coordinator.record import Record
-from agentflow.coordinator.store import SCHEMA_VERSION, Store, StoreUnavailable
+from agentflow.coordinator.store import (
+    OperationalSafetyOnly,
+    ReservationIntent,
+    SCHEMA_VERSION,
+    SafetySources,
+    Store,
+    StoreUnavailable,
+)
 from agentflow.evidence import (
     ApprovedAuthority,
     AuthorityPointer,
@@ -43,6 +50,7 @@ from agentflow.operational_safety import (
     SafetyRefused,
     TriggerOnceByActionIdTransportV1,
     _state_id,
+    _AdmissionContext,
 )
 
 
@@ -185,6 +193,11 @@ def route(owner, *, repository="octo/app", route_id="primary", config_value=None
         repository, "build", "codex", "gpt-5", route_id,
         config_value or {"model": "gpt-5", "effort": "high", "timeout": 900},
     )
+
+
+def admission(owner, cell):
+    return owner._participate_in_admission(_AdmissionContext(
+        "stage", cell.repository, cell.stage, cell.provider, cell.model, cell.digest))
 
 
 def request(cell, evidence_ref, *, check="route-health", subject="issue-585",
@@ -349,7 +362,7 @@ def test_every_route_read_recomputes_content_digests(safety, target, reader):
         elif reader == "canary_state":
             owner.canary_state(cell.digest)
         else:
-            owner.participate_in_admission(store._conn, cell.digest)
+            admission(owner, cell)
 
 
 @pytest.mark.parametrize("reader", ["resolve", "admission"])
@@ -398,7 +411,7 @@ def test_every_route_state_column_is_revalidated_on_read_and_admission(
         if reader == "resolve":
             owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
         else:
-            owner.participate_in_admission(store._conn, cell.digest)
+            admission(owner, cell)
 
 
 @pytest.mark.parametrize("reader", ["resolve", "admission"])
@@ -414,7 +427,7 @@ def test_route_and_canary_active_pointers_must_agree(safety, reader):
         if reader == "resolve":
             owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
         else:
-            owner.participate_in_admission(store._conn, cell.digest)
+            admission(owner, cell)
 
 
 def test_authority_controls_semantic_failure_and_unreadable_is_transport_only(safety):
@@ -771,21 +784,18 @@ def test_admission_refusal_consumes_no_permit_and_never_touches_running_work(saf
     owner, store, checks, _receipts, _reruns = safety
     cell = route(owner)
     quarantine(owner, checks, cell)
-    store.upsert(Record("waiting", "build", "codex", 1, state="waiting"))
+    store.upsert(Record("waiting", "build", "codex", 1, state="waiting",
+                        repo="octo/app", model="gpt-5"))
+    path = store.path
+    store.close()
+    admitted = Store(path, admission_mode=OperationalSafetyOnly(SafetySources(
+        check_evidence=checks)))
     with pytest.raises(SafetyRefused, match="not admissible"):
-        store.reserve(Record("waiting", "build", "codex", 1, state="running"), 5,
-                      operational_safety=owner, route_cell_digest=cell.digest)
-    assert store.record_of("waiting").state == "waiting"
-    assert store.permits_used("codex") == 0
-
-    healthy = route(owner, route_id="fallback",
-                    config_value={"model": "gpt-5", "effort": "low"})
-    store.upsert(Record("healthy", "build", "codex", 1, state="waiting"))
-    assert store.reserve(Record("healthy", "build", "codex", 1, state="running"), 5,
-                         operational_safety=owner, route_cell_digest=healthy.digest)
-    before = store.record_of("healthy")
-    quarantine(owner, checks, healthy, revision="healthy-later")
-    assert store.record_of("healthy") == before
+        admitted.reserve(ReservationIntent(
+            "waiting", None, 1, 10, "daemon", 5, None, cell.digest))
+    assert admitted.record_of("waiting").state == "waiting"
+    assert admitted.permits_used("codex") == 0
+    admitted.close()
 
 
 def test_quarantine_and_admission_race_serialize_in_one_store_transaction(tmp_path):
@@ -794,7 +804,8 @@ def test_quarantine_and_admission_race_serialize_in_one_store_transaction(tmp_pa
     checks = Checks()
     owner = OperationalSafety(seed, check_evidence=checks)
     cell = route(owner)
-    seed.upsert(Record("race", "build", "codex", 1, state="waiting"))
+    seed.upsert(Record("race", "build", "codex", 1, state="waiting",
+                       repo="octo/app", model="gpt-5"))
     observe(owner, checks, cell, "fail", "race/first")
     second = request(cell, "race/second")
     checks.issue(second, "fail")
@@ -803,13 +814,12 @@ def test_quarantine_and_admission_race_serialize_in_one_store_transaction(tmp_pa
     outcome, errors = {}, []
 
     def admit():
-        store = Store(path)
-        safety_owner = OperationalSafety(store, check_evidence=checks)
+        store = Store(path, admission_mode=OperationalSafetyOnly(SafetySources(
+            check_evidence=checks)))
         try:
             barrier.wait()
-            outcome["admitted"] = store.reserve(
-                Record("race", "build", "codex", 1, state="running"), 5,
-                operational_safety=safety_owner, route_cell_digest=cell.digest)
+            outcome["admitted"] = store.reserve(ReservationIntent(
+                "race", None, 1, 10, "daemon", 5, None, cell.digest)) is not None
         except SafetyRefused:
             outcome["admitted"] = False
         except BaseException as error:

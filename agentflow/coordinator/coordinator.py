@@ -35,7 +35,7 @@ from agentflow.coordinator.providers import (EndingReason, ProviderCause, Sessio
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import (
     COMPLETED, HELD, RUNNING, STALL_LOG_EVERY, STALL_OBSERVATION_MAX_GAP, STALL_PARK_AFTER,
-    STALL_STALLED_AFTER, WAITING, Record, stalled_for)
+    STALL_STALLED_AFTER, WAITING, Record, logical_stage_identity as _identity, stalled_for)
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import Store, default_store_path
@@ -1312,35 +1312,6 @@ class Coordinator:
         prefix identifies the logical stage; the tail carries the attempt, cause, and claim
         disposition. Provider prose and secrets never reach here — only typed causes do."""
         self._log(f"{record.repo}: {record.subject}: {record.stage}: {tail}")
-
-
-def _identity(repo: str, subject: str, stage: str, target: str | None, round: int = 0,
-              conflict_round: int = 0, resume: int = 0, review_axis: str = "combined",
-              review_passes: int = 0, review_sequence: int = 0,
-              uncertainty_handoffs: int = 0) -> str:
-    # The auto-revise round joins the identity once one exists, so an evidence-only revision —
-    # whose re-review binds to the *same* head SHA — still opens a genuinely new stage rather
-    # than colliding with the retired prior review's record. A conflict Revise's own round joins
-    # it too (ADR 0038), so each conflict resolution is a fresh stage that never collides with a
-    # finding-driven revise on the same head SHA. A deliberate maintainer resume joins its resume
-    # number the same way: an exhausted Build must not reuse its terminal record (#245), and a
-    # manual Review must not collide with an automatic moved-head retarget (#501).
-    parts = [repo, str(subject), stage, target or "-"]
-    if round:
-        parts.append(f"r{round}")
-    if conflict_round:
-        parts.append(f"c{conflict_round}")
-    if resume:
-        parts.append(f"s{resume}")
-    if stage == "review" and review_axis != "combined":
-        parts.append(f"a{review_axis}")
-    if stage == "review" and review_passes:
-        parts.append(f"p{review_passes}")
-    if stage == "review" and review_sequence:
-        parts.append(f"q{review_sequence}")
-    if uncertainty_handoffs:
-        parts.append(f"u{uncertainty_handoffs}")
-    return "|".join(parts)
 
 
 def _refusal_state(record: Record):
