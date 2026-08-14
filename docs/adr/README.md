@@ -21,12 +21,15 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 626](adr-626-manifest-rooted-evaluation-semantic-bundle.md) — One versioned,
+  manifest-rooted Evaluation bundle binds declarative candidate JSON to one pure semantic
+  module; validation executes that authority without reimplementing its algorithms.
 - [ADR 620](adr-620-evaluation-failure-classes.md) — Exactly six orthogonal evaluation failure
   classes; aliases, merged classes, and automatic policy mutation are rejected.
 - [ADR 606](adr-606-explicit-missing-metrics-and-adjudication-lineage.md) — Missing-metric
   names exactly match null values, and adjudication binds the canonical case and answer key.
-- [ADR 605](adr-605-canonical-evaluation-rulebook.md) — One versioned canonical data contract
-  owns Evaluation v1 semantics; runtime and independent verification both consume it.
+- [ADR 605](adr-605-canonical-evaluation-rulebook.md) — One versioned authority and no
+  duplicated Evaluation policy; its one-data-file clause is superseded by ADR 626.
 - [ADR 596](adr-596-typed-evidence-envelopes-and-lineage.md) — Typed failure/producer
   envelopes, bounded same-repository lineage, contextual briefing closure, SQLite schema v3,
   and suffix-routed JSON contract v2.
