@@ -222,6 +222,10 @@ class CapabilityRouting:
                 f"unknown builder complexity {builder_complexity!r}")
         if effort is not None and effort not in {"low", "medium", "high", "extra"}:
             raise RoutingConfigError(f"unknown launch effort {effort!r}")
+        if stage == "build" and complexity is None:
+            raise RoutingConfigError("build route selection requires complexity")
+        if stage == "revise" and builder_complexity is None and complexity is None:
+            raise RoutingConfigError("revise route selection requires complexity")
         if provider not in {"claude", "codex"} or self.provider_for(model) != provider:
             raise RoutingConfigError(
                 f"provider {provider!r} cannot launch model {model!r}")
@@ -511,10 +515,11 @@ def reachable_route_selections(config) -> tuple[RouteSelection, ...]:
 def reconcile_route_cells(config, store):
     """Idempotently register all currently reachable governed RouteCells."""
     from agentflow.coordinator.store import StoreUnavailable
+    import sqlite3
     registered = []
     for selection in reachable_route_selections(config):
         try:
             registered.append(store.register_route_selection(selection))
-        except (SafetyRefused, StoreUnavailable):
+        except (SafetyRefused, StoreUnavailable, sqlite3.DatabaseError):
             continue
     return tuple(registered)

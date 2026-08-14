@@ -748,15 +748,17 @@ class Store:
         """Register one exact routing-owned selection through this Store's sealed owner."""
         if self._operational_safety is None:
             raise StoreUnavailable("route registration is not configured")
-        from agentflow.routing import RouteSelection, routing
+        from agentflow.routing import RouteSelection
         if type(selection) is not RouteSelection:
             raise TypeError("route registration requires the exact frozen selection")
-        if routing.cli_identifier(selection.provider, selection.model) \
-                != selection.launch_config.cli_model:
-            raise SafetyRefused("route selection CLI model does not match routing")
+        config = selection.launch_config
+        if (selection.route_id != f"production/{config.stage_profile_id}"
+                or selection.provider != config.provider
+                or selection.model != config.internal_model):
+            raise SafetyRefused("route selection does not bind its launch configuration")
         return self._operational_safety.register_route_cell(
             selection.repository, selection.stage, selection.provider, selection.model,
-            selection.route_id, selection.launch_config)
+            selection.route_id, config)
 
     def route_cell_state(self, route_cell_digest: str):
         """Read verified RouteCell state through this Store's sealed owner."""

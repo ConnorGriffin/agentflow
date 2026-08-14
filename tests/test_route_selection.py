@@ -106,6 +106,9 @@ def test_launch_config_v1_has_fixed_canonical_bytes_and_digest():
     ("wall_ceiling_s", 0),
     ("sandbox_policy", "read-only"),
     ("result_schema_digest", "0" * 64),
+    ("stage_profile_id", "build/deep/unknown"),
+    ("internal_model", " sol"),
+    ("allowed_tools", ["Read", "Read"]),
 ])
 def test_launch_config_v1_refuses_nonclosed_or_inconsistent_input(change, value):
     selection = routing.select_route(
@@ -199,6 +202,22 @@ def test_store_resolves_one_decoded_envelope_and_closes_refusal_codes(tmp_path):
     store.close()
 
 
+def test_store_registration_uses_the_frozen_selection_not_routing(monkeypatch, tmp_path):
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    selection = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
+    monkeypatch.setattr(routing, "cli_identifier", lambda *_: (_ for _ in ()).throw(
+        AssertionError("routing was reread")))
+
+    registered = store.register_route_selection(selection)
+
+    assert registered.route_id == selection.route_id
+    store.close()
+
+
 def test_provider_argv_consumes_only_the_decoded_admitted_envelope(
         monkeypatch, tmp_path):
     store = Store(
@@ -223,6 +242,8 @@ def test_provider_argv_consumes_only_the_decoded_admitted_envelope(
         "agentflow.coordinator.profiles.profile_for",
         lambda *_: (_ for _ in ()).throw(AssertionError("profile was reread")))
     monkeypatch.setattr(
+        "agentflow.coordinator.profiles.WITHHELD_EDIT_TOOLS", ("Read",))
+    monkeypatch.setattr(
         "agentflow.coordinator.providers.stage_result_schema",
         lambda *_: (_ for _ in ()).throw(AssertionError("schema was reread")))
     monkeypatch.setenv("AGENTFLOW_SESSION_TIMEOUT", "1")
@@ -231,6 +252,40 @@ def test_provider_argv_consumes_only_the_decoded_admitted_envelope(
     assert before[before.index("--model") + 1] == selection.launch_config.cli_model
     assert before[before.index("--max-turns") + 1] == str(
         selection.launch_config.turn_ceiling)
+    store.close()
+
+
+def test_codex_argv_consumes_only_the_decoded_admitted_envelope(monkeypatch, tmp_path):
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    record = Record(
+        "stage-codex-provider-646", "intake", "codex", 1,
+        repo="octo/app", model="sol", complexity="deep",
+        source=str(tmp_path), input_ptr="scope the issue")
+    stored, *_ = store.submit(record)
+    selection = routing.select_route(
+        "octo/app", "intake", "codex", "sol", complexity="deep")
+    store.register_route_selection(selection)
+    admitted = store.resolve_admitted_launch(
+        stored.identity, stored.revision, selection.route_id)
+    monkeypatch.setattr(
+        "agentflow.runner._write_output_schema", lambda _schema: "/schema.json")
+
+    before = provider_command(stored, admitted)
+    monkeypatch.setattr(routing, "cli_identifier", lambda *_: (_ for _ in ()).throw(
+        AssertionError("routing was reread")))
+    monkeypatch.setattr(
+        "agentflow.coordinator.profiles.profile_for",
+        lambda *_: (_ for _ in ()).throw(AssertionError("profile was reread")))
+    monkeypatch.setattr(
+        "agentflow.coordinator.providers.stage_result_schema",
+        lambda *_: (_ for _ in ()).throw(AssertionError("schema was reread")))
+
+    assert provider_command(stored, admitted) == before
+    assert before[before.index("-m") + 1] == selection.launch_config.cli_model
+    assert before[before.index("--sandbox") + 1] == selection.launch_config.sandbox_policy
     store.close()
 
 
@@ -260,6 +315,58 @@ def test_launcher_supervision_consumes_the_same_decoded_admitted_envelope(
     assert launcher._session_timeout_for(stored, admitted) == (
         selection.launch_config.wall_ceiling_s)
     assert launcher._build_lease_for(stored, admitted) == selection.launch_config.build_lease
+    store.close()
+
+
+def test_local_launcher_start_threads_one_envelope_to_argv_and_supervision(
+        monkeypatch, tmp_path):
+    selection = routing.select_route(
+        "octo/app", "build", "codex", "sol", complexity="deep", effort="high")
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    waiting = Record(
+        "stage-start-646", "build", "codex", 5,
+        repo="octo/app", model="sol", complexity="deep", effort="high",
+        source=str(tmp_path), input_ptr="build it", launch_token="token-646")
+    store.register_route_selection(selection)
+    from agentflow.operational_safety import decode_admitted_launch
+    admitted = decode_admitted_launch(store._operational_safety.resolve(
+        waiting.repo, waiting.stage, waiting.pool, waiting.model, selection.route_id))
+    consumed = []
+    spawned = []
+
+    class Child:
+        def wait(self, timeout):
+            return 0
+
+    class LaunchStore:
+        path = tmp_path / "coordinator.db"
+
+        @staticmethod
+        def record_of(_identity):
+            return replace(waiting, start_fact="started", family="42")
+
+    def command(record, envelope):
+        consumed.append((record, envelope))
+        return ["provider"]
+
+    monkeypatch.setattr(
+        "agentflow.coordinator.launcher.subprocess.Popen",
+        lambda argv, cwd=None: spawned.append((argv, cwd)) or Child())
+    launcher = LocalLauncher(provider_command=command, timeout=0.1)
+
+    result = launcher.start(waiting, LaunchStore(), admitted)
+
+    assert result.fact == "started" and result.family == "42"
+    assert consumed == [(waiting, admitted)]
+    child_argv = spawned[0][0]
+    assert str(selection.launch_config.wall_ceiling_s) in child_argv
+    lease_at = child_argv.index("--build-lease")
+    assert child_argv[lease_at + 2:lease_at + 5] == [
+        str(value) for value in selection.launch_config.build_lease]
+    assert child_argv[-1] == "provider"
     store.close()
 
 

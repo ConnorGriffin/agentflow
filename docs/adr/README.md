@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 646](adr-646-immutable-route-selection.md) — Routing materializes one closed immutable
+  launch artifact; OperationalSafety registers and decodes it for shared argv and supervision
+  consumption without giving ordinary admission routing authority.
 - [ADR 628](adr-628-read-only-effective-policy-briefings.md) — A read-only resolver folds pinned
   fleet policy, monotone repository overlays, and stage applicability into one bounded immutable
   briefing without acquiring promotion or persistence authority.

@@ -63,6 +63,23 @@ class SafetyRefused(RuntimeError):
     """The requested action is outside the bounded automatic authority."""
 
 
+READ_ONLY_WITHHELD_TOOLS_V1 = ("Edit", "Write", "NotebookEdit")
+_PROFILE_COMPLEXITIES = frozenset({"standard", "deep"})
+_PROFILE_EFFORTS = frozenset({"default", "low", "medium", "high", "extra"})
+_STAGE_PROFILE_TOKENS = frozenset({
+    "intake", "attack", "mockup", "review", "respond", "converse", "research",
+})
+
+
+def _valid_stage_profile_id(value: str) -> bool:
+    """Whether ``value`` is one closed routing-profile identity."""
+    parts = value.split("/")
+    if parts[0] in {"build", "revise"}:
+        return (len(parts) == 3 and parts[1] in _PROFILE_COMPLEXITIES
+                and parts[2] in _PROFILE_EFFORTS)
+    return len(parts) == 1 and value in _STAGE_PROFILE_TOKENS
+
+
 @dataclass(frozen=True, slots=True)
 class LaunchConfigV1:
     """The complete immutable launch policy registered for one RouteCell."""
@@ -90,8 +107,11 @@ class LaunchConfigV1:
             value = getattr(self, name)
             if type(value) is not str or not value or value != value.strip():
                 raise SafetyRefused(f"invalid launch configuration {name}")
+        if not _valid_stage_profile_id(self.stage_profile_id):
+            raise SafetyRefused("invalid launch configuration stage_profile_id")
         if self.reasoning_effort is not None and (
-                type(self.reasoning_effort) is not str or not self.reasoning_effort):
+                type(self.reasoning_effort) is not str or not self.reasoning_effort
+                or self.reasoning_effort != self.reasoning_effort.strip()):
             raise SafetyRefused("invalid launch configuration reasoning_effort")
         for name in ("turn_ceiling", "wall_ceiling_s"):
             value = getattr(self, name)
@@ -105,7 +125,9 @@ class LaunchConfigV1:
             raise SafetyRefused("invalid launch configuration build_lease")
         if self.allowed_tools is not None and (
                 type(self.allowed_tools) is not tuple or not self.allowed_tools
-                or any(type(tool) is not str or not tool for tool in self.allowed_tools)):
+                or any(type(tool) is not str or not tool or tool != tool.strip()
+                       for tool in self.allowed_tools)
+                or len(set(self.allowed_tools)) != len(self.allowed_tools)):
             raise SafetyRefused("invalid launch configuration allowed_tools")
         if (type(self.sandbox_policy) is not str
                 or self.sandbox_policy not in {"read-only", "workspace-write"}):
@@ -671,10 +693,10 @@ class OperationalSafety:
 
     def register_route_cell(
             self, repository: str, stage: str, provider: str, model: str,
-            route_id: str, launch_config: Mapping[str, object] | LaunchConfigV1) -> RouteCell:
-        config_bytes = (encode_launch_config(launch_config)
-                        if type(launch_config) is LaunchConfigV1
-                        else _canonical_bytes(launch_config))
+            route_id: str, launch_config: LaunchConfigV1) -> RouteCell:
+        if type(launch_config) is not LaunchConfigV1:
+            raise SafetyRefused("route registration requires the exact launch configuration v1")
+        config_bytes = encode_launch_config(launch_config)
         config_digest = sha256(config_bytes).hexdigest()
         body = {
             "repository": repository,
@@ -685,8 +707,7 @@ class OperationalSafety:
             "launch_config_digest": config_digest,
         }
         cell = RouteCell(**body, digest=_digest(body))
-        if type(launch_config) is LaunchConfigV1:
-            decode_admitted_launch(ResolvedLaunch(cell, config_bytes))
+        decode_admitted_launch(ResolvedLaunch(cell, config_bytes))
         with self._transaction():
             row = self._conn.execute(
                 "SELECT content FROM safety_launch_configs WHERE digest = ?",

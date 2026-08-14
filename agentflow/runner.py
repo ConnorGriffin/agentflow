@@ -942,7 +942,7 @@ class ClaudeRunner(_WorktreeRunner):
         Claude's first-class ``--effort`` flag; every other stage leaves it ``None``. A
         rung above Claude's ladder clamps to its top rather than failing the launch.
         """
-        from agentflow.coordinator.profiles import WITHHELD_EDIT_TOOLS
+        from agentflow.operational_safety import READ_ONLY_WITHHELD_TOOLS_V1
 
         from agentflow.routing import routing
         deny: tuple[str, ...] = ()
@@ -960,7 +960,7 @@ class ClaudeRunner(_WorktreeRunner):
                 tools = list(profile.allowed_tools)
                 tools += [f"mcp__{name}" for name in servers]
                 argv += ["--tools", ",".join(tools)]
-                deny = WITHHELD_EDIT_TOOLS
+                deny = READ_ONLY_WITHHELD_TOOLS_V1
             argv += ["--max-turns", str(profile.turn_ceiling)]
             if profile.reasoning_effort is not None:
                 argv += ["--effort",

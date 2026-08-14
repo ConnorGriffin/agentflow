@@ -25,6 +25,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from agentflow.operational_safety import READ_ONLY_WITHHELD_TOOLS_V1
+
 _MIN = 60
 
 # Read/search allowlists for the read-only stages (§3a). Every one omits the edit tools; the
@@ -47,7 +49,7 @@ _READ_ONLY_TOOLS: dict[str, tuple[str, ...]] = {
 # unreachability *is* the fail-closed guarantee (ADR 0044 pt 1/5): the capability is absent, not
 # present-and-caught. The deny block earns its keep as defense in depth if the allowlist ever
 # regresses.
-WITHHELD_EDIT_TOOLS: tuple[str, ...] = ("Edit", "Write", "NotebookEdit")
+WITHHELD_EDIT_TOOLS: tuple[str, ...] = READ_ONLY_WITHHELD_TOOLS_V1
 
 # Wall (seconds) + turn ceilings for the non-Build stages (§3b). Every ceiling sits clear of the
 # work its stage is recorded needing — that headroom is the whole point, so the ceiling kills a
