@@ -750,6 +750,44 @@ def test_two_store_activation_between_resolve_and_reserve_is_stale_without_capac
     store.close()
 
 
+def test_two_store_corruption_between_resolve_and_reserve_is_unreadable_without_capacity(
+        tmp_path):
+    path = tmp_path / "coordinator.db"
+    store = Store(
+        path,
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    record = Record(
+        "stage-corrupt-race-646", "review", "codex", 1,
+        repo="octo/app", model="sol", complexity="deep")
+    stored, *_ = store.submit(record)
+    selection = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
+    cell = store.register_route_selection(selection)
+    other_store = Store(path, admission_mode=OperationalSafetyOnly(SafetySources()))
+    reservations = []
+
+    def corrupt_active_config():
+        owner = other_store._operational_safety
+        with owner._transaction():
+            other_store._conn.execute(
+                "UPDATE safety_launch_configs SET content = ? WHERE digest = ?",
+                (b"{}", cell.launch_config_digest))
+
+    def reserve(admitted):
+        assert store._conn.in_transaction
+        reservations.append(admitted)
+
+    with pytest.raises(RouteAdmissionRefused) as unreadable:
+        store.consume_admitted_launch(
+            stored.identity, stored.revision, selection.route_id,
+            reserve=reserve, before_reserve=corrupt_active_config)
+    assert unreadable.value.code == "unreadable"
+    assert reservations == []
+    other_store.close()
+    store.close()
+
+
 def test_reconciliation_resumes_partial_concurrent_work_and_isolates_one_bad_route(tmp_path):
     config = RuntimeConfig(
         (RepoConfig("octo/app", str(tmp_path)),), (), Path(tmp_path / "config.toml"))

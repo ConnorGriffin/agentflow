@@ -766,6 +766,8 @@ class Store:
                     if error.code in {"missing", "stale", "mismatched", "quarantined"}:
                         raise RouteAdmissionRefused("stale") from None
                     raise
+                except SafetyRefused:
+                    raise RouteAdmissionRefused("unreadable") from None
                 if current.route_cell.digest != admitted.route_cell.digest:
                     raise RouteAdmissionRefused("stale") from None
                 result = reserve(admitted)
