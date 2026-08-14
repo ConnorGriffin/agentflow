@@ -24,6 +24,7 @@ from agentflow.canary_attribution import (
     CanaryAttributionAuthority,
     CanaryAttributionRefused,
     _digest,
+    register_sql_functions,
 )
 from agentflow.coordinator.record import Record
 from agentflow.coordinator.store import (
@@ -131,6 +132,23 @@ def exact_v2(path) -> tuple[Record, Record]:
     return waiting, running
 
 
+def attribution_row(*, identity=STAGE_IDENTITY, repository="octo/app",
+                    revision=SUBJECT_REVISION, route_digest="5" * 64,
+                    receipt_id="receipt-641", method_revision="6" * 40,
+                    cohort_id="7" * 64):
+    facts = {
+        "stage_identity": identity,
+        "repository": repository,
+        "subject_revision": revision,
+        "route_cell_digest": route_digest,
+        "receipt_id": receipt_id,
+        "method_revision": method_revision,
+        "cohort_id": cohort_id,
+        "contract_version": ATTRIBUTION_CONTRACT_VERSION,
+    }
+    return tuple(facts.values()) + (_digest(facts),)
+
+
 def test_contract_dependencies_vectors_schema_and_public_interface_are_exact():
     assert DEPENDENCY_PINS == {
         "issue_584_merge": "ef08dd3d2f691aa154ddaa193e6161b559099396",
@@ -147,17 +165,17 @@ def test_contract_dependencies_vectors_schema_and_public_interface_are_exact():
             "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e",
         "coordinator_store_target_schema": 3,
         "coordinator_store_target_fingerprint_digest":
-            "040dd13aa1108cb0f896893870a2cd563007be1d1c03b3ced96b92ab9f31f355",
+            "c8ed40cef9b93df395c4c57f62eb25b0b67422c000c22ece690c32f76a3f3921",
     }
     assert STORE_V2_SCHEMA_FINGERPRINT == _expected_schema_fingerprint(2)
     assert STORE_V2_SCHEMA_FINGERPRINT_DIGEST == (
         "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e")
     assert STORE_V3_SCHEMA_FINGERPRINT == _expected_schema_fingerprint(3)
     assert STORE_V3_SCHEMA_FINGERPRINT_DIGEST == (
-        "040dd13aa1108cb0f896893870a2cd563007be1d1c03b3ced96b92ab9f31f355")
+        "c8ed40cef9b93df395c4c57f62eb25b0b67422c000c22ece690c32f76a3f3921")
     assert CANARY_ATTRIBUTION_CONTRACT["schema"] == ATTRIBUTION_CONTRACT_VERSION
     assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == _digest(CANARY_ATTRIBUTION_CONTRACT) == (
-        "745fcdf2d8b358d2cb3418541d8c39bcb04c81bb913f7425866ae97ab4df2d38")
+        "745df06c868e3f3655d005aaab134a2a5b68573df0d617e19ede0c9a5dc8d237")
     for vector in CANARY_ATTRIBUTION_VECTORS:
         assert vector["attribution"]["receipt_id"] == vector["receipt"]["receipt_id"]
         assert (vector["attribution"]["method_revision"]
@@ -228,6 +246,16 @@ def test_exact_connection_open_transaction_and_operational_safety_binding_are_re
         authority.participate_in_admission(
             store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
     assert refused.value.code == "outside_transaction"
+
+    receipts.calls.clear()
+    safety.canary_state = lambda _digest: (_ for _ in ()).throw(
+        AssertionError("deferred transaction performed an external read"))
+    store._conn.execute("BEGIN")
+    with pytest.raises(CanaryAttributionRefused) as refused:
+        authority.participate_in_admission(
+            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
+    assert refused.value.code == "outside_transaction" and receipts.calls == []
+    store._conn.execute("ROLLBACK")
 
     other = Store(tmp_path / "other.db")
     other._conn.execute("BEGIN IMMEDIATE")
@@ -321,6 +349,101 @@ def test_two_connections_race_one_identical_committed_row(tmp_path):
     final.close()
 
 
+def test_two_deferred_transactions_refuse_deterministically_before_external_reads(tmp_path):
+    (seed, _seed_safety, receipts, _predecessor, active, _state,
+     _receipt, _seed_authority) = canary(tmp_path)
+    seed.close()
+    path = tmp_path / "coordinator.db"
+    start = threading.Barrier(2)
+    codes = []
+    errors = []
+    lock = threading.Lock()
+
+    def race():
+        store = Store(path)
+        safety = OperationalSafety(store)
+        safety.canary_state = lambda _digest: (_ for _ in ()).throw(
+            AssertionError("deferred transaction performed an external read"))
+        authority = CanaryAttributionAuthority(store, safety, receipts)
+        try:
+            store._conn.execute("BEGIN")
+            start.wait()
+            authority.participate_in_admission(
+                store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
+        except CanaryAttributionRefused as refused:
+            with lock:
+                codes.append(refused.code)
+        except BaseException as error:
+            with lock:
+                errors.append(error)
+        finally:
+            if store._conn.in_transaction:
+                store._conn.execute("ROLLBACK")
+            store.close()
+
+    threads = [threading.Thread(target=race), threading.Thread(target=race)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == [] and codes == ["outside_transaction", "outside_transaction"]
+    assert receipts.calls == []
+    final = Store(path)
+    assert final._conn.execute("SELECT count(*) FROM canary_attributions").fetchone()[0] == 0
+    final.close()
+
+
+def test_racing_different_derived_treatment_facts_replay_the_winner_row(tmp_path):
+    (seed, _seed_safety, _seed_receipts, predecessor, active, state,
+     _receipt, _seed_authority) = canary(tmp_path)
+    seed.close()
+    path = tmp_path / "coordinator.db"
+    request_a = CanaryActivationRequest("receipt-641", active.digest, predecessor.digest, 0)
+    request_b = CanaryActivationRequest("receipt-642", active.digest, predecessor.digest, 0)
+    readers = (Receipts(), Receipts())
+    readers[0].issue(request_a, revision="a" * 40)
+    readers[1].issue(request_b, revision="c" * 40)
+    states = (
+        state,
+        replace(state, cell_key="d" * 64, active_receipt_id="receipt-642",
+                active_receipt_digest=request_b.digest),
+    )
+    start = threading.Barrier(2)
+    values = []
+    errors = []
+    lock = threading.Lock()
+
+    def race(index):
+        store = Store(path)
+        safety = OperationalSafety(store)
+        safety.canary_state = lambda _digest: states[index]
+        authority = CanaryAttributionAuthority(store, safety, readers[index])
+        try:
+            start.wait()
+            value = participate(store, authority, route_digest=active.digest)
+            with lock:
+                values.append(value)
+        except BaseException as error:
+            with lock:
+                errors.append(error)
+        finally:
+            store.close()
+
+    threads = [threading.Thread(target=race, args=(index,)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == [] and len(values) == 2 and values[0] == values[1]
+    winner = values[0]
+    assert winner is not None
+    assert (winner.receipt_id, winner.method_revision, winner.cohort_id) in {
+        ("receipt-641", "a" * 40, state.cell_key),
+        ("receipt-642", "c" * 40, "d" * 64),
+    }
+    assert sum(len(reader.calls) for reader in readers) == 1
+
+
 @pytest.mark.parametrize("fault", [
     "missing", "unreadable", "wrong_verifier", "wrong_scope", "wrong_policy",
     "wrong_binding",
@@ -383,6 +506,8 @@ def test_every_persisted_field_is_digest_verified_and_tamper_fails_closed(tmp_pa
     store, _safety, _receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
     value = participate(store, authority, route_digest=active.digest)
     assert value is not None
+    store._conn.execute("DROP TRIGGER canary_attributions_no_update")
+    store._conn.execute("PRAGMA ignore_check_constraints = ON")
     replacement = STAGE_IDENTITY + "-tampered" if column == "stage_identity" else "tampered"
     store._conn.execute(
         f"UPDATE canary_attributions SET {column} = ? WHERE stage_identity = ?",
@@ -435,10 +560,69 @@ def test_schema_is_closed_content_free_and_has_no_update_delete_surface(tmp_path
             CANARY_ATTRIBUTION_SCHEMA)
     assert store._conn.execute(
         "SELECT count(*) FROM sqlite_master WHERE type='trigger' AND tbl_name="
-        "'canary_attributions'").fetchone()[0] == 0
-    with pytest.raises(sqlite3.OperationalError):
+        "'canary_attributions'").fetchone()[0] == 2
+    store._conn.execute(
+        "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        attribution_row())
+    store.close()
+
+    external = sqlite3.connect(tmp_path / "schema.db")
+    register_sql_functions(external)
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        external.execute(
+            "UPDATE canary_attributions SET receipt_id='receipt-642'"
+            " WHERE stage_identity=?", (STAGE_IDENTITY,))
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        external.execute(
+            "DELETE FROM canary_attributions WHERE stage_identity=?", (STAGE_IDENTITY,))
+    assert external.execute(
+        "SELECT receipt_id FROM canary_attributions WHERE stage_identity=?",
+        (STAGE_IDENTITY,)).fetchone()[0] == "receipt-641"
+    external.close()
+
+
+@pytest.mark.parametrize("field,value", [
+    ("identity", "secret:token-123"),
+    ("identity", "ignore-previous-instructions"),
+    ("identity", "octo/app|641|build|prose"),
+    ("identity", "octo/app|641|build|prompt"),
+    ("identity", "octo/app|641|build|finding"),
+    ("identity", "octo/app|641|build|provider-output"),
+    ("identity", "octo/app|641|build|source-content"),
+    ("receipt", "secret:token-123"),
+    ("receipt", "ignore-previous-instructions"),
+    ("receipt", "receipt-prompt"),
+    ("receipt", "receipt-finding"),
+    ("receipt", "receipt-provider-output"),
+    ("receipt", "receipt-source-content"),
+])
+def test_schema_guard_rejects_content_like_values_even_with_matching_digest(
+        tmp_path, field, value):
+    store = Store(tmp_path / "closed.db")
+    arguments = {"identity": STAGE_IDENTITY, "receipt_id": "receipt-641"}
+    arguments["identity" if field == "identity" else "receipt_id"] = value
+    with pytest.raises(sqlite3.IntegrityError, match="canary_attributions_closed"):
         store._conn.execute(
-            "INSERT INTO canary_attributions VALUES (?,?,?,?,?,?,?,?,?,?)", ("prose",) * 10)
+            "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            attribution_row(**arguments))
+    store.close()
+
+
+@pytest.mark.parametrize("identity,receipt_id", [
+    (STAGE_IDENTITY, "receipt-641"),
+    ("octo/app|642|review|" + "c" * 40 + "|r1|afix", "receipt-vector-fleet"),
+    ("octo/app|643|respond|IC_comment_1", "receipt-vector-overlay"),
+    ("octo/app|644|research|-", "receipt-lesson-" + "d" * 32),
+])
+def test_closed_identity_and_receipt_grammars_accept_declared_structured_vectors(
+        tmp_path, identity, receipt_id):
+    store = Store(tmp_path / (receipt_id + ".db"))
+    store._conn.execute(
+        "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        attribution_row(identity=identity, receipt_id=receipt_id))
+    assert store._conn.execute(
+        "SELECT receipt_id FROM canary_attributions WHERE stage_identity=?",
+        (identity,)).fetchone()[0] == receipt_id
     store.close()
 
 
@@ -477,6 +661,8 @@ def test_exact_v2_migrates_to_complete_v3_without_rewriting_records_or_safety(tm
 @pytest.mark.parametrize("checkpoint", [
     "v2-to-v3:begin",
     "v2-to-v3:create:canary_attributions",
+    "v2-to-v3:create:no-update-trigger",
+    "v2-to-v3:create:no-delete-trigger",
     "v2-to-v3:verify:fingerprint",
     "v2-to-v3:set:user-version",
     "v2-to-v3:commit",
@@ -539,7 +725,7 @@ def test_tampered_v2_is_not_a_migration_source_and_target_mismatch_rolls_back(
     target = tmp_path / "tampered-target.db"
     exact_v2(target)
 
-    def wrong_schema(conn):
+    def wrong_schema(conn, *, checkpoint=None):
         conn.execute(CANARY_ATTRIBUTION_SCHEMA)
         conn.execute("CREATE TABLE attacker (value TEXT)")
 

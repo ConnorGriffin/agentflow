@@ -30,7 +30,15 @@ ATTRIBUTION_CONTRACT_VERSION = "agentflow-canary-attribution-v1"
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _REVISION = re.compile(r"^(?:[a-f0-9]{40}|sha256:[a-f0-9]{64})$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-_CONTENT_FREE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/|#-]*$")
+_STAGE_IDENTITY = re.compile(
+    r"^(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\|"
+    r"(?P<subject>[1-9][0-9]{0,19})\|"
+    r"(?P<stage>intake|attack|build|mockup|review|revise|respond|research)\|"
+    r"(?P<target>-|[a-f0-9]{40}|[1-9][0-9]{0,19}|"
+    r"(?:IC|PRRC|DC)_[A-Za-z0-9_-]{1,96})"
+    r"(?:\|(?:r|c|s|p|q|u)[1-9][0-9]{0,9}|\|a(?:product|standards|fix))*$")
+_RECEIPT_ID = re.compile(
+    r"^receipt-(?:lesson-[a-f0-9]{32}|[1-9][0-9]{0,19}|vector-(?:fleet|overlay))$")
 
 CANARY_ATTRIBUTION_REFUSAL_CODES = frozenset({
     "wrong_connection",
@@ -55,7 +63,24 @@ CANARY_ATTRIBUTION_SCHEMA = (
     " method_revision TEXT NOT NULL,"
     " cohort_id TEXT NOT NULL,"
     " contract_version TEXT NOT NULL,"
-    " attribution_digest TEXT NOT NULL)"
+    " attribution_digest TEXT NOT NULL,"
+    " CONSTRAINT canary_attributions_closed CHECK (canary_attribution_row_valid("
+    "stage_identity, repository, subject_revision, route_cell_digest, receipt_id,"
+    " method_revision, cohort_id, contract_version, attribution_digest) = 1))"
+)
+
+_NO_UPDATE_SCHEMA = (
+    "CREATE TRIGGER canary_attributions_no_update BEFORE UPDATE ON canary_attributions "
+    "BEGIN SELECT RAISE(ABORT, 'canary_attributions is append-only'); END"
+)
+_NO_DELETE_SCHEMA = (
+    "CREATE TRIGGER canary_attributions_no_delete BEFORE DELETE ON canary_attributions "
+    "BEGIN SELECT RAISE(ABORT, 'canary_attributions is append-only'); END"
+)
+CANARY_ATTRIBUTION_SCHEMA_STATEMENTS = (
+    ("v2-to-v3:create:canary_attributions", CANARY_ATTRIBUTION_SCHEMA),
+    ("v2-to-v3:create:no-update-trigger", _NO_UPDATE_SCHEMA),
+    ("v2-to-v3:create:no-delete-trigger", _NO_DELETE_SCHEMA),
 )
 
 CANARY_ATTRIBUTION_SCHEMA_FINGERPRINT = (
@@ -63,7 +88,16 @@ CANARY_ATTRIBUTION_SCHEMA_FINGERPRINT = (
      "createtablecanary_attributions(stage_identitytextprimarykey,repositorytextnotnull,"
      "subject_revisiontextnotnull,route_cell_digesttextnotnull,receipt_idtextnotnull,"
      "method_revisiontextnotnull,cohort_idtextnotnull,contract_versiontextnotnull,"
-     "attribution_digesttextnotnull)"),
+     "attribution_digesttextnotnull,constraintcanary_attributions_closedcheck("
+     "canary_attribution_row_valid(stage_identity,repository,subject_revision,"
+     "route_cell_digest,receipt_id,method_revision,cohort_id,contract_version,"
+     "attribution_digest)=1))"),
+    ("trigger", "canary_attributions_no_delete", "canary_attributions",
+     "createtriggercanary_attributions_no_deletebeforedeleteoncanary_attributionsbegin"
+     "selectraise(abort,'canary_attributionsisappend-only');end"),
+    ("trigger", "canary_attributions_no_update", "canary_attributions",
+     "createtriggercanary_attributions_no_updatebeforeupdateoncanary_attributionsbegin"
+     "selectraise(abort,'canary_attributionsisappend-only');end"),
 )
 
 # Exact coordinator Store schema-v2 migration source at #585 merge bd818fa.  The Store
@@ -204,9 +238,18 @@ class PromotionReceiptAuthority(Protocol):
     def read(self, receipt_id: str) -> PromotionReceipt: ...
 
 
-def initialize_schema(conn: sqlite3.Connection) -> None:
-    """Create only the attribution-owned append-only table."""
-    conn.execute(CANARY_ATTRIBUTION_SCHEMA)
+def register_sql_functions(conn: sqlite3.Connection) -> None:
+    """Install the deterministic validator referenced by the closed v3 table schema."""
+    conn.create_function(
+        "canary_attribution_row_valid", 9, _schema_row_valid, deterministic=True)
+
+
+def initialize_schema(conn: sqlite3.Connection, *, checkpoint=None) -> None:
+    """Create only the attribution-owned append-only table and guards."""
+    for name, statement in CANARY_ATTRIBUTION_SCHEMA_STATEMENTS:
+        if checkpoint is not None:
+            checkpoint(name)
+        conn.execute(statement)
 
 
 class CanaryAttributionAuthority:
@@ -236,16 +279,20 @@ class CanaryAttributionAuthority:
         """Join one caller-owned transaction; never begin, commit, or roll it back."""
         if connection is not self._conn:
             raise CanaryAttributionRefused("wrong_connection")
-        if not connection.in_transaction:
+        if (not connection.in_transaction
+                or getattr(connection, "_agentflow_transaction_mode", None) != "immediate"):
             raise CanaryAttributionRefused("outside_transaction")
         supplied = _validate_supplied(
-            logical_stage_identity, repository, subject_revision, route_cell_digest)
+            logical_stage_identity, repository, subject_revision, route_cell_digest,
+            bind_identity=False)
         with self._lock:
             existing = self._row(logical_stage_identity)
             if existing is not None:
                 if _supplied(existing) != supplied:
                     raise CanaryAttributionRefused("conflicting_attribution")
                 return existing
+
+            _stage_identity(logical_stage_identity, repository, "wrong_binding")
 
             try:
                 state = self._operational_safety.canary_state(route_cell_digest)
@@ -257,6 +304,7 @@ class CanaryAttributionAuthority:
                 raise CanaryAttributionRefused("wrong_binding")
             if state.active_receipt_id is None:
                 return None
+            _receipt_id(state.active_receipt_id, "wrong_binding")
             receipt = self._receipt(state.active_receipt_id)
             method_revision = self._validate_receipt(receipt, state, repository)
             facts = {
@@ -287,9 +335,11 @@ class CanaryAttributionAuthority:
 
     def read(self, stage_identity: str) -> CanaryAttribution | None:
         """Resolve one committed attribution without consulting external authorities."""
-        _content_free(stage_identity, "wrong_binding", maximum=512)
         with self._lock:
-            return self._row(stage_identity)
+            attribution = self._row(stage_identity)
+            if attribution is None:
+                _stage_identity(stage_identity, None, "wrong_binding")
+            return attribution
 
     def _row(self, stage_identity: str) -> CanaryAttribution | None:
         try:
@@ -354,10 +404,12 @@ class CanaryAttributionAuthority:
 
 
 def _validate_supplied(stage_identity: str, repository: str, subject_revision: str,
-                       route_cell_digest: str) -> tuple[str, str, str, str]:
-    _content_free(stage_identity, "wrong_binding", maximum=512)
+                       route_cell_digest: str, *,
+                       bind_identity: bool = True) -> tuple[str, str, str, str]:
     if not isinstance(repository, str) or not _REPOSITORY.fullmatch(repository):
         raise CanaryAttributionRefused("wrong_scope")
+    _stage_identity(
+        stage_identity, repository if bind_identity else None, "wrong_binding")
     _revision(subject_revision, "wrong_binding", commit_only=True)
     _sha256(route_cell_digest, "wrong_binding")
     return stage_identity, repository, subject_revision, route_cell_digest
@@ -370,7 +422,7 @@ def _supplied(value: CanaryAttribution) -> tuple[str, str, str, str]:
 
 def _validate_attribution(value: CanaryAttribution) -> None:
     _validate_supplied(*_supplied(value))
-    _content_free(value.receipt_id, "corrupt_attribution", maximum=128)
+    _receipt_id(value.receipt_id, "corrupt_attribution")
     _revision(value.method_revision, "corrupt_attribution")
     _sha256(value.cohort_id, "corrupt_attribution")
     if value.contract_version != ATTRIBUTION_CONTRACT_VERSION:
@@ -382,10 +434,16 @@ def _validate_attribution(value: CanaryAttribution) -> None:
         raise CanaryAttributionRefused("corrupt_attribution")
 
 
-def _content_free(value: object, code: str, *, maximum: int) -> None:
-    if (not isinstance(value, str) or not value or len(value.encode("utf-8")) > maximum
-            or unicodedata.normalize("NFC", value) != value
-            or not _CONTENT_FREE.fullmatch(value)):
+def _stage_identity(value: object, repository: str | None, code: str) -> None:
+    if (not isinstance(value, str) or unicodedata.normalize("NFC", value) != value
+            or (match := _STAGE_IDENTITY.fullmatch(value)) is None
+            or (repository is not None and match.group("repository") != repository)):
+        raise CanaryAttributionRefused(code)
+
+
+def _receipt_id(value: object, code: str) -> None:
+    if (not isinstance(value, str) or unicodedata.normalize("NFC", value) != value
+            or not _RECEIPT_ID.fullmatch(value)):
         raise CanaryAttributionRefused(code)
 
 
@@ -398,3 +456,11 @@ def _revision(value: object, code: str, *, commit_only: bool = False) -> None:
 def _sha256(value: object, code: str) -> None:
     if not isinstance(value, str) or not _SHA256.fullmatch(value):
         raise CanaryAttributionRefused(code)
+
+
+def _schema_row_valid(*values: object) -> int:
+    try:
+        _validate_attribution(CanaryAttribution(*values))
+    except (CanaryAttributionRefused, TypeError, ValueError):
+        return 0
+    return 1

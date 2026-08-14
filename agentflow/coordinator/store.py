@@ -70,6 +70,32 @@ class SafetyAdmissionParticipant(Protocol):
             self, conn: sqlite3.Connection, route_cell_digest: str) -> str: ...
 
 
+class _StoreConnection(sqlite3.Connection):
+    """SQLite connection that remembers the caller-owned transaction's declared mode."""
+
+    _agentflow_transaction_mode: str | None = None
+
+    def execute(self, sql, parameters=(), /):
+        result = super().execute(sql, parameters)
+        statement = " ".join(sql.strip().rstrip(";").upper().split())
+        if statement in {"BEGIN", "BEGIN DEFERRED", "BEGIN TRANSACTION",
+                         "BEGIN DEFERRED TRANSACTION"}:
+            self._agentflow_transaction_mode = "deferred"
+        elif statement in {"BEGIN IMMEDIATE", "BEGIN IMMEDIATE TRANSACTION"}:
+            self._agentflow_transaction_mode = "immediate"
+        elif statement in {"COMMIT", "END", "END TRANSACTION", "ROLLBACK"}:
+            self._agentflow_transaction_mode = None
+        return result
+
+    def commit(self) -> None:
+        super().commit()
+        self._agentflow_transaction_mode = None
+
+    def rollback(self) -> None:
+        super().rollback()
+        self._agentflow_transaction_mode = None
+
+
 @dataclass(frozen=True)
 class ReservationLimits:
     """Global limits that must be decided with the permit reservation.
@@ -143,8 +169,11 @@ class Store:
     def _open(path: Path) -> sqlite3.Connection:
         # Autocommit mode (isolation_level=None) so the reservation can hold a single
         # explicit BEGIN IMMEDIATE across its read and its write.
-        conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT_MS / 1000,
-                               isolation_level=None, check_same_thread=False)
+        conn = sqlite3.connect(
+            path, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None,
+            check_same_thread=False, factory=_StoreConnection)
+        from agentflow.canary_attribution import register_sql_functions
+        register_sql_functions(conn)
         conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
         return conn
 
@@ -221,9 +250,8 @@ class Store:
         try:
             Store._migration_checkpoint("v2-to-v3:begin")
             conn.execute("BEGIN IMMEDIATE")
-            Store._migration_checkpoint("v2-to-v3:create:canary_attributions")
             from agentflow.canary_attribution import initialize_schema
-            initialize_schema(conn)
+            initialize_schema(conn, checkpoint=Store._migration_checkpoint)
             Store._migration_checkpoint("v2-to-v3:verify:fingerprint")
             if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
                 raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
