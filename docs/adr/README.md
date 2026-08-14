@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 585](adr-585-bounded-operational-self-healing.md) — One OperationalSafety owner
+  performs one deterministic rerun, exact-RouteCell quarantine/CAS reopen, and
+  generation-bound approved-canary rollback in the coordinator Store.
 - [ADR 584](adr-584-human-governed-promotion.md) — Exact, human-governed
   promotion through a read-only GitHub authority receipt and SQLite schema v4 binding marker.
 - [ADR 626](adr-626-manifest-rooted-evaluation-semantic-bundle.md) — One versioned,

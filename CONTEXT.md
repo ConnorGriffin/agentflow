@@ -50,6 +50,22 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Environment failure** — a failure of the execution environment rather than the
   subject under examination; it is not evidence of a product or process defect.
 
+- **RouteCell** — one immutable launch identity: repository, stage, provider, model,
+  route ID, and the digest of its resolved launch configuration. A changed configuration
+  is a different RouteCell, never an edit to the existing one.
+
+- **Operational action** — one durable, idempotent intent to perform a bounded safety
+  response, paired with content-free effect evidence and proof of completion. Its kinds
+  are deterministic rerun, exact-RouteCell quarantine, and approved-canary rollback.
+
+- **RouteCell quarantine** — the admission refusal attached to one exact active RouteCell
+  after repeated verified operational failure. It does not stop running work or affect a
+  sibling RouteCell.
+
+- **Approved canary** — a human-approved active RouteCell revision whose receipt names
+  its exact known-good predecessor and disabled generation. Automatic rollback may restore
+  only that predecessor; re-enabling needs a fresh approval for the current generation.
+
 - **Agentflow** — the headless workflow engine that moves approved GitHub build
   issues through intake, dispatch, build, review, and merge. It does not own
   planning conversations, issue tracking, or repository decisions.
