@@ -26,7 +26,7 @@ from agentflow.canary_attribution import (
     _digest,
     register_sql_functions,
 )
-from agentflow.coordinator.record import Record
+from agentflow.coordinator.record import ENABLED_STAGES, Record
 from agentflow.coordinator.store import (
     SCHEMA_VERSION,
     Store,
@@ -35,7 +35,13 @@ from agentflow.coordinator.store import (
     _expected_schema_fingerprint,
     _schema_fingerprint,
 )
-from agentflow.evidence import ApprovedAuthority, AuthorityPointer, EvidenceError, PromotionReceipt
+from agentflow.evidence import (
+    ApprovedAuthority,
+    AuthorityPointer,
+    EvidenceError,
+    PromotionReceipt,
+    valid_promotion_receipt_id,
+)
 from agentflow.operational_safety import (
     CanaryActivationRequest,
     OperationalSafety,
@@ -166,6 +172,8 @@ def test_contract_dependencies_vectors_schema_and_public_interface_are_exact():
         "coordinator_store_target_schema": 3,
         "coordinator_store_target_fingerprint_digest":
             "c8ed40cef9b93df395c4c57f62eb25b0b67422c000c22ece690c32f76a3f3921",
+        "coordinator_stage_vocabulary_digest": _digest(ENABLED_STAGES),
+        "evidence_promotion_receipt_id_grammar": "evidence-promotion-receipt-id-v1",
     }
     assert STORE_V2_SCHEMA_FINGERPRINT == _expected_schema_fingerprint(2)
     assert STORE_V2_SCHEMA_FINGERPRINT_DIGEST == (
@@ -175,7 +183,7 @@ def test_contract_dependencies_vectors_schema_and_public_interface_are_exact():
         "c8ed40cef9b93df395c4c57f62eb25b0b67422c000c22ece690c32f76a3f3921")
     assert CANARY_ATTRIBUTION_CONTRACT["schema"] == ATTRIBUTION_CONTRACT_VERSION
     assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == _digest(CANARY_ATTRIBUTION_CONTRACT) == (
-        "745df06c868e3f3655d005aaab134a2a5b68573df0d617e19ede0c9a5dc8d237")
+        "ffc5b2b7c9c259dbb884841b96e0120428913f5b9c1a8c635463db18758c5571")
     for vector in CANARY_ATTRIBUTION_VECTORS:
         assert vector["attribution"]["receipt_id"] == vector["receipt"]["receipt_id"]
         assert (vector["attribution"]["method_revision"]
@@ -268,6 +276,30 @@ def test_exact_connection_open_transaction_and_operational_safety_binding_are_re
         CanaryAttributionAuthority(other, safety, receipts)
     assert refused.value.code == "wrong_connection"
     other.close()
+    store.close()
+
+
+def test_cursor_transaction_paths_cannot_reuse_stale_immediate_authority_before_reads(tmp_path):
+    store, safety, receipts, _predecessor, active, _state, _receipt, authority = canary(tmp_path)
+    # Constructing sqlite3.Cursor directly bypasses Connection.cursor and any cursor factory.
+    # The Store connection's transaction authority must still observe every statement.
+    cursor = sqlite3.Cursor(store._conn)
+    cursor.execute("BEGIN IMMEDIATE")
+    assert authority.participate_in_admission(
+        store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest) is not None
+    cursor.execute("ROLLBACK")
+
+    receipts.calls.clear()
+    safety.canary_state = lambda _digest: (_ for _ in ()).throw(
+        AssertionError("cursor-deferred transaction performed an external read"))
+    store._conn.execute("BEGIN IMMEDIATE")
+    cursor.execute("COMMIT")
+    cursor.execute("BEGIN")
+    with pytest.raises(CanaryAttributionRefused) as refused:
+        authority.participate_in_admission(
+            store._conn, STAGE_IDENTITY, "octo/app", SUBJECT_REVISION, active.digest)
+    assert refused.value.code == "outside_transaction" and receipts.calls == []
+    cursor.execute("ROLLBACK")
     store.close()
 
 
@@ -613,6 +645,9 @@ def test_schema_guard_rejects_content_like_values_even_with_matching_digest(
     ("octo/app|642|review|" + "c" * 40 + "|r1|afix", "receipt-vector-fleet"),
     ("octo/app|643|respond|IC_comment_1", "receipt-vector-overlay"),
     ("octo/app|644|research|-", "receipt-lesson-" + "d" * 32),
+    ("octo/app|conv-1|converse|0", "receipt-candidate-alpha"),
+    ("octo/app|123e4567-e89b-42d3-a456-426614174000|converse|1",
+     "receipt-candidate-alpha"),
 ])
 def test_closed_identity_and_receipt_grammars_accept_declared_structured_vectors(
         tmp_path, identity, receipt_id):
@@ -624,6 +659,15 @@ def test_closed_identity_and_receipt_grammars_accept_declared_structured_vectors
         "SELECT receipt_id FROM canary_attributions WHERE stage_identity=?",
         (identity,)).fetchone()[0] == receipt_id
     store.close()
+
+
+def test_stage_and_receipt_grammars_are_bound_to_the_authoritative_sources():
+    assert "converse" in ENABLED_STAGES
+    assert valid_promotion_receipt_id("receipt-candidate-alpha")
+    for content_like in (
+            "secret:token-123", "ignore-previous-instructions", "receipt-candidate-secret",
+            "receipt-candidate-prompt", "receipt-provider-output", "receipt-source-content"):
+        assert not valid_promotion_receipt_id(content_like)
 
 
 @pytest.mark.parametrize("identity,repository,revision", [

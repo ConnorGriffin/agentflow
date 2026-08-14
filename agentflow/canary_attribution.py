@@ -15,7 +15,13 @@ import sqlite3
 import unicodedata
 from typing import Protocol
 
-from agentflow.evidence import EvidenceError, PromotionReceipt
+from agentflow.coordinator.record import ENABLED_STAGES
+from agentflow.evidence import (
+    PROMOTION_RECEIPT_ID_GRAMMAR_VERSION,
+    EvidenceError,
+    PromotionReceipt,
+    valid_promotion_receipt_id,
+)
 from agentflow.operational_safety import (
     CanaryState,
     OperationalSafety,
@@ -30,15 +36,18 @@ ATTRIBUTION_CONTRACT_VERSION = "agentflow-canary-attribution-v1"
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _REVISION = re.compile(r"^(?:[a-f0-9]{40}|sha256:[a-f0-9]{64})$")
 _REPOSITORY = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+_ISSUE_SUBJECT = re.compile(r"^[1-9][0-9]{0,19}$")
+_CONVERSATION_SUBJECT = re.compile(
+    r"^(?:[1-9][0-9]{0,19}|[a-f0-9]{32}|[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-"
+    r"[89ab][a-f0-9]{3}-[a-f0-9]{12}|(?:conv|conversation)-[1-9][0-9]{0,19})$")
+_STAGE_VOCABULARY = "|".join(re.escape(stage) for stage in ENABLED_STAGES)
 _STAGE_IDENTITY = re.compile(
     r"^(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\|"
-    r"(?P<subject>[1-9][0-9]{0,19})\|"
-    r"(?P<stage>intake|attack|build|mockup|review|revise|respond|research)\|"
-    r"(?P<target>-|[a-f0-9]{40}|[1-9][0-9]{0,19}|"
+    r"(?P<subject>[A-Za-z0-9-]{1,64})\|"
+    rf"(?P<stage>{_STAGE_VOCABULARY})\|"
+    r"(?P<target>-|[a-f0-9]{40}|[0-9]{1,20}|"
     r"(?:IC|PRRC|DC)_[A-Za-z0-9_-]{1,96})"
     r"(?:\|(?:r|c|s|p|q|u)[1-9][0-9]{0,9}|\|a(?:product|standards|fix))*$")
-_RECEIPT_ID = re.compile(
-    r"^receipt-(?:lesson-[a-f0-9]{32}|[1-9][0-9]{0,19}|vector-(?:fleet|overlay))$")
 
 CANARY_ATTRIBUTION_REFUSAL_CODES = frozenset({
     "wrong_connection",
@@ -170,6 +179,8 @@ DEPENDENCY_PINS = {
     "coordinator_store_schema_fingerprint_digest": STORE_V2_SCHEMA_FINGERPRINT_DIGEST,
     "coordinator_store_target_schema": 3,
     "coordinator_store_target_fingerprint_digest": STORE_V3_SCHEMA_FINGERPRINT_DIGEST,
+    "coordinator_stage_vocabulary_digest": _digest(ENABLED_STAGES),
+    "evidence_promotion_receipt_id_grammar": PROMOTION_RECEIPT_ID_GRAMMAR_VERSION,
 }
 
 CANARY_ATTRIBUTION_CONTRACT = {
@@ -279,8 +290,9 @@ class CanaryAttributionAuthority:
         """Join one caller-owned transaction; never begin, commit, or roll it back."""
         if connection is not self._conn:
             raise CanaryAttributionRefused("wrong_connection")
-        if (not connection.in_transaction
-                or getattr(connection, "_agentflow_transaction_mode", None) != "immediate"):
+        transaction_authority = getattr(
+            connection, "_agentflow_has_immediate_transaction_authority", None)
+        if (not callable(transaction_authority) or not transaction_authority()):
             raise CanaryAttributionRefused("outside_transaction")
         supplied = _validate_supplied(
             logical_stage_identity, repository, subject_revision, route_cell_digest,
@@ -439,11 +451,19 @@ def _stage_identity(value: object, repository: str | None, code: str) -> None:
             or (match := _STAGE_IDENTITY.fullmatch(value)) is None
             or (repository is not None and match.group("repository") != repository)):
         raise CanaryAttributionRefused(code)
+    subject = match.group("subject")
+    target = match.group("target")
+    if match.group("stage") == "converse":
+        if (_CONVERSATION_SUBJECT.fullmatch(subject) is None
+                or re.fullmatch(r"(?:0|[1-9][0-9]{0,19})", target) is None):
+            raise CanaryAttributionRefused(code)
+    elif _ISSUE_SUBJECT.fullmatch(subject) is None or target == "0":
+        raise CanaryAttributionRefused(code)
 
 
 def _receipt_id(value: object, code: str) -> None:
     if (not isinstance(value, str) or unicodedata.normalize("NFC", value) != value
-            or not _RECEIPT_ID.fullmatch(value)):
+            or not valid_promotion_receipt_id(value)):
         raise CanaryAttributionRefused(code)
 
 

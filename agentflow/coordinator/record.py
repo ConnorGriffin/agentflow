@@ -10,6 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+# The coordinator's complete logical-stage vocabulary.  It lives beside Record, the
+# durable source whose ``stage`` field carries these values, so admission, projections,
+# and content-free consumers do not maintain independent copies.
+ENABLED_STAGES = ("intake", "build", "review", "revise", "mockup", "respond", "converse",
+                  "research", "attack")
+
 # The four persisted states (ADR 0028). `completed`/`held` are reconciliation states that
 # retire once ownership transfers or the durable boundary is confirmed.
 WAITING = "waiting"

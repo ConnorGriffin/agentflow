@@ -71,29 +71,73 @@ class SafetyAdmissionParticipant(Protocol):
 
 
 class _StoreConnection(sqlite3.Connection):
-    """SQLite connection that remembers the caller-owned transaction's declared mode."""
+    """SQLite connection that remembers every caller-owned transaction's declared mode.
+
+    SQLite permits callers to construct ``sqlite3.Cursor(connection)`` directly, bypassing a
+    connection's cursor factory.  The connection-level trace is therefore the authority: SQLite
+    invokes it for statements from connection helpers, ordinary cursors, direct base cursors, and
+    scripts alike.  Callers cannot replace it and leave stale admission metadata behind.
+    """
 
     _agentflow_transaction_mode: str | None = None
 
-    def execute(self, sql, parameters=(), /):
-        result = super().execute(sql, parameters)
-        statement = " ".join(sql.strip().rstrip(";").upper().split())
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._agentflow_transaction_mode = None
+        self._agentflow_trace_generation = 0
+        super().set_trace_callback(self._track_transaction_statement)
+
+    def set_trace_callback(self, trace_callback) -> None:
+        raise sqlite3.NotSupportedError("Store transaction authority trace cannot be replaced")
+
+    def _track_transaction_statement(self, sql: str) -> None:
+        self._agentflow_trace_generation += 1
+        without_comments = re.sub(r"/\*.*?\*/|--[^\r\n]*(?:\r?\n|$)", " ", sql,
+                                  flags=re.DOTALL)
+        statement = " ".join(without_comments.strip().rstrip(";").upper().split())
         if statement in {"BEGIN", "BEGIN DEFERRED", "BEGIN TRANSACTION",
                          "BEGIN DEFERRED TRANSACTION"}:
-            self._agentflow_transaction_mode = "deferred"
+            self._agentflow_transaction_mode = (
+                "deferred" if not self.in_transaction else None)
         elif statement in {"BEGIN IMMEDIATE", "BEGIN IMMEDIATE TRANSACTION"}:
-            self._agentflow_transaction_mode = "immediate"
+            self._agentflow_transaction_mode = (
+                "immediate" if not self.in_transaction else None)
         elif statement in {"COMMIT", "END", "END TRANSACTION", "ROLLBACK"}:
             self._agentflow_transaction_mode = None
-        return result
+        elif statement.startswith("BEGIN "):
+            self._agentflow_transaction_mode = None
+
+    def _agentflow_has_immediate_transaction_authority(self) -> bool:
+        """Prove the trace is still installed as well as checking its tracked mode.
+
+        Calling a base-class descriptor can bypass Python overrides, including
+        ``sqlite3.Connection.set_trace_callback(connection, None)``.  A harmless statement with
+        an expected trace generation makes that path fail closed before an external authority is
+        read; it cannot turn a deferred transaction into a writer.
+        """
+        if (not self.in_transaction
+                or self._agentflow_transaction_mode != "immediate"):
+            return False
+        generation = self._agentflow_trace_generation
+        try:
+            super().execute("SELECT 1 /* agentflow transaction authority */").fetchone()
+        except sqlite3.DatabaseError:
+            return False
+        return (self.in_transaction
+                and self._agentflow_transaction_mode == "immediate"
+                and self._agentflow_trace_generation == generation + 1)
 
     def commit(self) -> None:
-        super().commit()
-        self._agentflow_transaction_mode = None
+        try:
+            super().commit()
+        finally:
+            self._agentflow_transaction_mode = None
 
     def rollback(self) -> None:
-        super().rollback()
-        self._agentflow_transaction_mode = None
+        try:
+            super().rollback()
+        finally:
+            self._agentflow_transaction_mode = None
 
 
 @dataclass(frozen=True)
