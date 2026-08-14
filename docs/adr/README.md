@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 628](adr-628-read-only-effective-policy-briefings.md) — A read-only resolver folds pinned
+  fleet policy, monotone repository overlays, and stage applicability into one bounded immutable
+  briefing without acquiring promotion or persistence authority.
 - [ADR 585](adr-585-bounded-operational-self-healing.md) — One OperationalSafety owner
   performs one deterministic rerun, exact-RouteCell quarantine/CAS reopen, and
   generation-bound approved-canary rollback in the coordinator Store.
