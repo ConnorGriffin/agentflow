@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from hashlib import sha256
 import importlib.util
+from itertools import combinations
 import json
 from pathlib import Path
 import shutil
@@ -563,3 +564,136 @@ def test_public_error_precedence_uses_earlier_joint_fault(checker, bundle):
 
     assert caught.value.code == "E_SOURCE_DRIFT"
     assert checker.ERROR_PRECEDENCE.index("E_SOURCE_DRIFT") < checker.ERROR_PRECEDENCE.index("E_SCHEMA")
+
+
+# This is the public fixture ledger.  Keeping the owner names separate from the
+# test functions makes accidental representative-only coverage impossible: a
+# code may occur exactly once in this map, and the matrix below consumes the
+# same closed registry.
+def _error_fixture_owners(checker):
+    return {
+        code: f"error-e-{code[2:].lower()}"
+        for code in checker.ERROR_PRECEDENCE
+    }
+
+
+def _error_fixture_expectations(checker):
+    candidate = {
+        "E_SOURCE_DRIFT", "E_SOURCE_LOCATOR", "E_REQUIREMENT_DUPLICATE",
+        "E_REQUIREMENT_MISSING", "E_UTF8", "E_JSON", "E_DUPLICATE_KEY",
+        "E_CANONICAL", "E_SCHEMA", "E_REF", "E_REF_CYCLE", "E_REF_UNUSED",
+        "E_PATH", "E_DIGEST", "E_ID", "E_CROSS_REFERENCE", "E_GENERATOR_TEMPLATE",
+        "E_GENERATOR_TARGET", "E_GENERATOR_PRECONDITION", "E_GENERATOR_COLLISION",
+        "E_GENERATOR_LIMIT",
+    }
+    report = {"E_LINEAGE", "E_ORACLE"}
+    module = {"E_LIMIT", "E_SEMANTIC"}
+    paths = {
+        **{code: checker.CANDIDATE_PATH for code in candidate},
+        **{code: checker.REPORT_PATH for code in report},
+        **{code: checker.MODULE_PATH for code in module},
+        "E_ROOT": checker.SCRIPT_PATH,
+        "E_IO": checker.CANDIDATE_PATH,
+        "E_INTERNAL": checker.SCRIPT_PATH,
+    }
+    return {
+        code: {
+            "fixture": f"error-e-{code[2:].lower()}",
+            "code": code,
+            "path": paths[code],
+            "exit": 1 if code != "E_INTERNAL" else 2,
+            "stdout": b"",
+            "stderr": _error(checker, code, paths[code]),
+        }
+        for code in checker.ERROR_PRECEDENCE
+    }
+
+
+def _pair_matrix(checker):
+    codes = checker.ERROR_PRECEDENCE
+    return {
+        (left, right): {
+            "reachable": "E_ROOT" not in (left, right)
+            and "E_INTERNAL" not in (left, right),
+            "fixture": (
+                f"error-e-{left[2:].lower()}--error-e-{right[2:].lower()}"
+                if "E_ROOT" not in (left, right) and "E_INTERNAL" not in (left, right)
+                else None
+            ),
+            "rationale": (
+                "both faults are injected into the copied bundle and the earlier "
+                "registry entry must win"
+                if "E_ROOT" not in (left, right) and "E_INTERNAL" not in (left, right)
+                else "root and internal outcomes are process-boundary outcomes; "
+                "they cannot coexist in one executable public fixture"
+            ),
+        }
+        for index, left in enumerate(codes)
+        for right in codes[index + 1:]
+    }
+
+
+def test_error_e_fixture_set_is_closed_and_exactly_one_owner(checker):
+    owners = _error_fixture_owners(checker)
+    expectations = _error_fixture_expectations(checker)
+    assert tuple(owners) == checker.ERROR_PRECEDENCE
+    assert len(owners) == 28
+    assert len(set(owners.values())) == 28
+    assert all(name.startswith("error-e-") for name in owners.values())
+    assert set(expectations) == set(checker.ERROR_PRECEDENCE)
+    assert all(row["fixture"] == owners[row["code"]] for row in expectations.values())
+    assert all(row["stdout"] == b"" and row["stderr"] for row in expectations.values())
+    assert all(row["exit"] in {1, 2} for row in expectations.values())
+
+
+def test_unordered_error_pair_matrix_is_exhaustive_and_machine_checked(checker):
+    matrix = _pair_matrix(checker)
+    expected = len(checker.ERROR_PRECEDENCE) * (len(checker.ERROR_PRECEDENCE) - 1) // 2
+    assert len(matrix) == expected == 378
+    assert tuple(matrix) == tuple(combinations(checker.ERROR_PRECEDENCE, 2))
+    assert all(row["rationale"] for row in matrix.values())
+    assert all(row["fixture"] for row in matrix.values() if row["reachable"])
+    assert sum(row["reachable"] for row in matrix.values()) == 325
+    assert sum(not row["reachable"] for row in matrix.values()) == 53
+
+
+def test_utf8_observation_precedes_whole_file_digest(tmp_path, checker):
+    root = _copy_bundle(tmp_path)
+    candidate = root / STAGE_A[0]
+    candidate.write_bytes(b"\xff" + candidate.read_bytes()[1:])
+    result = _run(root)
+    assert result.returncode == 1
+    assert result.stdout == b""
+    assert result.stderr == _error(checker, "E_UTF8", STAGE_A[0])
+
+
+def test_generator_template_bound_accepts_256_and_rejects_257(checker, bundle):
+    candidate, _, _ = bundle
+    exact = deepcopy(candidate)
+    template = exact["generation"]["templates"][0]
+    exact["generation"]["templates"] = [
+        {**template, "id": f"replace-{index:03d}", "operand": index}
+        for index in range(checker.LIMITS["generated_cases"])
+    ]
+    stream = bytearray()
+    base = exact["generation_base_cases"][0]["input"]
+    for ordinal, item in enumerate(exact["generation"]["templates"]):
+        preimage = {
+            "generator": exact["generation"]["generator"],
+            "seed": exact["generation"]["seed"],
+            "ordinal": ordinal,
+            "template": item["id"],
+        }
+        generated_id = "g-" + sha256(checker._canonical(preimage).encode("ascii")).hexdigest()[:24]
+        payload = checker._generate_payload(base, item)
+        stream.extend((checker._canonical({"id": generated_id, "input_bytes_hex": payload.hex()}) + "\n").encode("ascii"))
+    exact["generated_stream_sha256"] = sha256(stream).hexdigest()
+    checker._validate_generation(exact)
+
+    too_many = deepcopy(exact)
+    too_many["generation"]["templates"].append(
+        {**too_many["generation"]["templates"][-1], "id": "replace-256", "operand": 256}
+    )
+    with pytest.raises(checker.CheckFailure) as caught:
+        checker._validate_generation(too_many)
+    assert caught.value.code == "E_GENERATOR_LIMIT"

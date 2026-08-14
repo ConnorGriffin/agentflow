@@ -894,13 +894,16 @@ def _check_bundle(root_fd):
         if len(data) > maximum:
             _fail("E_LIMIT", path)
         contents[path] = data
+    # Observe encoding and syntax before whole-file locks.  The public priority
+    # puts E_UTF8/E_JSON ahead of E_DIGEST, so a malformed artifact must not be
+    # hidden by a stale lock.  The module audit has the same limit/encoding order.
+    candidate = _decode_json(contents[CANDIDATE_PATH], CANDIDATE_PATH)
+    report = _decode_json(contents[REPORT_PATH], REPORT_PATH)
+    evaluate = _audit_and_load_module(contents[MODULE_PATH])
     digests = {path: sha256(data).hexdigest() for path, data in contents.items()}
     for path in ARTIFACT_PATHS:
         if digests[path] != WHOLE_FILE_SHA256[path]:
             _fail("E_DIGEST", path)
-    candidate = _decode_json(contents[CANDIDATE_PATH], CANDIDATE_PATH)
-    report = _decode_json(contents[REPORT_PATH], REPORT_PATH)
-    evaluate = _audit_and_load_module(contents[MODULE_PATH])
     _validate_candidate(candidate, digests[MODULE_PATH])
     _validate_report(report, candidate, digests[CANDIDATE_PATH], digests[MODULE_PATH], evaluate)
 
