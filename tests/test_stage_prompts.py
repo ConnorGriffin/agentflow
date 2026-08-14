@@ -96,6 +96,7 @@ def test_runtime_preflight_reuses_trusted_static_inspection_and_fails_closed(
 
     assert result.state == runtime_state
     assert result.ready is False
+    assert result.ready_fact is None
     assert calls and calls[0][0] == tmp_path
     assert calls[0][4] == "codex"
 

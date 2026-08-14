@@ -78,6 +78,7 @@ def test_malformed_historical_capability_context_becomes_named_environment_failu
         source=str(tmp_path), capability_context=durable)
     result = _capability_preflight(record, False)
     assert result is not None and result.state == "incompatible"
+    assert result.ready_fact is None
     assert result.evidence[0].startswith("capability-context-invalid:")
 
 
@@ -155,7 +156,44 @@ def test_pre_582_record_without_any_safe_surface_fact_fails_closed(tmp_path):
     result = _capability_preflight(record, False)
 
     assert result is not None and result.state == "incompatible"
+    assert result.ready_fact is None
     assert result.evidence[0].startswith("capability-context-unavailable:")
+
+
+def test_missing_launch_root_never_carries_a_ready_fact(tmp_path):
+    from agentflow.pipeline import _capability_preflight
+
+    record = Record(
+        identity="o/r|5|build|-", stage="build", pool="claude", demand=1,
+        source=str(tmp_path / "missing"), capability_context="{}")
+
+    result = _capability_preflight(record, False)
+
+    assert result is not None and result.state == "missing"
+    assert result.ready_fact is None
+    assert result.evidence[0].startswith("launch-root-missing:")
+
+
+def test_failed_launch_materialization_never_carries_a_ready_fact(tmp_path, monkeypatch):
+    from agentflow.pipeline import _capability_preflight
+
+    source = tmp_path / "repo"
+    launch = source / ".agentflow" / "worktrees" / "claude" / "issue-5-fix"
+    launch.mkdir(parents=True)
+    (launch / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: none\n")
+    monkeypatch.setattr(
+        "agentflow.provider_skills.materialize_launch_capabilities",
+        lambda *_args: (False, "copy failed"),
+    )
+    record = Record(
+        identity="o/r|5|build|-", stage="build", pool="claude", demand=1,
+        source=str(launch), capability_root=str(source), capability_context="{}")
+
+    result = _capability_preflight(record, True)
+
+    assert result is not None and result.state == "incompatible"
+    assert result.ready_fact is None
+    assert result.evidence == ("launch-root-materialization-failed: copy failed",)
 
 
 def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):

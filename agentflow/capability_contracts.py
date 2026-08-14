@@ -118,7 +118,9 @@ def _checked_requirements(requirements: tuple[ContractRequirement, ...]) -> tupl
             raise ValueError(f"cyclic capability dependency at {requirement.id}")
         prior = seen.get(requirement.id)
         if prior is not None:
-            if (prior.version, prior.runtime) != (requirement.version, requirement.runtime):
+            if (prior.version, prior.runtime, prior.dependencies) != (
+                requirement.version, requirement.runtime, requirement.dependencies
+            ):
                 raise ValueError(f"conflicting capability requirement for {requirement.id}")
             return
         visiting.add(requirement.id)

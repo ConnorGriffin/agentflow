@@ -10,6 +10,7 @@ from agentflow.capability_contracts import (
     CapabilityReadyFact,
     ContractRequirement,
     preflight,
+    requirements_for,
     validate_capability_ready_fact,
 )
 
@@ -70,6 +71,23 @@ def test_ready_identity_changes_for_stage_provider_and_exact_manifest_bytes(
     assert changed_manifest is not None and changed_manifest.capability_id != original.capability_id
 
 
+def test_duplicate_requirement_with_divergent_closure_fails_closed():
+    version = "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+    invocations = (
+        SimpleNamespace(requirement=ContractRequirement(
+            "codebase-design", version,
+            dependencies=(ContractRequirement("domain-modeling", version),),
+        ), condition=None),
+        SimpleNamespace(requirement=ContractRequirement(
+            "codebase-design", version,
+            dependencies=(ContractRequirement("tdd", version),),
+        ), condition=None),
+    )
+
+    with pytest.raises(ValueError, match="conflicting capability requirement"):
+        requirements_for(invocations, {})
+
+
 def test_ready_fact_pins_the_public_digest_vector_and_content_free_shape(
     tmp_path, monkeypatch
 ):
@@ -109,6 +127,15 @@ def test_ready_fact_pins_the_public_digest_vector_and_content_free_shape(
         lambda fact: replace(fact, stage="review"),
         lambda fact: replace(fact, provider="claude"),
         lambda fact: replace(fact, manifest_digest="0" * 64),
+        lambda fact: replace(
+            fact, contracts=(replace(fact.contracts[0], contract_id="tdd"),) + fact.contracts[1:]
+        ),
+        lambda fact: replace(
+            fact, contracts=(replace(fact.contracts[0], contract_version="v0.3.0"),) + fact.contracts[1:]
+        ),
+        lambda fact: replace(
+            fact, contracts=(replace(fact.contracts[0], runtime=True),) + fact.contracts[1:]
+        ),
         lambda fact: replace(fact, contracts=tuple(reversed(fact.contracts))),
         lambda fact: replace(fact, contracts=fact.contracts + (fact.contracts[0],)),
         lambda fact: replace(fact, capability_digest="0" * 64),
