@@ -21,6 +21,10 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 653](adr-653-germanium-naming-stack.md) — The native operator product is Germanium and
+  its headless engine is Germanium Core. The Python distribution and import use
+  `germanium-core` and `germanium_core`, while the installed executable remains `germanium`;
+  migration and compatibility are planned separately rather than performed as a global rename.
 - [ADR 646](adr-646-immutable-route-selection.md) — Routing materializes one closed immutable
   launch artifact; OperationalSafety registers and decodes it for shared argv and supervision
   consumption without giving ordinary admission routing authority.
