@@ -9,11 +9,11 @@ Date: 2026-08-13
 data contract the sole Evaluation v1 semantic authority. The preflight for
 [#617](https://github.com/ConnorGriffin/agentflow/issues/617) then required an
 independent generic interpreter for the contract's procedural semantics. The
-provenance work on [#617](https://github.com/ConnorGriffin/agentflow/issues/617)
+provenance work on [#622](https://github.com/ConnorGriffin/agentflow/issues/622)
 demonstrated that this boundary needs a custom schema and opcode VM, duplicates
 algorithmic policy in the checker, and still does not close cold execution.
 
-The settled Evaluation decisions from that provenance remain inputs to #622.
+The settled Evaluation decisions from that provenance remain inputs to #617.
 Only their abandoned schema/opcode representation is rejected.
 
 ## Decision
