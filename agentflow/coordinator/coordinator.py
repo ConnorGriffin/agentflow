@@ -936,6 +936,13 @@ class Coordinator:
         # mode, RouteCell resolution, and briefing/capability admission receipts.
         reservation_limits = getattr(self._gate, "reservation_limits", None)
         limits = reservation_limits(record) if reservation_limits is not None else None
+        # Preparation is Coordinator-owned and may legitimately rewrite the WAITING row (for
+        # example, a pool/model migration or refusal/stall clearing).  Commit that exact state
+        # through the existing CAS seam before Store reloads it for admission.  A lost CAS ends
+        # this attempt; the winner's durable row remains authoritative and no reservation is
+        # attempted from the stale object.
+        if not self._persist(record):
+            return False
         admission = self._store.reserve(ReservationIntent(
             identity=record.identity,
             expected_launch_token=record.launch_token,

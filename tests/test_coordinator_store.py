@@ -33,30 +33,46 @@ def test_default_store_lives_under_the_state_directory(coord_state):
     assert default_store_path().is_relative_to(coord_state)
 
 
-def test_coordinator_begin_start_uses_no_admission_intent_without_premutation(
+def test_coordinator_begin_start_persists_waiting_then_uses_only_no_admission_intent(
         coord_state, monkeypatch):
     coordinator = Coordinator(daemon_generation="daemon-compat")
     record = Record(
         "compat", "review", "codex", 1, state=WAITING, lineage="codex",
         launch_token="prior-token", start_fact="not_started", family="old-family",
-        process_alive=True, attempt_committed=True, started_at=4, deadline=5)
+        process_alive=True, attempt_committed=True, started_at=4, deadline=5,
+        model="legacy-model", refusal="checkout-failed: old", refusals=3,
+        stall_refusal_id="checkout-failed", stall_started_at=7,
+        stall_last_observed_at=8)
     assert coordinator._store.upsert(record)
     coordinator._records[record.identity] = record
-    before = record.__dict__.copy()
+    record.model = "prepared-model"
+    record.refusal = ""
+    record.refusals = 0
+    record.stall_refusal_id = ""
+    record.stall_started_at = 0
+    record.stall_last_observed_at = 0
     reserve = coordinator._store.reserve
     captured = []
 
     def observe(intent):
         captured.append(intent)
-        assert record.__dict__ == before
+        assert type(intent) is ReservationIntent
+        prepared = coordinator._store.record_of(record.identity)
+        assert prepared == record
+        assert prepared is not None and prepared.state == WAITING
+        assert prepared.revision == 2 and prepared.launch_token == "prior-token"
         return reserve(intent)
 
     monkeypatch.setattr(coordinator._store, "reserve", observe)
     assert coordinator._begin_start(record, 100)
     assert captured == [ReservationIntent(
-        "compat", "prior-token", 1, 100, "daemon-compat", 5, None, None)]
+        "compat", "prior-token", 2, 100, "daemon-compat", 5, None, None)]
     durable = coordinator._store.record_of("compat")
     assert durable == record and record.state == RUNNING
+    assert record.revision == 3 and record.model == "prepared-model"
+    assert record.refusal == "" and record.refusals == 0
+    assert record.stall_refusal_id == "" and record.stall_started_at == 0
+    assert record.stall_last_observed_at == 0
     assert record.launch_token != "prior-token"
     assert coordinator._store.permits_used("codex") == 1
     coordinator._store.close()
