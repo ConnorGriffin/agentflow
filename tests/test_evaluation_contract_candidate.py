@@ -5,6 +5,7 @@ from hashlib import sha256
 import importlib.util
 from itertools import combinations
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -26,6 +27,16 @@ STAGE_A_DIGESTS = (
     "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554",
 )
 SUCCESS = b'{"checked":3,"format":"evaluation-contract-candidate-check-v1","status":"ok"}\n'
+PUBLIC_ERROR_CODES = (
+    "E_ROOT", "E_SOURCE_DRIFT", "E_SOURCE_LOCATOR", "E_REQUIREMENT_DUPLICATE",
+    "E_REQUIREMENT_MISSING", "E_IO", "E_LIMIT", "E_UTF8", "E_JSON",
+    "E_DUPLICATE_KEY", "E_CANONICAL", "E_SCHEMA", "E_REF", "E_REF_CYCLE",
+    "E_REF_UNUSED", "E_PATH", "E_DIGEST", "E_ID", "E_CROSS_REFERENCE",
+    "E_LINEAGE", "E_ORACLE", "E_GENERATOR_TEMPLATE", "E_GENERATOR_TARGET",
+    "E_GENERATOR_PRECONDITION", "E_GENERATOR_COLLISION", "E_GENERATOR_LIMIT",
+    "E_SEMANTIC", "E_INTERNAL",
+)
+ERROR_PAIRS = tuple(combinations(PUBLIC_ERROR_CODES, 2))
 
 
 @pytest.fixture(scope="module")
@@ -60,17 +71,15 @@ def _run(root: Path, cwd: Path | None = None) -> subprocess.CompletedProcess[byt
     )
 
 
-def _refresh_fixture_locks(root: Path) -> None:
+def _refresh_fixture_locks(root: Path, stale_paths=()) -> None:
     script = root / "scripts/check-evaluation-contract-candidate.py"
     text = script.read_text()
     for relative, original in zip(STAGE_A, STAGE_A_DIGESTS):
+        if relative in stale_paths:
+            continue
         current = sha256((root / relative).read_bytes()).hexdigest()
         text = text.replace(original, current)
     script.write_text(text)
-
-
-def _write_fixture_json(checker, path: Path, value) -> None:
-    path.write_bytes(_canonical_bytes(checker, value))
 
 
 def _error(checker, code: str, path: str) -> bytes:
@@ -86,6 +95,10 @@ def _redigest(checker, value):
 
 def _canonical_bytes(checker, value) -> bytes:
     return (checker._canonical(value) + "\n").encode("ascii")
+
+
+def _load_module(checker, source):
+    return checker._audit_and_load_module(source, checker._decode_module_source(source))
 
 
 def _minimal_schema(definition_count=0, reference_count=0):
@@ -145,90 +158,6 @@ def test_candidate_and_report_are_canonical_ascii_json(checker):
         data = (ROOT / relative).read_bytes()
         assert all(byte < 128 for byte in data)
         assert checker._decode_json(data, relative) is not None
-
-
-@pytest.mark.parametrize(
-    ("fault", "code", "path"),
-    [
-        ("canonical", "E_CANONICAL", STAGE_A[0]),
-        ("duplicate", "E_DUPLICATE_KEY", STAGE_A[0]),
-        ("source", "E_SOURCE_DRIFT", STAGE_A[0]),
-        ("schema", "E_SCHEMA", STAGE_A[0]),
-        ("ref", "E_REF_UNUSED", STAGE_A[0]),
-        ("path", "E_PATH", STAGE_A[0]),
-        ("ownership", "E_LINEAGE", STAGE_A[1]),
-        ("module-ast", "E_SEMANTIC", STAGE_A[2]),
-        ("module-limit", "E_LIMIT", STAGE_A[2]),
-    ],
-)
-def test_public_checker_reaches_closed_rejection_classes(
-        tmp_path, checker, bundle, fault, code, path):
-    root = _copy_bundle(tmp_path)
-    candidate_path = root / STAGE_A[0]
-    report_path = root / STAGE_A[1]
-    module_path = root / STAGE_A[2]
-    candidate, report, _ = bundle
-    if fault == "canonical":
-        candidate_path.write_bytes(candidate_path.read_bytes()[:-1] + b" \n")
-    elif fault == "duplicate":
-        candidate_path.write_bytes(b'{"digest":"' + b"0" * 64 + b'",' + candidate_path.read_bytes()[1:])
-    elif fault == "source":
-        changed = deepcopy(candidate)
-        changed["source_bindings"][0]["sha256"] = "0" * 64
-        _write_fixture_json(checker, candidate_path, changed)
-    elif fault == "schema":
-        changed = deepcopy(candidate)
-        changed["unexpected"] = None
-        _write_fixture_json(checker, candidate_path, changed)
-    elif fault == "ref":
-        changed = deepcopy(candidate)
-        changed["schemas"]["authority-blinding-error-v1"]["definitions"]["unused"] = {"type": "null"}
-        _write_fixture_json(checker, candidate_path, changed)
-    elif fault == "path":
-        changed = deepcopy(candidate)
-        changed["semantic_module"]["path"] = "../agentflow/evaluation_semantics_v1.py"
-        _write_fixture_json(checker, candidate_path, changed)
-    elif fault == "ownership":
-        changed = deepcopy(report)
-        changed["requirement_coverage"][0]["owner"] = "checker"
-        _write_fixture_json(checker, report_path, changed)
-    elif fault == "module-ast":
-        module_path.write_bytes(module_path.read_bytes().replace(
-            b"from hashlib import sha256", b"import os                    ", 1,
-        ))
-    elif fault == "module-limit":
-        module_path.write_bytes(module_path.read_bytes() + b"#" * 65_536)
-    _refresh_fixture_locks(root)
-
-    result = _run(root)
-
-    assert result.returncode == 1
-    assert result.stdout == b""
-    assert result.stderr == _error(checker, code, path)
-
-
-def test_public_checker_reports_fixed_root_and_io_paths(tmp_path, checker):
-    root = _copy_bundle(tmp_path)
-    renamed = root / "scripts/not-the-checker.py"
-    (root / "scripts/check-evaluation-contract-candidate.py").rename(renamed)
-    root_result = subprocess.run([sys.executable, str(renamed)], capture_output=True, check=False)
-    assert root_result.returncode == 1
-    assert root_result.stderr == _error(checker, "E_ROOT", checker.SCRIPT_PATH)
-
-    root = _copy_bundle(tmp_path / "io")
-    (root / STAGE_A[0]).unlink()
-    io_result = _run(root)
-    assert io_result.returncode == 1
-    assert io_result.stderr == _error(checker, "E_IO", checker.CANDIDATE_PATH)
-
-
-def test_controlled_internal_fault_has_exact_public_framing(checker, capfdbinary):
-    result = checker.main(force_internal=True)
-    captured = capfdbinary.readouterr()
-
-    assert result == 2
-    assert captured.out == b""
-    assert captured.err == _error(checker, "E_INTERNAL", checker.SCRIPT_PATH)
 
 
 @pytest.mark.parametrize(
@@ -303,7 +232,7 @@ def test_source_bindings_and_closed_locator_universe_are_independent(checker, bu
 
 def test_requirement_coverage_has_one_preflight_owner_and_valid_cases(checker, bundle):
     candidate, report, source = bundle
-    evaluate = checker._audit_and_load_module(source)
+    evaluate = _load_module(checker, source)
 
     checker._validate_report(
         report, candidate, STAGE_A_DIGESTS[0], STAGE_A_DIGESTS[2], evaluate,
@@ -314,7 +243,7 @@ def test_requirement_coverage_has_one_preflight_owner_and_valid_cases(checker, b
 
 def test_duplicate_and_wrong_requirement_ownership_fail(checker, bundle):
     candidate, report, source = bundle
-    evaluate = checker._audit_and_load_module(source)
+    evaluate = _load_module(checker, source)
     duplicate = deepcopy(report)
     duplicate["requirement_coverage"][1]["requirement_id"] = duplicate["requirement_coverage"][0]["requirement_id"]
     with pytest.raises(checker.CheckFailure, match="E_REQUIREMENT_DUPLICATE"):
@@ -328,7 +257,7 @@ def test_duplicate_and_wrong_requirement_ownership_fail(checker, bundle):
 
 def test_every_semantic_vector_dispatches_through_exact_interface(checker, bundle):
     candidate, report, source = bundle
-    evaluate = checker._audit_and_load_module(source)
+    evaluate = _load_module(checker, source)
     calls = []
 
     def recording(contract, operation_id, input_value):
@@ -347,7 +276,7 @@ def test_every_semantic_vector_dispatches_through_exact_interface(checker, bundl
 
 def test_score_gates_uses_contract_present_state(checker, bundle):
     candidate, report, source = bundle
-    evaluate = checker._audit_and_load_module(source)
+    evaluate = _load_module(checker, source)
     case = next(case for case in report["semantic_cases"] if case["operation_id"] == "op-v1-score-gates")
     contract = deepcopy(candidate)
     contract["missingness_policy"]["present_state"] = "current"
@@ -373,7 +302,7 @@ def test_score_gates_uses_contract_present_state(checker, bundle):
 
 def test_input_and_expectation_cannot_be_rebound_around_whole_file_lock(tmp_path, checker, bundle):
     candidate, report, source = bundle
-    evaluate = checker._audit_and_load_module(source)
+    evaluate = _load_module(checker, source)
     changed = deepcopy(report)
     case = changed["semantic_cases"][0]
     case["input_value"]["seed"] += 1
@@ -391,7 +320,7 @@ def test_input_and_expectation_cannot_be_rebound_around_whole_file_lock(tmp_path
 
 def test_module_interface_ast_import_and_capability_audit(checker, bundle):
     _, _, source = bundle
-    evaluate = checker._audit_and_load_module(source)
+    evaluate = _load_module(checker, source)
 
     assert list(__import__("inspect").signature(evaluate).parameters) == [
         "contract", "operation_id", "input_value",
@@ -416,7 +345,7 @@ def test_module_interface_ast_import_and_capability_audit(checker, bundle):
 )
 def test_module_audit_rejects_import_capability_surface_and_interface(checker, source):
     with pytest.raises(checker.CheckFailure, match="E_SEMANTIC"):
-        checker._audit_and_load_module(source)
+        checker._audit_and_load_module(source, checker._decode_module_source(source))
 
 
 def test_imported_public_callable_reaches_public_surface_check(checker):
@@ -426,7 +355,7 @@ def test_imported_public_callable_reaches_public_surface_check(checker):
     )
 
     with pytest.raises(checker.CheckFailure) as caught:
-        checker._audit_and_load_module(source)
+        checker._audit_and_load_module(source, checker._decode_module_source(source))
 
     assert caught.value.code == "E_SEMANTIC"
 
@@ -437,10 +366,11 @@ def test_module_source_exact_limit_passes_and_plus_one_fails(checker):
         b"def evaluate_v1(contract, operation_id, input_value):\n    return input_value\n"
     )
     exact = prefix + b"#" + b"x" * (checker.LIMITS["module_source_bytes"] - len(prefix) - 2) + b"\n"
-    checker._audit_and_load_module(exact)
+    checker._audit_and_load_module(exact, checker._decode_module_source(exact))
 
     with pytest.raises(checker.CheckFailure, match="E_LIMIT"):
-        checker._audit_and_load_module(exact[:-1] + b"x\n")
+        oversized = exact[:-1] + b"x\n"
+        checker._audit_and_load_module(oversized, checker._decode_module_source(oversized))
 
 
 def test_json_artifact_byte_limit_exact_and_plus_one(checker):
@@ -502,16 +432,6 @@ def test_path_byte_and_depth_limits_exact_and_plus_one(checker):
         checker._validate_path(exact_depth + "/a", checker.CANDIDATE_PATH)
 
 
-def test_generated_case_byte_limit_exact_and_plus_one(checker):
-    template = {
-        "operation": "json_replace", "operand": "x" * (checker.LIMITS["generated_case_bytes"] - 3),
-        "target": {"json_pointer": ""},
-    }
-    assert len(checker._generate_payload({}, template)) == checker.LIMITS["generated_case_bytes"]
-    template["operand"] += "x"
-    assert len(checker._generate_payload({}, template)) == checker.LIMITS["generated_case_bytes"] + 1
-
-
 def test_generated_template_count_limit_and_replay_are_deterministic(checker, bundle):
     candidate, _, _ = bundle
     checker._validate_generation(candidate)
@@ -553,118 +473,483 @@ def test_error_registry_and_output_invariants_are_closed(checker, bundle):
         assert len(_error(checker, code, checker.CANDIDATE_PATH)) <= checker.LIMITS["stdout_or_stderr_bytes"]
 
 
-def test_public_error_precedence_uses_earlier_joint_fault(checker, bundle):
-    candidate, _, source = bundle
-    changed = deepcopy(candidate)
-    changed["source_bindings"][0]["sha256"] = "0" * 64
-    changed["limits"]["definitions"] = 63
-
-    with pytest.raises(checker.CheckFailure) as caught:
-        checker._validate_candidate(changed, sha256(source).hexdigest())
-
-    assert caught.value.code == "E_SOURCE_DRIFT"
-    assert checker.ERROR_PRECEDENCE.index("E_SOURCE_DRIFT") < checker.ERROR_PRECEDENCE.index("E_SCHEMA")
+def _fault_name(code):
+    return "error-" + code.lower().replace("_", "-")
 
 
-# This is the public fixture ledger.  Keeping the owner names separate from the
-# test functions makes accidental representative-only coverage impossible: a
-# code may occur exactly once in this map, and the matrix below consumes the
-# same closed registry.
-def _error_fixture_owners(checker):
+def _new_fault_bundle(tmp_path, checker, bundle):
+    candidate, report, source = bundle
     return {
-        code: f"error-e-{code[2:].lower()}"
-        for code in checker.ERROR_PRECEDENCE
+        "root": _copy_bundle(tmp_path),
+        "checker": checker,
+        "candidate": deepcopy(candidate),
+        "report": deepcopy(report),
+        "module": source,
+        "codes": [],
+        "raw": [],
+        "stale": set(),
+        "root_fault": False,
+        "internal_fault": False,
+        "io_fault": False,
+        "collision": False,
+        "paths": {},
     }
 
 
-def _error_fixture_expectations(checker):
-    candidate = {
-        "E_SOURCE_DRIFT", "E_SOURCE_LOCATOR", "E_REQUIREMENT_DUPLICATE",
-        "E_REQUIREMENT_MISSING", "E_UTF8", "E_JSON", "E_DUPLICATE_KEY",
-        "E_CANONICAL", "E_SCHEMA", "E_REF", "E_REF_CYCLE", "E_REF_UNUSED",
-        "E_PATH", "E_DIGEST", "E_ID", "E_CROSS_REFERENCE", "E_GENERATOR_TEMPLATE",
-        "E_GENERATOR_TARGET", "E_GENERATOR_PRECONDITION", "E_GENERATOR_COLLISION",
-        "E_GENERATOR_LIMIT",
-    }
-    report = {"E_LINEAGE", "E_ORACLE"}
-    module = {"E_LIMIT", "E_SEMANTIC"}
-    paths = {
-        **{code: checker.CANDIDATE_PATH for code in candidate},
-        **{code: checker.REPORT_PATH for code in report},
-        **{code: checker.MODULE_PATH for code in module},
-        "E_ROOT": checker.SCRIPT_PATH,
-        "E_IO": checker.CANDIDATE_PATH,
-        "E_INTERNAL": checker.SCRIPT_PATH,
-    }
-    return {
-        code: {
-            "fixture": f"error-e-{code[2:].lower()}",
-            "code": code,
-            "path": paths[code],
-            "exit": 1 if code != "E_INTERNAL" else 2,
-            "stdout": b"",
-            "stderr": _error(checker, code, paths[code]),
+def _candidate_fault(state, code, mutation):
+    mutation(state["candidate"])
+    state["paths"][code] = STAGE_A[0]
+
+
+def _report_fault(state, code, mutation):
+    mutation(state["report"])
+    state["paths"][code] = STAGE_A[1]
+
+
+def _inject_root(state):
+    state["root_fault"] = True
+    state["paths"]["E_ROOT"] = "scripts/check-evaluation-contract-candidate.py"
+
+
+def _inject_source_drift(state):
+    _candidate_fault(state, "E_SOURCE_DRIFT", lambda value: value["source_bindings"][0].update(sha256="0" * 64))
+
+
+def _inject_source_locator(state):
+    _candidate_fault(state, "E_SOURCE_LOCATOR", lambda value: value["requirements"][0].update(source_locator="issue/583/acceptance/a15"))
+
+
+def _inject_requirement_duplicate(state):
+    _candidate_fault(state, "E_REQUIREMENT_DUPLICATE", lambda value: value["requirements"].append(deepcopy(value["requirements"][1])))
+
+
+def _inject_requirement_missing(state):
+    _candidate_fault(state, "E_REQUIREMENT_MISSING", lambda value: value["requirements"].pop(-2))
+
+
+def _inject_io(state):
+    state["io_fault"] = True
+
+
+def _inject_limit(state):
+    state["module"] += b"#" * 65_536
+    state["paths"]["E_LIMIT"] = STAGE_A[2]
+
+
+def _inject_raw(state, code):
+    state["raw"].append(code)
+
+
+def _inject_schema(state):
+    _candidate_fault(state, "E_SCHEMA", lambda value: value.update(unexpected=None))
+
+
+def _inject_ref(state):
+    def mutation(value):
+        value["schemas"]["authority-blinding-error-v1"]["root"]["properties"]["code"] = {
+            "type": "ref", "ref": "#/definitions/missing",
         }
-        for code in checker.ERROR_PRECEDENCE
-    }
+    _candidate_fault(state, "E_REF", mutation)
 
 
-def _pair_matrix(checker):
-    codes = checker.ERROR_PRECEDENCE
-    return {
-        (left, right): {
-            "reachable": "E_ROOT" not in (left, right)
-            and "E_INTERNAL" not in (left, right),
-            "fixture": (
-                f"error-e-{left[2:].lower()}--error-e-{right[2:].lower()}"
-                if "E_ROOT" not in (left, right) and "E_INTERNAL" not in (left, right)
-                else None
-            ),
-            "rationale": (
-                "both faults are injected into the copied bundle and the earlier "
-                "registry entry must win"
-                if "E_ROOT" not in (left, right) and "E_INTERNAL" not in (left, right)
-                else "root and internal outcomes are process-boundary outcomes; "
-                "they cannot coexist in one executable public fixture"
-            ),
+def _inject_ref_cycle(state):
+    def mutation(value):
+        schema = value["schemas"]["bootstrap-lower-bound-error-v1"]
+        schema["definitions"]["cycle"] = {"type": "ref", "ref": "#/definitions/cycle"}
+        schema["root"]["properties"]["code"] = {"type": "ref", "ref": "#/definitions/cycle"}
+    _candidate_fault(state, "E_REF_CYCLE", mutation)
+
+
+def _inject_ref_unused(state):
+    def mutation(value):
+        value["schemas"]["schedule-success-v1"]["definitions"]["unused"] = {"type": "null"}
+    _candidate_fault(state, "E_REF_UNUSED", mutation)
+
+
+def _inject_path(state):
+    _candidate_fault(state, "E_PATH", lambda value: value["artifact_registry"][0].update(path="../contract.json"))
+
+
+def _inject_digest(state):
+    state["module"] += b"# stale whole-file lock\n"
+    state["stale"].add(STAGE_A[2])
+    state["paths"]["E_DIGEST"] = STAGE_A[2]
+
+
+def _inject_id(state):
+    _candidate_fault(state, "E_ID", lambda value: value["rules"][0].update(rule_id="INVALID"))
+
+
+def _inject_cross_reference(state):
+    _candidate_fault(state, "E_CROSS_REFERENCE", lambda value: value["operation_contracts"][0].update(input_schema="missing-schema"))
+
+
+def _inject_lineage(state):
+    _report_fault(state, "E_LINEAGE", lambda value: value["requirement_coverage"][0].update(owner="checker"))
+
+
+def _inject_oracle(state):
+    def mutation(value):
+        case = next(
+            row for row in value["semantic_cases"]
+            if "EVAL_V1_OPERATION" in row["coverage"]
+        )
+        case["coverage"] = ["not-a-semantic-code"]
+    _report_fault(state, "E_ORACLE", mutation)
+
+
+def _append_generator_template(state, template):
+    state["candidate"]["generation"]["templates"].append(template)
+    state["candidate"]["generation"]["templates"].sort(key=lambda row: row["id"])
+
+
+def _inject_generator_template(state):
+    _candidate_fault(state, "E_GENERATOR_TEMPLATE", lambda value: value["generation"].update(generator="wrong-generator"))
+
+
+def _inject_generator_target(state):
+    _append_generator_template(state, {
+        "base_case_id": "base-canonical", "id": "a-target", "operand": 0,
+        "operation": "json_replace", "target": {"json_pointer": "not-a-pointer"},
+    })
+    state["paths"]["E_GENERATOR_TARGET"] = STAGE_A[0]
+
+
+def _inject_generator_precondition(state):
+    _append_generator_template(state, {
+        "base_case_id": "base-canonical", "id": "b-precondition", "operand": 0,
+        "operation": "json_replace", "target": {"json_pointer": "/missing"},
+    })
+    state["paths"]["E_GENERATOR_PRECONDITION"] = STAGE_A[0]
+
+
+def _inject_generator_collision(state):
+    _append_generator_template(state, {
+        "base_case_id": "base-canonical", "id": "c-collision", "operand": 0,
+        "operation": "json_replace", "target": {"json_pointer": "/a"},
+    })
+    state["collision"] = True
+    state["paths"]["E_GENERATOR_COLLISION"] = STAGE_A[0]
+
+
+def _inject_generator_limit(state):
+    _append_generator_template(state, {
+        "base_case_id": "base-canonical", "id": "z-limit", "operand": "x" * 65_534,
+        "operation": "json_replace", "target": {"json_pointer": ""},
+    })
+    state["paths"]["E_GENERATOR_LIMIT"] = STAGE_A[0]
+
+
+def _inject_semantic(state):
+    state["module"] = state["module"].replace(
+        b"from hashlib import sha256 as _sha256", b"import os                              ", 1,
+    )
+    state["paths"]["E_SEMANTIC"] = STAGE_A[2]
+
+
+def _inject_internal(state):
+    state["internal_fault"] = True
+    state["paths"]["E_INTERNAL"] = "scripts/check-evaluation-contract-candidate.py"
+
+
+FAULT_INJECTORS = {
+    "E_ROOT": _inject_root,
+    "E_SOURCE_DRIFT": _inject_source_drift,
+    "E_SOURCE_LOCATOR": _inject_source_locator,
+    "E_REQUIREMENT_DUPLICATE": _inject_requirement_duplicate,
+    "E_REQUIREMENT_MISSING": _inject_requirement_missing,
+    "E_IO": _inject_io,
+    "E_LIMIT": _inject_limit,
+    "E_UTF8": lambda state: _inject_raw(state, "E_UTF8"),
+    "E_JSON": lambda state: _inject_raw(state, "E_JSON"),
+    "E_DUPLICATE_KEY": lambda state: _inject_raw(state, "E_DUPLICATE_KEY"),
+    "E_CANONICAL": lambda state: _inject_raw(state, "E_CANONICAL"),
+    "E_SCHEMA": _inject_schema,
+    "E_REF": _inject_ref,
+    "E_REF_CYCLE": _inject_ref_cycle,
+    "E_REF_UNUSED": _inject_ref_unused,
+    "E_PATH": _inject_path,
+    "E_DIGEST": _inject_digest,
+    "E_ID": _inject_id,
+    "E_CROSS_REFERENCE": _inject_cross_reference,
+    "E_LINEAGE": _inject_lineage,
+    "E_ORACLE": _inject_oracle,
+    "E_GENERATOR_TEMPLATE": _inject_generator_template,
+    "E_GENERATOR_TARGET": _inject_generator_target,
+    "E_GENERATOR_PRECONDITION": _inject_generator_precondition,
+    "E_GENERATOR_COLLISION": _inject_generator_collision,
+    "E_GENERATOR_LIMIT": _inject_generator_limit,
+    "E_SEMANTIC": _inject_semantic,
+    "E_INTERNAL": _inject_internal,
+}
+
+
+def _inject_fault(state, code):
+    assert code not in state["codes"]
+    FAULT_INJECTORS[code](state)
+    state["codes"].append(code)
+
+
+def _bind_fault_bundle(state):
+    checker = state["checker"]
+    candidate = state["candidate"]
+    report = state["report"]
+    module = state["module"]
+    if state["collision"]:
+        templates = candidate["generation"]["templates"]
+        template = next(row for row in templates if row["id"] == "c-collision")
+        ordinal = templates.index(template)
+        preimage = {
+            "generator": candidate["generation"]["generator"],
+            "seed": candidate["generation"]["seed"],
+            "ordinal": ordinal,
+            "template": template["id"],
         }
-        for index, left in enumerate(codes)
-        for right in codes[index + 1:]
-    }
+        collision_id = "g-" + sha256(checker._canonical(preimage).encode("ascii")).hexdigest()[:24]
+        candidate["generation_base_cases"].append({"base_case_id": collision_id, "input": {"a": 1}})
+    candidate["semantic_module"]["source_sha256"] = sha256(module).hexdigest()
+    candidate = _redigest(checker, candidate)
+    candidate_bytes = _canonical_bytes(checker, candidate)
+    report["artifact_bindings"]["candidate_sha256"] = sha256(candidate_bytes).hexdigest()
+    report["artifact_bindings"]["module_sha256"] = sha256(module).hexdigest()
+    report["contract_digest"] = candidate["digest"]
+    report["source_binding_sha256"] = sha256(module).hexdigest()
+    report = _redigest(checker, report)
+    root = state["root"]
+    (root / STAGE_A[0]).write_bytes(candidate_bytes)
+    (root / STAGE_A[1]).write_bytes(_canonical_bytes(checker, report))
+    (root / STAGE_A[2]).write_bytes(module)
+
+    raw = state["raw"]
+    if raw:
+        candidate_fault = set(state["codes"]) & {
+            "E_SOURCE_DRIFT", "E_SOURCE_LOCATOR", "E_REQUIREMENT_DUPLICATE",
+            "E_REQUIREMENT_MISSING", "E_SCHEMA", "E_REF", "E_REF_CYCLE",
+            "E_REF_UNUSED", "E_PATH", "E_ID", "E_CROSS_REFERENCE",
+            "E_GENERATOR_TEMPLATE", "E_GENERATOR_TARGET",
+            "E_GENERATOR_PRECONDITION", "E_GENERATOR_COLLISION",
+            "E_GENERATOR_LIMIT",
+        }
+        if len(raw) == 1:
+            assignments = [(raw[0], STAGE_A[1] if candidate_fault else STAGE_A[0])]
+        else:
+            assignments = [(raw[0], STAGE_A[0]), (raw[1], STAGE_A[1])]
+        for code, relative in assignments:
+            path = root / relative
+            data = path.read_bytes()
+            if code == "E_UTF8":
+                data = b"\xff" + data[1:]
+            elif code == "E_JSON":
+                data = b"{\n"
+            elif code == "E_DUPLICATE_KEY":
+                data = b'{"digest":"' + b"0" * 64 + b'",' + data[1:]
+            else:
+                data = data[:-1] + b" \n"
+            path.write_bytes(data)
+            state["paths"][code] = relative
+
+    _refresh_fixture_locks(root, state["stale"])
+
+    if state["io_fault"]:
+        others = set(state["codes"]) - {"E_IO"}
+        if not others:
+            relative = STAGE_A[0]
+        elif others & {"E_LINEAGE", "E_ORACLE"} or state["raw"]:
+            relative = STAGE_A[2]
+        else:
+            relative = STAGE_A[1]
+        (root / relative).unlink()
+        state["paths"]["E_IO"] = relative
+    script = root / "scripts/check-evaluation-contract-candidate.py"
+    if state["root_fault"]:
+        renamed = script.with_name("not-the-checker.py")
+        script.rename(renamed)
+        script = renamed
+    state["script"] = script
 
 
-def test_error_e_fixture_set_is_closed_and_exactly_one_owner(checker):
-    owners = _error_fixture_owners(checker)
-    expectations = _error_fixture_expectations(checker)
-    assert tuple(owners) == checker.ERROR_PRECEDENCE
-    assert len(owners) == 28
-    assert len(set(owners.values())) == 28
-    assert all(name.startswith("error-e-") for name in owners.values())
-    assert set(expectations) == set(checker.ERROR_PRECEDENCE)
-    assert all(row["fixture"] == owners[row["code"]] for row in expectations.values())
-    assert all(row["stdout"] == b"" and row["stderr"] for row in expectations.values())
-    assert all(row["exit"] in {1, 2} for row in expectations.values())
+def _run_fault_bundle(state):
+    _bind_fault_bundle(state)
+    if not state["internal_fault"]:
+        return subprocess.run(
+            [sys.executable, str(state["script"])], cwd=state["root"],
+            capture_output=True, check=False,
+        )
+    launcher = (
+        "import importlib.util;"
+        f"p={str(state['script'])!r};"
+        "s=importlib.util.spec_from_file_location('fault_checker',p);"
+        "m=importlib.util.module_from_spec(s);s.loader.exec_module(m);"
+        "raise SystemExit(m.main(force_internal=True))"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", launcher], cwd=state["root"],
+        capture_output=True, check=False,
+    )
 
 
-def test_unordered_error_pair_matrix_is_exhaustive_and_machine_checked(checker):
-    matrix = _pair_matrix(checker)
-    expected = len(checker.ERROR_PRECEDENCE) * (len(checker.ERROR_PRECEDENCE) - 1) // 2
-    assert len(matrix) == expected == 378
-    assert tuple(matrix) == tuple(combinations(checker.ERROR_PRECEDENCE, 2))
-    assert all(row["rationale"] for row in matrix.values())
-    assert all(row["fixture"] for row in matrix.values() if row["reachable"])
-    assert sum(row["reachable"] for row in matrix.values()) == 325
-    assert sum(not row["reachable"] for row in matrix.values()) == 53
+def _assert_public_failure(state, result, expected_code):
+    checker = state["checker"]
+    expected_exit = 2 if expected_code == "E_INTERNAL" else 1
+    assert result.returncode == expected_exit
+    assert result.stdout == b""
+    assert result.stderr == _error(checker, expected_code, state["paths"][expected_code])
 
 
-def test_utf8_observation_precedes_whole_file_digest(tmp_path, checker):
+@pytest.mark.parametrize("code", PUBLIC_ERROR_CODES, ids=_fault_name)
+def test_isolated_public_checker_fixture(tmp_path, checker, bundle, code):
+    assert tuple(checker.ERROR_PRECEDENCE) == PUBLIC_ERROR_CODES
+    state = _new_fault_bundle(tmp_path, checker, bundle)
+    _inject_fault(state, code)
+
+    result = _run_fault_bundle(state)
+
+    assert state["codes"] == [code]
+    _assert_public_failure(state, result, code)
+
+
+def test_isolated_fixture_owner_names_are_closed_and_hyphenated():
+    names = tuple(_fault_name(code) for code in PUBLIC_ERROR_CODES)
+    assert len(names) == len(set(names)) == 28
+    assert all(name.startswith("error-e-") and "_" not in name for name in names)
+
+
+PAIR_REACHABILITY = {
+    pair: {"reachable": True, "reason": None}
+    for pair in ERROR_PAIRS
+}
+
+
+@pytest.mark.parametrize(
+    "pair", ERROR_PAIRS,
+    ids=lambda pair: _fault_name(pair[0]) + "--" + _fault_name(pair[1]),
+)
+def test_public_checker_unordered_pair_priority(tmp_path, checker, bundle, pair):
+    row = PAIR_REACHABILITY[pair]
+    if not row["reachable"]:
+        assert row["reason"] and "unreachable" in row["reason"]
+        return
+    state = _new_fault_bundle(tmp_path, checker, bundle)
+    for code in pair:
+        _inject_fault(state, code)
+
+    result = _run_fault_bundle(state)
+
+    assert state["codes"] == list(pair)
+    _assert_public_failure(state, result, pair[0])
+
+
+def test_pair_reachability_table_is_exhaustive_and_executes_every_reachable_pair():
+    assert tuple(PAIR_REACHABILITY) == ERROR_PAIRS
+    assert len(PAIR_REACHABILITY) == 378
+    assert sum(row["reachable"] for row in PAIR_REACHABILITY.values()) == 378
+    assert sum(not row["reachable"] for row in PAIR_REACHABILITY.values()) == 0
+    assert all(row["reason"] is None for row in PAIR_REACHABILITY.values())
+
+
+def _assert_module_audit_blocked(checker, monkeypatch, root):
+    calls = []
+    monkeypatch.setattr(
+        checker, "_audit_and_load_module",
+        lambda *_args: calls.append("audit attempted"),
+    )
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        with pytest.raises(checker.CheckFailure) as caught:
+            checker._check_bundle(root_fd)
+    finally:
+        os.close(root_fd)
+    assert (caught.value.code, caught.value.path) == ("E_DIGEST", STAGE_A[2])
+    assert calls == []
+
+
+def test_stale_module_lock_blocks_ast_load(tmp_path, checker, bundle, monkeypatch):
+    state = _new_fault_bundle(tmp_path, checker, bundle)
+    _inject_fault(state, "E_DIGEST")
+    _bind_fault_bundle(state)
+
+    _assert_module_audit_blocked(checker, monkeypatch, state["root"])
+
+
+def test_wrong_module_binding_blocks_ast_load(tmp_path, checker, bundle, monkeypatch):
+    state = _new_fault_bundle(tmp_path, checker, bundle)
+    _bind_fault_bundle(state)
+    root = state["root"]
+    candidate = json.loads((root / STAGE_A[0]).read_text())
+    candidate["semantic_module"]["source_sha256"] = "0" * 64
+    candidate = _redigest(checker, candidate)
+    candidate_bytes = _canonical_bytes(checker, candidate)
+    (root / STAGE_A[0]).write_bytes(candidate_bytes)
+    report = json.loads((root / STAGE_A[1]).read_text())
+    report["artifact_bindings"]["candidate_sha256"] = sha256(candidate_bytes).hexdigest()
+    report["contract_digest"] = candidate["digest"]
+    (root / STAGE_A[1]).write_bytes(_canonical_bytes(checker, _redigest(checker, report)))
+    _refresh_fixture_locks(root)
+
+    _assert_module_audit_blocked(checker, monkeypatch, root)
+
+
+@pytest.mark.parametrize("relative", STAGE_A, ids=("candidate", "report", "module"))
+def test_utf8_precedes_stale_digest_for_every_artifact(tmp_path, checker, relative):
     root = _copy_bundle(tmp_path)
-    candidate = root / STAGE_A[0]
-    candidate.write_bytes(b"\xff" + candidate.read_bytes()[1:])
+    path = root / relative
+    path.write_bytes(b"\xff" + path.read_bytes()[1:])
+
     result = _run(root)
+
     assert result.returncode == 1
     assert result.stdout == b""
-    assert result.stderr == _error(checker, "E_UTF8", STAGE_A[0])
+    assert result.stderr == _error(checker, "E_UTF8", relative)
+
+
+@pytest.mark.parametrize(
+    ("relative", "data"),
+    ((STAGE_A[0], b"[]\n"), (STAGE_A[1], b"null\n")),
+    ids=("candidate-array", "report-null"),
+)
+def test_non_object_schema_precedes_stale_digest(tmp_path, checker, relative, data):
+    root = _copy_bundle(tmp_path)
+    (root / relative).write_bytes(data)
+
+    result = _run(root)
+
+    assert result.returncode == 1
+    assert result.stdout == b""
+    assert result.stderr == _error(checker, "E_SCHEMA", relative)
+
+
+def _bind_generation_stream(checker, candidate):
+    stream = bytearray()
+    bases = {row["base_case_id"]: row["input"] for row in candidate["generation_base_cases"]}
+    for ordinal, item in enumerate(candidate["generation"]["templates"]):
+        preimage = {
+            "generator": candidate["generation"]["generator"],
+            "seed": candidate["generation"]["seed"],
+            "ordinal": ordinal,
+            "template": item["id"],
+        }
+        generated_id = "g-" + sha256(checker._canonical(preimage).encode("ascii")).hexdigest()[:24]
+        payload = checker._generate_payload(bases[item["base_case_id"]], item)
+        stream.extend((checker._canonical({"id": generated_id, "input_bytes_hex": payload.hex()}) + "\n").encode("ascii"))
+    candidate["generated_stream_sha256"] = sha256(stream).hexdigest()
+
+
+def test_generated_case_byte_limit_routes_through_generation_validation(checker, bundle):
+    candidate, _, _ = bundle
+    exact = deepcopy(candidate)
+    exact["generation"]["templates"] = [{
+        "base_case_id": "base-canonical", "id": "exact-generated-case-bytes",
+        "operand": "x" * 65_533, "operation": "json_replace",
+        "target": {"json_pointer": ""},
+    }]
+    _bind_generation_stream(checker, exact)
+    checker._validate_generation(exact)
+
+    plus_one = deepcopy(exact)
+    plus_one["generation"]["templates"][0]["operand"] += "x"
+    with pytest.raises(checker.CheckFailure) as caught:
+        checker._validate_generation(plus_one)
+    assert caught.value.code == "E_GENERATOR_LIMIT"
 
 
 def test_generator_template_bound_accepts_256_and_rejects_257(checker, bundle):
@@ -675,19 +960,7 @@ def test_generator_template_bound_accepts_256_and_rejects_257(checker, bundle):
         {**template, "id": f"replace-{index:03d}", "operand": index}
         for index in range(checker.LIMITS["generated_cases"])
     ]
-    stream = bytearray()
-    base = exact["generation_base_cases"][0]["input"]
-    for ordinal, item in enumerate(exact["generation"]["templates"]):
-        preimage = {
-            "generator": exact["generation"]["generator"],
-            "seed": exact["generation"]["seed"],
-            "ordinal": ordinal,
-            "template": item["id"],
-        }
-        generated_id = "g-" + sha256(checker._canonical(preimage).encode("ascii")).hexdigest()[:24]
-        payload = checker._generate_payload(base, item)
-        stream.extend((checker._canonical({"id": generated_id, "input_bytes_hex": payload.hex()}) + "\n").encode("ascii"))
-    exact["generated_stream_sha256"] = sha256(stream).hexdigest()
+    _bind_generation_stream(checker, exact)
     checker._validate_generation(exact)
 
     too_many = deepcopy(exact)

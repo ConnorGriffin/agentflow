@@ -306,11 +306,11 @@ def _validate_source_and_requirements(candidate):
         _fail("E_REQUIREMENT_MISSING", CANDIDATE_PATH)
     ids = [row.get("requirement_id") for row in requirements if isinstance(row, dict)]
     locators = [row.get("source_locator") for row in requirements if isinstance(row, dict)]
-    if len(ids) != len(set(ids)) or len(locators) != len(set(locators)):
-        _fail("E_REQUIREMENT_DUPLICATE", CANDIDATE_PATH)
     unknown = [locator for locator in locators if locator not in LOCATORS]
     if unknown:
         _fail("E_SOURCE_LOCATOR", CANDIDATE_PATH)
+    if len(ids) != len(set(ids)) or len(locators) != len(set(locators)):
+        _fail("E_REQUIREMENT_DUPLICATE", CANDIDATE_PATH)
     if tuple(ids) != REQUIREMENT_IDS or tuple(locators) != LOCATORS:
         _fail("E_REQUIREMENT_MISSING", CANDIDATE_PATH)
     for row, locator in zip(requirements, LOCATORS):
@@ -439,6 +439,18 @@ def _validate_value(value, node, definitions):
     return value is None
 
 
+def _validate_module_binding(candidate, module_digest):
+    if not isinstance(candidate, dict):
+        _fail("E_SCHEMA", CANDIDATE_PATH)
+    binding = candidate.get("semantic_module")
+    _require_keys(binding, {"interface_version", "path", "source_sha256"}, CANDIDATE_PATH)
+    _validate_path(binding["path"], CANDIDATE_PATH)
+    if binding["interface_version"] != "evaluation-semantics-v1" or binding["path"] != MODULE_PATH:
+        _fail("E_SCHEMA", CANDIDATE_PATH)
+    if binding["source_sha256"] != module_digest:
+        _fail("E_DIGEST", MODULE_PATH)
+
+
 def _validate_candidate(candidate, module_digest):
     expected_keys = {
         "artifact_registry", "authority_policy", "bootstrap_policy", "canonical_json",
@@ -450,19 +462,15 @@ def _validate_candidate(candidate, module_digest):
         "requirements", "rules", "schedule_policy", "schema_catalog", "schemas",
         "semantic_errors", "semantic_module", "source_bindings", "status_truth_table",
     }
-    _require_keys(candidate, expected_keys, CANDIDATE_PATH)
+    if not isinstance(candidate, dict):
+        _fail("E_SCHEMA", CANDIDATE_PATH)
     _validate_source_and_requirements(candidate)
+    _require_keys(candidate, expected_keys, CANDIDATE_PATH)
     if candidate["contract_version"] != "evaluation-contract-v1" or candidate["limits"] != LIMITS:
         _fail("E_SCHEMA", CANDIDATE_PATH)
     if candidate["checker_boundary"].get("artifact_order") != list(ARTIFACT_PATHS) or candidate["checker_boundary"].get("error_precedence") != list(ERROR_PRECEDENCE):
         _fail("E_SCHEMA", CANDIDATE_PATH)
-    binding = candidate["semantic_module"]
-    _require_keys(binding, {"interface_version", "path", "source_sha256"}, CANDIDATE_PATH)
-    _validate_path(binding["path"], CANDIDATE_PATH)
-    if binding["interface_version"] != "evaluation-semantics-v1" or binding["path"] != MODULE_PATH:
-        _fail("E_SCHEMA", CANDIDATE_PATH)
-    if binding["source_sha256"] != module_digest:
-        _fail("E_DIGEST", CANDIDATE_PATH)
+    _validate_module_binding(candidate, module_digest)
     schemas = candidate["schemas"]
     if not isinstance(schemas, dict) or not schemas or not all(_valid_id(name) for name in schemas):
         _fail("E_SCHEMA", CANDIDATE_PATH)
@@ -702,10 +710,14 @@ def _validate_report(report, candidate, candidate_digest, module_digest, evaluat
             codes = set(case["coverage"]) & rejection_codes
             if len(codes) == 1:
                 isolated_negative_codes.update(codes)
+        if (case["classification"] == "positive"
+                and case["operation_id"] == candidate["operation_ids"]["index_lineage"]):
+            _validate_positive_lineage(case["input_value"])
+    if isolated_negative_codes != rejection_codes:
+        _fail("E_ORACLE", REPORT_PATH)
+    for case in semantic:
         operation_id = case["operation_id"]
         contract = contracts.get(operation_id)
-        if case["classification"] == "positive" and operation_id == candidate["operation_ids"]["index_lineage"]:
-            _validate_positive_lineage(case["input_value"])
         before = _canonical(case["input_value"])
         try:
             actual = evaluate(candidate, operation_id, case["input_value"])
@@ -723,8 +735,6 @@ def _validate_report(report, candidate, candidate_digest, module_digest, evaluat
             _fail("E_SEMANTIC", MODULE_PATH)
         if _canonical(actual) != _canonical(expected):
             _fail("E_SEMANTIC", MODULE_PATH)
-    if isolated_negative_codes != rejection_codes:
-        _fail("E_ORACLE", REPORT_PATH)
     if report["digest"] != _digest_record(report):
         _fail("E_DIGEST", REPORT_PATH)
 
@@ -754,7 +764,7 @@ def _validate_positive_lineage(input_value):
             _fail("E_LINEAGE", REPORT_PATH)
 
 
-def _audit_and_load_module(source: bytes):
+def _decode_module_source(source: bytes):
     if len(source) > LIMITS["module_source_bytes"]:
         _fail("E_LIMIT", MODULE_PATH)
     if source.startswith(b"\xef\xbb\xbf") or b"\r" in source:
@@ -763,6 +773,10 @@ def _audit_and_load_module(source: bytes):
         text = source.decode("utf-8")
     except UnicodeDecodeError:
         _fail("E_UTF8", MODULE_PATH)
+    return text
+
+
+def _audit_and_load_module(source: bytes, text: str):
     if not source.endswith(b"\n") or source.endswith(b"\n\n"):
         _fail("E_SEMANTIC", MODULE_PATH)
     try:
@@ -885,27 +899,74 @@ def _repository_root():
 
 def _check_bundle(root_fd):
     contents = {}
+    failures = []
+    unavailable = object()
     maxima = (LIMITS["json_artifact_bytes"], LIMITS["json_artifact_bytes"], LIMITS["module_source_bytes"])
     for path, maximum in zip(ARTIFACT_PATHS, maxima):
         try:
             data = _read_file_at(root_fd, path, maximum)
         except OSError:
-            _fail("E_IO", path)
+            failures.append(CheckFailure("E_IO", path))
+            continue
         if len(data) > maximum:
-            _fail("E_LIMIT", path)
+            failures.append(CheckFailure("E_LIMIT", path))
         contents[path] = data
-    # Observe encoding and syntax before whole-file locks.  The public priority
-    # puts E_UTF8/E_JSON ahead of E_DIGEST, so a malformed artifact must not be
-    # hidden by a stale lock.  The module audit has the same limit/encoding order.
-    candidate = _decode_json(contents[CANDIDATE_PATH], CANDIDATE_PATH)
-    report = _decode_json(contents[REPORT_PATH], REPORT_PATH)
-    evaluate = _audit_and_load_module(contents[MODULE_PATH])
+
+    def capture(function, *args):
+        try:
+            return function(*args)
+        except CheckFailure as error:
+            failures.append(error)
+        except Exception:
+            failures.append(CheckFailure("E_INTERNAL", SCRIPT_PATH))
+        return unavailable
+
+    candidate = (
+        capture(_decode_json, contents[CANDIDATE_PATH], CANDIDATE_PATH)
+        if CANDIDATE_PATH in contents else None
+    )
+    report = (
+        capture(_decode_json, contents[REPORT_PATH], REPORT_PATH)
+        if REPORT_PATH in contents else None
+    )
+    module_text = (
+        capture(_decode_module_source, contents[MODULE_PATH])
+        if MODULE_PATH in contents else None
+    )
     digests = {path: sha256(data).hexdigest() for path, data in contents.items()}
     for path in ARTIFACT_PATHS:
-        if digests[path] != WHOLE_FILE_SHA256[path]:
-            _fail("E_DIGEST", path)
-    _validate_candidate(candidate, digests[MODULE_PATH])
-    _validate_report(report, candidate, digests[CANDIDATE_PATH], digests[MODULE_PATH], evaluate)
+        if path in digests and digests[path] != WHOLE_FILE_SHA256[path]:
+            failures.append(CheckFailure("E_DIGEST", path))
+
+    module_binding = unavailable
+    module_lock_matches = (
+        MODULE_PATH in digests
+        and digests[MODULE_PATH] == WHOLE_FILE_SHA256[MODULE_PATH]
+    )
+    if module_lock_matches and module_text is not unavailable and candidate is not unavailable:
+        module_binding = capture(_validate_module_binding, candidate, digests[MODULE_PATH])
+
+    evaluate = unavailable
+    if module_binding is not unavailable:
+        evaluate = capture(_audit_and_load_module, contents[MODULE_PATH], module_text)
+    if candidate is not unavailable and MODULE_PATH in digests:
+        capture(_validate_candidate, candidate, digests[MODULE_PATH])
+    if report is not unavailable and isinstance(candidate, dict):
+        def unavailable_evaluate(*_args):
+            raise ValueError("semantic module unavailable")
+        capture(
+            _validate_report, report, candidate,
+            digests.get(CANDIDATE_PATH, ""), digests.get(MODULE_PATH, ""),
+            evaluate if evaluate is not unavailable else unavailable_evaluate,
+        )
+    if failures:
+        code_order = {code: index for index, code in enumerate(ERROR_PRECEDENCE)}
+        path_order = {path: index for index, path in enumerate((*ARTIFACT_PATHS, SCRIPT_PATH))}
+        failure = min(
+            failures,
+            key=lambda error: (code_order[error.code], path_order.get(error.path, len(path_order))),
+        )
+        raise failure
 
 
 def _line(value):
