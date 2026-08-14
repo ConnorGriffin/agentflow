@@ -142,19 +142,67 @@ def test_zero_argument_checker_is_exact_and_cwd_independent(tmp_path):
     assert result.stderr == b""
 
 
-@pytest.mark.parametrize("relative", STAGE_A)
-def test_each_whole_file_lock_rejects_one_byte_mutation(tmp_path, checker, relative):
-    root = _copy_bundle(tmp_path)
+def _mutate_locked_byte(root, relative):
     path = root / relative
     data = path.read_bytes()
     index = data.index(b"evaluation")
     path.write_bytes(data[:index] + b"f" + data[index + 1:])
+
+
+@pytest.mark.parametrize("relative", STAGE_A)
+def test_each_whole_file_lock_rejects_one_byte_mutation(tmp_path, checker, relative):
+    root = _copy_bundle(tmp_path)
+    _mutate_locked_byte(root, relative)
 
     result = _run(root)
 
     assert result.returncode == 1
     assert result.stderr == _error(checker, "E_DIGEST", relative)
     assert result.stdout == b""
+
+
+@pytest.mark.parametrize(
+    ("mutated", "expected_path"),
+    [
+        ((STAGE_A[2],), STAGE_A[2]),
+        ((STAGE_A[0], STAGE_A[2]), STAGE_A[0]),
+        ((STAGE_A[1], STAGE_A[2]), STAGE_A[1]),
+    ],
+    ids=("module-over-report-derivative", "candidate-direct-order", "report-direct-order"),
+)
+def test_simultaneous_digest_failures_prefer_direct_mutated_artifact(
+        tmp_path, checker, mutated, expected_path):
+    root = _copy_bundle(tmp_path)
+    for relative in mutated:
+        _mutate_locked_byte(root, relative)
+
+    actual_digests = {
+        relative: sha256((root / relative).read_bytes()).hexdigest()
+        for relative in STAGE_A
+    }
+    direct = tuple(
+        relative for relative, locked in zip(STAGE_A, STAGE_A_DIGESTS)
+        if actual_digests[relative] != locked
+    )
+    candidate = json.loads((root / STAGE_A[0]).read_text())
+    report = json.loads((root / STAGE_A[1]).read_text())
+    derivative = []
+    if candidate["semantic_module"]["source_sha256"] != actual_digests[STAGE_A[2]]:
+        derivative.append(STAGE_A[2])
+    if report["artifact_bindings"]["candidate_sha256"] != actual_digests[STAGE_A[0]]:
+        derivative.append(STAGE_A[1])
+    if report["artifact_bindings"]["module_sha256"] != actual_digests[STAGE_A[2]]:
+        derivative.append(STAGE_A[1])
+    if report["source_binding_sha256"] != actual_digests[STAGE_A[2]]:
+        derivative.append(STAGE_A[1])
+
+    assert direct == mutated
+    assert derivative
+    assert len(direct) + len(derivative) >= 2
+    result = _run(root)
+    assert result.returncode == 1
+    assert result.stdout == b""
+    assert result.stderr == _error(checker, "E_DIGEST", expected_path)
 
 
 def test_candidate_and_report_are_canonical_ascii_json(checker):
