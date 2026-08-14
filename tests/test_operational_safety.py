@@ -25,6 +25,7 @@ from agentflow.evidence import (
 )
 from agentflow.operational_safety import (
     ACTION_STATE_MAP,
+    ActionIdempotentRerunEffect,
     CanaryActivationRequest,
     CheckEvidence,
     CheckEvidenceUnavailable,
@@ -36,10 +37,11 @@ from agentflow.operational_safety import (
     OperationalSafety,
     OPERATIONAL_SAFETY_CONTRACT_DIGEST,
     PROMOTION_VERIFIER,
-    RERUN_EFFECT_CONTRACT,
-    RERUN_EFFECT_CONTRACT_DIGEST,
+    RERUN_TRIGGER_ONCE_CONTRACT,
+    RERUN_TRIGGER_ONCE_CONTRACT_DIGEST,
     ROUTE_CELL_CONTRACT_DIGEST,
     SafetyRefused,
+    TriggerOnceByActionIdTransportV1,
     _state_id,
 )
 
@@ -101,8 +103,6 @@ class Receipts:
 
 
 class Reruns:
-    contract = RERUN_EFFECT_CONTRACT
-
     def __init__(self) -> None:
         self.effects: dict[str, EffectEvidence] = {}
         self.applied: list[str] = []
@@ -113,7 +113,6 @@ class Reruns:
         self.on_apply = None
         self.transaction_states: list[bool] = []
         self.conn = None
-        self.coalesced = threading.Event()
         self._effect_lock = threading.Lock()
         self._inflight: dict[str, threading.Event] = {}
 
@@ -123,28 +122,27 @@ class Reruns:
                 self.transaction_states.append(self.conn.in_transaction)
             return self.effects.get(action_id)
 
-    def apply(self, intent) -> EffectEvidence:
+    def trigger_once(self, action_id, intent) -> EffectEvidence:
+        assert action_id == intent.action_id
         if self.crash == "before_effect":
             raise RuntimeError("crash before effect")
         with self._effect_lock:
             if self.conn is not None:
                 self.transaction_states.append(self.conn.in_transaction)
-            existing = self.effects.get(intent.action_id)
+            existing = self.effects.get(action_id)
             if existing is not None:
                 return existing
-            completion = self._inflight.get(intent.action_id)
+            completion = self._inflight.get(action_id)
             owner = completion is None
             if owner:
                 completion = threading.Event()
-                self._inflight[intent.action_id] = completion
-                self.applied.append(intent.action_id)
-            else:
-                self.coalesced.set()
+                self._inflight[action_id] = completion
+                self.applied.append(action_id)
         assert completion is not None
         if not owner:
             assert completion.wait(2)
             with self._effect_lock:
-                return self.effects[intent.action_id]
+                return self.effects[action_id]
         evidence = EffectEvidence(
             f"transport/reruns/{intent.action_id}",
             f"provider accepted action_id={intent.action_id}",
@@ -155,12 +153,19 @@ class Reruns:
         if self.block:
             assert self.release.wait(2)
         with self._effect_lock:
-            self.effects[intent.action_id] = evidence
-            del self._inflight[intent.action_id]
+            self.effects[action_id] = evidence
+            del self._inflight[action_id]
             completion.set()
         if self.crash == "after_effect":
             raise RuntimeError("crash after effect")
         return evidence
+
+
+def rerun_owner(transport: Reruns) -> ActionIdempotentRerunEffect:
+    return ActionIdempotentRerunEffect(TriggerOnceByActionIdTransportV1(
+        evidence_for=transport.evidence_for,
+        trigger_once=transport.trigger_once,
+    ))
 
 
 @pytest.fixture
@@ -169,7 +174,7 @@ def safety(tmp_path):
     checks, receipts, reruns = Checks(), Receipts(), Reruns()
     owner = OperationalSafety(
         store, check_evidence=checks, promotion_receipts=receipts,
-        rerun_effect=reruns,
+        rerun_effect=rerun_owner(reruns),
     )
     yield owner, store, checks, receipts, reruns
     store.close()
@@ -248,10 +253,10 @@ def test_dependency_and_registry_receipts_are_exact():
     assert ROUTE_CELL_CONTRACT_DIGEST == (
         "c762ed469c4c2a311391898196713b26a2dbe2985896c262ea05a425368f63a5")
     assert OPERATIONAL_SAFETY_CONTRACT_DIGEST == (
-        "27e095449758459f748a9f8a85ec48afc460cb294bcb859c675dc568e8252d6d")
+        "ba8bf92fa7216d7fd59ef25b42d494de381f6a2a11afab1e0c44b174bfa9ddc0")
     assert PROMOTION_VERIFIER == ("github-authority", "v1")
-    assert RERUN_EFFECT_CONTRACT_DIGEST == (
-        "c8b9433f01643550f2dbc560b72aa033895b324e5a5a35dedc0d4b3af13b21b4")
+    assert RERUN_TRIGGER_ONCE_CONTRACT_DIGEST == (
+        "4bc192810ab1119c2b1ec49942fbceb0eddd50e012d765a148e0664cb02e7658")
     assert ACTION_STATE_MAP == {
         "rerun": "claimed -> effect_lease_claimed -> idempotent_effect -> result_committed",
         "quarantine": "claimed -> exact_cell_quarantined + result_committed",
@@ -271,17 +276,28 @@ def test_rerun_effect_requires_the_exact_code_owned_atomic_contract(tmp_path):
     assert store._conn.execute(
         "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
 
-    counterfeit = Reruns()
-    counterfeit.contract = replace(RERUN_EFFECT_CONTRACT)
-    with pytest.raises(SafetyRefused, match="exact code-owned atomic contract"):
-        OperationalSafety(store, check_evidence=checks, rerun_effect=counterfeit)
+    class MaliciousDuckAdapter:
+        contract = RERUN_TRIGGER_ONCE_CONTRACT
 
-    replaced = Reruns()
-    bound = OperationalSafety(store, check_evidence=checks, rerun_effect=replaced)
-    replaced.contract = replace(RERUN_EFFECT_CONTRACT)
-    with pytest.raises(SafetyRefused, match="exact code-owned atomic contract"):
+        def __init__(self):
+            self.calls = 0
+
+        def evidence_for(self, _action_id):
+            self.calls += 1
+
+        def apply(self, _intent):
+            self.calls += 1
+
+    malicious = MaliciousDuckAdapter()
+    with pytest.raises(SafetyRefused, match="exact code-owned concrete owner"):
+        OperationalSafety(store, check_evidence=checks, rerun_effect=malicious)
+
+    effect = rerun_owner(Reruns())
+    bound = OperationalSafety(store, check_evidence=checks, rerun_effect=effect)
+    bound._rerun_effect = malicious
+    with pytest.raises(SafetyRefused, match="exact code-owned concrete owner"):
         bound.reconcile(intent.action_id)
-    assert replaced.applied == []
+    assert malicious.calls == 0
     assert store._conn.execute(
         "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
     store.close()
@@ -429,7 +445,8 @@ def test_rerun_intent_crash_recovery_and_concurrent_reconcilers_are_single_fligh
     path = tmp_path / "coordinator.db"
     seed = Store(path)
     checks, reruns = Checks(), Reruns()
-    seed_owner = OperationalSafety(seed, check_evidence=checks, rerun_effect=reruns)
+    effect = rerun_owner(reruns)
+    seed_owner = OperationalSafety(seed, check_evidence=checks, rerun_effect=effect)
     reruns.conn = seed._conn
     cell = route(seed_owner)
     intent = observe(seed_owner, checks, cell, "fail", "semantic/first")[0]
@@ -467,7 +484,7 @@ def test_rerun_intent_crash_recovery_and_concurrent_reconcilers_are_single_fligh
 
     def reconcile():
         store = Store(path)
-        owner = OperationalSafety(store, check_evidence=checks, rerun_effect=reruns)
+        owner = OperationalSafety(store, check_evidence=checks, rerun_effect=effect)
         try:
             results.append(owner.reconcile(other_intent.action_id))
         except BaseException as error:
@@ -508,7 +525,8 @@ def test_rerun_intent_crash_recovery_and_concurrent_reconcilers_are_single_fligh
 def test_rerun_effect_may_reenter_the_same_store_without_nested_transaction(tmp_path):
     store = Store(tmp_path / "coordinator.db")
     checks, reruns = Checks(), Reruns()
-    owner = OperationalSafety(store, check_evidence=checks, rerun_effect=reruns)
+    owner = OperationalSafety(
+        store, check_evidence=checks, rerun_effect=rerun_owner(reruns))
     cell = route(owner)
     intent = observe(owner, checks, cell, "fail", "reentrant/failure")[0]
     reruns.conn = store._conn
@@ -527,7 +545,8 @@ def test_live_effect_overlap_after_lease_reclaim_coalesces_one_action_id(tmp_pat
     path = tmp_path / "coordinator.db"
     seed = Store(path)
     checks, reruns = Checks(), Reruns()
-    owner = OperationalSafety(seed, check_evidence=checks, rerun_effect=reruns)
+    effect = rerun_owner(reruns)
+    owner = OperationalSafety(seed, check_evidence=checks, rerun_effect=effect)
     cell = route(owner)
     intent = observe(owner, checks, cell, "fail", "overlap/failure")[0]
     seed.close()
@@ -538,7 +557,7 @@ def test_live_effect_overlap_after_lease_reclaim_coalesces_one_action_id(tmp_pat
         store = Store(path)
         try:
             results.append(OperationalSafety(
-                store, check_evidence=checks, rerun_effect=reruns,
+                store, check_evidence=checks, rerun_effect=effect,
             ).reconcile(intent.action_id))
         except BaseException as error:
             errors.append(error)
@@ -549,6 +568,8 @@ def test_live_effect_overlap_after_lease_reclaim_coalesces_one_action_id(tmp_pat
     second = threading.Thread(target=reconcile)
     first.start()
     assert reruns.entered.wait(2)
+    with effect._lock:
+        flight = effect._flights[intent.action_id]
 
     clock = Store(path)
     claim = clock._conn.execute(
@@ -562,7 +583,7 @@ def test_live_effect_overlap_after_lease_reclaim_coalesces_one_action_id(tmp_pat
     clock.close()
 
     second.start()
-    assert reruns.coalesced.wait(2)
+    assert flight.joined.wait(2)
     assert reruns.applied == [intent.action_id]
     reruns.release.set()
     first.join()
@@ -570,7 +591,7 @@ def test_live_effect_overlap_after_lease_reclaim_coalesces_one_action_id(tmp_pat
 
     final = Store(path)
     durable = OperationalSafety(
-        final, check_evidence=checks, rerun_effect=reruns,
+        final, check_evidence=checks, rerun_effect=effect,
     ).action_result(intent.action_id)
     assert errors == []
     assert len(results) == 2 and results[0] == results[1] == durable
@@ -583,7 +604,8 @@ def test_live_effect_overlap_after_lease_reclaim_coalesces_one_action_id(tmp_pat
 def test_expired_durable_rerun_lease_recovers_after_process_crash(tmp_path):
     store = Store(tmp_path / "coordinator.db")
     checks, reruns = Checks(), Reruns()
-    owner = OperationalSafety(store, check_evidence=checks, rerun_effect=reruns)
+    owner = OperationalSafety(
+        store, check_evidence=checks, rerun_effect=rerun_owner(reruns))
     cell = route(owner)
     intent = observe(owner, checks, cell, "fail", "abandoned/failure")[0]
     store._conn.execute(
@@ -691,7 +713,8 @@ def test_repository_promotion_receipt_cannot_cross_route_repository(safety):
 def test_canary_requires_exact_584_production_verifier(
         safety, tmp_path, verifier_id, verifier_version):
     _owner, store, checks, _receipts, reruns = safety
-    owner = OperationalSafety(store, check_evidence=checks, rerun_effect=reruns)
+    effect = rerun_owner(reruns)
+    owner = OperationalSafety(store, check_evidence=checks, rerun_effect=effect)
     good = route(owner)
     bad = route(owner, config_value={"model": "gpt-5", "effort": "medium"})
     item = CanaryActivationRequest("receipt-verifier", bad.digest, good.digest, 0)
@@ -701,7 +724,7 @@ def test_canary_requires_exact_584_production_verifier(
         content_hash=item.digest, receipt_id=item.promotion_receipt_id)
     owner = OperationalSafety(
         store, check_evidence=checks,
-        promotion_receipts=PromotionReceiptReader(path=path), rerun_effect=reruns)
+        promotion_receipts=PromotionReceiptReader(path=path), rerun_effect=effect)
     with pytest.raises(SafetyRefused, match="does not bind"):
         owner.approve_canary(item)
 

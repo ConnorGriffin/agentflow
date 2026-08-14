@@ -8,12 +8,13 @@ GitHub, prompt, policy, routing, autonomy, or merge adapter.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
 import sqlite3
+import threading
 import time
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 from uuid import uuid4
 
 from agentflow.evidence import EvidenceError, PromotionReceipt
@@ -97,28 +98,29 @@ ACTION_STATE_MAP = {
 }
 
 
-@dataclass(frozen=True)
-class RerunEffectContract:
+@dataclass(frozen=True, slots=True)
+class RerunTransportContract:
     identity: str
     version: str
-    idempotency_key: str
-    durability: str
-    concurrency: str
+    lookup: str
+    trigger: str
+    trust_boundary: str
 
     @property
     def digest(self) -> str:
         return _digest(asdict(self))
 
 
-# This singleton is the closed capability: equal caller-created declarations are refused.
-RERUN_EFFECT_CONTRACT = RerunEffectContract(
-    identity="agentflow-rerun-effect",
+# This declaration identifies the narrow remote trust boundary.  It is not an
+# authority token: OperationalSafety accepts only the exact concrete owner below.
+RERUN_TRIGGER_ONCE_CONTRACT = RerunTransportContract(
+    identity="agentflow-rerun-trigger-once-by-action-id",
     version="1",
-    idempotency_key="ActionIntent.action_id",
-    durability="effect evidence survives process loss before reconcile result commit",
-    concurrency="atomic action-id coalescing across overlapping apply calls",
+    lookup="evidence_for(action_id)",
+    trigger="trigger_once(action_id, intent)",
+    trust_boundary="transport durably deduplicates ActionIntent.action_id",
 )
-RERUN_EFFECT_CONTRACT_DIGEST = RERUN_EFFECT_CONTRACT.digest
+RERUN_TRIGGER_ONCE_CONTRACT_DIGEST = RERUN_TRIGGER_ONCE_CONTRACT.digest
 
 
 OPERATIONAL_SAFETY_CONTRACT = {
@@ -131,7 +133,8 @@ OPERATIONAL_SAFETY_CONTRACT = {
     "canary_receipt": "read-only #584 receipt authority binds approval declaration digest",
     "promotion_verifier": "/".join(PROMOTION_VERIFIER),
     "route_state": "recomputed cell-key+pointers+generation digest on every read",
-    "rerun_effect_contract_digest": RERUN_EFFECT_CONTRACT_DIGEST,
+    "rerun_effect_owner": "exact ActionIdempotentRerunEffect concrete type",
+    "rerun_transport_contract_digest": RERUN_TRIGGER_ONCE_CONTRACT_DIGEST,
     "rerun_transaction": "short lease CAS -> external idempotent effect -> short result CAS",
     "rollback_trigger": "committed exact-cell quarantine result",
     "reopen_proof": "authority-read pass bound to safety_state_id+route_cell+declaration",
@@ -269,14 +272,109 @@ class EffectEvidence:
     proof: str
 
 
-class RerunEffect(Protocol):
-    """Transport-only adapter bound to the code-owned atomic effect contract."""
+@dataclass(frozen=True, slots=True)
+class TriggerOnceByActionIdTransportV1:
+    """Exact binding for the one unavoidable remote idempotency trust boundary."""
 
-    contract: RerunEffectContract
+    evidence_for: Callable[[str], EffectEvidence | None]
+    trigger_once: Callable[[str, ActionIntent], EffectEvidence]
+    contract: RerunTransportContract = field(
+        default=RERUN_TRIGGER_ONCE_CONTRACT, init=False)
 
-    def evidence_for(self, action_id: str) -> EffectEvidence | None: ...
 
-    def apply(self, intent: ActionIntent) -> EffectEvidence: ...
+@dataclass
+class _EffectFlight:
+    completed: threading.Event = field(default_factory=threading.Event)
+    joined: threading.Event = field(default_factory=threading.Event)
+    result: EffectEvidence | None = None
+    error: BaseException | None = None
+
+
+class ActionIdempotentRerunEffect:
+    """Code-owned action-ID coalescing and evidence sharing around one v1 transport."""
+
+    __slots__ = ("_transport", "_lock", "_results", "_flights")
+
+    def __init__(self, transport: TriggerOnceByActionIdTransportV1) -> None:
+        if (type(transport) is not TriggerOnceByActionIdTransportV1
+                or transport.contract is not RERUN_TRIGGER_ONCE_CONTRACT):
+            raise SafetyRefused("rerun transport is not the exact trigger-once v1 binding")
+        self._transport = transport
+        self._lock = threading.Lock()
+        self._results: dict[str, EffectEvidence] = {}
+        self._flights: dict[str, _EffectFlight] = {}
+
+    def evidence_for(self, action_id: str) -> EffectEvidence | None:
+        with self._lock:
+            result = self._results.get(action_id)
+            flight = self._flights.get(action_id)
+        if result is not None:
+            return result
+        if flight is not None:
+            return self._join(flight)
+        result = self._transport.evidence_for(action_id)
+        if result is None:
+            return None
+        self._validate_evidence(result)
+        with self._lock:
+            existing = self._results.setdefault(action_id, result)
+        if existing != result:
+            raise SafetyRefused("rerun transport returned conflicting action evidence")
+        return existing
+
+    def apply(self, intent: ActionIntent) -> EffectEvidence:
+        action_id = intent.action_id
+        with self._lock:
+            result = self._results.get(action_id)
+            if result is not None:
+                return result
+            flight = self._flights.get(action_id)
+            owner = flight is None
+            if owner:
+                flight = _EffectFlight()
+                self._flights[action_id] = flight
+        assert flight is not None
+        if not owner:
+            return self._join(flight)
+        try:
+            result = self._transport.trigger_once(action_id, intent)
+            self._validate_evidence(result)
+        except BaseException as error:
+            self._finish(action_id, flight, error=error)
+            raise
+        self._finish(action_id, flight, result=result)
+        return result
+
+    @staticmethod
+    def _validate_evidence(result: object) -> None:
+        if type(result) is not EffectEvidence:
+            raise SafetyRefused("rerun transport returned invalid effect evidence")
+
+    @staticmethod
+    def _join(flight: _EffectFlight) -> EffectEvidence:
+        flight.joined.set()
+        flight.completed.wait()
+        if flight.error is not None:
+            raise flight.error
+        if flight.result is None:
+            raise SafetyRefused("rerun effect completed without evidence")
+        return flight.result
+
+    def _finish(self, action_id: str, flight: _EffectFlight, *,
+                result: EffectEvidence | None = None,
+                error: BaseException | None = None) -> None:
+        with self._lock:
+            if result is not None:
+                existing = self._results.setdefault(action_id, result)
+                if existing != result:
+                    error = SafetyRefused(
+                        "rerun transport returned conflicting action evidence")
+                    result = None
+            flight.result = result
+            flight.error = error
+            if self._flights.get(action_id) is flight:
+                del self._flights[action_id]
+            flight.completed.set()
 
 
 @dataclass(frozen=True)
@@ -331,7 +429,7 @@ class OperationalSafety:
     def __init__(self, store: object, *,
                  check_evidence: CheckEvidenceAuthority | None = None,
                  promotion_receipts: PromotionReceiptAuthority | None = None,
-                 rerun_effect: RerunEffect | None = None) -> None:
+                 rerun_effect: ActionIdempotentRerunEffect | None = None) -> None:
         self._conn: sqlite3.Connection = getattr(store, "_conn")
         self._lock = getattr(store, "_lock")
         self._check_evidence = check_evidence
@@ -546,12 +644,15 @@ class OperationalSafety:
                 raise
 
     @staticmethod
-    def _validate_rerun_effect(effect: RerunEffect) -> None:
-        if getattr(effect, "contract", None) is not RERUN_EFFECT_CONTRACT:
-            raise SafetyRefused(
-                "rerun effect adapter lacks the exact code-owned atomic contract")
+    def _validate_rerun_effect(effect: object) -> None:
+        if type(effect) is not ActionIdempotentRerunEffect:
+            raise SafetyRefused("rerun effect is not the exact code-owned concrete owner")
+        transport = effect._transport
+        if (type(transport) is not TriggerOnceByActionIdTransportV1
+                or transport.contract is not RERUN_TRIGGER_ONCE_CONTRACT):
+            raise SafetyRefused("rerun transport is not the exact trigger-once v1 binding")
 
-    def _require_rerun_effect(self) -> RerunEffect:
+    def _require_rerun_effect(self) -> ActionIdempotentRerunEffect:
         effect = self._rerun_effect
         if effect is None:
             raise SafetyRefused("rerun effect adapter is unavailable")

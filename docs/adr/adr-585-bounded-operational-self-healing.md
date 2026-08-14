@@ -28,15 +28,18 @@ resolves immutable RouteCells, accepts an `ObservationRequest`, reconciles claim
 one exact quarantine from authority-read evidence references, activates a receipt-approved canary,
 rolls it back to its declared predecessor, and participates in the existing Store reservation
 transaction. Its injected interfaces are `CheckEvidenceAuthority.read(evidence_ref)`,
-`PromotionReceiptAuthority.read(receipt_id)`, and the transport-only `RerunEffect.evidence_for` /
-`apply`. A supplied rerun adapter must hold the exact frozen, code-owned
-`RERUN_EFFECT_CONTRACT` singleton; an equal caller-created declaration is not authority. Its digest
-is `c8b9433f01643550f2dbc560b72aa033895b324e5a5a35dedc0d4b3af13b21b4`, and it requires durable,
-atomic coalescing of overlapping effects by `ActionIntent.action_id`. OperationalSafety validates
-this binding both when an adapter is supplied and immediately before reconciliation. The production promotion implementation
-is `PromotionReceiptReader`, which opens the #584 Evidence store read-only, starts one read snapshot,
-and revalidates exact schema v4 on every connection before reading a receipt. It adds no EvidenceStore
-verb or promotion write. OperationalSafety accepts only receipts produced by the exact #584
+`PromotionReceiptAuthority.read(receipt_id)`, and the exact concrete
+`ActionIdempotentRerunEffect`. OperationalSafety accepts that type only (not subclasses, protocols,
+or objects holding a declaration), both when supplied and immediately before reconciliation. The
+concrete owner atomically coalesces overlapping calls and shares evidence by
+`ActionIntent.action_id`. It binds one exact `TriggerOnceByActionIdTransportV1`, whose only remote
+operations are `evidence_for(action_id)` and `trigger_once(action_id, intent)`. That transport is the
+explicit, unavoidable trust boundary: its implementation must durably deduplicate action IDs across
+processes because remote behavior cannot be introspected locally. The versioned boundary digest is
+`4bc192810ab1119c2b1ec49942fbceb0eddd50e012d765a148e0664cb02e7658`. The production
+promotion implementation is `PromotionReceiptReader`, which opens the #584 Evidence store read-only,
+starts one read snapshot, and revalidates exact schema v4 on every connection before reading a
+receipt. It adds no EvidenceStore verb or promotion write. OperationalSafety accepts only receipts produced by the exact #584
 `github-authority/v1` verifier. There is no
 filesystem, GitHub, prompt, fixture, rubric, policy, routing, effort, autonomy, or merge adapter.
 
@@ -87,8 +90,8 @@ failure releases the lease immediately; a process crash leaves a durable lease t
 after expiry. Recovery always asks `evidence_for(action_id)` before applying, and the bound adapter
 atomically coalesces an overlapping apply for the same action ID even when a live effect outlasts
 its reclaimed lease. A superseded reconciler waits for and returns the one durable result rather
-than failing or committing without its lease. Quarantine and rollback effects live entirely in the Store, so
-their intent, state change, and result commit in one transaction. The action-state map is:
+than failing or committing without its lease. Quarantine and rollback effects live entirely in the
+Store, so their intent, state change, and result commit in one transaction. The action-state map is:
 
 | Kind | States |
 |---|---|
@@ -117,7 +120,7 @@ every non-SQLite table/index/trigger definition with the exact expected schema a
 missing, altered, or additional objects. The v1→v2 migration adds the safety tables without
 rewriting existing continuation records or changing running permits.
 The complete OperationalSafety contract digest is
-`27e095449758459f748a9f8a85ec48afc460cb294bcb859c675dc568e8252d6d`.
+`ba8bf92fa7216d7fd59ef25b42d494de381f6a2a11afab1e0c44b174bfa9ddc0`.
 
 Capability parity remains before admission under ADR 582. A non-ready pre-launch capability result
 retains its claim on environment-failure hold and consumes no permit, attempt, continuation, attempt
