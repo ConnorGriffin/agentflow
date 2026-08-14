@@ -611,6 +611,13 @@ class PromotionReceiptReader:
         with self._connect():
             pass
 
+    @classmethod
+    def for_production(cls) -> PromotionReceiptReader:
+        """Return the normal reader without probing production state during composition."""
+        reader = object.__new__(cls)
+        reader.path = state_path("evidence", "evidence.db")
+        return reader
+
     def _connect(self) -> sqlite3.Connection:
         encoded = quote(self.path.resolve().as_posix(), safe="/")
         conn: sqlite3.Connection | None = None

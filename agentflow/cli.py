@@ -153,6 +153,14 @@ def main(argv: list[str] | None = None) -> int | None:
     capacity_commands.add_parser(
         "calibrate", help="calibrate Claude usage from local history"
     )
+    authority_command = commands.add_parser(
+        "evidence-authority", help="publish or inspect the sealed Evaluation authority"
+    )
+    authority_commands = authority_command.add_subparsers(
+        dest="evidence_authority_command", required=True
+    )
+    authority_commands.add_parser("deploy", help="publish the sealed authority if absent")
+    authority_commands.add_parser("status", help="inspect the sealed authority without repair")
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -324,6 +332,12 @@ def main(argv: list[str] | None = None) -> int | None:
 
         os.environ["TRIAGE_AGENT"] = "claude"
         capacity_main(["calibrate"])
+    elif args.command == "evidence-authority":
+        from agentflow.evaluation_authority import deploy, status
+
+        result = deploy() if args.evidence_authority_command == "deploy" else status()
+        print(json.dumps(result.value(), sort_keys=True, separators=(",", ":")))
+        return 1 if result.status in {"authority-conflict", "invalid"} else 0
 
 
 if __name__ == "__main__":
