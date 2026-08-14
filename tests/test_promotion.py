@@ -1,17 +1,22 @@
 """Public promotion journeys and adversarial authority refusals for #584."""
 from __future__ import annotations
 
+import base64
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from hashlib import sha256
 import inspect
 from pathlib import Path
 import subprocess
+import threading
 
 import pytest
 
+from agentflow import github
 from agentflow.evidence import (AuthorityPointer, EvidenceError, EvidenceStore, FakeAuthorityVerifier,
                                 LessonCandidate, Observation, SubjectRevision)
-from agentflow.promotion import (GitHubAuthorityFacts, GitHubAuthorityVerifier,
+from agentflow.promotion import (GitHubAuthorityFacts, GitHubAuthoritySourceAdapter,
+                                 GitHubAuthorityVerifier,
                                  PromotionAuthorityError, PromotionScopeRegistry,
                                  parse_promotion_scope)
 
@@ -59,6 +64,16 @@ class Source:
 class UnreadableSource:
     def promotion_facts(self, repository, pull_number, artifact_path, revision):
         raise RuntimeError("untrusted source details must not escape")
+
+
+class ConcurrentSource:
+    def __init__(self, facts, barrier):
+        self.facts = facts
+        self.barrier = barrier
+
+    def promotion_facts(self, repository, pull_number, artifact_path, revision):
+        self.barrier.wait(timeout=5)
+        return self.facts
 
 
 def _candidate(store, pointer, *, candidate_id="candidate-1", version=1, digest=None):
@@ -163,6 +178,75 @@ def test_verifier_accepts_same_repository_overlay_and_admin_permission(tmp_path,
     assert GitHubAuthorityVerifier(Source(facts), registry).verify(pointer) is not None
 
 
+def test_production_source_reads_exact_github_artifact_bytes_and_is_injectable(monkeypatch):
+    pointer = _pointer()
+    artifact_bytes = b'{"policy":"exact"}'
+    responses = iter((
+        {"data": {"repository": {"pullRequest": {
+            "number": 42, "state": "MERGED", "merged": True,
+            "mergedAt": "2026-08-13T00:00:00Z", "headRefOid": "d" * 40,
+            "mergedBy": {"login": "maintainer"},
+            "mergeCommit": {"oid": pointer.revision, "tree": {"oid": "c" * 40}},
+            "closingIssuesReferences": {"totalCount": 1, "nodes": [
+                {"state": "CLOSED", "stateReason": "COMPLETED"}]},
+        }}}},
+        {"permission": "maintain"},
+        {"type": "file", "encoding": "base64",
+         "content": base64.b64encode(artifact_bytes).decode(), "size": len(artifact_bytes)},
+    ))
+    calls = []
+
+    def read_json(args):
+        calls.append(args)
+        return next(responses)
+
+    monkeypatch.setattr(github, "_read_json", read_json)
+    snapshot = github.promotion_authority_read(
+        pointer.repository, 42, "docs/policy.json", pointer.revision)
+    assert snapshot.artifact_bytes == artifact_bytes
+    assert snapshot.merged_by_permission == "maintain"
+    assert len(calls) == 3 and f"?ref={pointer.revision}" in calls[2][1]
+    recorded = []
+
+    def injected(repository, pull_number, artifact_path, revision):
+        recorded.append((repository, pull_number, artifact_path, revision))
+        return snapshot
+
+    monkeypatch.setattr(github, "promotion_authority_read", injected)
+    default_facts = GitHubAuthoritySourceAdapter().promotion_facts(
+        pointer.repository, 42, "docs/policy.json", pointer.revision)
+    facts = GitHubAuthoritySourceAdapter(injected).promotion_facts(
+        pointer.repository, 42, "docs/policy.json", pointer.revision)
+    assert default_facts == facts
+    assert facts.artifact_sha256 == sha256(artifact_bytes).hexdigest()
+    assert recorded == 2 * [(pointer.repository, 42, "docs/policy.json", pointer.revision)]
+
+
+def test_production_source_fails_closed_for_unreadable_or_malformed_artifact(monkeypatch):
+    pointer = _pointer()
+    monkeypatch.setattr(github, "_read_json", lambda args: None)
+    assert github.promotion_authority_read(
+        pointer.repository, 42, "docs/policy.json", pointer.revision) is None
+    responses = iter((
+        {"data": {"repository": {"pullRequest": {
+            "number": 42, "state": "MERGED", "merged": True,
+            "mergedAt": "2026-08-13T00:00:00Z", "headRefOid": "d" * 40,
+            "mergedBy": {"login": "maintainer"},
+            "mergeCommit": {"oid": pointer.revision, "tree": {"oid": "c" * 40}},
+            "closingIssuesReferences": {"totalCount": 1, "nodes": [
+                {"state": "CLOSED", "stateReason": "COMPLETED"}]},
+        }}}},
+        {"permission": "maintain"},
+        {"type": "file", "encoding": "base64", "content": "not base64", "size": 10},
+    ))
+    monkeypatch.setattr(github, "_read_json", lambda args: next(responses))
+    assert github.promotion_authority_read(
+        pointer.repository, 42, "docs/policy.json", pointer.revision) is None
+    assert GitHubAuthoritySourceAdapter(
+        lambda *args: (_ for _ in ()).throw(RuntimeError("source content"))
+    ).promotion_facts(pointer.repository, 42, "docs/policy.json", pointer.revision) is None
+
+
 @pytest.mark.parametrize("change", [
     {"repository": "other/repo"}, {"pull_number": 43}, {"merged": False},
     {"merge_commit": "b" * 40}, {"head_commit": "not-a-sha"}, {"tree": "not-a-sha"},
@@ -234,6 +318,34 @@ def test_promotion_binds_digest_version_prior_and_is_idempotent(tmp_path, monkey
     _candidate(store, successor, candidate_id="successor", version=2)
     store.verifier = GitHubAuthorityVerifier(Source(_facts(successor)), registry)
     assert store.promote("successor", successor, promoted_at=4).policy_version == 2
+
+
+def test_two_candidates_cannot_both_commit_the_same_fleet_transition(tmp_path, monkeypatch):
+    registry = _registry(tmp_path, monkeypatch)
+    pointer = _pointer()
+    barrier = threading.Barrier(2)
+    source = ConcurrentSource(_facts(pointer), barrier)
+    path = tmp_path / "evidence.db"
+    first = EvidenceStore(path=path, verifier=GitHubAuthorityVerifier(source, registry))
+    second = EvidenceStore(path=path, verifier=GitHubAuthorityVerifier(source, registry))
+    _candidate(first, pointer, candidate_id="candidate-one")
+    _candidate(first, pointer, candidate_id="candidate-two")
+
+    def promote(store, candidate_id):
+        try:
+            return store.promote(candidate_id, pointer, promoted_at=2)
+        except EvidenceError as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(
+            lambda pair: promote(*pair),
+            ((first, "candidate-one"), (second, "candidate-two")),
+        ))
+    receipts = [result for result in results if not isinstance(result, Exception)]
+    refusals = [result for result in results if isinstance(result, EvidenceError)]
+    assert len(receipts) == 1 and len(refusals) == 1
+    assert "current policy version" in str(refusals[0])
 
 
 def test_candidate_policy_version_rejects_boolean(tmp_path):

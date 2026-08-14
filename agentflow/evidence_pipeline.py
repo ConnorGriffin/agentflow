@@ -393,8 +393,8 @@ class EvidenceMiner:
             if not _valid_digest(item.proposal_digest):
                 continue
             try:
-                event = self._store.read(item.event_id)
-                linked = tuple(self._store.read(link.target_event_id) for link in event.links)
+                event = self._store._read(item.event_id)
+                linked = tuple(self._store._read(link.target_event_id) for link in event.links)
             except ValueError:
                 continue
             failure = next((candidate for candidate in linked
@@ -406,7 +406,7 @@ class EvidenceMiner:
                 continue
             try:
                 method = next(candidate.subject.removeprefix("contract/") for candidate in
-                    (self._store.read(link.target_event_id) for link in finding.links)
+                    (self._store._read(link.target_event_id) for link in finding.links)
                     if candidate.producer_kind == "decision" and candidate.revision == "v1"
                     and candidate.subject.startswith("contract/"))
             except (StopIteration, ValueError):

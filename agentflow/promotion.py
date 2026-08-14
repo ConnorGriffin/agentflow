@@ -15,13 +15,14 @@ from pathlib import Path
 import re
 import stat
 import subprocess
-from typing import Protocol, TYPE_CHECKING
+from typing import Callable, Protocol, TYPE_CHECKING
 
 from agentflow.promotion_contract import (PromotionAuthorityError, PromotionScope,
                                           parse_promotion_scope)
 
 if TYPE_CHECKING:
     from agentflow.evidence import ApprovedAuthority, AuthorityPointer
+    from agentflow.github import PromotionAuthorityRead
 
 
 _REGISTRY = Path("docs/evidence/promotion-scope-registry-v1.json")
@@ -175,6 +176,41 @@ class GitHubAuthoritySource(Protocol):
     """One read-only seam; implementations may use GitHub's REST or GraphQL API."""
     def promotion_facts(self, repository: str, pull_number: int,
                         artifact_path: str, revision: str) -> GitHubAuthorityFacts | None: ...
+
+
+class GitHubAuthoritySourceAdapter:
+    """Production read-only adapter from typed GitHub reads to verifier facts."""
+    def __init__(self, reader: Callable[
+            [str, int, str, str], "PromotionAuthorityRead | None"] | None = None) -> None:
+        self._reader = reader
+
+    def promotion_facts(self, repository: str, pull_number: int,
+                        artifact_path: str, revision: str) -> GitHubAuthorityFacts | None:
+        try:
+            reader = self._reader
+            if reader is None:
+                from agentflow.github import promotion_authority_read
+                reader = promotion_authority_read
+            result = reader(repository, pull_number, artifact_path, revision)
+            if result is None:
+                return None
+            return GitHubAuthorityFacts(
+                repository=result.repository,
+                pull_number=result.pull_number,
+                merged=result.merged,
+                merge_commit=result.merge_commit,
+                head_commit=result.head_commit,
+                tree=result.tree,
+                artifact_path=result.artifact_path,
+                artifact_revision=result.artifact_revision,
+                artifact_sha256=_sha256(result.artifact_bytes).hexdigest(),
+                linked_issue_closed=result.linked_issue_closed,
+                linked_issue_completed=result.linked_issue_completed,
+                merged_by=result.merged_by,
+                merged_by_permission=result.merged_by_permission,
+            )
+        except Exception:
+            return None
 
 
 class GitHubAuthorityVerifier:
