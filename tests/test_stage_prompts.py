@@ -114,6 +114,7 @@ def test_runtime_preflight_rejects_a_requirement_outside_the_manifest_pin(
     )
 
     assert result.state == "incompatible"
+    assert result.ready_fact is None
     assert "manifest pins" in result.evidence[0]
 
 
