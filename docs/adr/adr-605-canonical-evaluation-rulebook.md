@@ -3,6 +3,12 @@
 Status: accepted
 Date: 2026-08-13
 
+Supersession: [ADR 626](adr-626-manifest-rooted-evaluation-semantic-bundle.md)
+supersedes only this record's one-data-file clause with one manifest-rooted
+semantic bundle. Single authority, contract versioning, and no duplicated policy
+remain unchanged. See the revised
+[Evaluation candidate preflight](../research/evaluation-candidate-preflight.md).
+
 ## Context
 
 Independent review reproduced semantic drift when the parent plan, a projected JSON grammar, and verifier constants each encoded overlapping Evaluation v1 rules.

@@ -10,6 +10,9 @@ The product authority is [#583](https://github.com/ConnorGriffin/agentflow/issue
 [ADR 606](../adr/adr-606-explicit-missing-metrics-and-adjudication-lineage.md).
 [ADR 620](../adr/adr-620-evaluation-failure-classes.md) is the separately pinned,
 narrow closure of the six-class vocabulary; it adds no other product authority.
+[ADR 626](../adr/adr-626-manifest-rooted-evaluation-semantic-bundle.md) supersedes
+only ADR 605's one-data-file boundary: the one authority is now a manifest-rooted
+bundle of declarative candidate JSON and one digest-bound pure semantic module.
 Their requirements below are located and summarized, not copied into a second semantic
 rulebook. Existing code and tests establish mechanical implementation choices only.
 Comments, prior payloads, and this report are provenance, never product authority.
@@ -212,14 +215,17 @@ threshold, failure class, or authority boundary settled above.
    bundle object containing sorted `{path,digest}` entries. Reject a missing
    or non-string required digest, a prohibited nested self-identifier, or a mismatch.
    No digest includes a mutable ref, current time, absolute path, or process environment.
-   Separately, the standalone checker's checked-in source owns two reviewed,
+   Separately, the standalone checker's checked-in source owns three reviewed,
    immutable 64-lowercase-hex literal constants: one whole-file SHA-256 lock for
-   `contract-v1.candidate.json` and one for `contract-v1.conformance.json`. Neither
-   literal is supplied by a candidate, conformance report, environment, configuration,
-   or test fixture. The checker checks those exact file bytes before accepting their
-   in-file bindings, so a
-   coordinated mutation that recomputes a record, bundle, source, or report binding
-   still fails `E_DIGEST` unless the independently reviewed checker lock changes.
+   `contract-v1.candidate.json`, one for `contract-v1.conformance.json`, and one
+   for `agentflow/evaluation_semantics_v1.py`. No literal is supplied by a candidate,
+   conformance report, environment, configuration, or test fixture. The checker checks
+   those exact file bytes before accepting their
+   in-file bindings, so a coordinated mutation that recomputes a record, bundle,
+   source, or report binding still fails `E_DIGEST` unless the independently reviewed
+   checker lock changes.
+   The #617 tests mutate one byte in each locked artifact independently, without
+   changing the checker locks, and require all three mutations to fail acceptance.
 5. Stable IDs are ASCII `^[a-z][a-z0-9-]{0,47}$`, unique within their declared
    collection. Declared case IDs are source-controlled, never generated from a
    mutable title. Generated test IDs are `g-` plus the first 24 lowercase hex
@@ -258,12 +264,14 @@ are rejected (`E_REF_UNUSED`).
 All candidate paths are POSIX, repository-relative, nonempty, at most 160 bytes, and
 match `^[a-z0-9][a-z0-9._/-]*$`; they contain no `//`, leading slash, trailing slash,
 `.` segment, `..` segment, or symlink component. The checker validates declared paths
-lexically; it opens only the two fixed candidate data files, from the repository root,
-with no-follow semantics and accepts only regular files.
+lexically; it opens only the two fixed candidate JSON files and the one fixed bound
+semantic module, from the repository root, with no-follow semantics and accepts only
+regular files.
 
 | Limit | Exact default |
 | --- | ---: |
 | one JSON artifact | 1 MiB |
+| semantic module source | 64 KiB |
 | JSON nesting | 32 containers |
 | object members / array entries | 256 each |
 | definitions | 64 |
@@ -352,6 +360,67 @@ Generated cases exercise only generic bytes, parser, reference, and bound mechan
 they cannot replace the required frozen corpus, independent holdouts, six failure-class
 coverage, or planted review-round scenario.
 
+### Bound semantic module
+
+The candidate root contains exactly this additional binding:
+
+```json
+{
+  "semantic_module": {
+    "interface_version": "evaluation-semantics-v1",
+    "path": "agentflow/evaluation_semantics_v1.py",
+    "source_sha256": "<64 lowercase hexadecimal characters>"
+  }
+}
+```
+
+The path and interface version are exact literals. `source_sha256` follows the existing
+digest grammar and equals both the opened module's whole-file SHA-256 and the checker's
+independent reviewed lock. The interface version exposes exactly one public operation:
+
+```text
+evaluate_v1(contract, operation_id, input_value) -> result_value
+```
+
+The candidate JSON remains the declarative authority for schemas, enums, artifact roles
+and paths, thresholds, denominators, bounds, truth tables, authority parameters, and
+Evidence projections. The module is the bundle's sole procedural authority for schedule,
+lifecycle evaluation, authority and blinding transitions, exact arithmetic, bootstrap,
+and Evidence constructor projections. It uses only exact `int` and
+`fractions.Fraction`; every threshold, draw count, bound, path, role, scope, and policy
+value comes from `contract`. There is no hidden fallback threshold or policy constant.
+
+The module source is UTF-8 without BOM or CR bytes, uses LF line endings, and has exactly
+one trailing LF. It is pure Python using only the standard library. Its only permitted
+static imports are `from fractions import Fraction` and `from hashlib import sha256`.
+Source and execution may not use
+the filesystem, network, environment, clock, randomness, subprocesses, sockets, dynamic
+imports, `eval`, `exec`, or plugin registries. Top level contains only a module docstring,
+the approved imports, and function definitions without decorators, annotations, or
+default expressions; `evaluate_v1` is the only public callable.
+
+After checking the 64 KiB source limit, whole-file lock, candidate digest binding, and
+UTF-8 decoding, the checker parses the source with `ast`. It rejects any other import,
+top-level executable statement, forbidden API or name, dunder or reflection access, and
+reference to `eval`, `exec`, `compile`, `open`, or `__import__`. It compiles the audited
+tree and executes it once in a fresh namespace. The exact builtins are `abs`, `all`,
+`any`, `bool`, `bytes`, `dict`, `enumerate`, `int`, `isinstance`, `len`, `list`, `max`,
+`min`, `range`, `reversed`, `set`, `sorted`, `str`, `sum`, `tuple`, `zip`, `KeyError`,
+`TypeError`, and `ValueError`, plus an import hook restricted to the two approved static
+imports. The restricted load is checker mechanics, not an Evaluation operation. Human
+review audits the complete locked source for hidden defaults or policy constants that a
+syntactic audit cannot classify.
+
+The module reuses the existing error registry. Failure to open its fixed regular path is
+`E_IO`; exceeding 64 KiB is `E_LIMIT`; invalid source encoding is `E_UTF8`; a binding or
+whole-file mismatch is `E_DIGEST`; and a forbidden AST/import/public surface, execution
+exception, invalid result, or vector mismatch is `E_SEMANTIC`. A malformed candidate
+binding remains `E_SCHEMA`, or `E_PATH` when its path violates the closed path rule. No
+new public code or precedence rule is added.
+
+Production and conformance both call these exact digest-bound module bytes. Neither
+translates nor reimplements an algorithm.
+
 ### Validation order and checker interface
 
 The zero-argument public checker is exactly:
@@ -360,21 +429,25 @@ The zero-argument public checker is exactly:
 uv run python scripts/check-evaluation-contract-candidate.py
 ```
 
-It is a standalone stdlib script: it imports no `agentflow.*` module and finds the
-repository root from its own checked-in `scripts/` location rather than the current
-directory.
+It is a standalone stdlib script: it imports no AgentFlow product or runtime module,
+finds the repository root from its own checked-in `scripts/` location rather than the
+current directory, and loads only the audited source named below.
 
 ```text
 docs/evaluation/design/contract-v1.candidate.json
 docs/evaluation/design/contract-v1.conformance.json
+agentflow/evaluation_semantics_v1.py
 ```
 
-Runtime modules and runtime artifacts are #614 work and are deliberately outside
-this checker interface.
+Other runtime modules and runtime artifacts are #614 work and are deliberately outside
+this checker interface. The checker opens the three displayed paths in that order; it
+does not follow a candidate-supplied alternate path, import the `agentflow` package, scan
+a directory, open a cache, or read configuration or environment state. Repeated runs
+from any working directory over identical bytes produce byte-identical output.
 
-It validates the two files in lexicographic path order and stops at the first failing
-artifact. This is the one closed total order for its 28 public codes: 27 validation
-codes followed by `E_INTERNAL`:
+It validates the bundle and stops at the first failing artifact. The existing closed
+total order for its 28 public codes remains unchanged: 27 validation codes followed by
+`E_INTERNAL`:
 
 ```text
 E_ROOT < E_SOURCE_DRIFT < E_SOURCE_LOCATOR < E_REQUIREMENT_DUPLICATE <
@@ -385,29 +458,33 @@ E_GENERATOR_TARGET < E_GENERATOR_PRECONDITION < E_GENERATOR_COLLISION <
 E_GENERATOR_LIMIT < E_SEMANTIC < E_INTERNAL
 ```
 
-Within one artifact, the first applicable code in that order wins; within a collection,
-IDs and paths sort bytewise. `E_INTERNAL` is reachable only for an unexpected checker
-fault after its guarded validation path, is last in the registry, and never exposes a
-traceback. It validates the
-candidate's declared semantic rules, mappings, cases, and bounds as data, then applies
-an independent mechanical interpreter to every declared case; it never uses an
-expected result as a rule source.
+Within one artifact, the first applicable code in that order wins; ties across artifacts
+use the displayed path order; within a collection, IDs and paths sort bytewise.
+`E_INTERNAL` is reachable only for an unexpected checker fault after its guarded
+validation path, is last in the registry, and never exposes a traceback. The checker
+independently validates the candidate and report's structure,
+canonical bytes, schema grammar, references, coverage, lineage, paths, bounds, and
+digests, and audits the module's source, AST, imports, and public interface. It then
+executes every declared conformance vector through the bound `evaluate_v1`; it never
+uses an expected result as a rule source.
 
 The exact output bytes, streams, paths, and exits are closed. On success stdout is
 exactly the following ASCII bytes and stderr is empty (`b""`); exit is `0`:
 
 ```json
-{"checked":2,"format":"evaluation-contract-candidate-check-v1","status":"ok"}
+{"checked":3,"format":"evaluation-contract-candidate-check-v1","status":"ok"}
 ```
 
 The success byte sequence is
-`b'{"checked":2,"format":"evaluation-contract-candidate-check-v1","status":"ok"}\x0a'`.
+`b'{"checked":3,"format":"evaluation-contract-candidate-check-v1","status":"ok"}\x0a'`.
 For a validation failure other than `E_ROOT` or `E_INTERNAL`, stdout is empty (`b""`);
 stderr is exactly `canonical_json({"code":CODE,"format":"evaluation-contract-candidate-check-v1","path":PATH,"status":"error"}) + b"\x0a"`;
 exit is `1`. `PATH` is exactly
 `docs/evaluation/design/contract-v1.candidate.json` for a candidate-artifact error or
 `docs/evaluation/design/contract-v1.conformance.json` for a conformance-artifact error;
-this includes `E_SOURCE_DRIFT`, `E_SOURCE_LOCATOR`, `E_REQUIREMENT_DUPLICATE`, and
+module byte, digest, source, import, interface, or execution errors name exactly
+`agentflow/evaluation_semantics_v1.py`; this includes `E_SOURCE_DRIFT`,
+`E_SOURCE_LOCATOR`, `E_REQUIREMENT_DUPLICATE`, and
 `E_REQUIREMENT_MISSING` when the malformed binding or inventory is in that artifact.
 For `E_ROOT`, stdout is empty and stderr is exactly
 `b'{"code":"E_ROOT","format":"evaluation-contract-candidate-check-v1","path":"scripts/check-evaluation-contract-candidate.py","status":"error"}\x0a'`;
@@ -420,7 +497,8 @@ ordinary artifact-error line therefore has this exact shape, for example:
 {"code":"E_DIGEST","format":"evaluation-contract-candidate-check-v1","path":"docs/evaluation/design/contract-v1.candidate.json","status":"error"}
 ```
 
-It neither repairs nor writes a candidate file.
+It neither repairs nor writes any bundle file and creates no temporary file, cache, or
+bytecode artifact.
 
 The required #617 checker-fixture suite assigns exactly one isolated checker-fixture owner
 to each registry code, named `error-` plus the lowercase code with `_` changed to `-`.
@@ -435,14 +513,20 @@ This ownership and pair matrix is mechanical test evidence, not Evaluation fixtu
 
 ## Independent case oracle
 
-The checker has two deliberately separate roles. The candidate file is the sole data
-plane for Evaluation semantics: its closed rules, thresholds, mappings, cases, and
-expected outcomes are the candidate under review. The standalone checker supplies only
-an independent mechanical interpreter for the candidate's declared grammar, arithmetic,
-reference resolution, canonical bytes, and digest framing. It does not import AgentFlow
-product code or carry a second production registry of Evaluation thresholds, metrics,
-or eligibility semantics. The interpreter computes a declared case before it reads,
-deserializes, or hashes that case's `expected_result`.
+The checker has two deliberately separate roles. First, it independently validates the
+bundle's structure, bytes, references, requirement coverage, lineage, paths, bounds, and
+digests, and audits the module's full source, AST, imports, and public interface. Second,
+it executes the candidate's conformance vectors through the canonical bound module. The
+candidate's cases and expected outcomes remain independently reviewed evidence; they are
+not a second algorithm and are never passed to the module as policy.
+
+For each semantic case, the checker resolves the operation and input from the validated
+case map, calls `evaluate_v1(contract, operation_id, input_value)`, and captures the
+result before it reads that case's `expected_result`. The module receives neither the
+expected value nor the conformance report. The checker then validates and compares the
+actual and expected result with canonical JSON. A module exception, nonconforming result,
+or mismatch is `E_SEMANTIC`; the existing code order, output framing, and exit remain
+unchanged.
 
 For each semantic case, the oracle resolves `case_id` in the validated case map, then
 requires the exact case-manifest digest and the answer-key digest reached from that
@@ -455,13 +539,65 @@ The conformance report maps each applicable authoritative requirement to exactly
 candidate rule ID and at least one declared positive or negative case ID. The required
 swapped critical-miss, equality-threshold, bootstrap-replay, partial-token, and
 partial-round cases remain candidate data; the checker verifies their structure and
-independently interprets their declared mechanics. Checker tests protect that generic
-interpreter and its rejection behavior, not a duplicate production semantic registry.
+executes them through the bound module. Checker tests protect structural validation,
+module audit/loading, vector dispatch/comparison, and rejection behavior, not a duplicate
+production semantic registry.
 The report may not claim zero `unresolved` until the failure-class decision below is
 made; #617's acceptance condition then requires zero unresolved, unmapped applicable
 requirements, and duplicate owners.
 
-## Captured verification results
+This closes independent validation at the bundle boundary. The checker does not
+rederive schedule, bootstrap, lifecycle, authority, blinding, eligibility, or Evidence
+algorithms. Stronger algorithm rederivation would create a second semantic authority and
+conflict with [ADR 605](../adr/adr-605-canonical-evaluation-rulebook.md), as narrowed by
+[ADR 626](../adr/adr-626-manifest-rooted-evaluation-semantic-bundle.md).
+
+## ADR 626 revision preflight
+
+### Generated facts
+
+| Fact | Command | Output |
+| --- | --- | --- |
+| Fixed opened artifacts | `awk '/^### Validation order and checker interface/{s=1} s && /^```text$/{b++;next} s && b==2 && /^```$/{exit} s && b==2{print}' docs/research/evaluation-candidate-preflight.md` | `docs/evaluation/design/contract-v1.candidate.json`, `docs/evaluation/design/contract-v1.conformance.json`, `agentflow/evaluation_semantics_v1.py`; count `3`. |
+| Whole-file locks and success count | `sh /tmp/agentflow-626-doc-audit.sh "$PWD"` | Locks `3`; success `checked` value `3`; no prior success-count occurrence. |
+| Public errors | `sed -n '/^E_ROOT </,/E_GENERATOR_LIMIT < E_SEMANTIC < E_INTERNAL/p' docs/research/evaluation-candidate-preflight.md \| rg -o 'E_[A-Z_]+' \| sort -u \| wc -l` | `28`: `27` validation codes plus `E_INTERNAL`; order text unchanged. |
+| Limits | `awk '/^\| Limit \| Exact default \|/{s=1;next} s && /^\| ---/{next} s && /^\|/{n++;print} s && NF==0{exit} END{print "limit_rows=" n}' docs/research/evaluation-candidate-preflight.md` | `11` rows; the only added row is `semantic module source | 64 KiB` (`65536` bytes). All other rows are unchanged. |
+| Future deliverables | `sed -n '/git ls-files --error-unmatch docs\/evaluation\/design\/contract-v1.candidate.json/p' docs/research/evaluation-candidate-preflight.md \| rg -o '(docs\|agentflow\|scripts\|tests)/[^ ]+' \| wc -l` | `5`, including the bound module. |
+| Preserved extraction | SHA-256 of the section from `Durable source snapshots` up to `Mechanical contract`, at `18a3e804` and in the working tree | Both `79edfa3d7fec111b88bc7abe7ff0b91522b2931e882bd7125285c54d9ce7bff1`. |
+| Preserved generator | SHA-256 of `Generated-case byte mapping`, stopping before the old/new following section, at `18a3e804` and in the working tree | Both `8de74557ae1095873dd62e72b4d912f267d4c1979a2bacac0bb3e2b0429edea7`. |
+
+### Scratch text and contradiction audit
+
+`sh /tmp/agentflow-626-doc-audit.sh "$PWD"` compared the ADR and preflight
+binding blocks, enumerated paths/codes/bounds, and searched the active contract text for
+the superseded boundary's distinctive phrases. It reported:
+
+```text
+opened_artifacts=3
+whole_file_locks=3
+public_error_codes=28
+validation_codes=27 internal_codes=1
+module_source_bound_bytes=65536
+success_checked=3
+binding_match=pass
+stale_preflight_claims=0
+historical_rejection_hits=4
+adr_preflight_contradictions=0
+```
+
+The four historical hits are confined to ADR 626's Context and rejected Alternative;
+they explain why the prior interpreter/VM boundary was superseded and are not active
+requirements. The scratch script is throwaway and is not committed.
+
+### Revision checks
+
+| Gate | Command | Exit / result |
+| --- | --- | --- |
+| Diff whitespace | `git diff --check` | Exit `0`; no output. |
+| Public links | `uv run python scripts/check-public-doc-links.py` | Exit `0`; `Documentation link check passed for 13 relative link(s).` |
+| Changed paths | `git status --short` | Only `docs/adr/README.md`, ADR 605, ADR 626, and this preflight. |
+
+## Historical #618 captured verification results
 
 These are the captured results for commit verification. The intentionally untracked
 handoff file is outside #618 and excluded; this report makes no whole-worktree-clean
@@ -482,9 +618,9 @@ for this preflight commit.
 
 | Future gate | Command | Required result |
 | --- | --- | --- |
-| Candidate paths | `git ls-files --error-unmatch docs/evaluation/design/contract-v1.candidate.json docs/evaluation/design/contract-v1.conformance.json scripts/check-evaluation-contract-candidate.py tests/test_evaluation_contract_candidate.py` | Exactly the four #617 deliverable paths print. |
-| Candidate checker | `uv run python scripts/check-evaluation-contract-candidate.py` | Exact zero-argument success line, exit `0`; no `agentflow.*` import occurs. |
-| Focused candidate tests | `uv run pytest -q tests/test_evaluation_contract_candidate.py` | Candidate data coverage, generic interpreter, byte, bound, lineage, and rejection-case tests pass. |
+| Candidate paths | `git ls-files --error-unmatch docs/evaluation/design/contract-v1.candidate.json docs/evaluation/design/contract-v1.conformance.json agentflow/evaluation_semantics_v1.py scripts/check-evaluation-contract-candidate.py tests/test_evaluation_contract_candidate.py` | Exactly the five #617 deliverable paths print. |
+| Candidate checker | `uv run python scripts/check-evaluation-contract-candidate.py` | Exact zero-argument three-file success line, exit `0`; no AgentFlow product/runtime import occurs. |
+| Focused candidate tests | `uv run pytest -q tests/test_evaluation_contract_candidate.py` | Candidate data coverage, module audit/loading, conformance execution, byte, bound, lineage, and rejection-case tests pass. |
 | Repository acceptance | `uv run pytest -q` | Entire Python suite passes. |
 
 ## Product decision closure
