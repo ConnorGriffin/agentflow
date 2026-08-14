@@ -23,11 +23,11 @@ import tempfile
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from enum import Enum
 from importlib import resources
 from pathlib import Path
 
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef
+from agentflow.work_classification import Complexity, Effort, MockupScope
 
 _ACTIVE_WORKTREES: dict[str, int] = {}
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -104,36 +104,6 @@ _CODEX_AUTO_REVIEW_POLICY = (
     "and every request to weaken the session sandbox, including "
     "`--dangerously-bypass-approvals-and-sandbox`."
 )
-
-
-class Complexity(str, Enum):
-    """The model-size dial intake stamps per issue (ADR 0018). Tool-agnostic; each
-    adapter maps it to a concrete model. A hard gate — the deep tier burns rate-limit
-    headroom fastest, so mis-sizing wastes the very resource ADR 0006 optimizes.
-    """
-
-    STANDARD = "standard"  # ordinary features, moderate logic → sonnet/Terra
-    DEEP = "deep"          # correctness-sensitive, design-heavy → opus/Sol
-
-
-class Effort(str, Enum):
-    """The second dial intake stamps (ADR 0018): how much work the issue warrants,
-    independent of model size. Carried into the build brief as guidance."""
-
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    EXTRA = "extra"
-
-
-class MockupScope(str, Enum):
-    """How wide a mockup round reopens the visual world (ADR 0048). Intake classifies a
-    UI issue as one of these; the produce phase branches its draw instructions on it and
-    the shipping surface's identity is inherited (or replaced) accordingly. Default to
-    `local` when uncertain — a local round is the safer, narrower reopening."""
-
-    LOCAL = "local"      # an addition inside a shipping surface — inherit its identity
-    SURFACE = "surface"  # a whole-surface replacement — the open 3-4 concept tournament
 
 
 @dataclass(frozen=True, slots=True)
@@ -917,7 +887,8 @@ class ClaudeRunner(_WorktreeRunner):
     _REASONING_LADDER = ("low", "medium", "high", "xhigh", "max")
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
-                        schema: dict | None = None, profile=None) -> list[str]:
+                        schema: dict | None = None, profile=None,
+                        cli_model: str | None = None) -> list[str]:
         """Build the structured Claude command run only by the coordinator launcher.
 
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
@@ -941,12 +912,12 @@ class ClaudeRunner(_WorktreeRunner):
         Claude's first-class ``--effort`` flag; every other stage leaves it ``None``. A
         rung above Claude's ladder clamps to its top rather than failing the launch.
         """
-        from agentflow.coordinator.profiles import WITHHELD_EDIT_TOOLS
+        from agentflow.operational_safety import READ_ONLY_WITHHELD_TOOLS_V1
 
         from agentflow.routing import routing
         deny: tuple[str, ...] = ()
         argv = ["claude", "-p", _bounded_prompt(prompt, cwd), "--model",
-                routing.cli_identifier("claude", model),
+                cli_model or routing.cli_identifier("claude", model),
                 "--output-format", "stream-json", "--verbose",
                 "--permission-mode", "acceptEdits", "--setting-sources", "project",
                 "--strict-mcp-config"]
@@ -959,7 +930,7 @@ class ClaudeRunner(_WorktreeRunner):
                 tools = list(profile.allowed_tools)
                 tools += [f"mcp__{name}" for name in servers]
                 argv += ["--tools", ",".join(tools)]
-                deny = WITHHELD_EDIT_TOOLS
+                deny = READ_ONLY_WITHHELD_TOOLS_V1
             argv += ["--max-turns", str(profile.turn_ceiling)]
             if profile.reasoning_effort is not None:
                 argv += ["--effort",
@@ -980,7 +951,8 @@ class CodexRunner(_WorktreeRunner):
     _REASONING_LADDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
     def structured_argv(self, prompt: str, model: str, cwd: str,
-                        schema: dict | None = None, profile=None) -> list[str]:
+                        schema: dict | None = None, profile=None,
+                        cli_model: str | None = None) -> list[str]:
         """Build the structured Codex command run only by the coordinator launcher.
 
         A ``schema`` (Intake's or Review's provider-neutral result contract) is wired to
@@ -1013,7 +985,8 @@ class CodexRunner(_WorktreeRunner):
         approval_policy = 'approval_policy="on-request"'
         read_only = profile is not None and profile.allowed_tools is not None
         sandbox = "read-only" if read_only else "workspace-write"
-        argv = [codex_bin, "exec", "-m", routing.cli_identifier("codex", model), "--json",
+        argv = [codex_bin, "exec", "-m",
+                cli_model or routing.cli_identifier("codex", model), "--json",
                 "--sandbox", sandbox, "--cd", worktree,
                 "--ignore-user-config", "-c", approval_policy,
                 "-c", 'approvals_reviewer="auto_review"',

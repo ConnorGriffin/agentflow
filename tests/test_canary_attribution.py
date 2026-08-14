@@ -15,6 +15,7 @@ from agentflow.canary_attribution import (
     ATTRIBUTION_CONTRACT_VERSION,
     CANARY_ATTRIBUTION_CONTRACT,
     CANARY_ATTRIBUTION_CONTRACT_DIGEST,
+    CANARY_ATTRIBUTION_CONTRACT_V1_DIGEST,
     CANARY_ATTRIBUTION_RECEIPT_BINDING_VECTORS,
     CANARY_ATTRIBUTION_REFUSAL_CODES,
     DEPENDENCY_PINS,
@@ -36,6 +37,7 @@ from agentflow.coordinator.store import (
     AdmissionResult,
     NoAdmission,
     OperationalSafetyAndCanary,
+    RouteAdmissionRefused,
     ReservationIntent,
     SCHEMA_VERSION,
     SUPERVISOR_WINDOW,
@@ -50,12 +52,33 @@ from agentflow.evidence import ApprovedAuthority, AuthorityPointer, EvidenceErro
 from agentflow.operational_safety import (
     CanaryActivationRequest,
     CanaryState,
+    LaunchConfigV1,
     OperationalSafety,
+    RouteCell,
     SafetyRefused,
 )
 
 
 IDENTITY = "octo/app|641|build|-"
+PRIMARY_ROUTE_ID = "production/build/deep/default"
+
+
+def launch_config(effort: str, *, stage_profile_id="build/deep/default") -> LaunchConfigV1:
+    return LaunchConfigV1(
+        schema="agentflow-launch-v1",
+        provider="codex",
+        internal_model="gpt-5",
+        cli_model="gpt-5",
+        stage_profile_id=stage_profile_id,
+        reasoning_effort=effort,
+        turn_ceiling=64,
+        wall_ceiling_s=900,
+        build_lease=(8, 12, 20),
+        allowed_tools=None,
+        sandbox_policy="workspace-write",
+        result_schema_json=None,
+        result_schema_digest=None,
+    )
 
 
 class Receipts:
@@ -99,13 +122,13 @@ def seed(path, receipts: Receipts, *, with_receipt=True,
     store = Store(path)
     safety = OperationalSafety(store, promotion_receipts=receipts)
     predecessor = safety.register_route_cell(
-        "octo/app", "build", "codex", "gpt-5", "primary",
-        {"model": "gpt-5", "effort": "medium", "timeout": 900})
+        "octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID,
+        launch_config("medium"))
     active = predecessor
     if with_receipt:
         active = safety.register_route_cell(
-            "octo/app", "build", "codex", "gpt-5", "primary",
-            {"model": "gpt-5", "effort": "high", "timeout": 900})
+            "octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID,
+            launch_config("high"))
         request = CanaryActivationRequest(receipt_id, active.digest, predecessor.digest, 0)
         receipts.issue(request, receipt_id=receipt_id)
         safety.approve_canary(request)
@@ -142,13 +165,32 @@ def make_v2(path, *, record=None):
             item.identity, item.pool, item.state, item.demand, Store._encode(item)))
     conn.execute("PRAGMA user_version = 2")
     conn.execute("COMMIT")
-    holder = type("V2Store", (), {})()
-    holder._conn = conn
-    holder._lock = threading.RLock()
-    safety = OperationalSafety(holder)
-    cell = safety.register_route_cell(
-        "octo/app", "build", "codex", "gpt-5", "migration",
-        {"model": "gpt-5", "effort": "high", "timeout": 900})
+    config_bytes = b'{"effort":"high","model":"gpt-5","timeout":900}'
+    config_digest = _digest(json.loads(config_bytes))
+    body = {
+        "repository": "octo/app", "stage": "build", "provider": "codex",
+        "model": "gpt-5", "route_id": "migration",
+        "launch_config_digest": config_digest,
+    }
+    body_text = json.dumps(body, sort_keys=True, separators=(",", ":"))
+    cell = RouteCell(**body, digest=_digest(body))
+    legacy_key = _digest({
+        "repository": cell.repository, "stage": cell.stage,
+        "provider": cell.provider, "model": cell.model, "route_id": cell.route_id,
+    })
+    state_id = _digest({
+        "cell_key": legacy_key, "active": cell.digest,
+        "quarantined": None, "generation": 0,
+    })
+    conn.execute("INSERT INTO safety_launch_configs VALUES (?, ?)",
+                 (config_digest, config_bytes))
+    conn.execute("INSERT INTO safety_route_cells VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", (
+        cell.digest, legacy_key, cell.repository, cell.stage, cell.provider, cell.model,
+        cell.route_id, cell.launch_config_digest, body_text))
+    conn.execute("INSERT INTO safety_route_state VALUES (?, ?, NULL, NULL, ?, 0)",
+                 (legacy_key, cell.digest, state_id))
+    conn.execute("INSERT INTO safety_canary_state VALUES (?, ?, NULL, NULL, NULL, 0, 0)",
+                 (legacy_key, cell.digest))
     assert _schema_fingerprint(conn) == STORE_V2_SCHEMA_FINGERPRINT
     conn.close()
     return tuple(records), cell
@@ -175,8 +217,10 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
         "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e")
     assert STORE_V3_SCHEMA_FINGERPRINT_DIGEST == (
         "3a51988512b246ec34c469fc469b63cbcdabaf5d537c9a8552ae7c75d127bda5")
-    assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == (
+    assert CANARY_ATTRIBUTION_CONTRACT_V1_DIGEST == (
         "4c0ff263ee994228ffae0641a26959ca8f5f497285f800d0b7d980399e508157")
+    assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == (
+        "f7f64e3fb9a3913713d121d24af39c3f208d39b3cb6afb04b1457dd54b8d0d2f")
     assert _digest(STORE_V2_SCHEMA_FINGERPRINT) == STORE_V2_SCHEMA_FINGERPRINT_DIGEST
     assert _digest(STORE_V3_SCHEMA_FINGERPRINT) == STORE_V3_SCHEMA_FINGERPRINT_DIGEST
     assert _digest(CANARY_ATTRIBUTION_CONTRACT) == CANARY_ATTRIBUTION_CONTRACT_DIGEST
@@ -189,7 +233,7 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
         "identity", "expected_launch_token", "expected_revision", "now",
         "daemon_generation", "budget", "limits", "route_cell_digest"]
     assert list(inspect.signature(Store.reserve).parameters) == ["self", "intent"]
-    assert list(inspect.signature(Store.resolve_route_cell).parameters) == [
+    assert list(inspect.signature(Store.resolve_admitted_launch).parameters) == [
         "self", "stage_identity", "expected_revision", "route_id"]
     assert list(inspect.signature(Store.read_canary_attribution).parameters) == [
         "self", "stage_identity"]
@@ -208,8 +252,9 @@ def test_store_modes_are_exact_frozen_values_and_unconfigured_delegation_refuses
     with pytest.raises(FrozenInstanceError):
         sources.check_evidence = object()
     store = Store(tmp_path / "none.db")
-    with pytest.raises(StoreUnavailable, match="route resolution is not configured"):
-        store.resolve_route_cell(IDENTITY, 1, "primary")
+    with pytest.raises(RouteAdmissionRefused) as refused:
+        store.resolve_admitted_launch(IDENTITY, 1, PRIMARY_ROUTE_ID)
+    assert refused.value.code == "unreadable"
     with pytest.raises(StoreUnavailable, match="canary attribution is not configured"):
         store.read_canary_attribution(IDENTITY)
     store.close()
@@ -692,9 +737,9 @@ def test_same_owned_instances_handle_admission_resolution_and_read(tmp_path, mon
         seen["safety_admit"] = id(self)
         return safety_admit(self, context)
 
-    def remember_safety_resolve(self, *args):
+    def remember_safety_resolve(self, *args, **kwargs):
         seen["safety_resolve"] = id(self)
-        return safety_resolve(self, *args)
+        return safety_resolve(self, *args, **kwargs)
 
     def remember_canary_admit(self, context):
         seen["canary_admit"] = id(self)
@@ -709,7 +754,7 @@ def test_same_owned_instances_handle_admission_resolution_and_read(tmp_path, mon
     monkeypatch.setattr(CanaryAttributionAuthority, "_participate_in_admission", remember_canary_admit)
     monkeypatch.setattr(CanaryAttributionAuthority, "_read", remember_canary_read)
     store = composed(path, receipts)
-    store.resolve_route_cell(IDENTITY, 1, "primary")
+    store.resolve_admitted_launch(IDENTITY, 1, PRIMARY_ROUTE_ID)
     assert store.reserve(intent(digest=active.digest)) is not None
     store.read_canary_attribution(IDENTITY)
     assert seen["safety_admit"] == seen["safety_resolve"]
@@ -727,7 +772,10 @@ def test_direct_v2_to_v3_migration_preserves_records_and_has_zero_attributions(t
     assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 3
     assert _schema_fingerprint(store._conn) == STORE_V3_SCHEMA_FINGERPRINT
     assert tuple(store.load()[item.identity] for item in records) == records
-    assert OperationalSafety(store).route_state(cell.digest).route_cell_digest == cell.digest
+    with pytest.raises(SafetyRefused, match="requires operator reconciliation"):
+        OperationalSafety(store)
+    assert store._conn.execute(
+        "SELECT active_digest FROM safety_route_state").fetchone()[0] == cell.digest
     assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
     store.close()
 
@@ -750,8 +798,10 @@ def test_every_declared_migration_fault_observation_is_atomic(tmp_path, monkeypa
         assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == 3
         assert _schema_fingerprint(reopened._conn) == STORE_V3_SCHEMA_FINGERPRINT
         assert tuple(reopened.load()[item.identity] for item in records) == records
-        assert OperationalSafety(reopened).route_state(
-            cell.digest).route_cell_digest == cell.digest
+        with pytest.raises(SafetyRefused, match="requires operator reconciliation"):
+            OperationalSafety(reopened)
+        assert reopened._conn.execute(
+            "SELECT active_digest FROM safety_route_state").fetchone()[0] == cell.digest
         assert reopened._conn.execute(
             "SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 0
         reopened.close()

@@ -44,6 +44,7 @@ from agentflow.review_policy import (
 )
 from agentflow.screenshot_crib import SCREENSHOT_HARNESS
 from agentflow.shell_crib import SHELL_CRIB
+from agentflow.stage_result_contracts import REVIEW_VERDICT_SCHEMA
 from agentflow.worktree_ref import WorktreeRef
 
 
@@ -51,74 +52,6 @@ from agentflow.worktree_ref import WorktreeRef
 # else (including empty or unknown values) remains blocking.
 _NIT_SEVERITIES = {"nit", "nits", "info", "minor", "low", "style", "note",
                    "suggestion", "trivial", "cosmetic"}
-
-# The provider-neutral shape a reviewer's terminal verdict must match. Each runner adapter
-# translates it into that CLI's native structured-output surface (Claude `--json-schema`,
-# Codex `--output-schema`); the CLI enforces it, so `parse_verdict` validates a real object
-# rather than scavenging JSON out of free text.
-REVIEW_VERDICT_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "verdict": {"type": "string", "enum": ["PASS", "BLOCK"]},
-        "reviewed_sha": {"type": "string"},
-        "final_sha": {"type": "string"},
-        "pushed_sha": {"type": "string"},
-        "fixes": {"type": "array", "items": {"type": "string"}},
-        "depth": {"type": "string", "enum": ["focused", "targeted", "full"]},
-        "depth_reason": {"type": "string"},
-        "axis": {"type": "string", "enum": [
-            "combined", "product", "standards", "fix", "decision"]},
-        "change_author_tool": {"type": "string", "enum": ["claude", "codex"]},
-        "checks": {"type": "array", "items": {"type": "string"}},
-        "decision": {"type": "string"},
-        "follow_ups": {
-            "type": "array", "maxItems": 1,
-            "items": {
-                "type": "object", "additionalProperties": False,
-                "properties": {
-                    "evidence": {"type": "string"},
-                    "desired_outcome": {"type": "string"},
-                },
-                "required": ["evidence", "desired_outcome"],
-            },
-        },
-        "findings": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "action": {"type": "string", "enum": [
-                        "fix_before_completion", "necessary_follow_up", "ask_maintainer",
-                        "discard_preference"]},
-                    "file": {"type": "string"},
-                    "line": {"type": "integer"},
-                    "summary": {"type": "string"},
-                    "grounding": {"type": "string"},
-                },
-                "required": ["action", "file", "line", "summary", "grounding"],
-            },
-        },
-        "uncertainty": {
-            "anyOf": [
-                {"type": "null"},
-                {"type": "object", "additionalProperties": False,
-                 "properties": {
-                     "options": {"type": "array", "minItems": 2, "maxItems": 2,
-                                 "items": {"type": "string"}},
-                     "missing_guidance": {"type": "string"},
-                     "recommendation": {"type": "string"},
-                 },
-                 "required": ["options", "missing_guidance", "recommendation"]},
-            ],
-        },
-    },
-    "required": ["verdict", "depth", "depth_reason", "axis", "change_author_tool",
-                 "reviewed_sha", "final_sha", "pushed_sha", "fixes", "follow_ups",
-                 "checks", "decision", "findings", "uncertainty"],
-}
-
 
 @dataclass(frozen=True, slots=True)
 class Finding:

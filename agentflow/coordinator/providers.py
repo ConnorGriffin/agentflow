@@ -28,6 +28,7 @@ from agentflow.coordinator.session import read_session
 from agentflow.coordinator.store import default_store_path
 from agentflow.coordinator.telemetry import (
     AttemptUsage, claude_usage, codex_usage, lead_codex_worker_usage)
+from agentflow.stage_result_contracts import stage_result_schema
 
 
 class ProviderCause(str, Enum):
@@ -568,23 +569,6 @@ class SessionLeadInputError(ValueError):
     """A durable session-lead input cannot be safely refreshed before launch."""
 
 
-def _stage_result_schema(stage: str) -> dict | None:
-    """The provider-neutral result contract a stage's terminal decision must match, or None
-    for a code-writing stage that emits no structured decision. Intake, Review and the attack own
-    their schemas (domain validation lives with their parsers); this seam only names which stage
-    uses which, so no provider-specific schema detail leaks into coordinator policy."""
-    if stage == "intake":
-        from agentflow.intake import INTAKE_RESULT_SCHEMA
-        return INTAKE_RESULT_SCHEMA
-    if stage == "review":
-        from agentflow.reviewer import REVIEW_VERDICT_SCHEMA
-        return REVIEW_VERDICT_SCHEMA
-    if stage == "attack":
-        from agentflow.attack import ATTACK_RESULT_SCHEMA
-        return ATTACK_RESULT_SCHEMA
-    return None
-
-
 def _durable_prompt(record) -> str:
     """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt. A
     continuation carrying a recovery envelope (issue #225) appends those bounded durable facts so
@@ -679,12 +663,19 @@ class ClaudeProviderAdapter:
     def __init__(self, prompt_of=None) -> None:
         self._prompt_of = prompt_of or _durable_prompt
 
-    def command(self, record) -> list[str]:
+    def command(self, record, admitted=None) -> list[str]:
         from agentflow.coordinator.profiles import profile_for
         from agentflow.runner import ClaudeRunner
+        if admitted is not None:
+            launch = _validated_admitted_launch(record, admitted)
+            schema = (json.loads(launch.result_schema_json)
+                      if launch.result_schema_json is not None else None)
+            return ProviderArgv(ClaudeRunner().structured_argv(
+                self._prompt_of(record), launch.internal_model, record.source,
+                schema=schema, profile=launch, cli_model=launch.cli_model))
         return ProviderArgv(ClaudeRunner().structured_argv(
             self._prompt_of(record), record.model, record.source,
-            schema=_stage_result_schema(record.stage), profile=profile_for(record)))
+            schema=stage_result_schema(record.stage), profile=profile_for(record)))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
@@ -716,12 +707,19 @@ class CodexProviderAdapter:
         self._prompt_of = prompt_of or _durable_prompt
         self._account_of = account_of
 
-    def command(self, record) -> list[str]:
+    def command(self, record, admitted=None) -> list[str]:
         from agentflow.coordinator.profiles import profile_for
         from agentflow.runner import CodexRunner
+        if admitted is not None:
+            launch = _validated_admitted_launch(record, admitted)
+            schema = (json.loads(launch.result_schema_json)
+                      if launch.result_schema_json is not None else None)
+            return ProviderArgv(CodexRunner().structured_argv(
+                self._prompt_of(record), launch.internal_model, record.source,
+                schema=schema, profile=launch, cli_model=launch.cli_model))
         return ProviderArgv(CodexRunner().structured_argv(
             self._prompt_of(record), record.model, record.source,
-            schema=_stage_result_schema(record.stage), profile=profile_for(record)))
+            schema=stage_result_schema(record.stage), profile=profile_for(record)))
 
     def observe(self, record) -> ProviderObservation:
         session = read_session(default_store_path(), record.launch_token)
@@ -754,15 +752,33 @@ def _dormant_provider_command(record) -> list[str]:
     return ProviderArgv([sys.executable, "-c", ""])
 
 
-def provider_command(record) -> list[str]:
+def _validated_admitted_launch(record, admitted):
+    from agentflow.operational_safety import (
+        AdmittedLaunch, ResolvedLaunch, SafetyRefused,
+        decode_admitted_launch, encode_launch_config,
+    )
+    if type(admitted) is not AdmittedLaunch:
+        raise SafetyRefused("provider requires the exact admitted launch envelope")
+    verified = decode_admitted_launch(ResolvedLaunch(
+        admitted.route_cell, encode_launch_config(admitted.launch_config)))
+    cell = verified.route_cell
+    if ((record.repo, record.stage, record.pool, record.model)
+            != (cell.repository, cell.stage, cell.provider, cell.model)):
+        raise SafetyRefused("provider launch identity does not match its admitted RouteCell")
+    return verified.launch_config
+
+
+def provider_command(record, admitted=None) -> list[str]:
     """The real provider argv for a launched attempt, dispatched on its pool. A record with no
     durable input pointer has no prompt to run, so it falls back to the no-op provider: the
     path is fully wired for real Claude/Codex sessions. An unknown pool never reaches a launch
     (it has no permit ledger)."""
     adapter = _ADAPTERS.get(record.pool)
+    if admitted is not None:
+        _validated_admitted_launch(record, admitted)
     if adapter is None or not record.input_ptr or not record.source:
         return _dormant_provider_command(record)
-    return adapter().command(record)
+    return adapter().command(record, admitted)
 
 
 class ProviderObserver:

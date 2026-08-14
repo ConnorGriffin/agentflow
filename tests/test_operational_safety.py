@@ -40,18 +40,25 @@ from agentflow.operational_safety import (
     DETERMINISTIC_CHECKS,
     DETERMINISTIC_CHECK_ALLOWLIST_DIGEST,
     EffectEvidence,
+    LaunchConfigV1,
     ObservationRequest,
     OperationalSafety,
     OPERATIONAL_SAFETY_CONTRACT_DIGEST,
+    OPERATIONAL_SAFETY_CONTRACT_V1_DIGEST,
     PROMOTION_VERIFIER,
     RERUN_TRIGGER_ONCE_CONTRACT,
     RERUN_TRIGGER_ONCE_CONTRACT_DIGEST,
     ROUTE_CELL_CONTRACT_DIGEST,
+    ROUTE_CELL_CONTRACT_V1_DIGEST,
     SafetyRefused,
     TriggerOnceByActionIdTransportV1,
     _state_id,
     _AdmissionContext,
 )
+
+
+PRIMARY_ROUTE_ID = "production/build/deep/default"
+OTHER_ROUTE_ID = "production/build/standard/default"
 
 
 class Checks:
@@ -188,10 +195,25 @@ def safety(tmp_path):
     store.close()
 
 
-def route(owner, *, repository="octo/app", route_id="primary", config_value=None):
+def route(owner, *, repository="octo/app", route_id=PRIMARY_ROUTE_ID, effort="high"):
+    launch_config = LaunchConfigV1(
+        schema="agentflow-launch-v1",
+        provider="codex",
+        internal_model="gpt-5",
+        cli_model="gpt-5",
+        stage_profile_id=route_id.removeprefix("production/"),
+        reasoning_effort=effort,
+        turn_ceiling=64,
+        wall_ceiling_s=900,
+        build_lease=(8, 12, 20),
+        allowed_tools=None,
+        sandbox_policy="workspace-write",
+        result_schema_json=None,
+        result_schema_digest=None,
+    )
     return owner.register_route_cell(
         repository, "build", "codex", "gpt-5", route_id,
-        config_value or {"model": "gpt-5", "effort": "high", "timeout": 900},
+        launch_config,
     )
 
 
@@ -263,10 +285,14 @@ def test_dependency_and_registry_receipts_are_exact():
     }
     assert DETERMINISTIC_CHECK_ALLOWLIST_DIGEST == (
         "66af2cb2c82a3cba92170e0d920f7a4ea9cae8509f482969f90883a42ca47458")
-    assert ROUTE_CELL_CONTRACT_DIGEST == (
+    assert ROUTE_CELL_CONTRACT_V1_DIGEST == (
         "c762ed469c4c2a311391898196713b26a2dbe2985896c262ea05a425368f63a5")
-    assert OPERATIONAL_SAFETY_CONTRACT_DIGEST == (
+    assert ROUTE_CELL_CONTRACT_DIGEST == (
+        "14dc4e949ec2a045816040cbfb553118475a570395bb6ffc26d0e1c40c780c47")
+    assert OPERATIONAL_SAFETY_CONTRACT_V1_DIGEST == (
         "ba8bf92fa7216d7fd59ef25b42d494de381f6a2a11afab1e0c44b174bfa9ddc0")
+    assert OPERATIONAL_SAFETY_CONTRACT_DIGEST == (
+        "5ef205f7d655a85ef9fa0526ef154d61ba50712d6234e17d7f345d2e6c76d36d")
     assert PROMOTION_VERIFIER == ("github-authority", "v1")
     assert RERUN_TRIGGER_ONCE_CONTRACT_DIGEST == (
         "4bc192810ab1119c2b1ec49942fbceb0eddd50e012d765a148e0664cb02e7658")
@@ -320,17 +346,16 @@ def test_launch_config_is_immutable_and_resolves_only_through_active_pointer(saf
     owner, _store, _checks, receipts, _reruns = safety
     first = route(owner)
     assert route(owner) == first
-    changed = route(owner, config_value={
-        "model": "gpt-5", "effort": "low", "timeout": 900})
+    changed = route(owner, effort="low")
     assert changed.digest != first.digest
     assert changed.launch_config_digest != first.launch_config_digest
     assert owner.resolve(
-        "octo/app", "build", "codex", "gpt-5", "primary").route_cell == first
+        "octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID).route_cell == first
     item = approval(receipts, changed, first, 0, "receipt-resolution")
     owner.approve_canary(item)
-    resolved = owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
+    resolved = owner.resolve("octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID)
     assert resolved.route_cell == changed
-    assert json.loads(resolved.config_bytes)["effort"] == "low"
+    assert json.loads(resolved.config_bytes)["reasoning_effort"] == "low"
 
 
 @pytest.mark.parametrize("reader", ["resolve", "route_state", "canary_state", "admission"])
@@ -356,7 +381,7 @@ def test_every_route_read_recomputes_content_digests(safety, target, reader):
         message = "RouteCell digest"
     with pytest.raises(SafetyRefused, match=message):
         if reader == "resolve":
-            owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
+            owner.resolve("octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID)
         elif reader == "route_state":
             owner.route_state(cell.digest)
         elif reader == "canary_state":
@@ -383,7 +408,7 @@ def test_every_route_state_column_is_revalidated_on_read_and_admission(
             "UPDATE safety_route_state SET cell_key = ? WHERE cell_key = ?",
             ("f" * 64, cell.key))
     elif column == "active_digest":
-        other = route(owner, route_id="other-cell")
+        other = route(owner, route_id=OTHER_ROUTE_ID)
         store._conn.execute(
             "UPDATE safety_route_state SET active_digest = ?, safety_state_id = ?"
             " WHERE cell_key = ?",
@@ -409,7 +434,7 @@ def test_every_route_state_column_is_revalidated_on_read_and_admission(
 
     with pytest.raises(SafetyRefused):
         if reader == "resolve":
-            owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
+            owner.resolve("octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID)
         else:
             admission(owner, cell)
 
@@ -418,14 +443,14 @@ def test_every_route_state_column_is_revalidated_on_read_and_admission(
 def test_route_and_canary_active_pointers_must_agree(safety, reader):
     owner, store, _checks, _receipts, _reruns = safety
     cell = route(owner)
-    other = route(owner, route_id="other-cell")
+    other = route(owner, route_id=OTHER_ROUTE_ID)
     store._conn.execute(
         "UPDATE safety_canary_state SET active_digest = ? WHERE cell_key = ?",
         (other.digest, cell.key))
 
     with pytest.raises(SafetyRefused, match="active pointers disagree"):
         if reader == "resolve":
-            owner.resolve("octo/app", "build", "codex", "gpt-5", "primary")
+            owner.resolve("octo/app", "build", "codex", "gpt-5", PRIMARY_ROUTE_ID)
         else:
             admission(owner, cell)
 
@@ -683,8 +708,8 @@ def test_reopen_requires_authority_bound_passes_and_exact_state_cas(safety):
 def test_canary_receipt_binding_duplicate_rollback_and_generation_cas(safety):
     owner, _store, checks, receipts, _reruns = safety
     good = route(owner)
-    bad = route(owner, config_value={"model": "gpt-5", "effort": "medium"})
-    later = route(owner, config_value={"model": "gpt-5", "effort": "low"})
+    bad = route(owner, effort="medium")
+    later = route(owner, effort="low")
     other = route(owner, repository="octo/other")
     first = approval(receipts, bad, good, 0, "receipt-canary-1")
     forged = replace(first, approved_disabled_generation=1)
@@ -713,7 +738,7 @@ def test_canary_receipt_binding_duplicate_rollback_and_generation_cas(safety):
 def test_repository_promotion_receipt_cannot_cross_route_repository(safety):
     owner, _store, _checks, receipts, _reruns = safety
     good = route(owner)
-    bad = route(owner, config_value={"model": "gpt-5", "effort": "medium"})
+    bad = route(owner, effort="medium")
     item = CanaryActivationRequest("receipt-cross", bad.digest, good.digest, 0)
     receipts.issue(item, scope="repository-policy/other/repo/0-to-1")
     with pytest.raises(SafetyRefused, match="does not bind"):
@@ -729,7 +754,7 @@ def test_canary_requires_exact_584_production_verifier(
     effect = rerun_owner(reruns)
     owner = OperationalSafety(store, check_evidence=checks, rerun_effect=effect)
     good = route(owner)
-    bad = route(owner, config_value={"model": "gpt-5", "effort": "medium"})
+    bad = route(owner, effort="medium")
     item = CanaryActivationRequest("receipt-verifier", bad.digest, good.digest, 0)
     path = tmp_path / "wrong-verifier.db"
     write_promotion_receipt_db(
@@ -930,7 +955,7 @@ def test_real_adapter_and_sql_write_set_boundaries_deny_on_touch(safety, monkeyp
     monkeypatch.setattr(EvidenceStore, "promote", denied)
 
     good = route(owner)
-    bad = route(owner, config_value={"model": "gpt-5", "effort": "medium"})
+    bad = route(owner, effort="medium")
     item = approval(receipts, bad, good, 0, "receipt-boundary")
     owner.approve_canary(item)
     quarantine(owner, checks, bad)

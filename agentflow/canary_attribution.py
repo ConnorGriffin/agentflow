@@ -19,8 +19,10 @@ from agentflow.operational_safety import (
     CanaryState,
     OperationalSafety,
     OPERATIONAL_SAFETY_CONTRACT_DIGEST,
+    OPERATIONAL_SAFETY_CONTRACT_V1_DIGEST,
     PROMOTION_VERIFIER,
     ROUTE_CELL_CONTRACT_DIGEST,
+    ROUTE_CELL_CONTRACT_V1_DIGEST,
     _AdmissionContext,
 )
 from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
@@ -151,7 +153,9 @@ DEPENDENCY_PINS = {
     "issue_585_operational_safety_blob": "b1e10904b1ecf177a6cfafc218122f77f5261f30",
     "issue_585_store_blob": "1993afa56520777a0bb1391f476b3888e02c83f8",
     "promotion_verifier": "/".join(PROMOTION_VERIFIER),
+    "route_cell_contract_v1_digest": ROUTE_CELL_CONTRACT_V1_DIGEST,
     "route_cell_contract_digest": ROUTE_CELL_CONTRACT_DIGEST,
+    "operational_safety_contract_v1_digest": OPERATIONAL_SAFETY_CONTRACT_V1_DIGEST,
     "operational_safety_contract_digest": OPERATIONAL_SAFETY_CONTRACT_DIGEST,
     "coordinator_store_schema": 2,
     "coordinator_store_schema_fingerprint_digest": STORE_V2_SCHEMA_FINGERPRINT_DIGEST,
@@ -160,7 +164,7 @@ DEPENDENCY_PINS = {
 }
 
 CANARY_ATTRIBUTION_CONTRACT = {
-    "schema": ATTRIBUTION_CONTRACT_VERSION,
+    "schema": "agentflow-canary-attribution-contract-v2",
     "dependencies": DEPENDENCY_PINS,
     "store_modes": ["NoAdmission", "OperationalSafetyOnly", "OperationalSafetyAndCanary"],
     "transaction": "Store-owned BEGIN IMMEDIATE through successor commit",
@@ -175,8 +179,10 @@ CANARY_ATTRIBUTION_CONTRACT = {
     "immutability": "recursive delete/update triggers enabled and verified per Store connection",
     "refusal_codes": sorted(CANARY_ATTRIBUTION_REFUSAL_CODES),
 }
-CANARY_ATTRIBUTION_CONTRACT_DIGEST = (
+CANARY_ATTRIBUTION_CONTRACT_V1_DIGEST = (
     "4c0ff263ee994228ffae0641a26959ca8f5f497285f800d0b7d980399e508157")
+CANARY_ATTRIBUTION_CONTRACT_DIGEST = (
+    "f7f64e3fb9a3913713d121d24af39c3f208d39b3cb6afb04b1457dd54b8d0d2f")
 if _digest(CANARY_ATTRIBUTION_CONTRACT) != CANARY_ATTRIBUTION_CONTRACT_DIGEST:
     raise RuntimeError("CanaryAttribution contract changed")
 

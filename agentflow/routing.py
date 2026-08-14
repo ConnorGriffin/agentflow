@@ -9,12 +9,28 @@ prompts, and runners never parse or mirror it.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
+
+from agentflow.operational_safety import LaunchConfigV1, SafetyRefused
+from agentflow.stage_result_contracts import stage_result_schema
+from agentflow.work_classification import Complexity, Effort
 
 
 class RoutingConfigError(ValueError):
     """The shipped capability table cannot produce a safe launch decision."""
+
+
+@dataclass(frozen=True, slots=True)
+class RouteSelection:
+    repository: str
+    stage: str
+    provider: Literal["claude", "codex"]
+    model: str
+    route_id: str
+    launch_config: LaunchConfigV1
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +197,80 @@ class CapabilityRouting:
         names and CLI ids alike; ``None`` for a model this table does not know."""
         name = self._resolve_model_name(model)
         return self._models[name]["provider"] if name is not None else None
+
+    @staticmethod
+    def _stage_profile_id(stage: str, complexity: str | None, effort: str | None,
+                          builder_complexity: str | None) -> str:
+        if stage == "build":
+            return f"build/{complexity or 'deep'}/{effort or 'default'}"
+        if stage == "revise":
+            return f"revise/{builder_complexity or complexity or 'deep'}/{effort or 'default'}"
+        if stage == "attack":
+            return f"attack/{complexity or 'deep'}"
+        if stage == "review":
+            return f"review/{builder_complexity or complexity or 'deep'}"
+        return stage
+
+    def select_route(self, repository: str, stage: str, provider: str, model: str, *,
+                     complexity: str | None = None, effort: str | None = None,
+                     builder_complexity: str | None = None) -> RouteSelection:
+        """Materialize the coordinator-selected identity into one immutable launch policy."""
+        from agentflow.coordinator.admission import STAGE_NATIVE_HANDOFF
+        if (type(repository) is not str or len(repository.split("/")) != 2
+                or not all(repository.split("/"))):
+            raise RoutingConfigError("repository must be an owner/name identity")
+        if stage not in STAGE_NATIVE_HANDOFF:
+            raise RoutingConfigError(f"unknown launch stage {stage!r}")
+        if complexity is not None and complexity not in {"standard", "deep"}:
+            raise RoutingConfigError(f"unknown launch complexity {complexity!r}")
+        if builder_complexity is not None and builder_complexity not in {"standard", "deep"}:
+            raise RoutingConfigError(
+                f"unknown builder complexity {builder_complexity!r}")
+        if effort is not None and effort not in {"low", "medium", "high", "extra"}:
+            raise RoutingConfigError(f"unknown launch effort {effort!r}")
+        if stage == "build" and complexity is None:
+            raise RoutingConfigError("build route selection requires complexity")
+        if stage == "revise" and builder_complexity is None and complexity is None:
+            raise RoutingConfigError("revise route selection requires complexity")
+        if stage == "attack" and complexity is None:
+            raise RoutingConfigError("attack route selection requires complexity")
+        if stage == "review" and builder_complexity is None and complexity is None:
+            raise RoutingConfigError(f"{stage} route selection requires complexity")
+        if provider not in {"claude", "codex"} or self.provider_for(model) != provider:
+            raise RoutingConfigError(
+                f"provider {provider!r} cannot launch model {model!r}")
+        from agentflow.coordinator.profiles import profile_for_facts
+        from agentflow.operational_safety import canonical_result_schema
+
+        profile_id = self._stage_profile_id(
+            stage, complexity, effort, builder_complexity)
+        profile = profile_for_facts(stage, complexity, effort, builder_complexity)
+        schema_json, schema_digest = canonical_result_schema(stage_result_schema(stage))
+        timeout = os.environ.get("AGENTFLOW_SESSION_TIMEOUT")
+        try:
+            wall_ceiling = int(timeout) if timeout else profile.wall_ceiling_s
+        except ValueError as error:
+            raise RoutingConfigError("session timeout override must be a positive integer") from error
+        if wall_ceiling <= 0:
+            raise RoutingConfigError("session timeout override must be a positive integer")
+        build_lease = None if timeout else profile.build_lease
+        launch = LaunchConfigV1(
+            schema="agentflow-launch-v1",
+            provider=provider,
+            internal_model=model,
+            cli_model=self.cli_identifier(provider, model),
+            stage_profile_id=profile_id,
+            reasoning_effort=profile.reasoning_effort,
+            turn_ceiling=profile.turn_ceiling,
+            wall_ceiling_s=wall_ceiling,
+            build_lease=build_lease,
+            allowed_tools=profile.allowed_tools,
+            sandbox_policy="read-only" if profile.allowed_tools is not None else "workspace-write",
+            result_schema_json=schema_json,
+            result_schema_digest=schema_digest,
+        )
+        return RouteSelection(
+            repository, stage, provider, model, f"production/{profile_id}", launch)
 
     def estimate_cost_usd(self, model: str, *, input_tokens: int | None = None,
                           output_tokens: int | None = None,
@@ -391,3 +481,102 @@ verification — it is never a finding to re-delegate against.
 
 
 routing = CapabilityRouting.from_path(Path(__file__).with_name("model-routing.json"))
+
+
+def reachable_route_selections(config) -> tuple[RouteSelection, ...]:
+    """Enumerate every launch identity reachable from the production registries."""
+    from agentflow.coordinator.admission import MODEL_FOR, STAGE_NATIVE_HANDOFF
+    from agentflow.pool_control import POOLS
+    ordinary_repositories = {repo.repo for repo in config.repositories}
+    workspace_repositories = {repo.repo for repo in config.workspace_repositories}
+    complexities = tuple(item.value for item in Complexity)
+    efforts = tuple(item.value for item in Effort)
+    facts: list[tuple[str, str | None, str | None, str | None]] = []
+    for stage in STAGE_NATIVE_HANDOFF:
+        if stage == "build":
+            facts.extend((stage, complexity, effort, None)
+                         for complexity in complexities for effort in (*efforts, None))
+        elif stage == "revise":
+            facts.extend((stage, complexity, effort, complexity)
+                         for complexity in complexities for effort in (*efforts, None))
+        elif stage in {"review", "attack"}:
+            facts.extend((stage, complexity, None, None) for complexity in complexities)
+        else:
+            facts.append((stage, "deep", None, None))
+
+    selected: list[RouteSelection] = []
+    for repository in sorted(ordinary_repositories):
+        for stage, complexity, effort, builder_complexity in facts:
+            for provider in POOLS:
+                model = (routing.model_for_stage(
+                    stage, provider, complexity or "deep", builder_complexity)
+                    or MODEL_FOR[(provider, complexity or "deep")])
+                selected.append(routing.select_route(
+                    repository, stage, provider, model,
+                    complexity=complexity, effort=effort,
+                    builder_complexity=builder_complexity))
+    for repository in sorted(workspace_repositories - ordinary_repositories):
+        for provider in POOLS:
+            model = (routing.model_for_stage("converse", provider, "deep")
+                     or MODEL_FOR[(provider, "deep")])
+            selected.append(routing.select_route(
+                repository, "converse", provider, model, complexity="deep"))
+    return tuple(dict.fromkeys(selected))
+
+
+def reconcile_route_cells(config, store):
+    """Idempotently register all currently reachable governed RouteCells."""
+    from agentflow.coordinator.errors import StoreUnavailable
+    import sqlite3
+    registered = []
+    for selection in reachable_route_selections(config):
+        try:
+            registered.append(store.register_route_selection(selection))
+        except (SafetyRefused, StoreUnavailable, sqlite3.DatabaseError):
+            continue
+    return tuple(registered)
+
+
+def rematerialize_route_selection(selection: RouteSelection) -> RouteSelection:
+    """Rebuild one proposed registration from the current routing authority."""
+    if type(selection) is not RouteSelection:
+        raise SafetyRefused("route registration requires the exact frozen selection")
+    profile = selection.launch_config.stage_profile_id.split("/")
+    kwargs: dict[str, str] = {}
+    if selection.stage == "build":
+        if (len(profile) != 3 or profile[0] != "build"
+                or profile[1] not in {"standard", "deep"}
+                or profile[2] not in {"default", "low", "medium", "high", "extra"}):
+            raise SafetyRefused("build route selection has an invalid profile identity")
+        kwargs["complexity"] = profile[1]
+        if profile[2] != "default":
+            kwargs["effort"] = profile[2]
+    elif selection.stage == "revise":
+        if (len(profile) != 3 or profile[0] != "revise"
+                or profile[1] not in {"standard", "deep"}
+                or profile[2] not in {"default", "low", "medium", "high", "extra"}):
+            raise SafetyRefused("revise route selection has an invalid profile identity")
+        kwargs["complexity"] = profile[1]
+        kwargs["builder_complexity"] = profile[1]
+        if profile[2] != "default":
+            kwargs["effort"] = profile[2]
+    elif selection.stage in {"attack", "review"}:
+        if (len(profile) != 2 or profile[0] != selection.stage
+                or profile[1] not in {"standard", "deep"}):
+            raise SafetyRefused(
+                f"{selection.stage} route selection has an invalid profile identity")
+        kwargs["complexity"] = profile[1]
+        if selection.stage == "review":
+            kwargs["builder_complexity"] = profile[1]
+    return routing.select_route(
+        selection.repository, selection.stage, selection.provider, selection.model, **kwargs)
+
+
+def logical_route_id_for_record(record) -> str:
+    """Derive only a durable record's logical route identity.
+
+    This deliberately reads no provider/model registry, profile, schema, or environment value:
+    an admitted RouteCell retains its registered artifact after any of those policy inputs move.
+    """
+    return "production/" + CapabilityRouting._stage_profile_id(
+        record.stage, record.complexity, record.effort, record.builder_complexity)
