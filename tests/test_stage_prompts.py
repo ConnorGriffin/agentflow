@@ -96,6 +96,7 @@ def test_runtime_preflight_reuses_trusted_static_inspection_and_fails_closed(
 
     assert result.state == runtime_state
     assert result.ready is False
+    assert result.ready_fact is None
     assert calls and calls[0][0] == tmp_path
     assert calls[0][4] == "codex"
 
@@ -113,6 +114,7 @@ def test_runtime_preflight_rejects_a_requirement_outside_the_manifest_pin(
     )
 
     assert result.state == "incompatible"
+    assert result.ready_fact is None
     assert "manifest pins" in result.evidence[0]
 
 
