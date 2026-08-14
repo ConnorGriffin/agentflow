@@ -26,13 +26,16 @@ with SHA-256
 The ADR 605 and ADR 606 source bytes are their complete repository files at source
 revision `f5580b55cf373a7e9de47d99e617b08256b7647d`. ADR 620 source bytes are its
 complete repository file at immutable merge
-`3cd31b7d5528a6bb5bb322334a32a25ac13991b5`:
+`3cd31b7d5528a6bb5bb322334a32a25ac13991b5`. ADR 626 source bytes are its
+complete repository file at immutable commit
+`c13cc6b77bac94ab71b4c689aeef7f2eaa242be3`:
 
 | Source | Whole-file SHA-256 |
 | --- | --- |
 | `docs/adr/adr-605-canonical-evaluation-rulebook.md` | `6977d6e1ce0bf5ebcaaff4fb2f47112dd59208705fd739ab394aa26bc589e70f` |
 | `docs/adr/adr-606-explicit-missing-metrics-and-adjudication-lineage.md` | `4bde5dd87bcf4002de60c5a7a07f366fdea274e628dd24604ce5fd2495e4967b` |
 | `docs/adr/adr-620-evaluation-failure-classes.md` | `7aed248b63d8035364114a28eb184c0aa839b55c627f5de3d9d17e1af1b1cb9a` |
+| `docs/adr/adr-626-manifest-rooted-evaluation-semantic-bundle.md` | `6bccfb0848fd1ad985c1442e1cb8dbb633ded8bd0f10878e80b0876c9e17a13e` |
 
 Before extracting or accepting a candidate, run these exact rechecks from the
 repository root. Any command failure, a different revision, or a different digest is
@@ -42,10 +45,12 @@ repository root. Any command failure, a different revision, or a different diges
 source_revision=f5580b55cf373a7e9de47d99e617b08256b7647d
 test "$(git rev-parse "$source_revision^{commit}")" = "$source_revision"
 test "$(git rev-parse "3cd31b7d5528a6bb5bb322334a32a25ac13991b5^{commit}")" = 3cd31b7d5528a6bb5bb322334a32a25ac13991b5
+test "$(git rev-parse "c13cc6b77bac94ab71b4c689aeef7f2eaa242be3^{commit}")" = c13cc6b77bac94ab71b4c689aeef7f2eaa242be3
 test "$(gh api repos/ConnorGriffin/agentflow/issues/583 --jq .body | shasum -a 256 | awk '{print $1}')" = cdbaa62e34b3943fbbd2f3f63edf0b0cf17b00e3632983f8ab31506b89238c9d
 test "$(git show "$source_revision:docs/adr/adr-605-canonical-evaluation-rulebook.md" | shasum -a 256 | awk '{print $1}')" = 6977d6e1ce0bf5ebcaaff4fb2f47112dd59208705fd739ab394aa26bc589e70f
 test "$(git show "$source_revision:docs/adr/adr-606-explicit-missing-metrics-and-adjudication-lineage.md" | shasum -a 256 | awk '{print $1}')" = 4bde5dd87bcf4002de60c5a7a07f366fdea274e628dd24604ce5fd2495e4967b
 test "$(git show "3cd31b7d5528a6bb5bb322334a32a25ac13991b5:docs/adr/adr-620-evaluation-failure-classes.md" | shasum -a 256 | awk '{print $1}')" = 7aed248b63d8035364114a28eb184c0aa839b55c627f5de3d9d17e1af1b1cb9a
+test "$(git show "c13cc6b77bac94ab71b4c689aeef7f2eaa242be3:docs/adr/adr-626-manifest-rooted-evaluation-semantic-bundle.md" | shasum -a 256 | awk '{print $1}')" = 6bccfb0848fd1ad985c1442e1cb8dbb633ded8bd0f10878e80b0876c9e17a13e
 ```
 
 `gh api ... --jq .body` supplies the body stream and its single terminating LF for
@@ -70,13 +75,27 @@ acceptance    = "issue/583/acceptance/a" ("1" / "2" / "3" / "4" / "5" / "6" / "7
                 "8" / "9" / "10" / "11" / "12" / "13" / "14")
 out-of-scope  = "issue/583/out-of-scope/o" ("1" / "2" / "3" / "4" / "5")
 adr-locator   = "adr/605/decision/p" decision-605 / "adr/606/decision/p" decision-606 /
-                adr-620-locator
+                adr-620-locator / adr-626-locator
 decision-605  = "1" / "2" / "3"
 decision-606  = "1" / "2" / "3" / "4" / "5"
 adr-620-locator = "adr/620/decision/intro/p1" /
                   "adr/620/decision/class/r" ("1" / "2" / "3" / "4" / "5" / "6") /
                   "adr/620/decision/orthogonality/p1" /
                   "adr/620/decision/governance/p1"
+adr-626-locator = "adr/626/decision/bundle/p1" /
+                  "adr/626/decision/binding/intro-p1" /
+                  "adr/626/decision/binding/code1" /
+                  "adr/626/decision/interface/intro-p1" /
+                  "adr/626/decision/interface/code1" /
+                  "adr/626/decision/operation/p1" /
+                  "adr/626/decision/purity/p1" /
+                  "adr/626/decision/open-set/intro-p1" /
+                  "adr/626/decision/open-set/n" ("1" / "2" / "3") /
+                  "adr/626/decision/locks/p1" /
+                  "adr/626/decision/loading/p1" /
+                  "adr/626/decision/checker/p1" /
+                  "adr/626/decision/independence/p1" /
+                  "adr/626/decision/supersession/p1"
 ```
 
 Under Outcome, `p1` is its sole prose sentence; under Scope, `p1` and `p2` are
@@ -95,6 +114,15 @@ is `E_SOURCE_LOCATOR` (or `E_SOURCE_DRIFT` for bytes/revision), never an invitat
 infer a replacement meaning. They are the ADR 620 closure and extend the pinned
 extraction universe from the 41 #583/ADR 605/ADR 606 locators to 50 locators.
 
+For ADR 626, `bundle/p1` is the first Decision paragraph; `binding/intro-p1` and
+`binding/code1` are its binding-introduction paragraph and complete JSON block;
+`interface/intro-p1` and `interface/code1` are its interface-introduction paragraph and
+complete signature block; `operation/p1` and `purity/p1` are the next two complete
+paragraphs; `open-set/intro-p1` and `open-set/n1` through `n3` are the checker-open
+introduction and three numbered paths; and `locks/p1`, `loading/p1`, `checker/p1`,
+`independence/p1`, and `supersession/p1` are the remaining five Decision paragraphs.
+These 16 locators extend the complete pinned extraction universe to 66 locators.
+
 ### Deterministic extraction
 
 For each locator in the grammar order, the extractor emits one record:
@@ -105,12 +133,13 @@ sort_key       = grammar position (source order, then item number)
 text           = the complete selected sentence, bullet, or numbered item
 applicability  = all | corpus | holdout | semantic-case | implementation-boundary
 disposition    = settled | mechanical-choice | not-applicable | unresolved
-owner          = canonical-contract | checker | fixture-author | runner | product-owner
+owner          = semantic-bundle | canonical-contract | semantic-module | checker |
+                 fixture-author | runner | product-owner | implementation-boundary
 ```
 
 The ID is stable even if the selected text changes; the captured source digest makes
 such a change visible. Extraction preserves source order. The result is valid only
-when its ID list exactly equals the grammar's 50 locators, with no duplicate ID or
+when its ID list exactly equals the grammar's 66 locators, with no duplicate ID or
 source locator. A duplicate source item or a second record for one locator is
 `E_REQUIREMENT_DUPLICATE`; a missing locator is `E_REQUIREMENT_MISSING`. A source
 item that genuinely applies in more than one place remains one record with a
@@ -119,8 +148,11 @@ complete source map and the only candidate planning checklist.
 
 ## Requirement inventory
 
-Each row owns exactly one authoritative source item. “Settled” is a product rule
-the candidate must encode once in the versioned canonical contract. “Mechanical
+Each row owns exactly one authoritative source item. `semantic-bundle` owns only a
+cross-member authority or binding rule; `canonical-contract` owns declarative policy;
+and `semantic-module` owns procedural Evaluation semantics. `checker` owns only
+independent structure, byte, reference, coverage, digest, and source/AST validation,
+safe dispatch through the bound module, and expected-result comparison. “Mechanical
 choice” is an executable implementation default below, not a new Evaluation rule.
 
 | ID | Disposition / owner | Requirement and reason |
@@ -129,43 +161,43 @@ choice” is an executable implementation default below, not a new Evaluation ru
 | `eval-v1:issue/583/scope/p1` | settled / canonical-contract | Define and validate manifests, fixtures, rubrics, answer keys, scorecards, contamination rules, and eligibility. |
 | `eval-v1:issue/583/scope/p2` | not-applicable / runner | The executable multi-process runner is dependent work, so this candidate does not execute provider arms. |
 | `eval-v1:issue/583/versioned-contract/b1` | settled / canonical-contract | Manifest pins every named input, method, environment, schedule, scorer/judge, and Evidence-policy fact. |
-| `eval-v1:issue/583/versioned-contract/b2` | settled / canonical-contract | Quality is normalized in `[0,1]`; unavailable quality is zero only for eligibility and required hard/holdout semantic cases need adjudication. |
-| `eval-v1:issue/583/versioned-contract/b3` | settled / canonical-contract | Paired difference, five-repetition case mean, seeded 10,000-draw case bootstrap, and interpolated 2.5th percentile define the lower bound. |
-| `eval-v1:issue/583/versioned-contract/b4` | settled / canonical-contract | Critical misses are paired new candidate misses; grounded false positives are all-attempt mean validated counts and cannot increase. |
+| `eval-v1:issue/583/versioned-contract/b2` | settled / semantic-module | The contract supplies quality and adjudication policy; the bound module applies zero-for-eligibility and required-adjudication branches. |
+| `eval-v1:issue/583/versioned-contract/b3` | settled / semantic-module | The bound module owns paired differences, five-repetition means, seeded 10,000-draw bootstrap, and percentile interpolation from contract parameters. |
+| `eval-v1:issue/583/versioned-contract/b4` | settled / semantic-module | The bound module calculates new paired critical misses and all-attempt grounded-false-positive means from contract-declared metric identities. |
 | `eval-v1:issue/583/versioned-contract/b5` | settled / canonical-contract | Every named threshold is inclusive at its stated value. |
-| `eval-v1:issue/583/versioned-contract/b6` | settled / canonical-contract | The named metrics use all attempted runs; dollars remain present-only, un-imputed, and non-improving. |
-| `eval-v1:issue/583/eligibility-gates/n1` | settled / canonical-contract | Independently on corpus and holdouts, every hard case needs 4/5 candidate passes and no new paired critical miss. |
-| `eval-v1:issue/583/eligibility-gates/n2` | settled / canonical-contract | Independently on corpus and holdouts, lower bound is at least `-0.05` and grounded false positives do not increase. |
-| `eval-v1:issue/583/eligibility-gates/n3` | settled / canonical-contract | Independently on corpus and holdouts, one stated quality/tokens/rounds improvement is required, with complete paired reports for the latter two. |
-| `eval-v1:issue/583/eligibility-gates/n4` | settled / canonical-contract | Independently on corpus and holdouts, completion may fall at most two points and malformed/verification and unjudged rates may not rise. |
-| `eval-v1:issue/583/eligibility-gates/n5` | settled / canonical-contract | Blinded human review of named scorecard material is required before promotion eligibility. |
+| `eval-v1:issue/583/versioned-contract/b6` | settled / semantic-module | The bound module applies all-attempt and present-only aggregation from contract-declared metric and missingness policy. |
+| `eval-v1:issue/583/eligibility-gates/n1` | settled / semantic-module | The bound module evaluates the contract-declared hard-case pass and paired-critical-miss gate independently per partition. |
+| `eval-v1:issue/583/eligibility-gates/n2` | settled / semantic-module | The bound module evaluates the contract-declared lower-bound and grounded-false-positive gate independently per partition. |
+| `eval-v1:issue/583/eligibility-gates/n3` | settled / semantic-module | The bound module evaluates the contract-declared quality, token, and round improvement alternatives and completeness branches. |
+| `eval-v1:issue/583/eligibility-gates/n4` | settled / semantic-module | The bound module evaluates the contract-declared completion and failure-rate comparisons independently per partition. |
+| `eval-v1:issue/583/eligibility-gates/n5` | settled / semantic-module | The bound module evaluates the contract-declared authority and blinded-review transition before eligibility. |
 | `eval-v1:issue/583/acceptance/a1` | settled / canonical-contract | Machine-readable, versioned manifest, fixture, rubric, answer-key, scorecard, and eligibility schemas implement the contract. |
 | `eval-v1:issue/583/acceptance/a2` | settled / fixture-author | Corpus has sanitized/synthetic cases for six failure classes and the planted review-round scenario, plus an independent frozen holdout set. |
 | `eval-v1:issue/583/acceptance/a3` | settled / fixture-author | A motivating incident cannot be its candidate's holdout; edits to fixture/rubric/answer-key require a new corpus version. |
-| `eval-v1:issue/583/acceptance/a4` | settled / checker | Method sources require clean, resolved immutable revisions and materialized digests; dirty or unresolved sources fail. |
-| `eval-v1:issue/583/acceptance/a5` | settled / canonical-contract | Prefer mechanical answer keys; semantic judging is blinded, version-pinned, rationale-bearing, and records human adjudication state. |
-| `eval-v1:issue/583/acceptance/a6` | settled / canonical-contract | Scorecards report every named quality, defect, cost, completion, verification, missingness, and adjudication measure separately. |
-| `eval-v1:issue/583/acceptance/a7` | settled / canonical-contract | Reports keep missing values `null`; eligibility uses its explicit zero-quality and all-attempt rules. |
-| `eval-v1:issue/583/acceptance/a8` | settled / checker | Calculation implements all five gates, pairing, inclusive thresholds, 10,000-draw bootstrap, and token completeness; absent adjudication/manifest facts block it. |
+| `eval-v1:issue/583/acceptance/a4` | settled / semantic-module | The checker validates source-record structure and digest bindings; the bound module applies the contract's clean, resolved, immutable-source and materialization predicates to its input facts. |
+| `eval-v1:issue/583/acceptance/a5` | settled / semantic-module | The bound module applies the contract-declared mechanical-key preference and blinded, version-pinned adjudication transitions. |
+| `eval-v1:issue/583/acceptance/a6` | settled / semantic-module | The bound module constructs the contract-declared separate scorecard projections. |
+| `eval-v1:issue/583/acceptance/a7` | settled / semantic-module | The bound module preserves report nulls and applies the contract-declared zero-quality and all-attempt eligibility branches. |
+| `eval-v1:issue/583/acceptance/a8` | settled / semantic-module | The bound module owns all five gates, pairing, inclusive comparison, bootstrap, token-completeness, and missing-fact blocking calculations. The checker only dispatches vectors and compares results. |
 | `eval-v1:issue/583/acceptance/a9` | settled / fixture-author | Truth tables cover swapped misses, equality thresholds, bootstrap replay, and partial tokens and rounds. |
-| `eval-v1:issue/583/acceptance/a10` | settled / implementation-boundary | Results use #580's `evaluate`; eligibility may call `nominate`; no direct Evidence-table or parallel result store exists. |
+| `eval-v1:issue/583/acceptance/a10` | settled / semantic-module | The bound module owns the contract-declared Evidence constructor projections and operation ordering; downstream production invokes the resulting exact values through #580 without a parallel store. |
 | `eval-v1:issue/583/acceptance/a11` | settled / fixture-author | Production telemetry and raw finding counts are never fixture truth or automatic labels. |
-| `eval-v1:issue/583/acceptance/a12` | settled / checker | Contract tests cover every named mismatch, calculation, missingness, and contamination condition. |
+| `eval-v1:issue/583/acceptance/a12` | settled / checker | Checker tests cover structural rejection plus safe vector dispatch and expected-result comparison for every named case; calculations remain module-owned. |
 | `eval-v1:issue/583/acceptance/a13` | settled / implementation-boundary | Create and index ADR 583 in the stated location. |
-| `eval-v1:issue/583/acceptance/a14` | settled / checker | The repository-wide `uv run pytest -q` is the required final test command. |
+| `eval-v1:issue/583/acceptance/a14` | settled / implementation-boundary | The repository-wide `uv run pytest -q` remains the downstream final test command; it is not checker semantic ownership. |
 | `eval-v1:issue/583/out-of-scope/o1` | not-applicable / runner | Provider-arm execution and process/cache/oracle isolation are deferred. |
 | `eval-v1:issue/583/out-of-scope/o2` | not-applicable / product-owner | Promotion/canary behavior is deferred. |
 | `eval-v1:issue/583/out-of-scope/o3` | not-applicable / product-owner | Automatic method mutation is deferred. |
 | `eval-v1:issue/583/out-of-scope/o4` | not-applicable / fixture-author | Private transcript ingestion is deferred. |
 | `eval-v1:issue/583/out-of-scope/o5` | not-applicable / product-owner | UI is deferred. |
-| `eval-v1:adr/605/decision/p1` | settled / canonical-contract | Evaluation v1 has one versioned canonical data contract as its semantic authority. |
-| `eval-v1:adr/605/decision/p2` | settled / implementation-boundary | AgentFlow and its independent verifier consume that contract. |
-| `eval-v1:adr/605/decision/p3` | settled / implementation-boundary | Runtime owns execution mechanics; fixtures and locks prove conformance without restating semantic rules. |
+| `eval-v1:adr/605/decision/p1` | settled / semantic-bundle | ADR 626 supersedes only the data-only form: Evaluation v1 has one versioned manifest-rooted semantic bundle as its authority. |
+| `eval-v1:adr/605/decision/p2` | settled / implementation-boundary | ADR 626 narrows consumption: production calls the exact bound module, while the checker validates the bundle and safely dispatches conformance vectors. |
+| `eval-v1:adr/605/decision/p3` | settled / semantic-module | ADR 626 supersedes runtime ownership of procedural semantics: the bound module owns them; fixtures and locks remain conformance evidence without restating policy. |
 | `eval-v1:adr/606/decision/p1` | settled / canonical-contract | `missing_metric_names` is the exact sorted set of null arm-metric fields. |
 | `eval-v1:adr/606/decision/p2` | settled / canonical-contract | A wholly unavailable result names all seven stated metrics in lexicographic order: `duration_ms`, `fix_introduced_defect_count`, `grounded_false_positive_count`, `provider_dollars_micros`, `quality_micros`, `review_rounds`, and `tokens`. |
 | `eval-v1:adr/606/decision/p3` | settled / canonical-contract | A reported result may name only its null optional metrics in lexicographic order: `provider_dollars_micros`, `quality_micros`, `review_rounds`, and `tokens`; its other three metrics are required. |
-| `eval-v1:adr/606/decision/p4` | settled / checker | An adjudication is valid only when its case ID, exact case-manifest digest, and answer-key digest match the answer-key reference reached through the canonical validated case record. |
-| `eval-v1:adr/606/decision/p5` | settled / checker | The adjudication digest is the canonical digest of the receipt with its own digest field omitted. |
+| `eval-v1:adr/606/decision/p4` | settled / semantic-module | The bound module resolves and evaluates the canonical adjudication-lineage join; the checker independently validates its input references and compares vector results. |
+| `eval-v1:adr/606/decision/p5` | settled / semantic-module | The bound module constructs the adjudication digest from the contract-declared canonical preimage; the checker validates digest bindings and expected results. |
 | `eval-v1:adr/620/decision/intro/p1` | settled / canonical-contract | Evaluation v1 uses exactly the six failure-class identifiers in ADR 620. |
 | `eval-v1:adr/620/decision/class/r1` | settled / canonical-contract | `original_defect` is an artifact violation of a product, acceptance, security, or charter requirement before review. |
 | `eval-v1:adr/620/decision/class/r2` | settled / canonical-contract | `plan_gap` is a plan or acceptance criteria omission, contradiction, or failure to operationalize required behavior. |
@@ -175,11 +207,27 @@ choice” is an executable implementation default below, not a new Evaluation ru
 | `eval-v1:adr/620/decision/class/r6` | settled / canonical-contract | `fix_introduced_defect` was absent at the reviewed head and appeared in a later reviewer/reviser change. |
 | `eval-v1:adr/620/decision/orthogonality/p1` | settled / canonical-contract | `validation_state`, review action, and severity are independent of failure class and cannot select, alias, change, or imply it. |
 | `eval-v1:adr/620/decision/governance/p1` | settled / canonical-contract | The six identifiers are complete; aliases and merging are rejected, and classification cannot automatically mutate policy. |
+| `eval-v1:adr/626/decision/bundle/p1` | settled / semantic-bundle | One manifest-rooted bundle owns Evaluation v1: candidate JSON owns declarative policy; the bound module owns schedule, lifecycle, authority, blinding, exact-arithmetic, bootstrap, eligibility, and Evidence calculations. |
+| `eval-v1:adr/626/decision/binding/intro-p1` | settled / canonical-contract | The root candidate contains the exact semantic-module binding. |
+| `eval-v1:adr/626/decision/binding/code1` | settled / canonical-contract | The binding has exactly `interface_version`, fixed module `path`, and whole-source `source_sha256`. |
+| `eval-v1:adr/626/decision/interface/intro-p1` | settled / semantic-module | Interface version `evaluation-semantics-v1` identifies the module's one public operation. |
+| `eval-v1:adr/626/decision/interface/code1` | settled / semantic-module | The exact public interface is `evaluate_v1(contract, operation_id, input_value) -> result_value`. |
+| `eval-v1:adr/626/decision/operation/p1` | settled / semantic-bundle | The contract supplies every policy value; the bound module uses exact arithmetic with no fallback policy constants; production calls those exact bytes. |
+| `eval-v1:adr/626/decision/purity/p1` | settled / semantic-module | The module obeys the closed source-size, stdlib-import, purity, and forbidden-capability boundary. |
+| `eval-v1:adr/626/decision/open-set/intro-p1` | settled / checker | The checker opens one closed three-file set from its own repository root with regular-file and no-follow checks. |
+| `eval-v1:adr/626/decision/open-set/n1` | settled / checker | The first opened path is the fixed candidate JSON. |
+| `eval-v1:adr/626/decision/open-set/n2` | settled / checker | The second opened path is the fixed conformance JSON. |
+| `eval-v1:adr/626/decision/open-set/n3` | settled / checker | The third opened path is the fixed bound semantic module. |
+| `eval-v1:adr/626/decision/locks/p1` | settled / checker | The checker owns three independent whole-file locks and verifies the candidate's module binding against the fixed source. |
+| `eval-v1:adr/626/decision/loading/p1` | settled / checker | The checker owns deterministic source/AST/import/public-surface audit and restricted safe loading, but no Evaluation operation. |
+| `eval-v1:adr/626/decision/checker/p1` | settled / checker | The checker independently validates structure, canonical bytes, references, coverage, and digests, safely dispatches vectors, and compares expected results. |
+| `eval-v1:adr/626/decision/independence/p1` | settled / checker | The checker does not rederive schedule, bootstrap, lifecycle, authority, blinding, eligibility, or Evidence algorithms. |
+| `eval-v1:adr/626/decision/supersession/p1` | settled / semantic-bundle | Only ADR 605's one-data-file clause is superseded; single authority, versioning, and no duplicated policy survive. |
 
-The grammar and table contain exactly 50 source locators: one Outcome sentence, two
+The grammar and table contain exactly 66 source locators: one Outcome sentence, two
 Scope sentences, six Versioned-contract bullets, five eligibility gates, fourteen
 acceptance bullets, five out-of-scope bullets, eight ADR 605/606 Decision sentences,
-and nine ADR 620 Decision locators. An
+nine ADR 620 Decision locators, and sixteen ADR 626 Decision locators. An
 extractor seeing `a15` must fail `E_SOURCE_LOCATOR`; this prevents an invented
 acceptance item.
 
@@ -462,11 +510,11 @@ Within one artifact, the first applicable code in that order wins; ties across a
 use the displayed path order; within a collection, IDs and paths sort bytewise.
 `E_INTERNAL` is reachable only for an unexpected checker fault after its guarded
 validation path, is last in the registry, and never exposes a traceback. The checker
-independently validates the candidate and report's structure,
-canonical bytes, schema grammar, references, coverage, lineage, paths, bounds, and
-digests, and audits the module's source, AST, imports, and public interface. It then
-executes every declared conformance vector through the bound `evaluate_v1`; it never
-uses an expected result as a rule source.
+independently validates structure and canonical bytes, including schema, reference,
+coverage, path, bound, lineage-reference, and digest integrity. It audits the module's
+source, AST, imports, and public interface, safely dispatches every declared vector
+through the bound `evaluate_v1`, and compares the actual and expected results. It
+implements no Evaluation calculation and never uses an expected result as a rule source.
 
 The exact output bytes, streams, paths, and exits are closed. On success stdout is
 exactly the following ASCII bytes and stderr is empty (`b""`); exit is `0`:
@@ -514,11 +562,11 @@ This ownership and pair matrix is mechanical test evidence, not Evaluation fixtu
 ## Independent case oracle
 
 The checker has two deliberately separate roles. First, it independently validates the
-bundle's structure, bytes, references, requirement coverage, lineage, paths, bounds, and
-digests, and audits the module's full source, AST, imports, and public interface. Second,
-it executes the candidate's conformance vectors through the canonical bound module. The
-candidate's cases and expected outcomes remain independently reviewed evidence; they are
-not a second algorithm and are never passed to the module as policy.
+bundle's structure, bytes, references, requirement coverage, and digests and audits the
+module's full source, AST, imports, and public interface. Second, it safely dispatches
+the candidate's conformance vectors through the canonical bound module and compares
+results. The candidate's cases and expected outcomes remain independently reviewed
+evidence; they are not a second algorithm and are never passed to the module as policy.
 
 For each semantic case, the checker resolves the operation and input from the validated
 case map, calls `evaluate_v1(contract, operation_id, input_value)`, and captures the
@@ -528,12 +576,12 @@ actual and expected result with canonical JSON. A module exception, nonconformin
 or mismatch is `E_SEMANTIC`; the existing code order, output framing, and exit remain
 unchanged.
 
-For each semantic case, the oracle resolves `case_id` in the validated case map, then
-requires the exact case-manifest digest and the answer-key digest reached from that
-case record. It recomputes the adjudication receipt preimage with the receipt digest
-omitted and accepts the receipt only if all four values agree. This is the ADR 606
-lineage join; a candidate cannot change a case, its answer key, and its expected result
-into a self-consistent but unbound fiction.
+For each semantic case, the checker structurally resolves `case_id` in the validated
+case map, requires the exact case-manifest and answer-key references, and validates the
+receipt's canonical digest binding before dispatch. The bound module evaluates the
+ADR 606 lineage join and returns its result for comparison. A candidate therefore cannot
+change a case, its answer key, and its expected result into a self-consistent but unbound
+fiction, and the checker still carries no lineage algorithm.
 
 The conformance report maps each applicable authoritative requirement to exactly one
 candidate rule ID and at least one declared positive or negative case ID. The required
@@ -558,36 +606,38 @@ conflict with [ADR 605](../adr/adr-605-canonical-evaluation-rulebook.md), as nar
 
 | Fact | Command | Output |
 | --- | --- | --- |
-| Fixed opened artifacts | `awk '/^### Validation order and checker interface/{s=1} s && /^```text$/{b++;next} s && b==2 && /^```$/{exit} s && b==2{print}' docs/research/evaluation-candidate-preflight.md` | `docs/evaluation/design/contract-v1.candidate.json`, `docs/evaluation/design/contract-v1.conformance.json`, `agentflow/evaluation_semantics_v1.py`; count `3`. |
-| Whole-file locks and success count | `sh /tmp/agentflow-626-doc-audit.sh "$PWD"` | Locks `3`; success `checked` value `3`; no prior success-count occurrence. |
-| Public errors | `sed -n '/^E_ROOT </,/E_GENERATOR_LIMIT < E_SEMANTIC < E_INTERNAL/p' docs/research/evaluation-candidate-preflight.md \| rg -o 'E_[A-Z_]+' \| sort -u \| wc -l` | `28`: `27` validation codes plus `E_INTERNAL`; order text unchanged. |
-| Limits | `awk '/^\| Limit \| Exact default \|/{s=1;next} s && /^\| ---/{next} s && /^\|/{n++;print} s && NF==0{exit} END{print "limit_rows=" n}' docs/research/evaluation-candidate-preflight.md` | `11` rows; the only added row is `semantic module source | 64 KiB` (`65536` bytes). All other rows are unchanged. |
-| Future deliverables | `sed -n '/git ls-files --error-unmatch docs\/evaluation\/design\/contract-v1.candidate.json/p' docs/research/evaluation-candidate-preflight.md \| rg -o '(docs\|agentflow\|scripts\|tests)/[^ ]+' \| wc -l` | `5`, including the bound module. |
-| Preserved extraction | SHA-256 of the section from `Durable source snapshots` up to `Mechanical contract`, at `18a3e804` and in the working tree | Both `79edfa3d7fec111b88bc7abe7ff0b91522b2931e882bd7125285c54d9ce7bff1`. |
-| Preserved generator | SHA-256 of `Generated-case byte mapping`, stopping before the old/new following section, at `18a3e804` and in the working tree | Both `8de74557ae1095873dd62e72b4d912f267d4c1979a2bacac0bb3e2b0429edea7`. |
+| Source map | Extract and de-duplicate inventory IDs; count the `adr/626` subset | `66` total, `66` unique, `16` ADR 626 locators. |
+| Closed owners | Compare all `settled / checker` IDs with the exact allowed set; assert the named procedural and bundle rows | Checker rows `9`, exact set passes; procedural-module rows `21`; semantic-bundle rows `4`. |
+| Fixed mechanics | Extract the checker-open fence, error registry, limit row, lock count, and success JSON | Opened artifacts `3`; locks `3`; public errors `28` (`27` validation plus `E_INTERNAL`); module bound `65536` bytes; success `checked` value `3`. |
+| ADR 626 source pin | `git show c13cc6b77bac94ab71b4c689aeef7f2eaa242be3:docs/adr/adr-626-manifest-rooted-evaluation-semantic-bundle.md \| shasum -a 256` | `6bccfb0848fd1ad985c1442e1cb8dbb633ded8bd0f10878e80b0876c9e17a13e`. |
+| Preserved unrelated mechanics | SHA-256 of `Mechanical contract` up to `Bound semantic module`, at `c13cc6b` and in the working tree | Both `7a7cc81b3976b3a0f598e8f1faaab8d889b0ddc6d5447dfe5c6c59b25eaedb97`. |
 
 ### Scratch text and contradiction audit
 
-`sh /tmp/agentflow-626-doc-audit.sh "$PWD"` compared the ADR and preflight
-binding blocks, enumerated paths/codes/bounds, and searched the active contract text for
-the superseded boundary's distinctive phrases. It reported:
+`sh /tmp/agentflow-626-doc-audit.sh "$PWD"` compared the ADR and preflight binding,
+enumerated and de-duplicated the source map, required the exact closed checker-owner set,
+asserted every routed procedural/bundle owner, verified the ADR source pin, compared the
+unrelated mechanical section to `c13cc6b`, and searched active text for the superseded
+boundary's distinctive phrases. It reported:
 
 ```text
-opened_artifacts=3
-whole_file_locks=3
-public_error_codes=28
-validation_codes=27 internal_codes=1
-module_source_bound_bytes=65536
-success_checked=3
-binding_match=pass
-stale_preflight_claims=0
+source_locators=66 unique=66 adr626=16
+owner_vocabulary=closed
+checker_owned_rows=9 exact_set=pass
+procedural_module_rows=21 audited=pass
+semantic_bundle_rows=4 audited=pass
+opened_artifacts=3 whole_file_locks=3
+public_error_codes=28 validation_codes=27 internal_codes=1
+module_source_bound_bytes=65536 success_checked=3
+adr626_source_sha256=6bccfb0848fd1ad985c1442e1cb8dbb633ded8bd0f10878e80b0876c9e17a13e
+unrelated_mechanical_sha256=7a7cc81b3976b3a0f598e8f1faaab8d889b0ddc6d5447dfe5c6c59b25eaedb97
+binding_match=pass stale_active_claims=0 ownership_contradictions=0
 historical_rejection_hits=4
-adr_preflight_contradictions=0
 ```
 
 The four historical hits are confined to ADR 626's Context and rejected Alternative;
-they explain why the prior interpreter/VM boundary was superseded and are not active
-requirements. The scratch script is throwaway and is not committed.
+they explain the superseded interpreter/VM boundary and are not active requirements.
+The scratch script is throwaway and is not committed.
 
 ### Revision checks
 
@@ -595,7 +645,8 @@ requirements. The scratch script is throwaway and is not committed.
 | --- | --- | --- |
 | Diff whitespace | `git diff --check` | Exit `0`; no output. |
 | Public links | `uv run python scripts/check-public-doc-links.py` | Exit `0`; `Documentation link check passed for 13 relative link(s).` |
-| Changed paths | `git status --short` | Only `docs/adr/README.md`, ADR 605, ADR 626, and this preflight. |
+| Focused tests | `uv run pytest -q tests/test_evidence_contract.py tests/test_reviewer.py` | Exit `0`; `80 passed in 0.72s`. |
+| Changed paths | `git status --short` | Only `docs/research/evaluation-candidate-preflight.md`. |
 
 ## Historical #618 captured verification results
 
@@ -632,8 +683,10 @@ validated #573 taxonomy: `original_defect`, `plan_gap`, `slice_scope_error`,
 `reviewer_false_claim`, `speculative_preference`, and `fix_introduced_defect`.
 The #617 candidate conformance report must map the nine pinned ADR 620 locators,
 including those exact identifiers and meanings, before claiming zero unresolved
-dispositions. This closure extends the source inventory to its pinned 50 locators.
+dispositions. ADR 626 adds its 16 pinned boundary locators, extending the complete source
+inventory to 66 locators.
 
 All absent field shapes, artifacts, bindings, and computations fail closed. Any later
 request to add a metric, threshold, case class, or promotion behavior requires a new
-reviewed canonical contract version under ADR 605; it is not a preflight default.
+reviewed semantic-bundle version under ADR 605 as narrowed by ADR 626; it is not a
+preflight default.
