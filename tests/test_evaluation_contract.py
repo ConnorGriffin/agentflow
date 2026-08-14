@@ -380,7 +380,9 @@ def test_bundle_derives_role_visibility_root_and_returns_no_raw_payload(contract
         artifact.value["root_digest"] = "2" * 64
 
 
-def test_bundle_rejects_cycles_digest_kind_path_symlink_nonregular_and_root(contract, tmp_path):
+def test_bundle_rejects_cycles_digest_kind_path_symlink_nonregular_and_root(
+    contract, tmp_path, monkeypatch,
+):
     index_path = "evaluation/v1/indexes/index-a.json"
     self_ref = {"digest": "0" * 64, "id": "index-a", "kind": "artifact-index", "path": index_path}
     entry, _digest = _write_artifact(
@@ -432,9 +434,17 @@ def test_bundle_rejects_cycles_digest_kind_path_symlink_nonregular_and_root(cont
     finally:
         linked_root.unlink()
 
+    open_calls = []
+
+    def unexpected_open(*args, **kwargs):
+        open_calls.append((args, kwargs))
+        raise AssertionError("unsafe path reached os.open")
+
+    monkeypatch.setattr(evaluation_contract.os, "open", unexpected_open)
     with pytest.raises(EvaluationContractError) as unsafe:
         load_evaluation_bundle(contract, tmp_path, PurePosixPath("../escape.json"))
-    assert unsafe.value.code == "E_PATH"
+    assert (unsafe.value.code, unsafe.value.basename) == ("E_PATH", "<bundle>")
+    assert open_calls == []
 
 
 def test_json_byte_limit_accepts_exact_limit_and_rejects_plus_one(contract):

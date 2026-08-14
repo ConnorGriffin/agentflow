@@ -23,6 +23,7 @@ _MODULE_INTERFACE = "evaluation-semantics-v1"
 _MODULE_SHA256 = "185f41a5e4549cc1ccbc4615af5846c3ed0f95285790d193e1b2f43aa3dc8554"
 _MAX_JSON_BYTES = 1_048_576
 _MAX_MODULE_BYTES = 65_536
+_COMPONENT_GUARD_PREFIX = "/__agentflow_evaluation_component__/"
 _SENTINELS = frozenset({"<contract>", "<bundle>", "<module>"})
 _SAFE_BASENAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,159}$")
 _SAFE_ID = re.compile(r"^[a-z][a-z0-9-]{0,47}$")
@@ -289,10 +290,31 @@ def _open_directory(path: Path, sentinel: str) -> int:
 
 
 def _read_at(root_fd: int, relative: PurePosixPath, maximum: int, basename: str) -> bytes:
+    try:
+        if type(relative) is not PurePosixPath or relative.is_absolute() or not relative.parts:
+            _error("E_PATH", basename)
+        text = relative.as_posix()
+        normalized = os.path.normpath(os.path.join(_COMPONENT_GUARD_PREFIX, text))
+        components: list[str] = []
+        if normalized.startswith(_COMPONENT_GUARD_PREFIX):
+            authorized = normalized[len(_COMPONENT_GUARD_PREFIX):]
+            parts = authorized.split("/")
+            if (
+                authorized == text
+                and _SAFE_PATH.fullmatch(authorized)
+                and all(part not in {"", ".", ".."} for part in parts)
+            ):
+                components = parts
+        if not components:
+            _error("E_PATH", basename)
+    except EvaluationContractError:
+        raise
+    except Exception:
+        _error("E_PATH", basename)
     descriptor = os.dup(root_fd)
     opened: int | None = descriptor
     try:
-        for component in relative.parts[:-1]:
+        for component in components[:-1]:
             child = os.open(
                 component,
                 os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
@@ -301,7 +323,7 @@ def _read_at(root_fd: int, relative: PurePosixPath, maximum: int, basename: str)
             os.close(opened)
             opened = child
         file_fd = os.open(
-            relative.name,
+            components[-1],
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
             dir_fd=opened,
         )
