@@ -21,15 +21,29 @@ import os
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass, fields
+from contextlib import contextmanager
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import TYPE_CHECKING, Callable, Mapping, TypeAlias
 from uuid import uuid4
 
 from agentflow.state import state_dir as _state_dir, state_path
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
+from agentflow.operational_safety import (
+    ActionIdempotentRerunEffect,
+    CheckEvidenceAuthority,
+    OperationalSafety,
+    PromotionReceiptAuthority as SafetyPromotionReceiptAuthority,
+    ResolvedLaunch,
+    SafetyRefused,
+    _AdmissionContext,
+    _SafetyAdmissionResult,
+)
 
-SCHEMA_VERSION = 2
+if TYPE_CHECKING:
+    from agentflow.canary_attribution import CanaryAttribution, PromotionReceiptAuthority
+
+SCHEMA_VERSION = 3
 _RECORDS_SCHEMA = (
     "CREATE TABLE records ("
     " identity TEXT PRIMARY KEY,"
@@ -44,6 +58,22 @@ _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_COORD_BUSY_MS", "2000"))
 
 _SET_FIELDS = {"descendants"}
 _COLUMNS = [f.name for f in fields(Record)]
+SUPERVISOR_WINDOW = 2 * 3600
+V2_TO_V3_FAULT_OBSERVATIONS = (
+    "v2-to-v3:before-begin",
+    "v2-to-v3:after-begin",
+    "v2-to-v3:create:canary_attributions:before",
+    "v2-to-v3:create:canary_attributions:after",
+    "v2-to-v3:create:no-update-trigger:before",
+    "v2-to-v3:create:no-update-trigger:after",
+    "v2-to-v3:create:no-delete-trigger:before",
+    "v2-to-v3:create:no-delete-trigger:after",
+    "v2-to-v3:before-fingerprint",
+    "v2-to-v3:after-fingerprint",
+    "v2-to-v3:after-user-version",
+    "v2-to-v3:before-commit",
+    "v2-to-v3:after-commit",
+)
 
 
 def state_dir() -> Path:
@@ -63,13 +93,6 @@ class StoreUnavailable(RuntimeError):
     coordinator treats this as fail-closed: no starts, no claim changes."""
 
 
-class SafetyAdmissionParticipant(Protocol):
-    """The narrow shared-transaction seam reserved for #627 admission wiring."""
-
-    def participate_in_admission(
-            self, conn: sqlite3.Connection, route_cell_digest: str) -> str: ...
-
-
 @dataclass(frozen=True)
 class ReservationLimits:
     """Global limits that must be decided with the permit reservation.
@@ -85,6 +108,51 @@ class ReservationLimits:
     lane_by_stage: Mapping[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class ReservationIntent:
+    identity: str
+    expected_launch_token: str | None
+    expected_revision: int
+    now: int
+    daemon_generation: str
+    budget: int
+    limits: ReservationLimits | None
+    route_cell_digest: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AdmissionResult:
+    successor: Record
+    safety_state_id: str | None
+    canary_attribution: CanaryAttribution | None
+
+
+@dataclass(frozen=True, slots=True)
+class SafetySources:
+    check_evidence: CheckEvidenceAuthority | None = None
+    promotion_receipts: SafetyPromotionReceiptAuthority | None = None
+    rerun_effect: ActionIdempotentRerunEffect | None = None
+
+
+@dataclass(frozen=True)
+class NoAdmission:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class OperationalSafetyOnly:
+    safety_sources: SafetySources
+
+
+@dataclass(frozen=True, slots=True)
+class OperationalSafetyAndCanary:
+    safety_sources: SafetySources
+    promotion_receipts: PromotionReceiptAuthority
+
+
+StoreAdmissionMode: TypeAlias = NoAdmission | OperationalSafetyOnly | OperationalSafetyAndCanary
+
+
 class Store:
     """A thin durable table of continuation records keyed by stage identity.
 
@@ -93,13 +161,37 @@ class Store:
     that is how the crash-recovery boundaries are exercised.
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *,
+                 admission_mode: StoreAdmissionMode = NoAdmission()) -> None:
         self.path = Path(path)
         # The daemon dispatches concurrent chains through one coordinator, so the single
         # connection is shared across threads and serialized by this lock — the reservation
         # critical section is one place, matching the one-ledger design (ADR 0030).
         self._lock = threading.RLock()
+        self._promotion_receipt_callback_active = threading.Event()
         self._conn = self._connect()
+        self._operational_safety: OperationalSafety | None = None
+        self._canary_attribution = None
+        try:
+            if type(admission_mode) is NoAdmission:
+                return
+            if type(admission_mode) not in {
+                    OperationalSafetyOnly, OperationalSafetyAndCanary}:
+                raise TypeError("unknown Store admission mode")
+            sources = admission_mode.safety_sources
+            if type(sources) is not SafetySources:
+                raise TypeError("Store safety sources must be the exact frozen value")
+            self._operational_safety = OperationalSafety(
+                self, check_evidence=sources.check_evidence,
+                promotion_receipts=sources.promotion_receipts,
+                rerun_effect=sources.rerun_effect)
+            if type(admission_mode) is OperationalSafetyAndCanary:
+                from agentflow.canary_attribution import CanaryAttributionAuthority
+                self._canary_attribution = CanaryAttributionAuthority(
+                    self, self._operational_safety, admission_mode.promotion_receipts)
+        except BaseException:
+            self._conn.close()
+            raise
 
     def _connect(self) -> sqlite3.Connection:
         # A fully-initialized store is published atomically: it is built in a private temp
@@ -123,12 +215,18 @@ class Store:
                     raise StoreUnavailable("store schema 1 does not match the migration source")
                 self._migrate_v1_to_v2(conn)
                 version = 2
+            if version == 2:
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(2):
+                    conn.close()
+                    raise StoreUnavailable("store schema 2 does not match the migration source")
+                self._migrate_v2_to_v3(conn)
+                version = 3
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(2):
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
                 conn.close()
-                raise StoreUnavailable("store schema 2 does not match the accepted schema")
+                raise StoreUnavailable("store schema 3 does not match the accepted schema")
         except sqlite3.DatabaseError as e:  # corrupt file, locked-beyond-wait, unreadable
             raise StoreUnavailable(f"cannot open continuation store: {e}") from e
         return conn
@@ -137,9 +235,16 @@ class Store:
     def _open(path: Path) -> sqlite3.Connection:
         # Autocommit mode (isolation_level=None) so the reservation can hold a single
         # explicit BEGIN IMMEDIATE across its read and its write.
-        conn = sqlite3.connect(path, timeout=_BUSY_TIMEOUT_MS / 1000,
-                               isolation_level=None, check_same_thread=False)
+        conn = sqlite3.connect(
+            path, timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None,
+            check_same_thread=False)
+        from agentflow.canary_attribution import register_sql_functions
+        register_sql_functions(conn)
         conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA recursive_triggers = ON")
+        if conn.execute("PRAGMA recursive_triggers").fetchone()[0] != 1:
+            conn.close()
+            raise StoreUnavailable("recursive trigger enforcement is unavailable")
         return conn
 
     def _create_atomically(self) -> None:
@@ -179,6 +284,10 @@ class Store:
             conn.execute(_RECORDS_SCHEMA)
             from agentflow.operational_safety import OperationalSafety
             OperationalSafety.initialize_schema(conn)
+            from agentflow.canary_attribution import initialize_schema
+            initialize_schema(conn)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+                raise sqlite3.DatabaseError("initialized coordinator schema was not accepted")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
@@ -198,6 +307,35 @@ class Store:
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
             conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migration_checkpoint(_name: str) -> None:
+        """Fault-injection seam for the Store v2-to-v3 migration tests."""
+
+    @staticmethod
+    def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
+        """Add append-only CanaryAttribution state without rewriting existing owners."""
+        committed = False
+        try:
+            Store._migration_checkpoint("v2-to-v3:before-begin")
+            conn.execute("BEGIN IMMEDIATE")
+            Store._migration_checkpoint("v2-to-v3:after-begin")
+            from agentflow.canary_attribution import initialize_schema
+            initialize_schema(conn, checkpoint=Store._migration_checkpoint)
+            Store._migration_checkpoint("v2-to-v3:before-fingerprint")
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(3):
+                raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
+            Store._migration_checkpoint("v2-to-v3:after-fingerprint")
+            conn.execute("PRAGMA user_version = 3")
+            Store._migration_checkpoint("v2-to-v3:after-user-version")
+            Store._migration_checkpoint("v2-to-v3:before-commit")
+            conn.execute("COMMIT")
+            committed = True
+            Store._migration_checkpoint("v2-to-v3:after-commit")
+        except BaseException:
+            if not committed and conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
 
     def load(self) -> dict[str, Record]:
@@ -233,6 +371,21 @@ class Store:
         waiting = {pool: pr_bound_waiting(records, pool, now) for pool in permits}
         return permits, waiting
 
+    def _refuse_promotion_receipt_callback_mutation(self) -> None:
+        if self._promotion_receipt_callback_active.is_set():
+            raise StoreUnavailable("reentrant Store mutation during admission")
+
+    @contextmanager
+    def _promotion_receipt_callback(self):
+        """Mark only the untrusted receipt-reader call as non-reentrant."""
+        if self._promotion_receipt_callback_active.is_set():
+            raise StoreUnavailable("promotion receipt callback is already active")
+        self._promotion_receipt_callback_active.set()
+        try:
+            yield
+        finally:
+            self._promotion_receipt_callback_active.clear()
+
     def upsert(self, record: Record, *, retire_descendants: bool = False) -> bool:
         """Persist one record only if its durable revision is still current.
 
@@ -240,6 +393,7 @@ class Store:
         ``False`` without changing durable state, so an old cycle can never replace a newer
         continuation or terminal transition.
         """
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -271,6 +425,7 @@ class Store:
         A process crash releases SQLite's transaction; the stage adapter's idempotent durable
         proof can then be retried by a fresh coordinator. Returning false rolls back cleanly.
         """
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -317,6 +472,7 @@ class Store:
         head. The superseded predecessor is left completed-and-retired, exactly as a normal
         claim-transfer leaves its completed predecessor, so it leaves the running ledger and is
         never re-admitted or re-reconciled."""
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -379,88 +535,150 @@ class Store:
                 self._rollback_quietly()
                 raise
 
-    def reserve(self, record: Record, budget: int,
-                limits: ReservationLimits | None = None,
-                expected_launch_token: str | None = None,
-                expected_revision: int | None = None, *,
-                operational_safety: SafetyAdmissionParticipant | None = None,
-                route_cell_digest: str | None = None) -> bool:
-        """Atomically reserve ``record``'s demand on its pool, or refuse. Availability is read
-        and the running row is written under one ``BEGIN IMMEDIATE``, so two coordinator
-        instances racing on the same file serialize on the write lock and can never push a
-        pool's ledger past ``budget`` (ADR 0029/0030). When supplied, machine and dispatch-lane
-        limits are checked from those same running rows in the same transaction, so racers on
-        different pools cannot exceed either global cap. Returns whether the reservation was
-        taken; on refusal nothing is written.
+    @staticmethod
+    def _admission_checkpoint(_name: str) -> None:
+        """Fault-observation seam around the two atomic admission cutpoints."""
 
-        The write is a same-identity compare-and-set: an existing row must still be ``waiting``
-        at the launch-token generation the caller loaded.
-        Two coordinator instances that both loaded the
-        same ``waiting`` record and each flipped it to ``running`` with its own fresh launch token
-        serialize on the write lock — the first commits its reservation, and the second finds the
-        row already advanced and refuses instead of clobbering the winner's token or terminal
-        outcome. Exactly one running reservation and one launch token survive the race."""
+    def reserve(self, intent: ReservationIntent) -> AdmissionResult | None:
+        """Atomically admit the exact durable WAITING Record named by ``intent``.
+
+        Store owns the immediate transaction, derives the participant context and ten-field
+        successor, and publishes a result only after commit.  Ordinary ineligibility returns
+        ``None`` without calling either admission owner or writing any row.
+        """
+        self._refuse_promotion_receipt_callback_mutation()
+        if type(intent) is not ReservationIntent:
+            raise TypeError("reserve requires the exact ReservationIntent")
+        if (not isinstance(intent.identity, str) or not intent.identity
+                or (intent.expected_launch_token is not None
+                    and not isinstance(intent.expected_launch_token, str))
+                or isinstance(intent.expected_revision, bool)
+                or not isinstance(intent.expected_revision, int)
+                or intent.expected_revision < 0
+                or isinstance(intent.now, bool) or not isinstance(intent.now, int)
+                or intent.now < 0
+                or not isinstance(intent.daemon_generation, str)
+                or not intent.daemon_generation
+                or (intent.limits is not None
+                    and type(intent.limits) is not ReservationLimits)):
+            return None
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 existing_row = self._conn.execute(
-                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
-                if existing_row is not None:
-                    existing = self._decode(existing_row[0])
-                    if (existing.state != WAITING
-                            or existing.launch_token != expected_launch_token
-                            or (expected_revision is not None
-                                and existing.revision != expected_revision)):
-                        # Reservation is a WAITING -> RUNNING compare-and-set. Any other durable
-                        # state or token means another instance already advanced this identity;
-                        # never overwrite newer attempts, completion, or hold state with a stale
-                        # waiting generation.
-                        self._conn.execute("ROLLBACK")
-                        return False
-                if limits is not None:
+                    "SELECT data FROM records WHERE identity = ?", (intent.identity,)).fetchone()
+                if existing_row is None:
+                    self._conn.execute("ROLLBACK")
+                    return None
+                existing = self._decode(existing_row[0])
+                if (existing.state != WAITING
+                        or existing.launch_token != intent.expected_launch_token
+                        or existing.revision != intent.expected_revision
+                        or isinstance(intent.budget, bool) or not isinstance(intent.budget, int)
+                        or intent.budget < 0):
+                    self._conn.execute("ROLLBACK")
+                    return None
+                if intent.limits is not None:
+                    limits = intent.limits
                     rows = self._conn.execute(
                         "SELECT data FROM records WHERE state = ? AND identity != ?",
-                        (RUNNING, record.identity),
+                        (RUNNING, existing.identity),
                     ).fetchall()
                     running = [self._decode(row[0]) for row in rows]
                     roots = [item for item in running if item.root is None]
                     if len(roots) >= limits.machine_ceiling:
                         self._conn.execute("ROLLBACK")
-                        return False
+                        return None
                     lane_count = sum(
                         limits.lane_by_stage.get(item.stage, item.stage) == limits.stage_lane
                         for item in roots
                     )
                     if lane_count >= limits.stage_cap:
                         self._conn.execute("ROLLBACK")
-                        return False
+                        return None
                 row = self._conn.execute(
                     "SELECT COALESCE(SUM(demand), 0) FROM records"
                     " WHERE pool = ? AND state = ? AND identity != ?",
-                    (record.pool, RUNNING, record.identity),
+                    (existing.pool, RUNNING, existing.identity),
                 ).fetchone()
-                if int(row[0]) + record.demand > budget:
+                if int(row[0]) + existing.demand > intent.budget:
                     self._conn.execute("ROLLBACK")
-                    return False
-                if (operational_safety is None) != (route_cell_digest is None):
+                    return None
+                if (self._operational_safety is not None
+                        and (not isinstance(intent.route_cell_digest, str)
+                             or not intent.route_cell_digest)):
                     self._conn.execute("ROLLBACK")
-                    return False
-                if operational_safety is not None:
-                    operational_safety.participate_in_admission(
-                        self._conn, route_cell_digest)  # type: ignore[arg-type]
-                record.revision = (existing.revision + 1 if existing_row is not None else 1)
-                self._write(record)
+                    return None
+                safety_state_id = None
+                attribution = None
+                if self._operational_safety is not None:
+                    context = _AdmissionContext(
+                        stage_identity=existing.identity,
+                        repository=existing.repo,
+                        stage=existing.stage,
+                        provider=existing.pool,
+                        model=existing.model,
+                        route_cell_digest=intent.route_cell_digest)  # type: ignore[arg-type]
+                    safety = self._operational_safety._participate_in_admission(context)
+                    if (type(safety) is not _SafetyAdmissionResult
+                            or not isinstance(safety.safety_state_id, str)
+                            or not safety.safety_state_id):
+                        raise SafetyRefused("OperationalSafety returned an invalid admission result")
+                    safety_state_id = safety.safety_state_id
+                    if self._canary_attribution is not None:
+                        from agentflow.canary_attribution import _CanaryAdmissionResult
+                        canary = self._canary_attribution._participate_in_admission(context)
+                        if type(canary) is not _CanaryAdmissionResult:
+                            raise SafetyRefused("CanaryAttribution returned an invalid admission result")
+                        attribution = canary.attribution
+                self._admission_checkpoint("after-attribution-before-successor")
+                successor = replace(
+                    existing,
+                    state=RUNNING,
+                    revision=existing.revision + 1,
+                    start_fact=None,
+                    launch_token=uuid4().hex,
+                    family=None,
+                    process_alive=False,
+                    attempt_committed=False,
+                    daemon_generation=intent.daemon_generation,
+                    started_at=intent.now,
+                    deadline=intent.now + SUPERVISOR_WINDOW,
+                )
+                self._write(successor)
+                self._admission_checkpoint("after-successor-before-commit")
                 self._conn.execute("COMMIT")
-                return True
+                self._admission_checkpoint("after-commit")
+                return AdmissionResult(successor, safety_state_id, attribution)
             except sqlite3.DatabaseError as e:
-                try:
-                    self._conn.execute("ROLLBACK")
-                except sqlite3.DatabaseError:
-                    pass
+                self._rollback_quietly()
                 raise StoreUnavailable(f"cannot reserve on continuation store: {e}") from e
             except BaseException:
                 self._rollback_quietly()
                 raise
+
+    def resolve_route_cell(self, stage_identity: str, expected_revision: int,
+                           route_id: str) -> ResolvedLaunch:
+        """Resolve through this Store's exact sealed OperationalSafety instance."""
+        if self._operational_safety is None:
+            raise StoreUnavailable("route resolution is not configured")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM records WHERE identity = ?", (stage_identity,)).fetchone()
+            if row is None:
+                raise StoreUnavailable("route resolution record is unavailable")
+            record = self._decode(row[0])
+            if record.revision != expected_revision:
+                raise StoreUnavailable("route resolution record revision changed")
+            return self._operational_safety.resolve(
+                record.repo, record.stage, record.pool, record.model, route_id)
+
+    def read_canary_attribution(
+            self, stage_identity: str) -> CanaryAttribution | None:
+        """Read one committed attribution through this Store's sealed owner."""
+        if self._canary_attribution is None:
+            raise StoreUnavailable("canary attribution is not configured")
+        return self._canary_attribution._read(stage_identity)
 
     def discard(self, expected: Record) -> bool:
         """Remove a never-started record from the ledger under a revision compare-and-set, freeing
@@ -475,6 +693,7 @@ class Store:
         compare-and-set, so genuine in-flight or completed work is never freed. Returns whether the
         row was removed.
         """
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -516,6 +735,7 @@ class Store:
         a handshake timeout (rotating the token) or returned the record to ``waiting``, the
         write is refused and the caller must not become a provider — this is what stops an
         uncancelled bootstrap from starting an unreserved, uncounted provider."""
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -545,6 +765,7 @@ class Store:
         it. Otherwise rotate the reservation's launch token so any still-running child's late
         guarded write is refused, and return ``(not_started, None)``. Exactly one of this and
         :meth:`child_start` can win, so a launch never both times out and starts a provider."""
+        self._refuse_promotion_receipt_callback_mutation()
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -587,7 +808,10 @@ class Store:
         return int(row[0])
 
     def close(self) -> None:
-        self._conn.close()
+        self._refuse_promotion_receipt_callback_mutation()
+        with self._lock:
+            self._refuse_promotion_receipt_callback_mutation()
+            self._conn.close()
 
     def _write(self, record: Record) -> None:
         """The one INSERT-or-update statement, shared by every writer. The caller owns the
@@ -676,12 +900,16 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, 
 
 
 def _expected_schema_fingerprint(version: int) -> tuple[tuple[str, str, str, str], ...]:
+    if version in (2, 3):
+        from agentflow.canary_attribution import (
+            STORE_V2_SCHEMA_FINGERPRINT,
+            STORE_V3_SCHEMA_FINGERPRINT,
+        )
+        return (STORE_V2_SCHEMA_FINGERPRINT if version == 2
+                else STORE_V3_SCHEMA_FINGERPRINT)
     conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         conn.execute(_RECORDS_SCHEMA)
-        if version == 2:
-            from agentflow.operational_safety import OperationalSafety
-            OperationalSafety.initialize_schema(conn)
         return _schema_fingerprint(conn)
     finally:
         conn.close()

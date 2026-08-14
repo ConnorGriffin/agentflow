@@ -566,7 +566,7 @@ def test_the_new_record_fields_default_so_older_stores_still_open(coord_state):
     finally:
         store.close()
 
-    assert SCHEMA_VERSION == 2
+    assert SCHEMA_VERSION == 3
     assert restored.refusals == 0 and restored.stall_refusal_id == ""
     assert restored.stall_started_at == 0 and restored.stall_last_observed_at == 0
 

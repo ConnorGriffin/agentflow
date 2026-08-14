@@ -23,8 +23,8 @@ import os
 import json
 import threading
 import time
-from dataclasses import dataclass, replace
-from uuid import uuid4
+from copy import deepcopy
+from dataclasses import dataclass, fields, replace
 
 from agentflow.coordinator.admission import (
     ATTEMPT_BUDGET, CODE_WRITING, ISSUE_BOUND, LINEAGE_PINNED, MODEL_FOR, PERMIT_BUDGET, PR_BOUND,
@@ -38,7 +38,8 @@ from agentflow.coordinator.record import (
     STALL_STALLED_AFTER, WAITING, Record, stalled_for)
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
-from agentflow.coordinator.store import Store, default_store_path
+from agentflow.coordinator.store import (
+    SUPERVISOR_WINDOW, ReservationIntent, Store, default_store_path)
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
@@ -49,7 +50,6 @@ from agentflow.review_policy import ReviewState
 # supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
 # stable deadline after a restart.
 CONTINUATION_BUDGET = ATTEMPT_BUDGET - 1  # the two automatic continuations after the first try
-SUPERVISOR_WINDOW = 2 * 3600              # observe-until horizon stamped at admission, for the log
 # A daemon restart/reboot that kills a running family costs no attempt — the same attempt resumes in
 # place. That resume is bounded per stage identity so a family that keeps dying with no provider end
 # fact still parks eventually instead of spinning forever at zero budget cost.
@@ -836,7 +836,7 @@ class Coordinator:
         capacity is re-placed instead of freezing at zero attempts (ADR 0020)."""
         if self._store.permits_used(record.pool) + record.demand > PERMIT_BUDGET:
             return True
-        return not self._gate(record)
+        return not self._gate(deepcopy(record))
 
     @staticmethod
     def _may_migrate(record: Record, dest_pool: str) -> bool:
@@ -917,7 +917,7 @@ class Coordinator:
             return False  # a code-writing stage may not silently leave its pinned lineage
         if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
             return False  # new issue work defers while a PR-bound stage waits to start (#293)
-        if not self._gate(record):
+        if not self._gate(deepcopy(record)):
             # An independent admission gate refusal (headroom, ceiling, cap, pacing) used to be
             # silent: a record pinned to a pool the weekly ratchet blocks sat `waiting` with its
             # claim held for days with zero log lines while intake logged its own deferral every
@@ -928,36 +928,36 @@ class Coordinator:
             # lands in the slot preparation just cleared; `_admit` persists whatever the cycle
             # finally settled on, so a capacity reason that has not changed costs no write (#405).
             reason_of = getattr(self._gate, "deferral_reason", None)
-            reason = reason_of(record) if reason_of is not None else None
+            reason = reason_of(deepcopy(record)) if reason_of is not None else None
             self._note_refusal(record, reason or "", False)
             self._emit_deferral(record, now, reason)
             return False
-        # Flip to a reservation and atomically claim demand plus any global admission limits
-        # on the ledger; concurrent instances cannot push a pool, machine, or stage lane past
-        # its reviewed budget (ADR 0029/0030). The fresh
-        # launch token binds this reservation to exactly one bootstrap child: only a child
-        # holding it may record `started`, so a timed-out launch disowned back to waiting can
-        # never be adopted by an uncancelled child (ADR 0030 handshake boundary).
-        expected_launch_token = record.launch_token
-        expected_revision = record.revision
-        record.state = RUNNING
-        record.start_fact = None
-        record.launch_token = uuid4().hex
-        record.family = None
-        record.process_alive = False
-        record.attempt_committed = False  # a fresh attempt has not been consumed yet
-        record.daemon_generation = self._daemon_generation  # who admitted this attempt (restart marker)
-        record.started_at = now
-        record.deadline = now + SUPERVISOR_WINDOW  # observe-until, for the recovered-running log
+        # Store derives and commits the reservation successor. Default NoAdmission mode preserves
+        # the shipped coordinator behavior; #627 remains the owner of composed Safety/Attribution
+        # mode, RouteCell resolution, and briefing/capability admission receipts.
         reservation_limits = getattr(self._gate, "reservation_limits", None)
-        limits = reservation_limits(record) if reservation_limits is not None else None
-        if not self._store.reserve(
-                record, PERMIT_BUDGET, limits,
-                expected_launch_token=expected_launch_token,
-                expected_revision=expected_revision):
-            record.state = WAITING  # the pool cannot fit this demand right now
-            record.start_fact = None
+        limits = reservation_limits(deepcopy(record)) if reservation_limits is not None else None
+        # Preparation is Coordinator-owned and may legitimately rewrite the WAITING row (for
+        # example, a pool/model migration or refusal/stall clearing).  Commit that exact state
+        # through the existing CAS seam before Store reloads it for admission.  A lost CAS ends
+        # this attempt; the winner's durable row remains authoritative and no reservation is
+        # attempted from the stale object.
+        if not self._persist(record):
             return False
+        admission = self._store.reserve(ReservationIntent(
+            identity=record.identity,
+            expected_launch_token=record.launch_token,
+            expected_revision=record.revision,
+            now=now,
+            daemon_generation=self._daemon_generation,
+            budget=PERMIT_BUDGET,
+            limits=limits,
+            route_cell_digest=None,
+        ))
+        if admission is None:
+            return False
+        for item in fields(Record):
+            setattr(record, item.name, getattr(admission.successor, item.name))
         return True
 
     def _emit_deferral(self, record: Record, now: int, reason: str | None) -> None:
@@ -970,7 +970,7 @@ class Coordinator:
         if not reason:
             return
         permitted = getattr(self._gate, "should_emit_deferral", None)
-        if permitted is not None and not permitted(record):
+        if permitted is not None and not permitted(deepcopy(record)):
             return
         waited = ""
         if now > record.created_at > 0:
