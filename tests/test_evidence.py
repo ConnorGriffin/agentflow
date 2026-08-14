@@ -8,7 +8,7 @@ import sqlite3
 from agentflow.evidence import (AuthorityPointer, EvidenceEnvelopeV2, EvidenceLink,
                                 EvidenceStore, Event, FailureFacts, Observation, ProducerEvent, ProducerFacts,
                                 SubjectRevision, ApprovedAuthority, Evaluation,
-                                EvidenceError, FakeAuthorityVerifier, LessonCandidate,
+                                EvidenceError, EvidenceReceiptReader, FakeAuthorityVerifier, LessonCandidate,
                                 _V2_SCHEMA, _V3_SCHEMA, _V4_SCHEMA, _schema_fingerprint,
                                 _schema_fingerprint_for)
 from agentflow.evidence_contract import validate_fixtures
@@ -600,6 +600,17 @@ def test_evidence_store_exposes_exactly_five_public_verbs():
     public = {name for name in dir(EvidenceStore)
               if not name.startswith("_") and callable(getattr(EvidenceStore, name))}
     assert public == {"observe", "evaluate", "nominate", "promote", "brief_for"}
+    assert not hasattr(EvidenceStore, "_read")
+
+
+def test_read_only_receipt_query_is_separate_from_the_governed_store(tmp_path):
+    store = EvidenceStore(path=tmp_path / "evidence.db")
+    event = store.observe(_observation())
+    receipts = EvidenceReceiptReader(path=store.path)
+    public = {name for name in dir(EvidenceReceiptReader)
+              if not name.startswith("_") and callable(getattr(EvidenceReceiptReader, name))}
+    assert public == {"read"}
+    assert receipts.read(event.event_id).event_id == event.event_id
 
 
 @pytest.mark.parametrize("outcome,digest", [("merge", "1" * 64), ("park", "2" * 64)])

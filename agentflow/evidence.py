@@ -1,14 +1,16 @@
 """Redacted, provider-neutral evidence behind one governed interface.
 
-The database is deliberately private. Callers use :class:`EvidenceStore` and
-its five verbs; the GitHub adapter satisfies ``AuthorityVerifier`` without
-changing the durable evidence model.
+The database is deliberately private. Governed callers use :class:`EvidenceStore` and its five
+verbs; storage-owned read-only adapters expose bounded content-free receipts outside that verb
+surface. The GitHub adapter satisfies ``AuthorityVerifier`` without changing the durable evidence
+model.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import quote
 import re
 import sqlite3
 
@@ -483,7 +485,7 @@ class ProducerEvent:
 
 @dataclass(frozen=True)
 class EvidenceRecord:
-    """Content-free typed facts used by Evidence's internal read-only miner."""
+    """Content-free typed facts returned by the separate read-only receipt reader."""
     event_id: str
     event_kind: str
     subject: str
@@ -548,8 +550,61 @@ class PromotionReceipt:
     authoritative: bool
 
 
+class EvidenceReceiptReader:
+    """Read immutable Evidence event receipts without widening ``EvidenceStore``.
+
+    This adapter owns its read-only SQLite connection and is injected into consumers that need
+    content-free facts. It cannot evaluate, nominate, promote, retain, or otherwise mutate
+    Evidence.
+    """
+    def __init__(self, *, path: Path) -> None:
+        self.path = path
+        try:
+            with self._connect() as conn:
+                if (conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                        or _schema_fingerprint(conn) != _schema_fingerprint_for(_V4_SCHEMA)):
+                    raise EvidenceError("evidence receipt store was not accepted")
+        except sqlite3.Error as error:
+            raise EvidenceError("evidence receipt store is unavailable") from error
+
+    def _connect(self) -> sqlite3.Connection:
+        encoded = quote(self.path.resolve().as_posix(), safe="/")
+        conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
+    def read(self, event_id: str) -> EvidenceRecord:
+        """Return one immutable, content-free event receipt."""
+        _token(event_id, "event_id")
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
+                if row is None:
+                    raise EvidenceError("unknown event receipt")
+                states = tuple(item[0] for item in conn.execute(
+                    "SELECT DISTINCT validation_state FROM observations WHERE event_id=? "
+                    "ORDER BY validation_state", (event_id,)))
+                links = tuple(EvidenceLink(item[0], item[1], item[2]) for item in conn.execute(
+                    "SELECT relation, target_event_id, ordinal FROM event_links "
+                    "WHERE source_event_id=? ORDER BY ordinal", (event_id,)))
+                lineage = conn.execute(
+                    "SELECT parent_revision, fixer_revision FROM observations WHERE event_id=? "
+                    "AND (parent_revision<>'' OR fixer_revision<>'') "
+                    "ORDER BY observation_id LIMIT 1", (event_id,)).fetchone()
+                return EvidenceRecord(
+                    event_id, row["event_kind"], row["subject"], row["revision"],
+                    row["failure_class"], row["producer_kind"], row["review_action"], states,
+                    links, "" if lineage is None else lineage["parent_revision"],
+                    "" if lineage is None else lineage["fixer_revision"],
+                )
+        except sqlite3.Error as error:
+            raise EvidenceError("evidence receipt store is unavailable") from error
+
+
 class EvidenceStore:
-    """The sole caller-facing Evidence interface; its schema is fail-closed."""
+    """The sole governed five-verb Evidence interface; its schema is fail-closed."""
     def __init__(self, *, path: Path | None = None, verifier: AuthorityVerifier | None = None) -> None:
         self.path = path or state_path("evidence", "evidence.db")
         self.verifier = verifier or FakeAuthorityVerifier()
@@ -948,28 +1003,6 @@ class EvidenceStore:
             (event_id,)))
         return ProducerEvent(event_id, ids, row["producer_kind"], row["review_action"], states,
                              links, contextual)
-
-    def _read(self, event_id: str) -> EvidenceRecord:
-        """Internal immutable, content-free projection for the read-only miner."""
-        _token(event_id, "event_id")
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
-            if row is None:
-                raise EvidenceError("unknown event")
-            states = tuple(item[0] for item in conn.execute(
-                "SELECT DISTINCT validation_state FROM observations WHERE event_id=? ORDER BY validation_state",
-                (event_id,)))
-            links = tuple(EvidenceLink(item[0], item[1], item[2]) for item in conn.execute(
-                "SELECT relation, target_event_id, ordinal FROM event_links WHERE source_event_id=? ORDER BY ordinal",
-                (event_id,)))
-            lineage = conn.execute(
-                "SELECT parent_revision, fixer_revision FROM observations WHERE event_id=? "
-                "AND (parent_revision<>'' OR fixer_revision<>'') ORDER BY observation_id LIMIT 1",
-                (event_id,)).fetchone()
-            return EvidenceRecord(event_id, row["event_kind"], row["subject"], row["revision"],
-                                  row["failure_class"], row["producer_kind"], row["review_action"],
-                                  states, links, "" if lineage is None else lineage["parent_revision"],
-                                  "" if lineage is None else lineage["fixer_revision"])
 
     def evaluate(self, evaluation: Evaluation) -> Evaluation:
         with self._connect() as conn:

@@ -7,11 +7,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-from typing import Iterable
+from typing import Iterable, Protocol
 import re
 
 from agentflow.evidence import (AuthorityPointer, EvidenceEnvelopeV2, EvidenceLink,
-                                EvidenceStore, FailureFacts, LessonCandidate, ProducerEvent,
+                                EvidenceRecord, EvidenceStore, FailureFacts, LessonCandidate, ProducerEvent,
                                 ProducerFacts, SubjectRevision)
 
 _UPSTREAM_CONTRACTS = frozenset({"build-tdd", "plan-review", "code-review",
@@ -379,12 +379,17 @@ class LessonInput:
     proposal_digest: str
 
 
+class EvidenceReceiptQuery(Protocol):
+    """Injected read-only access to immutable, content-free Evidence event receipts."""
+    def read(self, event_id: str) -> EvidenceRecord: ...
+
+
 class EvidenceMiner:
     """Read-only miner that returns candidates without evaluating or mutating Evidence."""
     SAFE_STATES = frozenset({"reproduced", "model_judged", "human_validated"})
 
-    def __init__(self, store: EvidenceStore) -> None:
-        self._store = store
+    def __init__(self, receipts: EvidenceReceiptQuery) -> None:
+        self._receipts = receipts
 
     def candidates(self, inputs: Iterable[LessonInput], *, policy_version: int,
                    nominated_at: int) -> tuple[LessonCandidate, ...]:
@@ -393,8 +398,8 @@ class EvidenceMiner:
             if not _valid_digest(item.proposal_digest):
                 continue
             try:
-                event = self._store._read(item.event_id)
-                linked = tuple(self._store._read(link.target_event_id) for link in event.links)
+                event = self._receipts.read(item.event_id)
+                linked = tuple(self._receipts.read(link.target_event_id) for link in event.links)
             except ValueError:
                 continue
             failure = next((candidate for candidate in linked
@@ -406,7 +411,7 @@ class EvidenceMiner:
                 continue
             try:
                 method = next(candidate.subject.removeprefix("contract/") for candidate in
-                    (self._store._read(link.target_event_id) for link in finding.links)
+                    (self._receipts.read(link.target_event_id) for link in finding.links)
                     if candidate.producer_kind == "decision" and candidate.revision == "v1"
                     and candidate.subject.startswith("contract/"))
             except (StopIteration, ValueError):
