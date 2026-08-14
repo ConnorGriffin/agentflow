@@ -360,7 +360,14 @@ def test_score_gates_uses_contract_present_state(checker, bundle):
         return "current" if value == "present" else value
 
     input_value = replace_present(input_value)
-    assert evaluate(contract, case["operation_id"], input_value) == case["expected_result"]
+    input_value["attempt_pages"][0]["attempts"][0]["candidate"]["critical_miss"]["value"] = True
+    result = evaluate(contract, case["operation_id"], input_value)
+
+    scorecard = result["value"]["scorecard"]
+    assert scorecard["gates"]["hard"] is False
+    assert scorecard["metrics"]["new_critical_miss_count"] == 1
+    assert scorecard["metrics"]["token_saving_median"]["state"] == "present"
+    assert scorecard["metrics"]["round_saving_median"]["state"] == "present"
 
 
 def test_input_and_expectation_cannot_be_rebound_around_whole_file_lock(tmp_path, checker, bundle):
@@ -400,7 +407,7 @@ def test_module_interface_ast_import_and_capability_audit(checker, bundle):
     "source",
     [
         b"import os\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
-        b"from fractions import Fraction\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
+        b"from fractions import Fraction\nfrom hashlib import sha256\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
         b"def helper():\n    return open('x')\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
         b"def public():\n    return 1\n\ndef evaluate_v1(contract, operation_id, input_value):\n    return {}\n",
         b"def evaluate_v1(contract, operation_id):\n    return {}\n",
@@ -409,6 +416,18 @@ def test_module_interface_ast_import_and_capability_audit(checker, bundle):
 def test_module_audit_rejects_import_capability_surface_and_interface(checker, source):
     with pytest.raises(checker.CheckFailure, match="E_SEMANTIC"):
         checker._audit_and_load_module(source)
+
+
+def test_imported_public_callable_reaches_public_surface_check(checker):
+    source = (
+        b"from fractions import Fraction\nfrom hashlib import sha256\n\n"
+        b"def evaluate_v1(contract, operation_id, input_value):\n    return {}\n"
+    )
+
+    with pytest.raises(checker.CheckFailure) as caught:
+        checker._audit_and_load_module(source)
+
+    assert caught.value.code == "E_SEMANTIC"
 
 
 def test_module_source_exact_limit_passes_and_plus_one_fails(checker):
