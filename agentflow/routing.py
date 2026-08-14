@@ -523,3 +523,22 @@ def reconcile_route_cells(config, store):
         except (SafetyRefused, StoreUnavailable, sqlite3.DatabaseError):
             continue
     return tuple(registered)
+
+
+def rematerialize_route_selection(selection: RouteSelection) -> RouteSelection:
+    """Rebuild one proposed registration from the current routing authority."""
+    if type(selection) is not RouteSelection:
+        raise SafetyRefused("route registration requires the exact frozen selection")
+    profile = selection.launch_config.stage_profile_id.split("/")
+    kwargs: dict[str, str] = {}
+    if selection.stage == "build":
+        kwargs["complexity"] = profile[1]
+        if profile[2] != "default":
+            kwargs["effort"] = profile[2]
+    elif selection.stage == "revise":
+        kwargs["complexity"] = profile[1]
+        kwargs["builder_complexity"] = profile[1]
+        if profile[2] != "default":
+            kwargs["effort"] = profile[2]
+    return routing.select_route(
+        selection.repository, selection.stage, selection.provider, selection.model, **kwargs)

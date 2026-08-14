@@ -194,23 +194,37 @@ def test_store_resolves_one_decoded_envelope_and_closes_refusal_codes(tmp_path):
     assert missing.value.code == "missing"
 
     other = routing.select_route(
-        "other/repo", "build", "codex", "sol", complexity="deep", effort="high")
+        "other/repo", "review", "codex", "sol", complexity="deep")
     store.register_route_selection(other)
-    with pytest.raises(RouteAdmissionRefused) as mismatched:
-        store.resolve_admitted_launch(stored.identity, stored.revision, other.route_id)
-    assert mismatched.value.code == "mismatched"
+    sibling_record, *_ = store.submit(Record(
+        "stage-646-sibling", "review", "codex", 1,
+        repo="third/repo", model="sol", complexity="deep"))
+    with pytest.raises(RouteAdmissionRefused) as sibling:
+        store.resolve_admitted_launch(
+            sibling_record.identity, sibling_record.revision, other.route_id)
+    assert sibling.value.code == "missing"
     store.close()
 
 
-def test_store_registration_uses_the_frozen_selection_not_routing(monkeypatch, tmp_path):
+def test_store_registration_refuses_values_not_rematerialized_by_routing(tmp_path):
     store = Store(
         tmp_path / "coordinator.db",
         admission_mode=OperationalSafetyOnly(SafetySources()),
     )
     selection = routing.select_route(
         "octo/app", "review", "codex", "sol", complexity="deep")
-    monkeypatch.setattr(routing, "cli_identifier", lambda *_: (_ for _ in ()).throw(
-        AssertionError("routing was reread")))
+    altered = (
+        replace(selection, model="opus", launch_config=replace(
+            selection.launch_config, internal_model="opus", cli_model="opus")),
+        replace(selection, launch_config=replace(selection.launch_config, wall_ceiling_s=1)),
+        replace(selection, launch_config=replace(
+            selection.launch_config, allowed_tools=("Read",), sandbox_policy="read-only")),
+        replace(selection, launch_config=replace(selection.launch_config, reasoning_effort="high")),
+    )
+
+    for candidate in altered:
+        with pytest.raises(SafetyRefused):
+            store.register_route_selection(candidate)
 
     registered = store.register_route_selection(selection)
 
@@ -370,7 +384,7 @@ def test_local_launcher_start_threads_one_envelope_to_argv_and_supervision(
     store.close()
 
 
-def test_changed_config_keeps_route_identity_inactive_and_survives_reopen(tmp_path):
+def test_changed_config_keeps_route_identity_inactive_and_survives_reopen(monkeypatch, tmp_path):
     path = tmp_path / "coordinator.db"
     store = Store(path, admission_mode=OperationalSafetyOnly(SafetySources()))
     record = Record(
@@ -380,8 +394,9 @@ def test_changed_config_keeps_route_identity_inactive_and_survives_reopen(tmp_pa
     first = routing.select_route(
         "octo/app", "review", "codex", "sol", complexity="deep")
     first_cell = store.register_route_selection(first)
-    changed = replace(first, launch_config=replace(
-        first.launch_config, wall_ceiling_s=first.launch_config.wall_ceiling_s + 1))
+    monkeypatch.setenv("AGENTFLOW_SESSION_TIMEOUT", "321")
+    changed = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
     changed_cell = store.register_route_selection(changed)
 
     assert changed.route_id == first.route_id
@@ -454,7 +469,7 @@ def test_store_closes_quarantined_and_unreadable_route_refusals(tmp_path):
     corrupt.close()
 
 
-def test_activation_between_resolve_and_reserve_is_stale_without_capacity(tmp_path):
+def test_activation_between_resolve_and_reserve_is_stale_without_capacity(monkeypatch, tmp_path):
     store = Store(
         tmp_path / "coordinator.db",
         admission_mode=OperationalSafetyOnly(SafetySources()),
@@ -466,8 +481,9 @@ def test_activation_between_resolve_and_reserve_is_stale_without_capacity(tmp_pa
     first = routing.select_route(
         "octo/app", "review", "codex", "sol", complexity="deep")
     first_cell = store.register_route_selection(first)
-    changed = replace(first, launch_config=replace(
-        first.launch_config, wall_ceiling_s=first.launch_config.wall_ceiling_s + 1))
+    monkeypatch.setenv("AGENTFLOW_SESSION_TIMEOUT", "321")
+    changed = routing.select_route(
+        "octo/app", "review", "codex", "sol", complexity="deep")
     changed_cell = store.register_route_selection(changed)
     reservations = []
 

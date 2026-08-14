@@ -707,15 +707,18 @@ class Store:
                 record = self._decode(row[0])
                 if record.revision != expected_revision:
                     raise RouteAdmissionRefused("stale")
-                routes = self._conn.execute(
-                    "SELECT repository, stage, provider, model FROM safety_route_cells"
-                    " WHERE route_id = ?", (route_id,)).fetchall()
-                if not routes:
-                    raise RouteAdmissionRefused("missing")
                 identity = (record.repo, record.stage, record.pool, record.model)
-                if identity not in routes:
-                    raise RouteAdmissionRefused("mismatched")
+                route = self._conn.execute(
+                    "SELECT 1 FROM safety_route_cells WHERE repository = ? AND stage = ?"
+                    " AND provider = ? AND model = ? AND route_id = ?",
+                    (*identity, route_id)).fetchone()
+                if route is None:
+                    raise RouteAdmissionRefused("missing")
                 resolved = self._operational_safety.resolve(*identity, route_id)
+                cell = resolved.route_cell
+                if (cell.repository, cell.stage, cell.provider, cell.model, cell.route_id) != (
+                        *identity, route_id):
+                    raise RouteAdmissionRefused("mismatched")
                 state = self._operational_safety.route_state(resolved.route_cell.digest)
                 if state.quarantined:
                     raise RouteAdmissionRefused("quarantined")
@@ -748,17 +751,20 @@ class Store:
         """Register one exact routing-owned selection through this Store's sealed owner."""
         if self._operational_safety is None:
             raise StoreUnavailable("route registration is not configured")
-        from agentflow.routing import RouteSelection
+        from agentflow.routing import (
+            RouteSelection, RoutingConfigError, rematerialize_route_selection,
+        )
         if type(selection) is not RouteSelection:
             raise TypeError("route registration requires the exact frozen selection")
-        config = selection.launch_config
-        if (selection.route_id != f"production/{config.stage_profile_id}"
-                or selection.provider != config.provider
-                or selection.model != config.internal_model):
-            raise SafetyRefused("route selection does not bind its launch configuration")
+        try:
+            current = rematerialize_route_selection(selection)
+        except RoutingConfigError as error:
+            raise SafetyRefused("route selection is not admitted by current routing") from error
+        if current != selection:
+            raise SafetyRefused("route selection differs from current routing authority")
         return self._operational_safety.register_route_cell(
             selection.repository, selection.stage, selection.provider, selection.model,
-            selection.route_id, config)
+            selection.route_id, selection.launch_config)
 
     def route_cell_state(self, route_cell_digest: str):
         """Read verified RouteCell state through this Store's sealed owner."""
