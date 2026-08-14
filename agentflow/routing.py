@@ -532,13 +532,29 @@ def rematerialize_route_selection(selection: RouteSelection) -> RouteSelection:
     profile = selection.launch_config.stage_profile_id.split("/")
     kwargs: dict[str, str] = {}
     if selection.stage == "build":
+        if (len(profile) != 3 or profile[0] != "build"
+                or profile[1] not in {"standard", "deep"}
+                or profile[2] not in {"default", "low", "medium", "high", "extra"}):
+            raise SafetyRefused("build route selection has an invalid profile identity")
         kwargs["complexity"] = profile[1]
         if profile[2] != "default":
             kwargs["effort"] = profile[2]
     elif selection.stage == "revise":
+        if (len(profile) != 3 or profile[0] != "revise"
+                or profile[1] not in {"standard", "deep"}
+                or profile[2] not in {"default", "low", "medium", "high", "extra"}):
+            raise SafetyRefused("revise route selection has an invalid profile identity")
         kwargs["complexity"] = profile[1]
         kwargs["builder_complexity"] = profile[1]
         if profile[2] != "default":
             kwargs["effort"] = profile[2]
     return routing.select_route(
         selection.repository, selection.stage, selection.provider, selection.model, **kwargs)
+
+
+def select_route_for_record(record) -> RouteSelection:
+    """Materialize the current routing identity a durable record requires."""
+    return routing.select_route(
+        record.repo, record.stage, record.pool, record.model,
+        complexity=record.complexity, effort=record.effort,
+        builder_complexity=record.builder_complexity)

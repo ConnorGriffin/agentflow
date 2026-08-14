@@ -708,6 +708,9 @@ class Store:
                 if record.revision != expected_revision:
                     raise RouteAdmissionRefused("stale")
                 identity = (record.repo, record.stage, record.pool, record.model)
+                from agentflow.routing import select_route_for_record
+                if select_route_for_record(record).route_id != route_id:
+                    raise RouteAdmissionRefused("mismatched")
                 route = self._conn.execute(
                     "SELECT 1 FROM safety_route_cells WHERE repository = ? AND stage = ?"
                     " AND provider = ? AND model = ? AND route_id = ?",

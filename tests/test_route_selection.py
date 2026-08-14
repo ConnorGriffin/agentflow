@@ -189,9 +189,9 @@ def test_store_resolves_one_decoded_envelope_and_closes_refusal_codes(tmp_path):
         store.resolve_admitted_launch(stored.identity, stored.revision - 1, selection.route_id)
     assert stale.value.code == "stale"
 
-    with pytest.raises(RouteAdmissionRefused) as missing:
+    with pytest.raises(RouteAdmissionRefused) as mismatched:
         store.resolve_admitted_launch(stored.identity, stored.revision, "production/absent")
-    assert missing.value.code == "missing"
+    assert mismatched.value.code == "mismatched"
 
     other = routing.select_route(
         "other/repo", "review", "codex", "sol", complexity="deep")
@@ -229,6 +229,27 @@ def test_store_registration_refuses_values_not_rematerialized_by_routing(tmp_pat
     registered = store.register_route_selection(selection)
 
     assert registered.route_id == selection.route_id
+    store.close()
+
+
+@pytest.mark.parametrize(("stage", "profile_id"), [
+    ("build", "build/deep"),
+    ("revise", "revise/deep/default/extra"),
+])
+def test_store_registration_refuses_malformed_profile_tokens_before_indexing(
+        stage, profile_id, tmp_path):
+    store = Store(
+        tmp_path / "coordinator.db",
+        admission_mode=OperationalSafetyOnly(SafetySources()),
+    )
+    selection = routing.select_route(
+        "octo/app", stage, "codex", "sol", complexity="deep",
+        effort="high" if stage == "build" else None,
+        builder_complexity="deep" if stage == "revise" else None)
+    object.__setattr__(selection.launch_config, "stage_profile_id", profile_id)
+
+    with pytest.raises(SafetyRefused):
+        store.register_route_selection(selection)
     store.close()
 
 
