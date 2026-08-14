@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass, fields
@@ -29,6 +30,14 @@ from agentflow.state import state_dir as _state_dir, state_path
 from agentflow.coordinator.record import COMPLETED, NOT_STARTED, RUNNING, STARTED, WAITING, Record
 
 SCHEMA_VERSION = 2
+_RECORDS_SCHEMA = (
+    "CREATE TABLE records ("
+    " identity TEXT PRIMARY KEY,"
+    " pool TEXT NOT NULL,"
+    " state TEXT NOT NULL,"
+    " demand INTEGER NOT NULL,"
+    " data TEXT NOT NULL)"
+)
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
 # daemon cycle on a lock we cannot prove will clear.
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_COORD_BUSY_MS", "2000"))
@@ -109,11 +118,17 @@ class Store:
                 raise StoreUnavailable(
                     f"store schema {version} is newer than supported {SCHEMA_VERSION}")
             if version == 1:
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(1):
+                    conn.close()
+                    raise StoreUnavailable("store schema 1 does not match the migration source")
                 self._migrate_v1_to_v2(conn)
                 version = 2
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(2):
+                conn.close()
+                raise StoreUnavailable("store schema 2 does not match the accepted schema")
         except sqlite3.DatabaseError as e:  # corrupt file, locked-beyond-wait, unreadable
             raise StoreUnavailable(f"cannot open continuation store: {e}") from e
         return conn
@@ -161,14 +176,7 @@ class Store:
         # One transaction: the whole schema and its version appear together or not at all.
         conn.execute("BEGIN IMMEDIATE")
         try:
-            conn.execute(
-                "CREATE TABLE records ("
-                " identity TEXT PRIMARY KEY,"
-                " pool TEXT NOT NULL,"
-                " state TEXT NOT NULL,"
-                " demand INTEGER NOT NULL,"
-                " data TEXT NOT NULL)"
-            )
+            conn.execute(_RECORDS_SCHEMA)
             from agentflow.operational_safety import OperationalSafety
             OperationalSafety.initialize_schema(conn)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -184,6 +192,8 @@ class Store:
             conn.execute("BEGIN IMMEDIATE")
             from agentflow.operational_safety import OperationalSafety
             OperationalSafety.initialize_schema(conn)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(2):
+                raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
             conn.execute("PRAGMA user_version = 2")
             conn.execute("COMMIT")
         except sqlite3.DatabaseError:
@@ -652,3 +662,26 @@ def _unlink(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, str], ...]:
+    """Canonical SQL for every caller-owned schema object; SQLite internals are excluded."""
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master "
+        "WHERE name NOT LIKE 'sqlite_%' AND sql IS NOT NULL "
+        "ORDER BY type, name"
+    ).fetchall()
+    return tuple((kind, name, table, re.sub(r"\s+", "", sql).lower())
+                 for kind, name, table, sql in rows)
+
+
+def _expected_schema_fingerprint(version: int) -> tuple[tuple[str, str, str, str], ...]:
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    try:
+        conn.execute(_RECORDS_SCHEMA)
+        if version == 2:
+            from agentflow.operational_safety import OperationalSafety
+            OperationalSafety.initialize_schema(conn)
+        return _schema_fingerprint(conn)
+    finally:
+        conn.close()

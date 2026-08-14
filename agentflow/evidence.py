@@ -603,6 +603,39 @@ class EvidenceReceiptReader:
             raise EvidenceError("evidence receipt store is unavailable") from error
 
 
+class PromotionReceiptReader:
+    """Read exact #584 promotion receipts without widening ``EvidenceStore``."""
+
+    def __init__(self, *, path: Path) -> None:
+        self.path = path
+        try:
+            with self._connect() as conn:
+                if (conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                        or _schema_fingerprint(conn) != _schema_fingerprint_for(_V4_SCHEMA)):
+                    raise EvidenceError("promotion receipt store was not accepted")
+        except sqlite3.Error as error:
+            raise EvidenceError("promotion receipt store is unavailable") from error
+
+    def _connect(self) -> sqlite3.Connection:
+        encoded = quote(self.path.resolve().as_posix(), safe="/")
+        conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
+    def read(self, receipt_id: str) -> PromotionReceipt:
+        _token(receipt_id, "receipt_id")
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM receipts WHERE receipt_id=?", (receipt_id,)).fetchone()
+                if row is None:
+                    raise EvidenceError("unknown promotion receipt")
+                return EvidenceStore._receipt(row)
+        except sqlite3.Error as error:
+            raise EvidenceError("promotion receipt store is unavailable") from error
+
+
 class EvidenceStore:
     """The sole governed five-verb Evidence interface; its schema is fail-closed."""
     def __init__(self, *, path: Path | None = None, verifier: AuthorityVerifier | None = None) -> None:

@@ -14,6 +14,9 @@ import json
 import sqlite3
 from typing import Mapping, Protocol
 
+from agentflow.evidence import EvidenceError, PromotionReceipt
+from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
+
 
 def _canonical_text(value: object) -> str:
     return json.dumps(
@@ -85,7 +88,7 @@ ROUTE_CELL_CONTRACT = {
 ROUTE_CELL_CONTRACT_DIGEST = _digest(ROUTE_CELL_CONTRACT)
 
 ACTION_STATE_MAP = {
-    "rerun": "claimed -> externally_effected -> result_committed",
+    "rerun": "claimed -> single_flight_effect_reconciled -> result_committed",
     "quarantine": "claimed -> exact_cell_quarantined + result_committed",
     "rollback": "claimed -> predecessor_pointer_restored + result_committed",
 }
@@ -95,9 +98,10 @@ OPERATIONAL_SAFETY_CONTRACT = {
     "route_cell_contract_digest": ROUTE_CELL_CONTRACT_DIGEST,
     "deterministic_check_allowlist_digest": DETERMINISTIC_CHECK_ALLOWLIST_DIGEST,
     "action_state_map": ACTION_STATE_MAP,
-    "canary_receipt": "id+bad_digest+predecessor_digest+disabled_generation+receipt_digest",
-    "rollback_trigger": "active_bad_route_cell_is_quarantined",
-    "reopen_proof": "safety_state_id+route_cell_digest+check_declaration_digest+pass",
+    "observation_authority": "evidence_ref -> exact code-owned declaration result",
+    "canary_receipt": "read-only #584 receipt authority binds approval declaration digest",
+    "rollback_trigger": "committed exact-cell quarantine result",
+    "reopen_proof": "authority-read pass bound to safety_state_id+route_cell+declaration",
     "admission_seam": "participate_in_admission(existing_store_connection, route_cell_digest)",
 }
 OPERATIONAL_SAFETY_CONTRACT_DIGEST = _digest(OPERATIONAL_SAFETY_CONTRACT)
@@ -131,20 +135,14 @@ class ResolvedLaunch:
 
 
 @dataclass(frozen=True)
-class SafetyObservation:
+class ObservationRequest:
     repository: str
     subject: str
     subject_revision: str
     check_id: str
     check_version: str
     route_cell_digest: str
-    outcome: str                    # pass | fail | unreadable
     evidence_ref: str
-    verified: bool = False
-
-    @property
-    def identity(self) -> str:
-        return _digest(asdict(self))
 
     @property
     def scope_identity(self) -> str:
@@ -156,6 +154,50 @@ class SafetyObservation:
             "check_version": self.check_version,
             "route_cell_digest": self.route_cell_digest,
         })
+
+
+@dataclass(frozen=True)
+class CheckEvidence:
+    """Authority-read, content-free result for one deterministic declaration."""
+
+    observation_id: str
+    repository: str
+    subject: str
+    subject_revision: str
+    check_id: str
+    check_version: str
+    route_cell_digest: str
+    declaration_digest: str
+    outcome: str
+    evidence_ref: str
+    proof: str
+    safety_state_id: str = ""
+
+
+class CheckEvidenceUnavailable(RuntimeError):
+    """The result transport is unreadable; this is never semantic failure evidence."""
+
+
+class CheckEvidenceAuthority(Protocol):
+    def read(self, evidence_ref: str) -> CheckEvidence: ...
+
+
+class PromotionReceiptAuthority(Protocol):
+    def read(self, receipt_id: str) -> PromotionReceipt: ...
+
+
+@dataclass(frozen=True)
+class _AuthorizedObservation:
+    request: ObservationRequest
+    observation_id: str
+    declaration: DeterministicCheck
+    outcome: str
+    evidence_ref: str
+    proof: str
+
+    @property
+    def scope_identity(self) -> str:
+        return self.request.scope_identity
 
 
 @dataclass(frozen=True)
@@ -208,26 +250,20 @@ class RouteSafetyState:
 
 
 @dataclass(frozen=True)
-class ReopenProof:
-    check_id: str
-    check_version: str
-    route_cell_digest: str
-    safety_state_id: str
-    declaration_digest: str
-    evidence_ref: str
-    passed: bool
-
-
-@dataclass(frozen=True)
-class CanaryApproval:
-    receipt_id: str
+class CanaryActivationRequest:
+    promotion_receipt_id: str
     bad_route_cell_digest: str
     predecessor_route_cell_digest: str
     approved_disabled_generation: int
 
     @property
     def digest(self) -> str:
-        return _digest(asdict(self))
+        return _digest({
+            "schema": "agentflow-canary-approval-v1",
+            "bad_route_cell_digest": self.bad_route_cell_digest,
+            "predecessor_route_cell_digest": self.predecessor_route_cell_digest,
+            "approved_disabled_generation": self.approved_disabled_generation,
+        })
 
 
 @dataclass(frozen=True)
@@ -244,9 +280,14 @@ class CanaryState:
 class OperationalSafety:
     """One owner for bounded operational action and RouteCell state."""
 
-    def __init__(self, store: object, rerun_effect: RerunEffect | None = None) -> None:
+    def __init__(self, store: object, *,
+                 check_evidence: CheckEvidenceAuthority | None = None,
+                 promotion_receipts: PromotionReceiptAuthority | None = None,
+                 rerun_effect: RerunEffect | None = None) -> None:
         self._conn: sqlite3.Connection = getattr(store, "_conn")
         self._lock = getattr(store, "_lock")
+        self._check_evidence = check_evidence
+        self._promotion_receipts = promotion_receipts
         self._rerun_effect = rerun_effect
 
     @staticmethod
@@ -305,16 +346,18 @@ class OperationalSafety:
             row = self._conn.execute(
                 "SELECT content FROM safety_launch_configs WHERE digest = ?",
                 (config_digest,)).fetchone()
-            if row is not None and bytes(row[0]) != config_bytes:
-                raise SafetyRefused("launch config digest collision")
+            if row is not None:
+                if self._launch_config(config_digest, conn=self._conn) != config_bytes:
+                    raise SafetyRefused("launch config digest collision")
             self._conn.execute(
                 "INSERT OR IGNORE INTO safety_launch_configs (digest, content) VALUES (?, ?)",
                 (config_digest, config_bytes))
             stored_cell = self._conn.execute(
                 "SELECT data FROM safety_route_cells WHERE digest = ?",
                 (cell.digest,)).fetchone()
-            if stored_cell is not None and stored_cell[0] != _canonical_text(body):
-                raise SafetyRefused("RouteCell digest collision")
+            if stored_cell is not None:
+                if self._cell(cell.digest, conn=self._conn) != cell:
+                    raise SafetyRefused("RouteCell digest collision")
             self._conn.execute(
                 "INSERT OR IGNORE INTO safety_route_cells "
                 "(digest, cell_key, repository, stage, provider, model, route_id, "
@@ -342,45 +385,55 @@ class OperationalSafety:
         })
         with self._lock:
             row = self._conn.execute(
-                "SELECT c.data, c.digest, c.launch_config_digest, l.content "
-                "FROM safety_route_state s "
-                "JOIN safety_route_cells c ON c.digest = s.active_digest "
-                "JOIN safety_launch_configs l ON l.digest = c.launch_config_digest "
-                "WHERE s.cell_key = ?", (cell_key,)).fetchone()
-        if row is None:
-            raise SafetyRefused("route cell is not active")
-        body = json.loads(row[0])
-        return ResolvedLaunch(RouteCell(**body, digest=row[1]), bytes(row[3]))
+                "SELECT active_digest FROM safety_route_state WHERE cell_key = ?",
+                (cell_key,)).fetchone()
+            if row is None:
+                raise SafetyRefused("route cell is not active")
+            cell = self._cell(row[0], conn=self._conn)
+            config = self._launch_config(cell.launch_config_digest, conn=self._conn)
+        return ResolvedLaunch(cell, config)
 
-    def observe(self, observation: SafetyObservation) -> tuple[ActionIntent, ...]:
-        declaration = self._validate_observation(observation)
+    def observe(self, request: ObservationRequest) -> tuple[ActionIntent, ...]:
+        observation = self._authorize_observation(request)
+        declaration = observation.declaration
         created: list[ActionIntent] = []
         with self._transaction():
             inserted = self._conn.execute(
                 "INSERT OR IGNORE INTO safety_observations VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (observation.identity, observation.scope_identity,
-                 observation.route_cell_digest, observation.outcome,
-                 int(observation.verified and observation.outcome != "unreadable"),
+                (observation.observation_id, observation.scope_identity,
+                 request.route_cell_digest, observation.outcome,
+                 int(observation.outcome != "unreadable"),
                  observation.evidence_ref, declaration.digest)).rowcount
             if not inserted:
+                stored = self._conn.execute(
+                    "SELECT scope_identity, route_cell_digest, outcome, verified,"
+                    " evidence_ref, declaration_digest FROM safety_observations"
+                    " WHERE observation_id = ?", (observation.observation_id,)).fetchone()
+                expected = (
+                    observation.scope_identity, request.route_cell_digest,
+                    observation.outcome, int(observation.outcome != "unreadable"),
+                    observation.evidence_ref, declaration.digest,
+                )
+                if stored != expected:
+                    raise SafetyRefused("observation identity collision")
                 return self._actions_for_scope(observation.scope_identity)
             if observation.outcome == "pass":
                 return ()
             rerun = self._claim_action(
-                "rerun", observation.scope_identity, observation.route_cell_digest,
+                "rerun", observation.scope_identity, request.route_cell_digest,
                 declaration.digest, observation.evidence_ref,
                 "matching pass or one bounded failure observation",
                 {"scope_identity": observation.scope_identity,
-                 "repository": observation.repository,
-                 "subject": observation.subject,
-                 "check_id": observation.check_id,
-                 "check_version": observation.check_version,
-                 "subject_revision": observation.subject_revision})
+                 "repository": request.repository,
+                 "subject": request.subject,
+                 "check_id": request.check_id,
+                 "check_version": request.check_version,
+                 "subject_revision": request.subject_revision})
             created.append(rerun)
             if observation.outcome == "unreadable":
                 self._alert(
                     "transport", "transport:" + observation.scope_identity,
-                    observation.route_cell_digest, observation.evidence_ref)
+                    request.route_cell_digest, observation.evidence_ref)
                 return tuple(created)
             count = self._conn.execute(
                 "SELECT COUNT(*) FROM safety_observations "
@@ -393,43 +446,33 @@ class OperationalSafety:
             return tuple(created)
 
     def reconcile(self, action_id: str) -> ActionResult:
-        intent = self.action(action_id)
-        if intent.kind != "rerun":
-            result = self.action_result(action_id)
-            if result is None:
-                raise SafetyRefused("internal action has no committed result")
-            return result
-        existing = self.action_result(action_id)
-        if existing is not None:
-            return existing
-        if self._rerun_effect is None:
-            raise SafetyRefused("rerun effect adapter is unavailable")
-        evidence = self._rerun_effect.evidence_for(action_id)
-        if evidence is None:
-            evidence = self._rerun_effect.apply(intent)
-        if (not evidence.evidence_ref or not evidence.proof
-                or action_id not in evidence.proof):
-            raise SafetyRefused("rerun effect evidence does not bind the action ID")
         with self._transaction():
+            intent = self._action(action_id)
+            existing = self._action_result(action_id)
+            if intent.kind != "rerun":
+                if existing is None:
+                    raise SafetyRefused("internal action has no committed result")
+                return existing
+            if existing is not None:
+                return existing
+            if self._rerun_effect is None:
+                raise SafetyRefused("rerun effect adapter is unavailable")
+            evidence = self._rerun_effect.evidence_for(action_id)
+            if evidence is None:
+                evidence = self._rerun_effect.apply(intent)
+            if (not evidence.evidence_ref or not evidence.proof
+                    or action_id not in evidence.proof):
+                raise SafetyRefused("rerun effect evidence does not bind the action ID")
             self._complete_action(intent.action_id, evidence.evidence_ref, evidence.proof)
-        return self.action_result(action_id)  # type: ignore[return-value]
+            return self._action_result(action_id)  # type: ignore[return-value]
 
     def action(self, action_id: str) -> ActionIntent:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT action_id, idempotency_key, kind, route_cell_digest,"
-                " declaration_digest, evidence_ref, exit_condition, payload"
-                " FROM safety_actions WHERE action_id = ?", (action_id,)).fetchone()
-        if row is None:
-            raise SafetyRefused("unknown action")
-        return ActionIntent(*row[:-1], json.loads(row[-1]))
+            return self._action(action_id)
 
     def action_result(self, action_id: str) -> ActionResult | None:
         with self._lock:
-            row = self._conn.execute(
-                "SELECT action_id, evidence_ref, proof FROM safety_action_results"
-                " WHERE action_id = ?", (action_id,)).fetchone()
-        return ActionResult(*row) if row is not None else None
+            return self._action_result(action_id)
 
     def alerts(self, route_cell_digest: str) -> tuple[SafetyAlert, ...]:
         with self._lock:
@@ -450,18 +493,32 @@ class OperationalSafety:
         return RouteSafetyState(route_cell_digest, row[1] == route_cell_digest, row[2], row[3])
 
     def reopen(self, route_cell_digest: str, expected_safety_state_id: str,
-               proofs: tuple[ReopenProof, ...]) -> RouteSafetyState:
+               evidence_refs: tuple[str, ...]) -> RouteSafetyState:
         required = {(item.identifier, item.version)
                     for item in DETERMINISTIC_CHECKS}
-        supplied = {(proof.check_id, proof.check_version) for proof in proofs
-                    if proof.passed and proof.route_cell_digest == route_cell_digest
-                    and proof.safety_state_id == expected_safety_state_id
-                    and _CHECKS.get((proof.check_id, proof.check_version)) is not None
-                    and proof.declaration_digest
-                    == _CHECKS[(proof.check_id, proof.check_version)].digest
-                    and proof.evidence_ref}
+        supplied: set[tuple[str, str]] = set()
+        if self._check_evidence is None:
+            raise SafetyRefused("check evidence authority is unavailable")
+        for evidence_ref in evidence_refs:
+            try:
+                evidence = self._check_evidence.read(evidence_ref)
+            except CheckEvidenceUnavailable as error:
+                raise SafetyRefused("reopen evidence is unreadable") from error
+            except (EvidenceError, KeyError, ValueError) as error:
+                raise SafetyRefused("reopen evidence authority refused the reference") from error
+            if not isinstance(evidence, CheckEvidence):
+                raise SafetyRefused("reopen evidence authority returned an invalid result")
+            declaration = _CHECKS.get((evidence.check_id, evidence.check_version))
+            if (declaration is None
+                    or evidence.outcome != "pass" or not evidence.proof
+                    or evidence.evidence_ref != evidence_ref
+                    or evidence.route_cell_digest != route_cell_digest
+                    or evidence.safety_state_id != expected_safety_state_id
+                    or evidence.declaration_digest != declaration.digest):
+                raise SafetyRefused("reopen evidence authority binding was refused")
+            supplied.add((evidence.check_id, evidence.check_version))
         if supplied != required:
-            raise SafetyRefused("fresh capability-parity and route-health proofs required")
+            raise SafetyRefused("fresh capability-parity and route-health evidence required")
         cell = self._cell(route_cell_digest)
         with self._transaction():
             row = self._conn.execute(
@@ -479,13 +536,12 @@ class OperationalSafety:
                 (state_id, generation, cell.key, expected_safety_state_id))
         return self.route_state(route_cell_digest)
 
-    def approve_canary(self, approval: CanaryApproval) -> CanaryState:
-        if not approval.receipt_id:
-            raise SafetyRefused("canary approval receipt is required")
+    def approve_canary(self, approval: CanaryActivationRequest) -> CanaryState:
         bad = self._cell(approval.bad_route_cell_digest)
         predecessor = self._cell(approval.predecessor_route_cell_digest)
         if bad.key != predecessor.key or bad.digest == predecessor.digest:
             raise SafetyRefused("canary predecessor must be a different version of one cell")
+        receipt = self._approved_canary(approval, bad.repository)
         with self._transaction():
             row = self._conn.execute(
                 "SELECT active_digest, disabled_generation, generation"
@@ -498,38 +554,57 @@ class OperationalSafety:
                 "UPDATE safety_canary_state SET active_digest = ?, active_receipt_id = ?,"
                 " active_receipt_digest = ?, predecessor_digest = ?, generation = ?"
                 " WHERE cell_key = ?",
-                (bad.digest, approval.receipt_id, approval.digest, predecessor.digest,
+                (bad.digest, receipt.receipt_id, approval.digest, predecessor.digest,
                  generation, bad.key))
             self._activate_pointer(bad.key, predecessor.digest, bad.digest)
         return self.canary_state(bad.digest)
 
-    def rollback_canary(self, approval: CanaryApproval,
-                        evidence_ref: str, proof: str) -> ActionResult:
-        if not evidence_ref or not proof:
-            raise SafetyRefused("rollback evidence and proof are required")
+    def rollback_canary(self, approval: CanaryActivationRequest) -> ActionResult:
         bad = self._cell(approval.bad_route_cell_digest)
         predecessor = self._cell(approval.predecessor_route_cell_digest)
         if bad.key != predecessor.key:
             raise SafetyRefused("canary rollback crosses route cells")
+        receipt = self._approved_canary(approval, bad.repository)
+        rollback_scope = _digest({
+            "approval_digest": approval.digest,
+            "promotion_receipt_id": receipt.receipt_id,
+        })
+        action_id = self._action_id("rollback", rollback_scope, bad.digest)
         with self._transaction():
+            existing = self._action_result(action_id)
+            if existing is not None:
+                self._action(action_id)
+                return existing
             row = self._conn.execute(
                 "SELECT active_digest, active_receipt_id, active_receipt_digest,"
                 " predecessor_digest, disabled_generation, generation FROM safety_canary_state"
                 " WHERE cell_key = ?", (bad.key,)).fetchone()
-            if (row is None or row[0] != bad.digest or row[1] != approval.receipt_id
+            if (row is None or row[0] != bad.digest or row[1] != receipt.receipt_id
                     or row[2] != approval.digest or row[3] != predecessor.digest
                     or row[4] != approval.approved_disabled_generation):
                 raise SafetyRefused("canary rollback compare-and-swap refused")
             safety = self._conn.execute(
-                "SELECT active_digest, quarantined_digest FROM safety_route_state"
+                "SELECT active_digest, quarantined_digest, quarantine_action_id"
+                " FROM safety_route_state"
                 " WHERE cell_key = ?", (bad.key,)).fetchone()
-            if safety != (bad.digest, bad.digest):
+            if (safety is None or safety[0] != bad.digest or safety[1] != bad.digest
+                    or not safety[2]):
                 raise SafetyRefused("canary rollback requires its committed quarantine")
+            quarantine_result = self._action_result(safety[2])
+            if quarantine_result is None:
+                raise SafetyRefused("canary rollback requires its committed quarantine result")
+            proof = _canonical_text({
+                "approval_digest": approval.digest,
+                "promotion_receipt_id": receipt.receipt_id,
+                "quarantine_action_id": safety[2],
+                "quarantine_result_proof": quarantine_result.proof,
+            })
             intent = self._claim_action(
-                "rollback", _digest(asdict(approval)), bad.digest,
-                approval.digest, evidence_ref,
+                "rollback", rollback_scope, bad.digest,
+                approval.digest, quarantine_result.evidence_ref,
                 f"fresh human approval naming disabled generation {row[4] + 1}",
-                {"receipt_id": approval.receipt_id,
+                {"scope_identity": rollback_scope,
+                 "receipt_id": receipt.receipt_id,
                  "bad_route_cell_digest": bad.digest,
                  "predecessor_route_cell_digest": predecessor.digest,
                  "disabled_generation": row[4]})
@@ -541,10 +616,10 @@ class OperationalSafety:
                 " disabled_generation = ?, generation = ?"
                 " WHERE cell_key = ? AND active_digest = ? AND active_receipt_id = ?",
                 (predecessor.digest, disabled, generation, bad.key, bad.digest,
-                 approval.receipt_id))
+                 receipt.receipt_id))
             self._activate_pointer(bad.key, bad.digest, predecessor.digest)
-            self._complete_action(intent.action_id, evidence_ref, proof)
-        return self.action_result(intent.action_id)  # type: ignore[return-value]
+            self._complete_action(intent.action_id, quarantine_result.evidence_ref, proof)
+            return self._action_result(intent.action_id)  # type: ignore[return-value]
 
     def canary_state(self, route_cell_digest: str) -> CanaryState:
         cell = self._cell(route_cell_digest)
@@ -574,25 +649,79 @@ class OperationalSafety:
             raise SafetyRefused("route cell is not admissible")
         return row[2]
 
-    def _validate_observation(self, observation: SafetyObservation) -> DeterministicCheck:
-        declaration = _CHECKS.get((observation.check_id, observation.check_version))
+    def _authorize_observation(self, request: ObservationRequest) -> _AuthorizedObservation:
+        declaration = _CHECKS.get((request.check_id, request.check_version))
         if declaration is None or not declaration.side_effect_free:
             raise SafetyRefused("check is not in the deterministic allowlist")
-        if observation.outcome not in {"pass", "fail", "unreadable"}:
-            raise SafetyRefused("unknown check outcome")
-        if not observation.repository or not observation.subject or not observation.evidence_ref:
+        if not request.repository or not request.subject or not request.evidence_ref:
             raise SafetyRefused("observation identity and evidence are required")
-        if declaration.subject_revision_required and not observation.subject_revision:
+        if declaration.subject_revision_required and not request.subject_revision:
             raise SafetyRefused("subject revision is required")
         if declaration.route_cell_required:
-            cell = self._cell(observation.route_cell_digest)
-            if cell.repository != observation.repository:
+            cell = self._cell(request.route_cell_digest)
+            if cell.repository != request.repository:
                 raise SafetyRefused("observation crosses repositories")
-        return declaration
+        if self._check_evidence is None:
+            raise SafetyRefused("check evidence authority is unavailable")
+        try:
+            evidence = self._check_evidence.read(request.evidence_ref)
+        except CheckEvidenceUnavailable:
+            return _AuthorizedObservation(
+                request, "unreadable-" + _digest(asdict(request)), declaration,
+                "unreadable", request.evidence_ref, "")
+        except (EvidenceError, KeyError, ValueError) as error:
+            raise SafetyRefused("check evidence authority refused the reference") from error
+        if not isinstance(evidence, CheckEvidence):
+            raise SafetyRefused("check evidence authority returned an invalid result")
+        expected = (
+            request.repository, request.subject, request.subject_revision,
+            request.check_id, request.check_version, request.route_cell_digest,
+            declaration.digest, request.evidence_ref,
+        )
+        actual = (
+            evidence.repository, evidence.subject, evidence.subject_revision,
+            evidence.check_id, evidence.check_version, evidence.route_cell_digest,
+            evidence.declaration_digest, evidence.evidence_ref,
+        )
+        if (actual != expected or evidence.outcome not in {"pass", "fail"}
+                or not evidence.observation_id or not evidence.proof):
+            raise SafetyRefused("check evidence authority binding was refused")
+        return _AuthorizedObservation(
+            request, evidence.observation_id, declaration, evidence.outcome,
+            evidence.evidence_ref, evidence.proof)
 
-    def _quarantine(self, observation: SafetyObservation,
+    def _approved_canary(self, approval: CanaryActivationRequest,
+                         repository: str) -> PromotionReceipt:
+        if (not approval.promotion_receipt_id
+                or isinstance(approval.approved_disabled_generation, bool)
+                or not isinstance(approval.approved_disabled_generation, int)
+                or approval.approved_disabled_generation < 0):
+            raise SafetyRefused("valid canary approval identity and generation are required")
+        if self._promotion_receipts is None:
+            raise SafetyRefused("promotion receipt authority is unavailable")
+        try:
+            receipt = self._promotion_receipts.read(approval.promotion_receipt_id)
+        except (EvidenceError, PromotionAuthorityError, KeyError, ValueError) as error:
+            raise SafetyRefused("promotion receipt authority refused the approval") from error
+        if (not isinstance(receipt, PromotionReceipt)
+                or receipt.receipt_id != approval.promotion_receipt_id
+                or not receipt.authoritative or receipt.authority is None):
+            raise SafetyRefused("authoritative promotion receipt is required")
+        pointer = receipt.authority.pointer
+        try:
+            scope = parse_promotion_scope(pointer.scope)
+        except PromotionAuthorityError as error:
+            raise SafetyRefused("promotion receipt scope was refused") from error
+        if (pointer.content_hash_algorithm != "sha256"
+                or pointer.content_hash != approval.digest
+                or receipt.policy_version != scope.new
+                or (scope.kind == "repository" and scope.repository != repository)):
+            raise SafetyRefused("promotion receipt does not bind this canary declaration")
+        return receipt
+
+    def _quarantine(self, observation: _AuthorizedObservation,
                     declaration: DeterministicCheck) -> ActionIntent:
-        cell = self._cell(observation.route_cell_digest, conn=self._conn)
+        cell = self._cell(observation.request.route_cell_digest, conn=self._conn)
         intent = self._claim_action(
             "quarantine", observation.scope_identity, cell.digest, declaration.digest,
             observation.evidence_ref,
@@ -620,25 +749,87 @@ class OperationalSafety:
     def _claim_action(self, kind: str, scope: str, route_cell_digest: str,
                       declaration_digest: str, evidence_ref: str,
                       exit_condition: str, payload: Mapping[str, object]) -> ActionIntent:
-        key = _digest({"kind": kind, "scope": scope,
-                       "route_cell_digest": route_cell_digest})
+        key = self._action_key(kind, scope, route_cell_digest)
         action_id = "safety-" + key
-        self._conn.execute(
+        inserted = self._conn.execute(
             "INSERT OR IGNORE INTO safety_actions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (action_id, key, kind, route_cell_digest, declaration_digest, evidence_ref,
-             exit_condition, _canonical_text(payload)))
-        return self.action(action_id)
+             exit_condition, _canonical_text(payload))).rowcount
+        stored = self._action(action_id)
+        expected = ActionIntent(
+            action_id, key, kind, route_cell_digest, declaration_digest,
+            evidence_ref, exit_condition, payload,
+        )
+        if (inserted and stored != expected) or (not inserted and (
+                stored.action_id, stored.idempotency_key, stored.kind,
+                stored.route_cell_digest, stored.declaration_digest,
+                stored.exit_condition, stored.payload,
+        ) != (
+                expected.action_id, expected.idempotency_key, expected.kind,
+                expected.route_cell_digest, expected.declaration_digest,
+                expected.exit_condition, expected.payload,
+        )):
+            raise SafetyRefused("action identity collision")
+        return stored
+
+    @staticmethod
+    def _action_key(kind: str, scope: str, route_cell_digest: str) -> str:
+        return _digest({"kind": kind, "scope": scope,
+                        "route_cell_digest": route_cell_digest})
+
+    @classmethod
+    def _action_id(cls, kind: str, scope: str, route_cell_digest: str) -> str:
+        return "safety-" + cls._action_key(kind, scope, route_cell_digest)
+
+    def _action(self, action_id: str) -> ActionIntent:
+        row = self._conn.execute(
+            "SELECT action_id, idempotency_key, kind, route_cell_digest,"
+            " declaration_digest, evidence_ref, exit_condition, payload"
+            " FROM safety_actions WHERE action_id = ?", (action_id,)).fetchone()
+        if row is None:
+            raise SafetyRefused("unknown action")
+        try:
+            payload = json.loads(row[-1])
+        except (TypeError, ValueError) as error:
+            raise SafetyRefused("stored action payload is unreadable") from error
+        if not isinstance(payload, dict) or _canonical_text(payload) != row[-1]:
+            raise SafetyRefused("stored action payload is not canonical")
+        intent = ActionIntent(*row[:-1], payload)
+        if (intent.idempotency_key
+                != self._action_key(intent.kind, self._action_scope(intent),
+                                    intent.route_cell_digest)
+                or intent.action_id != "safety-" + intent.idempotency_key):
+            raise SafetyRefused("stored action identity was not accepted")
+        return intent
+
+    @staticmethod
+    def _action_scope(intent: ActionIntent) -> str:
+        scope = intent.payload.get("scope_identity")
+        if not isinstance(scope, str) or not scope:
+            raise SafetyRefused("stored action scope was not accepted")
+        return scope
+
+    def _action_result(self, action_id: str) -> ActionResult | None:
+        row = self._conn.execute(
+            "SELECT action_id, evidence_ref, proof FROM safety_action_results"
+            " WHERE action_id = ?", (action_id,)).fetchone()
+        return ActionResult(*row) if row is not None else None
 
     def _actions_for_scope(self, scope: str) -> tuple[ActionIntent, ...]:
         rows = self._conn.execute(
             "SELECT action_id FROM safety_actions WHERE payload LIKE ? ORDER BY kind",
             (f'%"scope_identity":"{scope}"%',)).fetchall()
-        return tuple(self.action(row[0]) for row in rows)
+        return tuple(self._action(row[0]) for row in rows)
 
     def _complete_action(self, action_id: str, evidence_ref: str, proof: str) -> None:
-        self._conn.execute(
+        inserted = self._conn.execute(
             "INSERT OR IGNORE INTO safety_action_results VALUES (?, ?, ?)",
-            (action_id, evidence_ref, proof))
+            (action_id, evidence_ref, proof)).rowcount
+        stored = self._action_result(action_id)
+        if (inserted and stored != ActionResult(action_id, evidence_ref, proof)) or (
+                not inserted and (stored is None or stored.action_id != action_id
+                                  or stored.proof != proof)):
+            raise SafetyRefused("action result identity collision")
 
     def _alert(self, kind: str, key: str, route_cell_digest: str,
                evidence_ref: str) -> None:
@@ -667,11 +858,52 @@ class OperationalSafety:
     def _cell(self, digest: str, *, conn: sqlite3.Connection | None = None) -> RouteCell:
         connection = conn or self._conn
         row = connection.execute(
-            "SELECT data FROM safety_route_cells WHERE digest = ?", (digest,)).fetchone()
+            "SELECT digest, cell_key, repository, stage, provider, model, route_id,"
+            " launch_config_digest, data FROM safety_route_cells WHERE digest = ?",
+            (digest,)).fetchone()
         if row is None:
             raise SafetyRefused("unknown RouteCell")
-        body = json.loads(row[0])
-        return RouteCell(**body, digest=digest)
+        try:
+            body = json.loads(row[8])
+        except (TypeError, ValueError) as error:
+            raise SafetyRefused("stored RouteCell is unreadable") from error
+        expected_keys = {
+            "repository", "stage", "provider", "model", "route_id",
+            "launch_config_digest",
+        }
+        if (not isinstance(body, dict) or set(body) != expected_keys
+                or _canonical_text(body) != row[8]
+                or _digest(body) != digest):
+            raise SafetyRefused("stored RouteCell digest was not accepted")
+        try:
+            cell = RouteCell(**body, digest=digest)
+        except TypeError as error:
+            raise SafetyRefused("stored RouteCell shape was not accepted") from error
+        columns = (row[2], row[3], row[4], row[5], row[6], row[7])
+        values = (cell.repository, cell.stage, cell.provider, cell.model,
+                  cell.route_id, cell.launch_config_digest)
+        if row[0] != digest or row[1] != cell.key or columns != values:
+            raise SafetyRefused("stored RouteCell columns do not bind its digest")
+        self._launch_config(cell.launch_config_digest, conn=connection)
+        return cell
+
+    def _launch_config(self, digest: str, *,
+                       conn: sqlite3.Connection | None = None) -> bytes:
+        connection = conn or self._conn
+        row = connection.execute(
+            "SELECT content FROM safety_launch_configs WHERE digest = ?", (digest,)).fetchone()
+        if row is None:
+            raise SafetyRefused("unknown launch configuration")
+        content = bytes(row[0])
+        if sha256(content).hexdigest() != digest:
+            raise SafetyRefused("stored launch configuration digest was not accepted")
+        try:
+            decoded = json.loads(content)
+        except (TypeError, ValueError, UnicodeDecodeError) as error:
+            raise SafetyRefused("stored launch configuration is unreadable") from error
+        if not isinstance(decoded, dict) or _canonical_bytes(decoded) != content:
+            raise SafetyRefused("stored launch configuration is not canonical")
+        return content
 
     class _Transaction:
         def __init__(self, owner: "OperationalSafety") -> None:
