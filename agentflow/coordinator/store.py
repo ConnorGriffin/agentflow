@@ -167,7 +167,7 @@ class Store:
         # connection is shared across threads and serialized by this lock — the reservation
         # critical section is one place, matching the one-ledger design (ADR 0030).
         self._lock = threading.RLock()
-        self._admission_owner_thread: int | None = None
+        self._admission_active = threading.Event()
         self._conn = self._connect()
         self._operational_safety: OperationalSafety | None = None
         self._canary_attribution = None
@@ -371,7 +371,7 @@ class Store:
         return permits, waiting
 
     def _refuse_reentrant_admission_mutation(self) -> None:
-        if self._admission_owner_thread == threading.get_ident():
+        if self._admission_active.is_set():
             raise StoreUnavailable("reentrant Store mutation during admission")
 
     def upsert(self, record: Record, *, retire_descendants: bool = False) -> bool:
@@ -551,7 +551,7 @@ class Store:
                     and type(intent.limits) is not ReservationLimits)):
             return None
         with self._lock:
-            self._admission_owner_thread = threading.get_ident()
+            self._admission_active.set()
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
                 existing_row = self._conn.execute(
@@ -646,7 +646,7 @@ class Store:
                 self._rollback_quietly()
                 raise
             finally:
-                self._admission_owner_thread = None
+                self._admission_active.clear()
 
     def resolve_route_cell(self, stage_identity: str, expected_revision: int,
                            route_id: str) -> ResolvedLaunch:
@@ -800,7 +800,9 @@ class Store:
 
     def close(self) -> None:
         self._refuse_reentrant_admission_mutation()
-        self._conn.close()
+        with self._lock:
+            self._refuse_reentrant_admission_mutation()
+            self._conn.close()
 
     def _write(self, record: Record) -> None:
         """The one INSERT-or-update statement, shared by every writer. The caller owns the

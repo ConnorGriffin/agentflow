@@ -378,6 +378,58 @@ def test_hostile_receipt_reader_cannot_reenter_store_mutations_or_split_commit(t
     store.close()
 
 
+def test_hostile_receipt_reader_threads_cannot_close_or_mutate_active_store(tmp_path):
+    path = tmp_path / "threaded-reentrant-reader.db"
+
+    class ThreadedHostileReceipts(Receipts):
+        store = None
+
+        def __init__(self):
+            super().__init__()
+            self.refusals = []
+
+        def attack(self, operation):
+            errors = []
+
+            def run():
+                try:
+                    operation()
+                except BaseException as error:
+                    errors.append(error)
+
+            thread = threading.Thread(target=run)
+            thread.start()
+            thread.join(1)
+            assert not thread.is_alive()
+            assert len(errors) == 1 and type(errors[0]) is StoreUnavailable
+            self.refusals.append(str(errors[0]))
+
+        def read(self, receipt_id):
+            if self.store is not None:
+                self.attack(self.store.close)
+                self.attack(lambda: self.store.upsert(
+                    Record("thread-attacker", "build", "codex", 1, state=WAITING)))
+            return super().read(receipt_id)
+
+    receipts = ThreadedHostileReceipts()
+    active, _ = seed(path, receipts)
+    store = composed(path, receipts)
+    receipts.store = store
+    result = store.reserve(intent(digest=active.digest))
+    assert type(result) is AdmissionResult
+    assert receipts.refusals == [
+        "reentrant Store mutation during admission",
+        "reentrant Store mutation during admission",
+    ]
+    assert store.record_of("thread-attacker") is None
+    assert store.record_of(IDENTITY) == result.successor
+    assert store.read_canary_attribution(IDENTITY) == result.canary_attribution
+    assert store._conn.execute("SELECT COUNT(*) FROM canary_attributions").fetchone()[0] == 1
+    assert store.permits_used("codex") == 1
+    assert not store._conn.in_transaction
+    store.close()
+
+
 @pytest.mark.parametrize("cutpoint", [
     "after-attribution-before-successor", "after-successor-before-commit"])
 def test_precommit_crash_cutpoints_roll_back_both_rows(tmp_path, monkeypatch, cutpoint):
