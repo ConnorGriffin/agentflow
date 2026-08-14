@@ -36,6 +36,8 @@ from agentflow.operational_safety import (
     OperationalSafety,
     OPERATIONAL_SAFETY_CONTRACT_DIGEST,
     PROMOTION_VERIFIER,
+    RERUN_EFFECT_CONTRACT,
+    RERUN_EFFECT_CONTRACT_DIGEST,
     ROUTE_CELL_CONTRACT_DIGEST,
     SafetyRefused,
     _state_id,
@@ -99,6 +101,8 @@ class Receipts:
 
 
 class Reruns:
+    contract = RERUN_EFFECT_CONTRACT
+
     def __init__(self) -> None:
         self.effects: dict[str, EffectEvidence] = {}
         self.applied: list[str] = []
@@ -109,31 +113,51 @@ class Reruns:
         self.on_apply = None
         self.transaction_states: list[bool] = []
         self.conn = None
+        self.coalesced = threading.Event()
+        self._effect_lock = threading.Lock()
+        self._inflight: dict[str, threading.Event] = {}
 
     def evidence_for(self, action_id: str) -> EffectEvidence | None:
-        if self.conn is not None:
-            self.transaction_states.append(self.conn.in_transaction)
-        return self.effects.get(action_id)
+        with self._effect_lock:
+            if self.conn is not None:
+                self.transaction_states.append(self.conn.in_transaction)
+            return self.effects.get(action_id)
 
     def apply(self, intent) -> EffectEvidence:
-        if self.conn is not None:
-            self.transaction_states.append(self.conn.in_transaction)
         if self.crash == "before_effect":
             raise RuntimeError("crash before effect")
-        existing = self.effects.get(intent.action_id)
-        if existing is not None:
-            return existing
-        self.applied.append(intent.action_id)
+        with self._effect_lock:
+            if self.conn is not None:
+                self.transaction_states.append(self.conn.in_transaction)
+            existing = self.effects.get(intent.action_id)
+            if existing is not None:
+                return existing
+            completion = self._inflight.get(intent.action_id)
+            owner = completion is None
+            if owner:
+                completion = threading.Event()
+                self._inflight[intent.action_id] = completion
+                self.applied.append(intent.action_id)
+            else:
+                self.coalesced.set()
+        assert completion is not None
+        if not owner:
+            assert completion.wait(2)
+            with self._effect_lock:
+                return self.effects[intent.action_id]
         evidence = EffectEvidence(
             f"transport/reruns/{intent.action_id}",
             f"provider accepted action_id={intent.action_id}",
         )
-        self.effects[intent.action_id] = evidence
         if self.on_apply is not None:
             self.on_apply()
         self.entered.set()
         if self.block:
             assert self.release.wait(2)
+        with self._effect_lock:
+            self.effects[intent.action_id] = evidence
+            del self._inflight[intent.action_id]
+            completion.set()
         if self.crash == "after_effect":
             raise RuntimeError("crash after effect")
         return evidence
@@ -224,13 +248,43 @@ def test_dependency_and_registry_receipts_are_exact():
     assert ROUTE_CELL_CONTRACT_DIGEST == (
         "c762ed469c4c2a311391898196713b26a2dbe2985896c262ea05a425368f63a5")
     assert OPERATIONAL_SAFETY_CONTRACT_DIGEST == (
-        "4a78101a35168ae33fab177d2eda21a33928caa5b9e124bdb8b478691dbffae6")
+        "27e095449758459f748a9f8a85ec48afc460cb294bcb859c675dc568e8252d6d")
     assert PROMOTION_VERIFIER == ("github-authority", "v1")
+    assert RERUN_EFFECT_CONTRACT_DIGEST == (
+        "c8b9433f01643550f2dbc560b72aa033895b324e5a5a35dedc0d4b3af13b21b4")
     assert ACTION_STATE_MAP == {
         "rerun": "claimed -> effect_lease_claimed -> idempotent_effect -> result_committed",
         "quarantine": "claimed -> exact_cell_quarantined + result_committed",
         "rollback": "claimed -> predecessor_pointer_restored + result_committed",
     }
+
+
+def test_rerun_effect_requires_the_exact_code_owned_atomic_contract(tmp_path):
+    store = Store(tmp_path / "coordinator.db")
+    checks = Checks()
+    owner = OperationalSafety(store, check_evidence=checks)
+    cell = route(owner)
+    intent = observe(owner, checks, cell, "fail", "unbound/failure")[0]
+
+    with pytest.raises(SafetyRefused, match="adapter is unavailable"):
+        owner.reconcile(intent.action_id)
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
+
+    counterfeit = Reruns()
+    counterfeit.contract = replace(RERUN_EFFECT_CONTRACT)
+    with pytest.raises(SafetyRefused, match="exact code-owned atomic contract"):
+        OperationalSafety(store, check_evidence=checks, rerun_effect=counterfeit)
+
+    replaced = Reruns()
+    bound = OperationalSafety(store, check_evidence=checks, rerun_effect=replaced)
+    replaced.contract = replace(RERUN_EFFECT_CONTRACT)
+    with pytest.raises(SafetyRefused, match="exact code-owned atomic contract"):
+        bound.reconcile(intent.action_id)
+    assert replaced.applied == []
+    assert store._conn.execute(
+        "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
+    store.close()
 
 
 def test_launch_config_is_immutable_and_resolves_only_through_active_pointer(safety):
@@ -467,6 +521,63 @@ def test_rerun_effect_may_reenter_the_same_store_without_nested_transaction(tmp_
     assert store.record_of("reentrant").state == "waiting"
     assert reruns.transaction_states and not any(reruns.transaction_states)
     store.close()
+
+
+def test_live_effect_overlap_after_lease_reclaim_coalesces_one_action_id(tmp_path):
+    path = tmp_path / "coordinator.db"
+    seed = Store(path)
+    checks, reruns = Checks(), Reruns()
+    owner = OperationalSafety(seed, check_evidence=checks, rerun_effect=reruns)
+    cell = route(owner)
+    intent = observe(owner, checks, cell, "fail", "overlap/failure")[0]
+    seed.close()
+    reruns.block = True
+    results, errors = [], []
+
+    def reconcile():
+        store = Store(path)
+        try:
+            results.append(OperationalSafety(
+                store, check_evidence=checks, rerun_effect=reruns,
+            ).reconcile(intent.action_id))
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            store.close()
+
+    first = threading.Thread(target=reconcile)
+    second = threading.Thread(target=reconcile)
+    first.start()
+    assert reruns.entered.wait(2)
+
+    clock = Store(path)
+    claim = clock._conn.execute(
+        "SELECT owner_token, generation FROM safety_rerun_claims WHERE action_id = ?",
+        (intent.action_id,)).fetchone()
+    assert claim is not None
+    clock._conn.execute(
+        "UPDATE safety_rerun_claims SET expires_at_ns = 0 WHERE action_id = ?"
+        " AND owner_token = ? AND generation = ?",
+        (intent.action_id, claim[0], claim[1]))
+    clock.close()
+
+    second.start()
+    assert reruns.coalesced.wait(2)
+    assert reruns.applied == [intent.action_id]
+    reruns.release.set()
+    first.join()
+    second.join()
+
+    final = Store(path)
+    durable = OperationalSafety(
+        final, check_evidence=checks, rerun_effect=reruns,
+    ).action_result(intent.action_id)
+    assert errors == []
+    assert len(results) == 2 and results[0] == results[1] == durable
+    assert reruns.applied == [intent.action_id]
+    assert final._conn.execute(
+        "SELECT COUNT(*) FROM safety_rerun_claims").fetchone()[0] == 0
+    final.close()
 
 
 def test_expired_durable_rerun_lease_recovers_after_process_crash(tmp_path):

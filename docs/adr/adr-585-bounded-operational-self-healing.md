@@ -29,7 +29,11 @@ one exact quarantine from authority-read evidence references, activates a receip
 rolls it back to its declared predecessor, and participates in the existing Store reservation
 transaction. Its injected interfaces are `CheckEvidenceAuthority.read(evidence_ref)`,
 `PromotionReceiptAuthority.read(receipt_id)`, and the transport-only `RerunEffect.evidence_for` /
-`apply`; `apply` is idempotent by `ActionIntent.action_id`. The production promotion implementation
+`apply`. A supplied rerun adapter must hold the exact frozen, code-owned
+`RERUN_EFFECT_CONTRACT` singleton; an equal caller-created declaration is not authority. Its digest
+is `c8b9433f01643550f2dbc560b72aa033895b324e5a5a35dedc0d4b3af13b21b4`, and it requires durable,
+atomic coalescing of overlapping effects by `ActionIntent.action_id`. OperationalSafety validates
+this binding both when an adapter is supplied and immediately before reconciliation. The production promotion implementation
 is `PromotionReceiptReader`, which opens the #584 Evidence store read-only, starts one read snapshot,
 and revalidates exact schema v4 on every connection before reading a receipt. It adds no EvidenceStore
 verb or promotion write. OperationalSafety accepts only receipts produced by the exact #584
@@ -80,8 +84,10 @@ Store lock or transaction held; a second short Store transaction CAS-validates t
 the result, and deletes the claim. Concurrent reconcilers wait outside transactions while the lease
 is live. Unrelated Store writers and reentrant writes from the effect therefore proceed. A caught
 failure releases the lease immediately; a process crash leaves a durable lease that can be reclaimed
-after expiry. Recovery always asks `evidence_for(action_id)` before applying, so a crash after the
-logical effect cannot duplicate it. Quarantine and rollback effects live entirely in the Store, so
+after expiry. Recovery always asks `evidence_for(action_id)` before applying, and the bound adapter
+atomically coalesces an overlapping apply for the same action ID even when a live effect outlasts
+its reclaimed lease. A superseded reconciler waits for and returns the one durable result rather
+than failing or committing without its lease. Quarantine and rollback effects live entirely in the Store, so
 their intent, state change, and result commit in one transaction. The action-state map is:
 
 | Kind | States |
@@ -111,7 +117,7 @@ every non-SQLite table/index/trigger definition with the exact expected schema a
 missing, altered, or additional objects. The v1→v2 migration adds the safety tables without
 rewriting existing continuation records or changing running permits.
 The complete OperationalSafety contract digest is
-`4a78101a35168ae33fab177d2eda21a33928caa5b9e124bdb8b478691dbffae6`.
+`27e095449758459f748a9f8a85ec48afc460cb294bcb859c675dc568e8252d6d`.
 
 Capability parity remains before admission under ADR 582. A non-ready pre-launch capability result
 retains its claim on environment-failure hold and consumes no permit, attempt, continuation, attempt
