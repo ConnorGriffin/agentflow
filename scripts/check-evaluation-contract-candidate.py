@@ -982,6 +982,13 @@ def _line(value):
     return (_canonical(value) + "\n").encode("ascii")
 
 
+def _bounded_output(value):
+    data = _line(value)
+    if len(data) > LIMITS["stdout_or_stderr_bytes"]:
+        _fail("E_LIMIT", SCRIPT_PATH)
+    return data
+
+
 def main(*, force_internal=False):
     root_fd = None
     try:
@@ -991,16 +998,16 @@ def main(*, force_internal=False):
             raise RuntimeError("controlled internal fault")
     except CheckFailure as error:
         sys.stdout.flush()
-        sys.stderr.buffer.write(_line({"code": error.code, "format": FORMAT, "path": error.path, "status": "error"}))
+        sys.stderr.buffer.write(_bounded_output({"code": error.code, "format": FORMAT, "path": error.path, "status": "error"}))
         return 1
     except Exception:
         sys.stdout.flush()
-        sys.stderr.buffer.write(_line({"code": "E_INTERNAL", "format": FORMAT, "path": SCRIPT_PATH, "status": "error"}))
+        sys.stderr.buffer.write(_bounded_output({"code": "E_INTERNAL", "format": FORMAT, "path": SCRIPT_PATH, "status": "error"}))
         return 2
     finally:
         if root_fd is not None:
             os.close(root_fd)
-    sys.stdout.buffer.write(_line({"checked": 3, "format": FORMAT, "status": "ok"}))
+    sys.stdout.buffer.write(_bounded_output({"checked": 3, "format": FORMAT, "status": "ok"}))
     return 0
 
 

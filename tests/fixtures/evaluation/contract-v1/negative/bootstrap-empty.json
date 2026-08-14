@@ -1,0 +1,1 @@
+{"case_id":"bootstrap-empty","classification":"negative","coverage":["EVAL_V1_BOOTSTRAP"],"expected_result":{"code":"EVAL_V1_BOOTSTRAP","operation_id":"op-v1-bootstrap-lower-bound","path":"/case_means","status":"error"},"input_value":{"case_mean_pages":[],"partition":"corpus","seed":7},"operation_id":"op-v1-bootstrap-lower-bound"}

@@ -1,0 +1,1 @@
+{"case_id":"invalid-operation-partition","classification":"negative","coverage":["EVAL_V1_PAIRING"],"expected_result":{"code":"EVAL_V1_PAIRING","operation_id":"op-v1-schedule","path":"/partition","status":"error"},"input_value":{"case_id_pages":[{"case_ids":["case-a","case-b"]}],"partition":"invalid","seed":7},"operation_id":"op-v1-schedule"}

@@ -1,0 +1,1 @@
+{"case_id":"zero-attempts","classification":"negative","coverage":["EVAL_V1_ELIGIBILITY"],"expected_result":{"code":"EVAL_V1_ELIGIBILITY","operation_id":"op-v1-score-gates","path":"/attempts","status":"error"},"input_value":{"attempt_pages":[],"bootstrap_lower_bound":{"denominator":20,"numerator":-1},"human_gate":true,"partition":"corpus"},"operation_id":"op-v1-score-gates"}
