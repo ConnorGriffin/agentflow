@@ -78,7 +78,7 @@ def test_profile_grants_each_writable_root_object_and_subpath_without_its_parent
     assert f"(allow file-write* (literal {json.dumps(str(parent.resolve()))}))" not in profile
 
 
-def test_claude_alone_gets_the_exact_securityd_mach_lookup(tmp_path, monkeypatch):
+def test_no_profile_admits_mach_lookup(tmp_path, monkeypatch):
     probe = _load_probe()
     executables = {provider: tmp_path / provider for provider in ("claude", "codex")}
     for executable in executables.values():
@@ -91,10 +91,9 @@ def test_claude_alone_gets_the_exact_securityd_mach_lookup(tmp_path, monkeypatch
     codex = probe._profile(probe._plan(parent, source, (writable,), "codex"))
     local = probe._profile(probe._plan(parent, source, (writable,), None))
 
-    clause = '(allow mach-lookup (global-name "com.apple.securityd.xpc"))'
-    assert clause in claude
-    assert clause not in codex and clause not in local
-    assert "mach-lookup (global-name \"*\")" not in claude
+    assert "mach-lookup" not in claude
+    assert "mach-lookup" not in codex
+    assert "mach-lookup" not in local
 
 
 @pytest.mark.parametrize("path_of", [

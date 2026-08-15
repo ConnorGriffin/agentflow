@@ -164,8 +164,6 @@ def _profile(plan: SandboxPlan) -> str:
     ]
     if plan.network:
         clauses += ['(allow network-outbound (remote tcp "*:443"))', '(allow network-outbound (remote udp "*:53"))']
-    if plan.provider == "claude":
-        clauses.append('(allow mach-lookup (global-name "com.apple.securityd.xpc"))')
     clauses += [f"(allow file-read* (literal {_quoted(path)}))" for path in plan.read_literals]
     clauses += [f"(allow file-read* (subpath {_quoted(path)}))" for path in plan.read_subpaths]
     clauses += [f"(allow file-read* (literal {_quoted(path)}))" for path in plan.write_subpaths]
