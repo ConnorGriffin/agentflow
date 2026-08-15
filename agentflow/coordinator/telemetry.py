@@ -426,6 +426,14 @@ class AttemptTelemetry:
 _ENTRY_FIELDS = {f.name for f in fields(AttemptTelemetry)}
 
 
+@dataclass(frozen=True)
+class AttemptTelemetryRead:
+    """Valid attempt telemetry plus bounded health information for observational readers."""
+
+    entries: list[AttemptTelemetry]
+    skipped: int | None
+
+
 def telemetry_dir(store_path: Path | str) -> Path:
     """Where per-attempt telemetry entries live, beside the records database and sessions."""
     return Path(store_path).parent / "telemetry"
@@ -465,27 +473,40 @@ def record_attempt(store_path: Path | str, entry: AttemptTelemetry) -> None:
 def read_attempts(store_path: Path | str) -> list[AttemptTelemetry]:
     """Every persisted attempt entry. An unreadable or malformed file is skipped, never
     fatal — a corrupt tail must not blind the whole projection."""
+    return read_attempts_with_health(store_path).entries
+
+
+def read_attempts_with_health(store_path: Path | str) -> AttemptTelemetryRead:
+    """Read valid attempts and report skipped files without exposing their contents."""
     entries: list[AttemptTelemetry] = []
+    skipped = 0
     directory = telemetry_dir(store_path)
     try:
         names = sorted(p for p in directory.iterdir() if p.suffix == ".json")
     except OSError:
-        return entries
+        if directory.exists():
+            return AttemptTelemetryRead(entries, None)
+        return AttemptTelemetryRead(entries, skipped)
     for path in names:
         try:
-            data = json.loads(path.read_text())
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            skipped += 1
             continue
         if not isinstance(data, dict):
+            skipped += 1
             continue
         usage_data = data.get("usage")
-        usage = _decode_usage(usage_data) if isinstance(usage_data, dict) else AttemptUsage()
+        if "usage" in data and not isinstance(usage_data, dict):
+            skipped += 1
+            continue
+        usage = _decode_usage(usage_data) if usage_data is not None else AttemptUsage()
         fields_in = {k: v for k, v in data.items() if k in _ENTRY_FIELDS and k != "usage"}
         try:
             entries.append(AttemptTelemetry(usage=usage, **fields_in))
         except TypeError:
-            continue  # an entry from an incompatible shape — skipped, not fatal
-    return entries
+            skipped += 1
+    return AttemptTelemetryRead(entries, skipped)
 
 
 def _decode_usage(data: dict) -> AttemptUsage:

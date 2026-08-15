@@ -357,6 +357,30 @@ class Store:
             self._conn.close()
             raise
 
+    @staticmethod
+    def load_records_read_only(path: Path | str) -> dict[str, Record]:
+        """Load current records without creating, migrating, or modifying a Store."""
+        store_path = Path(path)
+        try:
+            conn = sqlite3.connect(
+                f"{store_path.resolve().as_uri()}?mode=ro", uri=True,
+                timeout=_BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+            try:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version != SCHEMA_VERSION:
+                    raise StoreUnavailable(f"store schema {version} is not readable")
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(SCHEMA_VERSION):
+                    raise StoreUnavailable("store schema does not match the accepted schema")
+                rows = conn.execute("SELECT data FROM records").fetchall()
+                return {record.identity: record for record in (
+                    Store._decode(row[0]) for row in rows)}
+            finally:
+                conn.close()
+        except StoreUnavailable:
+            raise
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise StoreUnavailable(f"cannot open continuation store: {exc}") from exc
+
     def _connect(self) -> sqlite3.Connection:
         # A fully-initialized store is published atomically: it is built in a private temp
         # file under the same directory, then linked into place without replacement. The final path therefore

@@ -101,6 +101,14 @@ def main(argv: list[str] | None = None) -> int | None:
                                help="UTC start date, inclusive (YYYY-MM-DD)")
     spend_command.add_argument("--to", dest="spend_to", required=True,
                                help="UTC end date, exclusive (YYYY-MM-DD)")
+    learning_command = commands.add_parser("learning", help="report observational learning facts")
+    learning_commands = learning_command.add_subparsers(dest="learning_command", required=True)
+    learning_report = learning_commands.add_parser("report", help="report terminal review and revise facts")
+    learning_report.add_argument("--repo", required=True, help="OWNER/REPO to read")
+    learning_report.add_argument("--from", dest="learning_from", required=True,
+                                 help="UTC start date, inclusive (YYYY-MM-DD)")
+    learning_report.add_argument("--to", dest="learning_to", required=True,
+                                 help="UTC end date, exclusive (YYYY-MM-DD)")
     floodgates_command = commands.add_parser(
         "floodgates", help="fleet-wide headroom override (ADR 0025 amendment)"
     )
@@ -219,6 +227,22 @@ def main(argv: list[str] | None = None) -> int | None:
         except ValueError as exc:
             parser.error(str(exc))
         print(format_spend_report(report))
+        return 0
+    elif args.command == "learning":
+        from datetime import date
+
+        from agentflow.coordinator.errors import StoreUnavailable
+        from agentflow.coordinator.store import default_store_path
+        from agentflow.learning import dumps
+
+        try:
+            start = date.fromisoformat(args.learning_from)
+            end = date.fromisoformat(args.learning_to)
+            if start >= end:
+                raise ValueError("--from must be before --to")
+            sys.stdout.write(dumps(args.repo, start, end, default_store_path()))
+        except (StoreUnavailable, ValueError) as exc:
+            parser.error(str(exc))
         return 0
     elif args.command == "enroll":
         from agentflow.enroll import _audit_command, configured_repositories, enroll_repository, sync_fleet
