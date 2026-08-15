@@ -111,6 +111,62 @@ def test_recheck_passes_the_daemon_log_into_the_repository_loop(monkeypatch):
     assert seen[0][1] is log  # the same sink reaches the per-repository loop
 
 
+def test_recheck_composed_coordinator_emits_sanitized_overlay_diagnostic(
+        monkeypatch, tmp_path):
+    """The daemon's real per-repository recheck path wires the composed coordinator's overlay
+    diagnostic into the same log sink, without requiring a live GitHub or provider session."""
+    from agentflow import (coordinated_intake, coordinated_review, coordinated_revise,
+                           effective_policy, loop, pipeline)
+    from agentflow.coordinator import Submission
+    from agentflow.loop import RebaseResult
+
+    cfg = RepoConfig("owner/repo", str(tmp_path / "repo"))
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path / "state"))
+    monkeypatch.setattr(github, "list_open_prs", lambda repo, limit: [
+        github.PrRow(42, "agentflow/claude/issue-42-follow-up", "")])
+    monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [])
+    monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
+    monkeypatch.setattr(loop, "_base_advanced_for", lambda workdir, branch: True)
+    monkeypatch.setattr(loop, "_conflict_revise_owns_head", lambda cfg, n, branch: False)
+    monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CLEAN)
+    monkeypatch.setattr(loop, "remove_worktree_if_safe", lambda workdir, wt: True)
+    monkeypatch.setattr(loop, "pick_reviewer", lambda tool, **kwargs: "codex")
+    monkeypatch.setattr(loop, "_issue_acceptance", lambda cfg, number: "acceptance")
+    monkeypatch.setattr(loop, "claim", lambda repo, number, label: True)
+    monkeypatch.setattr(loop, "supersede_clean_review", lambda comments: True)
+    monkeypatch.setattr(loop, "_run", lambda *args, **kwargs:
+                        types.SimpleNamespace(returncode=0, stdout="a" * 40 + "\n"))
+    monkeypatch.setattr(
+        coordinated_review, "survivor_review_submission",
+        lambda *args, **kwargs: Submission(
+            repo=cfg.repo, subject="42", stage="review", target="a" * 40,
+            subject_revision="a" * 40, pool="codex", source=cfg.workdir,
+            builder_lineage="claude", branch_lineage="claude"))
+    monkeypatch.setattr(coordinated_review, "_resume_tainted_reviews", lambda coordinator: None)
+    monkeypatch.setattr(coordinated_review, "_resettle_diverged_reviews", lambda coordinator: None)
+    monkeypatch.setattr(coordinated_review, "_review_worktree_reset", lambda record: True)
+    monkeypatch.setattr(coordinated_revise, "_retire_dead_revises", lambda coordinator: None)
+    monkeypatch.setattr(coordinated_intake, "_retire_dead_intakes", lambda coordinator: None)
+    monkeypatch.setattr(pipeline, "_production_gate", lambda: lambda record: True)
+    monkeypatch.setattr(pipeline, "_capability_preflight", lambda record, materialize: None)
+
+    def overlay_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"secret")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", overlay_run)
+    logs = []
+
+    cycle([cfg], run=daemon._recheck, _log=logs.append)
+
+    diagnostics = [line for line in logs if "repository overlay read failed" in line]
+    assert len(diagnostics) == 1
+    assert "repository=owner/repo" in diagnostics[0]
+    assert "phase=show" in diagnostics[0]
+    assert "error_class=CLOSED" in diagnostics[0]
+    assert cfg.workdir not in diagnostics[0]
+    assert "secret" not in diagnostics[0]
+
+
 def test_dispatch_cycle_has_no_claim_reclaimer_and_forwards_pause(monkeypatch):
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",

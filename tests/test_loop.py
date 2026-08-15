@@ -581,7 +581,7 @@ def _issue_view(monkeypatch, issue):
     monkeypatch.setattr(loop, "_native_blockers", lambda cfg, n: set())
 
 
-def test_build_issue_submits_a_ready_issue_and_logs_overlay_diagnostic(monkeypatch, tmp_path):
+def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     from agentflow import coordinated_build
     from agentflow.coordinator.record import Record, WAITING
 
@@ -616,26 +616,7 @@ def test_build_issue_submits_a_ready_issue_and_logs_overlay_diagnostic(monkeypat
     assert out == "#5: submitted to coordinator → claude (build)"
     assert submitted == [submission]
     assert reconciled == [coordinator]
-    # The real per-repository loop composition must give the production coordinator the daemon
-    # logger so repository-overlay diagnostics reach the normal AgentFlow log.
-    callback = coordinator_kwargs["_log"]
-    from agentflow import effective_policy
-    from agentflow.effective_policy import ExactRevisionRepositoryOverlaySource
-    import subprocess
-
-    def run(command, **kwargs):
-        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"secret")
-
-    monkeypatch.setattr(effective_policy.subprocess, "run", run)
-    source = ExactRevisionRepositoryOverlaySource({"o/r": tmp_path}, on_diagnostic=callback)
-    with pytest.raises(effective_policy.PolicyValidationError):
-        source.read("o/r", "a" * 40)
-    assert len(logs) == 1
-    assert "repository=o/r" in logs[0]
-    assert "phase=show" in logs[0]
-    assert "error_class=CLOSED" in logs[0]
-    assert str(tmp_path) not in logs[0]
-    assert "secret" not in logs[0]
+    assert coordinator_kwargs["_log"] is not None
     assert picked == [{"operator": True, "floodgates": False, "stage": "build",
                        "complexity": "standard", "effort": "medium"}]
 
