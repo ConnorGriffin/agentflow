@@ -255,7 +255,7 @@ class Coordinator:
         # started, so reconciliation only logs "recovered running" for a family it did not just
         # launch — i.e. one found alive after a fresh coordinator reloaded the durable store.
         self._started_here: set[str] = set()
-        self._launched_this_cycle: set[str] = set()
+        self._launched_this_cycle: set[tuple[str, str | None]] = set()
         self._recovered_logged: set[str] = set()
         # When each stalled record last printed its line. Only the *cadence* is process-local —
         # the elapsed time it reports is durable (#406) — so a restart costs one extra line, not
@@ -553,7 +553,7 @@ class Coordinator:
 
     # --- reconciliation -----------------------------------------------------------------
 
-    def _reconcile(self, launched: set[str] | None = None) -> list[StageOutcome]:
+    def _reconcile(self, launched: set[tuple[str, str | None]] | None = None) -> list[StageOutcome]:
         """Resolve every ambiguous running record from its durable start fact and family
         liveness (ADR 0028/0030), returning the outcomes that terminated this cycle. The
         working set is reloaded first so a child's cross-process ``started`` write and any
@@ -564,7 +564,8 @@ class Coordinator:
         self._records = self._store.load()
         outcomes: list[StageOutcome] = []
         for record in list(self._records.values()):
-            if launched is not None and record.identity not in launched:
+            if (launched is not None
+                    and (record.identity, record.launch_token) not in launched):
                 continue
             if record.hold_pending:
                 outcome = self._finalize_hold(record)
@@ -1124,7 +1125,7 @@ class Coordinator:
         self._consume_attempt(record)
         if not self._persist(record):
             return
-        self._launched_this_cycle.add(record.identity)
+        self._launched_this_cycle.add((record.identity, record.launch_token))
         started = getattr(self._gate, "started", None)
         if started is not None:
             started(record)
