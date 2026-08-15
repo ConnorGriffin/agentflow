@@ -59,6 +59,30 @@ def test_provider_plan_admits_only_its_exact_credential_handle(tmp_path, monkeyp
     assert f'(allow file-read* (subpath {json.dumps(str(handle.parent))}))' not in profile
 
 
+@pytest.mark.parametrize(("provider", "configuration_variable"), [("claude", "CLAUDE_CONFIG_DIR"), ("codex", "CODEX_HOME")])
+def test_provider_plan_admits_only_its_exact_configuration_directory(tmp_path, monkeypatch, provider, configuration_variable):
+    probe = _load_probe()
+    executable = tmp_path / "provider"; executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(probe.shutil, "which", lambda _: str(executable))
+    root = tmp_path / "task"; source = root / "source"; source.mkdir(parents=True)
+
+    environment, writable = probe._task_environment(root, provider)
+    configuration = Path(environment[configuration_variable])
+    profile = probe._profile(probe._plan(tmp_path, source, writable, provider))
+
+    quoted = json.dumps(str(configuration))
+    assert configuration in writable
+    assert f"(allow file-read* (literal {quoted}))" in profile
+    assert f"(allow file-write* (literal {quoted}))" in profile
+    assert f"(allow file-write* (subpath {quoted}))" in profile
+    provider_parent = json.dumps(str(root / "provider"))
+    real_home = json.dumps(str(probe._REAL_HOME))
+    assert f"(allow file-read* (literal {provider_parent}))" not in profile
+    assert f"(allow file-write* (literal {provider_parent}))" not in profile
+    assert f"(allow file-read* (subpath {real_home}))" not in profile
+    assert f"(allow file-write* (subpath {real_home}))" not in profile
+
+
 def test_profile_grants_each_writable_root_object_and_subpath_without_its_parent(tmp_path):
     probe = _load_probe()
     parent = tmp_path / "parent"; source = parent / "source"

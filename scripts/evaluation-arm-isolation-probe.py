@@ -173,8 +173,8 @@ def _profile(plan: SandboxPlan) -> str:
 
 
 def _task_environment(root: Path, provider: str | None) -> tuple[dict[str, str], tuple[Path, ...]]:
-    names = ("home", "xdg-config", "xdg-cache", "xdg-data", "tmp", "provider", "output")
-    roots = tuple(root / name for name in names)
+    names = ("home", "xdg-config", "xdg-cache", "xdg-data", "tmp", "output")
+    roots = [root / name for name in names]
     for path in roots:
         path.mkdir(mode=0o700)
     env = {
@@ -185,14 +185,18 @@ def _task_environment(root: Path, provider: str | None) -> tuple[dict[str, str],
         "GIT_CONFIG_NOSYSTEM": "1", "NO_PROXY": "*",
     }
     if provider == "claude":
-        (root / "provider" / "claude").mkdir()
-        env["CLAUDE_CONFIG_DIR"] = str(root / "provider" / "claude")
+        config = root / "provider" / "claude"
+        config.mkdir(parents=True)
+        roots.append(config)
+        env["CLAUDE_CONFIG_DIR"] = str(config)
         os.symlink(_AUTH_HANDLES[provider], root / "home" / ".claude.json")
     elif provider == "codex":
-        (root / "provider" / "codex").mkdir()
-        env["CODEX_HOME"] = str(root / "provider" / "codex")
-        os.symlink(_AUTH_HANDLES[provider], root / "provider" / "codex" / "auth.json")
-    return env, roots
+        config = root / "provider" / "codex"
+        config.mkdir(parents=True)
+        roots.append(config)
+        env["CODEX_HOME"] = str(config)
+        os.symlink(_AUTH_HANDLES[provider], config / "auth.json")
+    return env, tuple(roots)
 
 
 def _provider_executable(provider: str) -> Path:
