@@ -241,7 +241,9 @@ def _skills_problem(
         return None
     names = manifest["connor_skills"]["skills"]
     if all(destinations[(".agents/skills", name)] == "ok" for name in names) and all(
-        _legacy_claude_skill_link(root, name) for name in names
+        destinations[(".claude/skills", name)] == "absent"
+        or _legacy_claude_skill_link(root, name)
+        for name in names
     ):
         return None
     # Converge never rewrites the vendored skill pack (no reproducible content to write —
