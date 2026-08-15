@@ -89,13 +89,14 @@ class ReviewFinding:
     grounding: str
     file: str = ""
     line: int = 0
+    failure_class: str = ""
 
 
 def encode_findings(findings: tuple[ReviewFinding, ...]) -> str:
     """Encode the durable Full-axis finding ledger."""
     return json.dumps([
         {"action": item.action.value, "summary": item.summary, "grounding": item.grounding,
-         "file": item.file, "line": item.line}
+         "file": item.file, "line": item.line, "failure_class": item.failure_class}
         for item in findings
     ], sort_keys=True)
 
@@ -112,7 +113,8 @@ def decode_findings(payload: str) -> tuple[ReviewFinding, ...] | None:
                 return None
             result.append(ReviewFinding(
                 ReviewAction(str(raw["action"])), str(raw["summary"]),
-                str(raw["grounding"]), str(raw.get("file", "")), int(raw.get("line", 0))))
+                str(raw["grounding"]), str(raw.get("file", "")), int(raw.get("line", 0)),
+                str(raw.get("failure_class", ""))))
         return tuple(result)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
@@ -552,8 +554,14 @@ def parse_review_result(payload: str, *, expected_sha: str | None = None,
             line = raw.get("line", 0)
             if not isinstance(line, int):
                 return _invalid("finding line is not an integer")
+            failure_class = str(raw.get("failure_class", ""))
+            if failure_class and failure_class not in {
+                    "fix_introduced_defect", "original_defect", "plan_gap",
+                    "reviewer_false_claim", "slice_scope_error", "speculative_preference"}:
+                return _invalid("finding failure class is unknown")
             findings.append(ReviewFinding(
-                action, summary.strip(), grounding.strip(), str(raw.get("file", "")), line))
+                action, summary.strip(), grounding.strip(), str(raw.get("file", "")), line,
+                failure_class))
 
         uncertainty = None
         raw_uncertainty = data.get("uncertainty")

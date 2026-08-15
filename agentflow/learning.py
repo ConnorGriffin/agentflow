@@ -18,6 +18,7 @@ SCHEMA = "agentflow-learning-report-v1"
 def report(repository: str, start: date, end: date, store_path: Path | str) -> dict:
     """Project durable terminal facts into the deliberately narrow learning report."""
     records = Store.load_records_read_only(store_path)
+    lesson_uses = Store.load_lesson_use_attributions_read_only(store_path)
     telemetry = read_attempts_with_health(store_path)
     by_identity: dict[str, list[AttemptTelemetry]] = defaultdict(list)
     for entry in telemetry.entries:
@@ -35,38 +36,8 @@ def report(repository: str, start: date, end: date, store_path: Path | str) -> d
             included.append((record, attempts))
 
     subjects: dict[str, list] = defaultdict(list)
-    findings: dict[tuple[str, str, str], int] = defaultdict(int)
-    review_unavailable = 0
     for record, _attempts in included:
         subjects[record.subject].append(record)
-        review = ReviewState.from_record(record)
-        if review is None:
-            review_unavailable += 1
-            continue
-        for finding in review.findings:
-            findings[(record.stage, review.assignment.axis.value, finding.action.value)] += 1
-
-    attempts = [item for _, group in included for item in group]
-    elapsed_total = 0
-    elapsed_known = 0
-    token_total = 0
-    token_known = 0
-    cost_total = 0
-    cost_known = 0
-    token_fields = (
-        "input_tokens", "cached_input_tokens", "cache_creation_tokens",
-        "output_tokens", "reasoning_output_tokens")
-    for attempt in attempts:
-        if attempt.started_at > 0 and attempt.finalized_at > 0:
-            elapsed_total += max(0, attempt.finalized_at - attempt.started_at)
-            elapsed_known += 1
-        values = [getattr(attempt.usage, name) for name in token_fields]
-        if any(value is not None for value in values):
-            token_total += sum(value for value in values if value is not None)
-            token_known += 1
-        if attempt.usage.cost_usd is not None:
-            cost_total += attempt.usage.cost_usd
-            cost_known += 1
 
     subject_items = []
     for subject, subject_records in subjects.items():
@@ -83,9 +54,80 @@ def report(repository: str, start: date, end: date, store_path: Path | str) -> d
         pointers.sort(key=lambda item: (item["stage"], item["identity"]))
         subject_items.append({"subject": subject, "revise_rounds": len(rounds), "records": pointers})
     subject_items.sort(key=lambda item: item["subject"])
-    revise_total = sum(item["revise_rounds"] for item in subject_items)
-    terminal = {state: sum(record.state == state for record, _ in included)
-                for state in (COMPLETED, HELD)}
+    cohort_subjects = {"pre_adoption": [], "post_adoption": []}
+    for item in subject_items:
+        cohort = ("post_adoption" if any(pointer["identity"] in lesson_uses
+                  for pointer in item["records"]) else "pre_adoption")
+        cohort_subjects[cohort].append(item)
+
+    records_by_identity = {record.identity: record for record, _attempts in included}
+    token_fields = (
+        "input_tokens", "cached_input_tokens", "cache_creation_tokens",
+        "output_tokens", "reasoning_output_tokens")
+
+    def summarize(items):
+        denominator = len(items)
+        identities = {pointer["identity"] for item in items for pointer in item["records"]}
+        cohort_attempts = [item for identity in identities for item in by_identity[identity]]
+        cohort_records = [records_by_identity[identity] for identity in identities]
+        revise_total = sum(item["revise_rounds"] for item in items)
+        revised = sum(item["revise_rounds"] > 0 for item in items)
+        terminal = {state: sum(record.state == state for record in cohort_records)
+                    for state in (COMPLETED, HELD)}
+        unavailable = 0
+        finding_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+        for record in cohort_records:
+            review = ReviewState.from_record(record)
+            if review is None:
+                unavailable += 1
+                continue
+            for finding in review.findings:
+                finding_counts[(record.stage, review.assignment.axis.value,
+                                finding.action.value)] += 1
+        elapsed_total = elapsed_known = token_total = token_known = cost_known = 0
+        cost_total = 0
+        for attempt in cohort_attempts:
+            if attempt.started_at > 0 and attempt.finalized_at > 0:
+                elapsed_total += max(0, attempt.finalized_at - attempt.started_at)
+                elapsed_known += 1
+            values = [getattr(attempt.usage, name) for name in token_fields]
+            if any(value is not None for value in values):
+                token_total += sum(value for value in values if value is not None)
+                token_known += 1
+            if attempt.usage.cost_usd is not None:
+                cost_total += attempt.usage.cost_usd
+                cost_known += 1
+        summary = {
+            "terminal_subjects": denominator,
+            "subjects_with_revise": revised,
+            "revision_required_rate": {"numerator": revised, "denominator": denominator},
+            "revise_rounds": {"total": revise_total,
+                              "mean": {"numerator": revise_total, "denominator": denominator}},
+            "terminal_records": {"completed": terminal[COMPLETED], "held": terminal[HELD]},
+            "review_state_unavailable": unavailable,
+            "attempts": len(cohort_attempts),
+            "elapsed_seconds": {"total": elapsed_total, "attempts_known": elapsed_known,
+                                "attempts_unknown": len(cohort_attempts) - elapsed_known},
+            "tokens": {"total": token_total, "attempts_known": token_known,
+                       "attempts_unknown": len(cohort_attempts) - token_known},
+            "cost_usd": {"total": cost_total, "attempts_known": cost_known,
+                         "attempts_unknown": len(cohort_attempts) - cost_known},
+        }
+        return summary, [
+            {"stage": stage, "axis": axis, "action": action, "count": count}
+            for (stage, axis, action), count in sorted(finding_counts.items())]
+
+    summary, finding_groups = summarize(subject_items)
+
+    def cohort_summary(items):
+        summary, groups = summarize(items)
+        return summary | {
+            "finding_groups": groups,
+            "attributed_stage_records": sum(pointer["identity"] in lesson_uses
+                                              for item in items for pointer in item["records"]),
+            "attribution_missing": sum(pointer["identity"] not in lesson_uses
+                                       for item in items for pointer in item["records"]),
+        }
     return {
         "schema": SCHEMA,
         "status": "degraded" if telemetry.skipped is None or telemetry.skipped else "complete",
@@ -93,21 +135,12 @@ def report(repository: str, start: date, end: date, store_path: Path | str) -> d
         "window": {"from": start.isoformat(), "to": end.isoformat()},
         "telemetry_entries_read": len(telemetry.entries),
         "telemetry_entries_skipped": telemetry.skipped,
-        "summary": {
-            "terminal_subjects": len(subject_items),
-            "subjects_with_revise": sum(item["revise_rounds"] > 0 for item in subject_items),
-            "revision_required_rate": {"numerator": sum(item["revise_rounds"] > 0 for item in subject_items), "denominator": len(subject_items)},
-            "revise_rounds": {"total": revise_total, "mean": {"numerator": revise_total, "denominator": len(subject_items)}},
-            "terminal_records": {"completed": terminal[COMPLETED], "held": terminal[HELD]},
-            "review_state_unavailable": review_unavailable,
-            "attempts": len(attempts),
-            "elapsed_seconds": {"total": elapsed_total, "attempts_known": elapsed_known, "attempts_unknown": len(attempts) - elapsed_known},
-            "tokens": {"total": token_total, "attempts_known": token_known, "attempts_unknown": len(attempts) - token_known},
-            "cost_usd": {"total": cost_total, "attempts_known": cost_known, "attempts_unknown": len(attempts) - cost_known},
+        "summary": summary,
+        "attribution": {
+            "kind": "observational_non_causal",
+            "cohorts": {name: cohort_summary(items) for name, items in cohort_subjects.items()},
         },
-        "finding_groups": [
-            {"stage": stage, "axis": axis, "action": action, "count": count}
-            for (stage, axis, action), count in sorted(findings.items())],
+        "finding_groups": finding_groups,
         "subjects": subject_items,
     }
 

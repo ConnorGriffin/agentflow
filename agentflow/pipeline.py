@@ -432,7 +432,8 @@ def _capability_preflight(record, materialize: bool):
     return preflight(inspection_root, record.stage, record.pool, requirements)
 
 
-def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None) -> Coordinator:
+def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None,
+                      evidence_store=None) -> Coordinator:
     """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
     adapter verifies a durable starting/final-head verdict and retains the detached bounded-fix
@@ -441,6 +442,24 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
     same branch and releases the change claim on completion; its Mockup adapter verifies one
     pushed visual round and releases its drawing claim at the human-pick boundary. One
     :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    if evidence_store is None and repositories is not None:
+        from agentflow.evidence import EvidenceStore
+        evidence_store = EvidenceStore()
+
+    def review_evidence(record, obs):
+        if evidence_store is None:
+            return
+        from agentflow.evidence_pipeline import EvidenceProducer
+        coordinated_review.record_evidence(
+            EvidenceProducer(evidence_store, repository=record.repo), record, obs)
+
+    def revise_evidence(record, obs):
+        if evidence_store is None:
+            return
+        from agentflow.evidence_pipeline import EvidenceProducer
+        coordinated_revise.record_evidence(
+            EvidenceProducer(evidence_store, repository=record.repo), record, obs)
+
     intake = IntakeStageAdapter(
         worktree_reset=coordinated_intake.reset_worktree,
         apply_route=coordinated_intake.apply_route,
@@ -457,11 +476,13 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
         worktree_reset=coordinated_review._review_worktree_reset,
         handoff=park_pr,
         settle=coordinated_review._settle_review,
-        prepare_settle=coordinated_review._prepare_review_settlement)
+        prepare_settle=coordinated_review._prepare_review_settlement,
+        evidence=review_evidence if evidence_store is not None else None)
     revise = ReviseStageAdapter(
         revision_ready=coordinated_revise._revision_ready, worktree_ready=worktree_ready,
         handoff=park_pr,
-        uncertainty=coordinated_revise._conflict_uncertainty_outcome)
+        uncertainty=coordinated_revise._conflict_uncertainty_outcome,
+        evidence=revise_evidence if evidence_store is not None else None)
     respond = RespondStageAdapter(
         reply_ready=coordinated_respond._reply_ready, worktree_ready=worktree_ready,
         handoff=coordinated_respond._park_respond,

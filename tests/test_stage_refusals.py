@@ -658,7 +658,7 @@ def test_the_refusal_fields_default_so_records_written_before_this_change_still_
     finally:
         store.close()
 
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     assert restored.refusal == "" and restored.refusal_expected is False
 
 

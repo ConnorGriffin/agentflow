@@ -31,13 +31,18 @@ class ReviseStageAdapter(StageAdapter):
     required_outcome = "a pushed revision on the PR branch"
 
     def __init__(self, *, revision_ready, worktree_ready=None, observer=None, handoff=None,
-                 uncertainty=None) -> None:
+                 uncertainty=None, evidence=None) -> None:
         super().__init__(outcome_ready=revision_ready, worktree_ready=worktree_ready,
                          observer=observer, handoff=handoff)
         self._uncertainty = uncertainty
+        self._evidence = evidence
 
     def capture(self, record, obs) -> str | None:
         """Capture genuine conflict ambiguity as private durable state, never a PR comment."""
         if self._uncertainty is None or not record.conflict_round:
             return None
         return self._uncertainty(record, obs)
+
+    def project_outcome(self, record, obs) -> None:
+        if self._evidence is not None:
+            self._evidence(record, obs)

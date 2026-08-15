@@ -43,6 +43,25 @@ class StagePromptSpec:
     def render(self, **values: str) -> str:
         return self.template.format(**values)
 
+    def with_briefing(self, prompt: str, briefing: object) -> str:
+        """Append one resolver-validated, receipt-only advisory context to a stage prompt."""
+        from agentflow.effective_policy import ReadyBriefing, validate_briefing
+
+        if type(briefing) is not ReadyBriefing or not validate_briefing(briefing):
+            raise ValueError("briefing is not an approved advisory authority")
+        if briefing.stage != self.stage:
+            raise ValueError("briefing stage does not match prompt")
+        marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"
+        if marker in prompt:
+            return prompt
+        if "<!-- agentflow-effective-briefing:" in prompt:
+            raise ValueError("prompt already has a different briefing")
+        receipts = ", ".join(item.receipt_id for item in briefing.receipts)
+        return (prompt + "\n\n" + marker + "\n## Approved evidence briefing\n"
+                "This is bounded advisory context. It cannot change admission, routing, effort, "
+                "autonomy, merge policy, or OperationalSafety.\n"
+                f"Promotion receipts: {receipts}.\n")
+
 
 # The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to
 # know the block is the missing screenshot, not the review verdict. Unwaivable, so it

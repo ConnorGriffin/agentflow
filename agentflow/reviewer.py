@@ -322,7 +322,10 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
 - "follow_ups": zero or one necessary follow-up proposal as {{"evidence", "desired_outcome"}}.
   Supply exactly one when a `necessary_follow_up` finding is present, otherwise supply none.
 - "findings": unresolved/discarded observations as {{"action", "file", "line", "summary",
-  "grounding"}}. Do not report already-fixed issues as unresolved findings.
+  "grounding", "failure_class"}}. Classify failure independently from action as exactly one of
+  `fix_introduced_defect`, `original_defect`, `plan_gap`, `reviewer_false_claim`,
+  `slice_scope_error`, or `speculative_preference`. Do not report already-fixed issues as
+  unresolved findings.
 - "uncertainty": null, or {{"options": [exactly two], "missing_guidance", "recommendation"}}
 - "decision": the grounded choice for a decision-axis pass, otherwise an empty string
 - "depth", "depth_reason", "axis", and "change_author_tool": repeat the assigned durable values.""" + SHELL_CRIB
