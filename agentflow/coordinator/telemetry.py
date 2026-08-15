@@ -426,6 +426,14 @@ class AttemptTelemetry:
 _ENTRY_FIELDS = {f.name for f in fields(AttemptTelemetry)}
 
 
+@dataclass(frozen=True)
+class AttemptTelemetryRead:
+    """Valid attempt telemetry plus bounded health information for observational readers."""
+
+    entries: list[AttemptTelemetry]
+    skipped: int | None
+
+
 def telemetry_dir(store_path: Path | str) -> Path:
     """Where per-attempt telemetry entries live, beside the records database and sessions."""
     return Path(store_path).parent / "telemetry"
@@ -466,26 +474,69 @@ def read_attempts(store_path: Path | str) -> list[AttemptTelemetry]:
     """Every persisted attempt entry. An unreadable or malformed file is skipped, never
     fatal — a corrupt tail must not blind the whole projection."""
     entries: list[AttemptTelemetry] = []
-    directory = telemetry_dir(store_path)
     try:
-        names = sorted(p for p in directory.iterdir() if p.suffix == ".json")
+        names = sorted(p for p in telemetry_dir(store_path).iterdir() if p.suffix == ".json")
     except OSError:
         return entries
     for path in names:
-        try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        if not isinstance(data, dict):
-            continue
-        usage_data = data.get("usage")
-        usage = _decode_usage(usage_data) if isinstance(usage_data, dict) else AttemptUsage()
-        fields_in = {k: v for k, v in data.items() if k in _ENTRY_FIELDS and k != "usage"}
-        try:
-            entries.append(AttemptTelemetry(usage=usage, **fields_in))
-        except TypeError:
-            continue  # an entry from an incompatible shape — skipped, not fatal
+        entry = _read_attempt(path, strict=False)
+        if entry is not None:
+            entries.append(entry)
     return entries
+
+
+def read_attempts_with_health(store_path: Path | str) -> AttemptTelemetryRead:
+    """Read valid attempts and report skipped files without exposing their contents."""
+    entries: list[AttemptTelemetry] = []
+    skipped = 0
+    directory = telemetry_dir(store_path)
+    try:
+        directory.stat()
+    except FileNotFoundError:
+        return AttemptTelemetryRead(entries, skipped)
+    except OSError:
+        return AttemptTelemetryRead(entries, None)
+    try:
+        names = sorted(p for p in directory.iterdir() if p.suffix == ".json")
+    except OSError:
+        return AttemptTelemetryRead(entries, None)
+    for path in names:
+        entry = _read_attempt(path, strict=True)
+        if entry is None:
+            skipped += 1
+            continue
+        entries.append(entry)
+    return AttemptTelemetryRead(entries, skipped)
+
+
+def _read_attempt(path: Path, *, strict: bool) -> AttemptTelemetry | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    usage_data = data.get("usage")
+    if strict and "usage" in data and not isinstance(usage_data, dict):
+        return None
+    usage = _decode_usage(usage_data) if isinstance(usage_data, dict) else AttemptUsage()
+    fields_in = {k: v for k, v in data.items() if k in _ENTRY_FIELDS and k != "usage"}
+    try:
+        entry = AttemptTelemetry(usage=usage, **fields_in)
+    except TypeError:
+        return None
+    return entry if not strict or _learning_safe(entry) else None
+
+
+def _learning_safe(entry: AttemptTelemetry) -> bool:
+    if (type(entry.identity) is not str or type(entry.started_at) is not int
+            or type(entry.finalized_at) is not int):
+        return False
+    for name in _TOKEN_FIELDS:
+        value = getattr(entry.usage, name)
+        if value is not None and type(value) is not int:
+            return False
+    return entry.usage.cost_usd is None or type(entry.usage.cost_usd) in {int, float}
 
 
 def _decode_usage(data: dict) -> AttemptUsage:
