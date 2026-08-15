@@ -549,9 +549,20 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
     monkeypatch.setattr("agentflow.enroll._install_connor_skills", install_skills)
     monkeypatch.setattr("agentflow.enroll._install_methodology_skills",
                         lambda root: "DO:   installed methodology contracts")
+
+    def install_ui_runtime(root):
+        for agent_root in (".agents/skills", ".claude/skills"):
+            package = (
+                root / agent_root / "drive-local-webapp" / "node_modules" /
+                "playwright" / "package.json"
+            )
+            package.parent.mkdir(parents=True, exist_ok=True)
+            package.write_text('{"version": "1.61.1"}\n')
+        return "DO:   installed fake UI runtime"
+
     monkeypatch.setattr(
         "agentflow.enroll._install_ui_runtime",
-        lambda root: "DO:   installed fake UI runtime",
+        install_ui_runtime,
     )
 
     first = main(["enroll", str(tmp_path), "--apply"])
@@ -562,8 +573,24 @@ def test_enroll_apply_installs_repo_local_capabilities_idempotently(
     assert "ui-surfaces: frontend/" in (tmp_path / "AGENTS.md").read_text()
     assert (tmp_path / "CLAUDE.md").readlink() == Path("AGENTS.md")
     assert (tmp_path / ".gitignore").read_text() == (
-        ".agentflow/\n.agents/skills/**/node_modules/\n"
+        ".agentflow/\n.agents/skills/**/node_modules/\n.claude/skills/**/node_modules/\n"
     )
+    for provider in (".agents", ".claude"):
+        dependency = (
+            tmp_path / provider / "skills" / "drive-local-webapp" /
+            "node_modules" / "playwright" / "package.json"
+        )
+        assert subprocess.run(
+            ["git", "-C", str(tmp_path), "check-ignore", "--quiet", str(dependency)],
+            check=False,
+        ).returncode == 0
+    status = subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--short", "--untracked-files=all"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert "node_modules" not in status
     codex_skill = tmp_path / ".agents" / "skills" / "agentflow" / "SKILL.md"
     claude_skill = tmp_path / ".claude" / "skills" / "agentflow" / "SKILL.md"
     assert codex_skill.is_file()
