@@ -131,6 +131,55 @@ def test_output_file_reader_rejects_a_symlink_to_outside_output(tmp_path):
     assert probe._read_result(output) is None
 
 
+def test_codex_provider_row_uses_the_anchored_reader_without_a_precheck(tmp_path, monkeypatch):
+    probe = _load_probe()
+    parent = tmp_path / "parent"; parent.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"admitted_readable":true,"sibling_reachable":false,"oracle_reachable":false}', encoding="utf-8")
+
+    def clone(_, root):
+        source = root / "source"; source.mkdir()
+        return source
+
+    def environment(root, _):
+        output = root / "output"; output.mkdir()
+        return {}, (output,)
+
+    calls = 0
+    def run(_, **__):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"outcome": "exited", "exit_status": 0, "stdout": b"codex 1.2.3\n", "stderr": b"", "stdout_bytes": 12, "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False, "duration_seconds": 0}
+        os.symlink(outside, parent / "codex-order-1" / "output" / "final.json")
+        return {"outcome": "exited", "exit_status": 0, "stdout": b"", "stderr": b"", "stdout_bytes": 0, "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False, "duration_seconds": 0}
+
+    monkeypatch.setattr(probe, "_detached_bundle_clone", clone)
+    monkeypatch.setattr(probe, "_task_environment", environment)
+    monkeypatch.setattr(probe, "_plan", lambda *args: object())
+    monkeypatch.setattr(probe, "_profile", lambda _: "profile")
+    monkeypatch.setattr(probe, "_provider_executable", lambda _: Path("/provider"))
+    monkeypatch.setattr(probe, "_run_bounded", run)
+    monkeypatch.setattr(Path, "is_file", lambda _: (_ for _ in ()).throw(AssertionError("unsafe precheck")))
+
+    row = probe._probe_provider(parent, "codex", "order-1", probe.SourceBundle(tmp_path / "bundle", "revision"))
+
+    assert row["final_result"] is None
+
+
+def test_git_timeout_is_bounded_and_content_free(monkeypatch):
+    probe = _load_probe()
+
+    def timed_out(*args, **kwargs):
+        assert kwargs["timeout"] == 30
+        raise subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+
+    monkeypatch.setattr(probe.subprocess, "run", timed_out)
+
+    with pytest.raises(RuntimeError, match="^source preparation failed$"):
+        probe._git(["status"])
+
+
 def test_disposable_cleanup_repairs_hostile_provider_permissions(tmp_path):
     probe = _load_probe()
     root = tmp_path / "provider-root"

@@ -443,7 +443,7 @@ def _probe_provider(parent: Path, provider: str, order: str, bundle: SourceBundl
         version = _version_from_startup(startup)
         if version is not None:
             run = _run_bounded(_profile_command(profile, _provider_command(provider, source, result_path, schema_path, executable)), cwd=source, env=env, timeout=_PROVIDER_TIMEOUT)
-            if provider == "codex" and run["outcome"] == "exited" and result_path.is_file():
+            if provider == "codex" and run["outcome"] == "exited":
                 final = _read_result(result_path.parent)
             elif provider == "claude" and run["outcome"] == "exited" and not run["stdout_truncated"]:
                 final = _parse_result(run["stdout"])
