@@ -505,11 +505,12 @@ def _backup_once(path: Path) -> None:
         shutil.copy2(path, backup)
 
 
-def _append_once(path: Path, line: str) -> None:
+def _append_once(path: Path, line: str, *, backup: bool = True) -> None:
     existing = path.read_text() if path.exists() else ""
     if line in existing.splitlines():
         return
-    _backup_once(path)
+    if backup:
+        _backup_once(path)
     separator = "" if not existing or existing.endswith("\n") else "\n"
     path.write_text(f"{existing}{separator}{line}\n")
 
@@ -643,6 +644,45 @@ def _install_file(path: Path, content: str, *, overwrite: bool = False) -> str:
     return f"DO:   installed {path}"
 
 
+def _normalize_skill_lock(
+    root: Path, names: list[str], *, source: str, commit: str
+) -> str | None:
+    lock = root / "skills-lock.json"
+    try:
+        if not lock.exists():
+            return None
+        if not lock.is_file():
+            return f"WARN: {lock} is not a regular skills lock file"
+        document = json.loads(lock.read_text())
+    except OSError as exc:
+        return f"WARN: could not read {lock}: {exc}"
+    except json.JSONDecodeError as exc:
+        return f"WARN: could not parse {lock}: {exc}"
+    if not isinstance(document, dict):
+        return f"WARN: {lock} must contain a JSON object"
+    skills = document.get("skills")
+    if not isinstance(skills, dict):
+        return f"WARN: {lock} has no valid skills object"
+    if any(not isinstance(entry, dict) for entry in skills.values()):
+        return f"WARN: {lock} contains an invalid skill entry"
+    changed = False
+    for name in names:
+        entry = skills.get(name)
+        if entry is None:
+            continue
+        normalized = {**entry, "source": source, "sourceType": "git", "ref": commit}
+        if normalized != entry:
+            skills[name] = normalized
+            changed = True
+    if not changed:
+        return None
+    try:
+        lock.write_text(json.dumps(document, indent=2) + "\n")
+    except OSError as exc:
+        return f"WARN: could not write {lock}: {exc}"
+    return None
+
+
 def _ensure_fleet_config(root: Path) -> str:
     from agentflow.config import ConfigurationError, default_config_path, load_config
 
@@ -686,6 +726,15 @@ def _install_connor_skills(root: Path) -> str:
     manifest = _manifest()
     names = manifest["connor_skills"]["skills"]
     specs = {item.get("skill"): item for item in manifest["capabilities"]}
+    expected = manifest["connor_skills"]["commit"]
+    warning = _normalize_skill_lock(
+        root,
+        names,
+        source=manifest["connor_skills"]["source"],
+        commit=expected,
+    )
+    if warning:
+        return warning
     destinations = _public_skill_destination_states(root, manifest)
     if all(state == "ok" for state in destinations.values()):
         return "ok:   Connor skill pack already installed"
@@ -710,7 +759,6 @@ def _install_connor_skills(root: Path) -> str:
             f"installer was not run ({rendered})"
         )
     resolved, error = _resolved_skill_release(manifest)
-    expected = manifest["connor_skills"]["commit"]
     if error:
         return f"WARN: public skill release could not be verified — {error}"
     if resolved != expected:
@@ -743,6 +791,14 @@ def _install_connor_skills(root: Path) -> str:
                 reason = (result.stderr or result.stdout).strip().splitlines()
                 tail = reason[-1] if reason else f"exit {result.returncode}"
                 return f"WARN: Connor skill install failed — {tail}"
+            warning = _normalize_skill_lock(
+                root,
+                [name],
+                source=manifest["connor_skills"]["source"],
+                commit=expected,
+            )
+            if warning:
+                return warning
             wiring = _wire_claude_skill(root, name)
             if wiring.startswith("WARN:"):
                 return wiring
@@ -767,6 +823,14 @@ def _install_methodology_skills(root: Path) -> str:
     """
     manifest = _manifest()
     source = manifest["methodology_skills"]
+    warning = _normalize_skill_lock(
+        root,
+        source["skills"],
+        source=source["source"],
+        commit=source["commit"],
+    )
+    if warning:
+        return warning
     states = _methodology_destination_states(root, manifest)
     if all(state == "ok" for state in states.values()):
         return "ok:   methodology contracts already installed"
@@ -808,6 +872,14 @@ def _install_methodology_skills(root: Path) -> str:
             result = _run_command(command, cwd=root, timeout=120)
             if result.returncode:
                 return "WARN: methodology contract install failed"
+            warning = _normalize_skill_lock(
+                root,
+                [name],
+                source=source["source"],
+                commit=source["commit"],
+            )
+            if warning:
+                return warning
             wiring = _wire_claude_skill(root, name)
             if wiring.startswith("WARN:"):
                 return wiring
@@ -947,10 +1019,10 @@ def _apply_enrollment(
     root: Path, profile: str, surfaces: tuple[str, ...], *, converge: bool = False
 ) -> list[str]:
     outcomes: list[str] = []
-    _append_once(root / ".gitignore", ".agentflow/")
+    _append_once(root / ".gitignore", ".agentflow/", backup=False)
     if surfaces:
-        _append_once(root / ".gitignore", ".agents/skills/**/node_modules/")
-        _append_once(root / ".gitignore", ".claude/skills/**/node_modules/")
+        _append_once(root / ".gitignore", ".agents/skills/**/node_modules/", backup=False)
+        _append_once(root / ".gitignore", ".claude/skills/**/node_modules/", backup=False)
 
     agents = root / "AGENTS.md"
     claude = root / "CLAUDE.md"

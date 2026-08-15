@@ -107,7 +107,6 @@ enroll_repo() { # <dir>
   if [ -f "$ignore" ] && grep -qxF '.agentflow/' "$ignore"; then
     note "ok:   .agentflow/ already ignored"
   else
-    backup "$ignore"
     do_or_show "add .agentflow/ to $ignore" \
       bash -c 'if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then printf "\n" >> "$1"; fi; printf ".agentflow/\n" >> "$1"' _ "$ignore"
   fi
