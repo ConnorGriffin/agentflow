@@ -4,12 +4,14 @@ All provider work is coordinator-owned. There is no legacy execution mode or byp
 
 ## Activate
 
+Complete [capacity calibration](getting-started.md#calibrate-capacity) before
+activation; it is a prerequisite.
+
 Validate the repository configuration, start the daemon under the process supervisor,
 then inspect it while still paused:
 
 ```bash
 uv run agentflow check
-uv run agentflow capacity calibrate
 uv run agentflow service install
 uv run agentflow status
 ```
@@ -57,14 +59,9 @@ ownership, attempts, permits, claims, or recovery; use the coordinator records a
 An orphaned visible claim is held for a one-hour safety grace before removal so a short,
 deterministic interactive scope operation cannot race the daemon.
 
-For a read-only observational report over one repository and UTC window, run:
-
-```bash
-uv run agentflow learning report --repo OWNER/REPO --from YYYY-MM-DD --to YYYY-MM-DD
-```
-
-See the [learning pipeline](learning-pipeline.md) for its bounded facts,
-missingness, and non-action contract.
+For the read-only observational report over one repository and UTC window, see
+[Learning pipeline: Run the report](learning-pipeline.md#run-the-report) for its
+bounded facts, missingness, and non-action contract.
 
 ## Console service
 
