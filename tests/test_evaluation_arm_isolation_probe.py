@@ -291,6 +291,8 @@ def test_real_provider_matrix_has_exactly_four_rows(tmp_path, monkeypatch, capsy
 
     monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    system_profile = tmp_path / "system.sb"; system_profile.touch()
+    monkeypatch.setattr(probe, "_SYSTEM_PROFILE", system_profile)
     monkeypatch.setattr(probe, "_metadata", lambda: {"metadata": "closed"})
     monkeypatch.setattr(probe, "_capture_source_bundle", lambda _: bundle)
     monkeypatch.setattr(probe, "_probe_provider", fake_probe)
@@ -331,7 +333,7 @@ def test_coordinator_command_is_exact_and_reusable():
     assert probe._coordinator_command(["--local-only"]) == f"python3 {SCRIPT} --local-only"
 
 
-def test_local_only_cli_emits_only_a_provider_free_boundary(monkeypatch, capsys):
+def test_local_only_cli_emits_only_a_provider_free_boundary(tmp_path, monkeypatch, capsys):
     probe = _load_probe()
     facts = {
         "admitted_read": True, "task_write": True, "source_write_denied": True,
@@ -354,6 +356,8 @@ def test_local_only_cli_emits_only_a_provider_free_boundary(monkeypatch, capsys)
 
     monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    system_profile = tmp_path / "system.sb"; system_profile.touch()
+    monkeypatch.setattr(probe, "_SYSTEM_PROFILE", system_profile)
     monkeypatch.setattr(probe, "_run_bounded", fake_run)
     monkeypatch.setattr(probe, "_metadata", lambda: {"metadata": "closed"})
 
@@ -363,13 +367,15 @@ def test_local_only_cli_emits_only_a_provider_free_boundary(monkeypatch, capsys)
     assert all(row["facts"] == facts for row in payload["results"])
 
 
-def test_local_only_cli_rejects_a_false_boundary_fact(monkeypatch, capsys):
+def test_local_only_cli_rejects_a_false_boundary_fact(tmp_path, monkeypatch, capsys):
     probe = _load_probe()
     facts = {key: True for key in probe._LOCAL_FACT_KEYS}
     facts["oracle_stat_denied"] = False
 
     monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    system_profile = tmp_path / "system.sb"; system_profile.touch()
+    monkeypatch.setattr(probe, "_SYSTEM_PROFILE", system_profile)
     monkeypatch.setattr(probe, "_metadata", lambda: {"metadata": "closed"})
     monkeypatch.setattr(probe, "_probe_local_boundary", lambda _, order: {
         "order": order, "helper_stage": {"outcome": "exited", "exit_status": 0}, "facts": facts,
