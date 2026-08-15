@@ -111,10 +111,15 @@ def decode_findings(payload: str) -> tuple[ReviewFinding, ...] | None:
         for raw in raw_items:
             if not isinstance(raw, dict):
                 return None
+            failure_class = str(raw.get("failure_class", ""))
+            if failure_class not in {"", "fix_introduced_defect", "original_defect", "plan_gap",
+                                     "reviewer_false_claim", "slice_scope_error",
+                                     "speculative_preference"}:
+                return None
             result.append(ReviewFinding(
                 ReviewAction(str(raw["action"])), str(raw["summary"]),
                 str(raw["grounding"]), str(raw.get("file", "")), int(raw.get("line", 0)),
-                str(raw.get("failure_class", ""))))
+                failure_class))
         return tuple(result)
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None

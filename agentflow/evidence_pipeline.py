@@ -238,6 +238,37 @@ class EvidenceProducer:
             "observed", (EvidenceLink("derives_from", revision.event_id, 0),))
         return RequestRevision(subject, authority, revision, claim, (criterion,))
 
+    def stage_source(self, stage_id: str, stage: str, issue: str, source_revision: str,
+                     input_digest: str, *, observed_at: int = 0) -> RequestRevision:
+        """Bind a terminal stage fact to its frozen content-free input and checkout revision."""
+        if (not stage_id or stage not in {"intake", "attack", "research"} or not issue
+                or not re.fullmatch(r"[a-f0-9]{40}", source_revision)
+                or not _valid_digest(input_digest)):
+            raise ValueError("stage source lacks durable identity")
+        locator = f"issues/{issue}"
+        source_digest = _digest(
+            "stage-source-v1", self._repository, stage_id, stage, issue,
+            source_revision, input_digest)
+        authority = AuthorityPointer(
+            "github", self._repository, locator, source_revision, "sha256", input_digest,
+            "stage-source")
+        subject = SubjectRevision(
+            "issue", f"issue/{issue}", f"issue-{source_digest[:32]}", locator, source_digest)
+        revision = self._producer(
+            _id("observation", "stage-revision", source_digest, str(observed_at)),
+            subject, authority, observed_at, "revision", source_digest, "observed")
+        claim = self._producer(
+            _id("observation", "stage-claim", source_digest, str(observed_at)),
+            subject, authority, observed_at, "claim",
+            _digest("stage-claim-v1", source_digest), "observed",
+            (EvidenceLink("derives_from", revision.event_id, 0),))
+        criterion = self._producer(
+            _id("observation", "stage-criterion", source_digest, str(observed_at)),
+            subject, authority, observed_at, "criterion",
+            _digest("stage-criterion-v1", source_digest), "observed",
+            (EvidenceLink("derives_from", revision.event_id, 0),))
+        return RequestRevision(subject, authority, revision, claim, (criterion,))
+
     def provenance(self, captured: RequestRevision, current: GitHubRequest | None) -> Provenance:
         if current is None:
             return Provenance("unavailable")

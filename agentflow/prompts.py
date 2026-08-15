@@ -14,6 +14,8 @@ this module runs anything.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from importlib.resources import files
 
 from agentflow.runner import MockupScope
 from agentflow.screenshot_crib import SCREENSHOT_HARNESS
@@ -51,6 +53,19 @@ class StagePromptSpec:
             raise ValueError("briefing is not an approved advisory authority")
         if briefing.stage != self.stage:
             raise ValueError("briefing stage does not match prompt")
+        lessons = tuple(item for item in briefing.receipts
+                        if item.candidate_id != "evaluation-contract-v1")
+        if lessons:
+            if len(lessons) != 1 or self.stage != "review":
+                raise ValueError("briefing does not bind one deployed stage method")
+            authority = lessons[0].authority
+            method_path = "agentflow/reviewer.py"
+            method_digest = sha256(
+                files("agentflow").joinpath("reviewer.py").read_bytes()).hexdigest()
+            if (authority.content_hash_algorithm != "sha256"
+                    or authority.content_hash != method_digest
+                    or not authority.locator.endswith(f"/files/{method_path}")):
+                raise ValueError("briefing method authority does not match the deployed artifact")
         marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"
         if marker in prompt:
             return prompt

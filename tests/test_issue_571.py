@@ -3,35 +3,41 @@ from __future__ import annotations
 
 import inspect
 import json
+import sqlite3
+from dataclasses import replace
 from datetime import date
+from hashlib import sha256
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from agentflow import coordinated_review, coordinated_revise, github
+from agentflow import (coordinated_research, coordinated_review, coordinated_revise, github,
+                       pipeline, reviewer)
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
-from agentflow.coordinator import Coordinator, ReviewStageAdapter
+from agentflow.coordinator import Coordinator, ReviewStageAdapter, StageRouter
 from agentflow.coordinator.launcher import STARTED, StartResult
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
 from agentflow.coordinator.record import COMPLETED, RUNNING, Record
 from agentflow.coordinator.revise_stage import ReviseStageAdapter
-from agentflow.coordinator.store import (
-    AdmissionRefused, OperationalSafetyAndCanary, SafetySources, Store)
+from agentflow.coordinator.store import OperationalSafetyAndCanary, SafetySources, Store
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
-from agentflow.effective_policy import EffectivePolicyResolver, FleetPolicyV1, ReadyBriefing
+from agentflow.effective_policy import (
+    CapabilityRequirement, EffectivePolicyResolver, FleetPolicyV1, ReadyBriefing)
 from agentflow.evidence import (
     ApprovedAuthority, AuthorityPointer, EvidenceError, EvidenceReceiptReader, EvidenceStore,
     FakeAuthorityVerifier, PromotionReceiptReader)
 from agentflow.evidence_pipeline import EvidenceMiner, EvidenceProducer, LessonInput
 from agentflow.learning import report
 from agentflow.prompts import stage_prompt_spec
-from agentflow.review_policy import ReviewAction, ReviewFinding, ReviewState
+from agentflow.review_policy import ReviewState
 from agentflow.routing import routing
 from agentflow.worktree_ref import WorktreeRef
 
 
 REPOSITORY = "ConnorGriffin/agentflow"
-PROPOSAL_DIGEST = "9" * 64
+METHOD_ARTIFACT = Path(inspect.getsourcefile(reviewer) or "")
+PROPOSAL_DIGEST = sha256(METHOD_ARTIFACT.read_bytes()).hexdigest()
 METHOD_REVISION = "e" * 40
 METHOD_POINTER = AuthorityPointer(
     "github", REPOSITORY, "pulls/571/files/agentflow/reviewer.py",
@@ -77,9 +83,7 @@ class _Launcher:
 
 
 def _review_record(identity: str, reviewed_sha: str, *, started_at: int) -> Record:
-    state = ReviewState(findings=(ReviewFinding(
-        ReviewAction.FIX, "private finding body", "charter: public-interface coverage",
-        "agentflow/example.py", 7, "original_defect"),))
+    state = ReviewState(change_author_tool="claude")
     return Record(
         identity=identity, stage="review", pool="codex", demand=1,
         repo=REPOSITORY, subject="571", target=reviewed_sha,
@@ -87,6 +91,23 @@ def _review_record(identity: str, reviewed_sha: str, *, started_at: int) -> Reco
             "/private/tmp/issue-571", "codex", 571, "learning-loop").path,
         created_at=started_at - 1, started_at=started_at, state=RUNNING,
         **state.record_fields())
+
+
+def _review_payload(reviewed_sha: str) -> str:
+    return json.dumps({
+        "verdict": "BLOCK", "depth": "targeted",
+        "depth_reason": "one contained change", "axis": "combined",
+        "change_author_tool": "claude", "reviewed_sha": reviewed_sha,
+        "final_sha": reviewed_sha, "pushed_sha": "", "fixes": [],
+        "follow_ups": [], "checks": ["public-interface fixture"],
+        "findings": [{
+            "action": "fix_before_completion", "summary": "private finding body",
+            "grounding": "charter: public-interface coverage",
+            "file": "agentflow/example.py", "line": 7,
+            "failure_class": "original_defect",
+        }],
+        "uncertainty": None, "decision": "",
+    }, sort_keys=True)
 
 
 def _revise_record(review: Record) -> Record:
@@ -107,6 +128,39 @@ def _ready(record, _materialize):
     return CapabilityPreflightResult(record.stage, record.pool, (), "ready", (), "", fact)
 
 
+def test_production_router_wires_terminal_intake_attack_and_research_evidence(tmp_path):
+    evidence_path = tmp_path / "terminal-evidence.db"
+    evidence = EvidenceStore(path=evidence_path)
+    coordinator = pipeline.build_coordinator(
+        store=Store(tmp_path / "terminal-coordinator.db"), evidence_store=evidence)
+    records = [
+        Record("terminal-intake", "intake", "codex", 1, repo=REPOSITORY, subject="1",
+               subject_revision="1" * 40, input_ptr="private intake prompt",
+               outcome='{"route":"close"}', started_at=10),
+        Record("terminal-attack", "attack", "codex", 1, repo=REPOSITORY, subject="2",
+               subject_revision="2" * 40, input_ptr="private attack prompt",
+               outcome='{"objections":"private objection"}', started_at=20),
+        Record("terminal-research", "research", "codex", 1, repo=REPOSITORY, subject="3",
+               subject_revision="3" * 40, input_ptr="private research prompt",
+               source=str(tmp_path / "research"), started_at=30),
+    ]
+    findings = Path(coordinated_research.findings_path(records[2]))
+    findings.parent.mkdir(parents=True)
+    findings.write_text("private research findings")
+
+    for record in records:
+        coordinator._adapter.project_outcome(record, ProviderObservation())
+
+    with sqlite3.connect(evidence_path) as connection:
+        kinds = [row[0] for row in connection.execute(
+            "SELECT producer_kind FROM events WHERE producer_kind IN ('verification','objection')")]
+    assert sorted(kinds) == ["objection", "objection", "verification", "verification"]
+    retained = evidence_path.read_bytes()
+    assert all(value not in retained for value in (
+        b"private intake prompt", b"private attack prompt", b"private objection",
+        b"private research prompt", b"private research findings"))
+
+
 def test_public_learning_loop_closes_without_network_provider_or_daemon_side_effects(
         tmp_path, monkeypatch):
     evidence_path = tmp_path / "evidence.db"
@@ -117,16 +171,17 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
     review_events = []
     revise_events = []
 
-    review_adapter = ReviewStageAdapter(
-        verdict_ready=lambda _record, _observation: True,
+    review_adapter = StageRouter({"review": ReviewStageAdapter(
+        verdict_ready=coordinated_review._verdict_ready,
         worktree_reset=lambda _record: True,
+        capture_state=coordinated_review.capture_verdict_state,
         evidence=lambda record, observation: review_events.extend(
-            coordinated_review.record_evidence(producer, record, observation)))
-    revise_adapter = ReviseStageAdapter(
+            coordinated_review.record_evidence(producer, record, observation)))})
+    revise_adapter = StageRouter({"revise": ReviseStageAdapter(
         revision_ready=lambda _record, _observation: True,
         worktree_ready=lambda _record: True,
         evidence=lambda record, observation: revise_events.append(
-            coordinated_revise.record_evidence(producer, record, observation)))
+            coordinated_revise.record_evidence(producer, record, observation)))})
     heads = {}
     monkeypatch.setattr(github, "open_pr_for_branch", lambda _repo, branch: heads[branch])
 
@@ -135,12 +190,15 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
         review = _review_record(
             f"{REPOSITORY}|571-{ordinal}|review|{reviewed}", reviewed,
             started_at=100 + ordinal * 10)
-        outcome = review_adapter.capture(
-            review, ProviderObservation(final_message='{"verdict":"BLOCK"}'))
+        observation = ProviderObservation(final_message=_review_payload(reviewed))
+        outcome = review_adapter.capture(review, observation)
         assert outcome
         review.outcome = outcome
         assert flow_store.upsert(review)
-        review_adapter.project_outcome(review, ProviderObservation(final_message=outcome))
+        captured = ReviewState.from_record(flow_store.record_of(review.identity))
+        assert captured is not None
+        assert [item.failure_class for item in captured.findings] == ["original_defect"]
+        review_adapter.project_outcome(review, observation)
 
         revise = _revise_record(review)
         parsed = WorktreeRef.parse(revise.source)
@@ -175,6 +233,7 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
     pre_store.close()
     promoted = evidence.promote(candidate.candidate_id, METHOD_POINTER, promoted_at=160)
     assert promoted.authoritative and promoted.authority == METHOD_APPROVAL
+    assert promoted.authority.approved_hash == sha256(METHOD_ARTIFACT.read_bytes()).hexdigest()
 
     promotion_reader = PromotionReceiptReader(path=evidence_path)
     policy = FleetPolicyV1(1, (EffectivePolicyResolver._receipt_value(promoted),), ())
@@ -203,9 +262,8 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
     assert approved_submission is not None
     approved_prompt = approved_submission.input_ptr
     method_instruction = "Classify failure independently from action as exactly one of"
-    baseline_prompt = approved_prompt.replace(method_instruction, "Use the prior classification")
     consumed_prompt = stage_prompt_spec("review").with_briefing(approved_prompt, briefing)
-    assert approved_prompt != baseline_prompt
+    assert consumed_prompt != approved_prompt
     assert method_instruction in consumed_prompt
     assert promoted.receipt_id in consumed_prompt
 
@@ -222,9 +280,9 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
         "incomplete", 1_723_686_400, 1_723_686_410, usage=AttemptUsage()))
 
     launcher = _Launcher()
-    adapter = ReviewStageAdapter(
+    adapter = StageRouter({"review": ReviewStageAdapter(
         verdict_ready=lambda _record, _observation: True,
-        worktree_reset=lambda _record: True, observer=_Observer())
+        worktree_reset=lambda _record: True, observer=_Observer())})
     coordinator = Coordinator(
         store=store, launcher=launcher, adapter=adapter,
         capability_preflight=_ready, briefing_resolver=resolver,
@@ -250,16 +308,52 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
     store = Store(coordinator_path, admission_mode=OperationalSafetyAndCanary(
         SafetySources(), promotion_reader))
     assert store.read_lesson_use_attribution(identity) == original_attribution
-    record = store.record_of(identity)
-    assert record is not None
-    store._conn.execute("BEGIN IMMEDIATE")
-    assert store._insert_or_validate_lesson_use(record, briefing) == original_attribution
-    store._conn.execute("ROLLBACK")
-    conflicting = resolver.brief_for(REPOSITORY, "review", "a" * 40)
-    store._conn.execute("BEGIN IMMEDIATE")
-    with pytest.raises(AdmissionRefused, match="briefing_mismatch"):
-        store._insert_or_validate_lesson_use(record, conflicting)
-    store._conn.execute("ROLLBACK")
+
+    conflict_policy = FleetPolicyV1(
+        1, policy.receipts,
+        (CapabilityRequirement("fixture-method", "v1", "0" * 64),))
+    conflicting_briefing = implementation(
+        resolver, REPOSITORY, "review", "f" * 40, conflict_policy)
+    assert isinstance(conflicting_briefing, ReadyBriefing)
+    conflict_store = Store(
+        tmp_path / "conflicting-attribution.db",
+        admission_mode=OperationalSafetyAndCanary(SafetySources(), promotion_reader))
+    conflict_launcher = _Launcher()
+    conflict_coordinator = Coordinator(
+        store=conflict_store, launcher=conflict_launcher, adapter=adapter,
+        capability_preflight=_ready, briefing_resolver=resolver,
+        route_selector=routing.select_route, daemon_generation="issue-571-conflict-fixture")
+    conflict_identity = conflict_coordinator.submit_stage(
+        replace(approved_submission, transfer_from=None))
+    conflict_waiting = conflict_store.record_of(conflict_identity)
+    assert conflict_waiting is not None
+    conflict_store.register_route_selection(routing.select_route(
+        conflict_waiting.repo, conflict_waiting.stage, conflict_waiting.pool,
+        conflict_waiting.model, complexity=conflict_waiting.complexity,
+        effort=conflict_waiting.effort,
+        builder_complexity=conflict_waiting.builder_complexity))
+    values = {
+        "stage_identity": conflict_identity, "repository": conflict_waiting.repo,
+        "stage": conflict_waiting.stage,
+        "subject_revision": conflict_waiting.subject_revision,
+        "briefing_id": conflicting_briefing.briefing_id,
+        "briefing_digest": conflicting_briefing.briefing_digest,
+        "promotion_receipt_id": promoted.receipt_id,
+        "method_revision": promoted.authority.approved_revision,
+    }
+    digest = sha256(json.dumps(
+        {"domain": "lesson-use-attribution-v1", **values}, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+    conflict_store._conn.execute(
+        "INSERT INTO lesson_use_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (*values.values(), digest))
+
+    assert conflict_coordinator.cycle("codex", now=1_723_686_600) == []
+    refused = conflict_store.record_of(conflict_identity)
+    assert refused is not None and refused.refusal == "briefing_mismatch"
+    assert conflict_launcher.started == []
+    assert conflict_store.read_admission_receipt(conflict_identity) is None
+    conflict_store.close()
 
     learning = report(
         REPOSITORY, date(2024, 8, 15), date(2024, 8, 16), coordinator_path)

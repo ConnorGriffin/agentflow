@@ -73,7 +73,7 @@ def _evidence_source(producer, record):
 
 
 def _evidence_actions(record):
-    """Return only reviewer-classified actions; this adapter never infers failure class."""
+    """Return only durably captured classifications; this adapter never infers them."""
     from agentflow.review_policy import ReviewState
 
     state = ReviewState.from_record(record)
@@ -643,6 +643,33 @@ def _verdict_ready(record, obs):
             # independent combined/standards result.
             record.review_taint_cleared = True
     return VERIFIED
+
+
+def capture_verdict_state(record, payload: str) -> bool:
+    """Materialize one already-verified verdict into the durable typed Review ledger."""
+    from agentflow.review_policy import ReviewState, merge_findings, merge_follow_ups
+    from agentflow.reviewer import parse_verdict
+
+    review = ReviewState.from_record(record)
+    if review is None:
+        return False
+    verdict = parse_verdict(
+        payload, expected_sha=record.target, expected_depth=record.review_depth,
+        expected_axis=record.review_axis, expected_author=record.change_author_tool,
+        owned_heads=((record.review_prior_push,) if record.review_prior_push else ()))
+    if not verdict.parsed:
+        return False
+    findings = (verdict.actions if record.review_axis == "fix"
+                else merge_findings(review.findings, verdict.actions))
+    captured = replace(
+        review, findings=findings,
+        fixes=tuple(dict.fromkeys(review.fixes + verdict.fixes)),
+        follow_ups=merge_follow_ups(review.follow_ups, verdict.follow_ups),
+        checks=tuple(dict.fromkeys(review.checks + verdict.checks)),
+        uncertainty=verdict.uncertainty)
+    for name, value in captured.record_fields().items():
+        setattr(record, name, value)
+    return True
 
 
 def _commit_is_gone(workdir: str, sha: str) -> bool:

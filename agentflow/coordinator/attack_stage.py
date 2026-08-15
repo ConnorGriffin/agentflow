@@ -37,11 +37,12 @@ class AttackStageAdapter(StageAdapter):
     """
 
     def __init__(self, *, worktree_reset, apply_objections, claim_ready=None,
-                 observer=None, handoff=None, worktree_dispose=None) -> None:
+                 observer=None, handoff=None, worktree_dispose=None, evidence=None) -> None:
         super().__init__(worktree_ready=worktree_reset, observer=observer, handoff=handoff)
         self._apply_objections = apply_objections
         self._claim_ready = claim_ready or (lambda _record: True)
         self._worktree_dispose = worktree_dispose or (lambda _record: True)
+        self._evidence = evidence
 
     def prepare(self, record):
         # Rebuild first, then prove the transferred triaging claim immediately before admission.
@@ -61,6 +62,10 @@ class AttackStageAdapter(StageAdapter):
     def verify(self, record, obs) -> bool:
         # The round's outcome is the answer it captured, so the durable record is the whole check.
         return record.outcome is not None
+
+    def project_outcome(self, record, obs) -> None:
+        if self._evidence is not None:
+            self._evidence(record, obs)
 
     def recover(self, record, obs):
         """An attack is read-only: it owns no durable partial work, so a clean exit that produced
