@@ -1187,12 +1187,12 @@ class Store:
 
     def _insert_or_validate_lesson_use(self, record: Record, briefing) -> LessonUseAttribution | None:
         """Commit receipt-backed advisory use in the same transaction as the launch reservation."""
-        from agentflow.effective_policy import ReadyBriefing
+        from agentflow.effective_policy import ReadyBriefing, advisory_stage
 
         if type(briefing) is not ReadyBriefing:
             return None
         lessons = tuple(item for item in briefing.receipts
-                        if item.candidate_id != "evaluation-contract-v1")
+                        if advisory_stage(item) == record.stage)
         if not lessons:
             return None
         if len(lessons) != 1:

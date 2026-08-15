@@ -309,6 +309,20 @@ class BriefingReceipt:
         }
 
 
+_ADVISORY_STAGE_BY_METHOD = MappingProxyType({
+    "agentflow/reviewer.py": "review",
+})
+
+
+def advisory_stage(receipt: BriefingReceipt) -> str | None:
+    """Return the one stage authorized to consume a known promoted method."""
+    if type(receipt) is not BriefingReceipt or receipt.candidate_id == "evaluation-contract-v1":
+        return None
+    locator = receipt.authority.locator
+    return next((stage for method, stage in _ADVISORY_STAGE_BY_METHOD.items()
+                 if locator.endswith(f"/files/{method}")), None)
+
+
 @dataclass(frozen=True, slots=True)
 class FleetPolicyV1:
     policy_version: int

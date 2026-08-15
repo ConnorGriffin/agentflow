@@ -47,14 +47,14 @@ class StagePromptSpec:
 
     def with_briefing(self, prompt: str, briefing: object) -> str:
         """Append one resolver-validated, receipt-only advisory context to a stage prompt."""
-        from agentflow.effective_policy import ReadyBriefing, validate_briefing
+        from agentflow.effective_policy import ReadyBriefing, advisory_stage, validate_briefing
 
         if type(briefing) is not ReadyBriefing or not validate_briefing(briefing):
             raise ValueError("briefing is not an approved advisory authority")
         if briefing.stage != self.stage:
             raise ValueError("briefing stage does not match prompt")
         lessons = tuple(item for item in briefing.receipts
-                        if item.candidate_id != "evaluation-contract-v1")
+                        if advisory_stage(item) == self.stage)
         if lessons:
             if len(lessons) != 1 or self.stage != "review":
                 raise ValueError("briefing does not bind one deployed stage method")
@@ -66,12 +66,17 @@ class StagePromptSpec:
                     or authority.content_hash != method_digest
                     or not authority.locator.endswith(f"/files/{method_path}")):
                 raise ValueError("briefing method authority does not match the deployed artifact")
+        applicable = tuple(item for item in briefing.receipts
+                           if item.candidate_id == "evaluation-contract-v1"
+                           or advisory_stage(item) == self.stage)
+        if not applicable:
+            return prompt
         marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"
         if marker in prompt:
             return prompt
         if "<!-- agentflow-effective-briefing:" in prompt:
             raise ValueError("prompt already has a different briefing")
-        receipts = ", ".join(item.receipt_id for item in briefing.receipts)
+        receipts = ", ".join(item.receipt_id for item in applicable)
         return (prompt + "\n\n" + marker + "\n## Approved evidence briefing\n"
                 "This is bounded advisory context. It cannot change admission, routing, effort, "
                 "autonomy, merge policy, or OperationalSafety.\n"

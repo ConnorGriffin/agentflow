@@ -15,7 +15,7 @@ import pytest
 from agentflow import (coordinated_research, coordinated_review, coordinated_revise, github,
                        pipeline, reviewer)
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
-from agentflow.coordinator import Coordinator, ReviewStageAdapter, StageRouter
+from agentflow.coordinator import Coordinator, ReviewStageAdapter, StageRouter, Submission
 from agentflow.coordinator.launcher import STARTED, StartResult
 from agentflow.coordinator.providers import ProviderCause, ProviderObservation
 from agentflow.coordinator.record import COMPLETED, RUNNING, Record
@@ -61,15 +61,22 @@ class _Observer:
 
 
 class _Launcher:
-    def __init__(self):
+    def __init__(self, *, expects_attribution=True, forbidden_receipt_id=None):
         self.alive = set()
         self.started = []
+        self.expects_attribution = expects_attribution
+        self.forbidden_receipt_id = forbidden_receipt_id
 
     def start(self, record, store, admitted=None):
         attribution = store.read_lesson_use_attribution(record.identity)
-        assert attribution is not None
-        assert attribution.promotion_receipt_id in (record.input_ptr or "")
-        self.started.append((record.identity, attribution.attribution_digest, record.input_ptr))
+        if self.expects_attribution:
+            assert attribution is not None
+            assert attribution.promotion_receipt_id in (record.input_ptr or "")
+        else:
+            assert attribution is None
+            assert self.forbidden_receipt_id not in (record.input_ptr or "")
+        self.started.append((record.identity, getattr(
+            attribution, "attribution_digest", None), record.input_ptr))
         family = "issue-571-fixture-family"
         record.start_fact = STARTED
         record.family = family
@@ -80,7 +87,6 @@ class _Launcher:
 
     def is_alive(self, family):
         return family in self.alive
-
 
 def _review_record(identity: str, reviewed_sha: str, *, started_at: int) -> Record:
     state = ReviewState(change_author_tool="claude")
@@ -266,6 +272,36 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
     assert consumed_prompt != approved_prompt
     assert method_instruction in consumed_prompt
     assert promoted.receipt_id in consumed_prompt
+
+    unrelated_briefing = resolver.brief_for(REPOSITORY, "research", "9" * 40)
+    assert isinstance(unrelated_briefing, ReadyBriefing)
+    unrelated_prompt = "Research the bounded question."
+    assert (stage_prompt_spec("research").with_briefing(
+        unrelated_prompt, unrelated_briefing) == unrelated_prompt)
+
+    unrelated_store = Store(
+        tmp_path / "unrelated-stage.db",
+        admission_mode=OperationalSafetyAndCanary(SafetySources(), promotion_reader))
+    unrelated_launcher = _Launcher(
+        expects_attribution=False, forbidden_receipt_id=promoted.receipt_id)
+    unrelated_coordinator = Coordinator(
+        store=unrelated_store, launcher=unrelated_launcher, adapter=StageRouter({}),
+        capability_preflight=_ready, briefing_resolver=resolver,
+        route_selector=routing.select_route, daemon_generation="issue-571-unrelated-fixture")
+    unrelated_identity = unrelated_coordinator.submit_stage(Submission(
+        repo=REPOSITORY, subject="571-unrelated", stage="research", pool="codex",
+        subject_revision="9" * 40, input_ptr=unrelated_prompt))
+    unrelated_waiting = unrelated_store.record_of(unrelated_identity)
+    assert unrelated_waiting is not None
+    unrelated_store.register_route_selection(routing.select_route(
+        unrelated_waiting.repo, unrelated_waiting.stage, unrelated_waiting.pool,
+        unrelated_waiting.model, complexity=unrelated_waiting.complexity,
+        effort=unrelated_waiting.effort,
+        builder_complexity=unrelated_waiting.builder_complexity))
+    assert unrelated_coordinator.cycle("codex", now=1_723_686_450) == []
+    assert unrelated_launcher.started
+    assert unrelated_store.read_lesson_use_attribution(unrelated_identity) is None
+    unrelated_store.close()
 
     store = Store(coordinator_path, admission_mode=OperationalSafetyAndCanary(
         SafetySources(), promotion_reader))

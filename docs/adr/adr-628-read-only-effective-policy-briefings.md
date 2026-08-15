@@ -70,8 +70,9 @@ overlays can restrict but never widen fleet policy. Promotion and Evaluation rem
 #627 must combine the returned briefing with coordinator identity and persist it atomically before
 permit acquisition.
 
-Issue #571 adds one consumer check without widening resolver authority: before Review uses a
-non-Evaluation advisory receipt, its stage prompt verifies that the receipt's exact locator and
-SHA-256 name the deployed Review methodology artifact. The briefing still delivers only receipt
-authority and never method prose. A mismatch refuses before admission, and Store records the
-same receipt and method revision only after this check succeeds.
+Issue #571 adds one consumer check without widening resolver authority: a promoted method's exact
+artifact locator scopes it to its owning stage. Unrelated stages ignore that receipt for prompt
+consumption and use attribution. Before Review uses its advisory receipt, its stage prompt verifies
+that the locator and SHA-256 name the deployed Review methodology artifact. The briefing still
+delivers only receipt authority and never method prose. A mismatch refuses before admission, and
+Store records the same receipt and method revision only after this check succeeds.
