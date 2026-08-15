@@ -522,7 +522,10 @@ class ExactRevisionRepositoryOverlaySource:
 
     def read(self, repository: str, subject_revision: str) -> OverlayV1 | None:
         root = self._repositories.get(repository)
-        if root is None or not _SUBJECT_REVISION.fullmatch(subject_revision):
+        if root is None:
+            self._diagnose(repository, subject_revision, "lookup", 0)
+            raise PolicyValidationError("overlay repository or revision is unavailable")
+        if not _SUBJECT_REVISION.fullmatch(subject_revision):
             raise PolicyValidationError("overlay repository or revision is unavailable")
         result = self._run(
             ["git", "show", f"{subject_revision}:{self._PATH}"], root, "show",

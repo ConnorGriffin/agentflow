@@ -175,7 +175,8 @@ def _retire_dead_intakes(coord) -> None:
     from agentflow.coordinator import tracer
     from agentflow.coordinator.record import RUNNING
     for record in tracer.load_records():
-        if record.stage not in ("intake", "attack") or record.retired or not record.claim:
+        if (not coord._manages_repository(record.repo)
+                or record.stage not in ("intake", "attack") or record.retired or not record.claim):
             continue
         state = github.issue_state(record.repo, int(record.subject))
         if state != "CLOSED":

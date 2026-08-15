@@ -1261,7 +1261,8 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
     from agentflow.coordinator.record import COMPLETED, RUNNING
     records = {record.identity: record for record in tracer.load_records()}
     for record in list(records.values()):
-        if (record.stage != "review" or record.retired or record.hold_pending
+        if (not coord._manages_repository(record.repo)
+                or record.stage != "review" or record.retired or record.hold_pending
                 or not record.claim or not record.target):
             continue
         verdict = _review_verdict(record) if record.state == COMPLETED else None
@@ -1308,7 +1309,8 @@ def _resume_tainted_reviews(coord: Coordinator) -> None:
 
     records = list(tracer.load_records())
     candidates = [record for record in records
-                  if record.stage == "review" and record.retired and record.review_tainted
+                  if coord._manages_repository(record.repo)
+                  and record.stage == "review" and record.retired and record.review_tainted
                   and not record.review_taint_cleared and record.target]
     for record in candidates:
         same_head = [

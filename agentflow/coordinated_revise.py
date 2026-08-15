@@ -281,7 +281,8 @@ def _retire_dead_revises(coord) -> None:
     from agentflow.coordinator import tracer
     from agentflow.coordinator.record import RUNNING
     for record in tracer.load_records():
-        if record.stage != "revise" or record.retired or not record.claim:
+        if (not coord._manages_repository(record.repo)
+                or record.stage != "revise" or record.retired or not record.claim):
             continue
         parsed = source_facts(record)
         if parsed is None:

@@ -167,6 +167,32 @@ def test_recheck_composed_coordinator_emits_sanitized_overlay_diagnostic(
     assert "secret" not in diagnostics[0]
 
 
+def test_single_repository_composition_leaves_other_repository_waiting_record_untouched(
+        monkeypatch, tmp_path):
+    """A recheck helper may only admit the repository it configured for policy lookup."""
+    from agentflow import pipeline
+    from agentflow.coordinator import Coordinator, Submission
+    from agentflow.coordinator.store import Store, default_store_path
+
+    seed = Store(default_store_path())
+    identity = Coordinator(store=seed).submit_stage(Submission(
+        repo="owner/a", subject="680", stage="build", pool="claude", complexity="deep",
+        subject_revision="a" * 40))
+    seed.close()
+    monkeypatch.setattr(pipeline, "_production_gate", lambda: lambda record: True)
+    monkeypatch.setattr(pipeline, "_capability_preflight", lambda record, materialize: None)
+    monkeypatch.setattr(pipeline, "worktree_ready", lambda record: True)
+    logs = []
+
+    coordinator = pipeline.build_coordinator(
+        _log=logs.append, repositories={"owner/b": str(tmp_path / "repo-b")})
+    pipeline.reconcile_and_project(coordinator)
+
+    record = coordinator.stage_record(identity)
+    assert record is not None and record.state == "waiting" and record.refusal == ""
+    assert not any("invalid_overlay" in line for line in logs)
+
+
 def test_dispatch_cycle_has_no_claim_reclaimer_and_forwards_pause(monkeypatch):
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",

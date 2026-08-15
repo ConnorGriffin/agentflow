@@ -508,6 +508,7 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
         adapter=router, gate=_production_gate(), capability_preflight=_capability_preflight,
         disabled_cold_stages=frozenset({"mockup"}), log=_log or (lambda _line: None),
         store=store, briefing_resolver=briefing_resolver,
+        managed_repositories=(frozenset(repositories) if repositories is not None else None),
     )
 
 
@@ -1075,7 +1076,8 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     # die after a stage completion is committed but before it consumes the returned outcome.
     # A completed stage keeps its claim until its successor is atomically persisted.
     for record in tracer.load_records():
-        if (record.state == COMPLETED and not record.retired and record.claim
+        if (coord._manages_repository(record.repo)
+                and record.state == COMPLETED and not record.retired and record.claim
                 and not record.hold_pending):  # a pending park is already retried by reconcile
             opener = _OPENERS.get(record.stage)
             if opener is not None:
