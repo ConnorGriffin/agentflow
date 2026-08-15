@@ -263,6 +263,8 @@ def test_adr_627_pins_every_prerequisite_and_public_contract_digest():
             "f39ec2e8a6eeff7718ad3db5a58a1bc762aec46f7e59c9cddd6f4b0121707562",
         "Store v4 schema":
             "a2dd624722d0d4cbe93ffcf381f4de5cf6f52db1ebaa307453f51ede90986f7b",
+        "Store v5 schema":
+            "7103be329c503a9f263ba6e3d4cec882913892b82e2dd0de744b0579f3351dd1",
     }
     for label, digest in pins.items():
         assert label in adr and digest in adr

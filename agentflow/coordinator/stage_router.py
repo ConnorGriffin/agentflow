@@ -53,6 +53,11 @@ class StageCalls:
         fn = self._hook("capture")
         return fn(record, obs) if fn is not None else None
 
+    def project_outcome(self, record, obs) -> None:
+        fn = self._hook("project_outcome")
+        if fn is not None:
+            fn(record, obs)
+
     def prepare_completed(self, record) -> bool:
         fn = self._hook("prepare_completed")
         return bool(fn(record)) if fn is not None else True
@@ -102,6 +107,9 @@ class StageRouter:
 
     def capture(self, record, obs) -> str | None:
         return self._for(record).capture(record, obs)
+
+    def project_outcome(self, record, obs) -> None:
+        self._for(record).project_outcome(record, obs)
 
     def prepare_completed(self, record) -> bool:
         return self._for(record).prepare_completed(record)

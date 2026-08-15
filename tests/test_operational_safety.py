@@ -923,7 +923,7 @@ def test_store_advances_only_the_exact_v1_schema_without_rewriting_records(tmp_p
     store = Store(path)
     assert store.record_of("legacy") == record
     assert store.permits_used("claude") == 2
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
     store.close()
 
 

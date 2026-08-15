@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from hashlib import sha256
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,6 +50,54 @@ from agentflow.routing import routing
 from agentflow.runner import _run, codex_spent_at_render, remove_worktree_if_safe
 from agentflow.stage_worktree import worktree_owns_head
 from agentflow.worktree_ref import WorktreeRef, review_source_facts
+
+
+def _evidence_digest(*values: str) -> str:
+    return sha256("\0".join(values).encode()).hexdigest()
+
+
+def _evidence_identity(record) -> str:
+    return "review-" + _evidence_digest(
+        "review-id-v1", record.repo, record.subject, record.target or "", str(record.round))[:32]
+
+
+def _evidence_source(producer, record):
+    """Bind Evidence to the exact reviewed commit and PR locator, never review prose."""
+    facts = review_source_facts(record)
+    if facts is None or not record.target:
+        return None
+    _workdir, pr = facts
+    return producer.review_source(
+        _evidence_identity(record), record.target, locator=f"pulls/{pr}",
+        observed_at=max(0, record.started_at))
+
+
+def _evidence_actions(record):
+    """Return only durably captured classifications; this adapter never infers them."""
+    from agentflow.review_policy import ReviewState
+
+    state = ReviewState.from_record(record)
+    if state is None:
+        return ()
+    return tuple(item for item in state.findings if item.failure_class)
+
+
+def record_evidence(producer, record, _obs=None, *, source=None):
+    """Persist eligible review decisions through the existing typed producer interface."""
+    from agentflow.evidence_pipeline import ReviewFinding
+
+    source = source or _evidence_source(producer, record)
+    if source is None:
+        return ()
+    results = []
+    review_id = _evidence_identity(record)
+    for sequence, item in enumerate(_evidence_actions(record), 1):
+        results.append(producer.review(ReviewFinding(
+            review_id, record.target, record.review_axis, record.review_depth, sequence,
+            item.action.value, "code-review", source,
+            _evidence_digest("review-signature-v1", item.failure_class, item.grounding),
+            item.failure_class, "model_judged", max(0, record.started_at))))
+    return tuple(results)
 
 
 # The one extra lens a re-review gains when a conflict Revise produced the head under review (ADR
@@ -315,7 +364,7 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
     combined_actions = merge_findings(prior.findings, verdict.actions)
     actions = [
         {"action": item.action.value, "summary": item.summary, "grounding": item.grounding,
-         "file": item.file, "line": item.line}
+         "file": item.file, "line": item.line, "failure_class": item.failure_class}
         for item in combined_actions]
     uncertainty_value = verdict.uncertainty
     handoff = (
@@ -594,6 +643,33 @@ def _verdict_ready(record, obs):
             # independent combined/standards result.
             record.review_taint_cleared = True
     return VERIFIED
+
+
+def capture_verdict_state(record, payload: str) -> bool:
+    """Materialize one already-verified verdict into the durable typed Review ledger."""
+    from agentflow.review_policy import ReviewState, merge_findings, merge_follow_ups
+    from agentflow.reviewer import parse_verdict
+
+    review = ReviewState.from_record(record)
+    if review is None:
+        return False
+    verdict = parse_verdict(
+        payload, expected_sha=record.target, expected_depth=record.review_depth,
+        expected_axis=record.review_axis, expected_author=record.change_author_tool,
+        owned_heads=((record.review_prior_push,) if record.review_prior_push else ()))
+    if not verdict.parsed:
+        return False
+    findings = (verdict.actions if record.review_axis == "fix"
+                else merge_findings(review.findings, verdict.actions))
+    captured = replace(
+        review, findings=findings,
+        fixes=tuple(dict.fromkeys(review.fixes + verdict.fixes)),
+        follow_ups=merge_follow_ups(review.follow_ups, verdict.follow_ups),
+        checks=tuple(dict.fromkeys(review.checks + verdict.checks)),
+        uncertainty=verdict.uncertainty)
+    for name, value in captured.record_fields().items():
+        setattr(record, name, value)
+    return True
 
 
 def _commit_is_gone(workdir: str, sha: str) -> bool:

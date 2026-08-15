@@ -74,6 +74,10 @@ class StageAdapter:
         worktree instead of re-running the same prompt from scratch (issue #225)."""
         return durable_progress(record, self.required_outcome)
 
+    def project_outcome(self, record, obs) -> None:
+        """Project a verified outcome after its payload is durable, before completion commits."""
+        return None
+
     def finalize_hold(self, record) -> str | None:
         """Create the stage-native human handoff and return its durable proof (ADR 0028's
         exhaustion table). Production wires the real park/hold and notifies once; tests may omit

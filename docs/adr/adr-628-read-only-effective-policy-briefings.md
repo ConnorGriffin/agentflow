@@ -69,3 +69,12 @@ Unavailable or mismatched authorities stop launch through a named immutable hold
 overlays can restrict but never widen fleet policy. Promotion and Evaluation remain unchanged;
 #627 must combine the returned briefing with coordinator identity and persist it atomically before
 permit acquisition.
+
+Issue #571 adds one consumer check without widening resolver authority: a promoted method's exact
+artifact locator scopes it to its owning stage before the resolver constructs the stage briefing.
+Unrelated stages therefore keep the same briefing identity, prompt, admission receipt, and absence
+of use attribution before and after that method is promoted. Before Review uses its advisory
+receipt, its stage prompt verifies that the locator and SHA-256 name the deployed Review
+methodology artifact. The briefing still delivers only receipt authority and never method prose.
+A mismatch refuses before admission, and Store records the same receipt and method revision only
+after this check succeeds.

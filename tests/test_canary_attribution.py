@@ -46,10 +46,13 @@ from agentflow.coordinator.store import (
     SCHEMA_VERSION,
     STORE_V4_SCHEMA_FINGERPRINT,
     STORE_V4_SCHEMA_FINGERPRINT_DIGEST,
+    STORE_V5_SCHEMA_FINGERPRINT,
+    STORE_V5_SCHEMA_FINGERPRINT_DIGEST,
     SUPERVISOR_WINDOW,
     SafetySources,
     Store,
     StoreUnavailable,
+    V4_TO_V5_FAULT_OBSERVATIONS,
     V3_TO_V4_FAULT_OBSERVATIONS,
     V2_TO_V3_FAULT_OBSERVATIONS,
     V4_ADMISSION_PRECOMMIT_CUTPOINTS,
@@ -237,13 +240,15 @@ def assert_v2_snapshot(path, records, cell):
 
 
 def test_contract_schema_pins_and_closed_interfaces_are_exact():
-    assert SCHEMA_VERSION == 4
+    assert SCHEMA_VERSION == 5
     assert STORE_V2_SCHEMA_FINGERPRINT_DIGEST == (
         "9039da12f2376a5078ae067bbe91bfc1b1bae5dffdc469d9ac7d7afbfb2ea05e")
     assert STORE_V3_SCHEMA_FINGERPRINT_DIGEST == (
         "3a51988512b246ec34c469fc469b63cbcdabaf5d537c9a8552ae7c75d127bda5")
     assert STORE_V4_SCHEMA_FINGERPRINT_DIGEST == (
         "a2dd624722d0d4cbe93ffcf381f4de5cf6f52db1ebaa307453f51ede90986f7b")
+    assert STORE_V5_SCHEMA_FINGERPRINT_DIGEST == (
+        "7103be329c503a9f263ba6e3d4cec882913892b82e2dd0de744b0579f3351dd1")
     assert CANARY_ATTRIBUTION_CONTRACT_V1_DIGEST == (
         "4c0ff263ee994228ffae0641a26959ca8f5f497285f800d0b7d980399e508157")
     assert CANARY_ATTRIBUTION_CONTRACT_DIGEST == (
@@ -251,6 +256,7 @@ def test_contract_schema_pins_and_closed_interfaces_are_exact():
     assert _digest(STORE_V2_SCHEMA_FINGERPRINT) == STORE_V2_SCHEMA_FINGERPRINT_DIGEST
     assert _digest(STORE_V3_SCHEMA_FINGERPRINT) == STORE_V3_SCHEMA_FINGERPRINT_DIGEST
     assert _digest(STORE_V4_SCHEMA_FINGERPRINT) == STORE_V4_SCHEMA_FINGERPRINT_DIGEST
+    assert _digest(STORE_V5_SCHEMA_FINGERPRINT) == STORE_V5_SCHEMA_FINGERPRINT_DIGEST
     assert _digest(CANARY_ATTRIBUTION_CONTRACT) == CANARY_ATTRIBUTION_CONTRACT_DIGEST
     assert DEPENDENCY_PINS == CANARY_ATTRIBUTION_CONTRACT["dependencies"]
     assert DEPENDENCY_PINS["issue_584_merge"] == (
@@ -938,7 +944,7 @@ def test_schema_is_row_closed_and_insert_or_replace_cannot_delete_original(tmp_p
             "contract_version": ATTRIBUTION_CONTRACT_VERSION}
         digest = _digest({"domain": ROW_DIGEST_DOMAIN, **fields})
         assert _schema_row_valid(*fields.values(), digest) == 0
-    assert _schema_fingerprint(store._conn) == STORE_V4_SCHEMA_FINGERPRINT
+    assert _schema_fingerprint(store._conn) == STORE_V5_SCHEMA_FINGERPRINT
     store.close()
     reopened = composed(path, receipts)
     assert reopened._conn.execute("PRAGMA recursive_triggers").fetchone()[0] == 1
@@ -1090,8 +1096,8 @@ def test_direct_v2_to_v4_migration_preserves_records_and_has_zero_receipts(tmp_p
         model="gpt-5", state=WAITING, revision=7)
     records, cell = make_v2(path, record=record)
     store = Store(path)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert _schema_fingerprint(store._conn) == STORE_V4_SCHEMA_FINGERPRINT
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert _schema_fingerprint(store._conn) == STORE_V5_SCHEMA_FINGERPRINT
     assert tuple(store.load()[item.identity] for item in records) == records
     with pytest.raises(SafetyRefused, match="requires operator reconciliation"):
         OperationalSafety(store)
@@ -1118,8 +1124,8 @@ def test_current_v3_schema_migrates_directly_to_exact_v4_without_record_rewrite(
     conn.close()
 
     store = Store(path)
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 4
-    assert _schema_fingerprint(store._conn) == STORE_V4_SCHEMA_FINGERPRINT
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert _schema_fingerprint(store._conn) == STORE_V5_SCHEMA_FINGERPRINT
     assert store._conn.execute("SELECT data FROM records ORDER BY identity").fetchall() == before
     assert tuple(store.load()[item.identity] for item in records) == records
     assert store.read_admission_receipt(IDENTITY) is None
@@ -1166,6 +1172,57 @@ def test_every_v3_to_v4_fault_observation_is_atomic(tmp_path, monkeypatch, obser
     check.close()
 
 
+@pytest.mark.parametrize("observation", V4_TO_V5_FAULT_OBSERVATIONS)
+def test_every_v4_to_v5_fault_observation_is_atomic(tmp_path, monkeypatch, observation):
+    path = tmp_path / (observation.replace(":", "-") + ".db")
+    record = Record(
+        IDENTITY, "review", "codex", 1, repo="octo/app", subject="571",
+        model="gpt-5", state=WAITING)
+    store = Store(path)
+    assert store.upsert(record)
+    store.close()
+
+    source = sqlite3.connect(path)
+    source.execute("DROP TRIGGER lesson_use_attributions_no_update")
+    source.execute("DROP TRIGGER lesson_use_attributions_no_delete")
+    source.execute("DROP TABLE lesson_use_attributions")
+    source.execute("PRAGMA user_version = 4")
+    source.commit()
+    before = source.execute("SELECT data FROM records ORDER BY identity").fetchall()
+    assert _schema_fingerprint(source) == STORE_V4_SCHEMA_FINGERPRINT
+    source.close()
+
+    def crash(name):
+        if name == observation:
+            raise RuntimeError("migration fault")
+
+    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(crash))
+    with pytest.raises(RuntimeError, match="migration fault"):
+        Store(path)
+    monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(lambda _name: None))
+
+    check = sqlite3.connect(path)
+    if observation == "v4-to-v5:after-commit":
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert _schema_fingerprint(check) == STORE_V5_SCHEMA_FINGERPRINT
+        assert check.execute("SELECT COUNT(*) FROM lesson_use_attributions").fetchone()[0] == 0
+    else:
+        assert check.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert _schema_fingerprint(check) == STORE_V4_SCHEMA_FINGERPRINT
+        assert check.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE "
+            "'lesson_use_attributions%'").fetchone()[0] == 0
+    assert check.execute("SELECT data FROM records ORDER BY identity").fetchall() == before
+    check.close()
+
+    reopened = Store(path)
+    assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    assert _schema_fingerprint(reopened._conn) == STORE_V5_SCHEMA_FINGERPRINT
+    assert reopened.load()[IDENTITY].subject == "571"
+    assert reopened.load_lesson_use_attributions_read_only(path) == {}
+    reopened.close()
+
+
 @pytest.mark.parametrize("observation", V2_TO_V3_FAULT_OBSERVATIONS)
 def test_every_declared_migration_fault_observation_is_atomic(tmp_path, monkeypatch, observation):
     path = tmp_path / (observation.replace(":", "-") + ".db")
@@ -1181,8 +1238,8 @@ def test_every_declared_migration_fault_observation_is_atomic(tmp_path, monkeypa
     monkeypatch.setattr(Store, "_migration_checkpoint", staticmethod(lambda _name: None))
     if observation == "v2-to-v3:after-commit":
         reopened = Store(path)
-        assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert _schema_fingerprint(reopened._conn) == STORE_V4_SCHEMA_FINGERPRINT
+        assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert _schema_fingerprint(reopened._conn) == STORE_V5_SCHEMA_FINGERPRINT
         assert tuple(reopened.load()[item.identity] for item in records) == records
         with pytest.raises(SafetyRefused, match="requires operator reconciliation"):
             OperationalSafety(reopened)

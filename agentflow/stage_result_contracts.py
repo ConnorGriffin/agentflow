@@ -74,8 +74,11 @@ REVIEW_VERDICT_SCHEMA = {
                     "line": {"type": "integer"},
                     "summary": {"type": "string"},
                     "grounding": {"type": "string"},
+                    "failure_class": {"type": "string", "enum": [
+                        "fix_introduced_defect", "original_defect", "plan_gap",
+                        "reviewer_false_claim", "slice_scope_error", "speculative_preference"]},
                 },
-                "required": ["action", "file", "line", "summary", "grounding"],
+                "required": ["action", "file", "line", "summary", "grounding", "failure_class"],
             },
         },
         "uncertainty": {

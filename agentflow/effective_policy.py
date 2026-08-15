@@ -309,6 +309,28 @@ class BriefingReceipt:
         }
 
 
+_ADVISORY_STAGE_BY_METHOD = MappingProxyType({
+    "agentflow/reviewer.py": "review",
+})
+
+
+def advisory_stage(receipt: BriefingReceipt) -> str | None:
+    """Return the one stage authorized to consume a known promoted method."""
+    if type(receipt) is not BriefingReceipt or receipt.candidate_id == "evaluation-contract-v1":
+        return None
+    locator = receipt.authority.locator
+    return next((stage for method, stage in _ADVISORY_STAGE_BY_METHOD.items()
+                 if locator.endswith(f"/files/{method}")), None)
+
+
+def receipt_applies_to_stage(receipt: BriefingReceipt, stage: str) -> bool:
+    """Whether a receipt contributes to one stage's effective briefing identity."""
+    if type(receipt) is not BriefingReceipt:
+        return False
+    owner = advisory_stage(receipt)
+    return owner is None or owner == stage
+
+
 @dataclass(frozen=True, slots=True)
 class FleetPolicyV1:
     policy_version: int
@@ -869,8 +891,13 @@ class EffectivePolicyResolver:
             receipts, capabilities = policy.receipts, policy.capabilities
             not_applicable = False
 
+        receipts = tuple(item for item in receipts
+                         if receipt_applies_to_stage(item, safe_stage))
+        expected_receipts = tuple(item for item in policy.receipts
+                                  if receipt_applies_to_stage(item, safe_stage))
+
         resolved_by_id: dict[str, BriefingReceipt] = {}
-        for expected in policy.receipts:
+        for expected in expected_receipts:
             try:
                 actual = self._promotion_receipts.read(expected.receipt_id)
             except Exception:

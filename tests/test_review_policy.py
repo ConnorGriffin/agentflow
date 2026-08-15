@@ -129,6 +129,15 @@ def test_historical_follow_up_references_do_not_block_one_current_proposal():
     ]
 
 
+def test_durable_finding_decode_rejects_an_unknown_failure_class():
+    payload = json.dumps([{
+        "action": "fix_before_completion", "summary": "fix", "grounding": "contract",
+        "file": "agentflow/example.py", "line": 1, "failure_class": "invented",
+    }])
+
+    assert decode_findings(payload) is None
+
+
 def test_later_review_replaces_or_clears_the_current_follow_up_proposal():
     historical = FollowUp("legacy evidence", "legacy outcome", "https://github.com/o/r/issues/9")
     prior_proposal = FollowUp("prior evidence", "prior outcome")

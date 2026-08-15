@@ -14,6 +14,8 @@ this module runs anything.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from hashlib import sha256
+from importlib.resources import files
 
 from agentflow.runner import MockupScope
 from agentflow.screenshot_crib import SCREENSHOT_HARNESS
@@ -42,6 +44,43 @@ class StagePromptSpec:
 
     def render(self, **values: str) -> str:
         return self.template.format(**values)
+
+    def with_briefing(self, prompt: str, briefing: object) -> str:
+        """Append one resolver-validated, receipt-only advisory context to a stage prompt."""
+        from agentflow.effective_policy import (
+            ReadyBriefing, advisory_stage, receipt_applies_to_stage, validate_briefing)
+
+        if type(briefing) is not ReadyBriefing or not validate_briefing(briefing):
+            raise ValueError("briefing is not an approved advisory authority")
+        if briefing.stage != self.stage:
+            raise ValueError("briefing stage does not match prompt")
+        lessons = tuple(item for item in briefing.receipts
+                        if advisory_stage(item) == self.stage)
+        if lessons:
+            if len(lessons) != 1 or self.stage != "review":
+                raise ValueError("briefing does not bind one deployed stage method")
+            authority = lessons[0].authority
+            method_path = "agentflow/reviewer.py"
+            method_digest = sha256(
+                files("agentflow").joinpath("reviewer.py").read_bytes()).hexdigest()
+            if (authority.content_hash_algorithm != "sha256"
+                    or authority.content_hash != method_digest
+                    or not authority.locator.endswith(f"/files/{method_path}")):
+                raise ValueError("briefing method authority does not match the deployed artifact")
+        applicable = tuple(item for item in briefing.receipts
+                           if receipt_applies_to_stage(item, self.stage))
+        if not applicable:
+            return prompt
+        marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"
+        if marker in prompt:
+            return prompt
+        if "<!-- agentflow-effective-briefing:" in prompt:
+            raise ValueError("prompt already has a different briefing")
+        receipts = ", ".join(item.receipt_id for item in applicable)
+        return (prompt + "\n\n" + marker + "\n## Approved evidence briefing\n"
+                "This is bounded advisory context. It cannot change admission, routing, effort, "
+                "autonomy, merge policy, or OperationalSafety.\n"
+                f"Promotion receipts: {receipts}.\n")
 
 
 # The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to

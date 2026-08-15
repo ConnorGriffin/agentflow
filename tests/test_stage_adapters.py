@@ -88,6 +88,20 @@ def test_a_stage_with_no_adapter_registered_falls_back_like_a_bare_coordinator()
     assert router.finalize_hold(record) == f"proof:{record.identity}:pr:parked"
 
 
+def test_router_projects_a_verified_outcome_to_the_selected_stage():
+    projected = []
+
+    class ProjectingStage:
+        def project_outcome(self, record, obs):
+            projected.append((record.identity, obs.final_message))
+
+    router = StageRouter({"review": ProjectingStage()})
+    record = _record("review")
+    router.project_outcome(record, ProviderObservation(final_message="durable"))
+
+    assert projected == [(record.identity, "durable")]
+
+
 @pytest.mark.parametrize("command", (
     "gh issue create --title follow-up",
     "env GH_TOKEN=x gh issue create --title follow-up",

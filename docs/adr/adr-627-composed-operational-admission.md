@@ -48,6 +48,8 @@ The composed public contracts are pinned as follows:
   `f7f64e3fb9a3913713d121d24af39c3f208d39b3cb6afb04b1457dd54b8d0d2f`.
 - exact coordinator Store v4 schema fingerprint:
   `a2dd624722d0d4cbe93ffcf381f4de5cf6f52db1ebaa307453f51ede90986f7b`.
+- exact coordinator Store v5 schema fingerprint:
+  `7103be329c503a9f263ba6e3d4cec882913892b82e2dd0de744b0579f3351dd1`.
 - promoted #648 Evaluation artifact and receipt SHA-256 values:
   `a0e90b5b41c87ff67f257315cc6578b0b181249037f1ced2bac827cd3670d1ec` and
   `f39ec2e8a6eeff7718ad3db5a58a1bc762aec46f7e59c9cddd6f4b0121707562`.
@@ -73,7 +75,7 @@ Content-free policy, capability, and RouteCell refusals remain WAITING with thei
 and are reevaluated on the next cycle or restart. Capacity and lost compare-and-set races are
 ordinary deferrals. No authority refusal consumes a permit, attempt, receipt, or attribution.
 
-The shipped Store schema is v3; its only admission migration is v3 to the final v4. V4 adds a
+The Store schema before composed admission was v3; its admission migration is v3 to v4. V4 adds a
 Store-owned `receipt_digest` to the existing receipt row. That ordinary canonical self-digest
 covers `stage_identity` and all nine `AdmissionReceipt` fields. It also adds OperationalSafety's
 permanent `safety_admission_history`, keyed by `stage_identity`, whose row contains the admitted
@@ -83,7 +85,7 @@ the minimum integrity boundary for the single-operator, low-stakes deployment: n
 service, or second public receipt type is introduced, and a coordinated attacker that can rewrite
 both facts and their digests is outside the supported threat model.
 
-Store v4 is the sole transaction owner. One `BEGIN IMMEDIATE` validates the durable WAITING
+Store v5 is the sole transaction owner. One `BEGIN IMMEDIATE` validates the durable WAITING
 compare-and-set, briefing identity and applicability, capability self-digest/stage/provider,
 active nonquarantined exact RouteCell and launch configuration, capacity, OperationalSafety,
 optional canary attribution, and any existing exact AdmissionReceipt. Store then inserts the
@@ -94,6 +96,14 @@ non-reentrant. Malformed authority, database failures, callback mutation, precom
 races roll back every output. OperationalSafety inserts or validates its history row as a private
 participant on Store's already-open connection; it never begins, commits, or rolls back the
 transaction.
+
+Issue #571 extends v4 to v5 with one append-only `lesson_use_attributions` table. When the
+pinned #628 briefing contains one promoted advisory method, Store inserts or validates that
+exact briefing, PromotionReceipt, method revision, and self-digest in the admission transaction
+before publishing RUNNING. Conflicting attribution refuses admission. UPDATE and DELETE are
+forbidden. The table is attribution only: it adds no lesson lifecycle, policy decision, routing,
+Safety, autonomy, or promotion authority. The v4-to-v5 migration is atomic and does not rewrite
+historical Records or admissions.
 
 `AdmissionResult` contains no launch envelope. After commit, Coordinator obtains the immutable
 envelope from the committed AdmissionReceipt through Store's public historical decoder. If the
@@ -123,8 +133,9 @@ does not weaken the required composed `ReservationIntent` types.
   root is not authoritative, named authority failures become terminal, or historical lost-ack
   recovery consults current authority.
 - `tests/test_canary_attribution.py` fails if any callback can mutate Store, any precommit cutpoint
-  publishes a partial output, a forged receipt or Safety history reads successfully, the v3-to-v4
-  migration is not atomic, either admission fact is mutable, or the v4 fingerprint changes.
+  publishes a partial output, a forged receipt or Safety history reads successfully, either
+  admission migration is not atomic, an immutable fact is mutable, or an accepted schema
+  fingerprint changes.
 - `tests/test_effective_policy.py` fails if mutable HEAD affects an exact-revision overlay or a
   present corrupt Git object is inferred to be an absent path.
 - `tests/test_route_selection.py` fails if a pointer/config/quarantine race consumes capacity, a

@@ -38,7 +38,7 @@ class IntakeStageAdapter(StageAdapter):
     """Rebuild Intake's read-only source, capture its parsed route, and apply it once durable."""
 
     def __init__(self, *, worktree_reset, apply_route, claim_ready=None,
-                 observer=None, handoff=None, worktree_dispose=None) -> None:
+                 observer=None, handoff=None, worktree_dispose=None, evidence=None) -> None:
         super().__init__(worktree_ready=worktree_reset, observer=observer, handoff=handoff)
         self._apply_route = apply_route
         self._claim_ready = claim_ready or (lambda _record: True)
@@ -46,6 +46,7 @@ class IntakeStageAdapter(StageAdapter):
         # as ambiguous legacy activation evidence (issue #106). The default no-op keeps a bare
         # adapter's read-only stage side-effect-free; production wires the real disposer.
         self._worktree_dispose = worktree_dispose or (lambda _record: True)
+        self._evidence = evidence
 
     def prepare(self, record):
         # Rebuild first, then prove the GitHub claim immediately before admission. A removed or
@@ -61,6 +62,10 @@ class IntakeStageAdapter(StageAdapter):
     def verify(self, record, obs) -> bool:
         # Intake's outcome is the route it captured, so the durable record is the whole check.
         return record.outcome is not None
+
+    def project_outcome(self, record, obs) -> None:
+        if self._evidence is not None:
+            self._evidence(record, obs)
 
     def recover(self, record, obs):
         """Intake is read-only: it owns no durable partial work, so a clean exit that parsed no

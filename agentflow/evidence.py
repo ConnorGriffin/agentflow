@@ -495,6 +495,7 @@ class EvidenceRecord:
     review_action: str
     validation_states: tuple[str, ...]
     links: tuple[EvidenceLink, ...]
+    normalized_signature: str = ""
     reviewed_parent_revision: str = ""
     fixer_revision: str = ""
 
@@ -596,7 +597,8 @@ class EvidenceReceiptReader:
                 return EvidenceRecord(
                     event_id, row["event_kind"], row["subject"], row["revision"],
                     row["failure_class"], row["producer_kind"], row["review_action"], states,
-                    links, "" if lineage is None else lineage["parent_revision"],
+                    links, row["fact_digest"] if row["event_kind"] == "failure_observation" else "",
+                    "" if lineage is None else lineage["parent_revision"],
                     "" if lineage is None else lineage["fixer_revision"],
                 )
         except sqlite3.Error as error:

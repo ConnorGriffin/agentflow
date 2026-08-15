@@ -53,7 +53,7 @@ if TYPE_CHECKING:
     from agentflow.capability_contracts import CapabilityReadyFact
     from agentflow.effective_policy import NotApplicableBriefing, ReadyBriefing
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 _RECORDS_SCHEMA = (
     "CREATE TABLE records ("
     " identity TEXT PRIMARY KEY,"
@@ -97,6 +97,32 @@ _ADMISSION_RECEIPTS_FINGERPRINT = (
      "createtriggeradmission_receipts_no_updatebeforeupdateonadmission_receiptsbeginselectraise("
      "abort,'admission_receiptsisappend-only');end"),
 )
+_LESSON_USE_ATTRIBUTIONS_SCHEMA = (
+    "CREATE TABLE lesson_use_attributions ("
+    "stage_identity TEXT PRIMARY KEY,repository TEXT NOT NULL,stage TEXT NOT NULL,"
+    "subject_revision TEXT NOT NULL,briefing_id TEXT NOT NULL,briefing_digest TEXT NOT NULL,"
+    "promotion_receipt_id TEXT NOT NULL,method_revision TEXT NOT NULL,attribution_digest TEXT NOT NULL)"
+)
+_LESSON_USE_ATTRIBUTIONS_NO_UPDATE = (
+    "CREATE TRIGGER lesson_use_attributions_no_update BEFORE UPDATE ON lesson_use_attributions "
+    "BEGIN SELECT RAISE(ABORT, 'lesson_use_attributions is append-only'); END"
+)
+_LESSON_USE_ATTRIBUTIONS_NO_DELETE = (
+    "CREATE TRIGGER lesson_use_attributions_no_delete BEFORE DELETE ON lesson_use_attributions "
+    "BEGIN SELECT RAISE(ABORT, 'lesson_use_attributions is append-only'); END"
+)
+_LESSON_USE_ATTRIBUTIONS_FINGERPRINT = (
+    ("table", "lesson_use_attributions", "lesson_use_attributions",
+     "createtablelesson_use_attributions(stage_identitytextprimarykey,repositorytextnotnull,stagetextnotnull,"
+     "subject_revisiontextnotnull,briefing_idtextnotnull,briefing_digesttextnotnull,promotion_receipt_idtextnotnull,"
+     "method_revisiontextnotnull,attribution_digesttextnotnull)"),
+    ("trigger", "lesson_use_attributions_no_delete", "lesson_use_attributions",
+     "createtriggerlesson_use_attributions_no_deletebeforedeleteonlesson_use_attributionsbeginselectraise("
+     "abort,'lesson_use_attributionsisappend-only');end"),
+    ("trigger", "lesson_use_attributions_no_update", "lesson_use_attributions",
+     "createtriggerlesson_use_attributions_no_updatebeforeupdateonlesson_use_attributionsbeginselectraise("
+     "abort,'lesson_use_attributionsisappend-only');end"),
+)
 
 
 def _store_v4_fingerprint():
@@ -111,6 +137,14 @@ STORE_V4_SCHEMA_FINGERPRINT = _store_v4_fingerprint()
 STORE_V4_SCHEMA_FINGERPRINT_DIGEST = sha256(json.dumps(
     STORE_V4_SCHEMA_FINGERPRINT, sort_keys=True, separators=(",", ":"),
     ensure_ascii=True, allow_nan=False).encode()).hexdigest()
+STORE_V5_SCHEMA_FINGERPRINT = tuple(sorted(
+    STORE_V4_SCHEMA_FINGERPRINT + _LESSON_USE_ATTRIBUTIONS_FINGERPRINT))
+STORE_V5_SCHEMA_FINGERPRINT_DIGEST = (
+    "7103be329c503a9f263ba6e3d4cec882913892b82e2dd0de744b0579f3351dd1")
+if sha256(json.dumps(STORE_V5_SCHEMA_FINGERPRINT, sort_keys=True, separators=(",", ":"),
+                     ensure_ascii=True, allow_nan=False).encode()).hexdigest() != \
+        STORE_V5_SCHEMA_FINGERPRINT_DIGEST:
+    raise RuntimeError("coordinator Store schema fingerprint changed")
 # Bounded wait for a busy database. Beyond this we fail closed rather than block a whole
 # daemon cycle on a lock we cannot prove will clear.
 _BUSY_TIMEOUT_MS = int(os.environ.get("AGENTFLOW_COORD_BUSY_MS", "2000"))
@@ -135,6 +169,15 @@ V2_TO_V3_FAULT_OBSERVATIONS = (
     "v2-to-v3:after-user-version",
     "v2-to-v3:before-commit",
     "v2-to-v3:after-commit",
+)
+V4_TO_V5_FAULT_OBSERVATIONS = (
+    "v4-to-v5:after-begin",
+    "v4-to-v5:after-table",
+    "v4-to-v5:after-triggers",
+    "v4-to-v5:after-fingerprint",
+    "v4-to-v5:after-user-version",
+    "v4-to-v5:before-commit",
+    "v4-to-v5:after-commit",
 )
 V4_ADMISSION_PRECOMMIT_CUTPOINTS = (
     "after-begin",
@@ -276,6 +319,21 @@ class AdmissionReceipt:
 
 
 @dataclass(frozen=True, slots=True)
+class LessonUseAttribution:
+    """Immutable pre-launch use of one promoted advisory receipt."""
+
+    stage_identity: str
+    repository: str
+    stage: str
+    subject_revision: str
+    briefing_id: str
+    briefing_digest: str
+    promotion_receipt_id: str
+    method_revision: str
+    attribution_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionResult:
     successor: Record
     admission_receipt: AdmissionReceipt
@@ -392,6 +450,35 @@ class Store:
         except (OSError, sqlite3.DatabaseError) as exc:
             raise StoreUnavailable(f"cannot open continuation store: {exc}") from exc
 
+    @staticmethod
+    def load_lesson_use_attributions_read_only(path: Path | str) -> dict[str, LessonUseAttribution]:
+        """Read immutable advisory-use facts without opening the mutable coordinator owner."""
+        store_path = Path(path)
+        try:
+            conn = sqlite3.connect(f"{store_path.resolve().as_uri()}?mode=ro", uri=True)
+            try:
+                if (conn.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+                        or _schema_fingerprint(conn) != _expected_schema_fingerprint(SCHEMA_VERSION)):
+                    raise StoreUnavailable("store schema does not match the accepted schema")
+                rows = conn.execute(
+                    "SELECT r.data, a.stage_identity, a.repository, a.stage, a.subject_revision, "
+                    "a.briefing_id, a.briefing_digest, a.promotion_receipt_id, "
+                    "a.method_revision, a.attribution_digest FROM lesson_use_attributions AS a "
+                    "LEFT JOIN records AS r ON r.identity=a.stage_identity").fetchall()
+                values = {}
+                for row in rows:
+                    record = Store._decode(row[0])
+                    attribution = LessonUseAttribution(*row[1:])
+                    Store._validate_lesson_use(attribution, record)
+                    values[attribution.stage_identity] = attribution
+                return values
+            finally:
+                conn.close()
+        except StoreUnavailable:
+            raise
+        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+            raise StoreUnavailable("lesson use attribution is unreadable") from exc
+
     def _connect(self) -> sqlite3.Connection:
         # A fully-initialized store is published atomically: it is built in a private temp
         # file under the same directory, then linked into place without replacement. The final path therefore
@@ -426,12 +513,18 @@ class Store:
                     raise StoreUnavailable("store schema 3 does not match the migration source")
                 self._migrate_v3_to_v4(conn)
                 version = 4
+            if version == 4:
+                if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
+                    conn.close()
+                    raise StoreUnavailable("store schema 4 does not match the migration source")
+                self._migrate_v4_to_v5(conn)
+                version = 5
             if version != SCHEMA_VERSION:
                 conn.close()
                 raise StoreUnavailable(f"store schema {version} is not readable")
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(SCHEMA_VERSION):
                 conn.close()
-                raise StoreUnavailable("store schema 4 does not match the accepted schema")
+                raise StoreUnavailable("store schema does not match the accepted schema")
         except sqlite3.DatabaseError as e:  # corrupt file, locked-beyond-wait, unreadable
             raise StoreUnavailable(f"cannot open continuation store: {e}") from e
         return conn
@@ -495,7 +588,10 @@ class Store:
             conn.execute(_ADMISSION_RECEIPTS_SCHEMA)
             conn.execute(_ADMISSION_RECEIPTS_NO_UPDATE)
             conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
-            if _schema_fingerprint(conn) != _expected_schema_fingerprint(4):
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_SCHEMA)
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_UPDATE)
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_DELETE)
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(5):
                 raise sqlite3.DatabaseError("initialized coordinator schema was not accepted")
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             conn.execute("COMMIT")
@@ -564,6 +660,32 @@ class Store:
             conn.execute("COMMIT")
             committed = True
             Store._migration_checkpoint("v3-to-v4:after-commit")
+        except BaseException:
+            if not committed and conn.in_transaction:
+                conn.execute("ROLLBACK")
+            raise
+
+    @staticmethod
+    def _migrate_v4_to_v5(conn: sqlite3.Connection) -> None:
+        """Add immutable promoted-briefing use facts without rewriting admissions."""
+        committed = False
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            Store._migration_checkpoint("v4-to-v5:after-begin")
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_SCHEMA)
+            Store._migration_checkpoint("v4-to-v5:after-table")
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_UPDATE)
+            conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_DELETE)
+            Store._migration_checkpoint("v4-to-v5:after-triggers")
+            if _schema_fingerprint(conn) != _expected_schema_fingerprint(5):
+                raise sqlite3.DatabaseError("migrated coordinator schema was not accepted")
+            Store._migration_checkpoint("v4-to-v5:after-fingerprint")
+            conn.execute("PRAGMA user_version = 5")
+            Store._migration_checkpoint("v4-to-v5:after-user-version")
+            Store._migration_checkpoint("v4-to-v5:before-commit")
+            conn.execute("COMMIT")
+            committed = True
+            Store._migration_checkpoint("v4-to-v5:after-commit")
         except BaseException:
             if not committed and conn.in_transaction:
                 conn.execute("ROLLBACK")
@@ -964,6 +1086,7 @@ class Store:
                         existing.route_id, existing.route_cell_digest,
                         existing.launch_config_digest, safety_state_id)  # type: ignore[arg-type]
                     self._insert_or_validate_admission_receipt(existing.identity, receipt)
+                    self._insert_or_validate_lesson_use(existing, intent.briefing)
                     self._call_admission_callback(
                         self._admission_checkpoint, "after-receipt-before-successor")
                 successor = replace(
@@ -1061,6 +1184,86 @@ class Store:
         facts.update((item.name, getattr(receipt, item.name))
                      for item in fields(AdmissionReceipt))
         return _digest(facts)
+
+    def _insert_or_validate_lesson_use(self, record: Record, briefing) -> LessonUseAttribution | None:
+        """Commit receipt-backed advisory use in the same transaction as the launch reservation."""
+        from agentflow.effective_policy import ReadyBriefing, advisory_stage
+
+        if type(briefing) is not ReadyBriefing:
+            return None
+        lessons = tuple(item for item in briefing.receipts
+                        if advisory_stage(item) == record.stage)
+        if not lessons:
+            return None
+        if len(lessons) != 1:
+            raise AdmissionRefused("invalid_receipt")
+        receipt = lessons[0]
+        values = {
+            "stage_identity": record.identity,
+            "repository": record.repo,
+            "stage": record.stage,
+            "subject_revision": record.subject_revision,
+            "briefing_id": briefing.briefing_id,
+            "briefing_digest": briefing.briefing_digest,
+            "promotion_receipt_id": receipt.receipt_id,
+            "method_revision": receipt.authority.revision,
+        }
+        attribution = LessonUseAttribution(
+            **values, attribution_digest=_digest({"domain": "lesson-use-attribution-v1", **values}))
+        row = self._conn.execute(
+            "SELECT repository, stage, subject_revision, briefing_id, briefing_digest, "
+            "promotion_receipt_id, method_revision, attribution_digest "
+            "FROM lesson_use_attributions WHERE stage_identity=?", (record.identity,)).fetchone()
+        if row is not None:
+            prior = LessonUseAttribution(record.identity, *row)
+            if prior != attribution:
+                raise AdmissionRefused("briefing_mismatch")
+            return prior
+        self._conn.execute(
+            "INSERT INTO lesson_use_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            tuple(getattr(attribution, item.name) for item in fields(LessonUseAttribution)))
+        return attribution
+
+    def read_lesson_use_attribution(self, stage_identity: str) -> LessonUseAttribution | None:
+        """Read one immutable promoted-briefing use without exposing coordinator internals."""
+        if type(stage_identity) is not str or not stage_identity:
+            raise StoreUnavailable("lesson use attribution is unreadable")
+        with self._lock:
+            try:
+                row = self._conn.execute(
+                    "SELECT r.data, a.repository, a.stage, a.subject_revision, a.briefing_id, "
+                    "a.briefing_digest, a.promotion_receipt_id, a.method_revision, "
+                    "a.attribution_digest FROM lesson_use_attributions AS a JOIN records AS r "
+                    "ON r.identity=a.stage_identity WHERE a.stage_identity=?",
+                    (stage_identity,)).fetchone()
+                if row is None:
+                    if self._conn.execute(
+                            "SELECT 1 FROM lesson_use_attributions WHERE stage_identity=?",
+                            (stage_identity,)).fetchone() is not None:
+                        raise ValueError("orphan lesson use attribution")
+                    return None
+                record = self._decode(row[0])
+                value = LessonUseAttribution(stage_identity, *row[1:])
+                self._validate_lesson_use(value, record)
+                return value
+            except (sqlite3.DatabaseError, TypeError, ValueError) as error:
+                raise StoreUnavailable("lesson use attribution is unreadable") from error
+
+    @staticmethod
+    def _validate_lesson_use(value: LessonUseAttribution, record: Record) -> None:
+        source = {item.name: getattr(value, item.name) for item in fields(LessonUseAttribution)
+                  if item.name != "attribution_digest"}
+        if (type(record) is not Record or value.stage_identity != record.identity
+                or (value.repository, value.stage, value.subject_revision) != (
+                    record.repo, record.stage, record.subject_revision)
+                or not _SUBJECT_REVISION.fullmatch(value.subject_revision)
+                or not _LOWER_DIGEST.fullmatch(value.briefing_digest)
+                or value.briefing_id != f"briefing-v1:{value.briefing_digest}"
+                or not value.promotion_receipt_id
+                or not _SUBJECT_REVISION.fullmatch(value.method_revision)
+                or value.attribution_digest != _digest(
+                    {"domain": "lesson-use-attribution-v1", **source})):
+            raise ValueError("invalid lesson use attribution")
 
     def read_admission_receipt(self, stage_identity: str) -> AdmissionReceipt | None:
         """Read one immutable admission authority tuple through Store's public interface."""
@@ -1509,7 +1712,7 @@ def _schema_fingerprint(conn: sqlite3.Connection) -> tuple[tuple[str, str, str, 
 
 
 def _expected_schema_fingerprint(version: int) -> tuple[tuple[str, str, str, str], ...]:
-    if version in (2, 3, 4):
+    if version in (2, 3, 4, 5):
         from agentflow.canary_attribution import (
             STORE_V2_SCHEMA_FINGERPRINT,
             STORE_V3_SCHEMA_FINGERPRINT,
@@ -1518,7 +1721,7 @@ def _expected_schema_fingerprint(version: int) -> tuple[tuple[str, str, str, str
             return STORE_V2_SCHEMA_FINGERPRINT
         if version == 3:
             return STORE_V3_SCHEMA_FINGERPRINT
-        return STORE_V4_SCHEMA_FINGERPRINT
+        return STORE_V4_SCHEMA_FINGERPRINT if version == 4 else STORE_V5_SCHEMA_FINGERPRINT
     conn = sqlite3.connect(":memory:", isolation_level=None)
     try:
         conn.execute(_RECORDS_SCHEMA)

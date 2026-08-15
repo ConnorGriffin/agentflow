@@ -432,7 +432,8 @@ def _capability_preflight(record, materialize: bool):
     return preflight(inspection_root, record.stage, record.pool, requirements)
 
 
-def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None) -> Coordinator:
+def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None,
+                      evidence_store=None) -> Coordinator:
     """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
     Its Build adapter verifies the real PR outcome and reuses the retained worktree; its Review
     adapter verifies a durable starting/final-head verdict and retains the detached bounded-fix
@@ -441,12 +442,52 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
     same branch and releases the change claim on completion; its Mockup adapter verifies one
     pushed visual round and releases its drawing claim at the human-pick boundary. One
     :class:`StageRouter` dispatches each adapter call on the record's stage."""
+    if evidence_store is None and repositories is not None:
+        from agentflow.evidence import EvidenceStore
+        evidence_store = EvidenceStore()
+
+    def terminal_evidence(record, _obs):
+        if evidence_store is None:
+            return
+        from hashlib import sha256
+        from agentflow.evidence_pipeline import EvidenceProducer, StageFact
+
+        outcome = (coordinated_research.read_findings(record)
+                   if record.stage == "research" else record.outcome)
+        if not outcome:
+            return
+        producer = EvidenceProducer(evidence_store, repository=record.repo)
+        source = producer.stage_source(
+            record.identity, record.stage, str(record.subject), record.subject_revision,
+            sha256((record.input_ptr or "").encode()).hexdigest(),
+            observed_at=max(0, record.started_at))
+        signature = sha256(outcome.encode()).hexdigest()
+        producer.stage(StageFact(
+            record.identity, record.stage, source, signature, "model_judged",
+            max(0, record.started_at),
+            objection_ref=signature if record.stage == "attack" else ""))
+
+    def review_evidence(record, obs):
+        if evidence_store is None:
+            return
+        from agentflow.evidence_pipeline import EvidenceProducer
+        coordinated_review.record_evidence(
+            EvidenceProducer(evidence_store, repository=record.repo), record, obs)
+
+    def revise_evidence(record, obs):
+        if evidence_store is None:
+            return
+        from agentflow.evidence_pipeline import EvidenceProducer
+        coordinated_revise.record_evidence(
+            EvidenceProducer(evidence_store, repository=record.repo), record, obs)
+
     intake = IntakeStageAdapter(
         worktree_reset=coordinated_intake.reset_worktree,
         apply_route=coordinated_intake.apply_route,
         claim_ready=coordinated_intake.intake_claim_ready,
         worktree_dispose=coordinated_intake.dispose_worktree,
-        handoff=coordinated_intake.hold_intake)
+        handoff=coordinated_intake.hold_intake,
+        evidence=terminal_evidence if evidence_store is not None else None)
     build = BuildStageAdapter(
         pr_exists=coordinated_build._pr_exists, worktree_ready=worktree_ready,
         handoff=coordinated_build._hold_build,
@@ -457,11 +498,14 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
         worktree_reset=coordinated_review._review_worktree_reset,
         handoff=park_pr,
         settle=coordinated_review._settle_review,
-        prepare_settle=coordinated_review._prepare_review_settlement)
+        prepare_settle=coordinated_review._prepare_review_settlement,
+        evidence=review_evidence if evidence_store is not None else None,
+        capture_state=coordinated_review.capture_verdict_state)
     revise = ReviseStageAdapter(
         revision_ready=coordinated_revise._revision_ready, worktree_ready=worktree_ready,
         handoff=park_pr,
-        uncertainty=coordinated_revise._conflict_uncertainty_outcome)
+        uncertainty=coordinated_revise._conflict_uncertainty_outcome,
+        evidence=revise_evidence if evidence_store is not None else None)
     respond = RespondStageAdapter(
         reply_ready=coordinated_respond._reply_ready, worktree_ready=worktree_ready,
         handoff=coordinated_respond._park_respond,
@@ -482,13 +526,15 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
         findings_ready=coordinated_research._findings_ready,
         resolve=coordinated_research.resolve,
         park=coordinated_research.park,
-        worktree_ready=coordinated_research._research_worktree_ready)
+        worktree_ready=coordinated_research._research_worktree_ready,
+        evidence=terminal_evidence if evidence_store is not None else None)
     attack = AttackStageAdapter(
         worktree_reset=coordinated_attack.reset_worktree,
         apply_objections=coordinated_attack.apply_objections,
         claim_ready=coordinated_attack.attack_claim_ready,
         worktree_dispose=coordinated_attack.dispose_worktree,
-        handoff=coordinated_attack.hold_attack)
+        handoff=coordinated_attack.hold_attack,
+        evidence=terminal_evidence if evidence_store is not None else None)
     router = StageRouter({"intake": intake, "build": build, "review": review, "revise": revise,
                           "respond": respond, "mockup": mockup, "converse": converse,
                           "research": research, "attack": attack})

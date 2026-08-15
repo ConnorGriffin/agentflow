@@ -42,10 +42,15 @@ class ResearchStageAdapter(StageAdapter):
     required_outcome = "recorded findings for the ticket"
 
     def __init__(self, *, findings_ready, resolve=None, park=None, worktree_ready=None,
-                 observer=None) -> None:
+                 observer=None, evidence=None) -> None:
         super().__init__(outcome_ready=findings_ready, worktree_ready=worktree_ready,
                          observer=observer, handoff=park)
         self._resolve = resolve
+        self._evidence = evidence
+
+    def project_outcome(self, record, obs) -> None:
+        if self._evidence is not None:
+            self._evidence(record, obs)
 
     def finalize_completed(self, record) -> str | None:
         """Durably route the findings, then retire the run with no successor.

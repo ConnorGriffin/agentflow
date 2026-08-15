@@ -1085,6 +1085,17 @@ class Coordinator:
             if type(briefing) is HoldBriefing:
                 from agentflow.coordinator.store import AdmissionRefused
                 raise AdmissionRefused(briefing.hold_code)
+            from agentflow.effective_policy import ReadyBriefing
+            if type(briefing) is ReadyBriefing:
+                from agentflow.prompts import stage_prompt_spec
+                try:
+                    record.input_ptr = stage_prompt_spec(record.stage).with_briefing(
+                        record.input_ptr or "", briefing)
+                except ValueError:
+                    from agentflow.coordinator.store import AdmissionRefused
+                    raise AdmissionRefused("briefing_mismatch") from None
+                if not self._persist(record):
+                    return None
         common = {
             "identity": record.identity,
             "expected_launch_token": record.launch_token,
@@ -1230,6 +1241,9 @@ class Coordinator:
             if not self._persist(record):  # parsed outcome precedes any external projection
                 return None
         if verified:
+            project_outcome = getattr(self._adapter, "project_outcome", None)
+            if project_outcome is not None:
+                project_outcome(record, obs)
             record.state = COMPLETED
             if not self._persist(record, retire_descendants=True):
                 return None
