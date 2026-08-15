@@ -212,7 +212,9 @@ class Coordinator:
     ``cycle`` reconciles first — returning the completed outcomes and holds that reconciliation
     settled — then admits eligible continuations ahead of cold work with strict head-of-line
     blocking, starting each through the crash-safe launcher. If the store is unreadable the
-    constructor raises and the caller starts nothing and clears no claim (fail-closed).
+    constructor raises and the caller starts nothing and clears no claim (fail-closed). A
+    production composition may also declare the repositories it manages; that coordinator then
+    leaves other durable records for their owning composition to reconcile and admit.
 
     It depends on three cohesive collaborators, injected only so the crash boundaries can be
     exercised with fakes: a **launcher** that starts a provider family and reports its
@@ -226,7 +228,8 @@ class Coordinator:
     def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None, log=None,
                  daemon_generation: str | None = None,
                  disabled_cold_stages: frozenset[str] = frozenset(), store=None,
-                 route_selector=None, briefing_resolver=None) -> None:
+                 route_selector=None, briefing_resolver=None,
+                 managed_repositories: frozenset[str] | None = None) -> None:
         # Production injects its one composed Store; bare coordinators retain the historical
         # no-admission Store for focused coordinator tests and legacy state readability.
         self._store = store or Store(default_store_path())
@@ -248,6 +251,11 @@ class Coordinator:
         # already started. The coordinator owns the distinction: only truly cold, never-started
         # records are discarded; continuations and restart-resumes remain eligible.
         self._disabled_cold_stages = disabled_cold_stages
+        # A loop helper owns one configured repository but shares the durable Store with the
+        # dispatch coordinator. Its policy resolver is intentionally only configured for that
+        # repository, so it must never mutate a record owned by another helper/composition.
+        # ``None`` retains the historical all-record behavior for bare coordinators and tests.
+        self._managed_repositories = managed_repositories
         self._log = log or (lambda _line: None)
         self._lock = threading.RLock()
         self._records: dict[str, Record] = self._store.load()
@@ -264,9 +272,28 @@ class Coordinator:
 
     # --- public interface ---------------------------------------------------------------
 
+    def _manages_repository(self, repo: str) -> bool:
+        """Whether this coordinator owns durable work for ``repo``.
+
+        An unscoped coordinator is the complete, by-hand composition and retains ownership of
+        every record. Production helpers are scoped to their configured repository map.
+        """
+        return self._managed_repositories is None or repo in self._managed_repositories
+
+    def _require_managed_repository(self, repo: str) -> None:
+        """Reject a submission outside this composition before it reaches any collaborator."""
+        if not self._manages_repository(repo):
+            raise ValueError("submission repository is outside this coordinator's configured "
+                             "repositories")
+
+    def _owned_record(self, record: "Record | None") -> "Record | None":
+        """Return an identity lookup only when this composition is allowed to mutate it."""
+        return record if record is not None and self._manages_repository(record.repo) else None
+
     def submit_stage(self, submission: Submission) -> str:
         """Submit one logical stage's facts; returns its stable identity. Idempotent — a
         repeated submission for the same identity never duplicates work."""
+        self._require_managed_repository(submission.repo)
         stage = normalize_stage(submission.stage)
         review = submission.review or ReviewState(
             change_author_tool=submission.builder_lineage)
@@ -360,7 +387,7 @@ class Coordinator:
         (or a completed transfer) is never freed or revived. Idempotent and a no-op for any started
         or absent record: a repeat finds the slot already free."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.state != WAITING
                     or record.attempts != 0 or record.start_fact not in {None, NOT_STARTED}
                     or record.process_alive):
@@ -382,7 +409,7 @@ class Coordinator:
         completed stage awaiting a transfer. Idempotent and crash-safe: a repeat re-observes the
         durable handoff and neither re-notifies nor double-releases the claim."""
         with self._lock:
-            record = self._records.get(identity)
+            record = self._owned_record(self._records.get(identity))
             if record is None or record.retired or record.state != COMPLETED:
                 return None
             if not record.hold_pending:
@@ -401,7 +428,7 @@ class Coordinator:
         its claim with no park comment and no notification. Idempotent: a repeat finds it already
         retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "review"
                     or not record.claim):
                 return False
@@ -424,7 +451,7 @@ class Coordinator:
         would leave that handoff pending and silently retrying forever. Idempotent: a repeat finds
         it already retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "revise"
                     or not record.claim):
                 return False
@@ -448,7 +475,7 @@ class Coordinator:
         too — a held triage of a closed issue asks a human for a decision nobody can act on.
         Idempotent: a repeat finds it already retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage not in ("intake", "attack")
                     or not record.claim):
                 return False
@@ -470,7 +497,7 @@ class Coordinator:
         called for an open PR. Idempotent and crash-safe: a repeat re-observes the durable park and
         neither re-notifies nor double-releases the claim."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "review"
                     or not record.claim):
                 return None
@@ -500,7 +527,8 @@ class Coordinator:
             outcomes = self._reconcile()
             self._discard_disabled_cold_stages()
             waiting = [r for r in self._records.values()
-                       if r.pool == pool and r.state == WAITING and not r.hold_pending
+                       if self._manages_repository(r.repo)
+                       and r.pool == pool and r.state == WAITING and not r.hold_pending
                        and r.root is None]  # descendants share the root's reservation, never admit
             # Admission ranks each queue in three tiers (ADR 0039). An operator's interactive turn
             # (an Ask) outranks all background pipeline work (ADR 0034): it sorts to the head of
@@ -544,7 +572,8 @@ class Coordinator:
         attempt count is zero and capacity delays its restart.
         """
         for record in list(self._records.values()):
-            if (record.stage not in self._disabled_cold_stages or record.state != WAITING
+            if (not self._manages_repository(record.repo)
+                    or record.stage not in self._disabled_cold_stages or record.state != WAITING
                     or record.continuation or record.attempts != 0 or record.restart_resumes != 0
                     or record.start_fact not in {None, NOT_STARTED} or record.process_alive):
                 continue
@@ -564,8 +593,9 @@ class Coordinator:
         self._records = self._store.load()
         outcomes: list[StageOutcome] = []
         for record in list(self._records.values()):
-            if (launched is not None
-                    and (record.identity, record.launch_token) not in launched):
+            if (not self._manages_repository(record.repo)
+                    or (launched is not None
+                    and (record.identity, record.launch_token) not in launched)):
                 continue
             if record.hold_pending:
                 outcome = self._finalize_hold(record)
@@ -910,7 +940,8 @@ class Coordinator:
         pool's cycle."""
         candidates = [
             r for r in self._records.values()
-            if r.state == WAITING and not r.hold_pending and r.root is None
+            if self._manages_repository(r.repo)
+            and r.state == WAITING and not r.hold_pending and r.root is None
             and r.eligible_at <= now
             and r.pool != pool and self._may_migrate(r, pool)
             and self._pool_cannot_fit(r)]
@@ -1005,7 +1036,9 @@ class Coordinator:
         permits are per-pool. Coupling pools here would invite a cross-pool deadlock. A gate-blocked
         autonomous review deliberately stays waiting for its required independent tool without
         consuming permits; reviewed-profile same-tool fallback is selected before submission."""
-        return pr_bound_waiting(self._records.values(), pool, now)
+        return pr_bound_waiting(
+            (record for record in self._records.values()
+             if self._manages_repository(record.repo)), pool, now)
 
     def _begin_start(self, record: Record, now: int, *, capability=None):
         if (record.state != WAITING or record.hold_pending

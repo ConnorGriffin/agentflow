@@ -157,6 +157,21 @@ def test_repository_overlay_retries_show_timeout_once_and_reports_sanitized_diag
     assert "secret" not in diagnostics[0]
 
 
+def test_repository_overlay_reports_lookup_diagnostic_for_unconfigured_repository(tmp_path):
+    diagnostics = []
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: tmp_path}, on_diagnostic=diagnostics.append)
+
+    with pytest.raises(PolicyValidationError, match="repository or revision is unavailable"):
+        source.read("other/repo", REVISION)
+
+    assert len(diagnostics) == 1
+    assert "repository=other/repo" in diagnostics[0]
+    assert f"revision={REVISION}" in diagnostics[0]
+    assert "phase=lookup" in diagnostics[0]
+    assert str(tmp_path) not in diagnostics[0]
+
+
 def test_repository_overlay_retries_ls_tree_oserror_once_then_returns_absent_quietly(
         tmp_path, monkeypatch):
     root = tmp_path / "repo"

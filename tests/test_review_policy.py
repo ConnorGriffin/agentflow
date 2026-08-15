@@ -987,7 +987,7 @@ def test_taint_recovery_chooses_only_latest_forced_autonomous_record(monkeypatch
     submitted = []
 
     coordinated_review._resume_tainted_reviews(
-        SimpleNamespace(submit_stage=submitted.append))
+        SimpleNamespace(submit_stage=submitted.append, _manages_repository=lambda _repo: True))
 
     assert chosen == ["latest"]
     assert len(submitted) == 1

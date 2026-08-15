@@ -412,18 +412,22 @@ def test_real_launcher_spawns_a_provider_and_the_start_is_durable(coord_state):
 
 
 
-def test_real_launcher_recovers_an_instantly_exited_provider_in_its_launch_cycle(
+def test_real_launcher_recovers_a_known_dead_family_in_its_launch_cycle(
         coord_state):
-    """An exited real provider is recovered in its launch cycle, without a restart."""
+    """A real launch whose liveness is known dead recovers in its launch cycle."""
+    class KnownDeadFamilyLauncher(LocalLauncher):
+        def is_alive(self, _family):
+            return False
+
     exiting_provider = lambda record: [sys.executable, "-c", ""]
-    coord = Coordinator(launcher=LocalLauncher(exiting_provider, timeout=5))
+    coord = Coordinator(launcher=KnownDeadFamilyLauncher(exiting_provider, timeout=5))
     identity = coord.submit_stage(review(pool="claude"))
 
     assert coord.cycle("claude") == []
     durable = record_of(coord, identity)
 
-    # The start fact and family prove LocalLauncher started the real provider before
-    # the same-cycle liveness observation recovered its vanished process family.
+    # The start fact and family prove LocalLauncher completed the real bootstrap handshake;
+    # the injected liveness seam makes the final same-cycle observation deterministic.
     assert durable.start_fact == "started" and durable.family is not None
     assert durable.state == "waiting" and durable.continuation and durable.claim
     assert not durable.process_alive

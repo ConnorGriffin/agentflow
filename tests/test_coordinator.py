@@ -48,6 +48,40 @@ def test_submission_binds_one_subject_revision_and_route_through_store_seam_befo
     assert len(calls) == 1
 
 
+def test_scoped_coordinator_rejects_foreign_submission_without_persistence(make_coord):
+    route_selections = []
+    coord = make_coord(
+        FakeSession(), managed_repositories=frozenset({"owner/b"}),
+        route_selector=lambda *args, **kwargs: route_selections.append((args, kwargs)))
+
+    with pytest.raises(ValueError, match="outside this coordinator's configured repositories"):
+        coord.submit_stage(Submission(
+            repo="owner/a", subject="680", stage="build", pool="claude", effort="low",
+            subject_revision="a" * 40))
+
+    assert coord._store.load() == {}
+    assert route_selections == []
+
+
+def test_scoped_coordinator_cannot_withdraw_foreign_identity(make_coord, monkeypatch):
+    owner = make_coord(FakeSession())
+    identity = owner.submit_stage(Submission(
+        repo="owner/a", subject="680", stage="build", pool="claude", effort="low"))
+    before = owner.stage_record(identity)
+    assert before is not None
+    discard_calls = []
+    original_discard = Store.discard
+    monkeypatch.setattr(
+        Store, "discard", lambda store, record: discard_calls.append(record) or
+        original_discard(store, record))
+    scoped = make_coord(FakeSession(), managed_repositories=frozenset({"owner/b"}))
+
+    assert scoped.withdraw_stage(identity) is False
+
+    assert scoped.stage_record(identity) == before
+    assert discard_calls == []
+
+
 @pytest.mark.parametrize("provider", ("claude", "codex"))
 def test_nonready_capability_preflight_holds_before_admission_and_survives_restart(
         make_coord, provider):
