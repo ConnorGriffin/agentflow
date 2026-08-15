@@ -153,6 +153,16 @@ def _validate_plan(plan: SandboxPlan) -> None:
             raise ValueError(f"external literal admission rejected: {candidate}")
 
 
+def _metadata_ancestors(plan: SandboxPlan) -> tuple[Path, ...]:
+    ancestors: dict[Path, None] = {}
+    for path in (*plan.read_literals, *plan.read_subpaths, *plan.write_subpaths):
+        ancestor = _absolute(path).parent
+        while ancestor != Path("/"):
+            ancestors.setdefault(ancestor, None)
+            ancestor = ancestor.parent
+    return tuple(ancestors)
+
+
 def _profile(plan: SandboxPlan) -> str:
     _validate_plan(plan)
     clauses = [
@@ -164,6 +174,7 @@ def _profile(plan: SandboxPlan) -> str:
     ]
     if plan.network:
         clauses += ['(allow network-outbound (remote tcp "*:443"))', '(allow network-outbound (remote udp "*:53"))']
+    clauses += [f"(allow file-read-metadata (literal {_quoted(path)}))" for path in _metadata_ancestors(plan)]
     clauses += [f"(allow file-read* (literal {_quoted(path)}))" for path in plan.read_literals]
     clauses += [f"(allow file-read* (subpath {_quoted(path)}))" for path in plan.read_subpaths]
     clauses += [f"(allow file-read* (literal {_quoted(path)}))" for path in plan.write_subpaths]

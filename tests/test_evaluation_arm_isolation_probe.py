@@ -102,6 +102,37 @@ def test_profile_grants_each_writable_root_object_and_subpath_without_its_parent
     assert f"(allow file-write* (literal {json.dumps(str(parent.resolve()))}))" not in profile
 
 
+def test_profile_grants_only_exact_metadata_ancestors(tmp_path):
+    probe = _load_probe()
+    parent = tmp_path / "parent"; source = parent / "task" / "source"; writable = parent / "task" / "provider" / "codex"
+    sibling, oracle = parent / "sibling", parent / "oracle"
+    source.mkdir(parents=True); writable.mkdir(parents=True); sibling.mkdir(); oracle.mkdir()
+    plan = probe.SandboxPlan((source,), (Path("/bin/sh"),), (writable,), parent, False)
+    profile = probe._profile(plan)
+
+    expected = {parent, parent / "task", parent / "task" / "provider", Path("/bin")}
+    for ancestor in expected:
+        assert f"(allow file-read-metadata (literal {json.dumps(str(ancestor))}))" in profile
+    assert '(allow file-read-metadata (literal "/"))' not in profile
+    assert str(sibling) not in profile and str(oracle) not in profile
+    assert "file-read-metadata (subpath" not in profile
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="sandbox-exec is macOS-only")
+def test_local_profile_canonicalizes_a_task_owned_provider_configuration_directory(tmp_path):
+    probe = _load_probe()
+    parent = tmp_path / "parent"; root = parent / "task"; source = root / "source"
+    source.mkdir(parents=True)
+    _, writable = probe._task_environment(root, "codex")
+    configuration = root / "provider" / "codex"
+    profile = probe._profile(probe._plan(parent, source, writable, None))
+
+    run = probe._run_bounded(probe._profile_command(profile, ["/bin/sh", "-c", "cd \"$1\" && pwd -P", "sh", str(configuration)]), cwd=source, env={}, timeout=10)
+
+    assert run["outcome"] == "exited" and run["exit_status"] == 0
+    assert run["stdout"].decode("utf-8").strip() == str(configuration)
+
+
 def test_no_profile_admits_mach_lookup(tmp_path, monkeypatch):
     probe = _load_probe()
     executables = {provider: tmp_path / provider for provider in ("claude", "codex")}
