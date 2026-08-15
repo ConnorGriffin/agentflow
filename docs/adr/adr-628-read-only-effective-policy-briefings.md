@@ -71,8 +71,10 @@ overlays can restrict but never widen fleet policy. Promotion and Evaluation rem
 permit acquisition.
 
 Issue #571 adds one consumer check without widening resolver authority: a promoted method's exact
-artifact locator scopes it to its owning stage. Unrelated stages ignore that receipt for prompt
-consumption and use attribution. Before Review uses its advisory receipt, its stage prompt verifies
-that the locator and SHA-256 name the deployed Review methodology artifact. The briefing still
-delivers only receipt authority and never method prose. A mismatch refuses before admission, and
-Store records the same receipt and method revision only after this check succeeds.
+artifact locator scopes it to its owning stage before the resolver constructs the stage briefing.
+Unrelated stages therefore keep the same briefing identity, prompt, admission receipt, and absence
+of use attribution before and after that method is promoted. Before Review uses its advisory
+receipt, its stage prompt verifies that the locator and SHA-256 name the deployed Review
+methodology artifact. The briefing still delivers only receipt authority and never method prose.
+A mismatch refuses before admission, and Store records the same receipt and method revision only
+after this check succeeds.

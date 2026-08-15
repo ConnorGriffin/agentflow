@@ -47,7 +47,8 @@ class StagePromptSpec:
 
     def with_briefing(self, prompt: str, briefing: object) -> str:
         """Append one resolver-validated, receipt-only advisory context to a stage prompt."""
-        from agentflow.effective_policy import ReadyBriefing, advisory_stage, validate_briefing
+        from agentflow.effective_policy import (
+            ReadyBriefing, advisory_stage, receipt_applies_to_stage, validate_briefing)
 
         if type(briefing) is not ReadyBriefing or not validate_briefing(briefing):
             raise ValueError("briefing is not an approved advisory authority")
@@ -67,8 +68,7 @@ class StagePromptSpec:
                     or not authority.locator.endswith(f"/files/{method_path}")):
                 raise ValueError("briefing method authority does not match the deployed artifact")
         applicable = tuple(item for item in briefing.receipts
-                           if item.candidate_id == "evaluation-contract-v1"
-                           or advisory_stage(item) == self.stage)
+                           if receipt_applies_to_stage(item, self.stage))
         if not applicable:
             return prompt
         marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"

@@ -23,10 +23,11 @@ from agentflow.coordinator.revise_stage import ReviseStageAdapter
 from agentflow.coordinator.store import OperationalSafetyAndCanary, SafetySources, Store
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.effective_policy import (
-    CapabilityRequirement, EffectivePolicyResolver, FleetPolicyV1, ReadyBriefing)
+    PINNED_EVALUATION_POLICY, CapabilityRequirement, EffectivePolicyResolver,
+    FleetPolicyV1, ReadyBriefing)
 from agentflow.evidence import (
     ApprovedAuthority, AuthorityPointer, EvidenceError, EvidenceReceiptReader, EvidenceStore,
-    FakeAuthorityVerifier, PromotionReceiptReader)
+    FakeAuthorityVerifier, PromotionReceipt, PromotionReceiptReader)
 from agentflow.evidence_pipeline import EvidenceMiner, EvidenceProducer, LessonInput
 from agentflow.learning import report
 from agentflow.prompts import stage_prompt_spec
@@ -50,6 +51,15 @@ METHOD_APPROVAL = ApprovedAuthority(
 class _NoOverlay:
     def read(self, _repository, _revision):
         return None
+
+
+class _PromotionReceipts:
+    def __init__(self, stored, fixed):
+        self.stored = stored
+        self.fixed = {item.receipt_id: item for item in fixed}
+
+    def read(self, receipt_id):
+        return self.fixed.get(receipt_id) or self.stored.read(receipt_id)
 
 
 class _Observer:
@@ -132,6 +142,20 @@ def _revise_record(review: Record) -> Record:
 def _ready(record, _materialize):
     fact = _ready_fact(record.stage, record.pool, b"issue-571-manifest", ())
     return CapabilityPreflightResult(record.stage, record.pool, (), "ready", (), "", fact)
+
+
+def _promotion_receipt(receipt):
+    authority = receipt.authority
+    pointer = AuthorityPointer(
+        authority.authority_kind, authority.repository, authority.locator, authority.revision,
+        authority.content_hash_algorithm, authority.content_hash, authority.scope)
+    approved = ApprovedAuthority(
+        pointer, authority.approval_id, authority.approved_revision, authority.approved_hash,
+        authority.approved_scope, authority.verifier_id, authority.verifier_version,
+        authority.outcome)
+    return PromotionReceipt(
+        receipt.receipt_id, receipt.candidate_id, receipt.approval_id,
+        receipt.policy_version, approved, receipt.authoritative)
 
 
 def test_production_router_wires_terminal_intake_attack_and_research_evidence(tmp_path):
@@ -241,8 +265,15 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
     assert promoted.authoritative and promoted.authority == METHOD_APPROVAL
     assert promoted.authority.approved_hash == sha256(METHOD_ARTIFACT.read_bytes()).hexdigest()
 
-    promotion_reader = PromotionReceiptReader(path=evidence_path)
-    policy = FleetPolicyV1(1, (EffectivePolicyResolver._receipt_value(promoted),), ())
+    stored_promotion_reader = PromotionReceiptReader(path=evidence_path)
+    evaluation_receipt = PINNED_EVALUATION_POLICY.receipts[0]
+    promotion_reader = _PromotionReceipts(
+        stored_promotion_reader, (_promotion_receipt(evaluation_receipt),))
+    policy_receipts = tuple(sorted(
+        (evaluation_receipt, EffectivePolicyResolver._receipt_value(promoted)),
+        key=lambda item: json.dumps(item.value(), sort_keys=True, separators=(",", ":"))))
+    policy = FleetPolicyV1(
+        1, policy_receipts, PINNED_EVALUATION_POLICY.capabilities)
     implementation = inspect.getclosurevars(
         EffectivePolicyResolver.brief_for).nonlocals["implementation"]
 
@@ -254,7 +285,7 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
         promotion_receipts=promotion_reader, overlay_source=_NoOverlay())
     briefing = resolver.brief_for(REPOSITORY, "review", "f" * 40)
     assert isinstance(briefing, ReadyBriefing)
-    assert briefing.receipts[0].receipt_id == promoted.receipt_id
+    assert promoted.receipt_id in {item.receipt_id for item in briefing.receipts}
 
     build = Record(
         "approved-method-build", "build", "claude", 1, repo=REPOSITORY,
@@ -275,9 +306,17 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
 
     unrelated_briefing = resolver.brief_for(REPOSITORY, "research", "9" * 40)
     assert isinstance(unrelated_briefing, ReadyBriefing)
+    evaluation_only_briefing = implementation(
+        resolver, REPOSITORY, "research", "9" * 40, PINNED_EVALUATION_POLICY)
+    assert isinstance(evaluation_only_briefing, ReadyBriefing)
+    assert unrelated_briefing == evaluation_only_briefing
+    assert unrelated_briefing.receipts == (evaluation_receipt,)
     unrelated_prompt = "Research the bounded question."
+    evaluation_only_prompt = stage_prompt_spec("research").with_briefing(
+        unrelated_prompt, evaluation_only_briefing)
     assert (stage_prompt_spec("research").with_briefing(
-        unrelated_prompt, unrelated_briefing) == unrelated_prompt)
+        unrelated_prompt, unrelated_briefing) == evaluation_only_prompt)
+    assert promoted.receipt_id not in evaluation_only_prompt
 
     unrelated_store = Store(
         tmp_path / "unrelated-stage.db",
