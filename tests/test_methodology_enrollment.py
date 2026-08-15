@@ -26,7 +26,11 @@ def _ready_ui_launch_source(tmp_path):
     """Create an enrolled source with a minimal runnable selected Codex UI runtime."""
     checkout = Path(__file__).parents[1]
     source = tmp_path / "source"
-    shutil.copytree(checkout / ".agents", source / ".agents")
+    shutil.copytree(
+        checkout / ".agents",
+        source / ".agents",
+        ignore=shutil.ignore_patterns("node_modules"),
+    )
     (source / "scripts").mkdir()
     shutil.copy2(checkout / "scripts" / "screenshots.mjs", source / "scripts")
     runtime = source / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
