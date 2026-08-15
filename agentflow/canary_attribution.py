@@ -327,7 +327,7 @@ class CanaryAttributionAuthority:
         }
         attribution = CanaryAttribution(
             **facts, attribution_digest=_digest({"domain": ROW_DIGEST_DOMAIN, **facts}))
-        _validate_attribution(attribution)
+        validate_canary_attribution(attribution)
         try:
             self._conn.execute(
                 "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -355,7 +355,7 @@ class CanaryAttributionAuthority:
             return None
         try:
             attribution = CanaryAttribution(*row)
-            _validate_attribution(attribution)
+            validate_canary_attribution(attribution)
         except (TypeError, ValueError, CanaryAttributionRefused) as error:
             raise CanaryAttributionRefused("corrupt_attribution") from error
         return attribution
@@ -444,6 +444,17 @@ def _receipt_binding_source(receipt: PromotionReceipt, state: CanaryState) -> di
             "generation": state.generation,
         },
     }
+
+
+def validate_canary_attribution(value: object) -> CanaryAttribution:
+    """Validate one content-free attribution row without reading or mutating its owner."""
+    if type(value) is not CanaryAttribution:
+        raise CanaryAttributionRefused("corrupt_attribution")
+    try:
+        _validate_attribution(value)
+    except (TypeError, ValueError) as error:
+        raise CanaryAttributionRefused("corrupt_attribution") from error
+    return value
 
 
 def _validate_attribution(value: CanaryAttribution) -> None:
