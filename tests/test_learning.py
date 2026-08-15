@@ -4,11 +4,14 @@ import json
 import os
 import sqlite3
 import subprocess
+from dataclasses import asdict
 from pathlib import Path
 
 from agentflow.coordinator.record import COMPLETED, HELD, Record
 from agentflow.coordinator.store import SCHEMA_VERSION, Store
-from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt, telemetry_dir
+from agentflow.coordinator.telemetry import (
+    AttemptTelemetry, AttemptUsage, read_attempts, read_attempts_with_health,
+    record_attempt, telemetry_dir)
 from agentflow.review_policy import ReviewAction, ReviewAssignment, ReviewAxis, ReviewFinding, ReviewState
 
 
@@ -138,6 +141,40 @@ def test_learning_report_empty_telemetry_is_complete_and_non_mapping_usage_is_sk
     assert data["status"] == "degraded" and data["telemetry_entries_skipped"] == 1
 
 
+def test_legacy_reader_keeps_non_mapping_usage_while_learning_health_skips_it(tmp_path):
+    path = tmp_path / "records.db"
+    entry = _attempt("legacy", "legacy", finalized=1_704_067_200)
+    payload = entry.__dict__ | {"usage": []}
+    directory = telemetry_dir(path)
+    directory.mkdir()
+    (directory / "legacy.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    (legacy,) = read_attempts(path)
+    strict = read_attempts_with_health(path)
+
+    assert legacy.identity == "legacy" and legacy.usage == AttemptUsage()
+    assert strict.entries == [] and strict.skipped == 1
+
+
+def test_learning_report_skips_bad_timestamps_but_emits_other_facts(tmp_path):
+    state, path, store = _state(tmp_path)
+    for identity in ("good", "bad"):
+        assert store.upsert(Record(identity, "review", "codex", 1, repo="owner/repo",
+                                   subject=identity, state=COMPLETED))
+    store.close()
+    record_attempt(path, _attempt("good", "good", finalized=1_704_067_200))
+    bad = asdict(_attempt("bad", "bad", finalized=1_704_067_200)) | {"started_at": "bad"}
+    (telemetry_dir(path) / "bad.json").write_text(json.dumps(bad), encoding="utf-8")
+
+    result = _run(state, "learning", "report", "--repo", "owner/repo",
+                  "--from", "2024-01-01", "--to", "2024-01-02")
+
+    data = json.loads(result.stdout)
+    assert result.returncode == 0 and data["status"] == "degraded"
+    assert data["telemetry_entries_skipped"] == 1
+    assert [item["subject"] for item in data["subjects"]] == ["good"]
+
+
 def test_learning_required_arguments_and_unavailable_store_exit_two_without_creation(tmp_path):
     state = tmp_path / "state"
     missing = _run(state, "learning", "report")
@@ -162,7 +199,49 @@ def test_learning_rejects_old_store_without_migrating_it(tmp_path):
     assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
 
 
-def test_learning_module_has_no_forbidden_operational_imports():
-    source = (ROOT / "agentflow" / "learning.py").read_text()
-    for forbidden in ("evidence", "promotion", "OperationalSafety", "canary", "admission", "routing", "providers", "github"):
-        assert forbidden not in source
+def test_learning_cli_invokes_no_forbidden_operational_actions(tmp_path, monkeypatch, capsys):
+    from agentflow import cli, github
+    from agentflow.canary_attribution import CanaryAttributionAuthority
+    from agentflow.coordinator import providers
+    from agentflow.evidence import EvidenceStore
+    from agentflow.operational_safety import OperationalSafety
+    from agentflow.review_policy import ReviewState
+
+    state, path, store = _state(tmp_path)
+    assert store.upsert(Record("terminal", "review", "codex", 1, repo="owner/repo",
+                               subject="42", state=COMPLETED))
+    store.close()
+    record_attempt(path, _attempt("terminal", "terminal", finalized=1_704_067_200))
+    monkeypatch.setenv("AGENTFLOW_STATE", str(state))
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("learning report invoked a forbidden operation")
+
+    monkeypatch.setattr(github, "_gh", forbidden)
+    monkeypatch.setattr(providers, "provider_command", forbidden)
+    monkeypatch.setattr(OperationalSafety, "observe", forbidden)
+    monkeypatch.setattr(CanaryAttributionAuthority, "_participate_in_admission", forbidden)
+    monkeypatch.setattr(EvidenceStore, "evaluate", forbidden)
+    monkeypatch.setattr(EvidenceStore, "promote", forbidden)
+    monkeypatch.setattr(ReviewState, "record_fields", forbidden)
+
+    assert cli.main(["learning", "report", "--repo", "owner/repo",
+                     "--from", "2024-01-01", "--to", "2024-01-02"]) == 0
+    assert json.loads(capsys.readouterr().out)["schema"] == "agentflow-learning-report-v1"
+
+
+def test_learning_health_reports_unreadable_directory_as_unknown(tmp_path, monkeypatch):
+    directory = telemetry_dir(tmp_path / "records.db")
+    directory.mkdir()
+    original = Path.iterdir
+
+    def unreadable(path):
+        if path == directory:
+            raise OSError("simulated directory I/O failure")
+        return original(path)
+
+    monkeypatch.setattr(Path, "iterdir", unreadable)
+
+    report = read_attempts_with_health(tmp_path / "records.db")
+
+    assert report.entries == [] and report.skipped is None
