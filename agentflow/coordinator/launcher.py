@@ -38,15 +38,18 @@ class StartResult:
 
 
 def pid_family_alive(family: str | None) -> bool:
-    """Whether a recorded process family is still executing — the liveness signal the
-    worktree-recovery pass already trusts, reused here rather than a second notion."""
+    """Whether the recorded session-leader PID still names its exact process family.
+
+    The launch child calls ``setsid`` before it records its PID, so its PID must also be its
+    process-group ID. A bare PID probe could adopt a later, unrelated process after PID reuse;
+    that mismatch is absent for recovery.
+    """
     if not family:
         return False
     try:
-        os.kill(int(family), 0)
-        return True
-    except PermissionError:
-        return True
+        pid = int(family)
+        os.kill(pid, 0)
+        return os.getpgid(pid) == pid
     except (OSError, ValueError):
         return False
 

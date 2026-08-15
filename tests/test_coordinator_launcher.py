@@ -65,6 +65,14 @@ def test_durable_started_then_dead_recovery_consumes_exactly_one_attempt(make_co
     assert starts_until_held(recovered, fake, identity, "codex") == 2
 
 
+def test_local_launcher_rejects_a_live_pid_that_is_not_its_process_family(monkeypatch):
+    """Recovery must not adopt or signal a PID reused by an unrelated process group."""
+    monkeypatch.setattr(launcher_mod.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(launcher_mod.os, "getpgid", lambda _pid: 12345)
+
+    assert not LocalLauncher.is_alive("89850")
+
+
 @pytest.mark.parametrize(("result", "legacy_exit"), [
     ({"exit_status": 17, "signal": None, "timed_out": False}, None),
     (None, 17),
@@ -133,6 +141,39 @@ def test_durable_started_and_alive_recovery_keeps_the_reservation(make_coord):
     assert permits(recovered, "codex") == 2
     assert recovered.cycle("codex") == []       # idempotent across repeated reconciliation
     assert permits(recovered, "codex") == 2
+
+
+def test_recovery_settles_an_absent_family_from_its_durable_result(make_coord):
+    """An ended family with a durable result completes immediately, never until its deadline."""
+    fake = FakeSession()
+    started = make_coord(fake)
+    identity = started.submit_stage(review())
+    started.cycle("codex")
+    fake.end(identity, success=True)
+
+    recovered = make_coord(fake)
+    assert [outcome.status for outcome in recovered.cycle("codex")] == ["completed"]
+    durable = record_of(recovered, identity)
+    assert durable.state == "completed" and durable.attempts == 1
+    assert not durable.process_alive
+    assert recovered.cycle("codex") == []
+
+
+def test_recovery_closes_an_absent_family_without_a_result_once(make_coord):
+    """A vanished family follows the normal closed recovery path without a second attempt."""
+    fake = FakeSession()
+    started = make_coord(fake)
+    identity = started.submit_stage(review())
+    started.cycle("codex")
+    fake.kill(identity)
+    fake.gate_open = False
+
+    recovered = make_coord(fake)
+    assert recovered.cycle("codex") == []
+    durable = record_of(recovered, identity)
+    assert durable.state == "waiting" and durable.continuation
+    assert durable.attempts == 1 and durable.claim
+    assert not durable.process_alive
 
 
 # --- ADR 0030 / issue #175: a daemon restart resumes an attempt without charging it ---------
