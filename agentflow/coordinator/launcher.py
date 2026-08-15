@@ -38,17 +38,37 @@ class StartResult:
 
 
 def pid_family_alive(family: str | None) -> bool:
-    """Whether a recorded process family is still executing — the liveness signal the
-    worktree-recovery pass already trusts, reused here rather than a second notion."""
+    """Whether the recorded session-leader PID may still name its process family.
+
+    The launch child calls ``setsid`` before it records its PID, so its PID must also be its
+    process-group ID. A missing PID or mismatched group is absent for recovery. A matching
+    leader cannot prove its original birth, and unavailable process probes remain conservatively
+    alive; this liveness seam only observes and never signals, kills, or adopts a process.
+    """
     if not family:
         return False
     try:
-        os.kill(int(family), 0)
-        return True
+        pid = int(family)
+    except ValueError:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)  # probe only; signal 0 has no effect
     except PermissionError:
         return True
-    except (OSError, ValueError):
+    except ProcessLookupError:
         return False
+    except OSError:
+        return True
+    try:
+        return os.getpgid(pid) == pid
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
 
 
 class LocalLauncher:
