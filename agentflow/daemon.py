@@ -98,7 +98,7 @@ def cycle(repos: list[RepoConfig], run, _log=log) -> None:
 
 
 def _recheck(cfg: RepoConfig, _log=None) -> str:
-    return f"recheck: {recheck_once(cfg)}"
+    return f"recheck: {recheck_once(cfg, _log=_log)}"
 
 
 def dispatch_cycle(repos: list[RepoConfig], _log=log, *, submit_new: bool = True) -> None:

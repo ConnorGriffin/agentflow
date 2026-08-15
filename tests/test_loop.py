@@ -599,20 +599,24 @@ def test_build_issue_submits_a_ready_issue_to_the_coordinator(monkeypatch):
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
     monkeypatch.setattr(coordinated_build, "resume_if_held", lambda sub, records: sub)
     submitted = []
+    logs = []
     waiting = Record(identity="o/r|5|build|-", stage="build", pool="claude", demand=5,
                      state=WAITING)
     coordinator = SimpleNamespace(
         submit_stage=lambda sub: submitted.append(sub) or "o/r|5|build|-",
         stage_record=lambda identity: waiting)
-    monkeypatch.setattr(pipeline, "build_coordinator", lambda **_kwargs: coordinator)
+    coordinator_kwargs = {}
+    monkeypatch.setattr(pipeline, "build_coordinator",
+                        lambda **kwargs: coordinator_kwargs.update(kwargs) or coordinator)
     reconciled = []
     monkeypatch.setattr(pipeline, "reconcile_and_project", reconciled.append)
 
-    out = build_issue(RepoConfig("o/r", "/tmp"), 5)
+    out = build_issue(RepoConfig("o/r", "/tmp"), 5, _log=logs.append)
 
     assert out == "#5: submitted to coordinator → claude (build)"
     assert submitted == [submission]
     assert reconciled == [coordinator]
+    assert coordinator_kwargs["_log"] is not None
     assert picked == [{"operator": True, "floodgates": False, "stage": "build",
                        "complexity": "standard", "effort": "medium"}]
 

@@ -182,7 +182,7 @@ def _next_untriaged_issue(cfg: RepoConfig, reserved: set[int] = frozenset()) -> 
     return min(untriaged, key=lambda i: i["number"]) if untriaged else None
 
 
-def build_issue(cfg: RepoConfig, n: int, *, floodgates: bool = False) -> str:
+def build_issue(cfg: RepoConfig, n: int, *, floodgates: bool = False, _log=None) -> str:
     """By-hand build of a *specific* ready issue (ADR 0022's `build <N>`). Fetches issue N,
     **refuses and redirects** anything that isn't `ready-for-agent` (a held issue → `pickup`;
     an un-triaged one → `triage`/`scope`), refuses one already claimed or in flight, then
@@ -228,7 +228,7 @@ def build_issue(cfg: RepoConfig, n: int, *, floodgates: bool = False) -> str:
     # instead of silently reusing the terminal held record.
     records = pipeline.tracer.load_records()
     resumed = coordinated_build.resume_if_held(submission, records)
-    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
+    coordinator = pipeline.build_coordinator(_log=_log, repositories={cfg.repo: cfg.workdir})
     identity = coordinator.submit_stage(resumed)
     record = coordinator.stage_record(identity)
     # Claim the issue and report a launch only when admission actually produced runnable work. An
@@ -531,7 +531,7 @@ _SAME_TOOL_REVIEW_WARNING = (
 
 
 def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
-              maintainer_confirmed: bool = False) -> str:
+              maintainer_confirmed: bool = False, _log=None) -> str:
     """Submit `/agentflow review <pr>` through the durable coordinator.
 
     A forced same-tool review is never implicit: the first call returns the warning, and only an
@@ -607,7 +607,7 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
         return "review submission unavailable"
     if predecessor is None and not claim(cfg.repo, issue, BUILDING):
         return "could not claim PR review"
-    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
+    coordinator = pipeline.build_coordinator(_log=_log, repositories={cfg.repo: cfg.workdir})
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
     status = "same-tool review submitted; maintainer merge required" if force_same_tool \
@@ -616,7 +616,7 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
 
 
 def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
-                               branch_tool: str, branch: str, comments: list[dict]) -> str:
+                               branch_tool: str, branch: str, comments: list[dict], _log=None) -> str:
     """Submit the rebased exact head as a fresh durable Review; never launch one directly.
 
     Submitting one takes the PR back from the maintainer, so the summary the earlier — now
@@ -644,7 +644,7 @@ def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,
         return "review submission unavailable"
     if not claim(cfg.repo, n, BUILDING):
         return "could not claim survivor Review"
-    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
+    coordinator = pipeline.build_coordinator(_log=_log, repositories={cfg.repo: cfg.workdir})
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
     if not supersede_clean_review(comments):
@@ -674,7 +674,7 @@ def _conflict_revise_owns_head(cfg: RepoConfig, n: int, branch: str) -> bool:
 
 
 def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: str,
-                              branch: str, comments: list[dict]) -> str | None:
+                              branch: str, comments: list[dict], _log=None) -> str | None:
     """A survivor's re-rebase no longer applies: open a conflict Revise on the builder's own lineage
     to resolve it (ADR 0038) instead of parking. The Revise adopts the retained PR-branch worktree,
     is bound to the conflicting head SHA it must supersede, and is admitted ahead of cold build work.
@@ -708,7 +708,7 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
         return None                                       # unreconstructable → caller parks
     if not claim(cfg.repo, n, BUILDING):
         return f"#{pr}: conflict — could not claim conflict revise"
-    coordinator = pipeline.build_coordinator(repositories={cfg.repo: cfg.workdir})
+    coordinator = pipeline.build_coordinator(_log=_log, repositories={cfg.repo: cfg.workdir})
     coordinator.submit_stage(submission)
     pipeline.reconcile_and_project(coordinator)
     supersede_clean_review(comments)   # the Revise is durably open either way; retried next cycle
@@ -716,7 +716,7 @@ def _conflict_revise_survivor(cfg: RepoConfig, pr: int, n: int, sl: str, tool: s
 
 
 def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str,
-                     comments: list[dict]) -> str:
+                     comments: list[dict], _log=None) -> str:
     """Re-rebase one survivor and route the outcome by the repo's profile. On conflict, open a
     conflict Revise to resolve it (ADR 0038); park only when that stage cannot be reconstructed or
     genuinely fails its bounded attempts. On a clean re-rebase: `autonomous` reruns the merge gate
@@ -738,7 +738,9 @@ def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str,
     wt = Path(WorktreeRef.for_build(cfg.workdir, tool, n, sl).path)
     result = _rebase_branch(cfg, branch, wt)
     if result is RebaseResult.CONFLICT:
-        revised = _conflict_revise_survivor(cfg, pr, n, sl, tool, branch, comments)
+        revised = (_conflict_revise_survivor(cfg, pr, n, sl, tool, branch, comments, _log)
+                   if _log is not None else
+                   _conflict_revise_survivor(cfg, pr, n, sl, tool, branch, comments))
         if revised is not None:
             return revised
         _park_conflicted_survivor(cfg, pr, n)
@@ -754,10 +756,13 @@ def _rebase_survivor(cfg: RepoConfig, pr: int, branch: str, profile: str,
     remove_worktree_if_safe(cfg.workdir, wt)
     if profile != "autonomous":
         return f"#{pr}: re-rebased clean — mergeable for the human"
-    return f"#{pr}: {_merge_autonomous_survivor(cfg, pr, n, sl, tool, branch, comments)}"
+    merge = (_merge_autonomous_survivor(cfg, pr, n, sl, tool, branch, comments, _log)
+             if _log is not None else
+             _merge_autonomous_survivor(cfg, pr, n, sl, tool, branch, comments))
+    return f"#{pr}: {merge}"
 
 
-def recheck_once(cfg: RepoConfig) -> str:
+def recheck_once(cfg: RepoConfig, _log=None) -> str:
     """Re-rebase every open agentflow PR whose base advanced since a sibling merged, and
     reroute by profile (ADR 0009 merge-time floor; issue #45). Merges serialize — at most
     one lands per cycle, so surviving siblings re-rebase against the new `main` before the
@@ -779,7 +784,9 @@ def recheck_once(cfg: RepoConfig) -> str:
             continue
         if conflict_already_flagged(comments) or reply_pending(comments):
             continue   # already pinged, or a maintainer question the responder owns
-        out = _rebase_survivor(cfg, pr, branch, profile, comments)
+        out = (_rebase_survivor(cfg, pr, branch, profile, comments, _log)
+               if _log is not None else
+               _rebase_survivor(cfg, pr, branch, profile, comments))
         results.append(out)
         if out.endswith(": merged"):
             break   # one merge per cycle — survivors re-rebase against the new main first
