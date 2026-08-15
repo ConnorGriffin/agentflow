@@ -44,6 +44,7 @@ from agentflow.worktree_ref import BUILD_BRANCH_RE, WorktreeRef, issue_of_branch
 class RepoConfig:
     repo: str        # "owner/name" on GitHub
     workdir: str     # local main checkout
+    declared_workdir: str | None = None  # non-resolved config path; recovery rejects symlinks
 
 
 def _row_dict(row: github.IssueRow) -> dict:

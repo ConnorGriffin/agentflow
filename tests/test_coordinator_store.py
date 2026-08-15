@@ -10,6 +10,7 @@ push a pool past its budget.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import sqlite3
 import threading
 
@@ -222,6 +223,101 @@ def test_absent_store_is_created_versioned_and_round_trips(tmp_path):
     loaded = reopened.load()
     assert loaded["R1"].stage == "review"
     assert reopened.permits_used("claude") == 1
+
+
+def test_supersede_refuses_an_independently_occupied_successor_without_mutation(tmp_path):
+    store = Store(tmp_path / "coord.db")
+    predecessor = Record(
+        "owner/repo|7|build|-", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=WAITING, claim=True,
+    )
+    occupied = Record(
+        "owner/repo|7|build|-|s1", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=WAITING, claim=True,
+        source="independent-owner",
+    )
+    assert store.upsert(predecessor)
+    assert store.upsert(occupied)
+    before = deepcopy(store.load())
+
+    with pytest.raises(StoreUnavailable, match="successor is already occupied"):
+        store.submit(
+            Record(
+                occupied.identity, "build", "codex", 5,
+                repo="owner/repo", subject="7", state=WAITING, claim=True,
+                source="recovery-candidate",
+            ),
+            predecessor.identity,
+            supersede=True,
+        )
+
+    assert store.load() == before
+    store.close()
+
+
+def test_recovery_rerun_checks_immutable_successor_facts_inside_store_transaction(tmp_path):
+    store = Store(tmp_path / "coord.db")
+    predecessor = Record(
+        "owner/repo|7|build|-", "build", "codex", 5,
+        repo="owner/repo", subject="7", state="completed", claim=False, retired=True,
+        refusal="capability_environment_failure:incompatible",
+    )
+    successor = Record(
+        "owner/repo|7|build|-|s1", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=WAITING, claim=True,
+        source="expected-source", resume=1,
+    )
+    assert store.upsert(predecessor)
+    assert store.upsert(successor)
+    before = deepcopy(store.load())
+
+    with pytest.raises(StoreUnavailable, match="successor is already occupied"):
+        store.submit(
+            Record(
+                successor.identity, "build", "codex", 5,
+                repo="owner/repo", subject="7", state=WAITING, claim=True,
+                source="conflicting-source", resume=1,
+            ),
+            predecessor.identity,
+            supersede=True,
+        )
+
+    assert store.load() == before
+    store.close()
+
+
+def test_recovery_rerun_accepts_an_exact_claim_owner_that_has_already_progressed(tmp_path):
+    store = Store(tmp_path / "coord.db")
+    predecessor = Record(
+        "owner/repo|7|build|-", "build", "codex", 5,
+        repo="owner/repo", subject="7", state="completed", claim=False, retired=True,
+        refusal="capability_environment_failure:incompatible",
+    )
+    successor = Record(
+        "owner/repo|7|build|-|s1", "build", "codex", 5,
+        repo="owner/repo", subject="7", state=RUNNING, claim=True,
+        source="expected-source", resume=1, attempts=2, attempt_committed=True,
+        launch_token="active-attempt", family="1234", process_alive=True,
+    )
+    assert store.upsert(predecessor)
+    assert store.upsert(successor)
+    before = deepcopy(store.load())
+
+    durable_successor, durable_predecessor, transferred, root = store.submit(
+        Record(
+            successor.identity, "build", "codex", 5,
+            repo="owner/repo", subject="7", state=WAITING, claim=True,
+            source="expected-source", resume=1,
+        ),
+        predecessor.identity,
+        supersede=True,
+    )
+
+    assert durable_successor == successor
+    assert durable_predecessor == predecessor
+    assert transferred is False and root is None
+    assert store.load() == before
+    store.close()
 
 
 def test_reserve_is_atomic_across_instances(tmp_path):

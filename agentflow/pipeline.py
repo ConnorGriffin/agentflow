@@ -49,6 +49,221 @@ from agentflow.worktree_ref import source_facts
 _ORPHAN_CLAIM_GRACE_SECONDS = 60 * 60
 
 
+def recover_capability(
+    repository: str, config, *, acquire_lock, release_lock
+) -> tuple[int, dict]:
+    """Recover never-started incompatible Intake/Build records onto one enrolled root."""
+    import json
+
+    from agentflow.capability_contracts import preflight
+    from agentflow.coordinator import Submission
+    from agentflow.coordinator.record import COMPLETED, NOT_STARTED, WAITING
+    from agentflow.prompts import requirements_for
+    from agentflow.repo_facts import surface_declaration
+    from agentflow.worktree_ref import WorktreeKind, WorktreeRef, capture_subject_revision
+
+    report = {"repository": repository, "revision": "", "results": []}
+    matches = [cfg for cfg in config.repositories if cfg.repo == repository]
+    if len(matches) != 1:
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": "repository-unconfigured"}]
+        return 1, report
+    try:
+        acquired = acquire_lock(_log=lambda _message: None)
+    except OSError:
+        release_lock()
+        acquired = False
+    if not acquired:
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": "daemon-running"}]
+        return 1, report
+    try:
+        root = Path(matches[0].workdir)
+        declared_root = Path(matches[0].declared_workdir or matches[0].workdir)
+        root_usable = (root.is_dir() and not root.is_symlink()
+                       and not declared_root.is_symlink())
+        revision = capture_subject_revision(str(root)) if root_usable else ""
+    except BaseException:
+        release_lock()
+        raise
+    if not root_usable or not revision:
+        reason = "root-unusable" if not root_usable else "revision-unreadable"
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": reason}]
+        release_lock()
+        return 1, report
+    report["revision"] = revision
+    try:
+        store = Store(default_store_path())
+    except StoreUnavailable:
+        report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                              "reason": "transfer-failed"}]
+        release_lock()
+        return 2, report
+    except BaseException:
+        release_lock()
+        raise
+    try:
+        try:
+            records = store.load()
+        except StoreUnavailable:
+            report["results"] = [{"predecessor": "", "successor": "", "status": "skipped",
+                                  "reason": "transfer-failed"}]
+            return 2, report
+        candidates = sorted(
+            (r for r in records.values() if r.repo == repository
+             and r.refusal == "capability_environment_failure:incompatible"),
+            key=lambda r: r.identity)
+        context = {"ui": bool(surface_declaration(str(root)).surfaces)}
+        prepared: list[tuple[object, Submission]] = []
+        refused: list[dict[str, str]] = []
+        validation_failed = False
+        for prior in candidates:
+            result = {"predecessor": prior.identity, "successor": "", "status": "skipped",
+                      "reason": ""}
+            if prior.stage not in {"intake", "build"}:
+                result["reason"] = "unsupported-stage"
+                refused.append(result)
+                validation_failed = True
+                continue
+            started = bool(
+                prior.attempts or prior.attempt_committed or prior.launch_token or prior.started_at
+                or prior.family or prior.process_alive
+                or prior.start_fact not in {None, NOT_STARTED})
+            if started:
+                result["reason"] = "started"
+                refused.append(result)
+                validation_failed = True
+                continue
+            fresh = (prior.state == WAITING and prior.claim and not prior.retired
+                     and not prior.hold_pending)
+            recovered = prior.state == COMPLETED and prior.retired and not prior.claim
+            if not fresh and not recovered:
+                result["reason"] = "ineligible-state"
+                refused.append(result)
+                validation_failed = True
+                continue
+            try:
+                subject = int(prior.subject)
+            except (TypeError, ValueError):
+                result["reason"] = "input-unreadable"
+                refused.append(result)
+                validation_failed = True
+                continue
+            try:
+                payload = (json.loads(prior.input_ptr or "") if prior.stage == "intake"
+                           else prior.input_ptr)
+            except (TypeError, ValueError):
+                payload = None
+            if ((prior.stage == "intake" and not isinstance(payload, dict))
+                    or (prior.stage == "build" and not isinstance(payload, str))):
+                result["reason"] = "input-unreadable"
+                refused.append(result)
+                validation_failed = True
+                continue
+            ref = WorktreeRef.parse(prior.source)
+            source_path = Path(prior.source or "")
+            expected_kind = (WorktreeKind.INTAKE if prior.stage == "intake"
+                             else WorktreeKind.BUILD)
+            owner = prior.pool if prior.stage == "intake" else (prior.branch_lineage or prior.pool)
+            valid_source = bool(
+                ref is not None and ref.kind is expected_kind and ref.tool == owner
+                and str(ref.number) == str(prior.subject) and source_path.is_dir()
+                and not source_path.is_symlink()
+                and (prior.stage == "intake" or prior.lineage == prior.pool))
+            if not valid_source:
+                result["reason"] = "source-unreadable"
+                refused.append(result)
+                validation_failed = True
+                continue
+            if not preflight(root, prior.stage, prior.pool,
+                             requirements_for(prior.stage, context)).ready:
+                result["reason"] = "capability-not-ready"
+                refused.append(result)
+                validation_failed = True
+                continue
+            resume = prior.resume + 1
+            if prior.stage == "intake":
+                payload["source_ref"] = revision
+                source = WorktreeRef.for_intake(str(root), prior.pool, subject).path
+                input_ptr = json.dumps(payload, sort_keys=True)
+                branch = prior.branch_lineage
+            else:
+                lane = f"{prior.pool}-recovery-s{resume}"
+                source = WorktreeRef.for_build(str(root), lane, subject, ref.slug).path
+                input_ptr, branch = prior.input_ptr, lane
+            submission = Submission(
+                repo=repository,
+                subject=prior.subject,
+                stage=prior.stage,
+                target=prior.target,
+                pool=prior.pool,
+                complexity=prior.complexity,
+                effort=prior.effort,
+                source=source,
+                input_ptr=input_ptr,
+                claim=True,
+                resume=resume,
+                builder_lineage=prior.builder_lineage,
+                branch_lineage=branch,
+                builder_complexity=prior.builder_complexity,
+                builder_effort=prior.builder_effort,
+                session_lead=prior.session_lead,
+                capability_root=str(root),
+                capability_context=context,
+                subject_revision=revision,
+                transfer_from=prior.identity,
+                supersede=True,
+                continuation=prior.continuation,
+                interactive=prior.interactive,
+                floodgates=prior.floodgates,
+            )
+            prepared.append((prior, submission))
+        if refused:
+            report["results"] = sorted(refused, key=lambda item: item["predecessor"])
+            return (1 if validation_failed else 2), report
+        coordinator = Coordinator(store=store)
+        already_recovered = []
+        for prior, submission in prepared:
+            if prior.state != COMPLETED:
+                continue
+            try:
+                identity = coordinator.submit_stage(submission)
+            except StoreUnavailable as exc:
+                reason = ("successor-conflict" if "successor is already occupied" in str(exc)
+                          else "transfer-failed")
+                report["results"] = [{"predecessor": prior.identity, "successor": "",
+                                      "status": "skipped", "reason": reason}]
+                return 2, report
+            already_recovered.append((prior, identity))
+        report["results"].extend(
+            {"predecessor": prior.identity, "successor": identity,
+             "status": "already_recovered", "reason": "already-recovered"}
+            for prior, identity in already_recovered)
+        for prior, submission in prepared:
+            if prior.state == COMPLETED:
+                continue
+            try:
+                identity = coordinator.submit_stage(submission)
+            except StoreUnavailable as exc:
+                reason = ("successor-conflict" if "successor is already occupied" in str(exc)
+                          else "transfer-failed")
+                report["results"].append({"predecessor": prior.identity, "successor": "",
+                                          "status": "skipped", "reason": reason})
+                report["results"].sort(key=lambda item: item["predecessor"])
+                return 2, report
+            report["results"].append({
+                "predecessor": prior.identity, "successor": identity,
+                "status": "recovered", "reason": "recovered"})
+        report["results"].sort(key=lambda item: item["predecessor"])
+        return 0, report
+    finally:
+        try:
+            store.close()
+        finally:
+            release_lock()
+
+
 def production_store() -> Store:
     """Build the one production admission owner; callers never open sealed sub-owners."""
     from agentflow.evidence import PromotionReceiptReader

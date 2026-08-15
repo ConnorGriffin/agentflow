@@ -731,7 +731,26 @@ class Store:
                     already_transferred = (
                         prior.state == COMPLETED and prior.retired and not prior.claim
                         and successor_row is not None and successor.claim)
+                    if (already_transferred and supersede
+                            and prior.refusal == "capability_environment_failure:incompatible"
+                            and prior.stage in {"intake", "build"}):
+                        immutable_recovery_fields = (
+                            "identity", "stage", "pool", "demand", "repo", "subject", "target",
+                            "subject_revision", "route_id", "route_cell_digest",
+                            "launch_config_digest", "continuation", "model", "complexity",
+                            "effort", "lineage", "source", "input_ptr", "capability_root",
+                            "capability_context", "session_lead", "builder_lineage",
+                            "branch_lineage", "builder_complexity", "builder_effort", "round",
+                            "conflict_round", "resume", "auto_merge_allowed", "root",
+                            "interactive", "floodgates",
+                        )
+                        already_transferred = all(
+                            getattr(successor, name) == getattr(record, name)
+                            for name in immutable_recovery_fields)
                     if not already_transferred:
+                        if supersede and successor_row is not None:
+                            raise StoreUnavailable(
+                                "cannot transfer claim: successor is already occupied")
                         eligible = (prior.claim and not prior.retired if supersede
                                     else prior.state == COMPLETED and not prior.retired
                                     and prior.claim)

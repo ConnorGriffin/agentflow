@@ -340,11 +340,19 @@ def _try_claim() -> bool:
         LOCK.mkdir()
     except FileExistsError:
         return False
-    (LOCK / "pid").write_text(str(os.getpid()))
+    try:
+        (LOCK / "pid").write_text(str(os.getpid()))
+    except BaseException:
+        try:
+            (LOCK / "pid").unlink(missing_ok=True)
+            LOCK.rmdir()
+        except OSError:
+            pass
+        raise
     return True
 
 
-def _acquire_lock() -> bool:
+def _acquire_lock(_log=log) -> bool:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if _try_claim():
         return True
@@ -386,7 +394,7 @@ def _acquire_lock() -> bool:
             os.rename(LOCK, stale)
         except OSError:
             return False
-        log("reclaiming dead-owner lock" if owner_is_dead else "reclaiming stale lock")
+        _log("reclaiming dead-owner lock" if owner_is_dead else "reclaiming stale lock")
         shutil.rmtree(stale, ignore_errors=True)
         return _try_claim()
     finally:

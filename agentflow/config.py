@@ -75,14 +75,15 @@ def load_config(path: str | Path | None = None) -> RuntimeConfig:
         if not isinstance(workspace, bool):
             raise ConfigurationError(f"{label}.workspace must be true or false")
 
-        workdir = Path(workdir_value).expanduser()
-        if not workdir.is_absolute():
-            workdir = source.parent / workdir
-        workdir = workdir.resolve()
+        declared_workdir = Path(workdir_value).expanduser()
+        if not declared_workdir.is_absolute():
+            declared_workdir = source.parent / declared_workdir
+        declared_workdir = declared_workdir.absolute()
+        workdir = declared_workdir.resolve()
         if not workdir.is_dir():
             raise ConfigurationError(f"{label}.workdir is not a directory: {workdir}")
 
-        configured_repo = RepoConfig(repo, str(workdir))
+        configured_repo = RepoConfig(repo, str(workdir), str(declared_workdir))
         repositories.append(configured_repo)
         if workspace:
             workspace_repositories.append(configured_repo)

@@ -169,6 +169,10 @@ def main(argv: list[str] | None = None) -> int | None:
     )
     authority_commands.add_parser("deploy", help="publish the sealed authority if absent")
     authority_commands.add_parser("status", help="inspect the sealed authority without repair")
+    recover_capability = commands.add_parser(
+        "recover-capability", help="recover zero-attempt capability-held stages"
+    )
+    recover_capability.add_argument("repository", metavar="OWNER/REPO")
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -183,6 +187,23 @@ def main(argv: list[str] | None = None) -> int | None:
             f"configuration valid: {count} {noun} "
             f"({workspace_count} workspace)"
         )
+    elif args.command == "recover-capability":
+        from agentflow import daemon
+        from agentflow.pipeline import recover_capability
+
+        try:
+            config = load_config()
+        except ConfigurationError:
+            print(json.dumps({"repository": args.repository, "revision": "", "results": [{"predecessor": "", "successor": "", "status": "skipped", "reason": "repository-unconfigured"}]}, separators=(",", ":")))
+            return 1
+        status, report = recover_capability(
+            args.repository,
+            config,
+            acquire_lock=daemon._acquire_lock,
+            release_lock=daemon._release_lock,
+        )
+        print(json.dumps(report, separators=(",", ":")))
+        return status
     elif args.command == "doctor":
         from agentflow.enroll import doctor, print_doctor
 
