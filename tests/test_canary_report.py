@@ -46,6 +46,20 @@ class Telemetry:
         return CanaryAttemptProjection(identity, self.attempts)
 
 
+def _snapshot_631_fixture(report, *, now):
+    if report is None:
+        return {"status": "missing", "state": None}
+    measures = report.measures
+    return {
+        "status": "reported",
+        "state": report.result,
+        "age_source": measures.evidence_finalized_at,
+        "snapshot_age": None if measures.evidence_age_missing else now - measures.evidence_finalized_at,
+        "age_missing": measures.evidence_age_missing,
+        "missingness": (measures.duration_missing, measures.token_missing, measures.cost_missing),
+    }
+
+
 def attribution_for(identity):
     fields = {
         "stage_identity": identity, "repository": "octo/app", "route_cell_digest": "a" * 64,
@@ -244,19 +258,42 @@ def test_downstream_629_631_mapping_fixture(tmp_path, attempts, state, reason):
     }
     reconciliation_state, advisory_reason = reconciliation[report.result]
     snapshot = {
-        "state": report.result,
+        **_snapshot_631_fixture(report, now=100),
         "receipt_pointer": (report.receipt_binding, report.method_revision, report.cohort_id),
         "report_key": (report.stage_identity, report.report_version),
-        "age_source": report.measures.evidence_finalized_at,
-        "age_missing": report.measures.evidence_age_missing,
-        "missingness": (report.measures.duration_missing, report.measures.token_missing,
-                        report.measures.cost_missing),
         "hold_reason": None if report.result == "observation" else advisory_reason,
     }
     assert reconciliation_state == state
     assert snapshot["state"] == state and snapshot["hold_reason"] == reason
     assert snapshot["receipt_pointer"] == ("b" * 64, "c" * 40, "d" * 64)
     assert snapshot["report_key"] == (IDENTITY, REPORT_VERSION)
+
+
+def test_631_mapping_fixture_preserves_age_missingness_and_report_absence(tmp_path):
+    measured = reporter(tmp_path, (
+        fact("early", verified=True, started=10, finalized=40, tokens=3, cost=1.5),
+        fact("late", verified=True, started=50, finalized=90, tokens=7, cost=2.5),
+    )).report(IDENTITY, REPORT_VERSION)
+    snapshot = _snapshot_631_fixture(measured, now=100)
+    assert snapshot == {
+        "status": "reported", "state": "observation", "age_source": 90, "snapshot_age": 10,
+        "age_missing": False, "missingness": (False, False, False),
+    }
+
+    zero_dir = tmp_path / "zero"
+    zero_dir.mkdir()
+    zero_snapshot = _snapshot_631_fixture(
+        reporter(zero_dir).report(IDENTITY, REPORT_VERSION), now=100)
+    assert zero_snapshot["state"] == "block_recommendation"
+    assert (zero_snapshot["age_source"], zero_snapshot["snapshot_age"],
+            zero_snapshot["age_missing"], zero_snapshot["missingness"]) == (
+                None, None, True, (True, True, True))
+
+    refused_dir = tmp_path / "refused"
+    refused_dir.mkdir()
+    with pytest.raises(CanaryReportRefused, match="attribution_absent"):
+        reporter(refused_dir, attribution=None).report(IDENTITY, REPORT_VERSION)
+    assert _snapshot_631_fixture(None, now=100) == {"status": "missing", "state": None}
 
 
 def test_report_does_not_mutate_telemetry_or_store(tmp_path):
