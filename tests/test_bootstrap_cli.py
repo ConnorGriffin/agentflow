@@ -1534,6 +1534,13 @@ def test_enroll_public_ui_command_path_reports_each_stage(
             )
             package.parent.mkdir(parents=True)
             package.write_text('{"version": "1.61.1"}\n')
+            (package.parent / "lib").mkdir()
+            (package.parent / "cli.js").write_text('require("./lib/program")\n')
+            (package.parent / "lib" / "program.js").write_text("module.exports = {}\n")
+            (package.parent.parent / ".bin").mkdir()
+            (package.parent.parent / ".bin" / "playwright").symlink_to(
+                "../playwright/cli.js"
+            )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         if command == ["node", "--version"]:
             return SimpleNamespace(returncode=0, stdout="v20.0.0\n", stderr="")
@@ -1554,6 +1561,9 @@ def test_enroll_public_ui_command_path_reports_each_stage(
     )
     monkeypatch.setattr(
         "agentflow.provider_skills.skill_destination_status", destination_status
+    )
+    monkeypatch.setattr(
+        "agentflow.runtime_contracts.skill_destination_status", destination_status
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.provider_skill_status",

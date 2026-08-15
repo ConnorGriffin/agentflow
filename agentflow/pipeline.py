@@ -417,15 +417,19 @@ def _capability_preflight(record, materialize: bool):
             f"agentflow enroll {repair_root} --apply")
     context = dict(durable_context)
     context["ui"] = bool(declaration.surfaces)
+    requirements = requirements_for(record.stage, context)
     if materialize:
-        ok, detail = materialize_launch_capabilities(source_root, actual_root, record.pool)
+        materialize_runtime = any(requirement.runtime for requirement in requirements)
+        ok, detail = materialize_launch_capabilities(
+            source_root, actual_root, record.pool,
+            materialize_runtime=materialize_runtime,
+        )
         if not ok:
             return CapabilityPreflightResult(
-                record.stage, record.pool, requirements_for(record.stage, context),
+                record.stage, record.pool, requirements,
                 "incompatible", (f"launch-root-materialization-failed: {detail}",),
                 f"agentflow enroll {actual_root} --apply")
-    return preflight(inspection_root, record.stage, record.pool,
-                     requirements_for(record.stage, context))
+    return preflight(inspection_root, record.stage, record.pool, requirements)
 
 
 def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None) -> Coordinator:

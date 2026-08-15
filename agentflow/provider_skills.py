@@ -11,9 +11,18 @@ import hashlib
 import json
 import os
 from importlib.resources import files
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import shutil
 import tomllib
+
+from agentflow.filesystem_contracts import (
+    _contained,
+    _regular_directory,
+    _safe_manifest_path,
+    runtime_tree_status,
+    skill_destination_status,
+)
+from agentflow.runtime_contracts import playwright_runtime_status
 
 
 RECEIPT_SCHEMA = 1
@@ -30,87 +39,6 @@ When invoked, reply with this exact line and nothing else:
 
 {NATIVE_DISCOVERY_MARKER}
 """
-
-
-def _regular_directory(path: Path) -> bool:
-    return path.is_dir() and not path.is_symlink()
-
-
-def _contained(path: Path, root: Path) -> bool:
-    try:
-        path.resolve(strict=True).relative_to(root.resolve(strict=True))
-    except (FileNotFoundError, OSError, ValueError):
-        return False
-    return True
-
-
-def _safe_manifest_path(value: object) -> PurePosixPath | None:
-    if not isinstance(value, str):
-        return None
-    relative = PurePosixPath(value)
-    if (
-        relative.is_absolute()
-        or not relative.parts
-        or any(part in {"", ".", ".."} for part in relative.parts)
-    ):
-        return None
-    return relative
-
-
-def skill_destination_status(directory: Path, files_manifest: list[dict]) -> str:
-    """Compare one non-symlinked project-local skill directory with its pinned manifest."""
-    root = directory.parent.parent
-    skill_root = directory.parent
-    if not root.exists() and not root.is_symlink():
-        return "absent"
-    if not _regular_directory(root):
-        return "incompatible"
-    if not skill_root.exists() and not skill_root.is_symlink():
-        return "absent"
-    if not _regular_directory(skill_root):
-        return "incompatible"
-    if not directory.exists() and not directory.is_symlink():
-        return "absent"
-    if (
-        not _contained(skill_root, root)
-        or not _regular_directory(directory)
-        or not _contained(directory, root)
-    ):
-        return "incompatible"
-    expected: dict[str, str] = {}
-    for item in files_manifest:
-        relative = _safe_manifest_path(item.get("path")) if isinstance(item, dict) else None
-        digest = item.get("sha256") if isinstance(item, dict) else None
-        if relative is None or not isinstance(digest, str):
-            return "incompatible"
-        target = directory.joinpath(*relative.parts)
-        if target.is_symlink() or (target.exists() and not _contained(target, directory)):
-            return "incompatible"
-        if not target.is_file():
-            # Once the skill directory exists, a missing tracked file is drift, not
-            # absence.  In particular, an occupied empty directory must never look like
-            # a safe destination for enrollment.
-            return "drifted"
-        expected[relative.as_posix()] = digest
-    actual: set[str] = set()
-    for path in directory.rglob("*"):
-        relative = path.relative_to(directory)
-        if "node_modules" in relative.parts:
-            continue
-        if path.is_symlink():
-            return "incompatible"
-        if path.is_file():
-            if not _contained(path, directory):
-                return "incompatible"
-            actual.add(relative.as_posix())
-    if actual != set(expected):
-        return "drifted"
-    if any(
-        hashlib.sha256((directory / relative).read_bytes()).hexdigest() != digest
-        for relative, digest in expected.items()
-    ):
-        return "drifted"
-    return "ok"
 
 
 def _manifest_fingerprint() -> str:
@@ -390,7 +318,7 @@ def provider_skill_status(root: Path, provider: str, spec: dict) -> tuple[str, s
 
 
 def materialize_launch_capabilities(
-    source: Path, destination: Path, provider: str
+    source: Path, destination: Path, provider: str, materialize_runtime: bool = False
 ) -> tuple[bool, str]:
     """Copy missing pinned provider skills into a prepared launch root without overwriting.
 
@@ -418,34 +346,130 @@ def materialize_launch_capabilities(
         or not _contained(source_skills, source_provider_root)
     ):
         return False, f"{provider} capability source root is missing or incompatible"
+    provider_root_existed = destination_provider_root.exists()
     if destination_provider_root.is_symlink() or (
-        destination_provider_root.exists() and not destination_provider_root.is_dir()
+        provider_root_existed and not destination_provider_root.is_dir()
     ):
         return False, f"{provider} launch provider root is incompatible"
-    if destination_provider_root.exists() and not _contained(destination_provider_root, destination):
+    if provider_root_existed and not _contained(destination_provider_root, destination):
         return False, f"{provider} launch provider root escapes the launch root"
+    skills_existed = destination_skills.exists()
     if destination_skills.is_symlink() or (
-        destination_skills.exists() and not destination_skills.is_dir()
+        skills_existed and not destination_skills.is_dir()
     ):
         return False, f"{provider} launch skill root is incompatible"
-    destination_skills.mkdir(parents=True, exist_ok=True)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = [
+        spec for spec in manifest["capabilities"]
+        if spec.get("skill") and "version" in spec
+    ]
+    source_runtime = source_skills / "drive-local-webapp" / "node_modules"
+    destination_drive = destination_skills / "drive-local-webapp"
+    destination_runtime = destination_drive / "node_modules"
+    missing_skills = [
+        (spec, source_skills / spec["skill"], destination_skills / spec["skill"])
+        for spec in specs
+        if not (destination_skills / spec["skill"]).exists()
+        and not (destination_skills / spec["skill"]).is_symlink()
+    ]
+    for spec, source_skill, _target_skill in missing_skills:
+        if skill_destination_status(source_skill, spec["files"]) != "ok":
+            return False, f"{provider} source skill {spec['skill']} is not intact"
+    runtime_existed = False
+    if materialize_runtime:
+        runtime = manifest["playwright"]
+        status, detail = playwright_runtime_status(
+            source, version=runtime["version"], node_minimum=runtime["node_minimum"],
+            manifest=manifest, provider=provider,
+        )
+        if status != "ok":
+            return False, f"{provider} source Playwright runtime is not intact: {detail}"
+        drive = next(spec for spec in specs if spec["skill"] == "drive-local-webapp")
+        if destination_drive.is_symlink():
+            return False, f"{provider} launch runtime destination is symlinked"
+        if destination_drive.exists() and skill_destination_status(
+            destination_drive, drive["files"]
+        ) != "ok":
+            return False, f"{provider} launch runtime destination skill is occupied or incompatible"
+        runtime_existed = destination_runtime.exists() or destination_runtime.is_symlink()
+        if runtime_existed:
+            status, detail = playwright_runtime_status(
+                destination, version=runtime["version"], node_minimum=runtime["node_minimum"],
+                manifest=manifest, provider=provider,
+            )
+            if status != "ok":
+                return False, f"{provider} launch runtime destination is occupied or {status}: {detail}"
+    created: list[tuple[Path, bool]] = []
+
+    def rollback() -> list[str]:
+        errors = []
+        for path, recursive in reversed(created):
+            try:
+                if not recursive:
+                    path.rmdir()
+                elif path.is_symlink():
+                    path.unlink()
+                elif path.exists():
+                    if not _contained(path, destination):
+                        errors.append(f"{path} escapes the launch root")
+                        continue
+                    shutil.rmtree(path)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
+        return errors
+
+    def failed(message: str) -> tuple[bool, str]:
+        cleanup_errors = rollback()
+        if cleanup_errors:
+            return False, f"{provider} rollback failed after {message}: {'; '.join(cleanup_errors)}"
+        return False, message
+
+    def claim_directory(path: Path, *, recursive: bool = True) -> tuple[bool, str] | None:
+        try:
+            path.mkdir()
+        except FileExistsError:
+            return failed(f"{provider} launch destination appeared concurrently: {path}")
+        except OSError as exc:
+            return failed(f"{provider} launch destination creation failed: {path}: {exc}")
+        created.append((path, recursive))
+        return None
+
+    if not provider_root_existed:
+        if error := claim_directory(destination_provider_root, recursive=False):
+            return error
+    if not skills_existed:
+        if error := claim_directory(destination_skills, recursive=False):
+            return error
     if (
         destination_provider_root.is_symlink()
         or destination_skills.is_symlink()
         or not _contained(destination_provider_root, destination)
         or not _contained(destination_skills, destination_provider_root)
     ):
-        return False, f"{provider} launch skill root is symlinked"
-    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
-    for spec in manifest["capabilities"]:
-        name = spec.get("skill")
-        if not name or "version" not in spec:
-            continue
-        source_skill = source_skills / name
-        target_skill = destination_skills / name
-        if target_skill.exists() or target_skill.is_symlink():
-            continue
-        if skill_destination_status(source_skill, spec["files"]) != "ok":
-            return False, f"{provider} source skill {name} is not intact"
-        shutil.copytree(source_skill, target_skill)
+        return failed(f"{provider} launch skill root is symlinked")
+
+    for spec, source_skill, target_skill in missing_skills:
+        if error := claim_directory(target_skill):
+            return error
+        try:
+            shutil.copytree(
+                source_skill, target_skill,
+                dirs_exist_ok=True,
+                **({"ignore": shutil.ignore_patterns("node_modules")}
+                   if spec["skill"] == "drive-local-webapp" else {}),
+            )
+        except (OSError, shutil.Error) as exc:
+            return failed(f"{provider} skill copy failed: {exc}")
+    if materialize_runtime and not runtime_existed:
+        if error := claim_directory(destination_runtime):
+            return error
+        try:
+            shutil.copytree(
+                source_runtime, destination_runtime, symlinks=True, dirs_exist_ok=True
+            )
+        except (OSError, shutil.Error) as exc:
+            return failed(f"{provider} Playwright runtime copy failed: {exc}")
+        tree_status, detail = runtime_tree_status(destination_runtime)
+        if tree_status != "ok":
+            return failed(f"{provider} copied Playwright runtime is incompatible: {detail}")
     return True, f"materialized missing {provider} capabilities into the launch root"
