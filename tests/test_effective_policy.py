@@ -125,6 +125,151 @@ def test_repository_overlay_reads_exact_revision_not_mutable_head(tmp_path):
     assert source.read(REPOSITORY, old).canonical_bytes != overlay_path.read_bytes()
 
 
+def test_repository_overlay_retries_show_timeout_once_and_reports_sanitized_diagnostic(
+        tmp_path, monkeypatch):
+    root = tmp_path / "configured-root"
+    root.mkdir()
+    encoded = _canonical(_overlay_value())
+    calls = []
+    diagnostics = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"secret")
+        return subprocess.CompletedProcess(command, 0, stdout=encoded)
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    assert source.read(REPOSITORY, REVISION) is not None
+    assert calls == [
+        ["git", "show", f"{REVISION}:.agentflow/briefing-overlay-v1.json"],
+        ["git", "show", f"{REVISION}:.agentflow/briefing-overlay-v1.json"],
+    ]
+    assert len(diagnostics) == 1
+    assert "repository=octo/repo" in diagnostics[0]
+    assert f"revision={REVISION}" in diagnostics[0]
+    assert str(root) not in diagnostics[0]
+    assert "phase=show" in diagnostics[0]
+    assert "error_class=CLOSED" in diagnostics[0]
+    assert "secret" not in diagnostics[0]
+
+
+def test_repository_overlay_retries_ls_tree_oserror_once_then_returns_absent_quietly(
+        tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+    diagnostics = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        if command[1] == "show":
+            return subprocess.CompletedProcess(command, 1, stdout=b"")
+        if len(calls) == 2:
+            raise OSError("private launch detail")
+        return subprocess.CompletedProcess(command, 0, stdout=b"")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    assert source.read(REPOSITORY, REVISION) is None
+    assert len(calls) == 3
+    assert len(diagnostics) == 1
+    assert "phase=ls-tree" in diagnostics[0]
+    assert "private launch detail" not in diagnostics[0]
+
+
+def test_repository_overlay_does_not_retry_parse_failure(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+    diagnostics = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout=b"not-json")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    with pytest.raises(PolicyValidationError):
+        source.read(REPOSITORY, REVISION)
+    assert len(calls) == 1
+    assert len(diagnostics) == 1
+    assert "phase=parse" in diagnostics[0]
+
+
+def test_repository_overlay_retries_show_oserror_once_then_remains_fail_closed(
+        tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+    diagnostics = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        raise OSError("launch detail")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource(
+        {REPOSITORY: root}, on_diagnostic=diagnostics.append)
+
+    with pytest.raises(PolicyValidationError, match="unreadable"):
+        source.read(REPOSITORY, REVISION)
+    assert len(calls) == 2
+    assert len(diagnostics) == 1
+    assert all("phase=show" in diagnostic for diagnostic in diagnostics)
+
+
+def test_repository_overlay_does_not_retry_unavailable_revision(tmp_path, monkeypatch):
+    root = tmp_path / "repo"
+    root.mkdir()
+    calls = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 1, stdout=b"")
+
+    monkeypatch.setattr(effective_policy.subprocess, "run", run)
+    source = ExactRevisionRepositoryOverlaySource({REPOSITORY: root})
+
+    with pytest.raises(PolicyValidationError, match="revision is unavailable"):
+        source.read(REPOSITORY, REVISION)
+    assert len(calls) == 2
+
+
+def test_production_coordinator_wires_agentflow_log_to_overlay_diagnostics(monkeypatch):
+    import agentflow.pipeline as pipeline
+
+    captured = {}
+
+    class Source:
+        def __init__(self, repositories, *, on_diagnostic=None):
+            captured["source"] = (repositories, on_diagnostic)
+
+    class Resolver:
+        def __init__(self, **kwargs):
+            captured["resolver"] = kwargs
+
+    monkeypatch.setattr(effective_policy, "ExactRevisionRepositoryOverlaySource", Source)
+    monkeypatch.setattr(effective_policy, "EffectivePolicyResolver", Resolver)
+    monkeypatch.setattr(pipeline, "Store", lambda *args, **kwargs: object())
+    monkeypatch.setattr(pipeline, "Coordinator", lambda **kwargs: kwargs)
+    logs = []
+
+    pipeline.build_coordinator(logs.append, repositories={REPOSITORY: "/configured/root"})
+
+    repositories, callback = captured["source"]
+    assert repositories == {REPOSITORY: "/configured/root"}
+    callback("diagnostic")
+    assert logs == ["diagnostic"]
+
+
 def test_repository_overlay_distinguishes_missing_path_from_corrupt_present_object(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
