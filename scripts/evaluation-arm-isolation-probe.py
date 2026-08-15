@@ -41,6 +41,14 @@ _RESULT_SCHEMA = {
     "required": ["admitted_readable", "sibling_reachable", "oracle_reachable"],
     "additionalProperties": False,
 }
+_LOCAL_FACT_KEYS = {
+    "admitted_read", "task_write", "source_write_denied", "sibling_open_denied",
+    "sibling_stat_denied", "sibling_enumeration_denied", "sibling_symlink_open_denied",
+    "oracle_open_denied", "oracle_stat_denied", "oracle_enumeration_denied",
+    "oracle_symlink_open_denied", "unrelated_home_open_denied", "unrelated_home_stat_denied",
+    "unrelated_home_enumeration_denied",
+}
+_OUTER_SEATBELT_CLAUDE_SETTINGS = {"sandbox": {"enabled": False}}
 
 
 @dataclass(frozen=True)
@@ -242,6 +250,7 @@ def _provider_command(provider: str, source: Path, result_path: Path, schema_pat
     if provider == "claude":
         return [executable, "--print", "--no-session-persistence", "--permission-mode", "bypassPermissions",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
+                "--settings", json.dumps(_OUTER_SEATBELT_CLAUDE_SETTINGS, separators=(",", ":")),
                 "--json-schema", json.dumps(_RESULT_SCHEMA, separators=(",", ":")),
                 "--max-budget-usd", "0.05", prompt]
     return [executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
@@ -251,11 +260,16 @@ def _provider_command(provider: str, source: Path, result_path: Path, schema_pat
 
 def _detached_bundle_clone(root: Path) -> Path:
     repository = Path(__file__).resolve().parents[1]
+    root.mkdir(parents=True, exist_ok=True)
     bundle, source = root / "method.bundle", root / "source"
     if subprocess.run(["git", "-C", str(repository), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout:
         raise RuntimeError("source repository is dirty")
     revision = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
-    subprocess.run(["git", "-C", str(repository), "bundle", "create", str(bundle), revision], check=True)
+    branch = subprocess.run(["git", "-C", str(repository), "symbolic-ref", "--quiet", "--short", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+    branch_revision = subprocess.run(["git", "-C", str(repository), "rev-parse", branch], text=True, capture_output=True, check=True).stdout.strip()
+    if branch_revision != revision:
+        raise RuntimeError("source branch changed while building bundle")
+    subprocess.run(["git", "-C", str(repository), "bundle", "create", str(bundle), branch], check=True)
     subprocess.run(["git", "clone", "--no-checkout", "--no-local", str(bundle), str(source)], capture_output=True, check=True)
     subprocess.run(["git", "-C", str(source), "checkout", "--detach", revision], capture_output=True, check=True)
     for ref in subprocess.run(["git", "-C", str(source), "for-each-ref", "--format=%(refname)"], text=True, capture_output=True, check=True).stdout.splitlines():
@@ -325,22 +339,30 @@ open_denied "$sibling" && sibling_open_denied=true; stat_denied "$sibling" && si
 open_denied "$oracle" && oracle_open_denied=true; stat_denied "$oracle" && oracle_stat_denied=true; enumeration_denied "$oracle_dir" && oracle_enumeration_denied=true; open_denied "$oracle_link" && oracle_symlink_open_denied=true
 ! (cd "$home") 2>/dev/null && unrelated_home_open_denied=true; ! [ -d "$home" ] && unrelated_home_stat_denied=true; enumeration_denied "$home" && unrelated_home_enumeration_denied=true
 printf '{"admitted_read":%s,"task_write":%s,"source_write_denied":%s,"sibling_open_denied":%s,"sibling_stat_denied":%s,"sibling_enumeration_denied":%s,"sibling_symlink_open_denied":%s,"oracle_open_denied":%s,"oracle_stat_denied":%s,"oracle_enumeration_denied":%s,"oracle_symlink_open_denied":%s,"unrelated_home_open_denied":%s,"unrelated_home_stat_denied":%s,"unrelated_home_enumeration_denied":%s}\\n' "$admitted_read" "$task_write" "$source_write_denied" "$sibling_open_denied" "$sibling_stat_denied" "$sibling_enumeration_denied" "$sibling_symlink_open_denied" "$oracle_open_denied" "$oracle_stat_denied" "$oracle_enumeration_denied" "$oracle_symlink_open_denied" "$unrelated_home_open_denied" "$unrelated_home_stat_denied" "$unrelated_home_enumeration_denied"
+if [ "$admitted_read" = true ] && [ "$task_write" = true ] && [ "$source_write_denied" = true ] && [ "$sibling_open_denied" = true ] && [ "$sibling_stat_denied" = true ] && [ "$sibling_enumeration_denied" = true ] && [ "$sibling_symlink_open_denied" = true ] && [ "$oracle_open_denied" = true ] && [ "$oracle_stat_denied" = true ] && [ "$oracle_enumeration_denied" = true ] && [ "$oracle_symlink_open_denied" = true ] && [ "$unrelated_home_open_denied" = true ] && [ "$unrelated_home_stat_denied" = true ] && [ "$unrelated_home_enumeration_denied" = true ]; then
+    exit 0
+fi
+exit 1
 '''
     return ["/bin/sh", "-c", variables + checks]
 
 
 def _parse_local_facts(raw: bytes) -> dict[str, bool] | None:
-    keys = {
-        "admitted_read", "task_write", "source_write_denied", "sibling_open_denied",
-        "sibling_stat_denied", "sibling_enumeration_denied", "sibling_symlink_open_denied",
-        "oracle_open_denied", "oracle_stat_denied", "oracle_enumeration_denied",
-        "oracle_symlink_open_denied", "unrelated_home_open_denied", "unrelated_home_stat_denied",
-        "unrelated_home_enumeration_denied",
-    }
     value = _json_object(raw)
-    if value is None or set(value) != keys or any(type(value[key]) is not bool for key in keys):
+    if value is None or set(value) != _LOCAL_FACT_KEYS or any(type(value[key]) is not bool for key in _LOCAL_FACT_KEYS):
         return None
     return value
+
+
+def _local_boundary_passed(row: dict[str, object]) -> bool:
+    facts = row["facts"]
+    return (
+        row["helper_stage"]["outcome"] == "exited"
+        and row["helper_stage"]["exit_status"] == 0
+        and isinstance(facts, dict)
+        and set(facts) == _LOCAL_FACT_KEYS
+        and all(type(value) is bool and value for value in facts.values())
+    )
 
 
 def _probe_local_boundary(parent: Path, order: str) -> dict[str, object]:
@@ -404,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
         orders = (providers, tuple(reversed(providers)))
         if args.local_only:
             results = [_probe_local_boundary(parent, f"order-{index}") for index, _ in enumerate(orders, 1)]
-            passed = all(row["helper_stage"]["outcome"] == "exited" and row["helper_stage"]["exit_status"] == 0 and row["facts"] for row in results)
+            passed = all(_local_boundary_passed(row) for row in results)
             payload = {**_metadata(include_provider_versions=False), "mode": "local-only", "results": results,
                        "coordinator_command": _coordinator_command(raw)}
         else:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,6 +32,7 @@ def test_local_plan_has_no_provider_credential_or_network_admission(tmp_path):
     profile = probe._profile(plan)
 
     assert plan.network is False
+    assert set(plan.read_literals) == {Path("/bin/sh"), Path("/private/var/select/sh")}
     assert not any(path in probe._AUTH_HANDLES.values() for path in plan.read_literals)
     assert "network-outbound" not in profile
     for handle in probe._AUTH_HANDLES.values():
@@ -98,6 +100,7 @@ def test_current_cli_commands_have_one_outer_sandbox_owner(tmp_path):
     codex = probe._provider_command("codex", tmp_path, result, schema, "codex")
 
     assert claude[claude.index("--permission-mode") + 1] == "bypassPermissions"
+    assert json.loads(claude[claude.index("--settings") + 1]) == {"sandbox": {"enabled": False}}
     assert "--max-budget-usd" in claude and "--json-schema" in claude
     assert codex[codex.index("--sandbox") + 1] == "danger-full-access"
     assert codex[codex.index("--ask-for-approval") + 1] == "never"
@@ -111,6 +114,7 @@ def test_local_helper_checks_admitted_read_write_and_all_denials(tmp_path):
     assert command[:2] == ["/bin/sh", "-c"]
     for fact in ("admitted_read", "task_write", "source_write_denied", "sibling_open_denied", "sibling_stat_denied", "sibling_enumeration_denied", "sibling_symlink_open_denied", "oracle_open_denied", "oracle_stat_denied", "oracle_enumeration_denied", "oracle_symlink_open_denied", "unrelated_home_open_denied", "unrelated_home_stat_denied", "unrelated_home_enumeration_denied"):
         assert fact in command[2]
+    assert "exit 1" in command[2]
 
 
 def test_coordinator_command_is_exact_and_reusable():
@@ -149,3 +153,37 @@ def test_local_only_cli_emits_only_a_provider_free_boundary(monkeypatch, capsys)
     payload = json.loads(capsys.readouterr().out)
     assert payload["mode"] == "local-only"
     assert all(row["facts"] == facts for row in payload["results"])
+
+
+def test_local_only_cli_rejects_a_false_boundary_fact(monkeypatch, capsys):
+    probe = _load_probe()
+    facts = {key: True for key in probe._LOCAL_FACT_KEYS}
+    facts["oracle_stat_denied"] = False
+
+    monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(probe, "_metadata", lambda **_: {"metadata": "closed"})
+    monkeypatch.setattr(probe, "_probe_local_boundary", lambda _, order: {
+        "order": order, "helper_stage": {"outcome": "exited", "exit_status": 0}, "facts": facts,
+    })
+
+    assert probe.main(["--local-only"]) == 1
+    assert all(row["facts"]["oracle_stat_denied"] is False for row in json.loads(capsys.readouterr().out)["results"])
+
+
+def test_detached_bundle_clone_smoke_uses_a_clean_temporary_repository(tmp_path, monkeypatch):
+    probe = _load_probe()
+    repository = tmp_path / "repository"
+    script = repository / "scripts" / "probe.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# probe\n", encoding="utf-8")
+    subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=Probe Test", "-c", "user.email=probe@example.test", "commit", "-m", "seed"], check=True, capture_output=True)
+    monkeypatch.setattr(probe, "__file__", str(script))
+
+    source = probe._detached_bundle_clone(tmp_path / "arm")
+
+    assert subprocess.run(["git", "-C", str(source), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout == ""
+    assert subprocess.run(["git", "-C", str(source), "for-each-ref"], text=True, capture_output=True, check=True).stdout == ""
+    assert not (source / ".git" / "objects" / "info" / "alternates").exists()
