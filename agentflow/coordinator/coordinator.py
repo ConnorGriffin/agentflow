@@ -280,9 +280,20 @@ class Coordinator:
         """
         return self._managed_repositories is None or repo in self._managed_repositories
 
+    def _require_managed_repository(self, repo: str) -> None:
+        """Reject a submission outside this composition before it reaches any collaborator."""
+        if not self._manages_repository(repo):
+            raise ValueError("submission repository is outside this coordinator's configured "
+                             "repositories")
+
+    def _owned_record(self, record: "Record | None") -> "Record | None":
+        """Return an identity lookup only when this composition is allowed to mutate it."""
+        return record if record is not None and self._manages_repository(record.repo) else None
+
     def submit_stage(self, submission: Submission) -> str:
         """Submit one logical stage's facts; returns its stable identity. Idempotent — a
         repeated submission for the same identity never duplicates work."""
+        self._require_managed_repository(submission.repo)
         stage = normalize_stage(submission.stage)
         review = submission.review or ReviewState(
             change_author_tool=submission.builder_lineage)
@@ -376,7 +387,7 @@ class Coordinator:
         (or a completed transfer) is never freed or revived. Idempotent and a no-op for any started
         or absent record: a repeat finds the slot already free."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.state != WAITING
                     or record.attempts != 0 or record.start_fact not in {None, NOT_STARTED}
                     or record.process_alive):
@@ -398,7 +409,7 @@ class Coordinator:
         completed stage awaiting a transfer. Idempotent and crash-safe: a repeat re-observes the
         durable handoff and neither re-notifies nor double-releases the claim."""
         with self._lock:
-            record = self._records.get(identity)
+            record = self._owned_record(self._records.get(identity))
             if record is None or record.retired or record.state != COMPLETED:
                 return None
             if not record.hold_pending:
@@ -417,7 +428,7 @@ class Coordinator:
         its claim with no park comment and no notification. Idempotent: a repeat finds it already
         retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "review"
                     or not record.claim):
                 return False
@@ -440,7 +451,7 @@ class Coordinator:
         would leave that handoff pending and silently retrying forever. Idempotent: a repeat finds
         it already retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "revise"
                     or not record.claim):
                 return False
@@ -464,7 +475,7 @@ class Coordinator:
         too — a held triage of a closed issue asks a human for a decision nobody can act on.
         Idempotent: a repeat finds it already retired and does nothing."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage not in ("intake", "attack")
                     or not record.claim):
                 return False
@@ -486,7 +497,7 @@ class Coordinator:
         called for an open PR. Idempotent and crash-safe: a repeat re-observes the durable park and
         neither re-notifies nor double-releases the claim."""
         with self._lock:
-            record = self._store.record_of(identity)
+            record = self._owned_record(self._store.record_of(identity))
             if (record is None or record.retired or record.stage != "review"
                     or not record.claim):
                 return None
