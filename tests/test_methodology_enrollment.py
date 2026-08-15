@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 from importlib.resources import files
 from pathlib import Path
 import shutil
@@ -120,9 +121,7 @@ def test_recommended_native_discovery_repair_is_runnable_idempotent_and_releases
     assert runs == [True]
 
 
-def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
-    tmp_path, monkeypatch
-):
+def _methodology_enrollment_fixture(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     source = tmp_path / "methodology-source" / "skills"
@@ -155,6 +154,7 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
         enrollment.shutil, "which", lambda command: f"/usr/bin/{command}"
     )
 
+    lock = repo / "skills-lock.json"
     commands = []
 
     def run(command, **_kwargs):
@@ -165,9 +165,28 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
             name = command[command.index("--skill") + 1]
             target = repo / ".agents" / "skills" / name
             shutil.copytree(source / name, target)
+            document = json.loads(lock.read_text()) if lock.exists() else {
+                "version": 1, "skills": {}
+            }
+            document["skills"][name] = {
+                "source": str(tmp_path / "deleted-temp-clone"),
+                "sourceType": "local",
+                "computedHash": "hash",
+                "skillPath": "SKILL.md",
+            }
+            lock.write_text(json.dumps(document) + "\n")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(enrollment, "_run_command", run)
+    return enrollment, repo, source, names, fixture_commit, lock, commands
+
+
+def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, fixture_commit, lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
 
     report = enroll_repository(str(repo), apply=True)
 
@@ -187,6 +206,11 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
     for location in (".agents/skills", ".claude/skills"):
         for name in names:
             assert (repo / location / name / "SKILL.md").is_file()
+    lock_entries = json.loads(lock.read_text())["skills"]
+    assert all(entry["source"] == str(source.parent) for entry in lock_entries.values())
+    assert all(entry["sourceType"] == "git" for entry in lock_entries.values())
+    assert all(entry["ref"] == fixture_commit for entry in lock_entries.values())
+    assert "deleted-temp-clone" not in lock.read_text()
 
     shutil.rmtree(repo / ".claude" / "skills" / "tdd")
     regressed = doctor(str(repo), stage="build", provider="codex")
@@ -195,6 +219,167 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
         cell.context == "headless" and not cell.ready
         for cell in regressed.stage_matrix
     )
+
+
+def test_enrollment_warns_and_rolls_back_for_a_non_object_lock(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, _source, _names, _commit, lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    lock.write_text("[]\n")
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert lock.read_text() == "[]\n"
+
+
+def test_enrollment_warns_and_rolls_back_when_lock_write_fails(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, _source, names, _commit, lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    stale = {
+        "version": 1,
+        "skills": {
+            names[0]: {
+                "source": str(tmp_path / "deleted-temp-clone"),
+                "sourceType": "local",
+                "computedHash": "hash",
+                "skillPath": "SKILL.md",
+            }
+        },
+    }
+    lock.write_text(json.dumps(stale) + "\n")
+    original_write_text = Path.write_text
+
+    def fail_lock_write(path, *args, **kwargs):
+        if path == lock:
+            raise OSError("read-only lock")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_lock_write)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert json.loads(lock.read_text()) == stale
+
+
+def test_enrollment_normalizes_installer_lock_to_manifest_git_revision(tmp_path):
+    import agentflow.enroll as enrollment
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    lock = repo / "skills-lock.json"
+    lock.write_text(json.dumps({
+        "version": 1,
+        "skills": {
+            "tdd": {
+                "source": str(tmp_path / "deleted-temp-clone"),
+                "sourceType": "local",
+                "computedHash": "hash",
+                "skillPath": "SKILL.md",
+            },
+            "unrelated": {"source": "keep", "sourceType": "git"},
+        },
+    }) + "\n")
+
+    before = lock.read_bytes()
+    enrollment._normalize_skill_lock(
+        repo,
+        ["tdd"],
+        source="https://github.com/ConnorGriffin/skills",
+        commit="a" * 40,
+    )
+    first = lock.read_bytes()
+    enrollment._normalize_skill_lock(
+        repo,
+        ["tdd"],
+        source="https://github.com/ConnorGriffin/skills",
+        commit="a" * 40,
+    )
+
+    assert first != before
+    assert lock.read_bytes() == first
+    entry = json.loads(first)["skills"]["tdd"]
+    assert entry["source"] == "https://github.com/ConnorGriffin/skills"
+    assert entry["sourceType"] == "git"
+    assert entry["ref"] == "a" * 40
+    assert entry["computedHash"] == "hash"
+    assert entry["skillPath"] == "SKILL.md"
+    assert "deleted-temp-clone" not in lock.read_text()
+
+
+def test_repeated_enrollment_migrates_existing_public_and_methodology_locks(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    manifest = deepcopy(enrollment._manifest())
+    public_names = tuple(manifest["connor_skills"]["skills"])
+    methodology_names = tuple(manifest["methodology_skills"]["skills"])
+    all_names = public_names + methodology_names
+    for name in all_names:
+        content = f"# {name}\n"
+        for location in (".agents/skills", ".claude/skills"):
+            target = repo / location / name
+            target.mkdir(parents=True)
+            (target / "SKILL.md").write_text(content)
+        capability = next(
+            item for item in manifest["capabilities"] if item.get("skill") == name
+        )
+        capability["files"] = [{
+            "path": "SKILL.md",
+            "sha256": hashlib.sha256(content.encode()).hexdigest(),
+        }]
+
+    public_commit = "b" * 40
+    methodology_commit = "c" * 40
+    manifest["connor_skills"].update(
+        source="https://github.com/ConnorGriffin/skills",
+        commit=public_commit,
+    )
+    manifest["methodology_skills"].update(
+        source="https://github.com/ConnorGriffin/skills",
+        commit=methodology_commit,
+    )
+    stale_source = str(tmp_path / "deleted-temp-clone")
+    lock = repo / "skills-lock.json"
+    lock.write_text(json.dumps({
+        "version": 1,
+        "skills": {
+            name: {
+                "source": stale_source,
+                "sourceType": "local",
+                "computedHash": f"hash-{name}",
+                "skillPath": "SKILL.md",
+            }
+            for name in all_names
+        },
+    }) + "\n")
+    monkeypatch.setattr(enrollment, "_manifest", lambda: manifest)
+
+    assert enrollment._install_connor_skills(repo).startswith("ok:")
+    assert enrollment._install_methodology_skills(repo).startswith("ok:")
+    migrated = lock.read_bytes()
+    assert enrollment._install_connor_skills(repo).startswith("ok:")
+    assert enrollment._install_methodology_skills(repo).startswith("ok:")
+    assert lock.read_bytes() == migrated
+
+    entries = json.loads(migrated)["skills"]
+    for name in public_names:
+        assert entries[name]["source"] == manifest["connor_skills"]["source"]
+        assert entries[name]["ref"] == public_commit
+    for name in methodology_names:
+        assert entries[name]["source"] == manifest["methodology_skills"]["source"]
+        assert entries[name]["ref"] == methodology_commit
+    assert all(entries[name]["sourceType"] == "git" for name in all_names)
+    assert stale_source not in lock.read_text()
 
 
 def test_provider_discovery_requires_provider_specific_native_receipts(tmp_path, monkeypatch):

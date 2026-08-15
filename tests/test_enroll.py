@@ -104,7 +104,18 @@ def test_enrollment_preserves_existing_ignore_content(tmp_path):
     _enroll(tmp_path, apply=True)
 
     assert ignore.read_text() == ".venv/\n*.log\n.agentflow/\n"
-    assert ignore.with_name(".gitignore.pre-agentflow").read_text() == ".venv/\n*.log\n"
+    assert not ignore.with_name(".gitignore.pre-agentflow").exists()
+
+
+def test_enrollment_preserves_a_preexisting_gitignore_backup(tmp_path):
+    ignore = tmp_path / ".gitignore"
+    backup = tmp_path / ".gitignore.pre-agentflow"
+    ignore.write_text(".venv/\n")
+    backup.write_text("user backup\n")
+
+    _enroll(tmp_path, apply=True)
+
+    assert backup.read_text() == "user backup\n"
 
 
 def test_repeated_enrollment_adds_agentflow_rule_exactly_once(tmp_path):

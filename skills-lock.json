@@ -1,15 +1,35 @@
 {
   "version": 1,
   "skills": {
+    "codebase-design": {
+      "source": "https://github.com/ConnorGriffin/skills",
+      "sourceType": "git",
+      "computedHash": "5a91c2b3c9a66fb4e9288b12cd51c6f4f7748ab2430b0a2a25d17c76ffe0842d",
+      "ref": "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+    },
+    "domain-modeling": {
+      "source": "https://github.com/ConnorGriffin/skills",
+      "sourceType": "git",
+      "computedHash": "df3f438907cffd9a07e43447d66bd8bcd56da9f45eb140242a9c305b4f31b618",
+      "ref": "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
+    },
     "drive-local-webapp": {
-      "source": "/var/folders/gt/90sngsj52js71wmfhqhrr0mw0000gn/T/agentflow-skills-qa_58ci1/source",
-      "sourceType": "local",
-      "computedHash": "3f3a8cd47f3d6b60a4460f7aa9b11f6667eb53d8abd1d393e42b56d86b7c56f9"
+      "source": "https://github.com/ConnorGriffin/skills",
+      "sourceType": "git",
+      "computedHash": "3f3a8cd47f3d6b60a4460f7aa9b11f6667eb53d8abd1d393e42b56d86b7c56f9",
+      "ref": "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
+    },
+    "tdd": {
+      "source": "https://github.com/ConnorGriffin/skills",
+      "sourceType": "git",
+      "computedHash": "86ae6d14eb3d836adbc0979089f92c53f5eb137126bc5acd18a87f32ac1032c3",
+      "ref": "08b0c1ba9ac74d93bf92af8fceef77d0ad9a8666"
     },
     "ui-craft": {
-      "source": "/var/folders/gt/90sngsj52js71wmfhqhrr0mw0000gn/T/agentflow-skills-qa_58ci1/source",
-      "sourceType": "local",
-      "computedHash": "003ddfc4a331d540781f99f0ce4148321148ce0db3cb2a213b258465ca5677b0"
+      "source": "https://github.com/ConnorGriffin/skills",
+      "sourceType": "git",
+      "computedHash": "003ddfc4a331d540781f99f0ce4148321148ce0db3cb2a213b258465ca5677b0",
+      "ref": "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
     }
   }
 }
