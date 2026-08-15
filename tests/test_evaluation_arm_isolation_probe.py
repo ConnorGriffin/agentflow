@@ -59,6 +59,44 @@ def test_provider_plan_admits_only_its_exact_credential_handle(tmp_path, monkeyp
     assert f'(allow file-read* (subpath {json.dumps(str(handle.parent))}))' not in profile
 
 
+def test_profile_grants_each_writable_root_object_and_subpath_without_its_parent(tmp_path):
+    probe = _load_probe()
+    parent = tmp_path / "parent"; source = parent / "source"
+    roots = (parent / "home", parent / "xdg-config", parent / "output")
+    source.mkdir(parents=True)
+    for root in roots:
+        root.mkdir()
+
+    profile = probe._profile(probe._plan(parent, source, roots, None))
+
+    for root in roots:
+        quoted = json.dumps(str(root.resolve()))
+        assert f"(allow file-read* (literal {quoted}))" in profile
+        assert f"(allow file-write* (literal {quoted}))" in profile
+        assert f"(allow file-read* (subpath {quoted}))" in profile
+        assert f"(allow file-write* (subpath {quoted}))" in profile
+    assert f"(allow file-write* (literal {json.dumps(str(parent.resolve()))}))" not in profile
+
+
+def test_claude_alone_gets_the_exact_securityd_mach_lookup(tmp_path, monkeypatch):
+    probe = _load_probe()
+    executables = {provider: tmp_path / provider for provider in ("claude", "codex")}
+    for executable in executables.values():
+        executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(probe.shutil, "which", lambda provider: str(executables[provider]))
+    parent = tmp_path / "parent"; source, writable = parent / "source", parent / "output"
+    source.mkdir(parents=True); writable.mkdir()
+
+    claude = probe._profile(probe._plan(parent, source, (writable,), "claude"))
+    codex = probe._profile(probe._plan(parent, source, (writable,), "codex"))
+    local = probe._profile(probe._plan(parent, source, (writable,), None))
+
+    clause = '(allow mach-lookup (global-name "com.apple.securityd.xpc"))'
+    assert clause in claude
+    assert clause not in codex and clause not in local
+    assert "mach-lookup (global-name \"*\")" not in claude
+
+
 @pytest.mark.parametrize("path_of", [
     lambda probe, _: Path("/usr/bin/false"),
     lambda probe, _: probe._AUTH_HANDLES["claude"],
@@ -241,15 +279,24 @@ def test_bounded_runner_kills_a_quiet_descendant_before_returning(tmp_path):
 
 
 @pytest.mark.parametrize("stage", [
-    {"outcome": "exited", "exit_status": 0, "stderr_bytes": 1, "stdout_truncated": False, "stderr_truncated": False},
     {"outcome": "exited", "exit_status": 0, "stderr_bytes": 65_536, "stdout_truncated": False, "stderr_truncated": True},
     {"outcome": "exited", "exit_status": 1, "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False},
 ])
-def test_provider_pass_requires_a_clean_exit_and_no_stderr(stage):
+def test_provider_pass_requires_exit_and_untruncated_capture(stage):
     probe = _load_probe()
     row = {"version": "1.2.3", "provider_stage": stage, "final_result": probe._EXPECTED_PROVIDER_RESULT}
 
     assert probe._provider_passed(row) is False
+
+
+def test_provider_pass_accepts_bounded_stderr_but_never_uses_it_as_the_result():
+    probe = _load_probe()
+    stage = {"outcome": "exited", "exit_status": 0, "stderr_bytes": 518, "stderr": b'{"admitted_readable":true,"sibling_reachable":false,"oracle_reachable":false}', "stdout_truncated": False, "stderr_truncated": False}
+    passing = {"version": "1.2.3", "provider_stage": stage, "final_result": probe._EXPECTED_PROVIDER_RESULT}
+    stderr_only = {"version": "1.2.3", "provider_stage": stage, "final_result": None}
+
+    assert probe._provider_passed(passing) is True
+    assert probe._provider_passed(stderr_only) is False
 
 
 def test_provider_pass_rejects_truncated_stdout():

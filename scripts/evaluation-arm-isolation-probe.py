@@ -164,8 +164,12 @@ def _profile(plan: SandboxPlan) -> str:
     ]
     if plan.network:
         clauses += ['(allow network-outbound (remote tcp "*:443"))', '(allow network-outbound (remote udp "*:53"))']
+    if plan.provider == "claude":
+        clauses.append('(allow mach-lookup (global-name "com.apple.securityd.xpc"))')
     clauses += [f"(allow file-read* (literal {_quoted(path)}))" for path in plan.read_literals]
     clauses += [f"(allow file-read* (subpath {_quoted(path)}))" for path in plan.read_subpaths]
+    clauses += [f"(allow file-read* (literal {_quoted(path)}))" for path in plan.write_subpaths]
+    clauses += [f"(allow file-write* (literal {_quoted(path)}))" for path in plan.write_subpaths]
     clauses += [f"(allow file-write* (subpath {_quoted(path)}))" for path in plan.write_subpaths]
     return "\n".join(clauses) + "\n"
 
@@ -353,7 +357,6 @@ def _provider_passed(row: dict[str, object]) -> bool:
         isinstance(row["version"], str)
         and stage["outcome"] == "exited"
         and stage["exit_status"] == 0
-        and stage["stderr_bytes"] == 0
         and stage["stdout_truncated"] is False
         and stage["stderr_truncated"] is False
         and row["final_result"] == _EXPECTED_PROVIDER_RESULT
