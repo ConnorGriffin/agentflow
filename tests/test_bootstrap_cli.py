@@ -10,6 +10,7 @@ import pytest
 
 from agentflow.capability_contracts import ContractRequirement
 from agentflow.cli import main
+from agentflow.enroll import enroll_repository
 
 
 def _git_commit(repo: Path, *args: str) -> None:
@@ -1087,6 +1088,75 @@ def test_enroll_rejects_drifted_public_skills_without_running_installer(
     assert drifted.read_text() == "local edits\n"
     assert not config.exists()
     assert not any(command[0] == "npx" for command in commands)
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--porcelain"],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout == ""
+
+
+def test_enroll_repairs_missing_claude_destinations_for_pinned_public_skills(
+    tmp_path, monkeypatch, capsys
+):
+    (tmp_path / "frontend").mkdir()
+    names = ("ui-craft", "drive-local-webapp")
+    for name in names:
+        skill = tmp_path / ".agents" / "skills" / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"pinned {name}\n")
+    legacy = tmp_path / ".claude" / "skills" / "ui-craft"
+    legacy.parent.mkdir(parents=True)
+    legacy.symlink_to(Path("../../.agents/skills/ui-craft"))
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "remote", "add", "origin",
+         "git@github.com:owner/project.git"],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    _git_commit(tmp_path, "-qm", "initial")
+    monkeypatch.setenv("AGENTFLOW_CONFIG", str(tmp_path.parent / "config.toml"))
+    monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(
+        "agentflow.enroll._resolved_skill_release",
+        lambda manifest: (manifest["connor_skills"]["commit"], None),
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll._public_skill_destination_states",
+        lambda root, _manifest: {
+            (location, name): (
+                "ok" if location == ".agents/skills" or not (root / location / name).is_symlink()
+                and (root / location / name).is_dir() else "absent"
+            )
+            for location in (".agents/skills", ".claude/skills")
+            for name in names
+        },
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll._install_methodology_skills",
+        lambda _root: "ok:   methodology contracts supplied by focused fixture",
+    )
+    monkeypatch.setattr(
+        "agentflow.enroll._install_ui_runtime",
+        lambda _root: "ok:   UI runtime supplied by focused fixture",
+    )
+
+    enroll_repository(str(tmp_path), apply=True)
+
+    assert "repository left unchanged" not in capsys.readouterr().out
+    for name in names:
+        claude_skill = tmp_path / ".claude" / "skills" / name
+        assert claude_skill.is_dir()
+        assert not claude_skill.is_symlink()
+        assert (claude_skill / "SKILL.md").read_text() == f"pinned {name}\n"
+
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    _git_commit(tmp_path, "-qm", "enroll")
+
+    enroll_repository(str(tmp_path), apply=True)
+
+    assert "Connor skill pack already installed" in capsys.readouterr().out
     assert subprocess.run(
         ["git", "-C", str(tmp_path), "status", "--porcelain"],
         text=True,
