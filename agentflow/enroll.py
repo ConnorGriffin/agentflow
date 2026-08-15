@@ -948,6 +948,7 @@ def _apply_enrollment(
     _append_once(root / ".gitignore", ".agentflow/")
     if surfaces:
         _append_once(root / ".gitignore", ".agents/skills/**/node_modules/")
+        _append_once(root / ".gitignore", ".claude/skills/**/node_modules/")
 
     agents = root / "AGENTS.md"
     claude = root / "CLAUDE.md"
