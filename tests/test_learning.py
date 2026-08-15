@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import asdict
 from pathlib import Path
 
+import pytest
+
 from agentflow.coordinator.record import COMPLETED, HELD, Record
 from agentflow.coordinator.store import SCHEMA_VERSION, Store
 from agentflow.coordinator.telemetry import (
@@ -197,6 +199,40 @@ def test_learning_rejects_old_store_without_migrating_it(tmp_path):
 
     assert result.returncode == 2 and result.stdout == ""
     assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
+
+
+@pytest.mark.parametrize("corrupt_record", ("[]", "state_list"))
+def test_learning_report_refuses_malformed_records_without_mutating_store(
+        tmp_path, corrupt_record):
+    state, path, store = _state(tmp_path)
+    assert store.upsert(Record("terminal", "review", "codex", 1, repo="owner/repo",
+                               subject="42", state=COMPLETED))
+    store.close()
+    conn = sqlite3.connect(path)
+    data = json.loads(conn.execute(
+        "SELECT data FROM records WHERE identity = ?", ("terminal",)).fetchone()[0])
+    if corrupt_record == "[]":
+        data = []
+    else:
+        data["state"] = []
+    conn.execute("UPDATE records SET data = ? WHERE identity = ?",
+                 (json.dumps(data), "terminal"))
+    conn.commit()
+    schema = conn.execute("PRAGMA user_version").fetchone()[0]
+    rows = conn.execute("SELECT identity, pool, state, demand, data FROM records").fetchall()
+    conn.close()
+    before = path.read_bytes()
+
+    result = _run(state, "learning", "report", "--repo", "owner/repo",
+                  "--from", "2024-01-01", "--to", "2024-01-02")
+
+    assert result.returncode == 2 and result.stdout == ""
+    assert "Traceback" not in result.stderr
+    assert path.read_bytes() == before
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == schema
+    assert conn.execute("SELECT identity, pool, state, demand, data FROM records").fetchall() == rows
+    conn.close()
 
 
 def test_learning_cli_invokes_no_forbidden_operational_actions(tmp_path, monkeypatch, capsys):
