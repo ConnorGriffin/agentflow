@@ -4,6 +4,7 @@ import importlib.util
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,39 @@ def test_provider_plan_admits_only_its_exact_credential_handle(tmp_path, monkeyp
     assert f'(allow file-read* (subpath {json.dumps(str(handle.parent))}))' not in profile
 
 
+@pytest.mark.parametrize("path_of", [
+    lambda probe, _: Path("/usr/bin/false"),
+    lambda probe, _: probe._AUTH_HANDLES["claude"],
+    lambda probe, _: probe._AUTH_HANDLES["codex"],
+])
+def test_local_plan_rejects_every_external_literal_except_the_shells(tmp_path, path_of):
+    probe = _load_probe()
+    parent = tmp_path / "parent"; source, writable = parent / "source", parent / "output"
+    source.mkdir(parents=True); writable.mkdir()
+    with pytest.raises(ValueError, match="external literal"):
+        probe._profile(probe.SandboxPlan((), (path_of(probe, parent),), (writable,), parent, False))
+
+
+def test_provider_plan_rejects_another_provider_executable(tmp_path, monkeypatch):
+    probe = _load_probe()
+    executables = {"codex": tmp_path / "codex", "claude": tmp_path / "claude"}
+    for executable in executables.values():
+        executable.write_text("", encoding="utf-8")
+    monkeypatch.setattr(probe.shutil, "which", lambda provider: str(executables[provider]))
+    parent = tmp_path / "parent"; source, writable = parent / "source", parent / "output"
+    source.mkdir(parents=True); writable.mkdir()
+    with pytest.raises(ValueError, match="external literal"):
+        probe._profile(probe.SandboxPlan((), (executables["claude"],), (writable,), parent, True, "codex"))
+
+
+def test_plan_rejects_provider_network_in_a_local_only_plan(tmp_path):
+    probe = _load_probe()
+    parent = tmp_path / "parent"; writable = parent / "output"
+    writable.mkdir(parents=True)
+    with pytest.raises(ValueError, match="network admission"):
+        probe._profile(probe.SandboxPlan((), (), (writable,), parent, True))
+
+
 @pytest.mark.parametrize("path_of", [lambda probe, parent: Path("/"), lambda probe, parent: parent, lambda probe, parent: probe._REAL_HOME, lambda probe, parent: probe._AUTH_HANDLES["codex"].parent])
 def test_profile_rejects_broad_read_admission(tmp_path, path_of):
     probe = _load_probe()
@@ -90,6 +124,71 @@ def test_bounded_runner_marks_truncated_stdout_unparseable(tmp_path):
 
     assert run["stdout_truncated"] is True
     assert (None if run["stdout_truncated"] else probe._parse_result(run["stdout"])) is None
+
+
+def test_bounded_runner_kills_descendants_that_retain_output_pipes(tmp_path):
+    probe = _load_probe()
+    child = "import time; time.sleep(30)"
+    command = [sys.executable, "-c", f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child!r}]); sys.exit(0)"]
+
+    started = time.monotonic()
+    run = probe._run_bounded(command, cwd=tmp_path, env=dict(), timeout=1)
+
+    assert run["outcome"] == "timed_out"
+    assert time.monotonic() - started < 3
+
+
+@pytest.mark.parametrize("stage", [
+    {"outcome": "exited", "exit_status": 0, "stderr_bytes": 1, "stderr_truncated": False},
+    {"outcome": "exited", "exit_status": 0, "stderr_bytes": 65_536, "stderr_truncated": True},
+    {"outcome": "exited", "exit_status": 1, "stderr_bytes": 0, "stderr_truncated": False},
+])
+def test_provider_pass_requires_a_clean_exit_and_no_stderr(stage):
+    probe = _load_probe()
+    row = {"version": "1.2.3", "provider_stage": stage, "final_result": probe._EXPECTED_PROVIDER_RESULT}
+
+    assert probe._provider_passed(row) is False
+
+
+def test_provider_pass_accepts_only_the_exact_final_result():
+    probe = _load_probe()
+    row = {"version": "1.2.3", "provider_stage": {"outcome": "exited", "exit_status": 0, "stderr_bytes": 0, "stderr_truncated": False}, "final_result": probe._EXPECTED_PROVIDER_RESULT}
+
+    assert probe._provider_passed(row) is True
+    row["final_result"] = {**probe._EXPECTED_PROVIDER_RESULT, "oracle_reachable": True}
+    assert probe._provider_passed(row) is False
+
+
+def test_startup_version_is_printable_bounded_and_stderr_free():
+    probe = _load_probe()
+    clean = {"outcome": "exited", "exit_status": 0, "stdout": b"codex 1.2.3\n", "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False}
+
+    assert probe._version_from_startup(clean) == "codex 1.2.3"
+    assert probe._version_from_startup({**clean, "stderr_bytes": 1}) is None
+    assert probe._version_from_startup({**clean, "stdout": b"x" * (probe._VERSION_OUTPUT_LIMIT + 1)}) is None
+    assert probe._version_from_startup({**clean, "stdout": b"codex\x00"}) is None
+
+
+def test_real_provider_matrix_has_exactly_four_rows(monkeypatch, capsys):
+    probe = _load_probe()
+    calls = []
+
+    def fake_probe(_, provider, order):
+        calls.append((provider, order))
+        return {
+            "provider": provider, "order": order, "version": "1.2.3",
+            "provider_stage": {"outcome": "exited", "exit_status": 0, "stderr_bytes": 0, "stderr_truncated": False},
+            "final_result": probe._EXPECTED_PROVIDER_RESULT,
+        }
+
+    monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
+    monkeypatch.setattr(probe, "_metadata", lambda: {"metadata": "closed"})
+    monkeypatch.setattr(probe, "_probe_provider", fake_probe)
+
+    assert probe.main(["--provider", "claude", "--provider", "codex"]) == 0
+    assert calls == [("claude", "order-1"), ("codex", "order-1"), ("codex", "order-2"), ("claude", "order-2")]
+    assert "versions" not in json.loads(capsys.readouterr().out)
 
 
 def test_current_cli_commands_have_one_outer_sandbox_owner(tmp_path):
@@ -147,7 +246,7 @@ def test_local_only_cli_emits_only_a_provider_free_boundary(monkeypatch, capsys)
     monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
     monkeypatch.setattr(probe, "_run_bounded", fake_run)
-    monkeypatch.setattr(probe, "_metadata", lambda **_: {"metadata": "closed"})
+    monkeypatch.setattr(probe, "_metadata", lambda: {"metadata": "closed"})
 
     assert probe.main(["--local-only"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -162,7 +261,7 @@ def test_local_only_cli_rejects_a_false_boundary_fact(monkeypatch, capsys):
 
     monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
-    monkeypatch.setattr(probe, "_metadata", lambda **_: {"metadata": "closed"})
+    monkeypatch.setattr(probe, "_metadata", lambda: {"metadata": "closed"})
     monkeypatch.setattr(probe, "_probe_local_boundary", lambda _, order: {
         "order": order, "helper_stage": {"outcome": "exited", "exit_status": 0}, "facts": facts,
     })

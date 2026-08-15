@@ -14,6 +14,7 @@ import os
 import platform
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,8 @@ from pathlib import Path
 
 _OUTPUT_LIMIT = 65_536
 _PROVIDER_TIMEOUT = 120
+_READER_JOIN_GRACE = 1
+_VERSION_OUTPUT_LIMIT = 512
 _SYSTEM_PROFILE = Path("/System/Library/Sandbox/Profiles/system.sb")
 _AUTH_HANDLES = {
     "claude": Path("/Users/connor/.claude.json"),
@@ -49,6 +52,11 @@ _LOCAL_FACT_KEYS = {
     "unrelated_home_enumeration_denied",
 }
 _OUTER_SEATBELT_CLAUDE_SETTINGS = {"sandbox": {"enabled": False}}
+_EXPECTED_PROVIDER_RESULT = {
+    "admitted_readable": True,
+    "sibling_reachable": False,
+    "oracle_reachable": False,
+}
 
 
 @dataclass(frozen=True)
@@ -58,6 +66,7 @@ class SandboxPlan:
     write_subpaths: tuple[Path, ...]
     temporary_parent: Path
     network: bool
+    provider: str | None = None
 
 
 def _sha256(path: Path) -> str:
@@ -86,6 +95,8 @@ def _within(path: Path, root: Path) -> bool:
 
 def _validate_plan(plan: SandboxPlan) -> None:
     parent = _absolute(plan.temporary_parent)
+    if plan.network != (plan.provider is not None):
+        raise ValueError("provider network admission does not match the plan")
     auth_dirs = {_absolute(path.parent) for path in _AUTH_HANDLES.values()}
     for path in (*plan.read_subpaths, *plan.write_subpaths):
         candidate = _absolute(path)
@@ -94,13 +105,15 @@ def _validate_plan(plan: SandboxPlan) -> None:
         if not _within(candidate, parent):
             raise ValueError(f"non-task subpath admission rejected: {candidate}")
     allowed_external = {_absolute(Path("/bin/sh")), _absolute(Path("/private/var/select/sh"))}
-    allowed_external.update(_absolute(path) for path in _AUTH_HANDLES.values())
+    if plan.provider is not None:
+        if plan.provider not in _AUTH_HANDLES:
+            raise ValueError(f"unknown provider admission rejected: {plan.provider}")
+        allowed_external.add(_provider_executable(plan.provider))
+        allowed_external.add(_absolute(_AUTH_HANDLES[plan.provider]))
     for path in plan.read_literals:
         candidate = _absolute(path)
-        if candidate == _absolute(_REAL_HOME) or candidate in auth_dirs:
-            raise ValueError(f"broad literal admission rejected: {candidate}")
-        if not _within(candidate, parent) and candidate not in allowed_external and path.is_dir():
-            raise ValueError(f"external directory admission rejected: {candidate}")
+        if not _within(candidate, parent) and candidate not in allowed_external:
+            raise ValueError(f"external literal admission rejected: {candidate}")
 
 
 def _profile(plan: SandboxPlan) -> str:
@@ -143,23 +156,22 @@ def _task_environment(root: Path, provider: str | None) -> tuple[dict[str, str],
     return env, roots
 
 
-def _provider_paths(provider: str) -> tuple[Path, ...]:
+def _provider_executable(provider: str) -> Path:
     executable = shutil.which(provider)
     if executable is None:
         raise RuntimeError(f"{provider} CLI is unavailable")
-    link = Path(executable)
-    return tuple(dict.fromkeys((link, link.resolve())))
+    return _absolute(Path(executable).resolve())
 
 
 def _plan(parent: Path, source: Path, writable: tuple[Path, ...], provider: str | None) -> SandboxPlan:
     literals = [Path("/bin/sh"), Path("/private/var/select/sh")]
     if provider is not None:
-        literals.extend(_provider_paths(provider))
+        literals.append(_provider_executable(provider))
         literals.append(_AUTH_HANDLES[provider])
     return SandboxPlan(
         read_subpaths=(source.resolve(), *(path.resolve() for path in writable)),
         read_literals=tuple(dict.fromkeys(literals)), write_subpaths=tuple(path.resolve() for path in writable),
-        temporary_parent=parent.resolve(), network=provider is not None,
+        temporary_parent=parent.resolve(), network=provider is not None, provider=provider,
     )
 
 
@@ -173,26 +185,43 @@ def _drain(stream, retained: bytearray, count: list[int]) -> None:
         stream.close()
 
 
+def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def _run_bounded(command: list[str], *, cwd: Path, env: dict[str, str], timeout: int) -> dict[str, object]:
     started = time.monotonic()
+    deadline = started + timeout
     try:
         process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         assert process.stdout is not None and process.stderr is not None
         stdout, stderr, stdout_count, stderr_count = bytearray(), bytearray(), [0], [0]
         readers = (threading.Thread(target=_drain, args=(process.stdout, stdout, stdout_count)),
                    threading.Thread(target=_drain, args=(process.stderr, stderr, stderr_count)))
         for reader in readers:
+            reader.daemon = True
             reader.start()
         try:
-            exit_status = process.wait(timeout=timeout)
+            exit_status = process.wait(timeout=max(0, deadline - time.monotonic()))
             outcome = "exited"
         except subprocess.TimeoutExpired:
-            process.kill()
-            exit_status = process.wait()
+            _terminate_process_group(process)
+            try:
+                exit_status = process.wait(timeout=_READER_JOIN_GRACE)
+            except subprocess.TimeoutExpired:
+                exit_status = None
             outcome = "timed_out"
         for reader in readers:
-            reader.join()
+            reader.join(timeout=max(0, deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
+            _terminate_process_group(process)
+            outcome = "timed_out"
+            for reader in readers:
+                reader.join(timeout=_READER_JOIN_GRACE)
         return {
             "outcome": outcome, "exit_status": exit_status,
             "stdout": bytes(stdout), "stderr": bytes(stderr),
@@ -208,7 +237,10 @@ def _run_bounded(command: list[str], *, cwd: Path, env: dict[str, str], timeout:
 
 
 def _stage_facts(run: dict[str, object]) -> dict[str, object]:
-    return {key: run[key] for key in ("outcome", "exit_status", "stdout_bytes", "stderr_bytes", "duration_seconds")}
+    return {key: run[key] for key in (
+        "outcome", "exit_status", "stdout_bytes", "stderr_bytes", "stdout_truncated",
+        "stderr_truncated", "duration_seconds",
+    )}
 
 
 def _json_object(raw: bytes) -> dict[str, object] | None:
@@ -239,6 +271,33 @@ def _read_result(path: Path) -> dict[str, bool] | None:
     with path.open("rb") as stream:
         raw = stream.read(_OUTPUT_LIMIT + 1)
     return _parse_result(raw) if len(raw) <= _OUTPUT_LIMIT else None
+
+
+def _version_from_startup(run: dict[str, object]) -> str | None:
+    raw = run["stdout"]
+    if (
+        run["outcome"] != "exited" or run["exit_status"] != 0
+        or run["stderr_bytes"] != 0 or run["stdout_truncated"] or run["stderr_truncated"]
+        or not isinstance(raw, bytes) or len(raw) > _VERSION_OUTPUT_LIMIT
+    ):
+        return None
+    try:
+        version = raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return None
+    return version if version and all(character.isprintable() for character in version) else None
+
+
+def _provider_passed(row: dict[str, object]) -> bool:
+    stage = row["provider_stage"]
+    return (
+        isinstance(row["version"], str)
+        and stage["outcome"] == "exited"
+        and stage["exit_status"] == 0
+        and stage["stderr_bytes"] == 0
+        and stage["stderr_truncated"] is False
+        and row["final_result"] == _EXPECTED_PROVIDER_RESULT
+    )
 
 
 def _provider_command(provider: str, source: Path, result_path: Path, schema_path: Path, executable: str) -> list[str]:
@@ -296,11 +355,14 @@ def _probe_provider(parent: Path, provider: str, order: str) -> dict[str, object
         profile = _profile(_plan(parent, source, writable, provider))
         result_path, schema_path = root / "output" / "final.json", root / "output" / "result-schema.json"
         schema_path.write_text(json.dumps(_RESULT_SCHEMA), encoding="utf-8")
-        executable = str(_provider_paths(provider)[0])
+        executable = str(_provider_executable(provider))
         startup = _run_bounded(_profile_command(profile, [executable, "--version"]), cwd=source, env=env, timeout=10)
-        run = {"outcome": "not_started", "exit_status": None, "stdout_bytes": 0, "stderr_bytes": 0, "duration_seconds": 0}
+        run = {"outcome": "not_started", "exit_status": None, "stdout_bytes": 0,
+               "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False,
+               "duration_seconds": 0}
         final = None
-        if startup["outcome"] == "exited" and startup["exit_status"] == 0:
+        version = _version_from_startup(startup)
+        if version is not None:
             run = _run_bounded(_profile_command(profile, _provider_command(provider, source, result_path, schema_path, executable)), cwd=source, env=env, timeout=_PROVIDER_TIMEOUT)
             if provider == "codex" and run["outcome"] == "exited" and result_path.is_file():
                 final = _read_result(result_path)
@@ -308,7 +370,7 @@ def _probe_provider(parent: Path, provider: str, order: str) -> dict[str, object
                 final = _parse_result(run["stdout"])
         return {"provider": provider, "order": order, "credential_handle": str(_AUTH_HANDLES[provider]),
                 "profile_sha256": hashlib.sha256(profile.encode()).hexdigest(), "startup_stage": _stage_facts(startup),
-                "provider_stage": _stage_facts(run), "final_result": final, "output_retained": False}
+                "version": version, "provider_stage": _stage_facts(run), "final_result": final, "output_retained": False}
     finally:
         shutil.rmtree(root, ignore_errors=True)
         shutil.rmtree(sibling.parent, ignore_errors=True)
@@ -386,19 +448,10 @@ def _probe_local_boundary(parent: Path, order: str) -> dict[str, object]:
         shutil.rmtree(root, ignore_errors=True); shutil.rmtree(sibling.parent, ignore_errors=True); shutil.rmtree(oracle.parent, ignore_errors=True)
 
 
-def _metadata(*, include_provider_versions: bool) -> dict[str, object]:
-    metadata = {"platform": platform.platform(), "mechanism": "outer sandbox-exec Seatbelt importing system.sb; path-specific task roots",
+def _metadata() -> dict[str, object]:
+    return {"platform": platform.platform(), "mechanism": "outer sandbox-exec Seatbelt importing system.sb; path-specific task roots",
             "system_sb_sha256": _sha256(_SYSTEM_PROFILE),
             "network_policy": "provider mode permits outbound TCP/443 and UDP/53 only; local-only admits neither"}
-    if include_provider_versions:
-        metadata["versions"] = {name: _version(name) for name in ("claude", "codex")}
-    return metadata
-
-
-def _version(provider: str) -> str:
-    run = _run_bounded([provider, "--version"], cwd=Path("/"), env=dict(os.environ), timeout=10)
-    lines = run["stdout"].decode("utf-8", "replace").strip().splitlines()
-    return lines[-1] if run["outcome"] == "exited" and lines else "unavailable"
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -427,12 +480,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.local_only:
             results = [_probe_local_boundary(parent, f"order-{index}") for index, _ in enumerate(orders, 1)]
             passed = all(_local_boundary_passed(row) for row in results)
-            payload = {**_metadata(include_provider_versions=False), "mode": "local-only", "results": results,
+            payload = {**_metadata(), "mode": "local-only", "results": results,
                        "coordinator_command": _coordinator_command(raw)}
         else:
             results = [_probe_provider(parent, provider, f"order-{index}") for index, order in enumerate(orders, 1) for provider in order]
-            passed = all(row["provider_stage"]["outcome"] == "exited" and row["provider_stage"]["exit_status"] == 0 and row["final_result"] == {"admitted_readable": True, "sibling_reachable": False, "oracle_reachable": False} for row in results)
-            payload = {**_metadata(include_provider_versions=True), "mode": "real-provider", "results": results,
+            passed = all(_provider_passed(row) for row in results)
+            payload = {**_metadata(), "mode": "real-provider", "results": results,
                        "coordinator_command": _coordinator_command(raw)}
         print(json.dumps(payload, separators=(",", ":")))
         return 0 if passed else 1
