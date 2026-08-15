@@ -143,12 +143,14 @@ def test_codex_provider_row_uses_the_anchored_reader_without_a_precheck(tmp_path
 
     def environment(root, _):
         output = root / "output"; output.mkdir()
-        return {}, (output,)
+        return {"CODEX_HOME": "task-owned-codex-home"}, (output,)
 
     calls = 0
-    def run(_, **__):
+    environments = []
+    def run(_, **kwargs):
         nonlocal calls
         calls += 1
+        environments.append(kwargs["env"])
         if calls == 1:
             return {"outcome": "exited", "exit_status": 0, "stdout": b"codex 1.2.3\n", "stderr": b"", "stdout_bytes": 12, "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False, "duration_seconds": 0}
         os.symlink(outside, parent / "codex-order-1" / "output" / "final.json")
@@ -165,6 +167,8 @@ def test_codex_provider_row_uses_the_anchored_reader_without_a_precheck(tmp_path
     row = probe._probe_provider(parent, "codex", "order-1", probe.SourceBundle(tmp_path / "bundle", "revision"))
 
     assert row["final_result"] is None
+    assert "CODEX_HOME" not in environments[0]
+    assert environments[1]["CODEX_HOME"] == "task-owned-codex-home"
 
 
 def test_git_timeout_is_bounded_and_content_free(monkeypatch):
@@ -310,11 +314,16 @@ def test_current_cli_commands_have_one_outer_sandbox_owner(tmp_path):
     codex = probe._provider_command("codex", tmp_path, result, schema, "codex")
 
     assert claude[claude.index("--permission-mode") + 1] == "bypassPermissions"
-    assert json.loads(claude[claude.index("--settings") + 1]) == {"sandbox": {"enabled": False}}
+    assert claude[claude.index("--model") + 1] == "haiku"
+    assert "--settings" not in claude
+    assert claude[claude.index("--setting-sources") + 1] == ""
+    assert claude[claude.index("--mcp-config") + 1] == '{"mcpServers":{}}'
+    assert "--strict-mcp-config" in claude and "--no-session-persistence" in claude
     assert "--max-budget-usd" in claude and "--json-schema" in claude
     assert codex[codex.index("--sandbox") + 1] == "danger-full-access"
     assert codex[codex.index("--ask-for-approval") + 1] == "never"
     assert "--output-last-message" in codex and "--ephemeral" in codex
+    assert probe._profile_command("profile", claude)[:4] == ["sandbox-exec", "-p", "profile", "--"]
 
 
 def test_local_helper_checks_admitted_read_write_and_all_denials(tmp_path):

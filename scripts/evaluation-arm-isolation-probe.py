@@ -53,7 +53,6 @@ _LOCAL_FACT_KEYS = {
     "oracle_symlink_open_denied", "unrelated_home_open_denied", "unrelated_home_stat_denied",
     "unrelated_home_enumeration_denied", "unrelated_home_symlink_open_denied",
 }
-_OUTER_SEATBELT_CLAUDE_SETTINGS = {"sandbox": {"enabled": False}}
 _EXPECTED_PROVIDER_RESULT = {
     "admitted_readable": True,
     "sibling_reachable": False,
@@ -368,9 +367,8 @@ def _provider_command(provider: str, source: Path, result_path: Path, schema_pat
         "the JSON object required by the supplied output schema."
     )
     if provider == "claude":
-        return [executable, "--print", "--no-session-persistence", "--permission-mode", "bypassPermissions",
+        return [executable, "--print", "--model", "haiku", "--no-session-persistence", "--permission-mode", "bypassPermissions",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
-                "--settings", json.dumps(_OUTER_SEATBELT_CLAUDE_SETTINGS, separators=(",", ":")),
                 "--json-schema", json.dumps(_RESULT_SCHEMA, separators=(",", ":")),
                 "--max-budget-usd", "0.05", prompt]
     return [executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
@@ -435,7 +433,9 @@ def _probe_provider(parent: Path, provider: str, order: str, bundle: SourceBundl
         result_path, schema_path = root / "output" / "final.json", root / "output" / "result-schema.json"
         schema_path.write_text(json.dumps(_RESULT_SCHEMA), encoding="utf-8")
         executable = str(_provider_executable(provider))
-        startup = _run_bounded(_profile_command(profile, [executable, "--version"]), cwd=source, env=env, timeout=10)
+        startup_env = dict(env)
+        startup_env.pop("CODEX_HOME", None)
+        startup = _run_bounded(_profile_command(profile, [executable, "--version"]), cwd=source, env=startup_env, timeout=10)
         run = {"outcome": "not_started", "exit_status": None, "stdout_bytes": 0,
                "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False,
                "duration_seconds": 0}
