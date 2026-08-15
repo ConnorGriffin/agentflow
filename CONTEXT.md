@@ -47,6 +47,16 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
 - **Evidence briefing** — the bounded canonical-event projection prepared for one
   subject; it is not a transcript, source archive, or alternate decision authority.
 
+- **Observational report** — a read-only projection of durable terminal review/revise
+  outcomes for one repository and bounded UTC window. It records association and
+  missingness only; it does not perform causal evaluation, generate lessons automatically,
+  or mutate policy.
+
+- **Observational cohort** — the bounded subjects selected by one observational report's
+  immutable terminal and telemetry facts. An operator may compare two reports manually;
+  that comparison remains observational, not causal, and does not itself generate lessons
+  or mutate policy.
+
 - **Environment failure** — a failure of the execution environment rather than the
   subject under examination; it is not evidence of a product or process defect.
 

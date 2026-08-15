@@ -57,6 +57,15 @@ ownership, attempts, permits, claims, or recovery; use the coordinator records a
 An orphaned visible claim is held for a one-hour safety grace before removal so a short,
 deterministic interactive scope operation cannot race the daemon.
 
+For a read-only observational report over one repository and UTC window, run:
+
+```bash
+uv run agentflow learning report --repo OWNER/REPO --from YYYY-MM-DD --to YYYY-MM-DD
+```
+
+See the [learning pipeline](learning-pipeline.md) for its bounded facts,
+missingness, and non-action contract.
+
 ## Console service
 
 `uv run agentflow service install` starts the daemon and the read-only operator console

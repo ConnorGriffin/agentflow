@@ -48,28 +48,11 @@ unreadable capacity facts fail closed.
 
 ## First run
 
-Install the per-user services, inspect them while paused, then explicitly allow
-cold submissions:
-
-```bash
-uv run agentflow service install
-uv run agentflow status
-uv run agentflow resume
-uv run agentflow status
-```
-
-The service starts paused. Use `uv run agentflow pause` before maintenance.
-Pause one provider without stopping reconciliation:
-
-```bash
-uv run agentflow pool pause claude
-uv run agentflow pool status claude
-uv run agentflow pool resume claude
-```
-
-The console is local and read-only at `http://127.0.0.1:8788`. Daemon and
-console logs are under `~/Library/Logs/`. The installed LaunchAgent does not
-inherit `AGENTFLOW_NTFY_URL` from a shell.
+After enrollment and capacity calibration succeed, follow
+[Coordinator operations: Activate](coordinator-operations.md#activate) to
+install the service, inspect its paused state, and explicitly permit cold
+submissions. Use [Coordinator operations: Observe](coordinator-operations.md#observe)
+for status, recovery signals, and the bounded learning report.
 
 ## New-machine recovery
 
