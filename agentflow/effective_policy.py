@@ -503,18 +503,17 @@ class ExactRevisionRepositoryOverlaySource:
                     stderr=subprocess.DEVNULL, check=False, timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 if attempt == 0:
-                    self._diagnose(repository, revision, root, phase, time.monotonic() - started)
+                    self._diagnose(repository, revision, phase, time.monotonic() - started)
                 if attempt == 1:
                     raise PolicyValidationError("overlay object is unreadable")
         raise AssertionError("unreachable")
 
-    def _diagnose(self, repository: str, revision: str, root: Path, phase: str,
-                  elapsed: float) -> None:
+    def _diagnose(self, repository: str, revision: str, phase: str, elapsed: float) -> None:
         if self._on_diagnostic is None:
             return
         safe = lambda value: str(value).replace("\r", "\\r").replace("\n", "\\n")
         line = (f"repository overlay read failed repository={safe(repository)} "
-                f"revision={safe(revision)} root={safe(root)} phase={safe(phase)} "
+                f"revision={safe(revision)} phase={safe(phase)} "
                 f"elapsed={elapsed:.3f}s error_class=CLOSED")
         try:
             self._on_diagnostic(line)
@@ -535,20 +534,20 @@ class ExactRevisionRepositoryOverlaySource:
                 ["git", "ls-tree", "-z", "--full-tree", subject_revision, "--", self._PATH],
                 root, "ls-tree", repository, subject_revision)
             if probe.returncode:
-                self._diagnose(repository, subject_revision, root, "ls-tree", 0)
+                self._diagnose(repository, subject_revision, "ls-tree", 0)
                 raise PolicyValidationError("overlay revision is unavailable")
             if not probe.stdout:
                 return None
-            self._diagnose(repository, subject_revision, root, "ls-tree", 0)
+            self._diagnose(repository, subject_revision, "ls-tree", 0)
             raise PolicyValidationError("overlay object is unreadable")
         if len(result.stdout) > _MAX_OVERLAY_BYTES:
-            self._diagnose(repository, subject_revision, root, "parse", 0)
+            self._diagnose(repository, subject_revision, "parse", 0)
             raise PolicyValidationError("overlay exceeds byte limit")
         started = time.monotonic()
         try:
             return OverlayV1.parse(result.stdout)
         except PolicyValidationError:
-            self._diagnose(repository, subject_revision, root, "parse", time.monotonic() - started)
+            self._diagnose(repository, subject_revision, "parse", time.monotonic() - started)
             raise
 
 

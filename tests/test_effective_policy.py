@@ -151,7 +151,7 @@ def test_repository_overlay_retries_show_timeout_once_and_reports_sanitized_diag
     assert len(diagnostics) == 1
     assert "repository=octo/repo" in diagnostics[0]
     assert f"revision={REVISION}" in diagnostics[0]
-    assert f"root={root}" in diagnostics[0]
+    assert str(root) not in diagnostics[0]
     assert "phase=show" in diagnostics[0]
     assert "error_class=CLOSED" in diagnostics[0]
     assert "secret" not in diagnostics[0]
