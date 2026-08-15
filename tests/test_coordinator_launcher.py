@@ -180,6 +180,76 @@ def test_durable_started_and_alive_recovery_keeps_the_reservation(make_coord):
     assert permits(recovered, "codex") == 2
 
 
+def test_same_cycle_vanished_launch_settles_its_durable_result(make_coord):
+    """A provider lost during launch settles before this daemon's cycle returns."""
+    class VanishingSession(FakeSession):
+        def start(self, record, store):
+            result = super().start(record, store)
+            self.end(record.identity, success=True)
+            return result
+
+    fake = VanishingSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert [outcome.status for outcome in coord.cycle("codex")] == ["completed"]
+    durable = record_of(coord, identity)
+    assert durable.state == "completed" and durable.attempts == 1
+    assert not durable.process_alive
+    assert coord.cycle("codex") == []
+
+
+def test_same_cycle_vanished_launch_enters_recoverable_continuation(make_coord):
+    """A provider lost during launch retains its work and first-attempt accounting."""
+    class VanishingSession(FakeSession):
+        def start(self, record, store):
+            result = super().start(record, store)
+            self.kill(record.identity)
+            self.gate_open = False
+            return result
+
+    fake = VanishingSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "waiting" and durable.continuation and durable.claim
+    assert durable.attempts == 1 and not durable.process_alive
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "waiting" and durable.attempts == 1 and durable.claim
+
+
+def test_same_cycle_live_launch_remains_observed(make_coord):
+    """The post-launch reconciliation leaves an exact live family running."""
+    fake = FakeSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "running" and durable.attempts == 1
+    assert durable.process_alive and permits(coord, "codex") == durable.demand
+
+
+def test_same_cycle_permission_denied_launch_remains_observed(make_coord, monkeypatch):
+    """An uncertain process probe never turns a fresh launch into a recoverable ending."""
+    class PermissionDeniedSession(FakeSession):
+        def is_alive(self, family):
+            return LocalLauncher.is_alive(family)
+
+    monkeypatch.setattr(launcher_mod.os, "kill",
+                        lambda _pid, _signal: (_ for _ in ()).throw(PermissionError))
+    fake = PermissionDeniedSession()
+    coord = make_coord(fake)
+    identity = coord.submit_stage(review())
+
+    assert coord.cycle("codex") == []
+    durable = record_of(coord, identity)
+    assert durable.state == "running" and durable.attempts == 1 and durable.process_alive
+
+
 def test_recovery_settles_an_absent_family_from_its_durable_result(make_coord):
     """An ended family with a durable result completes immediately, never until its deadline."""
     fake = FakeSession()
