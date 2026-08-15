@@ -6,8 +6,11 @@ import json
 from importlib.resources import files
 from pathlib import Path
 import shutil
+import subprocess
 from types import SimpleNamespace
 import tomllib
+
+import pytest
 
 from agentflow.capability_contracts import ContractRequirement, preflight
 from agentflow.cli import main
@@ -17,6 +20,31 @@ from agentflow.provider_skills import (
     materialize_launch_capabilities, provider_skill_status,
     native_discovery_output_is_proof, native_discovery_output_is_unavailable,
     native_discovery_prompt, record_native_discovery_receipt, skill_destination_status)
+
+
+def _ready_ui_launch_source(tmp_path):
+    """Create an enrolled source with a minimal runnable selected Codex UI runtime."""
+    checkout = Path(__file__).parents[1]
+    source = tmp_path / "source"
+    shutil.copytree(checkout / ".agents", source / ".agents")
+    (source / "scripts").mkdir()
+    shutil.copy2(checkout / "scripts" / "screenshots.mjs", source / "scripts")
+    runtime = source / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    (runtime / "playwright" / "lib").mkdir(parents=True)
+    (runtime / "playwright" / "package.json").write_text('{"version":"1.61.1"}\n')
+    (runtime / "playwright" / "lib" / "program.js").write_text(
+        'module.exports = "1.61.1";\n'
+    )
+    (runtime / "playwright" / "cli.js").write_text(
+        'console.log(require("./lib/program"));\n'
+    )
+    (runtime / ".bin").mkdir()
+    (runtime / ".bin" / "playwright").symlink_to("../playwright/cli.js")
+    return source
+
+
+def _ui_runtime_requirement():
+    return (ContractRequirement("playwright", "1.61.1", runtime=True),)
 
 
 def test_native_discovery_prompts_are_provider_and_mode_specific():
@@ -475,3 +503,201 @@ def test_launch_materialization_rejects_provider_root_escape_before_writing(tmp_
 
     assert ready is False and "root" in detail
     assert not (outside / "skills").exists()
+
+
+def test_launch_materialization_copies_verified_ui_runtime_into_fresh_root(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+    monkeypatch.setattr(
+        "agentflow.provider_skills.native_discovery_status", lambda *_args: ("ok", "proven")
+    )
+    executable = shutil.which
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which",
+        lambda name: "/bin/codex" if name == "codex" else executable(name),
+    )
+    requirements = _ui_runtime_requirement()
+
+    assert preflight(source, "build", "codex", requirements).ready
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    runtime = destination / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    assert ready is True and "materialized" in detail
+    assert preflight(destination, "build", "codex", requirements).ready
+    assert (runtime / "playwright" / "package.json").read_text() == '{"version":"1.61.1"}\n'
+    assert not (runtime / "playwright" / "package.json").samefile(
+        source / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+        / "playwright" / "package.json"
+    )
+    launcher = runtime / ".bin" / "playwright"
+    assert launcher.is_symlink()
+    assert launcher.readlink() == Path("../playwright/cli.js")
+    assert launcher.resolve().is_relative_to(runtime)
+    result = subprocess.run(
+        ["node", str(launcher)], capture_output=True, check=False, text=True,
+    )
+    assert result.returncode == 0
+    assert result.stdout == "1.61.1\n"
+    assert materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )[0] is True
+
+
+def test_launch_materialization_refuses_occupied_drifted_ui_runtime(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents")
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+    runtime = destination / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    (runtime / "playwright" / "package.json").write_text('{"version":"0.0.0"}\n')
+    monkeypatch.setattr(
+        "agentflow.provider_skills.native_discovery_status", lambda *_args: ("ok", "proven")
+    )
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "runtime destination" in detail
+    assert (runtime / "playwright" / "package.json").read_text() == '{"version":"0.0.0"}\n'
+
+
+def test_launch_materialization_refuses_symlinked_destination_runtime_before_skills(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination_runtime = (
+        destination / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    )
+    destination_runtime.parent.mkdir(parents=True)
+    shutil.copytree(
+        source / ".agents" / "skills" / "drive-local-webapp",
+        destination_runtime.parent,
+        ignore=shutil.ignore_patterns("node_modules"), dirs_exist_ok=True,
+    )
+    external_runtime = tmp_path / "external-runtime"
+    shutil.copytree(
+        source / ".agents" / "skills" / "drive-local-webapp" / "node_modules",
+        external_runtime, symlinks=True,
+    )
+    destination_runtime.symlink_to(external_runtime, target_is_directory=True)
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "runtime destination" in detail
+    assert destination_runtime.is_symlink()
+    assert not (destination / ".agents" / "skills" / "tdd").exists()
+
+
+@pytest.mark.parametrize("launcher_target", ("external", "broken"))
+def test_launch_materialization_rejects_unsafe_source_runtime_before_writing(
+    tmp_path, launcher_target
+):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    outside = tmp_path / "outside.js"
+    destination.mkdir()
+    (destination / "scripts").mkdir()
+    shutil.copy2(source / "scripts" / "screenshots.mjs", destination / "scripts")
+    launcher = source / ".agents" / "skills" / "drive-local-webapp" / "node_modules" / ".bin" / "playwright"
+    launcher.unlink()
+    if launcher_target == "external":
+        outside.write_text("outside\n")
+        launcher.symlink_to(outside)
+    else:
+        launcher.symlink_to("../playwright/missing.js")
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "source Playwright runtime" in detail
+    assert not (destination / ".agents").exists()
+
+
+def test_launch_materialization_rolls_back_skills_after_copy_failure(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    original_copytree = shutil.copytree
+    copies = 0
+
+    def fail_after_first_skill(source_path, destination_path, *args, **kwargs):
+        nonlocal copies
+        if Path(source_path).parent.name == "skills":
+            copies += 1
+            if copies == 2:
+                raise OSError("injected skill copy failure")
+        return original_copytree(source_path, destination_path, *args, **kwargs)
+
+    monkeypatch.setattr("agentflow.provider_skills.shutil.copytree", fail_after_first_skill)
+
+    ready, detail = materialize_launch_capabilities(source, destination, "codex")
+
+    assert ready is False and "copy failed" in detail
+    assert copies == 2
+    assert not (destination / ".agents").exists()
+
+
+def test_launch_materialization_preserves_concurrent_skill_destination(tmp_path, monkeypatch):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    raced = destination / ".agents" / "skills" / "tdd"
+    sentinel = raced / "sentinel"
+    original_mkdir = Path.mkdir
+
+    def inject_concurrent_destination(path, *args, **kwargs):
+        if path == raced:
+            original_mkdir(path)
+            sentinel.write_text("concurrent owner\n")
+            raise FileExistsError("injected concurrent destination")
+        return original_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", inject_concurrent_destination)
+
+    ready, detail = materialize_launch_capabilities(source, destination, "codex")
+
+    assert ready is False and "appeared concurrently" in detail
+    assert sentinel.read_text() == "concurrent owner\n"
+
+
+@pytest.mark.parametrize("cleanup_denied", (False, True))
+def test_launch_materialization_reports_failed_mkdir_rollback(
+    tmp_path, monkeypatch, cleanup_denied
+):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    provider_root = destination / ".agents"
+    skills = provider_root / "skills"
+    original_mkdir = Path.mkdir
+    original_rmdir = Path.rmdir
+
+    def fail_skill_root_creation(path, *args, **kwargs):
+        if path == skills:
+            raise OSError("injected skill root creation failure")
+        return original_mkdir(path, *args, **kwargs)
+
+    def deny_cleanup(path):
+        if cleanup_denied and path == provider_root:
+            raise OSError("injected cleanup denial")
+        return original_rmdir(path)
+
+    monkeypatch.setattr(Path, "mkdir", fail_skill_root_creation)
+    monkeypatch.setattr(Path, "rmdir", deny_cleanup)
+
+    ready, detail = materialize_launch_capabilities(source, destination, "codex")
+
+    assert ready is False and "creation failed" in detail
+    assert ("rollback failed" in detail) is cleanup_denied
+    assert provider_root.exists() is cleanup_denied

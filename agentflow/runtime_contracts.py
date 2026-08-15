@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess
 
-from agentflow import provider_skills
+from agentflow.filesystem_contracts import runtime_tree_status, skill_destination_status
 
 
 def _run_command(command: list[str], *, timeout: int = 30):
@@ -23,18 +23,6 @@ def _run_command(command: list[str], *, timeout: int = 30):
 def _provider_skill_root(root: Path, provider: str) -> Path | None:
     location = {"codex": ".agents/skills", "claude": ".claude/skills"}.get(provider)
     return root / location if location else None
-
-
-def _playwright_version(root: Path, provider: str) -> str | None:
-    skill_root = _provider_skill_root(root, provider)
-    if skill_root is None:
-        return None
-    package = skill_root / "drive-local-webapp" / "node_modules" / "playwright" / "package.json"
-    try:
-        installed = json.loads(package.read_text()).get("version")
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return None
-    return installed if isinstance(installed, str) else None
 
 
 def playwright_runtime_status(
@@ -65,9 +53,7 @@ def playwright_runtime_status(
     if hashlib.sha256(harness.read_bytes()).hexdigest() != harness_spec["sha256"]:
         return "drifted", "pinned screenshot harness is drifted"
     drive = specs["drive-local-webapp"]
-    status = provider_skills.skill_destination_status(
-        skill_root / drive["skill"], drive["files"]
-    )
+    status = skill_destination_status(skill_root / drive["skill"], drive["files"])
     if status == "drifted":
         return "drifted", "pinned drive-local-webapp contract is drifted"
     if status == "absent":
@@ -80,9 +66,50 @@ def playwright_runtime_status(
     match = re.match(r"v(\d+)", node.stdout.strip())
     if node.returncode or not match or int(match.group(1)) < node_minimum:
         return "incompatible", f"Node {node_minimum}+ is required"
-    installed_version = _playwright_version(root, provider)
-    if installed_version is None:
-        return "missing", "installed Playwright metadata is missing from a project-local root"
+    drive_root = skill_root / drive["skill"]
+    runtime = drive_root / "node_modules"
+    tree_status, tree_detail = runtime_tree_status(runtime)
+    if tree_status != "ok":
+        return tree_status, tree_detail
+    try:
+        runtime_root = runtime.resolve(strict=True)
+        runtime_root.relative_to(drive_root.resolve(strict=True))
+    except (FileNotFoundError, OSError, ValueError):
+        return "incompatible", "installed Playwright runtime escapes its provider-local skill"
+    package_root = runtime / "playwright"
+    package = package_root / "package.json"
+    cli = package_root / "cli.js"
+    program = package_root / "lib" / "program.js"
+    required_files = (package, cli, program)
+    if any(not path.exists() and not path.is_symlink() for path in required_files):
+        return "missing", "installed Playwright package files are missing from a project-local root"
+    try:
+        for path in required_files:
+            if path.is_symlink() or not path.is_file():
+                return "incompatible", "installed Playwright package files are incompatible"
+            path.resolve(strict=True).relative_to(runtime_root)
+    except (FileNotFoundError, OSError, ValueError):
+        return "incompatible", "installed Playwright package files escape the project-local runtime"
+    launcher_directory = runtime / ".bin"
+    if not launcher_directory.exists() and not launcher_directory.is_symlink():
+        return "missing", "installed Playwright launcher directory is missing"
+    if launcher_directory.is_symlink() or not launcher_directory.is_dir():
+        return "incompatible", "installed Playwright launcher directory is incompatible"
+    launcher = launcher_directory / "playwright"
+    if not launcher.exists() and not launcher.is_symlink():
+        return "missing", "installed Playwright launcher is missing from a project-local root"
+    try:
+        if not launcher.is_symlink():
+            return "incompatible", "installed Playwright launcher is not a safe relative link"
+        resolved_launcher = launcher.resolve(strict=True)
+        if resolved_launcher != cli.resolve(strict=True):
+            return "incompatible", "installed Playwright launcher does not target its local CLI"
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return "incompatible", "installed Playwright launcher is broken or escapes its runtime"
+    try:
+        installed_version = json.loads(package.read_text()).get("version")
+    except (OSError, json.JSONDecodeError):
+        return "incompatible", "installed Playwright metadata is incompatible"
     if installed_version != version:
         return "incompatible", f"installed Playwright metadata does not pin {version}"
-    return "ok", f"pinned harness, Node {node_minimum}+, and Playwright {version} metadata are intact"
+    return "ok", f"pinned harness, Node {node_minimum}+, and Playwright {version} runtime are intact"
