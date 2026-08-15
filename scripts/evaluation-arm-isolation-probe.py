@@ -15,6 +15,7 @@ import platform
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ _OUTPUT_LIMIT = 65_536
 _PROVIDER_TIMEOUT = 120
 _READER_JOIN_GRACE = 1
 _VERSION_OUTPUT_LIMIT = 512
+_GIT_TIMEOUT = 30
 _SYSTEM_PROFILE = Path("/System/Library/Sandbox/Profiles/system.sb")
 _AUTH_HANDLES = {
     "claude": Path("/Users/connor/.claude.json"),
@@ -89,6 +91,36 @@ def _quoted(path: Path) -> str:
 
 def _absolute(path: Path) -> Path:
     return Path(os.path.abspath(path))
+
+
+def _remove_disposable(*paths: Path) -> None:
+    """Remove disposable roots or fail closed without reporting their contents."""
+    try:
+        for path in dict.fromkeys(paths):
+            if not os.path.lexists(path):
+                continue
+            if os.path.islink(path) or not path.is_dir():
+                os.unlink(path)
+            else:
+                os.chmod(path, stat.S_IRWXU)
+                for directory, child_directories, _ in os.walk(path, topdown=True, followlinks=False):
+                    for child in child_directories:
+                        candidate = Path(directory) / child
+                        if not candidate.is_symlink():
+                            os.chmod(candidate, stat.S_IRWXU)
+                shutil.rmtree(path)
+    except OSError:
+        raise RuntimeError("disposable cleanup failed") from None
+    if any(os.path.lexists(path) for path in paths):
+        raise RuntimeError("disposable cleanup failed")
+
+
+def _git(arguments: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(["git", *arguments], text=True, capture_output=True, check=True,
+                              timeout=_GIT_TIMEOUT, **kwargs)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("source preparation failed") from None
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -276,10 +308,29 @@ def _parse_result(raw: bytes) -> dict[str, bool] | None:
     return value
 
 
-def _read_result(path: Path) -> dict[str, bool] | None:
-    with path.open("rb") as stream:
-        raw = stream.read(_OUTPUT_LIMIT + 1)
-    return _parse_result(raw) if len(raw) <= _OUTPUT_LIMIT else None
+def _read_result(output: Path) -> dict[str, bool] | None:
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(output, directory_flags)
+        try:
+            result_fd = os.open("final.json", file_flags, dir_fd=directory_fd)
+        finally:
+            os.close(directory_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(result_fd).st_mode) or os.fstat(result_fd).st_nlink != 1:
+                return None
+            raw = bytearray()
+            while len(raw) <= _OUTPUT_LIMIT:
+                chunk = os.read(result_fd, _OUTPUT_LIMIT + 1 - len(raw))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+        finally:
+            os.close(result_fd)
+    except OSError:
+        return None
+    return _parse_result(bytes(raw)) if len(raw) <= _OUTPUT_LIMIT else None
 
 
 def _version_from_startup(run: dict[str, object]) -> str | None:
@@ -331,18 +382,18 @@ def _capture_source_bundle(parent: Path) -> SourceBundle:
     repository = Path(__file__).resolve().parents[1]
     parent.mkdir(parents=True, exist_ok=True)
     bundle = parent / "method.bundle"
-    if subprocess.run(["git", "-C", str(repository), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout:
+    if _git(["-C", str(repository), "status", "--porcelain"]).stdout:
         raise RuntimeError("source repository is dirty")
-    revision = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
-    branch = subprocess.run(["git", "-C", str(repository), "symbolic-ref", "--quiet", "--short", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
-    branch_revision = subprocess.run(["git", "-C", str(repository), "rev-parse", branch], text=True, capture_output=True, check=True).stdout.strip()
+    revision = _git(["-C", str(repository), "rev-parse", "HEAD"]).stdout.strip()
+    branch = _git(["-C", str(repository), "symbolic-ref", "--quiet", "--short", "HEAD"]).stdout.strip()
+    branch_revision = _git(["-C", str(repository), "rev-parse", branch]).stdout.strip()
     if branch_revision != revision:
         raise RuntimeError("source branch changed while building bundle")
-    subprocess.run(["git", "-C", str(repository), "bundle", "create", str(bundle), branch], check=True)
+    _git(["-C", str(repository), "bundle", "create", str(bundle), branch])
     if (
-        subprocess.run(["git", "-C", str(repository), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout
-        or subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip() != revision
-        or subprocess.run(["git", "-C", str(repository), "rev-parse", branch], text=True, capture_output=True, check=True).stdout.strip() != revision
+        _git(["-C", str(repository), "status", "--porcelain"]).stdout
+        or _git(["-C", str(repository), "rev-parse", "HEAD"]).stdout.strip() != revision
+        or _git(["-C", str(repository), "rev-parse", branch]).stdout.strip() != revision
     ):
         raise RuntimeError("source changed while building bundle")
     return SourceBundle(bundle, revision)
@@ -351,14 +402,20 @@ def _capture_source_bundle(parent: Path) -> SourceBundle:
 def _detached_bundle_clone(bundle: SourceBundle, root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     source = root / "source"
-    subprocess.run(["git", "clone", "--no-checkout", "--no-local", str(bundle.path), str(source)], capture_output=True, check=True)
-    subprocess.run(["git", "-C", str(source), "checkout", "--detach", bundle.revision], capture_output=True, check=True)
-    for ref in subprocess.run(["git", "-C", str(source), "for-each-ref", "--format=%(refname)"], text=True, capture_output=True, check=True).stdout.splitlines():
-        subprocess.run(["git", "-C", str(source), "update-ref", "-d", ref], check=True)
-    if subprocess.run(["git", "-C", str(source), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout:
+    _git(["clone", "--no-checkout", "--no-local", str(bundle.path), str(source)])
+    _git(["-C", str(source), "checkout", "--detach", bundle.revision])
+    for ref in _git(["-C", str(source), "for-each-ref", "--format=%(refname)"]).stdout.splitlines():
+        _git(["-C", str(source), "update-ref", "-d", ref])
+    # A shallow boundary at the pinned revision makes its tree the only reachable history.
+    (source / ".git" / "shallow").write_text(f"{bundle.revision}\n", encoding="ascii")
+    _git(["-C", str(source), "repack", "-a", "-d"])
+    _git(["-C", str(source), "prune", "--expire", "now"])
+    if _git(["-C", str(source), "status", "--porcelain"]).stdout:
         raise RuntimeError("detached source clone is dirty")
     if (source / ".git" / "objects" / "info" / "alternates").exists():
         raise RuntimeError("detached source clone has alternates")
+    if _git(["-C", str(source), "rev-parse", "HEAD"]).stdout.strip() != bundle.revision:
+        raise RuntimeError("detached source clone revision changed")
     return source
 
 
@@ -387,16 +444,14 @@ def _probe_provider(parent: Path, provider: str, order: str, bundle: SourceBundl
         if version is not None:
             run = _run_bounded(_profile_command(profile, _provider_command(provider, source, result_path, schema_path, executable)), cwd=source, env=env, timeout=_PROVIDER_TIMEOUT)
             if provider == "codex" and run["outcome"] == "exited" and result_path.is_file():
-                final = _read_result(result_path)
+                final = _read_result(result_path.parent)
             elif provider == "claude" and run["outcome"] == "exited" and not run["stdout_truncated"]:
                 final = _parse_result(run["stdout"])
         return {"provider": provider, "order": order, "credential_handle": str(_AUTH_HANDLES[provider]),
                 "profile_sha256": hashlib.sha256(profile.encode()).hexdigest(), "startup_stage": _stage_facts(startup),
                 "version": version, "provider_stage": _stage_facts(run), "final_result": final, "output_retained": False}
     finally:
-        shutil.rmtree(root, ignore_errors=True)
-        shutil.rmtree(sibling.parent, ignore_errors=True)
-        shutil.rmtree(oracle.parent, ignore_errors=True)
+        _remove_disposable(root, sibling.parent, oracle.parent)
 
 
 def _profile_command(profile: str, command: list[str]) -> list[str]:
@@ -470,7 +525,7 @@ def _probe_local_boundary(parent: Path, order: str) -> dict[str, object]:
                 "facts": _parse_local_facts(run["stdout"]) if not run["stdout_truncated"] else None,
                 "output_retained": False}
     finally:
-        shutil.rmtree(root, ignore_errors=True); shutil.rmtree(sibling.parent, ignore_errors=True); shutil.rmtree(oracle.parent, ignore_errors=True)
+        _remove_disposable(root, sibling.parent, oracle.parent)
 
 
 def _metadata() -> dict[str, object]:
@@ -516,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, separators=(",", ":")))
         return 0 if passed else 1
     finally:
-        shutil.rmtree(parent, ignore_errors=True)
+        _remove_disposable(parent)
 
 
 if __name__ == "__main__":

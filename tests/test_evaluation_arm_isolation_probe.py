@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import platform
 import subprocess
 import sys
 import time
@@ -112,10 +114,44 @@ def test_closed_parser_rejects_echo_stderr_partial_and_extra_fields():
 
 def test_output_file_reader_rejects_an_oversized_final_result(tmp_path):
     probe = _load_probe()
-    result = tmp_path / "result.json"
+    output = tmp_path / "output"; output.mkdir()
+    result = output / "final.json"
     result.write_bytes(b"{" + b" " * probe._OUTPUT_LIMIT)
 
-    assert probe._read_result(result) is None
+    assert probe._read_result(output) is None
+
+
+def test_output_file_reader_rejects_a_symlink_to_outside_output(tmp_path):
+    probe = _load_probe()
+    output = tmp_path / "output"; output.mkdir()
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"admitted_readable":true,"sibling_reachable":false,"oracle_reachable":false}', encoding="utf-8")
+    os.symlink(outside, output / "final.json")
+
+    assert probe._read_result(output) is None
+
+
+def test_disposable_cleanup_repairs_hostile_provider_permissions(tmp_path):
+    probe = _load_probe()
+    root = tmp_path / "provider-root"
+    hostile = root / "output" / "hostile"
+    hostile.mkdir(parents=True)
+    (hostile / "provider-bytes").write_text("not retained", encoding="utf-8")
+    os.chmod(hostile, 0)
+    os.chmod(hostile.parent, 0)
+
+    probe._remove_disposable(root)
+
+    assert not root.exists()
+
+
+def test_disposable_cleanup_fails_closed_when_absence_cannot_be_proven(tmp_path, monkeypatch):
+    probe = _load_probe()
+    root = tmp_path / "provider-root"; root.mkdir()
+    monkeypatch.setattr(probe.shutil, "rmtree", lambda _: None)
+
+    with pytest.raises(RuntimeError, match="^disposable cleanup failed$"):
+        probe._remove_disposable(root)
 
 
 def test_bounded_runner_marks_truncated_stdout_unparseable(tmp_path):
@@ -299,10 +335,16 @@ def test_detached_bundle_clone_smoke_uses_a_clean_temporary_repository(tmp_path,
     repository = tmp_path / "repository"
     script = repository / "scripts" / "probe.py"
     script.parent.mkdir(parents=True)
-    script.write_text("# probe\n", encoding="utf-8")
+    historical = repository / "prior-only.txt"
+    historical.write_text("prior-only sentinel\n", encoding="utf-8")
     subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
-    subprocess.run(["git", "-C", str(repository), "-c", "user.name=Probe Test", "-c", "user.email=probe@example.test", "commit", "-m", "seed"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=Probe Test", "-c", "user.email=probe@example.test", "commit", "-m", "prior"], check=True, capture_output=True)
+    prior_revision = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
+    historical.unlink()
+    script.write_text("# probe\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=Probe Test", "-c", "user.email=probe@example.test", "commit", "-m", "snapshot"], check=True, capture_output=True)
     monkeypatch.setattr(probe, "__file__", str(script))
 
     bundle = probe._capture_source_bundle(tmp_path / "arm")
@@ -316,3 +358,16 @@ def test_detached_bundle_clone_smoke_uses_a_clean_temporary_repository(tmp_path,
     assert not (source / ".git" / "objects" / "info" / "alternates").exists()
     assert (source / "scripts" / "probe.py").read_text(encoding="utf-8") == "# probe\n"
     assert subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip() == bundle.revision
+    assert subprocess.run(["git", "-C", str(source), "cat-file", "-e", f"{prior_revision}:prior-only.txt"], capture_output=True).returncode != 0
+
+
+@pytest.mark.skipif(platform.system() != "Darwin", reason="sandbox-exec is macOS-only")
+def test_local_only_cli_boundary_emits_a_closed_payload():
+    run = subprocess.run([sys.executable, str(SCRIPT), "--local-only"], text=True, capture_output=True, timeout=30)
+
+    assert run.returncode == 0, run.stderr
+    assert len(run.stdout.splitlines()) == 1
+    payload = json.loads(run.stdout)
+    assert payload["mode"] == "local-only"
+    assert len(payload["results"]) == 2
+    assert all(row["output_retained"] is False and all(row["facts"].values()) for row in payload["results"])
