@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
-import json
 import math
 from pathlib import Path
 import sqlite3
@@ -12,13 +11,13 @@ from time import time
 from typing import Protocol
 
 from agentflow.canary_attribution import (
-    ATTRIBUTION_CONTRACT_VERSION,
     CANARY_ATTRIBUTION_CONTRACT_DIGEST,
     CanaryAttribution,
     CanaryAttributionRefused,
+    validate_canary_attribution,
 )
 from agentflow.coordinator.errors import StoreUnavailable
-from agentflow.coordinator.telemetry import telemetry_dir
+from agentflow.coordinator.telemetry import read_attempts
 
 
 REPORT_VERSION = "canary-report-v1"
@@ -29,6 +28,8 @@ REPORT_MANIFEST = (b'{"fields":["stage_identity","report_version","receipt_bindi
                    b'"report_version":"canary-report-v1","results":["observation",'
                    b'"rollback_recommendation","block_recommendation"],"schema_version":1}')
 REPORT_MANIFEST_DIGEST = "d80ad3d7e1819f09856d2421e25c4199d55016e2f2afb6b8be7ebdd63a81557b"
+if sha256(REPORT_MANIFEST).hexdigest() != REPORT_MANIFEST_DIGEST:
+    raise RuntimeError("canary report manifest changed")
 
 _TABLE_SQL = """CREATE TABLE canary_reports (
   stage_identity TEXT NOT NULL,
@@ -128,43 +129,33 @@ class AttemptTelemetryReader:
 
     def read(self, stage_identity: str) -> CanaryAttemptProjection:
         facts = []
-        try:
-            paths = sorted(path for path in telemetry_dir(self._store_path).iterdir()
-                           if path.suffix == ".json")
-        except OSError:
-            paths = []
-        for path in paths:
-            try:
-                value = json.loads(path.read_text())
-            except (OSError, TypeError, ValueError):
-                continue
-            fact = _attempt_fact(value)
+        for entry in read_attempts(self._store_path):
+            fact = _attempt_fact(entry)
             if fact is not None and fact.stage_identity == stage_identity:
                 facts.append(fact)
-        return CanaryAttemptProjection(stage_identity, tuple(sorted(facts, key=lambda item: item.attempt_token)))
+        return CanaryAttemptProjection(
+            stage_identity, tuple(sorted(facts, key=lambda item: item.attempt_token)))
 
 
-def _attempt_fact(value: object) -> CanaryAttemptFact | None:
-    if not isinstance(value, dict):
+def _attempt_fact(entry: object) -> CanaryAttemptFact | None:
+    try:
+        identity, token, verified = entry.identity, entry.token, entry.verified
+        cause, classification = entry.cause, entry.classification
+        started, finalized, usage = entry.started_at, entry.finalized_at, entry.usage
+    except AttributeError:
         return None
-    usage = value.get("usage")
-    if not isinstance(usage, dict):
-        return None
-    required = ("identity", "token", "verified", "cause", "classification", "started_at", "finalized_at")
-    if any(key not in value for key in required):
-        return None
-    identity, token, verified = value["identity"], value["token"], value["verified"]
-    cause, classification = value["cause"], value["classification"]
-    started, finalized = value["started_at"], value["finalized_at"]
     if (not all(isinstance(item, str) for item in (identity, token, cause, classification))
             or type(verified) is not bool or any(type(item) is not int for item in (started, finalized))):
         return None
-    tokens = [usage.get(key) for key in (
-        "input_tokens", "cached_input_tokens", "cache_creation_tokens", "output_tokens",
-        "reasoning_output_tokens") if usage.get(key) is not None]
+    try:
+        tokens = [getattr(usage, key) for key in (
+            "input_tokens", "cached_input_tokens", "cache_creation_tokens", "output_tokens",
+            "reasoning_output_tokens") if getattr(usage, key) is not None]
+        cost = usage.cost_usd
+    except AttributeError:
+        return None
     if any(type(item) is not int or item < 0 for item in tokens):
         return None
-    cost = usage.get("cost_usd")
     if cost is not None and (isinstance(cost, bool) or not isinstance(cost, (int, float))
                              or not math.isfinite(cost) or cost < 0):
         return None
@@ -182,6 +173,10 @@ class CanaryReporter:
         self._telemetry = telemetry or AttemptTelemetryReader(store_path)
         self._path = Path(report_store_path) if report_store_path is not None else store_path.parent / "canary-reports.db"
         self._now = now or time
+
+    @staticmethod
+    def _checkpoint(_name: str) -> None:
+        """A test-only crash boundary around the final immutable-row commit."""
 
     def report(self, stage_identity: str, report_version: str) -> CanaryReport:
         if report_version != REPORT_VERSION:
@@ -217,7 +212,9 @@ class CanaryReporter:
             if existing is None:
                 conn.execute("INSERT INTO canary_reports VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                              _values(candidate))
+                self._checkpoint("before-commit")
                 conn.execute("COMMIT")
+                self._checkpoint("after-commit")
                 return candidate
             conn.execute("ROLLBACK")
             return existing
@@ -243,8 +240,11 @@ class CanaryReporter:
             raise CanaryReportRefused("attribution_invalid") from None
         if value is None:
             raise CanaryReportRefused("attribution_absent")
-        if (type(value) is not CanaryAttribution or value.stage_identity != stage_identity
-                or value.contract_version != ATTRIBUTION_CONTRACT_VERSION):
+        try:
+            value = validate_canary_attribution(value)
+        except CanaryAttributionRefused:
+            raise CanaryReportRefused("attribution_invalid") from None
+        if value.stage_identity != stage_identity:
             raise CanaryReportRefused("attribution_invalid")
         return value
 
