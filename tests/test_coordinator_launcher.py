@@ -67,10 +67,47 @@ def test_durable_started_then_dead_recovery_consumes_exactly_one_attempt(make_co
 
 def test_local_launcher_rejects_a_live_pid_that_is_not_its_process_family(monkeypatch):
     """Recovery must not adopt or signal a PID reused by an unrelated process group."""
-    monkeypatch.setattr(launcher_mod.os, "kill", lambda _pid, _signal: None)
+    probes = []
+    monkeypatch.setattr(launcher_mod.os, "kill",
+                        lambda pid, signal: probes.append((pid, signal)))
     monkeypatch.setattr(launcher_mod.os, "getpgid", lambda _pid: 12345)
 
     assert not LocalLauncher.is_alive("89850")
+    assert probes == [(89850, 0)]
+
+
+def test_local_launcher_rejects_a_proven_missing_pid(monkeypatch):
+    """A missing PID is definite evidence that the recorded family ended."""
+    def missing(*_args):
+        raise ProcessLookupError
+
+    monkeypatch.setattr(launcher_mod.os, "kill", missing)
+    monkeypatch.setattr(launcher_mod.os, "getpgid",
+                        lambda _pid: pytest.fail("missing PID must not reach the group probe"))
+
+    assert not LocalLauncher.is_alive("89850")
+
+
+@pytest.mark.parametrize("probe", ["kill", "getpgid"])
+def test_local_launcher_keeps_permission_denied_probe_conservatively_alive(monkeypatch, probe):
+    """Recovery waits when the OS cannot determine whether the recorded family still exists."""
+    def denied(*_args):
+        raise PermissionError
+
+    monkeypatch.setattr(launcher_mod.os, "kill", denied if probe == "kill"
+                        else lambda _pid, _signal: None)
+    monkeypatch.setattr(launcher_mod.os, "getpgid", denied if probe == "getpgid"
+                        else lambda _pid: 89850)
+
+    assert LocalLauncher.is_alive("89850")
+
+
+def test_local_launcher_keeps_an_ambiguous_reused_group_leader_alive(monkeypatch):
+    """Matching PID and PGID cannot prove the original process birth without new persistence."""
+    monkeypatch.setattr(launcher_mod.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(launcher_mod.os, "getpgid", lambda _pid: 89850)
+
+    assert LocalLauncher.is_alive("89850")
 
 
 @pytest.mark.parametrize(("result", "legacy_exit"), [
