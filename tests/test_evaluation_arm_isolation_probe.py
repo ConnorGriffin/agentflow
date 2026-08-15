@@ -314,14 +314,14 @@ def test_current_cli_commands_have_one_outer_sandbox_owner(tmp_path):
     codex = probe._provider_command("codex", tmp_path, result, schema, "codex")
 
     assert claude[claude.index("--permission-mode") + 1] == "bypassPermissions"
-    assert claude[claude.index("--model") + 1] == "haiku"
+    assert claude[claude.index("--model") + 1] == "sonnet"
     assert "--settings" not in claude
     assert claude[claude.index("--setting-sources") + 1] == ""
     assert claude[claude.index("--mcp-config") + 1] == '{"mcpServers":{}}'
     assert "--strict-mcp-config" in claude and "--no-session-persistence" in claude
     assert "--max-budget-usd" in claude and "--json-schema" in claude
-    assert codex[codex.index("--sandbox") + 1] == "danger-full-access"
-    assert codex[codex.index("--ask-for-approval") + 1] == "never"
+    assert "--dangerously-bypass-approvals-and-sandbox" in codex
+    assert "--sandbox" not in codex and "--ask-for-approval" not in codex
     assert "--output-last-message" in codex and "--ephemeral" in codex
     assert probe._profile_command("profile", claude)[:4] == ["sandbox-exec", "-p", "profile", "--"]
 

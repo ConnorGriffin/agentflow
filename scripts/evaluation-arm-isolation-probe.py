@@ -367,12 +367,12 @@ def _provider_command(provider: str, source: Path, result_path: Path, schema_pat
         "the JSON object required by the supplied output schema."
     )
     if provider == "claude":
-        return [executable, "--print", "--model", "haiku", "--no-session-persistence", "--permission-mode", "bypassPermissions",
+        return [executable, "--print", "--model", "sonnet", "--no-session-persistence", "--permission-mode", "bypassPermissions",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "",
                 "--json-schema", json.dumps(_RESULT_SCHEMA, separators=(",", ":")),
                 "--max-budget-usd", "0.05", prompt]
     return [executable, "exec", "--ephemeral", "--ignore-user-config", "--ignore-rules",
-            "--sandbox", "danger-full-access", "--ask-for-approval", "never", "--skip-git-repo-check",
+            "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
             "--cd", str(source), "--output-schema", str(schema_path), "--output-last-message", str(result_path), prompt]
 
 
