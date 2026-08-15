@@ -49,7 +49,7 @@ _LOCAL_FACT_KEYS = {
     "sibling_stat_denied", "sibling_enumeration_denied", "sibling_symlink_open_denied",
     "oracle_open_denied", "oracle_stat_denied", "oracle_enumeration_denied",
     "oracle_symlink_open_denied", "unrelated_home_open_denied", "unrelated_home_stat_denied",
-    "unrelated_home_enumeration_denied",
+    "unrelated_home_enumeration_denied", "unrelated_home_symlink_open_denied",
 }
 _OUTER_SEATBELT_CLAUDE_SETTINGS = {"sandbox": {"enabled": False}}
 _EXPECTED_PROVIDER_RESULT = {
@@ -67,6 +67,12 @@ class SandboxPlan:
     temporary_parent: Path
     network: bool
     provider: str | None = None
+
+
+@dataclass(frozen=True)
+class SourceBundle:
+    path: Path
+    revision: str
 
 
 def _sha256(path: Path) -> str:
@@ -209,19 +215,21 @@ def _run_bounded(command: list[str], *, cwd: Path, env: dict[str, str], timeout:
             exit_status = process.wait(timeout=max(0, deadline - time.monotonic()))
             outcome = "exited"
         except subprocess.TimeoutExpired:
-            _terminate_process_group(process)
             try:
+                _terminate_process_group(process)
                 exit_status = process.wait(timeout=_READER_JOIN_GRACE)
             except subprocess.TimeoutExpired:
                 exit_status = None
             outcome = "timed_out"
-        for reader in readers:
-            reader.join(timeout=max(0, deadline - time.monotonic()))
-        if any(reader.is_alive() for reader in readers):
+        finally:
             _terminate_process_group(process)
+        reader_deadline = time.monotonic() + _READER_JOIN_GRACE
+        for reader in readers:
+            reader.join(timeout=max(0, reader_deadline - time.monotonic()))
+        if any(reader.is_alive() for reader in readers):
             outcome = "timed_out"
             for reader in readers:
-                reader.join(timeout=_READER_JOIN_GRACE)
+                reader.join(timeout=max(0, reader_deadline - time.monotonic()))
         return {
             "outcome": outcome, "exit_status": exit_status,
             "stdout": bytes(stdout), "stderr": bytes(stderr),
@@ -233,7 +241,8 @@ def _run_bounded(command: list[str], *, cwd: Path, env: dict[str, str], timeout:
         }
     except OSError:
         return {"outcome": "launch_failed", "exit_status": None, "stdout": b"", "stderr": b"",
-                "stdout_bytes": 0, "stderr_bytes": 0, "duration_seconds": 0}
+                "stdout_bytes": 0, "stderr_bytes": 0, "stdout_truncated": False,
+                "stderr_truncated": False, "duration_seconds": 0}
 
 
 def _stage_facts(run: dict[str, object]) -> dict[str, object]:
@@ -295,6 +304,7 @@ def _provider_passed(row: dict[str, object]) -> bool:
         and stage["outcome"] == "exited"
         and stage["exit_status"] == 0
         and stage["stderr_bytes"] == 0
+        and stage["stdout_truncated"] is False
         and stage["stderr_truncated"] is False
         and row["final_result"] == _EXPECTED_PROVIDER_RESULT
     )
@@ -317,10 +327,10 @@ def _provider_command(provider: str, source: Path, result_path: Path, schema_pat
             "--cd", str(source), "--output-schema", str(schema_path), "--output-last-message", str(result_path), prompt]
 
 
-def _detached_bundle_clone(root: Path) -> Path:
+def _capture_source_bundle(parent: Path) -> SourceBundle:
     repository = Path(__file__).resolve().parents[1]
-    root.mkdir(parents=True, exist_ok=True)
-    bundle, source = root / "method.bundle", root / "source"
+    parent.mkdir(parents=True, exist_ok=True)
+    bundle = parent / "method.bundle"
     if subprocess.run(["git", "-C", str(repository), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout:
         raise RuntimeError("source repository is dirty")
     revision = subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip()
@@ -329,8 +339,20 @@ def _detached_bundle_clone(root: Path) -> Path:
     if branch_revision != revision:
         raise RuntimeError("source branch changed while building bundle")
     subprocess.run(["git", "-C", str(repository), "bundle", "create", str(bundle), branch], check=True)
-    subprocess.run(["git", "clone", "--no-checkout", "--no-local", str(bundle), str(source)], capture_output=True, check=True)
-    subprocess.run(["git", "-C", str(source), "checkout", "--detach", revision], capture_output=True, check=True)
+    if (
+        subprocess.run(["git", "-C", str(repository), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout
+        or subprocess.run(["git", "-C", str(repository), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip() != revision
+        or subprocess.run(["git", "-C", str(repository), "rev-parse", branch], text=True, capture_output=True, check=True).stdout.strip() != revision
+    ):
+        raise RuntimeError("source changed while building bundle")
+    return SourceBundle(bundle, revision)
+
+
+def _detached_bundle_clone(bundle: SourceBundle, root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    source = root / "source"
+    subprocess.run(["git", "clone", "--no-checkout", "--no-local", str(bundle.path), str(source)], capture_output=True, check=True)
+    subprocess.run(["git", "-C", str(source), "checkout", "--detach", bundle.revision], capture_output=True, check=True)
     for ref in subprocess.run(["git", "-C", str(source), "for-each-ref", "--format=%(refname)"], text=True, capture_output=True, check=True).stdout.splitlines():
         subprocess.run(["git", "-C", str(source), "update-ref", "-d", ref], check=True)
     if subprocess.run(["git", "-C", str(source), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout:
@@ -340,13 +362,13 @@ def _detached_bundle_clone(root: Path) -> Path:
     return source
 
 
-def _probe_provider(parent: Path, provider: str, order: str) -> dict[str, object]:
+def _probe_provider(parent: Path, provider: str, order: str, bundle: SourceBundle) -> dict[str, object]:
     root = parent / f"{provider}-{order}"
     root.mkdir()
     sibling = parent / f"sibling-{provider}-{order}" / "sibling-sentinel.txt"
     oracle = parent / f"oracle-{provider}-{order}" / "oracle-sentinel.txt"
     try:
-        source = _detached_bundle_clone(root)
+        source = _detached_bundle_clone(bundle, root)
         (source / "admitted.txt").write_text("admitted fixture\n", encoding="utf-8")
         for sentinel in (sibling, oracle):
             sentinel.parent.mkdir()
@@ -384,7 +406,8 @@ def _profile_command(profile: str, command: list[str]) -> list[str]:
 def _local_helper(admitted: Path, output: Path, sibling: Path, oracle: Path, sibling_link: Path, oracle_link: Path) -> list[str]:
     paths = {"admitted": admitted, "task": output / "write-proof", "source": admitted.with_name("forbidden-write"),
              "sibling": sibling, "sibling_dir": sibling.parent, "sibling_link": sibling_link,
-             "oracle": oracle, "oracle_dir": oracle.parent, "oracle_link": oracle_link, "home": _REAL_HOME}
+             "oracle": oracle, "oracle_dir": oracle.parent, "oracle_link": oracle_link,
+             "home": _REAL_HOME, "home_link": output / "home-link"}
     variables = "\n".join(f"{name}={shlex.quote(str(path))}" for name, path in paths.items())
     checks = '''
 open_denied() { ! (IFS= read -r ignored < "$1") 2>/dev/null; }
@@ -393,15 +416,16 @@ enumeration_denied() { directory=$1; set -- "$directory"/*; [ "$1" = "$directory
 admitted_read=false; task_write=false; source_write_denied=false
 sibling_open_denied=false; sibling_stat_denied=false; sibling_enumeration_denied=false; sibling_symlink_open_denied=false
 oracle_open_denied=false; oracle_stat_denied=false; oracle_enumeration_denied=false; oracle_symlink_open_denied=false
-unrelated_home_open_denied=false; unrelated_home_stat_denied=false; unrelated_home_enumeration_denied=false
+unrelated_home_open_denied=false; unrelated_home_stat_denied=false; unrelated_home_enumeration_denied=false; unrelated_home_symlink_open_denied=false
 { IFS= read -r line < "$admitted" && [ "$line" = "admitted fixture" ]; } 2>/dev/null && admitted_read=true
 { printf 'task write\\n' > "$task" && IFS= read -r line < "$task" && [ "$line" = "task write" ]; } 2>/dev/null && task_write=true
 ! (printf x > "$source") 2>/dev/null && source_write_denied=true
 open_denied "$sibling" && sibling_open_denied=true; stat_denied "$sibling" && sibling_stat_denied=true; enumeration_denied "$sibling_dir" && sibling_enumeration_denied=true; open_denied "$sibling_link" && sibling_symlink_open_denied=true
 open_denied "$oracle" && oracle_open_denied=true; stat_denied "$oracle" && oracle_stat_denied=true; enumeration_denied "$oracle_dir" && oracle_enumeration_denied=true; open_denied "$oracle_link" && oracle_symlink_open_denied=true
 ! (cd "$home") 2>/dev/null && unrelated_home_open_denied=true; ! [ -d "$home" ] && unrelated_home_stat_denied=true; enumeration_denied "$home" && unrelated_home_enumeration_denied=true
-printf '{"admitted_read":%s,"task_write":%s,"source_write_denied":%s,"sibling_open_denied":%s,"sibling_stat_denied":%s,"sibling_enumeration_denied":%s,"sibling_symlink_open_denied":%s,"oracle_open_denied":%s,"oracle_stat_denied":%s,"oracle_enumeration_denied":%s,"oracle_symlink_open_denied":%s,"unrelated_home_open_denied":%s,"unrelated_home_stat_denied":%s,"unrelated_home_enumeration_denied":%s}\\n' "$admitted_read" "$task_write" "$source_write_denied" "$sibling_open_denied" "$sibling_stat_denied" "$sibling_enumeration_denied" "$sibling_symlink_open_denied" "$oracle_open_denied" "$oracle_stat_denied" "$oracle_enumeration_denied" "$oracle_symlink_open_denied" "$unrelated_home_open_denied" "$unrelated_home_stat_denied" "$unrelated_home_enumeration_denied"
-if [ "$admitted_read" = true ] && [ "$task_write" = true ] && [ "$source_write_denied" = true ] && [ "$sibling_open_denied" = true ] && [ "$sibling_stat_denied" = true ] && [ "$sibling_enumeration_denied" = true ] && [ "$sibling_symlink_open_denied" = true ] && [ "$oracle_open_denied" = true ] && [ "$oracle_stat_denied" = true ] && [ "$oracle_enumeration_denied" = true ] && [ "$oracle_symlink_open_denied" = true ] && [ "$unrelated_home_open_denied" = true ] && [ "$unrelated_home_stat_denied" = true ] && [ "$unrelated_home_enumeration_denied" = true ]; then
+open_denied "$home_link" && unrelated_home_symlink_open_denied=true
+printf '{"admitted_read":%s,"task_write":%s,"source_write_denied":%s,"sibling_open_denied":%s,"sibling_stat_denied":%s,"sibling_enumeration_denied":%s,"sibling_symlink_open_denied":%s,"oracle_open_denied":%s,"oracle_stat_denied":%s,"oracle_enumeration_denied":%s,"oracle_symlink_open_denied":%s,"unrelated_home_open_denied":%s,"unrelated_home_stat_denied":%s,"unrelated_home_enumeration_denied":%s,"unrelated_home_symlink_open_denied":%s}\\n' "$admitted_read" "$task_write" "$source_write_denied" "$sibling_open_denied" "$sibling_stat_denied" "$sibling_enumeration_denied" "$sibling_symlink_open_denied" "$oracle_open_denied" "$oracle_stat_denied" "$oracle_enumeration_denied" "$oracle_symlink_open_denied" "$unrelated_home_open_denied" "$unrelated_home_stat_denied" "$unrelated_home_enumeration_denied" "$unrelated_home_symlink_open_denied"
+if [ "$admitted_read" = true ] && [ "$task_write" = true ] && [ "$source_write_denied" = true ] && [ "$sibling_open_denied" = true ] && [ "$sibling_stat_denied" = true ] && [ "$sibling_enumeration_denied" = true ] && [ "$sibling_symlink_open_denied" = true ] && [ "$oracle_open_denied" = true ] && [ "$oracle_stat_denied" = true ] && [ "$oracle_enumeration_denied" = true ] && [ "$oracle_symlink_open_denied" = true ] && [ "$unrelated_home_open_denied" = true ] && [ "$unrelated_home_stat_denied" = true ] && [ "$unrelated_home_enumeration_denied" = true ] && [ "$unrelated_home_symlink_open_denied" = true ]; then
     exit 0
 fi
 exit 1
@@ -438,6 +462,7 @@ def _probe_local_boundary(parent: Path, order: str) -> dict[str, object]:
             sentinel.parent.mkdir(); sentinel.write_text("sentinel\n", encoding="utf-8")
         env, writable = _task_environment(root, None)
         os.symlink(sibling, output / "sibling-link"); os.symlink(oracle, output / "oracle-link")
+        os.symlink(_REAL_HOME / ".claude.json", output / "home-link")
         profile = _profile(_plan(parent, source, writable, None))
         run = _run_bounded(_profile_command(profile, _local_helper(source / "admitted.txt", output, sibling, oracle, output / "sibling-link", output / "oracle-link")), cwd=Path("/"), env=env, timeout=10)
         return {"order": order, "profile_sha256": hashlib.sha256(profile.encode()).hexdigest(),
@@ -483,7 +508,8 @@ def main(argv: list[str] | None = None) -> int:
             payload = {**_metadata(), "mode": "local-only", "results": results,
                        "coordinator_command": _coordinator_command(raw)}
         else:
-            results = [_probe_provider(parent, provider, f"order-{index}") for index, order in enumerate(orders, 1) for provider in order]
+            bundle = _capture_source_bundle(parent)
+            results = [_probe_provider(parent, provider, f"order-{index}", bundle) for index, order in enumerate(orders, 1) for provider in order]
             passed = all(_provider_passed(row) for row in results)
             payload = {**_metadata(), "mode": "real-provider", "results": results,
                        "coordinator_command": _coordinator_command(raw)}

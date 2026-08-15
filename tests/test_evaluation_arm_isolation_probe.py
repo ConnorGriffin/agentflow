@@ -134,14 +134,27 @@ def test_bounded_runner_kills_descendants_that_retain_output_pipes(tmp_path):
     started = time.monotonic()
     run = probe._run_bounded(command, cwd=tmp_path, env=dict(), timeout=1)
 
-    assert run["outcome"] == "timed_out"
+    assert run["outcome"] == "exited"
     assert time.monotonic() - started < 3
 
 
+def test_bounded_runner_kills_a_quiet_descendant_before_returning(tmp_path):
+    probe = _load_probe()
+    marker = tmp_path / "descendant-survived"
+    child = f"import pathlib, time; time.sleep(.3); pathlib.Path({str(marker)!r}).write_text('survived')"
+    command = [sys.executable, "-c", f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child!r}], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); sys.exit(0)"]
+
+    run = probe._run_bounded(command, cwd=tmp_path, env=dict(), timeout=10)
+    time.sleep(.5)
+
+    assert run["outcome"] == "exited"
+    assert not marker.exists()
+
+
 @pytest.mark.parametrize("stage", [
-    {"outcome": "exited", "exit_status": 0, "stderr_bytes": 1, "stderr_truncated": False},
-    {"outcome": "exited", "exit_status": 0, "stderr_bytes": 65_536, "stderr_truncated": True},
-    {"outcome": "exited", "exit_status": 1, "stderr_bytes": 0, "stderr_truncated": False},
+    {"outcome": "exited", "exit_status": 0, "stderr_bytes": 1, "stdout_truncated": False, "stderr_truncated": False},
+    {"outcome": "exited", "exit_status": 0, "stderr_bytes": 65_536, "stdout_truncated": False, "stderr_truncated": True},
+    {"outcome": "exited", "exit_status": 1, "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False},
 ])
 def test_provider_pass_requires_a_clean_exit_and_no_stderr(stage):
     probe = _load_probe()
@@ -150,9 +163,16 @@ def test_provider_pass_requires_a_clean_exit_and_no_stderr(stage):
     assert probe._provider_passed(row) is False
 
 
+def test_provider_pass_rejects_truncated_stdout():
+    probe = _load_probe()
+    row = {"version": "1.2.3", "provider_stage": {"outcome": "exited", "exit_status": 0, "stderr_bytes": 0, "stdout_truncated": True, "stderr_truncated": False}, "final_result": probe._EXPECTED_PROVIDER_RESULT}
+
+    assert probe._provider_passed(row) is False
+
+
 def test_provider_pass_accepts_only_the_exact_final_result():
     probe = _load_probe()
-    row = {"version": "1.2.3", "provider_stage": {"outcome": "exited", "exit_status": 0, "stderr_bytes": 0, "stderr_truncated": False}, "final_result": probe._EXPECTED_PROVIDER_RESULT}
+    row = {"version": "1.2.3", "provider_stage": {"outcome": "exited", "exit_status": 0, "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False}, "final_result": probe._EXPECTED_PROVIDER_RESULT}
 
     assert probe._provider_passed(row) is True
     row["final_result"] = {**probe._EXPECTED_PROVIDER_RESULT, "oracle_reachable": True}
@@ -169,21 +189,25 @@ def test_startup_version_is_printable_bounded_and_stderr_free():
     assert probe._version_from_startup({**clean, "stdout": b"codex\x00"}) is None
 
 
-def test_real_provider_matrix_has_exactly_four_rows(monkeypatch, capsys):
+def test_real_provider_matrix_has_exactly_four_rows(tmp_path, monkeypatch, capsys):
     probe = _load_probe()
     calls = []
 
-    def fake_probe(_, provider, order):
+    bundle = probe.SourceBundle(tmp_path / "method.bundle", "pinned-revision")
+
+    def fake_probe(_, provider, order, received_bundle):
         calls.append((provider, order))
+        assert received_bundle == bundle
         return {
             "provider": provider, "order": order, "version": "1.2.3",
-            "provider_stage": {"outcome": "exited", "exit_status": 0, "stderr_bytes": 0, "stderr_truncated": False},
+            "provider_stage": {"outcome": "exited", "exit_status": 0, "stderr_bytes": 0, "stdout_truncated": False, "stderr_truncated": False},
             "final_result": probe._EXPECTED_PROVIDER_RESULT,
         }
 
     monkeypatch.setattr(probe.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(probe.shutil, "which", lambda _: "/usr/bin/sandbox-exec")
     monkeypatch.setattr(probe, "_metadata", lambda: {"metadata": "closed"})
+    monkeypatch.setattr(probe, "_capture_source_bundle", lambda _: bundle)
     monkeypatch.setattr(probe, "_probe_provider", fake_probe)
 
     assert probe.main(["--provider", "claude", "--provider", "codex"]) == 0
@@ -211,7 +235,7 @@ def test_local_helper_checks_admitted_read_write_and_all_denials(tmp_path):
     command = probe._local_helper(tmp_path / "admitted", tmp_path / "out", tmp_path / "sibling", tmp_path / "oracle", tmp_path / "sibling-link", tmp_path / "oracle-link")
 
     assert command[:2] == ["/bin/sh", "-c"]
-    for fact in ("admitted_read", "task_write", "source_write_denied", "sibling_open_denied", "sibling_stat_denied", "sibling_enumeration_denied", "sibling_symlink_open_denied", "oracle_open_denied", "oracle_stat_denied", "oracle_enumeration_denied", "oracle_symlink_open_denied", "unrelated_home_open_denied", "unrelated_home_stat_denied", "unrelated_home_enumeration_denied"):
+    for fact in ("admitted_read", "task_write", "source_write_denied", "sibling_open_denied", "sibling_stat_denied", "sibling_enumeration_denied", "sibling_symlink_open_denied", "oracle_open_denied", "oracle_stat_denied", "oracle_enumeration_denied", "oracle_symlink_open_denied", "unrelated_home_open_denied", "unrelated_home_stat_denied", "unrelated_home_enumeration_denied", "unrelated_home_symlink_open_denied"):
         assert fact in command[2]
     assert "exit 1" in command[2]
 
@@ -231,7 +255,7 @@ def test_local_only_cli_emits_only_a_provider_free_boundary(monkeypatch, capsys)
         "oracle_open_denied": True, "oracle_stat_denied": True,
         "oracle_enumeration_denied": True, "oracle_symlink_open_denied": True,
         "unrelated_home_open_denied": True, "unrelated_home_stat_denied": True,
-        "unrelated_home_enumeration_denied": True,
+        "unrelated_home_enumeration_denied": True, "unrelated_home_symlink_open_denied": True,
     }
 
     def fake_run(command, **_):
@@ -281,8 +305,14 @@ def test_detached_bundle_clone_smoke_uses_a_clean_temporary_repository(tmp_path,
     subprocess.run(["git", "-C", str(repository), "-c", "user.name=Probe Test", "-c", "user.email=probe@example.test", "commit", "-m", "seed"], check=True, capture_output=True)
     monkeypatch.setattr(probe, "__file__", str(script))
 
-    source = probe._detached_bundle_clone(tmp_path / "arm")
+    bundle = probe._capture_source_bundle(tmp_path / "arm")
+    script.write_text("# changed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repository), "-c", "user.name=Probe Test", "-c", "user.email=probe@example.test", "commit", "-m", "changed"], check=True, capture_output=True)
+    source = probe._detached_bundle_clone(bundle, tmp_path / "clone")
 
     assert subprocess.run(["git", "-C", str(source), "status", "--porcelain"], text=True, capture_output=True, check=True).stdout == ""
     assert subprocess.run(["git", "-C", str(source), "for-each-ref"], text=True, capture_output=True, check=True).stdout == ""
     assert not (source / ".git" / "objects" / "info" / "alternates").exists()
+    assert (source / "scripts" / "probe.py").read_text(encoding="utf-8") == "# probe\n"
+    assert subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], text=True, capture_output=True, check=True).stdout.strip() == bundle.revision
