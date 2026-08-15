@@ -378,7 +378,8 @@ class Store:
                 conn.close()
         except StoreUnavailable:
             raise
-        except (OSError, sqlite3.DatabaseError, TypeError, ValueError) as exc:
+        except (OSError, sqlite3.DatabaseError, json.JSONDecodeError, UnicodeError, TypeError,
+                ValueError, AttributeError, KeyError) as exc:
             raise StoreUnavailable(f"cannot open continuation store: {exc}") from exc
 
     def _connect(self) -> sqlite3.Connection:

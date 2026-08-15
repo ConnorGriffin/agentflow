@@ -199,6 +199,31 @@ def test_learning_rejects_old_store_without_migrating_it(tmp_path):
     assert sqlite3.connect(path).execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION
 
 
+def test_learning_report_refuses_malformed_record_without_mutating_store(tmp_path):
+    state, path, store = _state(tmp_path)
+    assert store.upsert(Record("terminal", "review", "codex", 1, repo="owner/repo",
+                               subject="42", state=COMPLETED))
+    store.close()
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE records SET data = ? WHERE identity = ?", ("[]", "terminal"))
+    conn.commit()
+    schema = conn.execute("PRAGMA user_version").fetchone()[0]
+    rows = conn.execute("SELECT identity, pool, state, demand, data FROM records").fetchall()
+    conn.close()
+    before = path.read_bytes()
+
+    result = _run(state, "learning", "report", "--repo", "owner/repo",
+                  "--from", "2024-01-01", "--to", "2024-01-02")
+
+    assert result.returncode == 2 and result.stdout == ""
+    assert "Traceback" not in result.stderr
+    assert path.read_bytes() == before
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == schema
+    assert conn.execute("SELECT identity, pool, state, demand, data FROM records").fetchall() == rows
+    conn.close()
+
+
 def test_learning_cli_invokes_no_forbidden_operational_actions(tmp_path, monkeypatch, capsys):
     from agentflow import cli, github
     from agentflow.canary_attribution import CanaryAttributionAuthority
