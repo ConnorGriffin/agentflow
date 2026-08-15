@@ -502,7 +502,8 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
             SafetySources(), receipt_reader))
         briefing_resolver = EffectivePolicyResolver(
             promotion_receipts=receipt_reader,
-            overlay_source=ExactRevisionRepositoryOverlaySource(repositories))
+            overlay_source=ExactRevisionRepositoryOverlaySource(
+                repositories, on_diagnostic=_log))
     return Coordinator(
         adapter=router, gate=_production_gate(), capability_preflight=_capability_preflight,
         disabled_cold_stages=frozenset({"mockup"}), log=_log or (lambda _line: None),

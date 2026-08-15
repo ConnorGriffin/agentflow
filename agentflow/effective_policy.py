@@ -11,10 +11,11 @@ from hashlib import sha256
 import json
 import re
 import subprocess
+import time
 from types import MappingProxyType
 from pathlib import Path
 import unicodedata
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from agentflow.evidence import PromotionReceiptReader
 
@@ -487,38 +488,68 @@ class ExactRevisionRepositoryOverlaySource:
 
     _PATH = ".agentflow/briefing-overlay-v1.json"
 
-    def __init__(self, repositories: Mapping[str, str | Path]) -> None:
+    def __init__(self, repositories: Mapping[str, str | Path], *,
+                 on_diagnostic: Callable[[str], None] | None = None) -> None:
         self._repositories = {name: Path(path) for name, path in repositories.items()}
+        self._on_diagnostic = on_diagnostic
+
+    def _run(self, command: list[str], root: Path, phase: str,
+             repository: str, revision: str) -> subprocess.CompletedProcess[bytes]:
+        for attempt in range(2):
+            started = time.monotonic()
+            try:
+                return subprocess.run(
+                    command, cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL, check=False, timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                if attempt == 0:
+                    self._diagnose(repository, revision, root, phase, time.monotonic() - started)
+                if attempt == 1:
+                    raise PolicyValidationError("overlay object is unreadable")
+        raise AssertionError("unreachable")
+
+    def _diagnose(self, repository: str, revision: str, root: Path, phase: str,
+                  elapsed: float) -> None:
+        if self._on_diagnostic is None:
+            return
+        safe = lambda value: str(value).replace("\r", "\\r").replace("\n", "\\n")
+        line = (f"repository overlay read failed repository={safe(repository)} "
+                f"revision={safe(revision)} root={safe(root)} phase={safe(phase)} "
+                f"elapsed={elapsed:.3f}s error_class=CLOSED")
+        try:
+            self._on_diagnostic(line)
+        except Exception:
+            pass
 
     def read(self, repository: str, subject_revision: str) -> OverlayV1 | None:
         root = self._repositories.get(repository)
         if root is None or not _SUBJECT_REVISION.fullmatch(subject_revision):
             raise PolicyValidationError("overlay repository or revision is unavailable")
-        try:
-            result = subprocess.run(
-                ["git", "show", f"{subject_revision}:{self._PATH}"], cwd=root,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                check=False, timeout=5)
-        except (OSError, subprocess.SubprocessError) as error:
-            raise PolicyValidationError("overlay object is unreadable") from error
+        result = self._run(
+            ["git", "show", f"{subject_revision}:{self._PATH}"], root, "show",
+            repository, subject_revision)
         if result.returncode:
             # Only an absent entry in the exact commit tree means no overlay.  A tree that names
             # the path but whose blob cannot be read is corrupt authority, never inferred absence.
-            try:
-                probe = subprocess.run(
-                    ["git", "ls-tree", "-z", "--full-tree", subject_revision, "--", self._PATH],
-                    cwd=root, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL, check=False, timeout=5)
-            except (OSError, subprocess.SubprocessError) as error:
-                raise PolicyValidationError("overlay object is unreadable") from error
+            probe = self._run(
+                ["git", "ls-tree", "-z", "--full-tree", subject_revision, "--", self._PATH],
+                root, "ls-tree", repository, subject_revision)
             if probe.returncode:
+                self._diagnose(repository, subject_revision, root, "ls-tree", 0)
                 raise PolicyValidationError("overlay revision is unavailable")
             if not probe.stdout:
                 return None
+            self._diagnose(repository, subject_revision, root, "ls-tree", 0)
             raise PolicyValidationError("overlay object is unreadable")
         if len(result.stdout) > _MAX_OVERLAY_BYTES:
+            self._diagnose(repository, subject_revision, root, "parse", 0)
             raise PolicyValidationError("overlay exceeds byte limit")
-        return OverlayV1.parse(result.stdout)
+        started = time.monotonic()
+        try:
+            return OverlayV1.parse(result.stdout)
+        except PolicyValidationError:
+            self._diagnose(repository, subject_revision, root, "parse", time.monotonic() - started)
+            raise
 
 
 @dataclass(frozen=True, slots=True)
