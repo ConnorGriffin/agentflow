@@ -100,6 +100,17 @@ def test_cycle_passes_log_into_run():
     assert any("build: ok" in m for m in emitted)          # result line also appeared
 
 
+def test_recheck_passes_the_daemon_log_into_the_repository_loop(monkeypatch):
+    seen = []
+    monkeypatch.setattr(daemon, "recheck_once",
+                        lambda cfg, _log=None: seen.append((cfg, _log)) or "loop result")
+
+    log = seen.append
+    assert daemon._recheck(B, _log=log) == "recheck: loop result"
+    assert seen[0][0] == B
+    assert seen[0][1] is log  # the same sink reaches the per-repository loop
+
+
 def test_dispatch_cycle_has_no_claim_reclaimer_and_forwards_pause(monkeypatch):
     seen = []
     monkeypatch.setattr(daemon.dispatch, "run_cycle",
