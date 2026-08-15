@@ -16,6 +16,12 @@ DOCUMENTS = [
     Path("SECURITY.md"),
     Path("SUPPORT.md"),
     Path("docs/public-beta.md"),
+    Path("docs/getting-started.md"),
+    Path("docs/pipeline.md"),
+    Path("docs/learning-pipeline.md"),
+    Path("docs/capabilities.md"),
+    Path("docs/coordinator-operations.md"),
+    Path("docs/evidence/README.md"),
 ]
 LINK_RE = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
 
