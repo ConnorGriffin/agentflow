@@ -219,6 +219,7 @@ def test_once_production_path_reaches_provider_command_through_composed_admissio
 
     from agentflow import coordinated_converse, dispatch, pipeline
     from agentflow.coordinator import Coordinator
+    from agentflow.coordinator.launcher import LocalLauncher
     from agentflow.coordinator.store import Store, default_store_path
 
     repo = tmp_path / "repo"
@@ -263,10 +264,30 @@ def test_once_production_path_reaches_provider_command_through_composed_admissio
         pool="codex"))
     seed_store.close()
 
+    # Model the concrete no-restart boundary: the launched handle becomes absent
+    # before the pass's final reconciliation.  The command and admission remain
+    # real; this hook only waits for the intentionally instant fake provider to
+    # reach that observation point instead of depending on process scheduling.
+    real_is_alive = LocalLauncher.is_alive
+
+    def exited_during_final_observation(family):
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if marker.exists() and not real_is_alive(family):
+                return False
+            time.sleep(0.01)
+        return real_is_alive(family)
+
+    monkeypatch.setattr(LocalLauncher, "is_alive", staticmethod(exited_during_final_observation))
+
     # Bound only external discovery, GitHub reconciliation, and publication. The named internal
     # production seams under test remain the real implementations.
     monkeypatch.setattr(daemon, "recover_worktrees", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(daemon, "recheck_once", lambda _cfg: "bounded external recheck")
+    monkeypatch.setattr(
+        daemon,
+        "recheck_once",
+        lambda _cfg, _log=None: "bounded external recheck",
+    )
     monkeypatch.setattr(daemon, "publish_snapshot", lambda _repos: None)
     monkeypatch.setattr(daemon, "log", lambda _line: None)
     monkeypatch.setattr(dispatch, "_refresh_claude_quota", lambda _log: None)
@@ -286,7 +307,10 @@ def test_once_production_path_reaches_provider_command_through_composed_admissio
     receipt = reopened.read_admission_receipt(identity)
     record = reopened.record_of(identity)
     assert receipt is not None and record is not None
-    assert record.state == "running" and record.start_fact == "started"
+    # The real provider command is admitted and starts, then its instant exit is
+    # reconciled as a continuation in this same --once cycle.
+    assert record.state == "waiting" and record.start_fact == "started"
+    assert record.continuation and record.claim and not record.process_alive
     assert receipt.route_cell_digest == record.route_cell_digest
     reopened.close()
 

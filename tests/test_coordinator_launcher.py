@@ -412,20 +412,22 @@ def test_real_launcher_spawns_a_provider_and_the_start_is_durable(coord_state):
 
 
 
-def test_real_launcher_releases_when_the_spawned_provider_exits(coord_state):
-    """A provider that exits is detected as a dead family and its permit is released."""
-    gate = {"open": True}
+def test_real_launcher_recovers_an_instantly_exited_provider_in_its_launch_cycle(
+        coord_state):
+    """An exited real provider is recovered in its launch cycle, without a restart."""
     exiting_provider = lambda record: [sys.executable, "-c", ""]
-    coord = Coordinator(launcher=LocalLauncher(exiting_provider, timeout=5),
-                        gate=lambda record: gate["open"])
-    coord.submit_stage(review(pool="claude"))
-    assert coord.cycle("claude") == []
-    assert permits(coord, "claude") == 1  # started
+    coord = Coordinator(launcher=LocalLauncher(exiting_provider, timeout=5))
+    identity = coord.submit_stage(review(pool="claude"))
 
-    time.sleep(0.5)                      # the provider exits
-    gate["open"] = False                 # do not immediately re-admit the continuation
-    coord.cycle("claude")
-    assert permits(coord, "claude") == 0  # the dead family's reservation is released
+    assert coord.cycle("claude") == []
+    durable = record_of(coord, identity)
+
+    # The start fact and family prove LocalLauncher started the real provider before
+    # the same-cycle liveness observation recovered its vanished process family.
+    assert durable.start_fact == "started" and durable.family is not None
+    assert durable.state == "waiting" and durable.continuation and durable.claim
+    assert not durable.process_alive
+    assert permits(coord, "claude") == 0
 
 
 def test_launched_session_is_observed_from_its_durable_artifacts(coord_state):
