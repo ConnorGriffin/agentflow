@@ -670,6 +670,35 @@ def test_delayed_launcher_result_cannot_disown_a_newer_attempt(make_coord):
     assert permits(first, "claude") == before.demand
 
 
+def test_same_cycle_launch_observation_cannot_reconcile_a_newer_attempt(make_coord):
+    """A's post-launch sweep owns v1, never B's successor v2 for the same stage identity."""
+    fake = FakeSession()
+    successor = []
+
+    def gate(_record):
+        return True
+
+    def advance_to_successor(record):
+        fake.kill(record.identity)
+        second = make_coord(fake)  # a distinct Coordinator and Store over the same durable ledger
+        second.cycle("claude")
+        durable = record_of(second, record.identity)
+        successor.append((durable.launch_token, durable.family))
+        fake.kill(record.identity)  # v2 is gone before A reaches its final launch observation
+
+    gate.started = advance_to_successor
+    first = make_coord(fake, gate=gate)
+    identity = first.submit_stage(Submission(
+        repo="o/r", subject="launch-token-race", stage="review", pool="claude"))
+
+    assert first.cycle("claude") == []
+    token, family = successor.pop()
+    durable = record_of(first, identity)
+    assert durable.launch_token == token and durable.family == family
+    assert durable.state == "running" and durable.attempts == 2
+    assert durable.process_alive and durable.claim and not fake.is_alive(family)
+
+
 def test_concurrent_descendant_submissions_are_atomically_registered(make_coord):
     """Two public submissions racing on one root both survive its revision changes, and the
     root's completion retires both children that share its reservation."""
