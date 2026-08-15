@@ -372,14 +372,24 @@ class Store:
                 if _schema_fingerprint(conn) != _expected_schema_fingerprint(SCHEMA_VERSION):
                     raise StoreUnavailable("store schema does not match the accepted schema")
                 rows = conn.execute("SELECT data FROM records").fetchall()
-                return {record.identity: record for record in (
-                    Store._decode(row[0]) for row in rows)}
+                records = {}
+                for row in rows:
+                    try:
+                        record = Store._decode(row[0])
+                        if (any(type(getattr(record, field)) is not str for field in (
+                                "identity", "repo", "subject", "stage", "state",
+                                "subject_revision"))
+                                or type(record.round) is not int):
+                            raise ValueError("record fields are unreadable")
+                    except (AttributeError, TypeError, ValueError) as exc:
+                        raise StoreUnavailable("continuation record is unreadable") from exc
+                    records[record.identity] = record
+                return records
             finally:
                 conn.close()
         except StoreUnavailable:
             raise
-        except (OSError, sqlite3.DatabaseError, json.JSONDecodeError, UnicodeError, TypeError,
-                ValueError, AttributeError, KeyError) as exc:
+        except (OSError, sqlite3.DatabaseError) as exc:
             raise StoreUnavailable(f"cannot open continuation store: {exc}") from exc
 
     def _connect(self) -> sqlite3.Connection:
