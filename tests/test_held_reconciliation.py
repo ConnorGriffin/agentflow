@@ -8,9 +8,10 @@ import pytest
 
 from conftest import FakeSession, record_of, starts_until_held
 
-from agentflow import github, pipeline
+from agentflow import dispatch, github, pipeline
 from agentflow.coordinator import Submission
 from agentflow.coordinator.providers import ProviderCause
+from agentflow.loop import RepoConfig
 
 
 def _held_record(make_coord, *, stage: str, subject: str = "7"):
@@ -35,6 +36,15 @@ def _only_held_sweep(monkeypatch):
     monkeypatch.setattr("agentflow.live.replace_projection", lambda *args, **kwargs: None)
 
 
+def _full_held_sweep(coord, monkeypatch):
+    """Run the held sweep through the full dispatch-pass interface."""
+    _only_held_sweep(monkeypatch)
+    monkeypatch.setattr(dispatch, "_refresh_claude_quota", lambda _log: None)
+    monkeypatch.setattr(pipeline, "reconcile_orphaned_claims", lambda *args, **kwargs: None)
+    dispatch.run_cycle([RepoConfig("o/r", "/held-worktree")], coordinator=coord,
+                       submit_new=False)
+
+
 def test_a_closed_held_issue_retires_and_is_audited(make_coord, monkeypatch):
     """A parked Build on a closed issue disappears from the operator's held work."""
     from agentflow.labels import BUILDING
@@ -51,9 +61,7 @@ def test_a_closed_held_issue_retires_and_is_audited(make_coord, monkeypatch):
         return True
 
     monkeypatch.setattr(github, "remove_label", remove_label)
-    _only_held_sweep(monkeypatch)
-
-    pipeline.reconcile_and_project(coord)
+    _full_held_sweep(coord, monkeypatch)
 
     record = record_of(coord, identity)
     assert record.retired is True and record.claim is False
@@ -66,9 +74,7 @@ def test_an_open_held_issue_remains_for_the_operator(make_coord, monkeypatch):
     coord, identity, _lines = _held_record(make_coord, stage="build")
     monkeypatch.setattr(github, "issue_state", lambda repo, number: "OPEN")
     monkeypatch.setattr(github, "issue_labels", lambda *args: pytest.fail("must not release"))
-    _only_held_sweep(monkeypatch)
-
-    pipeline.reconcile_and_project(coord)
+    _full_held_sweep(coord, monkeypatch)
 
     assert record_of(coord, identity).retired is False
 
@@ -78,9 +84,7 @@ def test_an_unreadable_held_issue_remains_for_the_operator(make_coord, monkeypat
     coord, identity, _lines = _held_record(make_coord, stage="build")
     monkeypatch.setattr(github, "issue_state", lambda repo, number: None)
     monkeypatch.setattr(github, "issue_labels", lambda *args: pytest.fail("must not release"))
-    _only_held_sweep(monkeypatch)
-
-    pipeline.reconcile_and_project(coord)
+    _full_held_sweep(coord, monkeypatch)
 
     assert record_of(coord, identity).retired is False
 
@@ -95,9 +99,7 @@ def test_pr_bound_holds_use_the_pr_state_not_an_issue_state(make_coord, monkeypa
                         lambda repo, number: checked.append((repo, number)) or pr_states[number])
     monkeypatch.setattr(github, "issue_state",
                         lambda *args: pytest.fail("PR-bound hold used issue_state"))
-    _only_held_sweep(monkeypatch)
-
-    pipeline.reconcile_and_project(closed_coord)
+    _full_held_sweep(closed_coord, monkeypatch)
 
     assert record_of(closed_coord, closed).retired is True
     assert record_of(open_coord, open_record).retired is False
@@ -122,9 +124,17 @@ def test_a_closed_hold_with_an_unprovable_claim_release_waits(make_coord, monkey
     monkeypatch.setattr(github, "issue_state", lambda repo, number: "CLOSED")
     monkeypatch.setattr(github, "issue_labels", lambda repo, number: frozenset({BUILDING}))
     monkeypatch.setattr(github, "remove_label", lambda repo, number, label: False)
-    _only_held_sweep(monkeypatch)
-
-    pipeline.reconcile_and_project(coord)
+    _full_held_sweep(coord, monkeypatch)
 
     held = record_of(coord, identity)
     assert held.retired is False and held.claim is True
+
+
+def test_direct_pipeline_reconciliation_never_reads_held_subjects(make_coord, monkeypatch):
+    """Only the daemon's full dispatch pass pays for held-subject reconciliation."""
+    coord, _identity, _lines = _held_record(make_coord, stage="build")
+    monkeypatch.setattr(github, "issue_state",
+                        lambda *args: pytest.fail("held sweep ran outside a full pass"))
+    _only_held_sweep(monkeypatch)
+
+    pipeline.reconcile_and_project(coord)
