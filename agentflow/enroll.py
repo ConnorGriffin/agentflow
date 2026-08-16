@@ -898,7 +898,25 @@ def _ensure_fleet_config(root: Path) -> str:
     return f"DO:   added {repo} to {target}"
 
 
-def _install_connor_skills(root: Path) -> str:
+def _replace_skill_tree(destination: Path, source: Path) -> None:
+    """Atomically swap one owned skill tree for a complete pinned replacement."""
+    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
+    replacement = temporary / "replacement"
+    backup = temporary / "previous"
+    try:
+        shutil.copytree(source, replacement)
+        destination.replace(backup)
+        try:
+            replacement.replace(destination)
+        except OSError:
+            backup.replace(destination)
+            raise
+        shutil.rmtree(backup)
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
     manifest = _manifest()
     names = manifest["connor_skills"]["skills"]
     specs = {item.get("skill"): item for item in manifest["capabilities"]}
@@ -925,15 +943,28 @@ def _install_connor_skills(root: Path) -> str:
             state == "ok" for state in refreshed.values()
         ):
             return "DO:   materialized the pinned Connor skill pack for Claude"
+    repairs = {
+        (location, name)
+        for (location, name), state in destinations.items()
+        if state == "drifted" and skill_ownership(root / location / name) is not None
+    }
+    if converge and repairs and all(
+        state == "ok" or (location, name) in repairs
+        for (location, name), state in destinations.items()
+    ):
+        repair_names = {name for _location, name in repairs}
+    else:
+        repair_names = set()
     if any(state != "absent" for state in destinations.values()):
-        rendered = ", ".join(
-            f"{location}/{name}={state}"
-            for (location, name), state in destinations.items()
-        )
-        return (
-            "WARN: existing public skill destinations are partial or conflicting; "
-            f"installer was not run ({rendered})"
-        )
+        if not repair_names:
+            rendered = ", ".join(
+                f"{location}/{name}={state}"
+                for (location, name), state in destinations.items()
+            )
+            return (
+                "WARN: existing public skill destinations are partial or conflicting; "
+                f"installer was not run ({rendered})"
+            )
     resolved, error = _resolved_skill_release(manifest)
     if error:
         return f"WARN: public skill release could not be verified — {error}"
@@ -961,8 +992,11 @@ def _install_connor_skills(root: Path) -> str:
                 f"{result.stdout.strip()}, expected {expected}"
             )
         for name in names:
+            if repair_names and name not in repair_names:
+                continue
             command = _connor_skill_command(manifest, source_tree, skill=name)
-            result = _run_command(command, cwd=root, timeout=120)
+            install_root = Path(temporary) if name in repair_names else root
+            result = _run_command(command, cwd=install_root, timeout=120)
             if result.returncode:
                 reason = (result.stderr or result.stdout).strip().splitlines()
                 tail = reason[-1] if reason else f"exit {result.returncode}"
@@ -975,7 +1009,15 @@ def _install_connor_skills(root: Path) -> str:
             )
             if warning:
                 return warning
-            if name == "drive-local-webapp":
+            if name in repair_names:
+                source = install_root / ".agents" / "skills" / name
+                for location, repaired_name in repairs:
+                    if repaired_name != name:
+                        continue
+                    destination = root / location / name
+                    _replace_skill_tree(destination, source)
+                    mark_skill_owned(destination)
+            else:
                 destination = root / ".agents" / "skills" / name
                 mark_skill_owned(destination)
                 if skill_ownership(destination) is None:
@@ -1146,6 +1188,7 @@ def _wire_claude_skill(root: Path, name: str) -> str:
         return f"WARN: {source} is not a safe materialization source"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
+    mark_skill_owned(target)
     return f"DO:   materialized {target} for Claude Code"
 
 
@@ -1283,7 +1326,10 @@ def _apply_enrollment(
                 harness, _asset_text("scripts/screenshots.mjs"), overwrite=converge
             )
         )
-        outcomes.append(_install_connor_skills(root))
+        outcomes.append(
+            _install_connor_skills(root, converge=True)
+            if converge else _install_connor_skills(root)
+        )
         outcomes.append(_install_ui_runtime(root))
     return outcomes
 
@@ -1513,7 +1559,9 @@ def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
             body=(
                 "Automated by `agentflow enroll --sync --apply`: commits every repository-local "
                 "enrollment artifact it materialized or converged. A drifted vendored skill pack "
-                "(ui-craft, drive-local-webapp) is reported by `agentflow doctor`, not rewritten here."
+                "(ui-craft, drive-local-webapp) is repaired here only when AgentFlow's ownership "
+                "record proves it materialized the destination; unowned drift stays reported by "
+                "`agentflow doctor`."
             ),
         )
         if pr.url is None:
