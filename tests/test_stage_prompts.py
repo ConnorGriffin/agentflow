@@ -3,12 +3,61 @@ from pathlib import Path
 
 import pytest
 
+from agentflow.coordinator.providers import provider_command, split_terminal_session_lead_contract
+from agentflow.coordinator.record import Record
 from agentflow.coordinator.tracer import ENABLED_STAGES
+from agentflow.effective_policy import (
+    ApplicabilityFacts, BriefingAuthority, BriefingReceipt, ReadyBriefing, _finish)
 from agentflow.prompts import STAGE_PROMPTS, requirements_for, stage_prompt_spec
 from agentflow.capability_contracts import ContractRequirement, preflight
+from agentflow.routing import routing
 
 
 ROOT = Path(__file__).parents[1]
+
+
+def _approved_briefing(stage: str) -> ReadyBriefing:
+    revision = "a" * 40
+    authority = BriefingAuthority(
+        "github", "octo/repo", "pulls/1/files/policy.json", revision, "sha256", "b" * 64,
+        "fleet-policy/0-to-1", "approval-1", revision, "b" * 64, "fleet-policy/0-to-1",
+        "github-authority", "v1", "verified")
+    receipt = BriefingReceipt("receipt-1", "candidate-1", "approval-1", 1, True, authority)
+    applicability = ApplicabilityFacts("fleet-policy/0-to-1", stage, revision)
+    value = {
+        "applicability": applicability.value(), "briefing_digest": "", "briefing_id": "",
+        "capabilities": [], "policy_version": 1, "receipts": [receipt.value()],
+        "repository": "octo/repo", "schema": "briefing-v1", "stage": stage,
+        "status": "ready", "subject_revision": revision,
+    }
+    digest, identity, _ = _finish(value)
+    return ReadyBriefing("octo/repo", stage, revision, digest, identity, 1, (receipt,), (),
+                         applicability)
+
+
+@pytest.mark.parametrize("stored_tail", [False, True], ids=["new", "durable-tail"])
+def test_approved_briefing_keeps_a_session_lead_contract_terminal_at_provider_launch(stored_tail):
+    task_brief = "Implement the durable task exactly.\n"
+    contract = routing.session_lead_instructions("build", "low", parent_provider="claude")
+    prompt = stage_prompt_spec("build").with_briefing(task_brief + contract,
+                                                        _approved_briefing("build"))
+    brief, refreshed_contract = split_terminal_session_lead_contract(prompt)
+    if stored_tail:
+        prompt = task_brief + refreshed_contract + brief.removeprefix(task_brief)
+    record = Record("session-lead", "build", "claude", 1, model="fable", source="/wt",
+                    input_ptr=prompt, session_lead=True, effort="low")
+
+    command = provider_command(record)
+    launched_prompt = command[command.index("-p") + 1]
+
+    assert brief.startswith(task_brief)
+    assert brief.count("<!-- agentflow-effective-briefing:") == 1
+    assert brief.count("receipt-1") == 1
+    assert refreshed_contract == contract
+    assert launched_prompt.endswith(routing.session_lead_instructions(
+        "build", "low", parent_provider="claude"))
+    assert launched_prompt.count("<!-- agentflow-effective-briefing:") == 1
+    assert task_brief in launched_prompt
 
 
 def test_build_prompt_and_requirements_share_one_skill_authority():
