@@ -17,7 +17,7 @@ from agentflow.canary_attribution import (
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
-from agentflow.coordinator.record import RUNNING, Record
+from agentflow.coordinator.record import RUNNING, STALL_PARK_AFTER, Record
 from agentflow.coordinator.store import (
     AdmissionRefused,
     OperationalSafetyAndCanary,
@@ -484,6 +484,7 @@ def test_only_final_prepared_root_failure_is_authoritative_and_retryable(
     waiting = store.record_of(identity)
     assert waiting.state == "waiting" and waiting.claim and waiting.refusal == refusal
     assert waiting.capability_preflight == "" and waiting.hold_reason is None
+    assert waiting.refusals == 1 and waiting.stall_refusal_id == refusal
     assert store.permits_used("codex") == 0 and launcher.launches == []
     assert store.read_admission_receipt(identity) is None
     assert store.read_canary_attribution(identity) is None
@@ -492,7 +493,37 @@ def test_only_final_prepared_root_failure_is_authoritative_and_retryable(
 
     deployed = True
     coordinator.cycle("codex")
-    assert len(launcher.launches) == 1 and store.record_of(identity).state == "running"
+    recovered = store.record_of(identity)
+    assert len(launcher.launches) == 1 and recovered.state == "running"
+    assert recovered.refusal == "" and recovered.refusals == 0
+    assert recovered.stall_refusal_id == "" and recovered.stall_started_at == 0
+    store.close()
+
+
+def test_repeated_capability_environment_failure_parks_with_a_durable_handoff(tmp_path):
+    capability = lambda record, materialize: (
+        _failure("incompatible", record.stage, record.pool)
+        if materialize else _ready(record.stage, record.pool)
+    )
+    coordinator, store, launcher, _adapter, identity = _coordinator(tmp_path, capability)
+    refusal = "capability_environment_failure:incompatible"
+
+    coordinator.cycle("codex", now=0)
+    refused = store.record_of(identity)
+    assert refused.state == "waiting" and refused.claim and refused.attempts == 0
+    assert refused.refusal == refusal and refused.refusals == 1
+    assert refused.stall_refusal_id == refusal and refused.stall_started_at == 0
+
+    for now in range(5 * 60, STALL_PARK_AFTER + 1, 5 * 60):
+        assert coordinator.cycle("codex", now=now) == []
+    pending = store.record_of(identity)
+    assert pending.hold_pending and pending.hold_reason == f"refused before start — {refusal}"
+    outcomes = coordinator.cycle("codex", now=STALL_PARK_AFTER + 5 * 60)
+
+    held = store.record_of(identity)
+    assert outcomes == [StageOutcome(identity, "build", "held", held.handoff_kind)]
+    assert held.state == "held" and held.handoff_proof and held.attempts == 0
+    assert store.permits_used("codex") == 0 and launcher.launches == []
     store.close()
 
 
