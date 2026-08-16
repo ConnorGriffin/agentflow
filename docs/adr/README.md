@@ -21,6 +21,9 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 594](adr-594-builds-keep-origin-main-base.md) — Builds retain one hard-coded
+  `origin/main` base; a native same-repository blocker edge orders lock-then-build work until its
+  mockup contract merges.
 - [ADR 694](adr-694-activate-promoted-review-methods.md) — Consecutive fleet-policy versions and
   query-only successor activation carry approved Review methods into production briefings.
 - [ADR 635](adr-635-immutable-canary-reports.md) — One immutable, content-free report per
