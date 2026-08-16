@@ -25,7 +25,7 @@ from conftest import FakeSession, permits, record_of, starts_until_held
 
 from agentflow.coordinator import Submission
 from agentflow.coordinator.admission import (
-    ADMISSION_MATRIX, CODE_WRITING, PERMIT_BUDGET, STAGE_NATIVE_HANDOFF, admission_demand)
+    ADMISSION_MATRIX, CODE_WRITING, STAGE_NATIVE_HANDOFF, admission_demand)
 from agentflow.coordinator.providers import ProviderCause
 
 
@@ -108,20 +108,22 @@ def test_same_snapshot_historical_stampede_is_bounded_atomically(make_coord):
     fake.kill(deep)                                       # (leave the store clean)
 
 
-def test_writers_share_a_pool_when_their_combined_demand_fits(make_coord):
+def test_two_writers_cannot_share_one_five_permit_pool(make_coord):
     fake = FakeSession()
     coord = make_coord(fake)
     first = submit_root(coord, "claude-revise")               # demand 3
     second = submit_root(coord, "claude-revise", suffix="-2")  # demand 3
 
     coord.cycle("claude")
-    assert permits(coord, "claude") == 6                       # both writers fit in the configured budget
+    assert permits(coord, "claude") == 3                       # only one writer fits (3 + 3 > 5)
 
-    fake.end(first, success=True)
-    fake.end(second, success=True)
-    done = {outcome.identity for outcome in coord.cycle("claude")}
-    assert permits(coord, "claude") == 0
-    assert done == {first, second}                            # both writers completed
+    done: set[str] = set()
+    for _ in range(4):
+        fake.end(first, success=True)   # completes whichever writer is currently running
+        fake.end(second, success=True)
+        done.update(o.identity for o in coord.cycle("claude"))
+        assert permits(coord, "claude") <= 3                   # never both writers at once
+    assert done == {first, second}                            # each ran, one after the other
 
 
 def test_near_exclusive_writer_keeps_useful_short_stage_concurrency(make_coord):
@@ -198,21 +200,14 @@ def test_a_closed_gate_defers_without_permits_or_attempts(make_coord):
 def test_permit_deferral_consumes_neither_permit_nor_attempt(make_coord):
     fake = FakeSession()
     coord = make_coord(fake)
-    prefilled = [
-        submit_root(coord, "claude-deep-build", suffix=f"-prefill-{number}")
-        for number in range(4)
-    ]
-    coord.cycle("claude")
-    assert permits(coord, "claude") == PERMIT_BUDGET - 5
     live = submit_root(coord, "claude-revise")               # demand 3, PR-bound → drains first
     deferred = submit_root(coord, "claude-medium-build")     # demand 4, cannot fit beside live
     coord.cycle("claude")
-    assert permits(coord, "claude") == PERMIT_BUDGET - 2
-    assert record_of(coord, deferred).attempts == 0            # deferred work spent nothing
+    assert permits(coord, "claude") == 3                      # only the PR-bound writer started
 
-    fake.end(prefilled[0], success=True)                       # free enough headroom for the deferred build
-    coord.cycle("claude")
-    assert record_of(coord, deferred).attempts == 1
+    fake.end(live, success=True)                             # free the pool
+    # The deferred writer never spent an attempt while blocked, so it keeps its full budget.
+    assert starts_until_held(coord, fake, deferred, "claude") == 3
 
 
 @pytest.mark.parametrize("cause", [

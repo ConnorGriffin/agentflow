@@ -17,7 +17,6 @@ import threading
 import pytest
 
 from agentflow.coordinator import Coordinator
-from agentflow.coordinator.admission import PERMIT_BUDGET
 from agentflow.coordinator.record import RUNNING, WAITING, Record
 from agentflow.coordinator.store import (
     LegacyReservationIntent, ReservationLimits, SCHEMA_VERSION, Store, StoreUnavailable,
@@ -68,7 +67,7 @@ def test_coordinator_begin_start_persists_waiting_then_uses_only_no_admission_in
     monkeypatch.setattr(coordinator._store, "reserve_legacy", observe)
     assert coordinator._begin_start(record, 100)
     assert captured == [LegacyReservationIntent(
-        "compat", "prior-token", 2, 100, "daemon-compat", PERMIT_BUDGET, None, None)]
+        "compat", "prior-token", 2, 100, "daemon-compat", 5, None, None)]
     durable = coordinator._store.record_of("compat")
     assert durable == record and record.state == RUNNING
     assert record.revision == 3 and record.model == "prepared-model"
