@@ -1292,11 +1292,11 @@ def _kill_running_family(record) -> None:
     orphaned process does not keep burning tokens on a superseded head (#220). Fail-open: a family
     already gone or an os.kill error never blocks the retire or park."""
     import signal
-    from agentflow.coordinator.launcher import pid_family_alive
+    from agentflow.coordinator.launcher import pid_family_alive, stop_pid_family
     if not pid_family_alive(record.family):
         return
     try:
-        os.kill(int(record.family), signal.SIGTERM)
+        stop_pid_family(record.family, signal.SIGTERM)
     except (OSError, ValueError):
         pass
 

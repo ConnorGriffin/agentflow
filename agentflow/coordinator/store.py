@@ -1543,10 +1543,11 @@ class Store:
     def child_start(self, identity: str, token: str, pid: int) -> bool:
         """The launched child's guarded ``started`` write (ADR 0030). Atomically records
         ``started`` with ``pid`` as the family *only if* the record is still the ``running``
-        reservation that stamped ``token``. If the coordinator already disowned this launch on
-        a handshake timeout (rotating the token) or returned the record to ``waiting``, the
-        write is refused and the caller must not become a provider — this is what stops an
-        uncancelled bootstrap from starting an unreserved, uncounted provider."""
+        reservation that stamped ``token`` and has not already recorded a start. If the
+        coordinator already disowned this launch on a handshake timeout (rotating the token),
+        returned the record to ``waiting``, or another bootstrap won, the write is refused and
+        the caller must not become a provider — this is what stops an uncancelled bootstrap from
+        starting an unreserved, uncounted provider."""
         self._refuse_admission_callback_mutation()
         with self._lock:
             try:
@@ -1557,7 +1558,8 @@ class Store:
                     self._conn.execute("ROLLBACK")
                     return False
                 record = self._decode(row[0])
-                if record.state != RUNNING or record.launch_token != token:
+                if (record.state != RUNNING or record.launch_token != token
+                        or record.start_fact == STARTED):
                     self._conn.execute("ROLLBACK")
                     return False
                 record.start_fact = STARTED
@@ -1570,6 +1572,39 @@ class Store:
             except sqlite3.DatabaseError as e:
                 self._rollback_quietly()
                 raise StoreUnavailable(f"cannot record child start: {e}") from e
+
+    def child_provider_group(
+            self, identity: str, token: str, supervisor_pid: int, provider_pgid: int) -> bool:
+        """Attach the provider's process group to a guarded child start.
+
+        The detached supervisor claims the launch token before it spawns anything. The provider
+        remains behind its bootstrap gate until this compare-and-set expands the durable family
+        from the supervisor pid to ``supervisor:provider-group``; a stale or losing child cannot
+        publish or release a provider under another launch's reservation.
+        """
+        self._refuse_admission_callback_mutation()
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                row = self._conn.execute(
+                    "SELECT data FROM records WHERE identity = ?", (identity,)).fetchone()
+                if row is None:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record = self._decode(row[0])
+                if (record.state != RUNNING or record.launch_token != token
+                        or record.start_fact != STARTED
+                        or record.family != str(supervisor_pid)):
+                    self._conn.execute("ROLLBACK")
+                    return False
+                record.family = f"{supervisor_pid}:{provider_pgid}"
+                record.revision += 1
+                self._write(record)
+                self._conn.execute("COMMIT")
+                return True
+            except sqlite3.DatabaseError as e:
+                self._rollback_quietly()
+                raise StoreUnavailable(f"cannot record provider process group: {e}") from e
 
     def disown_launch(self, identity: str, token: str) -> tuple[str, str | None]:
         """The coordinator's atomic timeout finalize (ADR 0030). If the child already won —

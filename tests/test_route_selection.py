@@ -537,7 +537,7 @@ def test_local_launcher_start_threads_one_envelope_to_argv_and_supervision(
 
         @staticmethod
         def record_of(_identity):
-            return replace(waiting, start_fact="started", family="42")
+            return replace(waiting, start_fact="started", family="42:43")
 
     def command(record, envelope):
         consumed.append((record, envelope))
@@ -550,7 +550,7 @@ def test_local_launcher_start_threads_one_envelope_to_argv_and_supervision(
 
     result = launcher.start(waiting, LaunchStore(), admitted)
 
-    assert result.fact == "started" and result.family == "42"
+    assert result.fact == "started" and result.family == "42:43"
     assert consumed == [(waiting, admitted)]
     child_argv = spawned[0][0]
     assert str(selection.launch_config.wall_ceiling_s) in child_argv
