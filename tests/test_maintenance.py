@@ -226,6 +226,44 @@ def test_maintenance_indexes_are_coupled_to_inventory_and_replay_safe(tmp_path):
     assert not any(record["applied"] for record in second)
 
 
+def test_maintenance_refuses_index_project_rebound_after_inventory(tmp_path):
+    from agentflow.maintenance import maintain
+
+    repo = _repo(tmp_path)
+    missing = tmp_path / "gone-project"
+
+    class ReboundIndex:
+        def __init__(self):
+            self.listed = 0
+            self.deleted = []
+
+        def list_projects(self):
+            self.listed += 1
+            root = missing if self.listed == 1 else repo
+            return [{"name": "moving-project", "root_path": str(root)}]
+
+        def delete_project(self, project):
+            self.deleted.append(project)
+            return True
+
+    index = ReboundIndex()
+    records = maintain(
+        [SimpleNamespace(repo="owner/repo", workdir=str(repo))],
+        apply=True,
+        live_sources=set(),
+        held_sources=set(),
+        index=index,
+    )
+
+    project = next(
+        record for record in records
+        if record["action"] == "delete-index" and record["project"] == "moving-project"
+    )
+    assert index.listed == 2
+    assert index.deleted == []
+    assert project["applied"] is False
+
+
 def test_public_maintenance_cli_is_jsonl_and_dry_run_by_default(monkeypatch, capsys):
     from agentflow.cli import main
 

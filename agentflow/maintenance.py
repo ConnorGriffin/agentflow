@@ -166,6 +166,18 @@ def maintain(
             continue
         if record["action"] == "delete-index":
             root = record["root"]
+            try:
+                current_projects = index.list_projects()
+            except Exception:
+                current_projects = None
+            if current_projects is None:
+                continue
+            current = [
+                project for project in current_projects
+                if isinstance(project, dict) and project.get("name") == record["project"]
+            ]
+            if len(current) != 1 or current[0].get("root_path") != root:
+                continue
             if record["reason"] == "missing":
                 still_eligible = not Path(root).exists()
             else:
