@@ -774,14 +774,7 @@ def test_launch_materialization_refreshes_a_known_old_pinned_harness(tmp_path):
     destination = tmp_path / "destination"
     shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
     (destination / "scripts").mkdir()
-    checkout = Path(__file__).parents[1]
-    old = subprocess.run(
-        [
-            "git", "show",
-            "dc2a08f350c85d49f65e31a7af529d0ffc8c3d46^:scripts/screenshots.mjs",
-        ],
-        cwd=checkout, capture_output=True, check=True,
-    ).stdout
+    old = Path(__file__).with_name("fixtures").joinpath("old-screenshots.mjs").read_bytes()
     manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
     harness = next(
         item for item in manifest["capabilities"] if item["id"] == "screenshot-harness"
