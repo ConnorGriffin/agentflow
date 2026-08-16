@@ -536,7 +536,7 @@ def _learning_safe(entry: AttemptTelemetry) -> bool:
             or type(entry.started_at) is not int or type(entry.finalized_at) is not int
             or entry.started_at < 0 or entry.finalized_at < 0
             or (entry.started_at and entry.finalized_at
-                and entry.finalized_at <= entry.started_at)):
+                and entry.finalized_at < entry.started_at)):
         return False
     for name in _TOKEN_FIELDS:
         value = getattr(entry.usage, name)

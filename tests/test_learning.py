@@ -185,7 +185,6 @@ def test_learning_report_skips_bad_timestamps_but_emits_other_facts(tmp_path):
         (("usage", "cost_usd"), float("inf")),
         (("started_at",), -1),
         (("finalized_at",), -1),
-        (("finalized_at",), 10),
         (("finalized_at",), 9),
     ),
 )
@@ -210,6 +209,22 @@ def test_learning_report_skips_impossible_numeric_telemetry(tmp_path, override, 
     assert result.returncode == 0 and data["status"] == "degraded"
     assert data["telemetry_entries_read"] == 0 and data["telemetry_entries_skipped"] == 1
     assert "NaN" not in result.stdout and "Infinity" not in result.stdout
+
+
+def test_learning_report_accepts_same_second_attempt(tmp_path):
+    state, path, store = _state(tmp_path)
+    assert store.upsert(Record("same-second", "review", "codex", 1, repo="owner/repo",
+                               subject="same-second", state=COMPLETED))
+    store.close()
+    record_attempt(path, _attempt("same-second", "same-second", started=10, finalized=10))
+
+    result = _run(state, "learning", "report", "--repo", "owner/repo",
+                  "--from", "1970-01-01", "--to", "1970-01-02")
+
+    data = json.loads(result.stdout)
+    assert result.returncode == 0 and data["status"] == "complete"
+    assert data["telemetry_entries_read"] == 1 and data["telemetry_entries_skipped"] == 0
+    assert data["summary"]["attempts"] == 1
 
 
 def test_learning_report_skips_copied_launch_token_telemetry(tmp_path):
