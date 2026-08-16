@@ -279,8 +279,10 @@ def _codex_spent_pct(windows: tuple[RateLimitWindow, ...], now: float) -> float:
 
 
 def _codex_dispatch_status(status: PoolStatus, now: float, floodgates: bool = False) -> PoolStatus:
-    if status.windows is None:
-        return PoolStatus(status.tool, False, 100.0, "limit facts unavailable", None)
+    if not status.windows:
+        return PoolStatus(status.tool, False, 100.0,
+                          status.reason or "limit facts unavailable", status.windows,
+                          status.active, status.ceiling, status.observed_at)
     fg = floodgates or floodgates_active()
     paced, pace_reason = _codex_pacing(status.windows, now, floodgates=fg)
     spent_pct = _codex_spent_pct(status.windows, now)
