@@ -108,6 +108,7 @@ def test_review_tier_uses_builder_complexity_and_pool_specific_models():
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
         repo="o/r", subject="7", complexity="standard",
+        builder_lineage="claude",
         source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
     )
     standard = coordinated_review.review_submission(build, "sha-1", "codex", 42)
