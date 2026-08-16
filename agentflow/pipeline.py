@@ -791,17 +791,21 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
     acceptance, surfaces = context
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
+    author = build.change_author_tool
+    if author not in {"claude", "codex"}:
+        coord.park_completed(build_identity)  # do not infer the head author from its branch lane
+        return
     assignment, _changed_files = coordinated_review._review_assignment_facts(
         build.repo, pr.number, profile=profile)
-    reviewer_tool = (pick_reviewer(build.pool, allow_same_tool=False)
-                     if profile == "autonomous" else pick_reviewer(build.pool))
+    reviewer_tool = (pick_reviewer(author, allow_same_tool=False)
+                     if profile == "autonomous" else pick_reviewer(author))
     if reviewer_tool is None:
         return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
                 # build keeps its claim and this opener re-drives next cycle.
     submission = coordinated_review.review_submission(
         build, pr.head_ref_oid, reviewer_tool, pr.number,
         acceptance=acceptance, surfaces=surfaces,
-        review=ReviewState(assignment=assignment, change_author_tool=build.pool))
+        review=ReviewState(assignment=assignment, change_author_tool=author))
     if submission is not None:
         coord.submit_stage(submission)
 
@@ -1009,20 +1013,24 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
     conflict_resolution = bool(revise.conflict_round)
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
+    author = revise.change_author_tool
+    if author not in {"claude", "codex"}:
+        coord.park_completed(revise_identity)  # no durable author for this exact head
+        return
     inherited = ReviewState.from_record(revise)
     if conflict_resolution and revise.uncertainty_handoffs and inherited is not None:
         # A private decision resolution is a Full product change. The PR-body proposal cannot
         # downgrade the required product+standards pass when the resolved Revise completes.
         review = replace(
             inherited, reviewed_from_sha=revise.target,
-            cross_tool_covered=False, sequence=inherited.sequence + 1)
+            change_author_tool=author, cross_tool_covered=False, sequence=inherited.sequence + 1)
     else:
         assignment, _changed_files = coordinated_review._review_assignment_facts(
             revise.repo, pr.number, conflict_resolution=conflict_resolution, profile=profile)
-        review = ReviewState(assignment=assignment, change_author_tool=revise.pool,
+        review = ReviewState(assignment=assignment, change_author_tool=author,
                              reviewed_from_sha=revise.target)
-    reviewer_tool = (pick_reviewer(revise.pool, allow_same_tool=False)
-                     if profile == "autonomous" else pick_reviewer(revise.pool))
+    reviewer_tool = (pick_reviewer(author, allow_same_tool=False)
+                     if profile == "autonomous" else pick_reviewer(author))
     if reviewer_tool is None:
         return  # ADR 0020: no tool free to review this cycle — post nothing; the completed
                 # revise keeps its claim and this opener re-drives next cycle.

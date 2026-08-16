@@ -31,6 +31,7 @@ from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.record import Record
 from agentflow.coordinator.telemetry import read_attempts
 from agentflow.gate import MAX_REVISES
+from agentflow.review_policy import ReviewAssignment
 from agentflow.reviewer import Finding, Verdict
 from agentflow.worktree_ref import WorktreeRef
 
@@ -959,6 +960,7 @@ def test_revise_submission_adopts_the_builder_branch_and_assumes_the_review_clai
 def test_review_submission_from_a_completed_revise_binds_the_new_head_and_keeps_lineage():
     revise = Record(identity="o/r|7|revise|sha-a", stage="revise", pool="claude", demand=3,
                     repo="o/r", subject="7", builder_lineage="claude", lineage="claude",
+                    change_author_tool="claude",
                     effort="high", builder_effort="high",
                     source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing")
     sub = coordinated_review.review_submission(revise, "sha-b-new", "codex", 42)
@@ -989,7 +991,8 @@ def test_claude_led_revise_keeps_a_codex_owned_branch_across_the_next_round():
         identity="o/r|7|revise|sha-a", stage="revise", pool=revise.pool, demand=3,
         repo="o/r", subject="7", target="sha-a", source=revise.source,
         builder_lineage=revise.builder_lineage, branch_lineage=revise.branch_lineage,
-        builder_complexity=revise.builder_complexity, builder_effort=revise.builder_effort)
+        builder_complexity=revise.builder_complexity, builder_effort=revise.builder_effort,
+        change_author_tool="claude")
     next_review = coordinated_review.review_submission(
         durable_revise, "sha-b", "codex", 42)
     assert next_review is not None and next_review.branch_lineage == "codex"
@@ -1150,6 +1153,7 @@ def test_conflict_uncertainty_opens_one_full_decision_pass_on_the_other_tool():
         repo="o/r", subject="7", target="head", conflict_round=1,
         effort="extra", builder_lineage="claude", builder_complexity="deep",
         builder_effort="extra",
+        change_author_tool="claude",
         source="/work/.agentflow/worktrees/claude/issue-7-fix",
         outcome=('conflict-uncertainty:{"options":["keep main","keep PR"],'
                  '"missing_guidance":"tie owner","recommendation":"keep main"}'))
@@ -1282,3 +1286,60 @@ def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypa
     assert submission.review.assignment.depth.value == "full"
     assert submission.review.assignment.axis.value == "product"
     assert submission.review.uncertainty_handoffs == 1
+
+
+def test_completed_revise_selects_against_its_recorded_head_author(monkeypatch):
+    revise = Record(
+        identity="revised", stage="revise", pool="claude", demand=3,
+        repo="o/r", subject="7", target="old", builder_lineage="claude",
+        branch_lineage="codex", builder_complexity="deep",
+        source="/work/.agentflow/worktrees/codex/issue-7-fix",
+        change_author_tool="codex")
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [revise])
+    monkeypatch.setattr(
+        pipeline, "source_facts",
+        lambda _record: ("/work", "agentflow/codex/issue-7-fix", "/wt"))
+    monkeypatch.setattr(
+        github, "open_pr_for_branch",
+        lambda *_args: github.PrRow(42, "agentflow/codex/issue-7-fix", "rebased"))
+    monkeypatch.setattr(
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+    monkeypatch.setattr(
+        coordinated_review, "_review_assignment_facts",
+        lambda *_args, **_kwargs: (ReviewAssignment(reason="one journey"), ()))
+    monkeypatch.setattr(pipeline, "repo_profile", lambda _workdir: "autonomous")
+    choices, submitted = [], []
+    monkeypatch.setattr(
+        pipeline, "pick_reviewer",
+        lambda author, **kwargs: choices.append((author, kwargs)) or "claude")
+
+    pipeline._open_review_on_completed_revise(
+        SimpleNamespace(submit_stage=submitted.append), revise.identity)
+
+    assert choices == [("codex", {"allow_same_tool": False})]
+    assert submitted[0].pool == "claude"
+    assert submitted[0].review.change_author_tool == "codex"
+
+
+def test_completed_revise_without_a_head_author_parks_for_a_maintainer(monkeypatch):
+    revise = Record(
+        identity="unknown-author", stage="revise", pool="claude", demand=3,
+        repo="o/r", subject="7", target="old", builder_lineage="claude",
+        source="/work/.agentflow/worktrees/claude/issue-7-fix")
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [revise])
+    monkeypatch.setattr(
+        pipeline, "source_facts",
+        lambda _record: ("/work", "agentflow/claude/issue-7-fix", "/wt"))
+    monkeypatch.setattr(
+        github, "open_pr_for_branch",
+        lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "rebased"))
+    monkeypatch.setattr(
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+    parked = []
+    coord = SimpleNamespace(
+        submit_stage=lambda _submission: pytest.fail("unknown authors must not open a review"),
+        park_completed=parked.append)
+
+    pipeline._open_review_on_completed_revise(coord, revise.identity)
+
+    assert parked == [revise.identity]

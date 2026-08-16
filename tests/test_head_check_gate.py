@@ -84,6 +84,7 @@ def _completed_review_record(*, profile="reviewed", round=0):
     return Record(
         identity=f"o/r|7|review|sha-a|{profile}", stage="review", pool="codex", demand=2,
         repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
+        change_author_tool="claude",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix", state="completed",
         auto_merge_allowed=True, round=round)
 

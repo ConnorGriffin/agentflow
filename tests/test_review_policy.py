@@ -317,7 +317,7 @@ def test_session_led_reviewer_push_keeps_the_generated_contract_terminal(monkeyp
 
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-        repo="o/r", subject="7",
+        repo="o/r", subject="7", change_author_tool="claude",
         source="/work/.agentflow/worktrees/claude/issue-7-fix")
     opening = coordinated_review.review_submission(
         build, "old-head", "codex", 42, acceptance="Preserve the public behavior.")
@@ -361,7 +361,7 @@ def _proven_session_led_review(*, state=None, legacy_provenance=False, head_sha=
 
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-        repo="o/r", subject="7",
+        repo="o/r", subject="7", change_author_tool="claude",
         source="/work/.agentflow/worktrees/claude/issue-7-fix")
     opening = coordinated_review.review_submission(
         build, head_sha, "codex", 42, acceptance="Preserve the public behavior.",

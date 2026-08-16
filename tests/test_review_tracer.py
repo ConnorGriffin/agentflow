@@ -864,6 +864,7 @@ def _completed_review_record(*, profile="reviewed"):
     return Record(
         identity=f"o/r|7|review|sha-a|{profile}", stage="review", pool="codex", demand=2,
         repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
+        change_author_tool="claude",
         source="/work/.agentflow/worktrees/codex-review/pr-42-fix", state="completed",
         auto_merge_allowed=True)
 
@@ -1411,7 +1412,7 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
 def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     build = Record(identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
                    subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
-                   capability_context="{")
+                   capability_context="{", change_author_tool="claude")
     sub = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
     assert sub is not None
     assert sub.stage == "review" and sub.target == "head-sha-123"
@@ -1444,7 +1445,7 @@ def test_review_submission_reuses_only_the_task_brief_from_a_session_lead_build(
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
         subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
-        input_ptr=durable_build_input, session_lead=True, effort="low")
+        input_ptr=durable_build_input, session_lead=True, effort="low", change_author_tool="claude")
 
     submission = coordinated_review.review_submission(
         build, "head-sha-123", "codex", 42, acceptance=durable_build_input)
@@ -1478,7 +1479,7 @@ def test_review_submission_reuses_the_prompt_inside_a_provider_input_envelope():
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
         subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
-        input_ptr=durable_build_input, session_lead=True, effort="low")
+        input_ptr=durable_build_input, session_lead=True, effort="low", change_author_tool="claude")
 
     submission = coordinated_review.review_submission(
         build, "head-sha-123", "codex", 42, acceptance=durable_build_input)
@@ -1498,7 +1499,8 @@ def test_coordinated_review_submission_is_preparable_as_a_session_lead(make_coor
         fake, adapter=_review_adapter(fake, verdict=[False], prep=[True]))
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
-        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing")
+        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
+        change_author_tool="claude")
     submission = coordinated_review.review_submission(build, "head-sha-123", "codex", 42)
 
     assert submission.session_lead is True
@@ -1514,7 +1516,8 @@ def test_survivor_review_has_no_synthetic_predecessor(monkeypatch):
 
     sub = coordinated_review.survivor_review_submission(
         cfg, issue=7, slug="fix", builder_tool="claude", head_sha="head-a",
-        reviewer_tool="codex", pr_number=42, acceptance="Issue acceptance")
+        reviewer_tool="codex", pr_number=42, acceptance="Issue acceptance",
+        review=ReviewState(change_author_tool="claude"))
 
     assert sub is not None and sub.stage == "review"
     assert sub.transfer_from is None
@@ -1630,7 +1633,7 @@ def test_a_legacy_session_led_moved_head_successor_normalizes_provenance(make_co
     coord = make_coord(fake)
     build = Record(
         identity="o/r|7|build|-", stage="build", pool="claude", demand=5,
-        repo="o/r", subject="7",
+        repo="o/r", subject="7", change_author_tool="claude",
         source="/work/.agentflow/worktrees/claude/issue-7-home-depot-probe")
     opening = coordinated_review.review_submission(build, "stale-sha", "codex", 26)
     contract = opening.input_ptr[opening.input_ptr.index(
