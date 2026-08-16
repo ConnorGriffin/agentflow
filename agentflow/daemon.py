@@ -47,6 +47,7 @@ import signal
 import shutil
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from agentflow import dispatch, live
@@ -187,8 +188,8 @@ def publish_snapshot(repos: list[RepoConfig], produce=snapshot, _log=log) -> Non
                       v1.get("repos") or [], v2.get("repositories") or [],
                       stage_health=health)}
         live.write_snapshot(merged)
-    except Exception as e:  # noqa: BLE001 — a bad publish must not kill the daemon
-        _log(f"snapshot publish error: {type(e).__name__}: {e}")
+    except Exception:  # noqa: BLE001 — a bad publish must not kill the daemon
+        _log("snapshot publish error: " + " | ".join(traceback.format_exc().splitlines()))
 
 
 def recover_worktrees(repos: list[RepoConfig], sweep=recover_stale_worktrees, _log=log) -> None:

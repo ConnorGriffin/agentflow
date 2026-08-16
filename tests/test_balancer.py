@@ -161,6 +161,20 @@ def test_operator_paused_pool_fails_before_capacity_helper(
     assert status.reason == "paused by operator"
 
 
+def test_operator_paused_codex_pool_stays_visible_in_dashboard_capacity(
+        stub_gate, monkeypatch):
+    """The daemon still publishes a paused pool's capacity row while cold submission sleeps."""
+    flag = state_path("pools", "codex.paused")
+    flag.parent.mkdir(parents=True)
+    flag.touch()
+    _seed_claude_quota(19)
+
+    codex = next(pool for pool in pools() if pool["tool"] == "codex")
+
+    assert codex == {"tool": "codex", "clear": False, "spent_pct": 100.0,
+                     "headroom_pct": 0.0, "reason": "paused by operator"}
+
+
 def test_session_lead_falls_back_to_codex_when_claude_is_operator_paused(
         stub_gate, monkeypatch):
     flag = state_path("pools", "claude.paused")

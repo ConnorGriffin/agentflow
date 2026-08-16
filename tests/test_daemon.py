@@ -880,13 +880,17 @@ def test_publish_snapshot_composes_v1_and_schema_v2(tmp_path, monkeypatch):
     assert published["attention"]["rows"][0]["url"] == "https://github.com/owner/a/pull/7"
 
 
-def test_publish_snapshot_skips_the_whole_publish_on_error(tmp_path, monkeypatch, capsys):
+def test_publish_snapshot_skips_the_whole_publish_on_error(tmp_path, monkeypatch):
     monkeypatch.setattr(live, "SNAPSHOT_FILE", tmp_path / "snapshot.json")
 
     def boom(repos, dispatch_enabled):
         raise RuntimeError("gh outage")
 
-    daemon.publish_snapshot([A], produce=boom, _log=print)
+    logs = []
+    daemon.publish_snapshot([A], produce=boom, _log=logs.append)
 
     assert live.read_snapshot() is None
-    assert "snapshot publish error" in capsys.readouterr().out
+    assert len(logs) == 1
+    assert "snapshot publish error: Traceback" in logs[0]
+    assert "tests/test_daemon.py" in logs[0]
+    assert "RuntimeError: gh outage" in logs[0]
