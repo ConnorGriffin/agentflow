@@ -256,13 +256,22 @@ def test_failed_launch_materialization_never_carries_a_ready_fact(tmp_path, monk
     assert result.evidence == ("launch-root-materialization-failed: copy failed",)
 
 
-def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):
+def test_production_admission_budget_reads_its_startup_environment(monkeypatch):
+    import importlib
+    import agentflow.coordinator.admission as admission
+
     monkeypatch.setenv("AGENTFLOW_PERMIT_BUDGET", "99")
+    assert importlib.reload(admission).PERMIT_BUDGET == 99
+    monkeypatch.delenv("AGENTFLOW_PERMIT_BUDGET")
+    importlib.reload(admission)
+
+
+def test_production_admission_matrix_is_immutable(monkeypatch):
     monkeypatch.setenv("AGENTFLOW_REVIEW_DEMAND", "0")
 
-    assert PERMIT_BUDGET == 5
+    assert PERMIT_BUDGET == 25
     assert admission_demand("review", "claude", "opus", "deep") == 1
-    assert admission_demand("future", "claude", "opus", "deep") == 5
+    assert admission_demand("future", "claude", "opus", "deep") == PERMIT_BUDGET
     assert admission_demand("review", "future", "opus", "deep") is None
     with pytest.raises(TypeError):
         ADMISSION_MATRIX[("review", "claude", "opus", "deep", None)] = 0
@@ -280,7 +289,7 @@ def test_production_admission_budget_and_matrix_are_immutable(monkeypatch):
     ("revise", "claude", "sonnet", "standard", 3),
     ("revise", "claude", "opus", "deep", 3),
     ("revise", "codex", "terra", "standard", 4),
-    ("revise", "codex", "sol", "deep", 5),
+    ("revise", "codex", "sol", "deep", PERMIT_BUDGET),
     ("respond", "claude", "opus", "deep", 3),
     ("respond", "codex", "sol", "deep", 5),
     ("mockup", "claude", "opus", "deep", 5),
@@ -300,7 +309,7 @@ def test_effort_blind_admission_rows_discard_every_supplied_effort(
     ("claude", "sonnet", "standard", (3, 4, 5, 5)),
     ("claude", "opus", "deep", (4, 4, 5, 5)),
     ("codex", "terra", "standard", (4, 5, 5, 5)),
-    ("codex", "sol", "deep", (5, 5, 5, 5)),
+    ("codex", "sol", "deep", (PERMIT_BUDGET,) * 4),
 ))
 def test_build_admission_keeps_its_effort_rows_and_missing_effort_fallback(
         pool, model, complexity, demands):
@@ -458,20 +467,18 @@ def test_never_started_launch_consumes_no_permit(make_coord):
 
 
 def test_permit_ledger_is_shared_across_coordinator_instances(make_coord):
-    """Two coordinator instances over one store draw from the same durable permit ledger, so
-    a second instance sees the first's reservations and cannot push a pool past its budget —
-    two demand-2 reviews fit, a third does not (ADR 0029/0030)."""
+    """Coordinator instances share one durable permit ledger and cannot exceed its budget."""
     fake = FakeSession()
     a = make_coord(fake)
     b = make_coord(fake)
-    a.submit_stage(Submission(repo="o/r", subject="a1", stage="review", pool="codex"))
-    a.submit_stage(Submission(repo="o/r", subject="a2", stage="review", pool="codex"))
+    for number in range(PERMIT_BUDGET // 2):
+        a.submit_stage(Submission(repo="o/r", subject=f"a{number}", stage="review", pool="codex"))
     b.submit_stage(Submission(repo="o/r", subject="b1", stage="review", pool="codex"))
 
-    a.cycle("codex")                     # a reserves two (four permits)
-    assert permits(a, "codex") == 4
+    a.cycle("codex")                     # a reserves as many demand-2 reviews as fit
+    assert permits(a, "codex") == (PERMIT_BUDGET // 2) * 2
     b.cycle("codex")                     # b sees the shared ledger is full and reserves none
-    assert permits(b, "codex") == 4
+    assert permits(b, "codex") == (PERMIT_BUDGET // 2) * 2
 
 
 def test_global_stage_limit_is_enforced_through_the_coordinator_seam(make_coord):

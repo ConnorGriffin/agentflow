@@ -6,7 +6,7 @@ pool to collect the completed stage outcomes and human holds that reconciliation
 the product policy leaves with no successor into the same idempotent human hold a budget
 exhaustion produces. Everything hard lives behind them: the
 continuation record and its four states, the waiting queue and ADR 0028 ordering, the
-attempt budget, the reviewed five-permit admission matrix, the atomic permit reservation on
+attempt budget, the reviewed admission matrix, the atomic permit reservation on
 the running-record ledger, the crash-safe provider start handshake, outcome-first
 classification, and reconciliation. SQLite, admission demand, attempt numbers, gates, and
 provider observations are private implementation details.
