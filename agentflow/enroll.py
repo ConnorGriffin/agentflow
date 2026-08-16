@@ -45,6 +45,7 @@ from agentflow.provider_skills import (
 from agentflow.repo_facts import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
                                   surface_declaration)
 from agentflow.runtime_contracts import playwright_runtime_status as _runtime_status
+from agentflow.skill_ownership import mark_skill_owned, skill_ownership
 
 # Directory names that hold a user-facing surface when a repo has one. Deliberately narrow:
 # a wrong guess here writes a declaration that either misses real UI or gates a backend path.
@@ -974,6 +975,11 @@ def _install_connor_skills(root: Path) -> str:
             )
             if warning:
                 return warning
+            if name == "drive-local-webapp":
+                destination = root / ".agents" / "skills" / name
+                mark_skill_owned(destination)
+                if skill_ownership(destination) is None:
+                    return f"WARN: could not record AgentFlow ownership for {destination}"
             wiring = _wire_claude_skill(root, name)
             if wiring.startswith("WARN:"):
                 return wiring
@@ -1201,6 +1207,7 @@ def _enrollment_journal(root: Path) -> _EnrollmentJournal:
         root / ".claude",
         root / "scripts",
         root / "skills-lock.json",
+        root / ".agentflow",
         config,
     ]
     if config.is_symlink():

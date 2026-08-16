@@ -1,5 +1,6 @@
 """Explicit enrollment protects agentflow's working area from Git status."""
 
+from hashlib import sha256
 import os
 import subprocess
 from pathlib import Path
@@ -14,6 +15,8 @@ from agentflow.enroll import (_audit_command, _converge_and_ship, _install_file,
                               main, newly_gated_prs, propose_surfaces, sync_fleet,
                               write_declaration)
 from agentflow.repo_facts import surface_declaration
+from agentflow.filesystem_contracts import skill_destination_status
+from agentflow.skill_ownership import skill_ownership
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "enroll-standards.sh"
@@ -39,6 +42,55 @@ def _git_commit_all(repo: Path, message: str = "commit") -> None:
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
     subprocess.run(["git", "commit", "-q", "-m", message], cwd=repo, check=True,
                     capture_output=True)
+
+
+def test_connor_skill_materialization_records_only_agentflow_owned_destination(
+    tmp_path, monkeypatch
+):
+    """An identical hand-written skill directory has no AgentFlow provenance."""
+    from agentflow import enroll
+
+    managed = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    handwritten = tmp_path / "handwritten" / "drive-local-webapp"
+    skill = "---\nname: drive-local-webapp\n---\n"
+    manifest = [{"path": "SKILL.md", "sha256": sha256(skill.encode()).hexdigest()}]
+
+    def run(command, **_kwargs):
+        if command[0] == "npx":
+            managed.mkdir(parents=True)
+            (managed / "SKILL.md").write_text(skill)
+        stdout = "a" * 40 if command[-1] == "HEAD" else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(enroll, "_run_command", run)
+    monkeypatch.setattr(enroll, "_resolved_skill_release", lambda _manifest: ("a" * 40, None))
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
+    monkeypatch.setattr(enroll, "_wire_claude_skill", lambda *_args: "ok")
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": "a" * 40,
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [{"skill": "drive-local-webapp", "files": manifest}],
+            "skill_installer": {"package": "skills", "version": "1"},
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+    handwritten.mkdir(parents=True)
+    (handwritten / "SKILL.md").write_text(skill)
+
+    assert skill_ownership(managed) == {
+        "schema": 1,
+        "owner": "agentflow",
+        "skill": "drive-local-webapp",
+    }
+    assert skill_ownership(handwritten) is None
+    assert skill_destination_status(managed, manifest) == "ok"
 
 
 def _enroll(repo: Path, *, apply: bool) -> subprocess.CompletedProcess:
