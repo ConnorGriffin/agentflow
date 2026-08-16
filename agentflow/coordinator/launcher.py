@@ -22,13 +22,17 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from agentflow.coordinator.record import NOT_STARTED, STARTED  # re-exported for callers
-from agentflow.coordinator._launch_child import _INHERITED_WORKTREE, _NO_WORKTREE
+from agentflow.coordinator._launch_child import _NO_WORKTREE, _WORKTREE
 
 # Bounded wait for the spawned child to durably record `started` before we treat the launch
 # as one that never produced a provider family.
 _HANDSHAKE_TIMEOUT_S = float(os.environ.get("AGENTFLOW_COORD_HANDSHAKE_S", "10"))
+# Bootstrap imports must resolve from the daemon deployment; the child receives any provider
+# worktree separately and applies it only in the gated provider fork.
+_DAEMON_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(frozen=True)
@@ -200,8 +204,8 @@ class LocalLauncher:
                  str(store.path), record.identity, str(token),
                  str(self._session_timeout_for(record, admitted)),
                  *lease_args,
-                 _INHERITED_WORKTREE if record.source else _NO_WORKTREE,
-                 *argv], cwd=record.source or None)
+                 *((_WORKTREE, record.source) if record.source else (_NO_WORKTREE,)),
+                 *argv], cwd=_DAEMON_ROOT)
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence
         # The intermediate exits at once; reap it so it does not linger. The provider

@@ -18,6 +18,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -907,7 +908,7 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
     class Provider:
         pid = 123
 
-        def __init__(self, _provider, output):
+        def __init__(self, _provider, output, _working_dir):
             output.write(json.dumps(started) + "\n")
             output.flush()
 
@@ -961,7 +962,7 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
     monkeypatch.chdir(tmp_path)
 
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "codex",
-            "0.20", "0.50", "1.0", _launch_child._INHERITED_WORKTREE, "provider"]
+            "0.20", "0.50", "1.0", _launch_child._WORKTREE, str(tmp_path), "provider"]
     revoker = threading.Thread(target=revoke_authorization)
     revoker.start()
     with pytest.raises(ChildExit) as exited:
@@ -1528,14 +1529,14 @@ def _run_clocked_supervisor(
     monkeypatch.setattr(_launch_child, "_head", head)
     monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
     monkeypatch.setattr(_launch_child, "_spawn_provider",
-                        lambda _provider, _output: Provider())
+                        lambda _provider, _output, _working_dir: Provider())
     monkeypatch.chdir(tmp_path)
 
     silent, test_grace, absolute = build_lease
     store_path = tmp_path / "records.db"
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "claude",
-            str(silent), str(test_grace), str(absolute), _launch_child._INHERITED_WORKTREE,
-            "provider"]
+            str(silent), str(test_grace), str(absolute), _launch_child._WORKTREE,
+            str(tmp_path), "provider"]
     with pytest.raises(ChildExit) as exited:
         _launch_child.main(args)
 
@@ -2355,7 +2356,7 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
 
     with pytest.raises(ChildExit) as exited:
         _launch_child.main([str(tmp_path / "records.db"), "attempt", "token", "30",
-                            _launch_child._INHERITED_WORKTREE, "provider"])
+                            _launch_child._WORKTREE, str(tmp_path), "provider"])
 
     assert exited.value.args == (0,)
     session = read_session(tmp_path / "records.db", "token")
@@ -2364,14 +2365,31 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
     assert "permission denied stopping provider process group" in session.partial_output
 
 
-def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tmp_path):
-    """The path named in the boundary is also the provider process's real working directory,
-    which is what the Claude project settings and OS workspace sandbox confine."""
+def test_bootstrap_uses_daemon_code_while_provider_uses_submitted_source(
+        coord_state, tmp_path, monkeypatch):
+    """The bootstrap module comes from the daemon, while the provider stays in its worktree."""
     from agentflow.coordinator.providers import ClaudeProviderAdapter
     from agentflow.coordinator.store import Store, default_store_path
 
     source = tmp_path / "owned-worktree"
-    source.mkdir()
+    shadow_init = source / "agentflow" / "__init__.py"
+    shadow_init.parent.mkdir(parents=True)
+    shadow_init.write_text("# Must never bootstrap the daemon.\n")
+    instrumentation = tmp_path / "bootstrap-import-tracer"
+    instrumentation.mkdir()
+    resolved_module = tmp_path / "bootstrap-agentflow-module"
+    (instrumentation / "sitecustomize.py").write_text(
+        "import importlib.machinery, os, pathlib, sys\n"
+        "class TraceAgentflow:\n"
+        " def find_spec(self, name, path=None, target=None):\n"
+        "  if name == 'agentflow':\n"
+        "   spec = importlib.machinery.PathFinder.find_spec(name, path)\n"
+        "   pathlib.Path(os.environ['AGENTFLOW_TEST_BOOTSTRAP_MODULE']).write_text(spec.origin)\n"
+        "  return None\n"
+        "sys.meta_path.insert(0, TraceAgentflow())\n")
+    monkeypatch.setenv("AGENTFLOW_TEST_BOOTSTRAP_MODULE", str(resolved_module))
+    monkeypatch.setenv("PYTHONPATH", f"{instrumentation}{os.pathsep}"
+                       f"{os.environ.get('PYTHONPATH', '')}")
     provider = lambda record: [sys.executable, "-c", "import os; print(os.getcwd())"]
     coord = Coordinator(launcher=LocalLauncher(provider, timeout=5))
     identity = coord.submit_stage(Submission(
@@ -2388,11 +2406,13 @@ def test_real_supervisor_starts_provider_in_the_submitted_source(coord_state, tm
         pytest.fail("provider supervisor did not finish")
 
     observation = ClaudeProviderAdapter().observe(record)
+    daemon_module = (Path(launcher_mod.__file__).parent.parent / "__init__.py").resolve()
+    assert Path(resolved_module.read_text()).resolve() == daemon_module
     assert observation.partial_output == str(source)
 
 
-def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, monkeypatch):
-    """The public launcher carries source authority in cwd, never in child argv."""
+def test_local_launcher_passes_worktree_data_from_daemon_code_root(tmp_path, monkeypatch):
+    """The public launcher starts daemon code and passes provider cwd as explicit data."""
     from agentflow.coordinator import _launch_child
     from agentflow.coordinator import launcher as launcher_mod
     from agentflow.coordinator.launcher import STARTED
@@ -2424,14 +2444,14 @@ def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, mo
                                         session_timeout=5).start(record, Store())
 
     assert result.family == "123:456"
-    assert observed["cwd"] == str(source)
-    assert _launch_child._INHERITED_WORKTREE in observed["argv"]
-    assert str(source) not in observed["argv"]
+    assert observed["cwd"] == Path(launcher_mod.__file__).parents[2]
+    assert _launch_child._WORKTREE in observed["argv"]
+    assert observed["argv"].count(str(source)) == 1
 
 
 def test_public_launcher_ignores_forged_provider_root_for_snapshot_authority(
         coord_state, tmp_path, monkeypatch):
-    """A provider path cannot redirect the snapshot away from LocalLauncher's inherited cwd."""
+    """A provider path cannot redirect the snapshot away from LocalLauncher's worktree data."""
     from agentflow.coordinator import _launch_child
 
     source, target = _tracked_build(tmp_path)
@@ -2482,9 +2502,10 @@ def test_public_launcher_ignores_forged_provider_root_for_snapshot_authority(
 
     record = _wait_for_real_child(identity, "forged root redirected the worktree snapshot")
     starts = [json.loads(line) for line in bootstrap.read_text().splitlines()]
-    cwd, argv = next(start for start in starts if _launch_child._INHERITED_WORKTREE in start[1])
-    assert cwd == str(source)
-    assert _launch_child._INHERITED_WORKTREE in argv
+    cwd, argv = next(start for start in starts if _launch_child._WORKTREE in start[1])
+    assert cwd == str(Path(launcher_mod.__file__).parents[2])
+    assert _launch_child._WORKTREE in argv
+    assert str(source) in argv
     assert not external_read.exists()
     assert marker.exists()
     assert _build_observation(record).timed_out is False

@@ -2,7 +2,7 @@
 
 Run as
 ``python -m agentflow.coordinator._launch_child <store_path> <identity> <token> <timeout>
-[--build-lease <provider> <silent> <test> <absolute>] --inherited-worktree [argv...]``.
+[--build-lease <provider> <silent> <test> <absolute>] --worktree <launch_root> [argv...]``.
 
 It double-forks so the provider family is reparented away from the daemon (and so an ended
 provider never lingers as a zombie the daemon would misread as alive), then makes a *guarded*
@@ -36,7 +36,7 @@ from agentflow.coordinator.store import Store
 _HEAD_FILE_BYTES = 8 * 1024 * 1024
 _HEAD_OBSERVATION_S = 0.025
 _HEAD_HELPERS: set[int] = set()
-_INHERITED_WORKTREE = "--inherited-worktree"
+_WORKTREE = "--worktree"
 _NO_WORKTREE = "--no-worktree"
 
 
@@ -94,7 +94,7 @@ class _ForkedProvider:
             time.sleep(min(0.01, remaining))
 
 
-def _spawn_provider(provider: list[str], output) -> _ForkedProvider:
+def _spawn_provider(provider: list[str], output, working_dir: str) -> _ForkedProvider:
     """Fork a separate-session provider that cannot exec until its family is durable."""
     gate_read, gate_write = os.pipe()
     try:
@@ -114,6 +114,8 @@ def _spawn_provider(provider: list[str], output) -> _ForkedProvider:
             os.close(gate_read)
             if not released:
                 os._exit(0)
+            if working_dir:
+                os.chdir(working_dir)
             os.execvp(provider[0], provider)
         except OSError:
             os._exit(127)
@@ -936,10 +938,12 @@ def main(args: list[str]) -> None:
         progress_provider, silent, test_grace, absolute, *tail = tail[1:]
         build_lease = (float(silent), float(test_grace), float(absolute))
     launch_root, *provider = tail
-    if launch_root == _INHERITED_WORKTREE:
+    if launch_root == _WORKTREE:
         try:
-            working_dir = os.getcwd()
-        except OSError:
+            working_dir, *provider = provider
+        except ValueError:
+            return
+        if not working_dir:
             return
     elif launch_root == _NO_WORKTREE:
         working_dir = ""
@@ -983,7 +987,7 @@ def main(args: list[str]) -> None:
     timed_out = False
     with events.open("w") as output:
         try:
-            process = _spawn_provider(provider, output)
+            process = _spawn_provider(provider, output, working_dir)
         except OSError:
             store.close()
             # No provider family ever came into existence for this attempt.
