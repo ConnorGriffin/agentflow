@@ -931,6 +931,9 @@ def _prepare_review_settlement(record) -> bool:
 RED_CHECK_SPENT_REASON = ("has a failing check on its reviewed head and no automatic revise "
                           "rounds remain")
 ACTION_REQUIRED_REASON = "has a check on its reviewed head that is asking for a human directly"
+PENDING_CHECK_REASON = "has a required check on its reviewed head that is still pending"
+UI_VERIFICATION_UNAVAILABLE_REASON = "could not run the required UI verification"
+UI_VERIFICATION_UNKNOWN_REASON = "could not determine whether UI verification was required"
 
 
 def _red_check_lines(checks) -> tuple[str, ...]:
@@ -938,6 +941,25 @@ def _red_check_lines(checks) -> tuple[str, ...]:
     exact commit it was read on. Pure (test surface)."""
     return tuple(f"Check `{name}` completed red on reviewed head {checks.sha}."
                  for name in checks.failing)
+
+
+def _pending_check_lines(checks) -> tuple[str, ...]:
+    """The one durable handoff fact for a non-terminal exact-head check rollup."""
+    return (f"Required checks are still pending on reviewed head {checks.sha}.",)
+
+
+def _settle_pending_check(record, verdict, workdir: str, pr: int, checks,
+                          *, autonomous: bool) -> str | None:
+    """Park a would-be clean review whose required checks have not completed.
+
+    This is deliberately a handoff rather than a settlement retry: a pending check cannot prove
+    PASS, and an external check that never completes must not leave a completed Review spinning
+    forever without an operator-visible terminal state.
+    """
+    return _park_review_settlement(
+        record, verdict, workdir, pr, reason=PENDING_CHECK_REASON, autonomous=autonomous,
+        checks=_pending_check_lines(checks),
+        missing="The reviewed head's required checks have not completed successfully.")
 
 
 def _settle_red_check(record, verdict, workdir: str, pr: int, checks,
@@ -1011,7 +1033,7 @@ def _settle_review(record) -> str | None:
     from agentflow import ratchet
     from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                                 post_clean_review_summary, reply_pending, squash_merge,
-                                ui_evidence_gap)
+                                ui_evidence_gap, ui_verification_required)
 
     facts = review_source_facts(record)
     if facts is None:
@@ -1060,10 +1082,31 @@ def _settle_review(record) -> str | None:
 
     surfaces = ui_surfaces(workdir)
     ui_gap = ui_evidence_gap(record.repo, pr, surfaces)
+    ui_verification_needed = (False if ui_gap
+                              else ui_verification_required(record.repo, pr, surfaces))
+    if ui_verification_needed is None:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=UI_VERIFICATION_UNKNOWN_REASON,
+            autonomous=autonomous, checks=verdict.checks,
+            missing="The pipeline could not determine whether the reviewed change requires UI "
+                    "verification.")
+    if not ui_gap and verdict.ui_verification.value == "unavailable":
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=UI_VERIFICATION_UNAVAILABLE_REASON,
+            autonomous=autonomous, checks=verdict.checks,
+            missing="The reviewer could not execute the required UI verification.")
+    if ui_verification_needed and verdict.ui_verification.value != "passed":
+        return _park_review_settlement(
+            record, verdict, workdir, pr,
+            reason="did not record the required UI verification", autonomous=autonomous,
+            checks=verdict.checks,
+            missing="The reviewed change touches a declared UI surface but has no runnable UI "
+                    "verification result.")
     # The head check gate (ADR 417): a clean exit first reads the checks on the exact reviewed
     # head, from GitHub — a reviewer cannot clear it by not looking. It is consulted only on the
     # exits that would otherwise finish clean: an unreadable answer defers only the clean
-    # settlement, and every park below still completes. Pending and absent checks change nothing.
+    # settlement, while every park below still completes. Pending checks park; absent checks do
+    # not change settlement.
     if not autonomous:
         if verdict.clean and not ui_gap:
             head_checks = github.commit_head_checks(record.repo, reviewed_head)
@@ -1071,6 +1114,9 @@ def _settle_review(record) -> str | None:
                 return None
             if head_checks.failing:
                 return _settle_red_check(
+                    record, verdict, workdir, pr, head_checks, autonomous=False)
+            if head_checks.pending:
+                return _settle_pending_check(
                     record, verdict, workdir, pr, head_checks, autonomous=False)
             if not post_clean_review_summary(record.repo, pr, verdict, reviewed_head):
                 return None
@@ -1089,6 +1135,9 @@ def _settle_review(record) -> str | None:
                 return None
             if head_checks.failing:
                 return _settle_red_check(
+                    record, verdict, workdir, pr, head_checks, autonomous=True)
+            if head_checks.pending:
+                return _settle_pending_check(
                     record, verdict, workdir, pr, head_checks, autonomous=True)
             if not post_clean_review_summary(record.repo, pr, verdict, reviewed_head):
                 return None
@@ -1119,6 +1168,9 @@ def _settle_review(record) -> str | None:
             return None
         if head_checks.failing:
             return _settle_red_check(
+                record, verdict, workdir, pr, head_checks, autonomous=True)
+        if head_checks.pending:
+            return _settle_pending_check(
                 record, verdict, workdir, pr, head_checks, autonomous=True)
     # CI already completed in prepare_completed, outside SQLite's write transaction. Recheck it
     # once without polling, together with the exact head, immediately before merge.

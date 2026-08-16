@@ -67,6 +67,18 @@ def test_structured_review_requires_recorded_checks():
     assert result.parsed is False and "checks" in result.detail
 
 
+def test_unavailable_ui_verification_cannot_settle_a_pass():
+    result = parse_review_result(json.dumps({
+        "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
+        "axis": "combined", "change_author_tool": "claude", "reviewed_sha": "head",
+        "final_sha": "head", "pushed_sha": "", "fixes": [], "follow_ups": [],
+        "checks": ["Replay launch blocked by macOS Chromium permissions"], "findings": [],
+        "uncertainty": None, "decision": "", "ui_verification": "unavailable",
+    }), expected_sha="head")
+
+    assert result.parsed is True and result.clean is False
+
+
 def test_follow_up_proposal_is_zero_or_one_and_required_exactly_for_its_finding():
     base = {
         "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",

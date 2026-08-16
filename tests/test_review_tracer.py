@@ -1059,6 +1059,7 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, content, comments,
     failing the test the way an unexpected merge must.
     """
     from agentflow import gate
+    from agentflow.review_policy import UIVerification
     from agentflow.reviewer import Verdict
 
     record = _completed_review_record(profile="autonomous")
@@ -1073,7 +1074,12 @@ def _settle_autonomous_clean_review(monkeypatch, *, surfaces, content, comments,
         parked.append(reason)
         posted.append(f"> *agentflow: parked for human review.*\n<!-- {proof_marker} -->")
 
-    monkeypatch.setattr(coordinated_review, "_review_verdict", lambda _r: Verdict(clean=True))
+    monkeypatch.setattr(
+        coordinated_review, "_review_verdict",
+        lambda _r: Verdict(
+            clean=True,
+            ui_verification=(UIVerification.PASSED if surfaces
+                             else UIVerification.NOT_REQUIRED)))
     monkeypatch.setattr(coordinated_review, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": "OPEN"})
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
