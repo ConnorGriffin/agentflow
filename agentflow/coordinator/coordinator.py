@@ -495,6 +495,27 @@ class Coordinator:
                               "nothing left to triage; retired silently, claim released")
             return True
 
+    def retire_stale_hold(self, identity: str) -> bool:
+        """Silently retire a claim-released human hold whose subject is already resolved.
+
+        The reconciliation caller owns the GitHub proof and, for issue-bound stages, proves every
+        visible claim and held label is gone first. A retained coordinator claim is intentionally
+        not cleared here: it means that proof was not established and the record must wait for a
+        later pass.
+        """
+        with self._lock:
+            record = self._owned_record(self._store.record_of(identity))
+            if (record is None or record.retired or record.state != HELD or record.claim):
+                return False
+            self._release(record)
+            record.state = COMPLETED
+            record.hold_pending = False
+            record.retired = True
+            if not self._persist(record, retire_descendants=True):
+                return False
+            self._emit(record, "subject was closed; held record retired")
+            return True
+
     def park_stale_review(self, identity: str) -> "StageOutcome | None":
         """Park a Review whose PR head moved off its immutable target once the auto-revise rounds are
         spent: the stranded record can open no bounded successor, so the PR is handed to a human
