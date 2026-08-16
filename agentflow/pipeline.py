@@ -419,8 +419,12 @@ def _capability_preflight(record, materialize: bool, *, _log=None):
     context["ui"] = bool(declaration.surfaces)
     requirements = requirements_for(record.stage, context)
     if materialize:
+        requirement_ids = {requirement.id for requirement in requirements}
         materialize_runtime = any(requirement.runtime for requirement in requirements)
-        materialize_kwargs = {"materialize_runtime": materialize_runtime}
+        materialize_kwargs = {
+            "materialize_runtime": materialize_runtime,
+            "requirement_ids": requirement_ids,
+        }
         if _log is not None:
             materialize_kwargs["_log"] = _log
         ok, detail = materialize_launch_capabilities(

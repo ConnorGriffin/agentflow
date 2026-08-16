@@ -308,7 +308,7 @@ def provider_skill_status(root: Path, provider: str, spec: dict) -> tuple[str, s
 
 def materialize_launch_capabilities(
     source: Path, destination: Path, provider: str, materialize_runtime: bool = False,
-    *, _log=None,
+    *, requirement_ids: set[str] | None = None, _log=None,
 ) -> tuple[bool, str]:
     """Copy missing pinned provider skills into a prepared launch root without overwriting.
 
@@ -353,6 +353,11 @@ def materialize_launch_capabilities(
         spec for spec in manifest["capabilities"]
         if spec.get("skill") and "version" in spec
     ]
+    if requirement_ids is not None:
+        specs = [
+            spec for spec in specs
+            if spec["id"] in requirement_ids or spec["skill"] in requirement_ids
+        ]
     source_runtime = source_skills / "drive-local-webapp" / "node_modules"
     destination_drive = destination_skills / "drive-local-webapp"
     destination_runtime = destination_drive / "node_modules"
@@ -576,7 +581,11 @@ def materialize_launch_capabilities(
             return False, f"{provider} source Playwright runtime is not intact: {detail}"
         if error := materialize_harness():
             return error
-        drive = next(spec for spec in specs if spec["skill"] == "drive-local-webapp")
+        drive = next(
+            (spec for spec in specs if spec["skill"] == "drive-local-webapp"), None
+        )
+        if drive is None:
+            return failed(f"{provider} launch runtime requires drive-local-webapp")
         if destination_drive.is_symlink():
             return failed(f"{provider} launch runtime destination is symlinked")
         if destination_drive.exists() and skill_destination_status(

@@ -16,6 +16,7 @@ import pytest
 from agentflow.capability_contracts import ContractRequirement, preflight
 from agentflow.cli import main
 from agentflow.enroll import doctor, enroll_repository, repair_capability_refusal
+from agentflow.prompts import requirements_for
 from agentflow.provider_skills import (
     NATIVE_DISCOVERY_MARKER, NATIVE_DISCOVERY_SKILL,
     materialize_launch_capabilities, provider_skill_status,
@@ -972,6 +973,60 @@ def test_launch_materialization_rejects_provider_root_escape_before_writing(tmp_
 
     assert ready is False and "root" in detail
     assert not (outside / "skills").exists()
+
+
+def test_launch_materialization_ignores_missing_unrequired_ui_skill(tmp_path):
+    checkout = Path(__file__).parents[1]
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    shutil.copytree(checkout / ".agents", source / ".claude")
+    shutil.rmtree(source / ".claude" / "skills" / "ui-craft")
+    destination.mkdir()
+
+    requirements = requirements_for("build", {"ui": False})
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "claude",
+        requirement_ids={requirement.id for requirement in requirements},
+    )
+
+    assert ready is True and "materialized" in detail
+    assert all(
+        (destination / ".claude" / "skills" / requirement.id).is_dir()
+        for requirement in requirements
+    )
+    assert not (destination / ".claude" / "skills" / "ui-craft").exists()
+
+
+def test_launch_materialization_rejects_missing_required_ui_skill(tmp_path):
+    checkout = Path(__file__).parents[1]
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    shutil.copytree(checkout / ".agents", source / ".claude")
+    shutil.rmtree(source / ".claude" / "skills" / "ui-craft")
+    destination.mkdir()
+
+    requirements = requirements_for("review", {"ui": True})
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "claude",
+        requirement_ids={requirement.id for requirement in requirements},
+    )
+
+    assert ready is False
+    assert detail == "claude source skill ui-craft is not intact"
+
+
+def test_launch_materialization_refuses_runtime_without_drive_skill_requirement(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True,
+        requirement_ids={"playwright"},
+    )
+
+    assert ready is False
+    assert detail == "codex launch runtime requires drive-local-webapp"
 
 
 def test_launch_materialization_copies_verified_ui_runtime_into_fresh_root(tmp_path, monkeypatch):
