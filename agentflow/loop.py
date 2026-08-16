@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import re
 import subprocess
-from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
@@ -32,19 +31,13 @@ from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABE
 from agentflow.notify import notify
 from agentflow.prompts import CONFLICT_REASON
 from agentflow.repo_facts import intake_allowlist, repo_profile
+from agentflow.repository import RepoConfig
 from agentflow.review_policy import ReviewState
 from agentflow.reviewer import Verdict
 from agentflow.runner import (_commit_is_on_origin, _run, _worktree_is_disposable,
                               _worktree_is_registered, remove_worktree_if_safe, resettable_head,
                               retain_stranded_commit, worktree_session)
 from agentflow.worktree_ref import BUILD_BRANCH_RE, WorktreeRef, issue_of_branch
-
-
-@dataclass(frozen=True)
-class RepoConfig:
-    repo: str        # "owner/name" on GitHub
-    workdir: str     # local main checkout
-    declared_workdir: str | None = None  # non-resolved config path; recovery rejects symlinks
 
 
 def _row_dict(row: github.IssueRow) -> dict:

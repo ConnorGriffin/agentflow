@@ -14,7 +14,9 @@ from agentflow.canary_attribution import (
     CanaryAttribution,
     _digest as _canary_digest,
 )
-from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
+from agentflow.capability_contracts import (
+    CapabilityPreflightResult, CapabilityRepairResult, ContractRequirement, _ready_fact,
+)
 from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.record import RUNNING, STALL_PARK_AFTER, Record
@@ -182,7 +184,7 @@ def _approved_briefing(repository, stage, subject_revision, receipt_id):
 
 def _coordinator(
         tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None,
-        launcher=None, log=None):
+        launcher=None, repair=None, log=None):
     path = tmp_path / "coordinator.db"
     receipts = receipts or _Receipts()
     store = Store(path, admission_mode=OperationalSafetyAndCanary(
@@ -191,7 +193,7 @@ def _coordinator(
     adapter = _Prepared()
     coordinator = Coordinator(
         store=store, launcher=launcher, adapter=adapter,
-        capability_preflight=capability,
+        capability_preflight=capability, capability_repair=repair,
         briefing_resolver=briefing or _Briefings(),
         route_selector=routing.select_route, daemon_generation="daemon-627", log=log)
     identity = coordinator.submit_stage(Submission(
@@ -205,6 +207,87 @@ def _coordinator(
             complexity=record.complexity, effort=record.effort,
             builder_complexity=record.builder_complexity))
     return coordinator, store, launcher, adapter, identity
+
+
+def test_observed_capability_refusal_repairs_once_reprobes_and_admits(tmp_path):
+    repaired = False
+    probes = []
+    repairs = []
+    lines = []
+
+    def capability(record, materialize):
+        probes.append(materialize)
+        if materialize and not repaired:
+            return CapabilityPreflightResult(
+                record.stage, record.pool,
+                (ContractRequirement("playwright", "1.61.1", runtime=True),),
+                "missing", ("playwright: pinned runtime is missing",),
+                f"agentflow enroll {record.capability_root} --apply",
+            )
+        return _ready(record.stage, record.pool)
+
+    def repair(record, refusal):
+        nonlocal repaired
+        repairs.append((record.identity, refusal.state))
+        repaired = True
+        return CapabilityRepairResult(True, "installed pinned runtime")
+
+    coordinator, store, launcher, adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair)
+    coordinator._log = lines.append
+
+    coordinator.cycle("codex")
+
+    record = store.record_of(identity)
+    assert repairs == [(identity, "missing")]
+    assert probes == [False, True, True]
+    assert adapter.calls == 1 and len(launcher.launches) == 1
+    assert record.state == "running" and record.attempts == 1
+    assert any(
+        "capability repair" in line
+        and str(record.capability_root or record.source or ".") in line
+        and "playwright@1.61.1" in line
+        and "installed pinned runtime" in line
+        for line in lines
+    )
+    store.close()
+
+
+def test_failed_capability_repair_logs_once_and_keeps_the_stall_clock(tmp_path):
+    probes = []
+    repairs = []
+    lines = []
+
+    def capability(record, materialize):
+        probes.append(materialize)
+        return (
+            _failure("missing", record.stage, record.pool)
+            if materialize else _ready(record.stage, record.pool)
+        )
+
+    def repair(record, refusal):
+        repairs.append((record.identity, refusal.state))
+        return CapabilityRepairResult(False, "npm ci exited 1")
+
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair)
+    coordinator._log = lines.append
+
+    coordinator.cycle("codex", now=0)
+    coordinator.cycle("codex", now=5 * 60)
+
+    waiting = store.record_of(identity)
+    assert repairs == [(identity, "missing")]
+    assert probes == [False, True, True, False, True]
+    assert waiting.state == "waiting" and waiting.attempts == 0
+    assert waiting.refusal == "capability_environment_failure:missing"
+    assert waiting.refusals == 2 and waiting.stall_refusal_id == waiting.refusal
+    assert waiting.stall_started_at == 0 and waiting.stall_last_observed_at == 5 * 60
+    assert launcher.launches == []
+    repair_lines = [line for line in lines if "capability repair" in line]
+    assert len(repair_lines) == 1
+    assert "outcome=failed" in repair_lines[0] and "npm ci exited 1" in repair_lines[0]
+    store.close()
 
 
 def _assert_zero_outputs(store, launcher, identity, code):

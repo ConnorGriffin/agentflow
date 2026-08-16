@@ -165,6 +165,7 @@ description = "the canonical Playwright screenshot harness"
 requirement = "ui"
 source = "bundled"
 sha256 = "ca2e1ff3a47e0f6680e7472df83df9fbbe39771546466bc28cf6858c0a35edaa"
+known_old_sha256 = ["ba094b9169747467257fc6f5bfcdc6d0f47a46bd99aa9827f0a3f352a03a84ad"]
 
 [[capabilities]]
 id = "playwright"

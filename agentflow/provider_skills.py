@@ -8,6 +8,7 @@ and capability manifest.  Every launch-root preflight rechecks both halves and f
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 from importlib.resources import files
@@ -375,39 +376,26 @@ def materialize_launch_capabilities(
     for spec, source_skill, _target_skill in missing_skills:
         if skill_destination_status(source_skill, spec["files"]) != "ok":
             return False, f"{provider} source skill {spec['skill']} is not intact"
-    runtime_existed = False
-    if materialize_runtime:
-        runtime = manifest["playwright"]
-        status, detail = playwright_runtime_status(
-            source, version=runtime["version"], node_minimum=runtime["node_minimum"],
-            manifest=manifest, provider=provider,
-        )
-        if status != "ok":
-            return False, f"{provider} source Playwright runtime is not intact: {detail}"
-        drive = next(spec for spec in specs if spec["skill"] == "drive-local-webapp")
-        if destination_drive.is_symlink():
-            return False, f"{provider} launch runtime destination is symlinked"
-        if destination_drive.exists() and skill_destination_status(
-            destination_drive, drive["files"]
-        ) != "ok":
-            return False, f"{provider} launch runtime destination skill is occupied or incompatible"
-        runtime_existed = destination_runtime.exists() or destination_runtime.is_symlink()
-        if runtime_existed:
-            status, detail = playwright_runtime_status(
-                destination, version=runtime["version"], node_minimum=runtime["node_minimum"],
-                manifest=manifest, provider=provider,
-            )
-            if status != "ok":
-                return False, f"{provider} launch runtime destination is occupied or {status}: {detail}"
     created: list[tuple[Path, bool]] = []
+    replaced_files: list[tuple[Path, bytes, str]] = []
 
     def rollback() -> list[str]:
         errors = []
+        for path, content, installed_digest in reversed(replaced_files):
+            try:
+                if hashlib.sha256(path.read_bytes()).hexdigest() != installed_digest:
+                    errors.append(f"{path} changed concurrently; replacement preserved")
+                    continue
+                path.write_bytes(content)
+            except OSError as exc:
+                errors.append(f"{path}: {exc}")
         for path, recursive in reversed(created):
             try:
                 if not recursive:
                     path.rmdir()
                 elif path.is_symlink():
+                    path.unlink()
+                elif path.is_file():
                     path.unlink()
                 elif path.exists():
                     if not _contained(path, destination):
@@ -433,6 +421,94 @@ def materialize_launch_capabilities(
             return failed(f"{provider} launch destination creation failed: {path}: {exc}")
         created.append((path, recursive))
         return None
+
+    def materialize_harness() -> tuple[bool, str] | None:
+        harness = next(
+            item for item in manifest["capabilities"] if item["id"] == "screenshot-harness"
+        )
+        source_harness = source / "scripts" / "screenshots.mjs"
+        destination_scripts = destination / "scripts"
+        destination_harness = destination_scripts / "screenshots.mjs"
+        source_bytes = source_harness.read_bytes() if source_harness.is_file() else b""
+        pinned_digest = harness["sha256"]
+        if (
+            source_harness.is_symlink()
+            or hashlib.sha256(source_bytes).hexdigest() != pinned_digest
+        ):
+            return failed(f"{provider} source screenshot harness is not intact")
+        scripts_existed = destination_scripts.exists()
+        if destination_scripts.is_symlink() or (
+            scripts_existed and not destination_scripts.is_dir()
+        ):
+            return failed(f"{provider} launch screenshot harness directory is incompatible")
+        if not scripts_existed:
+            if error := claim_directory(destination_scripts, recursive=False):
+                return error
+        if destination_harness.is_symlink() or (
+            destination_harness.exists() and not destination_harness.is_file()
+        ):
+            return failed(f"{provider} launch screenshot harness is occupied or incompatible")
+        if not destination_harness.exists():
+            try:
+                with destination_harness.open("xb") as stream:
+                    stream.write(source_bytes)
+            except (FileExistsError, OSError) as exc:
+                return failed(
+                    f"{provider} launch screenshot harness creation failed: {exc}"
+                )
+            created.append((destination_harness, True))
+            return None
+        try:
+            with destination_harness.open("r+b") as stream:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                prior = stream.read()
+                prior_digest = hashlib.sha256(prior).hexdigest()
+                if prior_digest == pinned_digest:
+                    return None
+                if prior_digest not in frozenset(harness.get("known_old_sha256", ())):
+                    return failed(
+                        f"{provider} launch screenshot harness is occupied or drifted"
+                    )
+                replaced_files.append((destination_harness, prior, pinned_digest))
+                stream.seek(0)
+                stream.truncate()
+                stream.write(source_bytes)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except OSError as exc:
+            return failed(f"{provider} launch screenshot harness refresh failed: {exc}")
+        return None
+
+    runtime_existed = False
+    if materialize_runtime:
+        runtime = manifest["playwright"]
+        status, detail = playwright_runtime_status(
+            source, version=runtime["version"], node_minimum=runtime["node_minimum"],
+            manifest=manifest, provider=provider,
+        )
+        if status != "ok":
+            return False, f"{provider} source Playwright runtime is not intact: {detail}"
+        if error := materialize_harness():
+            return error
+        drive = next(spec for spec in specs if spec["skill"] == "drive-local-webapp")
+        if destination_drive.is_symlink():
+            return failed(f"{provider} launch runtime destination is symlinked")
+        if destination_drive.exists() and skill_destination_status(
+            destination_drive, drive["files"]
+        ) != "ok":
+            return failed(
+                f"{provider} launch runtime destination skill is occupied or incompatible"
+            )
+        runtime_existed = destination_runtime.exists() or destination_runtime.is_symlink()
+        if runtime_existed:
+            status, detail = playwright_runtime_status(
+                destination, version=runtime["version"], node_minimum=runtime["node_minimum"],
+                manifest=manifest, provider=provider,
+            )
+            if status != "ok":
+                return failed(
+                    f"{provider} launch runtime destination is occupied or {status}: {detail}"
+                )
 
     if not provider_root_existed:
         if error := claim_directory(destination_provider_root, recursive=False):

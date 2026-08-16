@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import hashlib
 import json
@@ -14,7 +15,7 @@ import pytest
 
 from agentflow.capability_contracts import ContractRequirement, preflight
 from agentflow.cli import main
-from agentflow.enroll import doctor, enroll_repository
+from agentflow.enroll import doctor, enroll_repository, repair_capability_refusal
 from agentflow.provider_skills import (
     NATIVE_DISCOVERY_MARKER, NATIVE_DISCOVERY_SKILL,
     materialize_launch_capabilities, provider_skill_status,
@@ -277,6 +278,118 @@ def test_enrollment_materializes_missing_claude_methodology_destinations(
         ).read_bytes()
 
 
+def test_capability_repair_materializes_only_absent_claude_destinations(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    requirements = tuple(ContractRequirement(name, commit) for name in names)
+
+    result = repair_capability_refusal(repo, "claude", requirements)
+
+    assert result is not None and result.repaired
+    assert "Claude" in result.detail
+    assert not commands
+    for name in names:
+        destination = repo / ".claude" / "skills" / name
+        assert destination.is_dir() and not destination.is_symlink()
+        assert (destination / "SKILL.md").read_bytes() == (
+            source / name / "SKILL.md"
+        ).read_bytes()
+
+
+def test_capability_repair_installs_an_absent_pinned_runtime(tmp_path, monkeypatch):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    runtime = root / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    shutil.rmtree(runtime)
+    installs = []
+
+    def install(selected_root, *, provider=None):
+        installs.append((selected_root, provider))
+        (runtime / "playwright").mkdir(parents=True)
+        (runtime / "playwright" / "package.json").write_text(
+            '{"version":"1.61.1"}\n'
+        )
+        return "DO:   installed pinned Playwright and Chromium; self-check passed"
+
+    monkeypatch.setattr(enrollment, "_install_ui_runtime", install)
+
+    result = repair_capability_refusal(
+        root, "codex", _ui_runtime_requirement()
+    )
+
+    assert result is not None and result.repaired
+    assert "Playwright" in result.detail
+    assert installs == [(root, "codex")]
+    assert (runtime / "playwright" / "package.json").is_file()
+
+
+def test_capability_repair_materializes_claude_ui_skills_before_runtime(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    requirements = (
+        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
+        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
+        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
+    )
+    installs = []
+
+    def install(selected_root, *, provider=None):
+        installs.append((selected_root, provider))
+        for name in ("ui-craft", "drive-local-webapp"):
+            assert (root / ".claude" / "skills" / name).is_dir()
+        runtime = root / ".claude" / "skills" / "drive-local-webapp" / "node_modules"
+        assert (runtime / "playwright" / "package.json").is_file()
+        return "ok:   pinned Playwright, Chromium, and screenshot harness are ready"
+
+    monkeypatch.setattr(enrollment, "_install_ui_runtime", install)
+
+    result = repair_capability_refusal(root, "claude", requirements)
+
+    assert result is not None and result.repaired
+    assert installs == [(root, "claude")]
+    assert "Claude" in result.detail and "Playwright" in result.detail
+
+
+@pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
+def test_capability_repair_preserves_occupied_claude_destinations(
+    tmp_path, monkeypatch, destination_kind
+):
+    _enrollment, repo, source, names, commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    destination = repo / ".claude" / "skills" / names[0]
+    destination.parent.mkdir(parents=True)
+    if destination_kind == "drifted":
+        destination.mkdir()
+        (destination / "SKILL.md").write_text("operator edit\n")
+    else:
+        destination.symlink_to(Path("../../.agents/skills") / names[0])
+    requirements = tuple(ContractRequirement(name, commit) for name in names)
+
+    result = repair_capability_refusal(repo, "claude", requirements)
+
+    assert result is None
+    assert not commands
+    assert not (repo / ".claude" / "skills" / names[1]).exists()
+    if destination_kind == "drifted":
+        assert (destination / "SKILL.md").read_text() == "operator edit\n"
+    else:
+        assert destination.is_symlink()
+
+
 @pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
 def test_enrollment_refuses_occupied_claude_methodology_destinations(
     tmp_path, monkeypatch, destination_kind
@@ -304,6 +417,26 @@ def test_enrollment_refuses_occupied_claude_methodology_destinations(
         assert (destination / "SKILL.md").read_text() == "operator edit\n"
     else:
         assert destination.is_symlink()
+
+
+def test_capability_repair_is_single_writer_for_a_shared_root(tmp_path, monkeypatch):
+    _enrollment, repo, source, names, commit, _lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    requirements = tuple(ContractRequirement(name, commit) for name in names)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(
+            lambda _index: repair_capability_refusal(repo, "claude", requirements),
+            range(2),
+        ))
+
+    assert sum(result is not None and result.repaired for result in results) == 1
+    assert sum(result is None for result in results) == 1
+    for name in names:
+        assert (repo / ".claude" / "skills" / name / "SKILL.md").is_file()
 
 
 def test_enrollment_rolls_back_partial_claude_methodology_materialization(
@@ -634,6 +767,76 @@ def test_launch_materialization_copies_verified_ui_runtime_into_fresh_root(tmp_p
     assert materialize_launch_capabilities(
         source, destination, "codex", materialize_runtime=True
     )[0] is True
+
+
+def test_launch_materialization_refreshes_a_known_old_pinned_harness(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    checkout = Path(__file__).parents[1]
+    old = subprocess.run(
+        [
+            "git", "show",
+            "dc2a08f350c85d49f65e31a7af529d0ffc8c3d46^:scripts/screenshots.mjs",
+        ],
+        cwd=checkout, capture_output=True, check=True,
+    ).stdout
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    harness = next(
+        item for item in manifest["capabilities"] if item["id"] == "screenshot-harness"
+    )
+    assert hashlib.sha256(old).hexdigest() in harness["known_old_sha256"]
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.write_bytes(old)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is True and "materialized" in detail
+    assert destination_harness.read_bytes() == (
+        source / "scripts" / "screenshots.mjs"
+    ).read_bytes()
+
+
+@pytest.mark.parametrize("harness_kind", ("unknown", "symlinked"))
+def test_launch_materialization_preserves_an_occupied_harness(tmp_path, harness_kind):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    if harness_kind == "unknown":
+        destination_harness.write_text("operator-authored harness\n")
+    else:
+        external = tmp_path / "operator-harness.mjs"
+        external.write_text("operator-authored harness\n")
+        destination_harness.symlink_to(external)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "harness" in detail
+    assert destination_harness.read_text() == "operator-authored harness\n"
+    assert destination_harness.is_symlink() is (harness_kind == "symlinked")
+
+
+def test_launch_materialization_installs_a_missing_pinned_harness(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    assert ready is True and "materialized" in detail
+    assert destination_harness.read_bytes() == (
+        source / "scripts" / "screenshots.mjs"
+    ).read_bytes()
 
 
 def test_launch_materialization_refuses_occupied_drifted_ui_runtime(tmp_path, monkeypatch):

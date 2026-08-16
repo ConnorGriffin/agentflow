@@ -21,14 +21,18 @@ claiming to be headless while its own checkout says otherwise.
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import tomllib
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from importlib.resources import files
 from pathlib import Path
@@ -53,6 +57,8 @@ _SKIP_DIRS = {".git", ".agentflow", "node_modules", "dist", "build", ".venv", "v
 _MAX_DEPTH = 3
 
 _DECLARATION_KEY = "ui-surfaces:"
+_REPAIR_LOCKS: dict[Path, threading.Lock] = {}
+_REPAIR_LOCKS_GUARD = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -101,6 +107,103 @@ class StageCapability:
 
 def _manifest() -> dict:
     return tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+
+
+@contextmanager
+def _capability_repair_lock(root: Path):
+    """Serialize enrollment-owned repairs for coordinators sharing one repository root."""
+    lock_dir = root / ".agentflow"
+    if lock_dir.is_symlink() or (lock_dir.exists() and not lock_dir.is_dir()):
+        raise OSError(".agentflow repair lock directory is incompatible")
+    lock_dir.mkdir(exist_ok=True)
+    lock_path = lock_dir / "enrollment.lock"
+    with _REPAIR_LOCKS_GUARD:
+        local_lock = _REPAIR_LOCKS.setdefault(root, threading.Lock())
+    with local_lock:
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError("enrollment repair lock is not a regular file")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
+
+
+def repair_capability_refusal(root: str | Path, provider: str, requirements):
+    """Repair one deterministic missing capability set without touching occupied content."""
+    from agentflow.capability_contracts import CapabilityRepairResult
+
+    requested_root = Path(root).expanduser()
+    if requested_root.is_symlink() or not requested_root.is_dir():
+        return None
+    root = requested_root.resolve()
+    if provider not in {"claude", "codex"}:
+        return None
+    with _capability_repair_lock(root):
+        manifest = _manifest()
+        specs = {item["id"]: item for item in manifest["capabilities"]}
+        skill_specs = [
+            specs[item.id] for item in requirements
+            if item.id in specs and specs[item.id].get("skill")
+        ]
+        missing = []
+        if provider == "claude":
+            for spec in skill_specs:
+                name = spec["skill"]
+                source = root / ".agents" / "skills" / name
+                destination = root / ".claude" / "skills" / name
+                if _skill_destination_status(source, spec["files"]) != "ok":
+                    return None
+                status = _skill_destination_status(destination, spec["files"])
+                if status == "absent":
+                    missing.append(name)
+                elif status != "ok":
+                    return None
+        runtime_missing = False
+        if any(item.runtime for item in requirements):
+            harness = specs["screenshot-harness"]
+            if _content_status(
+                [root / "scripts" / "screenshots.mjs"], harness["sha256"]
+            ) != "ok":
+                return None
+            location = ".agents" if provider == "codex" else ".claude"
+            drive = specs["drive-local-webapp"]
+            drive_root = root / location / "skills" / drive["skill"]
+            drive_status = _skill_destination_status(drive_root, drive["files"])
+            materializing_drive = (
+                provider == "claude"
+                and drive_status == "absent"
+                and drive["skill"] in missing
+            )
+            if drive_status != "ok" and not materializing_drive:
+                return None
+            runtime = drive_root / "node_modules"
+            if runtime.exists() or runtime.is_symlink():
+                return None
+            runtime_missing = True
+        if not missing and not runtime_missing:
+            return None
+        journal = _enrollment_journal(root)
+        try:
+            outcomes = [_wire_claude_skill(root, name) for name in missing]
+            if runtime_missing:
+                outcomes.append(_install_ui_runtime(root, provider=provider))
+            if any(outcome.startswith("WARN:") for outcome in outcomes):
+                journal.restore()
+                return CapabilityRepairResult(False, "; ".join(outcomes))
+        except Exception:
+            journal.restore()
+            raise
+        finally:
+            journal.close()
+        repaired = []
+        if missing:
+            repaired.append("materialized absent pinned capability destinations for Claude")
+        if runtime_missing:
+            repaired.append("installed pinned Playwright runtime")
+        return CapabilityRepairResult(True, "; ".join(repaired))
 
 
 def _run_command(command: list[str], *, cwd: Path | None = None, timeout: int = 30):
@@ -887,23 +990,43 @@ def _install_methodology_skills(root: Path) -> str:
     return "DO:   installed pinned methodology contracts"
 
 
-def _install_ui_runtime(root: Path) -> str:
+def _install_ui_runtime(root: Path, *, provider: str | None = None) -> str:
     manifest = _manifest()
     specs = {item.get("skill"): item for item in manifest["capabilities"]}
+    locations = (
+        ({"codex": ".agents/skills", "claude": ".claude/skills"}[provider],)
+        if provider is not None else (".agents/skills", ".claude/skills")
+    )
     for name in manifest["connor_skills"]["skills"]:
-        if _skill_status(root, name, specs[name]["files"]) != "ok":
+        if any(
+            _skill_destination_status(root / location / name, specs[name]["files"]) != "ok"
+            for location in locations
+        ):
             return "WARN: UI runtime skipped because the pinned skill pack is not intact"
     playwright = manifest["playwright"]
-    if _playwright_available(
-        root,
-        version=playwright["version"],
-        node_minimum=playwright["node_minimum"],
-        verify_runtime=True,
-    ):
+
+    def available() -> bool:
+        if provider is None:
+            return _playwright_available(
+                root, version=playwright["version"],
+                node_minimum=playwright["node_minimum"], verify_runtime=True,
+            )
+        status, _detail = _runtime_status(
+            root, version=playwright["version"], node_minimum=playwright["node_minimum"],
+            manifest=manifest, provider=provider,
+        )
+        if status != "ok":
+            return False
+        result = _run_command(
+            ["node", str(root / "scripts" / "screenshots.mjs"), "--self-check"],
+            cwd=root, timeout=30,
+        )
+        return result.returncode == 0
+
+    if available():
         return "ok:   pinned Playwright, Chromium, and screenshot harness are ready"
     skill_dirs = {
-        (root / location / "drive-local-webapp").resolve()
-        for location in (".agents/skills", ".claude/skills")
+        (root / location / "drive-local-webapp").resolve() for location in locations
     }
     for skill in skill_dirs:
         commands = (
@@ -921,12 +1044,7 @@ def _install_ui_runtime(root: Path) -> str:
                 reason = (result.stderr or result.stdout).strip().splitlines()
                 tail = reason[-1] if reason else f"exit {result.returncode}"
                 return f"WARN: UI runtime setup failed — {tail}"
-    if not _playwright_available(
-        root,
-        version=playwright["version"],
-        node_minimum=playwright["node_minimum"],
-        verify_runtime=True,
-    ):
+    if not available():
         return "WARN: UI runtime setup completed but the screenshot harness self-check failed"
     return "DO:   installed pinned Playwright and Chromium; self-check passed"
 
