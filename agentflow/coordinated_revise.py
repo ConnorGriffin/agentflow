@@ -119,6 +119,8 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
         n=pr_number, repo=review_record.repo, findings=findings or "- (see review)",
         surfaces=surfaces or "any user-facing surface"), review_record.builder_effort, parent_pool)
     review = ReviewState.from_record(review_record)
+    if review is not None:
+        review = replace(review, change_author_tool=parent_pool)
     return Submission(
         repo=review_record.repo, subject=review_record.subject, stage="revise",
         target=reviewed_head, subject_revision=reviewed_head,

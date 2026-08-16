@@ -22,7 +22,7 @@ def store(tmp_path):
 
 
 def session(store, *, stage, identity, attempt=1, verified=True, outcome="done",
-            finalized_at=1_000, round=0, complexity="deep"):
+            finalized_at=1_000, round=0, complexity="deep", interrupted_by_restart=False):
     """One ended session on record, exactly as the coordinator stamps it."""
     record_attempt(store, AttemptTelemetry(
         token=uuid4().hex, identity=identity, repo="o/r", subject="1",
@@ -30,7 +30,7 @@ def session(store, *, stage, identity, attempt=1, verified=True, outcome="done",
         reasoning_effort=None, attempt=attempt, continuation=attempt > 1, restart_resumes=0,
         round=round, conflict_round=0, verified=verified, outcome=outcome if verified else "",
         cause="none", classification="complete", started_at=finalized_at - 60,
-        finalized_at=finalized_at))
+        finalized_at=finalized_at, interrupted_by_restart=interrupted_by_restart))
 
 
 def attacked(store, identity, *, objections="1. it breaks", remedied=False, at=1_000,
@@ -119,6 +119,14 @@ def test_an_attempt_that_may_still_get_another_session_is_not_counted_at_all(sto
     """A stage caught mid-run must never read as a stage producing nothing — the signal is
     absence, so absence has to be provable."""
     session(store, stage="review", identity="o/r|1|review|", attempt=1, verified=False)
+
+    assert stage_health(store) == []
+
+
+def test_a_restart_interrupted_attempt_at_the_budget_is_not_finished(store):
+    """A refunded final attempt is live, not a completed stage-health sample."""
+    session(store, stage="build", identity="o/r|restart|build|", attempt=3, verified=False,
+            interrupted_by_restart=True)
 
     assert stage_health(store) == []
 

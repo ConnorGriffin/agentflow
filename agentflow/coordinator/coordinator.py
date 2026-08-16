@@ -49,7 +49,7 @@ from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, reco
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
     VERIFIED, miss_summary, refusal_expected, refusal_stalls, unprepared)
-from agentflow.review_policy import ReviewState
+from agentflow.review_policy import ReviewState, current_head_author
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
 # supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
@@ -304,7 +304,10 @@ class Coordinator:
         self._require_managed_repository(submission.repo)
         stage = normalize_stage(submission.stage)
         review = submission.review or ReviewState(
-            change_author_tool=submission.builder_lineage)
+            # Build and Revise write the next PR head. Record their accountable session lead as
+            # the head author now; branch lineage is only a retained-worktree locator.
+            change_author_tool=(submission.pool if stage in {"build", "revise"}
+                                else submission.builder_lineage))
         model = (
             routing.model_for_stage(
                 stage, submission.pool, submission.complexity, submission.builder_complexity)
@@ -331,8 +334,9 @@ class Coordinator:
         lineage = (submission.pool if stage == "review"
                    else (submission.builder_lineage or submission.pool
                          if stage in LINEAGE_PINNED else None))
-        current_author = review.change_author_tool or submission.builder_lineage
-        auto_merge = not (current_author is not None and submission.pool == current_author)
+        current_author = current_head_author(
+            review.change_author_tool, submission.builder_lineage)
+        auto_merge = current_author is not None and submission.pool != current_author
         record = Record(
             identity=identity, stage=stage, pool=submission.pool,
             repo=submission.repo, subject=str(submission.subject), target=submission.target,
@@ -727,6 +731,8 @@ class Coordinator:
         obs = self._adapter.observe(record)
         if getattr(obs, "has_end_fact", False):
             return False  # the provider recorded an end — a real failure, charged like any other
+        self._record_telemetry(record, obs, outcome=None, verified=False,
+                               interrupted_by_restart=True)
         attempt_no = record.attempts
         self._release(record)
         record.attempts -= 1               # refund the up-front charge; the resume re-charges it
@@ -1229,8 +1235,9 @@ class Coordinator:
             record.route_id = route.route_id
             record.route_cell_digest = route.route_cell_digest
             record.launch_config_digest = route.launch_config_digest
-        current_author = record.change_author_tool or record.builder_lineage
-        record.auto_merge_allowed = not (current_author is not None and dest_pool == current_author)
+        current_author = current_head_author(
+            record.change_author_tool, record.builder_lineage)
+        record.auto_merge_allowed = current_author is not None and dest_pool != current_author
         if record.stage in LINEAGE_PINNED:
             record.lineage = dest_pool
             record.source = _repool_source(record.source, dest_pool)
@@ -1642,11 +1649,13 @@ class Coordinator:
     def _release(self, record: Record) -> None:
         record.process_alive = False
 
-    def _record_telemetry(self, record: Record, obs, *, outcome, verified: bool) -> None:
-        """Stamp this ended attempt's durable spend entry, keyed by its launch token (ADR 0040).
+    def _record_telemetry(self, record: Record, obs, *, outcome, verified: bool,
+                          interrupted_by_restart: bool = False) -> None:
+        """Stamp an ended or restart-interrupted attempt's durable spend entry by launch token.
 
-        Every attempt that ends is recorded — a completed stage, a superseded retry, a held
-        exhaustion — so no spend is lost. A telemetry write never fails a cycle: the durable
+        Every ended attempt is recorded — a completed stage, a superseded retry, a held
+        exhaustion — and restart recovery records the still-running attempt before re-admission,
+        so no observed helper spend is lost. A telemetry write never fails a cycle: the durable
         session artifact still carries the raw usage to re-derive later if the write is lost."""
         from agentflow.coordinator.profiles import profile_for
 
@@ -1662,9 +1671,11 @@ class Coordinator:
             restart_resumes=record.restart_resumes, round=record.round,
             conflict_round=record.conflict_round,
             verified=verified, outcome=outcome or "",
-            verify_miss=record.verify_miss,
-            cause=obs.cause.value, classification=obs.classification(),
+            verify_miss=record.verify_miss if not interrupted_by_restart else "",
+            cause=obs.cause.value,
+            classification="incomplete" if interrupted_by_restart else obs.classification(),
             started_at=record.started_at, finalized_at=int(time.time()),
+            interrupted_by_restart=interrupted_by_restart,
             usage=getattr(obs, "usage", AttemptUsage()))
         record_attempt(self._store.path, entry)
         # The provider's own five-hour quota fact, when this attempt's stream reported one, is the

@@ -256,7 +256,7 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
         subject="571", target="f" * 40, subject_revision="f" * 40,
         source=WorktreeRef.for_build(
             "/private/tmp/issue-571", "codex", 571, "learning-loop").path,
-        state=COMPLETED, claim=True)
+        builder_lineage="claude", state=COMPLETED, claim=True)
     approved_submission = coordinated_review.review_submission(
         build, "f" * 40, "codex", 571,
         acceptance="Use the exact promoted Review methodology.")

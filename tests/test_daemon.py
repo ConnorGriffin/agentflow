@@ -127,6 +127,7 @@ def test_recheck_composed_coordinator_emits_sanitized_overlay_diagnostic(
     monkeypatch.setattr(github, "pr_comment_rows", lambda repo, pr: [])
     monkeypatch.setattr(loop, "repo_profile", lambda workdir: "autonomous")
     monkeypatch.setattr(loop, "_base_advanced_for", lambda workdir, branch: True)
+    monkeypatch.setattr(loop, "_survivor_head_author", lambda *_args: "claude")
     monkeypatch.setattr(loop, "_conflict_revise_owns_head", lambda cfg, n, branch: False)
     monkeypatch.setattr(loop, "_rebase_branch", lambda cfg, branch, wt: RebaseResult.CLEAN)
     monkeypatch.setattr(loop, "remove_worktree_if_safe", lambda workdir, wt: True)
