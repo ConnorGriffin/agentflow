@@ -45,6 +45,7 @@ from agentflow.provider_skills import (
 from agentflow.repo_facts import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
                                   surface_declaration)
 from agentflow.runtime_contracts import playwright_runtime_status as _runtime_status
+from agentflow.skill_ownership import clear_skill_ownership, mark_skill_owned, skill_ownership
 
 # Directory names that hold a user-facing surface when a repo has one. Deliberately narrow:
 # a wrong guess here writes a declaration that either misses real UI or gates a backend path.
@@ -111,7 +112,13 @@ def _manifest() -> dict:
 
 @contextmanager
 def _capability_repair_lock(root: Path):
-    """Serialize enrollment-owned repairs for coordinators sharing one repository root."""
+    """Serialize enrollment-owned repairs for coordinators sharing one repository root.
+
+    Non-reentrant (the per-root ``threading.Lock`` plus the ``flock`` it guards): a nested
+    acquisition on the same root within one call chain deadlocks. Callers must not hold this
+    lock across a call into `_install_connor_skills`/`_replace_skill_tree`, which acquire it
+    themselves.
+    """
     lock_dir = root / ".agentflow"
     if lock_dir.is_symlink() or (lock_dir.exists() and not lock_dir.is_dir()):
         raise OSError(".agentflow repair lock directory is incompatible")
@@ -244,6 +251,7 @@ def repair_capability_refusal(root: str | Path, provider: str, requirements):
                     continue
                 try:
                     shutil.rmtree(destination)
+                    clear_skill_ownership(destination)
                 except OSError as exc:
                     errors.append(f"{destination}: {exc}")
             return errors
@@ -421,11 +429,9 @@ def _skills_problem(
         for name in names
     ):
         return None
-    # Converge never rewrites the vendored skill pack (no reproducible content to write —
-    # it comes from a temp clone the installer owns, not `_asset_text`), but a repo that was
-    # already fully installed and has since drifted is not a blocking precondition either;
-    # doctor() keeps reporting it. A partially-installed or otherwise-occupied destination
-    # still refuses, converge or not.
+    # Converge may repair drift only when the destination retains a valid ownership marker;
+    # unowned or incompatible content remains a blocking precondition. The pinned release is
+    # fetched into a temporary installer root, never synthesized from `_asset_text`.
     if converge and all(state in ("ok", "drifted") for state in destinations.values()):
         return None
     if any(state != "absent" for state in destinations.values()):
@@ -897,7 +903,37 @@ def _ensure_fleet_config(root: Path) -> str:
     return f"DO:   added {repo} to {target}"
 
 
-def _install_connor_skills(root: Path) -> str:
+def _replace_skill_tree(destination: Path, source: Path, files_manifest: list[dict]) -> str:
+    """Atomically swap one owned skill tree for a complete pinned replacement."""
+    with _capability_repair_lock(destination.parents[2]):
+        if (
+            _skill_destination_status(destination, files_manifest) != "drifted"
+            or skill_ownership(destination) is None
+        ):
+            return f"WARN: {destination} changed before owned-drift repair"
+        for leftover in destination.parent.glob(f".{destination.name}-*"):
+            if leftover.is_dir() and not leftover.is_symlink():
+                shutil.rmtree(leftover)
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent)
+        )
+        replacement = temporary / "replacement"
+        backup = temporary / "previous"
+        try:
+            shutil.copytree(source, replacement)
+            destination.replace(backup)
+            try:
+                replacement.replace(destination)
+            except OSError:
+                backup.replace(destination)
+                raise
+            shutil.rmtree(backup)
+            return f"DO:   repaired owned drift at {destination}"
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
     manifest = _manifest()
     names = manifest["connor_skills"]["skills"]
     specs = {item.get("skill"): item for item in manifest["capabilities"]}
@@ -918,21 +954,34 @@ def _install_connor_skills(root: Path) -> str:
         or _legacy_claude_skill_link(root, name)
         for name in names
     ):
-        outcomes = [_wire_claude_skill(root, name) for name in names]
+        outcomes = [_wire_claude_skill(root, name, expected) for name in names]
         refreshed = _public_skill_destination_states(root, manifest)
         if not any(outcome.startswith("WARN:") for outcome in outcomes) and all(
             state == "ok" for state in refreshed.values()
         ):
             return "DO:   materialized the pinned Connor skill pack for Claude"
+    repairs = {
+        (location, name)
+        for (location, name), state in destinations.items()
+        if state == "drifted" and skill_ownership(root / location / name) is not None
+    }
+    if converge and repairs and all(
+        state == "ok" or (location, name) in repairs
+        for (location, name), state in destinations.items()
+    ):
+        repair_names = {name for _location, name in repairs}
+    else:
+        repair_names = set()
     if any(state != "absent" for state in destinations.values()):
-        rendered = ", ".join(
-            f"{location}/{name}={state}"
-            for (location, name), state in destinations.items()
-        )
-        return (
-            "WARN: existing public skill destinations are partial or conflicting; "
-            f"installer was not run ({rendered})"
-        )
+        if not repair_names:
+            rendered = ", ".join(
+                f"{location}/{name}={state}"
+                for (location, name), state in destinations.items()
+            )
+            return (
+                "WARN: existing public skill destinations are partial or conflicting; "
+                f"installer was not run ({rendered})"
+            )
     resolved, error = _resolved_skill_release(manifest)
     if error:
         return f"WARN: public skill release could not be verified — {error}"
@@ -960,8 +1009,11 @@ def _install_connor_skills(root: Path) -> str:
                 f"{result.stdout.strip()}, expected {expected}"
             )
         for name in names:
+            if repair_names and name not in repair_names:
+                continue
             command = _connor_skill_command(manifest, source_tree, skill=name)
-            result = _run_command(command, cwd=root, timeout=120)
+            install_root = Path(temporary) if name in repair_names else root
+            result = _run_command(command, cwd=install_root, timeout=120)
             if result.returncode:
                 reason = (result.stderr or result.stdout).strip().splitlines()
                 tail = reason[-1] if reason else f"exit {result.returncode}"
@@ -974,7 +1026,26 @@ def _install_connor_skills(root: Path) -> str:
             )
             if warning:
                 return warning
-            wiring = _wire_claude_skill(root, name)
+            if name in repair_names:
+                source = install_root / ".agents" / "skills" / name
+                for location, repaired_name in repairs:
+                    if repaired_name != name:
+                        continue
+                    destination = root / location / name
+                    outcome = _replace_skill_tree(destination, source, specs[name]["files"])
+                    if outcome.startswith("WARN:"):
+                        return outcome
+                    try:
+                        mark_skill_owned(destination, expected)
+                    except OSError as exc:
+                        return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
+            else:
+                destination = root / ".agents" / "skills" / name
+                try:
+                    mark_skill_owned(destination, expected)
+                except OSError as exc:
+                    return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
+            wiring = _wire_claude_skill(root, name, expected)
             if wiring.startswith("WARN:"):
                 return wiring
     states = {
@@ -1127,7 +1198,15 @@ def _legacy_claude_skill_link(root: Path, name: str) -> bool:
     return target.is_symlink() and target.readlink() == desired
 
 
-def _wire_claude_skill(root: Path, name: str) -> str:
+def _wire_claude_skill(root: Path, name: str, pin: str | None = None) -> str:
+    """Materialize a repo skill's Claude-local copy and mark its provenance.
+
+    ``pin`` should be the same resolved pin the caller already recorded for this skill's
+    other destination, so one enrollment run records one pin per skill rather than two —
+    pass it explicitly whenever the caller has already resolved one. Callers that have not
+    (e.g. wiring a pre-existing ``.agents`` destination whose own pin is unknown here) fall
+    back to that destination's own marker, then to the manifest's pinned ``version``.
+    """
     target = root / ".claude" / "skills" / name
     source = root / ".agents" / "skills" / name
     if target.is_dir() and not target.is_symlink():
@@ -1140,6 +1219,18 @@ def _wire_claude_skill(root: Path, name: str) -> str:
         return f"WARN: {source} is not a safe materialization source"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
+    try:
+        if pin is None:
+            source_ownership = skill_ownership(source)
+            if source_ownership is not None:
+                pin = source_ownership["pin"]
+            else:
+                specs = {item.get("skill"): item for item in _manifest()["capabilities"]}
+                pin = specs[name].get("version") or specs[name].get("source") or "unpinned"
+        mark_skill_owned(target, pin)
+    except (KeyError, OSError) as exc:
+        shutil.rmtree(target)
+        return f"WARN: could not record AgentFlow ownership for {target}: {exc}"
     return f"DO:   materialized {target} for Claude Code"
 
 
@@ -1148,6 +1239,12 @@ class _EnrollmentJournal:
         self._temporary = tempfile.TemporaryDirectory(prefix="agentflow-enroll-")
         self._root = Path(self._temporary.name)
         self._entries: list[tuple[Path, Path | None]] = []
+        # Only a parent this enrollment run watched come into existence is ours to remove on
+        # rollback — a parent that already existed may be a concurrent repair's ``.agentflow``,
+        # and blindly rmdir-ing it races that repair's own mkdir+open of its lock file.
+        self._absent_parents_at_start = {
+            path.parent for path in dict.fromkeys(paths) if not path.parent.exists()
+        }
         for index, path in enumerate(dict.fromkeys(paths)):
             backup = self._root / str(index)
             if path.is_symlink():
@@ -1175,6 +1272,12 @@ class _EnrollmentJournal:
                 shutil.copytree(backup, path, symlinks=True)
             else:
                 shutil.copy2(backup, path)
+        for path, _backup in self._entries:
+            if path.name == "skill-ownership" and path.parent in self._absent_parents_at_start:
+                try:
+                    path.parent.rmdir()
+                except OSError:
+                    pass
 
     def discard_created_backups(self) -> None:
         """Remove rollback copies that a successful enrollment no longer needs."""
@@ -1201,6 +1304,7 @@ def _enrollment_journal(root: Path) -> _EnrollmentJournal:
         root / ".claude",
         root / "scripts",
         root / "skills-lock.json",
+        root / ".agentflow" / "skill-ownership",
         config,
     ]
     if config.is_symlink():
@@ -1276,7 +1380,10 @@ def _apply_enrollment(
                 harness, _asset_text("scripts/screenshots.mjs"), overwrite=converge
             )
         )
-        outcomes.append(_install_connor_skills(root))
+        outcomes.append(
+            _install_connor_skills(root, converge=True)
+            if converge else _install_connor_skills(root)
+        )
         outcomes.append(_install_ui_runtime(root))
     return outcomes
 
@@ -1506,7 +1613,9 @@ def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
             body=(
                 "Automated by `agentflow enroll --sync --apply`: commits every repository-local "
                 "enrollment artifact it materialized or converged. A drifted vendored skill pack "
-                "(ui-craft, drive-local-webapp) is reported by `agentflow doctor`, not rewritten here."
+                "(ui-craft, drive-local-webapp) is repaired here only when AgentFlow's ownership "
+                "record proves it materialized the destination; unowned drift stays reported by "
+                "`agentflow doctor`."
             ),
         )
         if pr.url is None:
