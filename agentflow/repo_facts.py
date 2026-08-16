@@ -26,6 +26,15 @@ _ALLOWLIST_RE = re.compile(r"^intake-allowlist:\s*(.+)", re.MULTILINE)
 _FACT_FILES = ("AGENTS.md", "CLAUDE.md")
 
 
+@dataclass(frozen=True)
+class RepoConfig:
+    """One configured repository and its resolved, operator-declared checkout path."""
+
+    repo: str
+    workdir: str
+    declared_workdir: str | None = None
+
+
 def _fact_texts(workdir: str) -> Iterator[str]:
     """The repo's own facts files that exist, in the order they win.
 

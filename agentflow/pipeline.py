@@ -368,7 +368,7 @@ def reconcile_orphaned_claims(cfg, *, _log=None) -> int:
 
 
 # --- production wiring (live orchestration; not unit-tested, ADR 0020) -------------------
-def _capability_preflight(record, materialize: bool):
+def _capability_preflight(record, materialize: bool, *, _log=None):
     """Validate the prepared provider launch root, including historical durable records."""
     from agentflow.capability_contracts import CapabilityPreflightResult, preflight
     from agentflow.prompts import STAGE_PROMPTS, requirements_for
@@ -420,9 +420,11 @@ def _capability_preflight(record, materialize: bool):
     requirements = requirements_for(record.stage, context)
     if materialize:
         materialize_runtime = any(requirement.runtime for requirement in requirements)
+        materialize_kwargs = {"materialize_runtime": materialize_runtime}
+        if _log is not None:
+            materialize_kwargs["_log"] = _log
         ok, detail = materialize_launch_capabilities(
-            source_root, actual_root, record.pool,
-            materialize_runtime=materialize_runtime,
+            source_root, actual_root, record.pool, **materialize_kwargs
         )
         if not ok:
             return CapabilityPreflightResult(
@@ -564,8 +566,15 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
             promotion_receipts=receipt_reader,
             overlay_source=ExactRevisionRepositoryOverlaySource(
                 repositories, on_diagnostic=_log))
+    capability_preflight = (
+        _capability_preflight
+        if _log is None
+        else lambda record, materialize: _capability_preflight(
+            record, materialize, _log=_log
+        )
+    )
     return Coordinator(
-        adapter=router, gate=_production_gate(), capability_preflight=_capability_preflight,
+        adapter=router, gate=_production_gate(), capability_preflight=capability_preflight,
         capability_repair=_repair_capability_refusal,
         disabled_cold_stages=frozenset({"mockup"}), log=_log or (lambda _line: None),
         store=store, briefing_resolver=briefing_resolver,

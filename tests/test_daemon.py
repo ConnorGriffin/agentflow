@@ -148,7 +148,10 @@ def test_recheck_composed_coordinator_emits_sanitized_overlay_diagnostic(
     monkeypatch.setattr(coordinated_revise, "_retire_dead_revises", lambda coordinator: None)
     monkeypatch.setattr(coordinated_intake, "_retire_dead_intakes", lambda coordinator: None)
     monkeypatch.setattr(pipeline, "_production_gate", lambda: lambda record: True)
-    monkeypatch.setattr(pipeline, "_capability_preflight", lambda record, materialize: None)
+    monkeypatch.setattr(
+        pipeline, "_capability_preflight",
+        lambda record, materialize, **_kwargs: None,
+    )
 
     def overlay_run(command, **kwargs):
         raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=b"secret")
