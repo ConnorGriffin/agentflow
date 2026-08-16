@@ -22,6 +22,7 @@ spend is genuinely unknown, not free.
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, field, fields
 from datetime import date, datetime, time as datetime_time, timezone
@@ -500,12 +501,14 @@ def read_attempts_with_health(store_path: Path | str) -> AttemptTelemetryRead:
         names = sorted(p for p in directory.iterdir() if p.suffix == ".json")
     except OSError:
         return AttemptTelemetryRead(entries, None)
+    tokens: set[str] = set()
     for path in names:
         entry = _read_attempt(path, strict=True)
-        if entry is None:
+        if entry is None or path.stem != entry.token or entry.token in tokens:
             skipped += 1
             continue
         entries.append(entry)
+        tokens.add(entry.token)
     return AttemptTelemetryRead(entries, skipped)
 
 
@@ -529,14 +532,19 @@ def _read_attempt(path: Path, *, strict: bool) -> AttemptTelemetry | None:
 
 
 def _learning_safe(entry: AttemptTelemetry) -> bool:
-    if (type(entry.identity) is not str or type(entry.started_at) is not int
-            or type(entry.finalized_at) is not int):
+    if (type(entry.token) is not str or not entry.token or type(entry.identity) is not str
+            or type(entry.started_at) is not int or type(entry.finalized_at) is not int
+            or entry.started_at < 0 or entry.finalized_at < 0
+            or (entry.started_at and entry.finalized_at
+                and entry.finalized_at <= entry.started_at)):
         return False
     for name in _TOKEN_FIELDS:
         value = getattr(entry.usage, name)
-        if value is not None and type(value) is not int:
+        if value is not None and (type(value) is not int or value < 0):
             return False
-    return entry.usage.cost_usd is None or type(entry.usage.cost_usd) in {int, float}
+    cost = entry.usage.cost_usd
+    return cost is None or (type(cost) in {int, float}
+                            and (type(cost) is int or math.isfinite(cost)))
 
 
 def _decode_usage(data: dict) -> AttemptUsage:
