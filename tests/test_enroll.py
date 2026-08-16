@@ -719,6 +719,118 @@ class TestEnrollSync:
         assert "1 converged / 0 already current / 0 failed / 0 skipped (dirty)" in out
         assert exit_code == 0
 
+    def test_sync_apply_commits_every_converged_enrollment_write(
+            self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "repo"
+        _git_init(repo, origin="git@github.com:o/repo.git")
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("stale content\n")
+        claude_skill = repo / ".claude" / "skills"
+        claude_skill.mkdir(parents=True)
+        (claude_skill / "agentflow").symlink_to(Path("../../.agents/skills/agentflow"))
+        _git_commit_all(repo, "drifted enrollment artifact")
+        config = tmp_path / "config.toml"
+        config.write_text(f'[[repositories]]\nrepo = "o/repo"\nworkdir = "{repo}"\n')
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+        monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+        monkeypatch.setattr(
+            "agentflow.enroll._install_methodology_skills",
+            lambda _root: "ok:   methodology contracts supplied by focused fixture",
+        )
+        monkeypatch.setattr(
+            "agentflow.enroll.doctor",
+            lambda _root: SimpleNamespace(
+                ready=True,
+                capabilities=(SimpleNamespace(
+                    id="codebase-memory", available=True, install=None, required=False,
+                ),),
+            ),
+        )
+        monkeypatch.setattr("agentflow.enroll._repo_drift",
+                            lambda _root: (["agentflow-skill: drifted"], []))
+        cfg = SimpleNamespace(repo="o/repo", workdir=str(repo))
+        monkeypatch.setattr(
+            "agentflow.enroll._run_command",
+            lambda command, **_kwargs: (
+                subprocess.CompletedProcess(command, 0, "", "")
+                if "push" in command else subprocess.run(command, capture_output=True, text=True)
+            ),
+        )
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda _repo, **_kwargs: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        assert sync_fleet([cfg], apply=True) == 0
+
+        assert "DO:   converged o/repo" in capsys.readouterr().out
+        committed = subprocess.run(
+            ["git", "-C", str(repo), "show", "--format=", "--name-only", _SYNC_BRANCH],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        assert set(committed) == {
+            ".agents/skills/agentflow/SKILL.md",
+            ".claude/skills/agentflow",
+            ".claude/skills/agentflow/SKILL.md",
+            ".gitignore",
+            "AGENTS.md",
+            "CLAUDE.md",
+        }
+
+    def test_sync_apply_reports_uncommitted_enrollment_writes(
+            self, tmp_path, monkeypatch, capsys):
+        repo = tmp_path / "repo"
+        _git_init(repo, origin="git@github.com:o/repo.git")
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("stale content\n")
+        claude_skill = repo / ".claude" / "skills"
+        claude_skill.mkdir(parents=True)
+        (claude_skill / "agentflow").symlink_to(Path("../../.agents/skills/agentflow"))
+        _git_commit_all(repo, "drifted enrollment artifact")
+        config = tmp_path / "config.toml"
+        config.write_text(f'[[repositories]]\nrepo = "o/repo"\nworkdir = "{repo}"\n')
+        monkeypatch.setenv("AGENTFLOW_CONFIG", str(config))
+        monkeypatch.setattr("agentflow.enroll._tooling_problem", lambda _surfaces: None)
+        monkeypatch.setattr(
+            "agentflow.enroll._install_methodology_skills",
+            lambda _root: "ok:   methodology contracts supplied by focused fixture",
+        )
+        monkeypatch.setattr(
+            "agentflow.enroll.doctor",
+            lambda _root: SimpleNamespace(
+                ready=True,
+                capabilities=(SimpleNamespace(
+                    id="codebase-memory", available=True, install=None, required=False,
+                ),),
+            ),
+        )
+        monkeypatch.setattr("agentflow.enroll._repo_drift",
+                            lambda _root: (["agentflow-skill: drifted"], []))
+        cfg = SimpleNamespace(repo="o/repo", workdir=str(repo))
+        staged = False
+
+        def fake_run(command, **_kwargs):
+            nonlocal staged
+            if command[-2:] == ["add", "-A"]:
+                staged = True
+            if staged and command[-2:] == ["status", "--porcelain"]:
+                branch = subprocess.run(
+                    ["git", "-C", str(repo), "branch", "--show-current"],
+                    check=True, capture_output=True, text=True,
+                ).stdout.strip()
+                if branch == _SYNC_BRANCH:
+                    return subprocess.CompletedProcess(command, 0, "?? AGENTS.md\n", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+
+        assert sync_fleet([cfg], apply=True) == 1
+
+        assert "WARN: o/repo failed to converge — enrollment did not converge — " \
+               "uncommitted paths: AGENTS.md" in capsys.readouterr().out
+
 
 class TestConvergeAndShip:
     """The per-repo apply/commit/push/PR sequence 4.3 point 4 describes."""
@@ -747,6 +859,70 @@ class TestConvergeAndShip:
             ["git", "-C", str(repo), "log", "-1", "--format=%B", _SYNC_BRANCH],
             check=True, capture_output=True, text=True).stdout
         assert "Signed-off-by: Tester <tester@example.com>" in log
+
+    def test_converge_commits_every_enrollment_write(self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+
+        def converge_apply(*_args, **_kwargs):
+            (repo / ".agents" / "skills" / "agentflow").mkdir(parents=True)
+            (repo / ".agents" / "skills" / "agentflow" / "SKILL.md").write_text("skill\n")
+            (repo / ".claude" / "skills" / "agentflow").mkdir(parents=True)
+            (repo / ".claude" / "skills" / "agentflow" / "SKILL.md").write_text("skill\n")
+            (repo / ".gitignore").write_text(".agentflow/\n")
+            (repo / "skills-lock.json").write_text('{"skills": {}}\n')
+            return SimpleNamespace(ready=True)
+
+        monkeypatch.setattr("agentflow.enroll.enroll_repository", converge_apply)
+
+        def fake_run(command, **_kwargs):
+            if "push" in command:
+                return subprocess.CompletedProcess(command, 0, "", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+        monkeypatch.setattr(
+            "agentflow.github.create_pr",
+            lambda _repo, **_kwargs: github.IssueCreation(url="https://example.test/pr/1"),
+        )
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is True
+        assert detail == "https://example.test/pr/1"
+        committed = subprocess.run(
+            ["git", "-C", str(repo), "show", "--format=", "--name-only", _SYNC_BRANCH],
+            check=True, capture_output=True, text=True,
+        ).stdout.splitlines()
+        assert committed == [
+            ".agents/skills/agentflow/SKILL.md",
+            ".claude/skills/agentflow/SKILL.md",
+            ".gitignore",
+            "skills-lock.json",
+        ]
+
+    def test_converge_refuses_to_report_success_with_uncommitted_writes(
+            self, tmp_path, monkeypatch):
+        repo = tmp_path / "repo"
+        _git_init(repo)
+        skill = repo / ".agents" / "skills" / "agentflow" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("content\n")
+        monkeypatch.setattr(
+            "agentflow.enroll.enroll_repository", lambda *_args, **_kwargs: SimpleNamespace(ready=True)
+        )
+
+        def fake_run(command, **_kwargs):
+            if command[-2:] == ["status", "--porcelain"]:
+                return subprocess.CompletedProcess(command, 0, "?? AGENTS.md\n", "")
+            return subprocess.run(command, capture_output=True, text=True)
+
+        monkeypatch.setattr("agentflow.enroll._run_command", fake_run)
+
+        ok, detail = _converge_and_ship(repo, "o/repo")
+
+        assert ok is False
+        assert detail == "enrollment did not converge — uncommitted paths: AGENTS.md"
 
     def test_a_failing_gh_pr_create_is_reported_as_a_failure(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"

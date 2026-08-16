@@ -268,7 +268,7 @@ def test_enrollment_materializes_missing_claude_methodology_destinations(
     assert all(
         item.available for item in report.capabilities if item.id in names
     )
-    assert not commands
+    assert all("check-ignore" in command for command in commands)
     for name in names:
         destination = repo / ".claude" / "skills" / name
         assert destination.is_dir()
@@ -276,6 +276,61 @@ def test_enrollment_materializes_missing_claude_methodology_destinations(
         assert (destination / "SKILL.md").read_bytes() == (
             source / name / "SKILL.md"
         ).read_bytes()
+
+
+def test_enrollment_refuses_an_ignored_required_capability_file(
+    tmp_path, monkeypatch, capsys
+):
+    import agentflow.enroll as enrollment
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("lib/\n")
+    (repo / "AGENTS.md").write_text("# repo\n\nprofile: reviewed\nui-surfaces: frontend/\n")
+    (repo / "frontend").mkdir()
+    monkeypatch.setattr(enrollment, "_checkout_problem", lambda _root: None)
+    monkeypatch.setattr(enrollment, "_config_problem", lambda: None)
+    monkeypatch.setattr(enrollment, "_tooling_problem", lambda _surfaces: None)
+    monkeypatch.setattr(enrollment, "_managed_files_problem", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enrollment, "_skills_problem", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enrollment, "_methodology_problem", lambda _root: None)
+    monkeypatch.setattr(
+        enrollment, "_apply_enrollment",
+        lambda *_args, **_kwargs: pytest.fail("ignored capability file must refuse before apply"),
+    )
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    output = capsys.readouterr().out
+    assert ".agents/skills/ui-craft/scripts/lib/design-parser.mjs" in output
+    assert "lib/" in output
+    assert not (repo / "CLAUDE.md").exists()
+
+
+def test_enrollment_with_no_ignored_capability_file_keeps_materializing(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, _commit, _lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    original_run = enrollment._run_command
+
+    def run(command, **kwargs):
+        if command[:4] == ["git", "-C", str(repo), "check-ignore"]:
+            return subprocess.run(command, capture_output=True, text=True)
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(enrollment, "_run_command", run)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False  # no local Claude or Codex runner in this focused fixture
+    for name in names:
+        assert (repo / ".agents" / "skills" / name / "SKILL.md").is_file()
+        assert (repo / ".claude" / "skills" / name / "SKILL.md").is_file()
 
 
 def test_capability_repair_materializes_only_absent_claude_destinations(
