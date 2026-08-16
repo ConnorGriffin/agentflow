@@ -1,8 +1,9 @@
-"""Store-owned, append-only attribution for already-active canary routing.
+"""Store-owned attribution for already-active canary routing.
 
 Canary attribution observes authority selected by OperationalSafety.  It never selects a
 RouteCell, changes routing, or owns a transaction.  The coordinator Store constructs the
 single owner, supplies durable Record facts, and commits the attribution with its successor.
+Rows are append-only except at ADR 627's atomic never-started reservation retirement boundary.
 """
 
 from __future__ import annotations

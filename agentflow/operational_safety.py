@@ -1311,7 +1311,7 @@ class OperationalSafety:
     def _validate_admission_history(
             self, stage_identity: str, route_cell_digest: str,
             safety_state_id: str) -> None:
-        """Validate the permanent admitted tuple without consulting mutable routing."""
+        """Validate the committed admitted tuple without consulting mutable routing."""
         row = self._conn.execute(
             "SELECT route_cell_digest, safety_state_id, history_digest "
             "FROM safety_admission_history WHERE stage_identity = ?",

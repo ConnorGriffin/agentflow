@@ -45,9 +45,9 @@ numbers. Duplicate members are rejected recursively. Object arrays are ordered b
 canonical bytes. Overlay and briefing self-digests omit only their declared identity fields.
 The overlay is bounded at 8 KiB and the final briefing at 16 KiB; collection and nested-bound
 limits are part of the closed contract. The exact effective-policy contract digest is
-`ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef`.
+`783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d`.
 
-The result vocabulary is ready, not applicable, or a hold with one of the seven closed codes.
+The result vocabulary is ready, not applicable, or a hold with one of the eight closed codes.
 Holds contain only validated tokens or digests as references. Rejected content, source prose,
 provider output, findings, prompts, transcripts, and secrets never enter a result.
 
@@ -65,10 +65,12 @@ provider output, findings, prompts, transcripts, and secrets never enter a resul
 ## Consequences
 
 Briefing delivery is deterministic, content-free, and independently reusable by admission.
-Unavailable or mismatched authorities stop launch through a named immutable hold. Repository
-overlays can restrict but never widen fleet policy. Promotion and Evaluation remain unchanged;
-#627 must combine the returned briefing with coordinator identity and persist it atomically before
-permit acquisition.
+Overlay read errors, timeouts, and repositories or revisions unavailable at read time stop launch
+through retryable `invalid_overlay`. Malformed or invalid successfully read immutable objects and
+authority mismatches stop launch through `invalid_overlay_authority`. Repository overlays can
+restrict but never widen fleet policy. Promotion and Evaluation remain unchanged; #627 must
+combine the returned briefing with coordinator identity and persist it atomically before permit
+acquisition.
 
 Issue #571 adds one consumer check without widening resolver authority: a promoted method's exact
 artifact locator scopes it to its owning stage before the resolver constructs the stage briefing.

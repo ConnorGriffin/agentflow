@@ -38,7 +38,7 @@ STAGES = (
 )
 HOLD_CODES = (
     "briefing_overflow", "incompatible_policy", "invalid_briefing", "invalid_overlay",
-    "invalid_receipt", "missing_policy", "missing_receipt",
+    "invalid_overlay_authority", "invalid_receipt", "missing_policy", "missing_receipt",
 )
 _MAX_INTEGER = 9_223_372_036_854_775_807
 _MAX_OVERLAY_BYTES = 8192
@@ -56,6 +56,10 @@ _SCOPE_SEGMENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 class PolicyValidationError(ValueError):
     """Untrusted policy or briefing input was rejected without retaining it."""
+
+
+class OverlayUnavailableError(RuntimeError):
+    """The repository could not supply an exact overlay object during this read."""
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -504,8 +508,8 @@ class ExactRevisionRepositoryOverlaySource:
     """Read the sole production overlay object without observing a mutable checkout.
 
     ``git show <revision>:<path>`` addresses the object directly in the enrolled local
-    repository.  It neither changes HEAD nor needs a network; the resolver deliberately
-    translates every malformed/unavailable result to its existing ``invalid_overlay`` hold.
+    repository. It neither changes HEAD nor needs a network. Availability failures remain
+    retryable while malformed bytes from an exact object are immutable authority failures.
     """
 
     _PATH = ".agentflow/briefing-overlay-v1.json"
@@ -527,7 +531,7 @@ class ExactRevisionRepositoryOverlaySource:
                 if attempt == 0:
                     self._diagnose(repository, revision, phase, time.monotonic() - started)
                 if attempt == 1:
-                    raise PolicyValidationError("overlay object is unreadable")
+                    raise OverlayUnavailableError("overlay object is unavailable") from None
         raise AssertionError("unreachable")
 
     def _diagnose(self, repository: str, revision: str, phase: str, elapsed: float) -> None:
@@ -546,34 +550,36 @@ class ExactRevisionRepositoryOverlaySource:
         root = self._repositories.get(repository)
         if root is None:
             self._diagnose(repository, subject_revision, "lookup", 0)
-            raise PolicyValidationError("overlay repository or revision is unavailable")
+            raise OverlayUnavailableError("overlay repository or revision is unavailable")
         if not _SUBJECT_REVISION.fullmatch(subject_revision):
-            raise PolicyValidationError("overlay repository or revision is unavailable")
+            raise OverlayUnavailableError("overlay repository or revision is unavailable")
         result = self._run(
             ["git", "show", f"{subject_revision}:{self._PATH}"], root, "show",
             repository, subject_revision)
         if result.returncode:
             # Only an absent entry in the exact commit tree means no overlay.  A tree that names
-            # the path but whose blob cannot be read is corrupt authority, never inferred absence.
+            # the path but whose blob cannot be read is unavailable, never inferred absence.
             probe = self._run(
                 ["git", "ls-tree", "-z", "--full-tree", subject_revision, "--", self._PATH],
                 root, "ls-tree", repository, subject_revision)
             if probe.returncode:
                 self._diagnose(repository, subject_revision, "ls-tree", 0)
-                raise PolicyValidationError("overlay revision is unavailable")
+                raise OverlayUnavailableError("overlay revision is unavailable")
             if not probe.stdout:
                 return None
             self._diagnose(repository, subject_revision, "ls-tree", 0)
-            raise PolicyValidationError("overlay object is unreadable")
+            raise OverlayUnavailableError("overlay object is unavailable")
         if len(result.stdout) > _MAX_OVERLAY_BYTES:
             self._diagnose(repository, subject_revision, "parse", 0)
             raise PolicyValidationError("overlay exceeds byte limit")
         started = time.monotonic()
         try:
             return OverlayV1.parse(result.stdout)
-        except PolicyValidationError:
+        except Exception as error:
             self._diagnose(repository, subject_revision, "parse", time.monotonic() - started)
-            raise
+            if isinstance(error, PolicyValidationError):
+                raise
+            raise PolicyValidationError("invalid overlay object") from error
 
 
 @dataclass(frozen=True, slots=True)
@@ -870,6 +876,9 @@ class EffectivePolicyResolver:
 
         try:
             overlay = self._overlay_source.read(repository, safe_revision)
+        except PolicyValidationError:
+            return _hold(
+                repository, safe_stage, safe_revision, "invalid_overlay_authority")
         except Exception:
             return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
         if overlay is not None:
@@ -884,7 +893,8 @@ class EffectivePolicyResolver:
                 if folded is None:
                     raise PolicyValidationError("invalid overlay restriction")
             except Exception:
-                return _hold(repository, safe_stage, safe_revision, "invalid_overlay")
+                return _hold(
+                    repository, safe_stage, safe_revision, "invalid_overlay_authority")
             receipts, capabilities = folded
             not_applicable = safe_stage in overlay.not_applicable_stages
         else:

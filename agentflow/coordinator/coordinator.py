@@ -100,7 +100,7 @@ REFUSED_BEFORE_START_HOLD_REASON = "refused before start"
 
 _PERMANENT_ADMISSION_REFUSALS = frozenset({
     "admission_identity_migration_required",
-    "invalid_overlay",
+    "invalid_overlay_authority",
 })
 
 

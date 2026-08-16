@@ -260,7 +260,7 @@ ADMISSION_REFUSAL_CODES = frozenset({
     "capability_environment_failure:drifted",
     "capability_environment_failure:incompatible",
     "briefing_overflow", "incompatible_policy", "invalid_briefing", "invalid_overlay",
-    "invalid_receipt", "missing_policy", "missing_receipt",
+    "invalid_overlay_authority", "invalid_receipt", "missing_policy", "missing_receipt",
 })
 
 
@@ -643,7 +643,7 @@ class Store:
 
     @staticmethod
     def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-        """Add append-only CanaryAttribution state without rewriting existing owners."""
+        """Add normally append-only CanaryAttribution state without rewriting existing owners."""
         committed = False
         try:
             Store._migration_checkpoint("v2-to-v3:before-begin")
