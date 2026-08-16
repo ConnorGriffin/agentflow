@@ -217,7 +217,7 @@ def _methodology_problem(root: Path) -> str | None:
     manifest = _manifest()
     names = manifest["methodology_skills"]["skills"]
     if all(states[(".agents/skills", name)] == "ok" for name in names) and all(
-        _legacy_claude_skill_link(root, name) for name in names
+        states[(".claude/skills", name)] == "absent" for name in names
     ):
         return None
     rendered = ", ".join(f"{location}/{name}={state}" for (location, name), state in states.items())
@@ -836,7 +836,6 @@ def _install_methodology_skills(root: Path) -> str:
         return "ok:   methodology contracts already installed"
     if all(states[(".agents/skills", name)] == "ok" for name in source["skills"]) and all(
         states[(".claude/skills", name)] == "absent"
-        or _legacy_claude_skill_link(root, name)
         for name in source["skills"]
     ):
         outcomes = [_wire_claude_skill(root, name) for name in source["skills"]]
