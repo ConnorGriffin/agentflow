@@ -37,7 +37,6 @@ from dataclasses import asdict, dataclass, replace
 from importlib.resources import files
 from pathlib import Path
 
-from agentflow.ci_policy import audit_workflows
 from agentflow.intake import sweep_legacy_labels
 from agentflow.provider_skills import (
     provider_skill_status,
@@ -1617,6 +1616,8 @@ def audit_lines(repos) -> list[str]:
     """One line per enrolled repo plus a census tail, naming every repo the gate cannot fire
     in: the ones that never answered, and the ones whose headless answer their own checkout
     contradicts."""
+    from agentflow.ci_policy import audit_workflows
+
     repos = list(repos)
     lines = []
     undeclared = []
