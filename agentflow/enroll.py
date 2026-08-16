@@ -45,7 +45,7 @@ from agentflow.provider_skills import (
 from agentflow.repo_facts import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
                                   surface_declaration)
 from agentflow.runtime_contracts import playwright_runtime_status as _runtime_status
-from agentflow.skill_ownership import mark_skill_owned, skill_ownership
+from agentflow.skill_ownership import clear_skill_ownership, mark_skill_owned, skill_ownership
 
 # Directory names that hold a user-facing surface when a repo has one. Deliberately narrow:
 # a wrong guess here writes a declaration that either misses real UI or gates a backend path.
@@ -245,6 +245,7 @@ def repair_capability_refusal(root: str | Path, provider: str, requirements):
                     continue
                 try:
                     shutil.rmtree(destination)
+                    clear_skill_ownership(destination)
                 except OSError as exc:
                     errors.append(f"{destination}: {exc}")
             return errors
@@ -422,11 +423,9 @@ def _skills_problem(
         for name in names
     ):
         return None
-    # Converge never rewrites the vendored skill pack (no reproducible content to write —
-    # it comes from a temp clone the installer owns, not `_asset_text`), but a repo that was
-    # already fully installed and has since drifted is not a blocking precondition either;
-    # doctor() keeps reporting it. A partially-installed or otherwise-occupied destination
-    # still refuses, converge or not.
+    # Converge may repair drift only when the destination retains a valid ownership marker;
+    # unowned or incompatible content remains a blocking precondition. The pinned release is
+    # fetched into a temporary installer root, never synthesized from `_asset_text`.
     if converge and all(state in ("ok", "drifted") for state in destinations.values()):
         return None
     if any(state != "absent" for state in destinations.values()):
@@ -898,8 +897,16 @@ def _ensure_fleet_config(root: Path) -> str:
     return f"DO:   added {repo} to {target}"
 
 
-def _replace_skill_tree(destination: Path, source: Path) -> None:
+def _replace_skill_tree(destination: Path, source: Path, files_manifest: list[dict]) -> str:
     """Atomically swap one owned skill tree for a complete pinned replacement."""
+    if (
+        _skill_destination_status(destination, files_manifest) != "drifted"
+        or skill_ownership(destination, files_manifest) is None
+    ):
+        return f"WARN: {destination} changed before owned-drift repair"
+    for leftover in destination.parent.glob(f".{destination.name}-*"):
+        if leftover.is_dir() and not leftover.is_symlink():
+            shutil.rmtree(leftover)
     temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
     replacement = temporary / "replacement"
     backup = temporary / "previous"
@@ -912,6 +919,7 @@ def _replace_skill_tree(destination: Path, source: Path) -> None:
             backup.replace(destination)
             raise
         shutil.rmtree(backup)
+        return f"DO:   repaired owned drift at {destination}"
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
 
@@ -946,7 +954,7 @@ def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
     repairs = {
         (location, name)
         for (location, name), state in destinations.items()
-        if state == "drifted" and skill_ownership(root / location / name) is not None
+        if state == "drifted" and skill_ownership(root / location / name, specs[name]["files"]) is not None
     }
     if converge and repairs and all(
         state == "ok" or (location, name) in repairs
@@ -1015,13 +1023,19 @@ def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
                     if repaired_name != name:
                         continue
                     destination = root / location / name
-                    _replace_skill_tree(destination, source)
-                    mark_skill_owned(destination)
+                    outcome = _replace_skill_tree(destination, source, specs[name]["files"])
+                    if outcome.startswith("WARN:"):
+                        return outcome
+                    try:
+                        mark_skill_owned(destination, specs[name]["files"])
+                    except OSError as exc:
+                        return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
             else:
                 destination = root / ".agents" / "skills" / name
-                mark_skill_owned(destination)
-                if skill_ownership(destination) is None:
-                    return f"WARN: could not record AgentFlow ownership for {destination}"
+                try:
+                    mark_skill_owned(destination, specs[name]["files"])
+                except OSError as exc:
+                    return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
             wiring = _wire_claude_skill(root, name)
             if wiring.startswith("WARN:"):
                 return wiring
@@ -1188,7 +1202,12 @@ def _wire_claude_skill(root: Path, name: str) -> str:
         return f"WARN: {source} is not a safe materialization source"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
-    mark_skill_owned(target)
+    specs = {item.get("skill"): item for item in _manifest()["capabilities"]}
+    try:
+        mark_skill_owned(target, specs[name]["files"])
+    except (KeyError, OSError) as exc:
+        shutil.rmtree(target)
+        return f"WARN: could not record AgentFlow ownership for {target}: {exc}"
     return f"DO:   materialized {target} for Claude Code"
 
 
@@ -1224,6 +1243,12 @@ class _EnrollmentJournal:
                 shutil.copytree(backup, path, symlinks=True)
             else:
                 shutil.copy2(backup, path)
+        for path, _backup in self._entries:
+            if path.name == "skill-ownership":
+                try:
+                    path.parent.rmdir()
+                except OSError:
+                    pass
 
     def discard_created_backups(self) -> None:
         """Remove rollback copies that a successful enrollment no longer needs."""
@@ -1250,7 +1275,7 @@ def _enrollment_journal(root: Path) -> _EnrollmentJournal:
         root / ".claude",
         root / "scripts",
         root / "skills-lock.json",
-        root / ".agentflow",
+        root / ".agentflow" / "skill-ownership",
         config,
     ]
     if config.is_symlink():

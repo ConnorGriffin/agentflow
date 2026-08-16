@@ -500,6 +500,31 @@ def test_failed_runtime_repair_preserves_concurrent_operator_content(
     assert changed.read_text() == "operator changed this during repair\n"
 
 
+def test_failed_runtime_repair_removes_ownership_markers_with_created_skills(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    requirements = (
+        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
+        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
+        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
+    )
+    monkeypatch.setattr(
+        enrollment, "_install_ui_runtime",
+        lambda *_args, **_kwargs: "WARN: UI runtime setup failed",
+    )
+
+    result = repair_capability_refusal(root, "claude", requirements)
+
+    assert result is not None and not result.repaired
+    assert not (root / ".claude" / "skills" / "ui-craft").exists()
+    assert not (root / ".agentflow" / "skill-ownership" / "claude" / "ui-craft.json").exists()
+
+
 @pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
 def test_capability_repair_preserves_occupied_claude_destinations(
     tmp_path, monkeypatch, destination_kind
