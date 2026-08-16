@@ -253,6 +253,90 @@ def test_public_enrollment_installs_methodology_contracts_for_headless_dispatch(
     )
 
 
+def test_enrollment_materializes_missing_claude_methodology_destinations(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, _commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert all(
+        item.available for item in report.capabilities if item.id in names
+    )
+    assert not commands
+    for name in names:
+        destination = repo / ".claude" / "skills" / name
+        assert destination.is_dir()
+        assert not destination.is_symlink()
+        assert (destination / "SKILL.md").read_bytes() == (
+            source / name / "SKILL.md"
+        ).read_bytes()
+
+
+@pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
+def test_enrollment_refuses_occupied_claude_methodology_destinations(
+    tmp_path, monkeypatch, destination_kind
+):
+    enrollment, repo, source, names, _commit, _lock, commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    destination = repo / ".claude" / "skills" / names[0]
+    destination.parent.mkdir(parents=True)
+    if destination_kind == "drifted":
+        destination.mkdir()
+        (destination / "SKILL.md").write_text("operator edit\n")
+    else:
+        destination.symlink_to(Path("../../.agents/skills") / names[0])
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert not commands
+    assert not (repo / "AGENTS.md").exists()
+    assert not (repo / "CLAUDE.md").exists()
+    if destination_kind == "drifted":
+        assert (destination / "SKILL.md").read_text() == "operator edit\n"
+    else:
+        assert destination.is_symlink()
+
+
+def test_enrollment_rolls_back_partial_claude_methodology_materialization(
+    tmp_path, monkeypatch
+):
+    enrollment, repo, source, names, _commit, _lock, _commands = (
+        _methodology_enrollment_fixture(tmp_path, monkeypatch)
+    )
+    for name in names:
+        shutil.copytree(source / name, repo / ".agents" / "skills" / name)
+    original_wire = enrollment._wire_claude_skill
+    materialized = 0
+
+    def fail_after_second_methodology_skill(root, name):
+        nonlocal materialized
+        outcome = original_wire(root, name)
+        if name in names:
+            materialized += 1
+            if materialized == 2:
+                return "WARN: injected methodology materialization failure"
+        return outcome
+
+    monkeypatch.setattr(enrollment, "_wire_claude_skill", fail_after_second_methodology_skill)
+
+    report = enrollment.enroll_repository(str(repo), apply=True)
+
+    assert report.ready is False
+    assert materialized == 3
+    assert not (repo / ".claude").exists()
+    assert not (repo / "AGENTS.md").exists()
+    assert not (repo / "CLAUDE.md").exists()
+
+
 def test_enrollment_warns_and_rolls_back_for_a_non_object_lock(
     tmp_path, monkeypatch
 ):
