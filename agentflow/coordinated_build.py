@@ -56,7 +56,8 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
         surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
     brief += routing.session_lead_instructions(
         "build", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
-        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
+        brief=brief)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="build", pool=parent_pool,
         subject_revision=capture_subject_revision(cfg.workdir),
