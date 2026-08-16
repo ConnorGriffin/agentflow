@@ -149,7 +149,7 @@ def test_hostile_gate_and_limits_mutations_cannot_change_waiting_authority_or_su
 
     assert callback_inputs == [("gate", authoritative_facts), ("limits", authoritative_facts)]
     assert captured == [LegacyReservationIntent(
-        "authority", "prepared-token", 2, 100, "daemon-authority", 5, limits, None)]
+        "authority", "prepared-token", 2, 100, "daemon-authority", PERMIT_BUDGET, limits, None)]
     successor = coordinator._store.record_of("authority")
     assert successor == record and successor is not None
     assert successor.state == RUNNING and successor.revision == 3
