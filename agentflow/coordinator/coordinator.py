@@ -42,7 +42,7 @@ from agentflow.coordinator.record import (
 from agentflow.coordinator.recovery import PROGRESS, REPAIR
 from agentflow.coordinator.stage_router import StageCalls
 from agentflow.coordinator.store import (
-    SUPERVISOR_WINDOW, LegacyReservationIntent, ReservationIntent, Store,
+    SUPERVISOR_WINDOW, LegacyReservationIntent, ReservationIntent, RouteAdmissionRefused, Store,
     default_store_path)
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.routing import routing
@@ -971,9 +971,18 @@ class Coordinator:
         """Retry transient admission refusals and hand immutable ones to a human."""
         if not observed:
             return "unprepared"
-        if code == "route_cell:stale" and self._repin_stale_route_cell(record):
-            self._emit(record, "route_cell:stale; re-pinned current RouteCell; retrying next "
-                               "cycle; no attempt or permit spent")
+        if code == "route_cell:stale":
+            rejection = self._repin_stale_route_cell(record)
+            if rejection is None:
+                self._emit(record, "route_cell:stale; re-pinned current RouteCell; retrying next "
+                                   "cycle; no attempt or permit spent")
+                return "unprepared"
+            detail = f"route_cell:stale; not re-pinned: {rejection}"
+            self._note_refusal(record, detail, False)
+            record.capability_preflight = ""
+            self._persist(record)
+            self._emit(record, f"{detail}; retrying next cycle; claim retained; "
+                               "no attempt or permit spent")
             return "unprepared"
         if code in _PERMANENT_ADMISSION_REFUSALS:
             record.hold_reason = refused_before_start_hold_reason(code)
@@ -990,39 +999,38 @@ class Coordinator:
                            "no attempt or permit spent")
         return "unprepared"
 
-    def _repin_stale_route_cell(self, record: Record) -> bool:
-        """Replace one superseded RouteCell pin with its selected successor, if it is unchanged.
+    def _repin_stale_route_cell(self, record: Record) -> str | None:
+        """Replace one superseded RouteCell pin with its active successor, or explain why not.
 
-        Admission already proved this exact pin stale.  Reselect through the submission/pool-move
-        seam, then accept only the same routing key and a different immutable digest.  Any routing
-        failure or changed key keeps the original refusal: a stale pin is recoverable, but it is
-        not authority to bypass another admission failure.
+        Admission already proved this exact pin stale.  Read the safety authority's active cell,
+        then accept only the same routing key and a different immutable digest.  Any lookup failure
+        or changed key keeps the original refusal: a stale pin is recoverable, but it is not
+        authority to bypass another admission failure.
         """
         identity = (record.repo, record.subject, record.stage, record.target,
                     record.subject_revision)
         try:
-            selection = self._route_selector(
-                record.repo, record.stage, record.pool, record.model,
-                complexity=record.complexity, effort=record.effort,
-                builder_complexity=record.builder_complexity)
-            if (selection.repository, selection.stage, selection.provider, selection.model) != (
-                    record.repo, record.stage, record.pool, record.model):
-                return False
-            route = self._store.route_selection_identity(selection)
-        except Exception:
-            return False
+            route = self._store.active_route_selection_identity(record)
+        except RouteAdmissionRefused as error:
+            return f"active RouteCell lookup refused: route_cell:{error.code}"
+        except Exception as error:
+            return f"active RouteCell lookup failed: {type(error).__name__}: {error}"
         if (identity != (record.repo, record.subject, record.stage, record.target,
-                         record.subject_revision)
-                or route.route_id != record.route_id
-                or route.route_cell_digest == record.route_cell_digest):
-            return False
+                         record.subject_revision)):
+            return "stage identity changed during active RouteCell lookup"
+        if route.route_id != record.route_id:
+            return "active RouteCell changed the logical route"
+        if route.route_cell_digest == record.route_cell_digest:
+            return "active RouteCell reproduced the same digest"
         record.route_id = route.route_id
         record.route_cell_digest = route.route_cell_digest
         record.launch_config_digest = route.launch_config_digest
         self._note_refusal(record, "", False)
         record.refusals = 0
         self._clear_stall(record)
-        return self._persist(record)
+        if not self._persist(record):
+            return "record changed before the active RouteCell could be persisted"
+        return None
 
     def _capability_failure(self, record: Record, capability, observed: bool) -> str:
         """Fail a real admission durably; leave speculative provider probes untouched."""

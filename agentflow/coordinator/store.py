@@ -1477,6 +1477,33 @@ class Store:
         return RouteSelectionIdentity(
             cell.route_id, cell.digest, cell.launch_config_digest)
 
+    def active_route_selection_identity(self, record: Record) -> RouteSelectionIdentity:
+        """Return the verified active RouteCell for one durable record's routing identity."""
+        if type(record) is not Record:
+            raise TypeError("active route lookup requires the exact durable record")
+        if self._operational_safety is None:
+            raise RouteAdmissionRefused("unreadable")
+        from agentflow.routing import logical_route_id_for_record
+        route_id = logical_route_id_for_record(record)
+        if route_id != record.route_id:
+            raise RouteAdmissionRefused("mismatched")
+        with self._lock:
+            try:
+                resolved = self._operational_safety.resolve(
+                    record.repo, record.stage, record.pool, record.model, route_id,
+                    conn=self._conn)
+                self._operational_safety.route_state(resolved.route_cell.digest)
+                admitted = decode_admitted_launch(resolved)
+            except _SafetyIdentityMismatch:
+                raise RouteAdmissionRefused("mismatched") from None
+            except _SafetyMissing:
+                raise RouteAdmissionRefused("missing") from None
+            except (SafetyRefused, sqlite3.DatabaseError, ValueError, TypeError):
+                raise RouteAdmissionRefused("unreadable") from None
+        cell = admitted.route_cell
+        return RouteSelectionIdentity(
+            cell.route_id, cell.digest, cell.launch_config_digest)
+
     @staticmethod
     def _rematerialize_route_selection(selection):
         from agentflow.routing import (

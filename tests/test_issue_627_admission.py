@@ -182,7 +182,7 @@ def _approved_briefing(repository, stage, subject_revision, receipt_id):
 
 def _coordinator(
         tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None,
-        launcher=None):
+        launcher=None, log=None):
     path = tmp_path / "coordinator.db"
     receipts = receipts or _Receipts()
     store = Store(path, admission_mode=OperationalSafetyAndCanary(
@@ -193,7 +193,7 @@ def _coordinator(
         store=store, launcher=launcher, adapter=adapter,
         capability_preflight=capability,
         briefing_resolver=briefing or _Briefings(),
-        route_selector=routing.select_route, daemon_generation="daemon-627")
+        route_selector=routing.select_route, daemon_generation="daemon-627", log=log)
     identity = coordinator.submit_stage(Submission(
         repo="octo/app", subject="627", stage="build", pool="codex",
         complexity="deep", subject_revision=REVISION))
@@ -689,11 +689,13 @@ def test_missing_route_authority_retries_after_public_registration(tmp_path):
     store.close()
 
 
-def test_pointer_change_repins_active_route_without_spending_attempt(tmp_path, monkeypatch):
+def test_launch_config_rotation_repins_active_route_without_spending_attempt(
+        tmp_path, monkeypatch):
     receipts = _Receipts()
+    logs = []
     coordinator, store, launcher, _adapter, identity = _coordinator(
         tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
-        receipts=receipts)
+        receipts=receipts, log=logs.append)
     record = store.record_of(identity)
     original_identity = (
         record.repo, record.subject, record.stage, record.target, record.subject_revision)
@@ -709,10 +711,17 @@ def test_pointer_change_repins_active_route_without_spending_attempt(tmp_path, m
         candidate_selection.repository, candidate_selection.stage,
         candidate_selection.provider, candidate_selection.model,
         candidate_selection.route_id, candidate_selection.launch_config)
+    original = authority.resolve_digest(old_digest).route_cell
+    assert candidate.key == original.key
+    assert (candidate.repository, candidate.stage, candidate.provider, candidate.model,
+            candidate.route_id) == (original.repository, original.stage, original.provider,
+                                    original.model, original.route_id)
+    assert candidate.launch_config_digest != original.launch_config_digest
     request = CanaryActivationRequest("receipt-repin", candidate.digest, old_digest, 0)
     receipts.issue(request)
     authority.approve_canary(request)
     authority_store.close()
+    monkeypatch.delenv("AGENTFLOW_SESSION_TIMEOUT")
 
     coordinator.cycle("codex")
 
@@ -725,20 +734,23 @@ def test_pointer_change_repins_active_route_without_spending_attempt(tmp_path, m
     assert repinned.refusal == "" and repinned.refusals == 0
     assert repinned.attempts == 0 and store.permits_used("codex") == 0
     assert launcher.launches == []
+    assert len(logs) == 1 and "re-pinned current RouteCell" in logs[0]
 
     coordinator.cycle("codex")
 
     admitted = store.record_of(identity)
     assert admitted.state == "running" and admitted.attempts == 1
     assert launcher.identities == [identity]
+    assert launcher.launches[0].route_cell.digest == candidate.digest
     store.close()
 
 
 def test_pointer_change_to_unselected_route_refuses_without_repin_loop(tmp_path):
     receipts = _Receipts()
+    logs = []
     coordinator, store, launcher, _adapter, identity = _coordinator(
         tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
-        receipts=receipts)
+        receipts=receipts, log=logs.append)
     record = store.record_of(identity)
     original_pin = (record.route_id, record.route_cell_digest, record.launch_config_digest)
     old_digest = record.route_cell_digest
@@ -758,10 +770,14 @@ def test_pointer_change_to_unselected_route_refuses_without_repin_loop(tmp_path)
     authority_store.close()
 
     coordinator.cycle("codex")
-    _assert_zero_outputs(store, launcher, identity, "route_cell:stale")
+    coordinator.cycle("codex")
+    detail = ("route_cell:stale; not re-pinned: active RouteCell lookup refused: "
+              "route_cell:mismatched")
+    _assert_zero_outputs(store, launcher, identity, detail)
     waiting = store.record_of(identity)
     assert (waiting.route_id, waiting.route_cell_digest,
             waiting.launch_config_digest) == original_pin
+    assert len(logs) == 2 and all(detail in line for line in logs)
     store.close()
 
 
