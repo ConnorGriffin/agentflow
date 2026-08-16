@@ -1,10 +1,10 @@
 # ADR 466 — The coordinated-build route is gated on the dials plus a slice-bearing work order
 
-- Status: Superseded by [ADR 511](adr-511-capability-routed-session-led-dispatch-supersedes-coordinated-build-slicing.md)
+- Status: Superseded by [ADR 511](adr-511-slicing-survives-under-the-session-lead.md)
 - Date: 2026-08-02
 - Ticket: [#466](https://github.com/ConnorGriffin/agentflow/issues/466)
   (wayfinder map [#463](https://github.com/ConnorGriffin/agentflow/issues/463))
-- Superseded by: [ADR 511](adr-511-capability-routed-session-led-dispatch-supersedes-coordinated-build-slicing.md)
+- Superseded by: [ADR 511](adr-511-slicing-survives-under-the-session-lead.md)
   retires this separately-gated route and its fixed cheap/frontier slice-model pair; it retains
   slicing under ADR 498's session lead.
 - Constrains: [ADR 464](adr-464-slice-runs-in-session.md) (the switch this fills in),

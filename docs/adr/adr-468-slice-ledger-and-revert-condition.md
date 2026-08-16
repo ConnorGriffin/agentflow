@@ -1,10 +1,10 @@
 # ADR 468 — The commits are the slice ledger, and the switch is the revert
 
-- Status: Accepted — partially retired by [ADR 511](adr-511-capability-routed-session-led-dispatch-supersedes-coordinated-build-slicing.md)
+- Status: Accepted — partially retired by [ADR 511](adr-511-slicing-survives-under-the-session-lead.md)
 - Date: 2026-08-02
 - Ticket: [#468](https://github.com/ConnorGriffin/agentflow/issues/468)
   (wayfinder map [#463](https://github.com/ConnorGriffin/agentflow/issues/463))
-- Relationship: [ADR 511](adr-511-capability-routed-session-led-dispatch-supersedes-coordinated-build-slicing.md)
+- Relationship: [ADR 511](adr-511-slicing-survives-under-the-session-lead.md)
   retains the commit-per-slice ledger as the measurement surface for sliced work and retires only
   the revert condition tied to this record's gated-route switch.
 - Constrains: [ADR 464](adr-464-slice-runs-in-session.md) (bounded return, commit-per-slice),

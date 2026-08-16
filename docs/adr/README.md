@@ -300,7 +300,7 @@ Issue-keyed records:
   but its tier follows the builder's complexity dial — cheap for standard, frontier for deep —
   and independence is measured against the session lead's tool rather than whichever worker
   wrote the diff. Weakens 0003; supersedes 0018's always-deep reviewer.
-- [ADR 511](adr-511-capability-routed-session-led-dispatch-supersedes-coordinated-build-slicing.md)
+- [ADR 511](adr-511-slicing-survives-under-the-session-lead.md)
   — Slicing survives under ADR 498's session lead: a lead that decomposes work runs slices as
   in-session subagents on one pull request, with ADR 465's non-self-scoping work order and ADR
   468's commit-per-slice ledger retained. It supersedes ADR 466's separately-gated route and fixed

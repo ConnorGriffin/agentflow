@@ -4,7 +4,7 @@
 - Date: 2026-08-02
 - Ticket: [#465](https://github.com/ConnorGriffin/agentflow/issues/465)
   (wayfinder map [#463](https://github.com/ConnorGriffin/agentflow/issues/463))
-- Relationship: Retained by [ADR 511](adr-511-capability-routed-session-led-dispatch-supersedes-coordinated-build-slicing.md):
+- Relationship: Retained by [ADR 511](adr-511-slicing-survives-under-the-session-lead.md):
   a session lead that slices still gives each slice a work order that does not allow self-scoping;
   this does not create a separately-gated slicing route.
 - Constrains: [ADR 0005](0005-spec-rigor-rides-the-dial.md) (work order),
