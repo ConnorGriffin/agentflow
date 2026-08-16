@@ -225,6 +225,122 @@ def test_absent_store_is_created_versioned_and_round_trips(tmp_path):
     assert reopened.permits_used("claude") == 1
 
 
+def test_upsert_retries_a_transient_database_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    competing_writer = sqlite3.connect(path, isolation_level=None)
+    attempts = []
+    competing_writer.execute("BEGIN IMMEDIATE")
+    backoffs = []
+
+    def observe_attempt(statement):
+        if statement == "BEGIN IMMEDIATE":
+            attempts.append(statement)
+
+    def release_for_retry(delay):
+        backoffs.append(delay)
+        competing_writer.execute("ROLLBACK")
+
+    store._conn.set_trace_callback(observe_attempt)
+    monkeypatch.setattr("agentflow.coordinator.store.time.sleep", release_for_retry)
+    try:
+        record = Record("retry", "review", "codex", 1)
+        assert store.upsert(record)
+        assert attempts == ["BEGIN IMMEDIATE", "BEGIN IMMEDIATE"]
+        assert backoffs == [0.1]
+        assert store.record_of(record.identity) == record
+    finally:
+        if competing_writer.in_transaction:
+            competing_writer.execute("ROLLBACK")
+        competing_writer.close()
+        store.close()
+
+
+def test_upsert_fails_closed_after_persistent_database_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    competing_writer = sqlite3.connect(path, isolation_level=None)
+    attempts = []
+    store._conn.set_trace_callback(
+        lambda statement: attempts.append(statement) if statement == "BEGIN IMMEDIATE" else None)
+    competing_writer.execute("BEGIN IMMEDIATE")
+
+    try:
+        record = Record("locked", "review", "codex", 1)
+        with pytest.raises(StoreUnavailable, match="database is locked"):
+            store.upsert(record)
+        assert attempts == ["BEGIN IMMEDIATE", "BEGIN IMMEDIATE", "BEGIN IMMEDIATE"]
+        assert record.revision == 0
+        assert store.record_of(record.identity) is None
+    finally:
+        competing_writer.execute("ROLLBACK")
+        competing_writer.close()
+        store.close()
+
+
+def _hold_commit_lock(path):
+    reader = sqlite3.connect(path, isolation_level=None)
+    reader.execute("BEGIN")
+    reader.execute("SELECT data FROM records").fetchall()
+    return reader
+
+
+def test_upsert_restores_revision_before_retry_after_commit_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    reader = _hold_commit_lock(path)
+    statements = []
+    backoffs = []
+    store._conn.set_trace_callback(statements.append)
+
+    def release_for_retry(delay):
+        backoffs.append(delay)
+        reader.execute("ROLLBACK")
+
+    monkeypatch.setattr("agentflow.coordinator.store.time.sleep", release_for_retry)
+    try:
+        record = Record("commit-retry", "review", "codex", 1)
+        assert store.upsert(record)
+        assert statements.count("BEGIN IMMEDIATE") == 2
+        assert statements.count("COMMIT") == 2
+        assert backoffs == [0.1]
+        assert record.revision == 1
+        assert store.record_of(record.identity) == record
+    finally:
+        if reader.in_transaction:
+            reader.execute("ROLLBACK")
+        reader.close()
+        store.close()
+
+
+def test_upsert_restores_revision_after_persistent_commit_lock(tmp_path, monkeypatch):
+    monkeypatch.setattr("agentflow.coordinator.store._BUSY_TIMEOUT_MS", 5)
+    path = tmp_path / "coord.db"
+    store = Store(path)
+    reader = _hold_commit_lock(path)
+    statements = []
+    backoffs = []
+    store._conn.set_trace_callback(statements.append)
+    monkeypatch.setattr("agentflow.coordinator.store.time.sleep", backoffs.append)
+
+    try:
+        record = Record("commit-locked", "review", "codex", 1)
+        with pytest.raises(StoreUnavailable, match="database is locked"):
+            store.upsert(record)
+        assert statements.count("BEGIN IMMEDIATE") == 3
+        assert statements.count("COMMIT") == 3
+        assert backoffs == [0.1, 0.3]
+        assert record.revision == 0
+        assert store.record_of(record.identity) is None
+    finally:
+        reader.execute("ROLLBACK")
+        reader.close()
+        store.close()
+
+
 def test_supersede_refuses_an_independently_occupied_successor_without_mutation(tmp_path):
     store = Store(tmp_path / "coord.db")
     predecessor = Record(

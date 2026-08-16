@@ -22,6 +22,7 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
@@ -780,25 +781,36 @@ class Store:
         """
         self._refuse_admission_callback_mutation()
         with self._lock:
-            try:
-                self._conn.execute("BEGIN IMMEDIATE")
-                row = self._conn.execute(
-                    "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
-                if row is not None and self._decode(row[0]).revision != record.revision:
-                    self._conn.execute("ROLLBACK")
-                    return False
-                if row is None and record.revision != 0:
-                    self._conn.execute("ROLLBACK")
-                    return False
-                record.revision += 1
-                self._write(record)
-                if retire_descendants:
-                    self._retire_descendants(record)
-                self._conn.execute("COMMIT")
-                return True
-            except sqlite3.DatabaseError as e:
-                self._rollback_quietly()
-                raise StoreUnavailable(f"cannot write continuation store: {e}") from e
+            revision = record.revision
+            for delay in (0.1, 0.3, None):
+                try:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    row = self._conn.execute(
+                        "SELECT data FROM records WHERE identity = ?", (record.identity,)).fetchone()
+                    if row is not None and self._decode(row[0]).revision != record.revision:
+                        self._conn.execute("ROLLBACK")
+                        return False
+                    if row is None and record.revision != 0:
+                        self._conn.execute("ROLLBACK")
+                        return False
+                    record.revision += 1
+                    self._write(record)
+                    if retire_descendants:
+                        self._retire_descendants(record)
+                    self._conn.execute("COMMIT")
+                    return True
+                except sqlite3.OperationalError as e:
+                    self._rollback_quietly()
+                    record.revision = revision
+                    message = str(e).lower()
+                    if delay is not None and "database is locked" in message:
+                        time.sleep(delay)
+                        continue
+                    raise StoreUnavailable(f"cannot write continuation store: {e}") from e
+                except sqlite3.DatabaseError as e:
+                    self._rollback_quietly()
+                    record.revision = revision
+                    raise StoreUnavailable(f"cannot write continuation store: {e}") from e
 
     def transition(self, expected: Record,
                    operation: Callable[[Record], bool], *,
