@@ -31,7 +31,7 @@ from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABE
 from agentflow.notify import notify
 from agentflow.prompts import CONFLICT_REASON
 from agentflow.repo_facts import RepoConfig, intake_allowlist, repo_profile
-from agentflow.review_policy import ReviewState
+from agentflow.review_policy import ReviewState, current_head_author
 from agentflow.reviewer import Verdict
 from agentflow.runner import (_commit_is_on_origin, _run, _worktree_is_disposable,
                               _worktree_is_registered, remove_worktree_if_safe, resettable_head,
@@ -552,8 +552,10 @@ def review_pr(cfg: RepoConfig, pr: int, *, force_same_tool: bool = False,
     except StoreUnavailable:
         return "coordinator state unreadable"
     def head_author(record):
-        if record.target == head and record.change_author_tool in {"claude", "codex"}:
-            return record.change_author_tool
+        if record.target == head:
+            author = current_head_author(record.change_author_tool, record.builder_lineage)
+            if author is not None:
+                return author
         # A bounded reviewer push has durable structured provenance even when the three-pass bail
         # parked before it could open the successor record at that new head.
         verdict = coordinated_review._review_verdict(record)
@@ -631,14 +633,15 @@ def _survivor_head_author(cfg: RepoConfig, issue: int, branch: str) -> str | Non
         record for record in records
         if record.stage == "review" and record.repo == cfg.repo
         and str(record.subject) == str(issue) and record.target == head.stdout.strip()
-        and record.change_author_tool in {"claude", "codex"}
+        and current_head_author(record.change_author_tool, record.builder_lineage) is not None
     ]
     latest = max(
         candidates,
         key=lambda record: (record.review_sequence, record.review_passes,
                             record.created_at, record.identity),
         default=None)
-    return latest.change_author_tool if latest else None
+    return (current_head_author(latest.change_author_tool, latest.builder_lineage)
+            if latest else None)
 
 
 def _merge_autonomous_survivor(cfg: RepoConfig, pr: int, n: int, sl: str,

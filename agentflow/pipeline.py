@@ -41,7 +41,7 @@ from agentflow.gate import MAX_REVISES, revise_round_budget_remains
 from agentflow.labels import BUILDING, DRAWING, RESOLVING, TRIAGING
 from agentflow.pr_park import park_pr
 from agentflow.repo_facts import repo_profile
-from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
+from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX, current_head_author
 from agentflow.stage_worktree import worktree_ready
 from agentflow.worktree_ref import source_facts
 
@@ -791,8 +791,8 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
     acceptance, surfaces = context
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
-    author = build.change_author_tool
-    if author not in {"claude", "codex"}:
+    author = current_head_author(build.change_author_tool, build.builder_lineage)
+    if author is None:
         coord.park_completed(build_identity)  # do not infer the head author from its branch lane
         return
     assignment, _changed_files = coordinated_review._review_assignment_facts(
@@ -1013,8 +1013,8 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
     conflict_resolution = bool(revise.conflict_round)
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
-    author = revise.change_author_tool
-    if author not in {"claude", "codex"}:
+    author = current_head_author(revise.change_author_tool, revise.builder_lineage)
+    if author is None:
         coord.park_completed(revise_identity)  # no durable author for this exact head
         return
     inherited = ReviewState.from_record(revise)

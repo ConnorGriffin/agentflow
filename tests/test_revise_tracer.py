@@ -1321,10 +1321,10 @@ def test_completed_revise_selects_against_its_recorded_head_author(monkeypatch):
     assert submitted[0].review.change_author_tool == "codex"
 
 
-def test_completed_revise_without_a_head_author_parks_for_a_maintainer(monkeypatch):
+def test_completed_revise_without_a_known_head_author_parks_for_a_maintainer(monkeypatch):
     revise = Record(
         identity="unknown-author", stage="revise", pool="claude", demand=3,
-        repo="o/r", subject="7", target="old", builder_lineage="claude",
+        repo="o/r", subject="7", target="old", builder_lineage="unreadable",
         source="/work/.agentflow/worktrees/claude/issue-7-fix")
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [revise])
     monkeypatch.setattr(

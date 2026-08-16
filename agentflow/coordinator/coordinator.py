@@ -49,7 +49,7 @@ from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, reco
 from agentflow.routing import routing
 from agentflow.coordinator.verification import (
     VERIFIED, miss_summary, refusal_expected, refusal_stalls, unprepared)
-from agentflow.review_policy import ReviewState
+from agentflow.review_policy import ReviewState, current_head_author
 
 # The observe-until window a recovered running attempt is logged against (ADR 0028's
 # supervisor deadline). Stored on the record at admission so a fresh coordinator reports a
@@ -334,9 +334,9 @@ class Coordinator:
         lineage = (submission.pool if stage == "review"
                    else (submission.builder_lineage or submission.pool
                          if stage in LINEAGE_PINNED else None))
-        current_author = review.change_author_tool
-        auto_merge = (current_author in {"claude", "codex"}
-                      and submission.pool != current_author)
+        current_author = current_head_author(
+            review.change_author_tool, submission.builder_lineage)
+        auto_merge = current_author is not None and submission.pool != current_author
         record = Record(
             identity=identity, stage=stage, pool=submission.pool,
             repo=submission.repo, subject=str(submission.subject), target=submission.target,
@@ -1233,9 +1233,9 @@ class Coordinator:
             record.route_id = route.route_id
             record.route_cell_digest = route.route_cell_digest
             record.launch_config_digest = route.launch_config_digest
-        current_author = record.change_author_tool
-        record.auto_merge_allowed = (current_author in {"claude", "codex"}
-                                     and dest_pool != current_author)
+        current_author = current_head_author(
+            record.change_author_tool, record.builder_lineage)
+        record.auto_merge_allowed = current_author is not None and dest_pool != current_author
         if record.stage in LINEAGE_PINNED:
             record.lineage = dest_pool
             record.source = _repool_source(record.source, dest_pool)

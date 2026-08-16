@@ -26,9 +26,10 @@ head and the other tool reviews it.
 **Amendment (#515): the current author is the durable exact-head provenance fact, never the
 branch lane or the pool that opened an earlier stage.** A Build or Revise records its accountable
 session lead as it opens; a reviewer push records that reviewer as the new head's author. Every
-later reviewer selection reads that fact. If it is missing or unreadable, Agentflow must not claim
-cross-tool coverage: it parks the affected completed or diverged review for a maintainer instead
-of inferring authorship from the branch name.
+later reviewer selection reads that fact, falling back only for pre-session-led records to their
+durable `builder_lineage`. If neither field names a known tool, Agentflow must not claim cross-tool
+coverage: it parks the affected completed or diverged review for a maintainer instead of inferring
+authorship from the branch name.
 
 - The **builder** self-reviews and flags what it's unsure of, but its own sign-off
   never gates a merge.

@@ -62,6 +62,22 @@ _FULL_CONTEXT_RE = re.compile(
 )
 
 
+def current_head_author(change_author_tool: str | None,
+                        builder_lineage: str | None) -> str | None:
+    """Return the recorded author of the current head, including legacy lineage.
+
+    ``change_author_tool`` is the exact-head fact written by session-led dispatch.  Records
+    created before that fact existed used ``builder_lineage`` for the build pool that authored
+    their head.  A branch name is never a substitute.  Unknown provenance stays unknown so the
+    caller can park rather than falsely record cross-tool coverage.
+    """
+    if change_author_tool in {"claude", "codex"}:
+        return change_author_tool
+    if builder_lineage in {"claude", "codex"}:
+        return builder_lineage
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class DepthAssignment:
     depth: ReviewDepth

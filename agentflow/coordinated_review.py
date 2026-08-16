@@ -46,6 +46,7 @@ from agentflow.pr_park import (chain_uncertainty, exact_head_review_chain, park_
                                park_proof_marker)
 from agentflow.prompts import UI_GAP_REASON, stage_prompt_spec
 from agentflow.repo_facts import repo_profile, surface_declaration, surfaces_phrase, ui_surfaces
+from agentflow.review_policy import current_head_author
 from agentflow.reviewer import review_worktree
 from agentflow.routing import routing
 from agentflow.runner import _run, codex_spent_at_render, remove_worktree_if_safe
@@ -192,8 +193,8 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
         surfaces=surfaces or "any user-facing surface")
     state = review or ReviewState()
     assignment = state.assignment
-    author = build_record.change_author_tool
-    if author not in BUILD_POOLS:
+    author = current_head_author(build_record.change_author_tool, build_record.builder_lineage)
+    if author is None:
         return None
     brief = with_review_assignment(
         brief,
@@ -243,8 +244,8 @@ def conflict_decision_review_submission(revise_record, *, head_sha: str, pr_numb
             revise_record.outcome[len(CONFLICT_UNCERTAINTY_PREFIX):])
     except json.JSONDecodeError:
         return None
-    author = revise_record.change_author_tool
-    if author not in BUILD_POOLS:
+    author = current_head_author(revise_record.change_author_tool, revise_record.builder_lineage)
+    if author is None:
         return None
     reviewer_tool = other_tool(author)
     if reviewer_tool is None:
@@ -394,8 +395,8 @@ def review_axis_successor_submission(review_record, verdict, *, axis=None, tool=
         key=lambda value: ("focused", "targeted", "full").index(value.value))
     reason = (verdict.depth_reason if verdict.depth != prior.assignment.depth
               else prior.assignment.reason)
-    author = prior.change_author_tool
-    if author not in BUILD_POOLS:
+    author = current_head_author(prior.change_author_tool, review_record.builder_lineage)
+    if author is None:
         return None
     session_lead = has_session_lead_provenance(review_record)
     prompt = _with_durable_review_assignment(
@@ -436,8 +437,8 @@ def tainted_review_submission(review_record, reviewer_tool: str):
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState)
 
     facts = review_source_facts(review_record)
-    author = review_record.change_author_tool
-    if (author not in BUILD_POOLS or facts is None or not review_record.target
+    author = current_head_author(review_record.change_author_tool, review_record.builder_lineage)
+    if (author is None or facts is None or not review_record.target
             or reviewer_tool == author):
         return None
     prior = ReviewState.from_record(review_record)
@@ -495,8 +496,8 @@ def decision_resume_review_submission(review_record, reviewer_tool: str, *, targ
         ReviewAssignment, ReviewAxis, ReviewDepth, ReviewState, decision_answer_handoff)
 
     facts = review_source_facts(review_record)
-    author = review_record.change_author_tool
-    if (author not in BUILD_POOLS or facts is None or not review_record.target or not target
+    author = current_head_author(review_record.change_author_tool, review_record.builder_lineage)
+    if (author is None or facts is None or not review_record.target or not target
             or not answer.strip()):
         return None
     prior = ReviewState.from_record(review_record)
@@ -851,9 +852,9 @@ def resume_answered_review(cfg, coordinator, pr: int, *, comment: str, target: s
             # answer either.
             return (f"#{issue}: an exact-head review already owns this issue — deferring the "
                     f"answered decision on PR #{pr}")
-        author = record.change_author_tool
+        author = current_head_author(record.change_author_tool, record.builder_lineage)
         source_facts = review_source_facts(record)
-        if author not in BUILD_POOLS or source_facts is None:
+        if author is None or source_facts is None:
             return None            # no lineage to resume — the park stays the human's move
         reviewer_tool = pick_reviewer(
             author, allow_same_tool=repo_profile(source_facts[0]) != "autonomous")
@@ -1094,7 +1095,8 @@ def _settle_review(record) -> str | None:
         # once when the auto-revise rounds are spent (#208).
         return None
 
-    if record.change_author_tool not in BUILD_POOLS:
+    author = current_head_author(record.change_author_tool, record.builder_lineage)
+    if author is None:
         return _park_review_settlement(
             record, verdict, workdir, pr, reason="current head author is unreadable",
             autonomous=autonomous)
@@ -1202,7 +1204,7 @@ def _settle_review(record) -> str | None:
     # never reaches it (the gate above owns red), so no revise round churns here.
     decision = decide_merge(
         verdict=verdict, ci_green=ci_green, reviewer_tool=record.pool,
-        builder_tool=record.change_author_tool,
+        builder_tool=author,
         revises_used=record.round,
         ui_evidence_missing=ui_gap, reply_pending=pending_reply)
     if decision is not MergeDecision.MERGE:
@@ -1337,8 +1339,8 @@ def _moved_head_review_submission(record, head_sha: str):
     from agentflow.coordinator import Submission
     from agentflow.review_policy import ReviewState
     facts = review_source_facts(record)
-    author = record.change_author_tool
-    if facts is None or not head_sha or author not in BUILD_POOLS:
+    author = current_head_author(record.change_author_tool, record.builder_lineage)
+    if facts is None or not head_sha or author is None:
         return None
     workdir, pr = facts
     slug = _review_slug(record)
@@ -1451,7 +1453,7 @@ def _resettle_diverged_reviews(coord: Coordinator) -> None:
                 _kill_running_family(record)
             coord.park_stale_review(record.identity)
             continue
-        if record.change_author_tool not in BUILD_POOLS:
+        if current_head_author(record.change_author_tool, record.builder_lineage) is None:
             if record.state == RUNNING:
                 _kill_running_family(record)
             coord.park_stale_review(record.identity)
@@ -1489,8 +1491,8 @@ def _resume_tainted_reviews(coord: Coordinator) -> None:
         pr_facts = _review_pr_facts(record)
         if pr_facts is None or pr_facts["state"] != "OPEN" or pr_facts["head"] != record.target:
             continue
-        author = record.change_author_tool
-        if author not in BUILD_POOLS:
+        author = current_head_author(record.change_author_tool, record.builder_lineage)
+        if author is None:
             continue
         reviewer_tool = pick_reviewer(author, allow_same_tool=False)
         if reviewer_tool is None:
