@@ -1189,7 +1189,9 @@ class Coordinator:
             record.state = WAITING
             self._persist(record)
             return
-        record.family = family or record.family
+        # The child may have expanded the durable supervisor pid to the complete provider family
+        # after the launcher formed its result. Prefer the fresh durable value over that snapshot.
+        record.family = record.family or family
         was_continuation = record.continuation
         self._consume_attempt(record)
         if not self._persist(record):

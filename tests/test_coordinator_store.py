@@ -615,13 +615,17 @@ def test_child_start_and_disown_are_mutually_exclusive(tmp_path):
     # The child wins the race: it records started before the coordinator gives up.
     store.upsert(Record("R-win", "review", "codex", 2, state="running", launch_token="T1"))
     assert store.child_start("R-win", "T1", 4242) is True
-    assert store.disown_launch("R-win", "T1") == (STARTED, "4242")
+    assert store.child_start("R-win", "T1", 4343) is False
+    assert store.child_provider_group("R-win", "T1", 4343, 4444) is False
+    assert store.child_provider_group("R-win", "T1", 4242, 4444) is True
+    assert store.disown_launch("R-win", "T1") == (STARTED, "4242:4444")
 
     # The timeout wins the race: disown rotates the token first, so an uncancelled child's
     # late guarded write is refused and no unreserved, uncounted provider can start.
     store.upsert(Record("R-lose", "review", "codex", 2, state="running", launch_token="T2"))
     assert store.disown_launch("R-lose", "T2") == (NOT_STARTED, None)
     assert store.child_start("R-lose", "T2", 5252) is False
+    assert store.child_provider_group("R-lose", "T2", 5252, 5353) is False
     reread = store.record_of("R-lose")
     assert reread.start_fact != STARTED and reread.family is None
 

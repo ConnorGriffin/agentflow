@@ -501,6 +501,38 @@ def test_real_supervisor_preserves_partial_output_signal_and_timeout(coord_state
     assert observation.cause is ProviderCause.TIMEOUT
 
 
+def test_forced_provider_stop_preserves_durable_timeout_result(coord_state):
+    """A provider that ignores SIGTERM is force-stopped without killing the result writer."""
+    from agentflow.coordinator.providers import ClaudeProviderAdapter
+    from agentflow.coordinator.store import Store, default_store_path
+
+    script = (
+        "import signal,time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "print('ignoring SIGTERM', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    provider = lambda _record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(provider, timeout=5, session_timeout=0.5))
+    identity = coord.submit_stage(review(subject="forced-timeout", pool="claude"))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 7
+    while time.monotonic() < deadline:
+        record = Store(default_store_path()).load()[identity]
+        if not pid_family_alive(record.family):
+            break
+        time.sleep(0.02)
+    else:
+        pytest.fail("force-stopped provider family did not finish")
+
+    observation = ClaudeProviderAdapter().observe(record)
+    assert observation.has_end_fact is True
+    assert observation.timed_out is True
+    assert observation.exit_status is None and observation.signal == signal.SIGKILL
+    assert observation.cause is ProviderCause.TIMEOUT
+
+
 def _wait_for_real_child(identity: str, message: str):
     from agentflow.coordinator.store import Store, default_store_path
 
@@ -866,16 +898,21 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
         def child_start(self, identity, token, family):
             return True
 
+        def child_provider_group(self, identity, token, supervisor_pid, provider_pgid):
+            return True
+
         def close(self):
             pass
 
     class Provider:
         pid = 123
 
-        def __init__(self, *args, **kwargs):
-            output = kwargs["stdout"]
+        def __init__(self, _provider, output):
             output.write(json.dumps(started) + "\n")
             output.flush()
+
+        def release(self):
+            pass
 
         def wait(self, timeout=None):
             if timeout is None or clock.now + timeout >= 0.22:
@@ -920,7 +957,7 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
     monkeypatch.setattr(_launch_child, "_head", lambda _working_dir: None)
     monkeypatch.setattr(_launch_child, "_worktree_snapshot", snapshot)
     monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
-    monkeypatch.setattr(_launch_child.subprocess, "Popen", Provider)
+    monkeypatch.setattr(_launch_child, "_spawn_provider", Provider)
     monkeypatch.chdir(tmp_path)
 
     args = [str(store_path), "attempt", "token", "5", "--build-lease", "codex",
@@ -1449,11 +1486,17 @@ def _run_clocked_supervisor(
         def child_start(self, identity, token, family):
             return True
 
+        def child_provider_group(self, identity, token, supervisor_pid, provider_pgid):
+            return True
+
         def close(self):
             pass
 
     class Provider:
         pid = 123
+
+        def release(self):
+            pass
 
         def wait(self, timeout=None):
             assert timeout is not None
@@ -1484,7 +1527,8 @@ def _run_clocked_supervisor(
     monkeypatch.setattr(_launch_child, "_clear_active", lambda _marker: None)
     monkeypatch.setattr(_launch_child, "_head", head)
     monkeypatch.setattr(_launch_child, "time", SimpleNamespace(monotonic=clock))
-    monkeypatch.setattr(_launch_child.subprocess, "Popen", lambda *args, **kwargs: Provider())
+    monkeypatch.setattr(_launch_child, "_spawn_provider",
+                        lambda _provider, _output: Provider())
     monkeypatch.chdir(tmp_path)
 
     silent, test_grace, absolute = build_lease
@@ -1993,18 +2037,18 @@ def _delay_supervisor_wait(
     wait_marker = ""
     if wait_returned_marker is not None:
         wait_marker = (
-            "  pathlib.Path(os.environ['AGENTFLOW_TEST_WAIT_RETURNED_MARKER']).write_text(str(timeout))\n")
+            "  pathlib.Path(os.environ['AGENTFLOW_TEST_WAIT_RETURNED_MARKER']).write_text('waited')\n")
     sitecustomize = (
-        "import os,subprocess,time\n"
+        "import os,time\n"
         + instrumentation
-        + "_wait=subprocess.Popen.wait\n"
-        "def wait(self,timeout=None):\n"
-        " result=_wait(self,timeout=timeout)\n"
-        " if timeout is not None:\n"
+        + "_waitpid=os.waitpid\n"
+        "def waitpid(pid,options):\n"
+        " result=_waitpid(pid,options)\n"
+        " if result[0] and options & os.WNOHANG:\n"
         + wait_marker
         + "  time.sleep(float(os.environ['AGENTFLOW_TEST_WAIT_DELAY']))\n"
         " return result\n"
-        "subprocess.Popen.wait=wait\n")
+        "os.waitpid=waitpid\n")
     (custom / "sitecustomize.py").write_text(sitecustomize)
     monkeypatch.setenv("AGENTFLOW_TEST_WAIT_DELAY", str(delay))
     if decoded_marker is not None:
@@ -2155,7 +2199,7 @@ def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord
 
     record = Store(default_store_path()).load()[identity]
     assert pid_family_alive(record.family)
-    os.kill(int(record.family), signal.SIGTERM)
+    os.kill(int(record.family.split(":", 1)[0]), signal.SIGTERM)
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -2169,6 +2213,58 @@ def test_real_supervisor_forwards_reconciler_sigterm_to_its_provider_group(coord
     observation = ClaudeProviderAdapter().observe(record)
     assert observation.signal in {15, 9}
     assert observation.timed_out is False
+
+
+def test_recovery_keeps_a_provider_after_its_supervisor_is_killed(coord_state, tmp_path):
+    """Killing the detached supervisor cannot make its still-running provider re-launch."""
+    from agentflow.coordinator.store import Store, default_store_path
+
+    provider_pid = tmp_path / "provider-pid"
+    script = (
+        "import os,pathlib,sys,time\n"
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+        "time.sleep(30)\n"
+    )
+    launched = []
+
+    class RecoveryLauncher:
+        @staticmethod
+        def is_alive(family):
+            return LocalLauncher.is_alive(family)
+
+        def start(self, *_args):
+            launched.append(True)
+            return pytest.fail("recovery launched a second provider")
+
+    coord = Coordinator(
+        launcher=LocalLauncher(
+            lambda _record: [sys.executable, "-c", script, str(provider_pid)],
+            timeout=5, session_timeout=30),
+        daemon_generation="daemon-before-kill")
+    identity = coord.submit_stage(review(subject="supervisor-killed", pool="claude"))
+    coord.cycle("claude")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and not provider_pid.exists():
+        time.sleep(0.02)
+    assert provider_pid.exists(), "provider never started"
+    record = Store(default_store_path()).load()[identity]
+    supervisor_pid, provider_group = map(int, record.family.split(":"))
+    assert supervisor_pid != provider_group
+    assert os.getpgid(int(provider_pid.read_text())) == provider_group
+    try:
+        os.kill(supervisor_pid, signal.SIGKILL)
+        assert pid_family_alive(record.family), "provider group vanished with its supervisor"
+        recovered = Coordinator(launcher=RecoveryLauncher(), daemon_generation="daemon-after-kill")
+        assert recovered.cycle("claude") == []
+        assert launched == []
+        durable = Store(default_store_path()).load()[identity]
+        assert durable.state == "running" and durable.process_alive
+    finally:
+        try:
+            os.killpg(provider_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
 
 def test_real_supervisor_remembers_sigterm_from_provider_spawn(coord_state):
@@ -2222,11 +2318,17 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
         def child_start(self, identity, token, family):
             return True
 
+        def child_provider_group(self, identity, token, supervisor_pid, provider_pgid):
+            return True
+
         def close(self):
             pass
 
     class Provider:
         pid = 123
+
+        def release(self):
+            pass
 
         def wait(self, timeout=None):
             return 0
@@ -2246,7 +2348,7 @@ def test_child_stop_permission_denial_records_a_durable_reason(tmp_path, monkeyp
         handlers[signal.SIGTERM](signal.SIGTERM, None)
         return Provider()
 
-    monkeypatch.setattr(_launch_child.subprocess, "Popen", start_provider)
+    monkeypatch.setattr(_launch_child, "_spawn_provider", start_provider)
     monkeypatch.setattr(_launch_child.os, "killpg",
                         lambda _pid, _signum: (_ for _ in ()).throw(PermissionError()))
     monkeypatch.chdir(tmp_path)
@@ -2307,7 +2409,7 @@ def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, mo
         path = tmp_path / "records.db"
 
         def record_of(self, _identity):
-            return SimpleNamespace(start_fact=STARTED, launch_token="token", family="123")
+            return SimpleNamespace(start_fact=STARTED, launch_token="token", family="123:456")
 
     record = SimpleNamespace(identity="attempt", launch_token="token", stage="review",
                              source=str(source))
@@ -2321,7 +2423,7 @@ def test_local_launcher_passes_only_the_inherited_worktree_sentinel(tmp_path, mo
     result = launcher_mod.LocalLauncher(lambda _record: ["provider"], timeout=1,
                                         session_timeout=5).start(record, Store())
 
-    assert result.family == "123"
+    assert result.family == "123:456"
     assert observed["cwd"] == str(source)
     assert _launch_child._INHERITED_WORKTREE in observed["argv"]
     assert str(source) not in observed["argv"]

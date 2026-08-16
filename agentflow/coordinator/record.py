@@ -101,7 +101,7 @@ class Record:
     start_fact: str | None = None        # durable launcher handshake result: started | not_started
     launch_token: str | None = None      # nonce a reservation stamps; only the child holding it may record `started`
     revision: int = 0                    # optimistic concurrency generation; every durable write advances it
-    family: str | None = None            # the provider process-family identity a `started` carries
+    family: str | None = None            # durable supervisor:provider-group identity (legacy: pid)
     process_alive: bool = False          # whether that family is still executing
     descendants: set[str] = field(default_factory=set)  # subagents charged to the root reservation
     handoffs: int = 0

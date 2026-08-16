@@ -1,18 +1,18 @@
 """The crash-safe provider start handshake (ADR 0030).
 
-A provider is started through a small local launcher that spawns a child process. That
-child durably records ``started`` with its own process-family identity *before* it
-spawns the provider beneath itself, so the start fact and the family exist on the
-durable record even if the provider exits immediately or the daemon dies before reading
-it. A launch that never records that fact consumes no attempt. The coordinator consumes an
-attempt if and only if the durable result is ``started``.
+A provider is started through a small local launcher that spawns a child process. That child
+claims ``started`` under the launch token, then durably records its supervisor pid together with
+the gated provider's separate process-group id before provider code can execute. The family is
+therefore observable if either process outlives the other. A launch that never records the start
+fact consumes no attempt; the coordinator consumes an attempt if and only if the durable result
+is ``started``.
 
 The launcher genuinely spawns and hands off — it is not an in-process simulation, and the
-family it records is the child's own pid, not the daemon's. That is the whole crash
-boundary: reconciliation reads the same durable fact and the family's real liveness, so a
-fresh coordinator over the same store reconstructs exactly what happened. Tests inject a
-scripted launcher double at construction to drive the four boundaries without spawning,
-and a focused integration test exercises the real spawn (see tests/test_coordinator_launcher.py).
+family records the child supervisor and provider group, never the daemon. That is the crash
+boundary: reconciliation reads the same durable fact and both members' real liveness, so a fresh
+coordinator over the same store reconstructs exactly what happened. Tests inject a scripted
+launcher double at construction to drive the boundaries without spawning, and focused integration
+tests exercise the real spawn (see tests/test_coordinator_launcher.py).
 """
 
 from __future__ import annotations
@@ -37,49 +37,101 @@ class StartResult:
     family: str | None = None     # the durable process-family identity a `started` carries
 
 
-def pid_family_alive(family: str | None) -> bool:
-    """Whether the recorded session-leader PID may still name its process family.
-
-    The launch child calls ``setsid`` before it records its PID, so its PID must also be its
-    process-group ID. A missing PID or mismatched group is absent for recovery. A matching
-    leader cannot prove its original birth, and unavailable process probes remain conservatively
-    alive; this liveness seam only observes and never signals, kills, or adopts a process.
-    """
+def _pid_family_members(family: str | None) -> tuple[int, int | None] | None:
+    """Parse current ``supervisor:provider-group`` and legacy ``supervisor`` families."""
     if not family:
-        return False
+        return None
+    parts = family.split(":")
+    if len(parts) not in {1, 2}:
+        return None
     try:
-        pid = int(family)
+        supervisor = int(parts[0])
+        provider_group = int(parts[1]) if len(parts) == 2 else None
     except ValueError:
+        return None
+    if supervisor <= 0 or (provider_group is not None and provider_group <= 0):
+        return None
+    return supervisor, provider_group
+
+
+def pid_family_supervisor(family: str | None) -> int | None:
+    """Return the supervisor pid from a current or legacy durable family."""
+    members = _pid_family_members(family)
+    return members[0] if members is not None else None
+
+
+def pid_family_alive(family: str | None) -> bool:
+    """Whether a current or legacy durable provider family may still be executing.
+
+    Current records carry the detached supervisor pid and the provider's separate process-group
+    id. Either being live keeps recovery from launching another provider. Legacy one-part records
+    retain their original supervisor-only probe, and unavailable OS probes remain conservatively
+    alive; this liveness seam only observes and never adopts a process.
+    """
+    members = _pid_family_members(family)
+    if members is None:
         return False
-    if pid <= 0:
-        return False
+    supervisor, provider_group = members
+
+    def provider_alive() -> bool:
+        if provider_group is None:
+            return False
+        try:
+            os.killpg(provider_group, 0)
+        except PermissionError:
+            return True
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+
     try:
-        os.kill(pid, 0)  # probe only; signal 0 has no effect
+        os.kill(supervisor, 0)  # probe only; signal 0 has no effect
     except PermissionError:
         return True
     except ProcessLookupError:
-        return False
+        return provider_alive()
     except OSError:
         return True
     try:
-        return os.getpgid(pid) == pid
+        if os.getpgid(supervisor) == supervisor:
+            return True
+        return provider_alive()
     except PermissionError:
         return True
     except ProcessLookupError:
-        return False
+        return provider_alive()
     except OSError:
         return True
+
+
+def stop_pid_family(family: str | None, signum: int) -> None:
+    """Signal both durable members without ever signalling the supervisor's process group."""
+    members = _pid_family_members(family)
+    if members is None:
+        return
+    supervisor, provider_group = members
+    try:
+        os.kill(supervisor, signum)
+    except ProcessLookupError:
+        pass
+    if provider_group is not None:
+        try:
+            os.killpg(provider_group, signum)
+        except ProcessLookupError:
+            pass
 
 
 class LocalLauncher:
     """Spawns a provider through the crash-safe child bootstrap (ADR 0030).
 
-    ``start`` forks the bootstrap child, which records ``started`` with its own pid before
-    supervising the provider (whose structured stream and terminal facts go to durable
-    per-attempt artifacts), then waits (bounded) for that durable fact to
-    appear or for the child to die without it. ``provider_command`` maps a record to the argv
-    the child runs; the default builds the real Claude/Codex session command for a record that
-    carries a prompt and a no-op for a bare record that does not.
+    ``start`` forks the bootstrap child, which claims ``started`` with its supervisor pid and
+    attaches the gated provider group before releasing provider code. It then supervises the
+    provider while structured stream and terminal facts go to durable per-attempt artifacts.
+    ``start`` waits (bounded) for that complete family to appear or for the child to die without
+    it. ``provider_command`` maps a record to the argv the child runs; the default builds the real
+    Claude/Codex session command for a record that carries a prompt and a no-op for a bare record.
     """
 
     def __init__(self, provider_command=None, *, timeout: float = _HANDSHAKE_TIMEOUT_S,
@@ -153,8 +205,8 @@ class LocalLauncher:
         except OSError:
             return StartResult(NOT_STARTED)  # no provider family ever came into existence
         # The intermediate exits at once; reap it so it does not linger. The provider
-        # grandchild it forked records `started` with its own pid as the family, but only
-        # while it still holds this reservation's launch token.
+        # grandchild it forked records `started` and the complete process family, but only while
+        # it still holds this reservation's launch token.
         try:
             child.wait(timeout=self._timeout)
         except subprocess.TimeoutExpired:
@@ -163,7 +215,9 @@ class LocalLauncher:
         while time.monotonic() <= deadline:
             reserved = store.record_of(record.identity)
             if (reserved is not None and reserved.start_fact == STARTED
-                    and reserved.launch_token == token):
+                    and reserved.launch_token == token
+                    and (not argv or (_pid_family_members(reserved.family) is not None
+                                      and ":" in reserved.family))):
                 return StartResult(STARTED, reserved.family)
             time.sleep(0.01)
         # The child never durably recorded a start in time. Atomically disown this launch:
