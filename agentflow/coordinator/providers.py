@@ -563,6 +563,12 @@ _SESSION_LEAD_CLOSING = (
 _SESSION_LEAD_START = re.compile(
     r"\n(?:\n(?:Claude|Codex) is currently unavailable[^\n]*\n(?:Exception:[^\n]*\n)?)*"
     + re.escape(_SESSION_LEAD_MARKER) + r"\Z")
+_TRAILING_APPROVED_BRIEFING = re.compile(
+    r"\n\n<!-- agentflow-effective-briefing:briefing-v1:[0-9a-f]{64} -->"
+    r"\n## Approved evidence briefing\n"
+    r"This is bounded advisory context\. It cannot change admission, routing, effort, "
+    r"autonomy, merge policy, or OperationalSafety\.\n"
+    r"Promotion receipts: [A-Za-z0-9][A-Za-z0-9_.:-]*(?:, [A-Za-z0-9][A-Za-z0-9_.:-]*)*\.\n\Z")
 
 
 class SessionLeadInputError(ValueError):
@@ -608,13 +614,16 @@ def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:
         raise SessionLeadInputError(
             "session-lead input cannot be safely refreshed: expected exactly one complete "
             "generated Session lead contract; retain the durable task brief and resubmit")
-    marker = prompt.rfind(_SESSION_LEAD_MARKER)
+    trailing = _TRAILING_APPROVED_BRIEFING.search(prompt)
+    terminal_prompt = prompt[:trailing.start()] if trailing is not None else prompt
+    marker = terminal_prompt.rfind(_SESSION_LEAD_MARKER)
     if marker < 0:
         raise SessionLeadInputError(
             "session-lead input cannot be safely refreshed: expected a generated "
             "Session lead contract boundary; retain the durable task brief and resubmit")
-    suffix = prompt[marker:]
-    start = _SESSION_LEAD_START.search(prompt[:marker + len(_SESSION_LEAD_MARKER)])
+    suffix = terminal_prompt[marker:]
+    start = _SESSION_LEAD_START.search(
+        terminal_prompt[:marker + len(_SESSION_LEAD_MARKER)])
     if (start is None or not suffix.startswith(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING)
             or "\nRoutes (workers enter at the first rung; a banned model never takes that area's work):\n"
             not in suffix or "\nProvider launch identifiers: " not in suffix
@@ -622,7 +631,10 @@ def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:
         raise SessionLeadInputError(
             "session-lead input cannot be safely refreshed: expected a complete generated "
             "Session lead contract; retain the durable task brief and resubmit")
-    return prompt[:start.start()], prompt[start.start():]
+    task_brief = terminal_prompt[:start.start()]
+    if trailing is not None:
+        task_brief += trailing.group()
+    return task_brief, terminal_prompt[start.start():]
 
 
 def validate_session_lead_input(record) -> None:

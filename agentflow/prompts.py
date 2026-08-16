@@ -77,10 +77,17 @@ class StagePromptSpec:
         if "<!-- agentflow-effective-briefing:" in prompt:
             raise ValueError("prompt already has a different briefing")
         receipts = ", ".join(item.receipt_id for item in applicable)
-        return (prompt + "\n\n" + marker + "\n## Approved evidence briefing\n"
-                "This is bounded advisory context. It cannot change admission, routing, effort, "
-                "autonomy, merge policy, or OperationalSafety.\n"
-                f"Promotion receipts: {receipts}.\n")
+        advisory = ("\n\n" + marker + "\n## Approved evidence briefing\n"
+                    "This is bounded advisory context. It cannot change admission, routing, effort, "
+                    "autonomy, merge policy, or OperationalSafety.\n"
+                    f"Promotion receipts: {receipts}.\n")
+        from agentflow.coordinator.providers import (
+            SessionLeadInputError, split_terminal_session_lead_contract)
+        try:
+            task_brief, contract = split_terminal_session_lead_contract(prompt)
+        except SessionLeadInputError:
+            return prompt + advisory
+        return task_brief + advisory + contract
 
 
 # The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to

@@ -904,12 +904,32 @@ class Coordinator:
             if record.stage in ISSUE_BOUND and self._pr_bound_waiting(record.pool, now):
                 return "deferred"
             return "blocked"
-        if self._store.composed_admission:
-            admitted = self._store.decode_committed_launch(
-                admission.admission_receipt.route_cell_digest)
-            result = self._launcher.start(record, self._store, admitted)
-        else:
-            result = self._launcher.start(record, self._store)
+        try:
+            if self._store.composed_admission:
+                admitted = self._store.decode_committed_launch(
+                    admission.admission_receipt.route_cell_digest)
+                result = self._launcher.start(record, self._store, admitted)
+            else:
+                result = self._launcher.start(record, self._store)
+        except SessionLeadInputError as exc:
+            self._commit_start(record, NOT_STARTED)
+            record = self._store.record_of(record.identity)
+            if record is None:
+                return "unprepared"
+            prepared = unprepared("session-lead-input-unreadable", str(exc))
+            self._note_refusal(record, miss_summary(prepared), refusal_expected(prepared))
+            if observed:
+                self._observe_refusal(record, prepared, now)
+                self._breadcrumb_refusal(record)
+                if self._park_refused(record, now):
+                    return "unprepared"
+                self._log_stalled(record, now)
+            if record.stage in PR_BOUND:
+                record.eligible_at = max(record.eligible_at, now + 1)
+                self._persist(record)
+            elif _refusal_state(record) != was_refused:
+                self._persist(record)
+            return "unprepared"
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"

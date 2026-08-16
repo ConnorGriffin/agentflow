@@ -67,6 +67,16 @@ class CapturingSession(ProgressingSession):
         return super().start(record, store)
 
 
+class ContractRejectingSession(CapturingSession):
+    """Reproduces a launch boundary that discovers a malformed refreshed prompt."""
+
+    def start(self, record, store):
+        if record.subject == "bad":
+            record.input_ptr = (record.input_ptr or "") + "\nnot an approved briefing"
+            providers.provider_command(record)
+        return super().start(record, store)
+
+
 def _review(subject: str = "7", pool: str = "claude", **kw) -> Submission:
     return Submission(repo="o/r", subject=subject, stage="review", pool=pool, **kw)
 
@@ -90,8 +100,9 @@ def _observed_529_brief(prefix: str = _TASK_PREFIX) -> str:
     return prefix + _stale_native_helper_contract()
 
 
-def _submit_codex_session_lead(coord, stale: str, native_helpers_marker: str | None) -> str:
-    identity = coord.submit_stage(_build(
+def _submit_codex_session_lead(coord, stale: str, native_helpers_marker: str | None,
+                                   subject: str = "7") -> str:
+    identity = coord.submit_stage(_build(subject,
         pool="codex", input_ptr=stale, source="/wt/issue-529",
         session_lead=native_helpers_marker is None))
     if native_helpers_marker is not None:
@@ -202,6 +213,23 @@ def test_unproven_or_incomplete_session_lead_input_refuses_before_provider_start
     assert record.attempts == 0
     assert record.refusal.startswith("session-lead-input-unreadable:")
     assert record.input_ptr == task_text
+
+
+def test_launch_time_session_lead_refusal_keeps_the_cycle_moving(make_coord):
+    fake = ContractRejectingSession()
+    coord = make_coord(fake)
+    bad = _submit_codex_session_lead(coord, _observed_529_brief(), None, "bad")
+    healthy = coord.submit_stage(_build(
+        "healthy", pool="codex", input_ptr="Build the healthy task.", source="/wt/healthy"))
+
+    assert coord.cycle("codex") == []
+
+    refused = record_of(coord, bad)
+    started = record_of(coord, healthy)
+    assert refused.state == "waiting" and refused.claim and refused.attempts == 0
+    assert refused.refusal.startswith("session-lead-input-unreadable:")
+    assert started.state == "running" and started.attempts == 1
+    assert permits(coord, "codex") == started.demand
 
 
 # --- clean exit, missing outcome: one targeted repair, then park -------------------------
