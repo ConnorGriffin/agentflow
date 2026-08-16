@@ -345,6 +345,23 @@ def test_provider_command_unwraps_the_versioned_durable_prompt(monkeypatch):
     assert prompts == ["ground the issue"]
 
 
+def test_repair_keeps_valid_single_contract_raw_and_enveloped_inputs_byte_identical():
+    from agentflow.coordinator.providers import repair_provider_input
+    from agentflow.routing import routing
+
+    prompt = "Keep the exact durable task.\n" + routing.session_lead_instructions(
+        "build", "low", parent_provider="claude")
+    envelope = json.dumps({
+        "format": PROVIDER_INPUT_V1,
+        "prompt": prompt,
+        "snapshot": {"body": "exact durable bytes", "number": 7},
+        "source_ref": "abc123",
+    }, sort_keys=True)
+
+    assert repair_provider_input(prompt) == prompt
+    assert repair_provider_input(envelope) == envelope
+
+
 def test_provider_adapters_observe_from_durable_session_artifacts(tmp_path, monkeypatch):
     """Each production adapter reconstructs the full observation from a launched attempt's
     durable events + exit artifacts. Claude reads its structured stream; Codex reads only its

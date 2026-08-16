@@ -830,11 +830,11 @@ class Coordinator:
         probe's refusal is nobody's evidence of anything: it must not count toward the breadcrumb
         or advance a clock, or a stage would escalate on how often it was speculatively tried
         somewhere it does not live (#406)."""
-        # A deployed #696 build may have persisted a canonical provider-input envelope followed
-        # by one approved advisory block. Repair that exact historical shape before Intake reads
-        # its snapshot/source ref; every other malformed durable input remains untouched and is
-        # refused by its stage adapter. Persisting here lets a paused daemon recover next cycle
-        # without reserving capacity or relying on a provider launch.
+        # Repair only the provider module's recognized historical durable-input shapes: #696's
+        # envelope followed by one approved advisory, or complete stale lead contracts before one
+        # complete terminal contract. Every other malformed input remains untouched and is refused
+        # by its stage adapter. Persisting here lets a paused daemon recover next cycle without
+        # reserving capacity or relying on a provider launch.
         repaired_input = repair_provider_input(record.input_ptr or "")
         if repaired_input != (record.input_ptr or ""):
             record.input_ptr = repaired_input

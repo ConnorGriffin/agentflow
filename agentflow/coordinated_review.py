@@ -35,7 +35,8 @@ from agentflow import github
 from agentflow.balancer import BUILD_POOLS, pick_reviewer
 from agentflow.coordinator import Coordinator, tracer
 from agentflow.coordinator.providers import (
-    SessionLeadInputError, has_session_lead_provenance, split_terminal_session_lead_contract)
+    SessionLeadInputError, has_session_lead_provenance, provider_input_prompt,
+    split_terminal_session_lead_contract)
 from agentflow.coordinator.store import StoreUnavailable
 from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
@@ -177,6 +178,14 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
     if parts is None or not head_sha:
         return None
     workdir, slug = parts
+    if (build_record.stage == "build" and acceptance
+            and acceptance == (build_record.input_ptr or "")
+            and has_session_lead_provenance(build_record)):
+        try:
+            acceptance, _build_contract = split_terminal_session_lead_contract(
+                provider_input_prompt(acceptance))
+        except SessionLeadInputError:
+            return None
     brief = REVIEW_PROMPT.format(
         pr=pr_number, issue=build_record.subject, starting_sha=head_sha,
         acceptance=acceptance or "(none provided)",

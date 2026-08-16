@@ -584,8 +584,58 @@ def place_approved_briefing(prompt: str, advisory: str) -> str:
     return task_brief + advisory + contract
 
 
+def _complete_session_lead_contract_span(
+        prompt: str, marker: int, *, terminal: bool) -> tuple[int, int] | None:
+    start = _SESSION_LEAD_START.search(prompt[:marker + len(_SESSION_LEAD_MARKER)])
+    closing = prompt.find(_SESSION_LEAD_CLOSING, marker + len(_SESSION_LEAD_MARKER))
+    if start is None or closing < 0:
+        return None
+    end = closing + len(_SESSION_LEAD_CLOSING)
+    suffix = prompt[marker:end]
+    if (not suffix.startswith(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING)
+            or suffix.count(_SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING) != 1
+            or "\nRoutes (workers enter at the first rung; a banned model never takes that area's work):\n"
+            not in suffix or "\nProvider launch identifiers: " not in suffix
+            or not suffix.endswith(_SESSION_LEAD_CLOSING)
+            or (terminal and end != len(prompt))):
+        return None
+    return start.start(), end
+
+
+def _repair_duplicate_session_lead_contracts(prompt: str) -> str:
+    """Remove only proven stale contracts before one complete terminal generated contract."""
+    opening = _SESSION_LEAD_MARKER + _SESSION_LEAD_OPENING
+    if not isinstance(prompt, str) or prompt.count(opening) <= 1:
+        return prompt
+    markers = []
+    cursor = 0
+    while (marker := prompt.find(opening, cursor)) >= 0:
+        markers.append(marker)
+        cursor = marker + len(opening)
+    spans = [
+        _complete_session_lead_contract_span(
+            prompt, marker, terminal=index == len(markers) - 1)
+        for index, marker in enumerate(markers)
+    ]
+    if any(span is None for span in spans):
+        return prompt
+    proven = [span for span in spans if span is not None]
+    if any(left[1] > right[0] for left, right in zip(proven, proven[1:])):
+        return prompt
+    preserved = []
+    cursor = 0
+    for start, end in proven[:-1]:
+        preserved.append(prompt[cursor:start])
+        cursor = end
+    preserved.append(prompt[cursor:])
+    return "".join(preserved)
+
+
 def repair_provider_input(raw: str) -> str:
-    """Repair only the known v1-envelope-plus-approved-advisory corruption shape."""
+    """Repair only recognized historical provider-input corruption shapes."""
+    repaired = _repair_duplicate_session_lead_contracts(raw)
+    if repaired != raw:
+        return repaired
     if not isinstance(raw, str) or raw.count("<!-- agentflow-effective-briefing:") != 1:
         return raw
     trailing = _TRAILING_APPROVED_BRIEFING.search(raw)
@@ -680,9 +730,8 @@ def has_session_lead_provenance(record) -> bool:
                 or getattr(record, "native_helpers_marker", None))
 
 
-def _base_durable_prompt(record) -> str:
-    """Decode the durable prompt envelope without applying runtime launch policy."""
-    raw = record.input_ptr or ""
+def provider_input_prompt(raw: str) -> str:
+    """Decode one canonical provider-input envelope, or return a legacy raw prompt verbatim."""
     try:
         payload = json.loads(raw)
     except (TypeError, ValueError):
@@ -691,6 +740,11 @@ def _base_durable_prompt(record) -> str:
             and isinstance(payload.get("prompt"), str)):
         return payload["prompt"]
     return raw
+
+
+def _base_durable_prompt(record) -> str:
+    """Decode the durable prompt envelope without applying runtime launch policy."""
+    return provider_input_prompt(record.input_ptr or "")
 
 
 class ProviderArgv(list):
