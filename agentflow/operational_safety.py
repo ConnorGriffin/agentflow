@@ -56,6 +56,25 @@ _SAFETY_ADMISSION_HISTORY_FINGERPRINT = (
 )
 
 
+def rollback_never_started_admission_history(
+        conn: sqlite3.Connection, stage_identity: str,
+) -> None:
+    """Remove one reservation fact after its provider launch proved never started.
+
+    The caller owns the transaction that also removes the coordinator record. SQLite has no
+    statement-scoped bypass for an unconditional delete trigger, so this owner must suspend and
+    restore its own trigger inside that transaction. SQLite's transactional DDL restores the
+    trigger with the row if any later step rolls back.
+    """
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError(
+            "never-started admission history rollback requires an active transaction")
+    conn.execute("DROP TRIGGER safety_admission_history_no_delete")
+    conn.execute(
+        "DELETE FROM safety_admission_history WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(_SAFETY_ADMISSION_HISTORY_NO_DELETE)
+
+
 def _canonical_text(value: object) -> str:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True,

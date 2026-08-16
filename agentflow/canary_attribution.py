@@ -73,6 +73,26 @@ CANARY_ATTRIBUTION_SCHEMA_STATEMENTS = (
     ("v2-to-v3:create:no-delete-trigger", _NO_DELETE_SCHEMA),
 )
 
+
+def rollback_never_started_canary_attribution(
+        conn: sqlite3.Connection, stage_identity: str,
+) -> None:
+    """Remove one attribution after its provider launch proved never started.
+
+    The caller owns the transaction that also removes the coordinator record. SQLite has no
+    statement-scoped bypass for an unconditional delete trigger, so this owner must suspend and
+    restore its own trigger inside that transaction. SQLite's transactional DDL restores the
+    trigger with the row if any later step rolls back.
+    """
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError(
+            "never-started canary attribution rollback requires an active transaction")
+    conn.execute("DROP TRIGGER canary_attributions_no_delete")
+    conn.execute(
+        "DELETE FROM canary_attributions WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(_NO_DELETE_SCHEMA)
+
+
 # Exact coordinator Store schema-v2 migration source at #585 merge bd818fa.  Store compares
 # canonical sqlite_master bytes before any v3 DDL is allowed to run.
 STORE_V2_SCHEMA_FINGERPRINT = (

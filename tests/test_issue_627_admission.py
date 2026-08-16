@@ -9,7 +9,7 @@ import sqlite3
 import pytest
 
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
-from agentflow.coordinator import Coordinator, Submission
+from agentflow.coordinator import Coordinator, StageOutcome, Submission
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.record import RUNNING, Record
 from agentflow.coordinator.store import (
@@ -406,7 +406,7 @@ def test_legacy_admission_identity_holds_and_frees_the_pool(tmp_path):
     started_sibling = store.record_of(sibling)
     assert held is not None and held.state == "held" and not held.claim
     assert held.hold_reason == "refused before start — admission_identity_migration_required"
-    assert outcomes == []
+    assert outcomes == [StageOutcome(identity, "build", "held", held.handoff_kind)]
     assert started_sibling is not None and started_sibling.state == "running"
     assert launcher.identities == [sibling]
     store.close()
@@ -445,7 +445,7 @@ def test_malformed_immutable_overlay_holds_and_frees_the_pool(tmp_path):
     assert source.calls == [("octo/app", REVISION)]
     assert held is not None and held.state == "held" and not held.claim
     assert held.hold_reason == "refused before start — invalid_overlay"
-    assert outcomes == []
+    assert outcomes == [StageOutcome(identity, "build", "held", held.handoff_kind)]
     assert started_sibling is not None and started_sibling.state == "running"
     assert launcher.identities == [sibling]
     store.close()
