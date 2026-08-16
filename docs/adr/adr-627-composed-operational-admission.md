@@ -38,7 +38,7 @@ This decision composes these exact prerequisite merges:
 The composed public contracts are pinned as follows:
 
 - capability manifest SHA-256:
-  `cba84e63be53884e6ed566a534883912f7d22156aad7e4a5590515140d18fcad`;
+  `aae288b0d75f57505192057245e1bd20f227c0ba4a397c0a8abd575d69608fc2`;
   each `capability-ready-v1` fact additionally carries and validates its own canonical digest.
 - effective-policy contract (the #628 pin above):
   `f87266dddb953ee684958d8acef2f65b0aaa22cb812199adcd8d4cf912cbb01f`.
@@ -68,7 +68,14 @@ once before first persistence. Continuations, successors, conflicts, manual resu
 resumes, and repooling retain or deliberately replace those facts as one lifecycle transition.
 Preparation addresses the captured revision. The source-root capability probe is advisory in the
 production composition because preparation can create or repair the launch root. Exactly one
-post-preparation probe over the final root is admission authority.
+post-preparation probe over the final root is initial admission authority. When that observation
+names a deterministic missing pinned destination or runtime, Coordinator gives the record one
+enrollment-owned **Capability repair**, then performs exactly one fresh authoritative probe in the
+same cycle. Only that fresh fact may admit the record. An unchanged failed repair is fingerprinted
+durably and is not attempted again on later clock observations; a changed refusal may earn one new
+attempt. Launch-root materialization may likewise restore a missing screenshot harness or replace
+one exact manifest-listed historical digest while preparing the final root. Every attempted repair
+logs its root, requirements, and ready or failed outcome.
 
 Coordinator resolves a governed briefing for every stage except Converse, then submits one exact
 `ReservationIntent` to Store. Coordinator owns no admission transaction, route registration,
@@ -81,6 +88,16 @@ object, including an overlay authority mismatch, use `invalid_overlay_authority`
 refusal and `admission_identity_migration_required` produce a terminal human handoff. Capacity
 and lost compare-and-set races are ordinary deferrals. No authority refusal consumes a permit,
 attempt, receipt, or attribution.
+
+Capability repair is deliberately narrower than enrollment. Claude destinations are copied only
+when every selected `.agents` source matches the manifest and every corresponding `.claude`
+destination is absent or already pinned. A pinned Playwright runtime is installed only when its
+provider-local `node_modules` destination is wholly absent. Launch materialization restores the
+screenshot harness only when it is absent or matches a manifest-listed known-old digest. Existing
+drift, symlinks, occupied runtimes, unknown harness bytes, invalid discovery receipts, and all other
+incompatible states remain human-owned refusals. Enrollment's per-root durable lock serializes
+writers. Failure rollback is limited to unchanged paths claimed by that attempt; content that
+appears or changes concurrently is preserved.
 
 The Store schema before composed admission was v3; its admission migration is v3 to v4. V4 adds a
 Store-owned `receipt_digest` to the existing receipt row. That ordinary canonical self-digest

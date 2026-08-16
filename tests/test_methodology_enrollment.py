@@ -361,6 +361,38 @@ def test_capability_repair_materializes_claude_ui_skills_before_runtime(
     assert "Claude" in result.detail and "Playwright" in result.detail
 
 
+def test_failed_runtime_repair_preserves_concurrent_operator_content(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    specs = {item["id"]: item for item in manifest["capabilities"]}
+    requirements = (
+        ContractRequirement("ui-craft", specs["ui-craft"]["version"]),
+        ContractRequirement("drive-local-webapp", specs["drive-local-webapp"]["version"]),
+        ContractRequirement("playwright", manifest["playwright"]["version"], runtime=True),
+    )
+    operator_note = root / ".agents" / "skills" / "tdd" / "operator-note.txt"
+
+    def fail_install(_selected_root, *, provider=None):
+        assert provider == "claude"
+        operator_note.write_text("authored while npm was running\n")
+        claude_skill = root / ".claude" / "skills" / "ui-craft" / "SKILL.md"
+        claude_skill.write_text("operator changed this during repair\n")
+        return "WARN: UI runtime setup failed — npm exited 1"
+
+    monkeypatch.setattr(enrollment, "_install_ui_runtime", fail_install)
+
+    result = repair_capability_refusal(root, "claude", requirements)
+
+    changed = root / ".claude" / "skills" / "ui-craft" / "SKILL.md"
+    assert result is not None and not result.repaired
+    assert operator_note.read_text() == "authored while npm was running\n"
+    assert changed.read_text() == "operator changed this during repair\n"
+
+
 @pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
 def test_capability_repair_preserves_occupied_claude_destinations(
     tmp_path, monkeypatch, destination_kind
@@ -858,7 +890,8 @@ def test_launch_materialization_refreshes_a_known_old_pinned_harness(tmp_path):
     destination = tmp_path / "destination"
     shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
     (destination / "scripts").mkdir()
-    old = Path(__file__).with_name("fixtures").joinpath("old-screenshots.mjs").read_bytes()
+    checkout = Path(__file__).parents[1]
+    old = (checkout / "tests" / "fixtures" / "old-screenshots.mjs").read_bytes()
     manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
     harness = next(
         item for item in manifest["capabilities"] if item["id"] == "screenshot-harness"
@@ -867,14 +900,19 @@ def test_launch_materialization_refreshes_a_known_old_pinned_harness(tmp_path):
     destination_harness = destination / "scripts" / "screenshots.mjs"
     destination_harness.write_bytes(old)
 
+    lines = []
     ready, detail = materialize_launch_capabilities(
-        source, destination, "codex", materialize_runtime=True
+        source, destination, "codex", materialize_runtime=True, _log=lines.append
     )
 
     assert ready is True and "materialized" in detail
     assert destination_harness.read_bytes() == (
         source / "scripts" / "screenshots.mjs"
     ).read_bytes()
+    assert lines == [
+        f"capability repair root={destination} requirements=screenshot-harness; "
+        "outcome=ready — materialized missing codex capabilities into the launch root"
+    ]
 
 
 @pytest.mark.parametrize("harness_kind", ("unknown", "symlinked"))
@@ -914,6 +952,68 @@ def test_launch_materialization_installs_a_missing_pinned_harness(tmp_path):
     assert destination_harness.read_bytes() == (
         source / "scripts" / "screenshots.mjs"
     ).read_bytes()
+
+
+def test_launch_rollback_preserves_a_concurrently_edited_created_harness(
+    tmp_path, monkeypatch
+):
+    import agentflow.provider_skills as provider_skills
+
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    destination.mkdir()
+    harness = destination / "scripts" / "screenshots.mjs"
+    lines = []
+
+    def fail_skill_copy(*_args, **_kwargs):
+        assert harness.is_file()
+        harness.write_text("operator changed this during materialization\n")
+        raise shutil.Error("copy failed")
+
+    monkeypatch.setattr(provider_skills.shutil, "copytree", fail_skill_copy)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True, _log=lines.append
+    )
+
+    assert ready is False and "rollback failed" in detail
+    assert harness.read_text() == "operator changed this during materialization\n"
+    assert len(lines) == 1
+    assert f"root={destination}" in lines[0]
+    assert "requirements=screenshot-harness" in lines[0]
+    assert "outcome=failed" in lines[0]
+
+
+def test_launch_rollback_never_follows_a_concurrently_substituted_harness_symlink(
+    tmp_path, monkeypatch
+):
+    import agentflow.provider_skills as provider_skills
+
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    (destination / "scripts").mkdir(parents=True)
+    checkout = Path(__file__).parents[1]
+    old = (checkout / "tests" / "fixtures" / "old-screenshots.mjs").read_bytes()
+    harness = destination / "scripts" / "screenshots.mjs"
+    harness.write_bytes(old)
+    external = tmp_path / "operator-harness.mjs"
+    current = (source / "scripts" / "screenshots.mjs").read_bytes()
+    external.write_bytes(current)
+
+    def fail_skill_copy(*_args, **_kwargs):
+        harness.unlink()
+        harness.symlink_to(external)
+        raise shutil.Error("copy failed")
+
+    monkeypatch.setattr(provider_skills.shutil, "copytree", fail_skill_copy)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False and "rollback failed" in detail
+    assert harness.is_symlink()
+    assert external.read_bytes() == current
 
 
 def test_launch_materialization_refuses_occupied_drifted_ui_runtime(tmp_path, monkeypatch):

@@ -410,6 +410,12 @@ only — no implementation details, no decisions (those are in `docs/adr/`).
   identically — so it parks for a human instead (ADR 0043).
   *Avoid:* retry, replay (both imply re-running the same empty attempt).
 
+- **Capability repair** — one coordinator-owned, enrollment-locked attempt to materialize an
+  absent pinned provider destination or runtime after the authoritative launch-root probe observes
+  the deterministic gap. It is followed by one fresh probe in the same cycle; drift, symlinks,
+  unknown content, and an unchanged failed repair remain on the capability refusal clock.
+  *Avoid:* targeted repair (that is a fresh stage session repairing a missing stage outcome).
+
 - **Stage outcome** — the durable fact a pipeline stage must produce before the pipeline
   can advance, such as an intake route, opened PR, or review verdict. A clean process exit
   without that fact is incomplete, not success; a human hold is a separate terminal handoff.

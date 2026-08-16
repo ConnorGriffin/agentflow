@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentflow.repository import RepoConfig
+from agentflow.repo_facts import RepoConfig
 
 
 class ConfigurationError(ValueError):

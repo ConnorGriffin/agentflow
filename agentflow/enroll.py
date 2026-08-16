@@ -200,19 +200,76 @@ def repair_capability_refusal(root: str | Path, provider: str, requirements):
                 return None
             repaired, probe_detail = prove_native_discovery(root, provider)
             return CapabilityRepairResult(repaired, probe_detail)
-        journal = _enrollment_journal(root)
+        created_skills = [
+            (root / ".claude" / "skills" / spec["skill"], spec["files"])
+            for spec in skill_specs if spec["skill"] in missing
+        ]
+        installed_snapshots: dict[Path, tuple | None] = {}
+
+        def tree_snapshot(path: Path) -> tuple | None:
+            """Fingerprint every entry without following links; unreadable means preserve."""
+            entries = []
+            try:
+                for current, directories, filenames in os.walk(path, followlinks=False):
+                    directories.sort()
+                    filenames.sort()
+                    base = Path(current)
+                    for name in directories + filenames:
+                        item = base / name
+                        relative = str(item.relative_to(path))
+                        if item.is_symlink():
+                            entries.append((relative, "link", str(item.readlink())))
+                        elif item.is_dir():
+                            entries.append((relative, "dir", ""))
+                        elif item.is_file():
+                            entries.append((
+                                relative, "file",
+                                hashlib.sha256(item.read_bytes()).hexdigest(),
+                            ))
+                        else:
+                            entries.append((relative, "other", ""))
+            except OSError:
+                return None
+            return tuple(entries)
+
+        def restore_created_skills() -> list[str]:
+            """Undo only our still-pinned copies; preserve concurrent changes."""
+            errors = []
+            for destination, _files_manifest in reversed(created_skills):
+                if not destination.exists() and not destination.is_symlink():
+                    continue
+                installed = installed_snapshots.get(destination)
+                if installed is None or tree_snapshot(destination) != installed:
+                    errors.append(f"{destination} changed concurrently; preserved")
+                    continue
+                try:
+                    shutil.rmtree(destination)
+                except OSError as exc:
+                    errors.append(f"{destination}: {exc}")
+            return errors
+
         try:
-            outcomes = [_wire_claude_skill(root, name) for name in missing]
+            outcomes = []
+            for name in missing:
+                outcome = _wire_claude_skill(root, name)
+                outcomes.append(outcome)
+                if not outcome.startswith("WARN:"):
+                    destination = root / ".claude" / "skills" / name
+                    installed_snapshots[destination] = tree_snapshot(destination)
             if runtime_missing:
                 outcomes.append(_install_ui_runtime(root, provider=provider))
             if any(outcome.startswith("WARN:") for outcome in outcomes):
-                journal.restore()
-                return CapabilityRepairResult(False, "; ".join(outcomes))
-        except Exception:
-            journal.restore()
-            raise
-        finally:
-            journal.close()
+                rollback = restore_created_skills()
+                detail = "; ".join(outcomes)
+                if rollback:
+                    detail += "; rollback: " + "; ".join(rollback)
+                return CapabilityRepairResult(False, detail)
+        except Exception as exc:
+            rollback = restore_created_skills()
+            detail = f"{type(exc).__name__}: {exc}"
+            if rollback:
+                detail += "; rollback: " + "; ".join(rollback)
+            return CapabilityRepairResult(False, detail)
         repaired = []
         if missing:
             repaired.append("materialized absent pinned capability destinations for Claude")

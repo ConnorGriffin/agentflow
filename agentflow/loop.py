@@ -30,8 +30,7 @@ from agentflow.labels import (AWAITING_DISPOSITION, BUILDING, DRAWING, HELD_LABE
                               effort_from_labels)
 from agentflow.notify import notify
 from agentflow.prompts import CONFLICT_REASON
-from agentflow.repo_facts import intake_allowlist, repo_profile
-from agentflow.repository import RepoConfig
+from agentflow.repo_facts import RepoConfig, intake_allowlist, repo_profile
 from agentflow.review_policy import ReviewState
 from agentflow.reviewer import Verdict
 from agentflow.runner import (_commit_is_on_origin, _run, _worktree_is_disposable,

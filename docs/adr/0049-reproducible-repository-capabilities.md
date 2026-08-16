@@ -41,7 +41,7 @@ Doctor never executes repository-managed code: static readiness requires exact
 harness and complete skill integrity before installed runtime metadata is read.
 The apply path performs the pinned runtime self-check after verification.
 
-`agentflow enroll PATH --profile PROFILE [--apply]` is the mutation interface.
+`agentflow enroll PATH --profile PROFILE [--apply]` is the operator's complete mutation interface.
 It is dry-run by default and defaults to `reviewed`. Apply preflights the exact
 clean Git root and GitHub origin, instruction shapes, runtime-valid existing
 configuration, required commands, public skill destinations, and release commit
@@ -59,6 +59,19 @@ Apply journals every managed path and the fleet configuration. A failure in the
 skills installer, npm, Chromium installer, or either self-check restores the
 original bytes and symlinks before returning not-ready, leaving an immediate
 retry possible.
+
+The daemon may call a narrower enrollment-owned Capability repair after an authoritative refusal.
+That operation shares enrollment's durable per-root lock and can only materialize selected absent
+Claude destinations from manifest-intact `.agents` sources or install an entirely absent selected
+Playwright runtime through the same locked npm seam. It never rewrites a symlink, drifted or partial
+skill, occupied runtime, or unknown content. Its rollback is path-scoped and compare-before-remove:
+only an unchanged destination created by the attempt is removed, while concurrent content is
+preserved and reported. The record is re-probed once; a failure returns to the existing clocked
+human path rather than repeatedly invoking npm.
+
+Prepared launch worktrees use the existing launch-capability materialization seam. The screenshot
+harness is created when absent or refreshed only from a manifest-listed known-old SHA-256 to the
+current pin. A symlink, non-file, or unrecognized digest remains untouched and refuses admission.
 
 The existing enrollment module remains the seam. Its legacy label sweep and UI
 surface audit commands remain supported; the public CLI now exposes the deeper

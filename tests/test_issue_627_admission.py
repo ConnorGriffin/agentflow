@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-import json
 from importlib.resources import files
 from pathlib import Path
+import json
 import shutil
 import sqlite3
 from types import SimpleNamespace
@@ -203,7 +203,7 @@ def _approved_briefing(repository, stage, subject_revision, receipt_id):
 
 def _coordinator(
         tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None,
-        launcher=None, repair=None, log=None, capability_root=None):
+        launcher=None, repair=None, log=None, pool="codex", capability_root=None):
     path = tmp_path / "coordinator.db"
     receipts = receipts or _Receipts()
     store = Store(path, admission_mode=OperationalSafetyAndCanary(
@@ -216,7 +216,7 @@ def _coordinator(
         briefing_resolver=briefing or _Briefings(),
         route_selector=routing.select_route, daemon_generation="daemon-627", log=log)
     identity = coordinator.submit_stage(Submission(
-        repo="octo/app", subject="627", stage="build", pool="codex",
+        repo="octo/app", subject="627", stage="build", pool=pool,
         complexity="deep", subject_revision=REVISION, capability_root=capability_root))
     record = store.record_of(identity)
     assert record is not None
@@ -422,6 +422,152 @@ def test_failed_capability_repair_logs_once_and_keeps_the_stall_clock(tmp_path):
     repair_lines = [line for line in lines if "capability repair" in line]
     assert len(repair_lines) == 1
     assert "outcome=failed" in repair_lines[0] and "npm ci exited 1" in repair_lines[0]
+    store.close()
+
+
+def _real_capability_root(tmp_path, *, ui: bool) -> Path:
+    checkout = Path(__file__).parents[1]
+    root = tmp_path / "capability-root"
+    shutil.copytree(
+        checkout / ".agents", root / ".agents",
+        ignore=shutil.ignore_patterns("node_modules"),
+    )
+    (root / "scripts").mkdir()
+    shutil.copy2(checkout / "scripts" / "screenshots.mjs", root / "scripts")
+    surfaces = "frontend/" if ui else "none"
+    (root / "AGENTS.md").write_text(
+        f"profile: reviewed\nui-surfaces: {surfaces}\n"
+    )
+    return root
+
+
+def _use_real_capability_admission(monkeypatch):
+    from agentflow import pipeline
+
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which", lambda _name: "/bin/provider"
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills.native_discovery_status",
+        lambda *_args: ("ok", "native discovery proven"),
+    )
+    monkeypatch.setattr(
+        "agentflow.runtime_contracts._run_command",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="v22.0.0\n"),
+    )
+    return pipeline._capability_preflight, pipeline._repair_capability_refusal
+
+
+def _point_record_at_capability_root(store, identity, root, *, ui):
+    record = store.record_of(identity)
+    assert record is not None
+    record.source = str(root)
+    record.capability_root = str(root)
+    record.capability_context = json.dumps({"ui": ui})
+    assert store.upsert(record)
+
+
+def test_real_admission_repairs_missing_claude_destinations_and_logs_root(
+    tmp_path, monkeypatch
+):
+    capability, repair = _use_real_capability_admission(monkeypatch)
+    root = _real_capability_root(tmp_path, ui=False)
+    lines = []
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, log=lines.append, pool="claude"
+    )
+    _point_record_at_capability_root(store, identity, root, ui=False)
+
+    coordinator.cycle("claude")
+
+    admitted = store.record_of(identity)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    required = ("tdd", "codebase-design", "domain-modeling")
+    assert admitted is not None and admitted.state == RUNNING
+    assert launcher.identities == [identity]
+    assert all((root / ".claude" / "skills" / name).is_dir() for name in required)
+    assert any(
+        f"capability repair root={root}" in line
+        and all(name in line for name in required)
+        and "outcome=ready" in line
+        for line in lines
+    )
+    assert any(manifest["methodology_skills"]["commit"] in line for line in lines)
+    store.close()
+
+
+def test_real_admission_installs_missing_pinned_runtime(tmp_path, monkeypatch):
+    import agentflow.enroll as enrollment
+
+    capability, repair = _use_real_capability_admission(monkeypatch)
+    root = _real_capability_root(tmp_path, ui=True)
+    runtime = root / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    installs = []
+
+    def install(selected_root, *, provider=None):
+        installs.append((selected_root, provider))
+        (runtime / "playwright" / "lib").mkdir(parents=True)
+        (runtime / "playwright" / "package.json").write_text(
+            '{"version":"1.61.1"}\n'
+        )
+        (runtime / "playwright" / "cli.js").write_text("// pinned cli\n")
+        (runtime / "playwright" / "lib" / "program.js").write_text("// pinned program\n")
+        (runtime / ".bin").mkdir()
+        (runtime / ".bin" / "playwright").symlink_to("../playwright/cli.js")
+        return "DO:   installed pinned Playwright and Chromium; self-check passed"
+
+    monkeypatch.setattr(enrollment, "_install_ui_runtime", install)
+    lines = []
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, log=lines.append
+    )
+    _point_record_at_capability_root(store, identity, root, ui=True)
+
+    coordinator.cycle("codex")
+
+    admitted = store.record_of(identity)
+    assert admitted is not None and admitted.state == RUNNING
+    assert launcher.identities == [identity]
+    assert installs == [(root, "codex")]
+    assert any(
+        f"capability repair root={root}" in line
+        and "playwright@1.61.1" in line
+        and "outcome=ready" in line
+        for line in lines
+    )
+    store.close()
+
+
+@pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
+def test_real_admission_preserves_occupied_claude_destination_and_refuses(
+    tmp_path, monkeypatch, destination_kind
+):
+    capability, repair = _use_real_capability_admission(monkeypatch)
+    root = _real_capability_root(tmp_path, ui=False)
+    destination = root / ".claude" / "skills" / "tdd"
+    destination.parent.mkdir(parents=True)
+    if destination_kind == "drifted":
+        destination.mkdir()
+        (destination / "SKILL.md").write_text("operator-authored skill\n")
+    else:
+        external = tmp_path / "operator-skill"
+        external.mkdir()
+        (external / "SKILL.md").write_text("operator-authored skill\n")
+        destination.symlink_to(external, target_is_directory=True)
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, pool="claude"
+    )
+    _point_record_at_capability_root(store, identity, root, ui=False)
+
+    coordinator.cycle("claude", now=0)
+
+    waiting = store.record_of(identity)
+    assert waiting is not None and waiting.state == "waiting"
+    assert waiting.refusal.startswith("capability_environment_failure:")
+    assert launcher.launches == []
+    assert not (root / ".claude" / "skills" / "codebase-design").exists()
+    assert destination.is_symlink() is (destination_kind == "symlinked")
+    assert (destination / "SKILL.md").read_text() == "operator-authored skill\n"
     store.close()
 
 

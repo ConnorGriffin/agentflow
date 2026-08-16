@@ -14,6 +14,7 @@ import os
 from importlib.resources import files
 from pathlib import Path
 import shutil
+import stat
 import tomllib
 
 from agentflow.filesystem_contracts import (
@@ -319,7 +320,8 @@ def provider_skill_status(root: Path, provider: str, spec: dict) -> tuple[str, s
 
 
 def materialize_launch_capabilities(
-    source: Path, destination: Path, provider: str, materialize_runtime: bool = False
+    source: Path, destination: Path, provider: str, materialize_runtime: bool = False,
+    *, _log=None,
 ) -> tuple[bool, str]:
     """Copy missing pinned provider skills into a prepared launch root without overwriting.
 
@@ -376,21 +378,105 @@ def materialize_launch_capabilities(
     for spec, source_skill, _target_skill in missing_skills:
         if skill_destination_status(source_skill, spec["files"]) != "ok":
             return False, f"{provider} source skill {spec['skill']} is not intact"
+    _log = _log or (lambda _line: None)
     created: list[tuple[Path, bool]] = []
-    replaced_files: list[tuple[Path, bytes, str]] = []
+    created_snapshots: dict[Path, tuple | None] = {}
+    replaced_files: list[tuple[Path, bytes, tuple[int, int, int, str]]] = []
+    attempted_requirements: list[str] = []
+    audit_emitted = False
+
+    def attempted(requirement: str) -> None:
+        if requirement not in attempted_requirements:
+            attempted_requirements.append(requirement)
+
+    def audit(outcome: str, detail: str) -> None:
+        nonlocal audit_emitted
+        if audit_emitted or not attempted_requirements:
+            return
+        audit_emitted = True
+        _log(
+            f"capability repair root={destination} "
+            f"requirements={','.join(attempted_requirements)}; "
+            f"outcome={outcome} — {detail}"
+        )
+
+    def path_snapshot(path: Path) -> tuple | None:
+        """Fingerprint identity and bytes without following links; unreadable means preserve."""
+        try:
+            root_stat = path.lstat()
+            if path.is_symlink():
+                return ((".", "link", root_stat.st_dev, root_stat.st_ino, root_stat.st_mode,
+                         str(path.readlink())),)
+            if path.is_file():
+                return ((".", "file", root_stat.st_dev, root_stat.st_ino, root_stat.st_mode,
+                         hashlib.sha256(path.read_bytes()).hexdigest()),)
+            if not path.is_dir():
+                return ((".", "other", root_stat.st_dev, root_stat.st_ino,
+                         root_stat.st_mode, ""),)
+            entries = [(
+                ".", "dir", root_stat.st_dev, root_stat.st_ino, root_stat.st_mode, "",
+            )]
+            for current, directories, filenames in os.walk(path, followlinks=False):
+                directories.sort()
+                filenames.sort()
+                base = Path(current)
+                for name in directories + filenames:
+                    item = base / name
+                    relative = str(item.relative_to(path))
+                    item_stat = item.lstat()
+                    if item.is_symlink():
+                        kind, content = "link", str(item.readlink())
+                    elif item.is_dir():
+                        kind, content = "dir", ""
+                    elif item.is_file():
+                        kind = "file"
+                        content = hashlib.sha256(item.read_bytes()).hexdigest()
+                    else:
+                        kind, content = "other", ""
+                    entries.append((
+                        relative, kind, item_stat.st_dev, item_stat.st_ino,
+                        item_stat.st_mode, content,
+                    ))
+            return tuple(entries)
+        except OSError:
+            return None
 
     def rollback() -> list[str]:
         errors = []
-        for path, content, installed_digest in reversed(replaced_files):
+        for path, content, installed in reversed(replaced_files):
+            descriptor = None
             try:
-                if hashlib.sha256(path.read_bytes()).hexdigest() != installed_digest:
-                    errors.append(f"{path} changed concurrently; replacement preserved")
-                    continue
-                path.write_bytes(content)
+                flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(path, flags)
+                with os.fdopen(descriptor, "r+b") as stream:
+                    descriptor = None
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+                    observed = os.fstat(stream.fileno())
+                    identity = (
+                        observed.st_dev, observed.st_ino, observed.st_mode,
+                        hashlib.sha256(stream.read()).hexdigest(),
+                    )
+                    if not stat.S_ISREG(observed.st_mode) or identity != installed:
+                        errors.append(f"{path} changed concurrently; replacement preserved")
+                        continue
+                    stream.seek(0)
+                    stream.truncate()
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
             except OSError as exc:
-                errors.append(f"{path}: {exc}")
+                errors.append(f"{path} changed concurrently; replacement preserved: {exc}")
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
         for path, recursive in reversed(created):
             try:
+                if not path.exists() and not path.is_symlink():
+                    continue
+                installed = created_snapshots.get(path)
+                if installed is None or path_snapshot(path) != installed:
+                    errors.append(f"{path} changed concurrently; created content preserved")
+                    continue
                 if not recursive:
                     path.rmdir()
                 elif path.is_symlink():
@@ -409,7 +495,8 @@ def materialize_launch_capabilities(
     def failed(message: str) -> tuple[bool, str]:
         cleanup_errors = rollback()
         if cleanup_errors:
-            return False, f"{provider} rollback failed after {message}: {'; '.join(cleanup_errors)}"
+            message = f"{provider} rollback failed after {message}: {'; '.join(cleanup_errors)}"
+        audit("failed", message)
         return False, message
 
     def claim_directory(path: Path, *, recursive: bool = True) -> tuple[bool, str] | None:
@@ -420,6 +507,7 @@ def materialize_launch_capabilities(
         except OSError as exc:
             return failed(f"{provider} launch destination creation failed: {path}: {exc}")
         created.append((path, recursive))
+        created_snapshots[path] = path_snapshot(path)
         return None
 
     def materialize_harness() -> tuple[bool, str] | None:
@@ -441,6 +529,8 @@ def materialize_launch_capabilities(
             scripts_existed and not destination_scripts.is_dir()
         ):
             return failed(f"{provider} launch screenshot harness directory is incompatible")
+        if not destination_harness.exists() and not destination_harness.is_symlink():
+            attempted("screenshot-harness")
         if not scripts_existed:
             if error := claim_directory(destination_scripts, recursive=False):
                 return error
@@ -457,6 +547,7 @@ def materialize_launch_capabilities(
                     f"{provider} launch screenshot harness creation failed: {exc}"
                 )
             created.append((destination_harness, True))
+            created_snapshots[destination_harness] = path_snapshot(destination_harness)
             return None
         try:
             with destination_harness.open("r+b") as stream:
@@ -469,12 +560,20 @@ def materialize_launch_capabilities(
                     return failed(
                         f"{provider} launch screenshot harness is occupied or drifted"
                     )
-                replaced_files.append((destination_harness, prior, pinned_digest))
+                attempted("screenshot-harness")
                 stream.seek(0)
                 stream.truncate()
                 stream.write(source_bytes)
                 stream.flush()
                 os.fsync(stream.fileno())
+                installed_stat = os.fstat(stream.fileno())
+                replaced_files.append((
+                    destination_harness, prior,
+                    (
+                        installed_stat.st_dev, installed_stat.st_ino,
+                        installed_stat.st_mode, pinned_digest,
+                    ),
+                ))
         except OSError as exc:
             return failed(f"{provider} launch screenshot harness refresh failed: {exc}")
         return None
@@ -510,6 +609,10 @@ def materialize_launch_capabilities(
                     f"{provider} launch runtime destination is occupied or {status}: {detail}"
                 )
 
+    for spec, _source_skill, _target_skill in missing_skills:
+        attempted(spec["id"])
+    if materialize_runtime and not runtime_existed:
+        attempted("playwright")
     if not provider_root_existed:
         if error := claim_directory(destination_provider_root, recursive=False):
             return error
@@ -536,6 +639,7 @@ def materialize_launch_capabilities(
             )
         except (OSError, shutil.Error) as exc:
             return failed(f"{provider} skill copy failed: {exc}")
+        created_snapshots[target_skill] = path_snapshot(target_skill)
     if materialize_runtime and not runtime_existed:
         if error := claim_directory(destination_runtime):
             return error
@@ -545,7 +649,10 @@ def materialize_launch_capabilities(
             )
         except (OSError, shutil.Error) as exc:
             return failed(f"{provider} Playwright runtime copy failed: {exc}")
+        created_snapshots[destination_runtime] = path_snapshot(destination_runtime)
         tree_status, detail = runtime_tree_status(destination_runtime)
         if tree_status != "ok":
             return failed(f"{provider} copied Playwright runtime is incompatible: {detail}")
-    return True, f"materialized missing {provider} capabilities into the launch root"
+    detail = f"materialized missing {provider} capabilities into the launch root"
+    audit("ready", detail)
+    return True, detail

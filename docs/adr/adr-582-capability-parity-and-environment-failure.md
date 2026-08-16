@@ -38,7 +38,14 @@ repositories omit UI-only contexts, and Mockup explicitly supports only UI conte
 `--provider` narrow this matrix rather than selecting a separate check.
 
 Missing, drifted, and incompatible contracts are environment failures: they retain the internal and
-visible claim on a named human hold and create neither Evidence nor attempt telemetry. A
+visible claim on the clocked capability refusal path and create neither Evidence nor attempt
+telemetry. After the authoritative launch-root observation, a deterministic missing subset earns
+one named Capability repair through enrollment's locked seam: absent pinned Claude destinations
+may be materialized from intact `.agents` sources, and an entirely absent provider-local Playwright
+runtime may be installed from its committed lockfile. The result is re-probed once in that cycle;
+only a ready re-probe admits. A failed unchanged repair is durably fingerprinted so later clock
+observations do not repeat it. Drift, symlinks, partial or occupied runtime trees, invalid discovery
+receipts, and unknown content are never rewritten and continue toward human escalation. A
 non-mutating source/provider preflight remains before stage preparation. After preparation copies
 missing pinned contracts from the enrolled checkout, a second preflight verifies `record.source` —
 including retained Review and Revise worktrees — before permits, attempts, or provider launch.
@@ -53,7 +60,8 @@ project-local discovery controls. It does not claim those flags eliminate ambien
 
 Enrollment and doctor expose one deterministic repair command. Enrollment refuses partial,
 conflicting, or drifted destinations and installs the manifest's exact release into both provider
-paths. AgentFlow does not fall back to a weaker or differently equipped provider, and optional
+paths. Coordinator may invoke only the absent-destination and absent-runtime subset described above;
+its audit names the root, requirements, and outcome. AgentFlow does not fall back to a weaker or differently equipped provider, and optional
 Codebase Memory remains optional.
 
 The methodology source is pinned to exact published commit
