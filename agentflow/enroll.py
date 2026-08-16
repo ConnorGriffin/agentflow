@@ -899,29 +899,32 @@ def _ensure_fleet_config(root: Path) -> str:
 
 def _replace_skill_tree(destination: Path, source: Path, files_manifest: list[dict]) -> str:
     """Atomically swap one owned skill tree for a complete pinned replacement."""
-    if (
-        _skill_destination_status(destination, files_manifest) != "drifted"
-        or skill_ownership(destination, files_manifest) is None
-    ):
-        return f"WARN: {destination} changed before owned-drift repair"
-    for leftover in destination.parent.glob(f".{destination.name}-*"):
-        if leftover.is_dir() and not leftover.is_symlink():
-            shutil.rmtree(leftover)
-    temporary = Path(tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent))
-    replacement = temporary / "replacement"
-    backup = temporary / "previous"
-    try:
-        shutil.copytree(source, replacement)
-        destination.replace(backup)
+    with _capability_repair_lock(destination.parents[2]):
+        if (
+            _skill_destination_status(destination, files_manifest) != "drifted"
+            or skill_ownership(destination) is None
+        ):
+            return f"WARN: {destination} changed before owned-drift repair"
+        for leftover in destination.parent.glob(f".{destination.name}-*"):
+            if leftover.is_dir() and not leftover.is_symlink():
+                shutil.rmtree(leftover)
+        temporary = Path(
+            tempfile.mkdtemp(prefix=f".{destination.name}-", dir=destination.parent)
+        )
+        replacement = temporary / "replacement"
+        backup = temporary / "previous"
         try:
-            replacement.replace(destination)
-        except OSError:
-            backup.replace(destination)
-            raise
-        shutil.rmtree(backup)
-        return f"DO:   repaired owned drift at {destination}"
-    finally:
-        shutil.rmtree(temporary, ignore_errors=True)
+            shutil.copytree(source, replacement)
+            destination.replace(backup)
+            try:
+                replacement.replace(destination)
+            except OSError:
+                backup.replace(destination)
+                raise
+            shutil.rmtree(backup)
+            return f"DO:   repaired owned drift at {destination}"
+        finally:
+            shutil.rmtree(temporary, ignore_errors=True)
 
 
 def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
@@ -954,7 +957,7 @@ def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
     repairs = {
         (location, name)
         for (location, name), state in destinations.items()
-        if state == "drifted" and skill_ownership(root / location / name, specs[name]["files"]) is not None
+        if state == "drifted" and skill_ownership(root / location / name) is not None
     }
     if converge and repairs and all(
         state == "ok" or (location, name) in repairs
@@ -1027,13 +1030,13 @@ def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
                     if outcome.startswith("WARN:"):
                         return outcome
                     try:
-                        mark_skill_owned(destination, specs[name]["files"])
+                        mark_skill_owned(destination, expected)
                     except OSError as exc:
                         return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
             else:
                 destination = root / ".agents" / "skills" / name
                 try:
-                    mark_skill_owned(destination, specs[name]["files"])
+                    mark_skill_owned(destination, expected)
                 except OSError as exc:
                     return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
             wiring = _wire_claude_skill(root, name)
@@ -1204,7 +1207,8 @@ def _wire_claude_skill(root: Path, name: str) -> str:
     shutil.copytree(source, target)
     specs = {item.get("skill"): item for item in _manifest()["capabilities"]}
     try:
-        mark_skill_owned(target, specs[name]["files"])
+        pin = specs[name].get("version") or specs[name].get("source") or "unpinned"
+        mark_skill_owned(target, pin)
     except (KeyError, OSError) as exc:
         shutil.rmtree(target)
         return f"WARN: could not record AgentFlow ownership for {target}: {exc}"
@@ -1216,6 +1220,12 @@ class _EnrollmentJournal:
         self._temporary = tempfile.TemporaryDirectory(prefix="agentflow-enroll-")
         self._root = Path(self._temporary.name)
         self._entries: list[tuple[Path, Path | None]] = []
+        # Only a parent this enrollment run watched come into existence is ours to remove on
+        # rollback — a parent that already existed may be a concurrent repair's ``.agentflow``,
+        # and blindly rmdir-ing it races that repair's own mkdir+open of its lock file.
+        self._absent_parents_at_start = {
+            path.parent for path in dict.fromkeys(paths) if not path.parent.exists()
+        }
         for index, path in enumerate(dict.fromkeys(paths)):
             backup = self._root / str(index)
             if path.is_symlink():
@@ -1244,7 +1254,7 @@ class _EnrollmentJournal:
             else:
                 shutil.copy2(backup, path)
         for path, _backup in self._entries:
-            if path.name == "skill-ownership":
+            if path.name == "skill-ownership" and path.parent in self._absent_parents_at_start:
                 try:
                     path.parent.rmdir()
                 except OSError:

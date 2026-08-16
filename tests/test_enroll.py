@@ -1,7 +1,9 @@
 """Explicit enrollment protects agentflow's working area from Git status."""
 
+from contextlib import contextmanager
 from hashlib import sha256
 import os
+import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,23 +86,34 @@ def test_connor_skill_materialization_records_only_agentflow_owned_destination(
     handwritten.mkdir(parents=True)
     (handwritten / "SKILL.md").write_text(skill)
 
-    ownership = skill_ownership(managed, manifest)
+    ownership = skill_ownership(managed)
     assert ownership is not None
     assert ownership["destination"] == ".agents/skills/drive-local-webapp"
-    assert skill_ownership(handwritten, manifest) is None
+    assert skill_ownership(handwritten) is None
     assert skill_destination_status(managed, manifest) == "ok"
 
 
-def test_skill_ownership_rejects_a_human_rewritten_destination(tmp_path):
+def test_skill_ownership_survives_content_drift_but_not_a_symlink_swap(tmp_path):
+    """Provenance binds destination identity, not tree content.
+
+    Later drift of the tree (a human rewrite, or a stale checkout) does not strip
+    ownership; that's exactly the state repair exists to fix. Only a destination that
+    stops being a regular directory (e.g. an operator swaps in a symlink) invalidates
+    the marker.
+    """
     destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
     destination.mkdir(parents=True)
     (destination / "SKILL.md").write_text("pinned\n")
-    manifest = [{"path": "SKILL.md", "sha256": sha256(b"pinned\n").hexdigest()}]
-    mark_skill_owned(destination, manifest)
+    mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
 
     (destination / "SKILL.md").write_text("human rewrite\n")
+    ownership = skill_ownership(destination)
+    assert ownership is not None
+    assert ownership["pin"] == "230e71a55ab07f0cd9beaa61649b583cb9d1bde1"
 
-    assert skill_ownership(destination, manifest) is None
+    shutil.rmtree(destination)
+    destination.symlink_to("elsewhere")
+    assert skill_ownership(destination) is None
 
 
 def test_enrollment_journal_preserves_unrelated_agentflow_state(tmp_path):
@@ -127,6 +140,41 @@ def test_enrollment_journal_preserves_unrelated_agentflow_state(tmp_path):
     journal.close()
 
 
+def test_enrollment_journal_never_removes_a_preexisting_empty_agentflow_dir(tmp_path):
+    """A pre-existing `.agentflow` might be a concurrent repair's lock directory.
+
+    Rollback must never rmdir it out from under that repair, even once it looks empty
+    after the skill-ownership subtree is restored/removed.
+    """
+    from agentflow.enroll import _enrollment_journal
+
+    state = tmp_path / ".agentflow"
+    state.mkdir()
+    journal = _enrollment_journal(tmp_path)
+    marker = state / "skill-ownership" / "agents" / "drive-local-webapp.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("marker\n")
+
+    journal.restore()
+
+    assert state.is_dir()
+    journal.close()
+
+
+def test_enrollment_journal_removes_an_agentflow_dir_it_created_once_empty(tmp_path):
+    from agentflow.enroll import _enrollment_journal
+
+    journal = _enrollment_journal(tmp_path)  # .agentflow is absent at start
+    marker = tmp_path / ".agentflow" / "skill-ownership" / "agents" / "drive-local-webapp.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text("marker\n")
+
+    journal.restore()
+
+    assert not (tmp_path / ".agentflow").exists()
+    journal.close()
+
+
 def test_skill_repair_refuses_a_destination_changed_to_symlink(tmp_path):
     from agentflow.enroll import _replace_skill_tree
 
@@ -134,7 +182,7 @@ def test_skill_repair_refuses_a_destination_changed_to_symlink(tmp_path):
     destination.mkdir(parents=True)
     (destination / "SKILL.md").write_text("drifted\n")
     manifest = [{"path": "SKILL.md", "sha256": sha256(b"pinned\n").hexdigest()}]
-    mark_skill_owned(destination, manifest)
+    mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
     (destination / "SKILL.md").unlink()
     destination.rmdir()
     destination.symlink_to("operator-content")
@@ -146,21 +194,60 @@ def test_skill_repair_refuses_a_destination_changed_to_symlink(tmp_path):
     assert destination.is_symlink()
 
 
-def test_connor_skill_converge_repairs_owned_drifted_destination(tmp_path, monkeypatch):
-    """Convergence replaces an owned drifted destination with the pinned skill tree."""
+def test_skill_repair_serializes_under_the_capability_repair_lock(tmp_path, monkeypatch):
+    """The stale-leftover sweep and the swap run under the repair lock.
+
+    It's the same lock `repair_capability_refusal` uses to serialize concurrent
+    coordinators sharing a root — otherwise the `.<name>-*` sweep can rmtree a
+    concurrent converge's in-flight temp dir.
+    """
     from agentflow import enroll
+    from agentflow.enroll import _replace_skill_tree
 
     destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
     destination.mkdir(parents=True)
     pinned = "---\nname: drive-local-webapp\n---\n"
+    (destination / "SKILL.md").write_text("drifted\n")
     manifest = [{"path": "SKILL.md", "sha256": sha256(pinned.encode()).hexdigest()}]
-    (destination / "SKILL.md").write_text("local edits\n")
-    mark_skill_owned(destination, manifest)
+    mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "SKILL.md").write_text(pinned)
+
+    calls = []
+    original_lock = enroll._capability_repair_lock
+
+    @contextmanager
+    def spy(root):
+        calls.append(root)
+        with original_lock(root):
+            yield
+
+    monkeypatch.setattr(enroll, "_capability_repair_lock", spy)
+
+    assert _replace_skill_tree(destination, source, manifest).startswith("DO:")
+    assert calls == [tmp_path]
+
+
+def test_connor_skill_converge_repairs_owned_drifted_destination(tmp_path, monkeypatch):
+    """Convergence replaces an owned drifted destination with the pinned skill tree.
+
+    The marker is reached through the real install path — a first, unmocked call to
+    `_install_connor_skills` materializes the destination and writes it via production
+    code — then the tree is mutated afterward to simulate drift a human or a stale
+    checkout could produce. That sequence is the only one production code can reach;
+    hand-writing a marker onto already-drifted content (as this test used to) cannot
+    happen from any real call path.
+    """
+    from agentflow import enroll
+
+    pinned = "---\nname: drive-local-webapp\n---\n"
+    manifest = [{"path": "SKILL.md", "sha256": sha256(pinned.encode()).hexdigest()}]
 
     def run(command, **kwargs):
         if command[0] == "npx":
             skill = Path(kwargs["cwd"]) / ".agents" / "skills" / "drive-local-webapp"
-            skill.mkdir(parents=True)
+            skill.mkdir(parents=True, exist_ok=True)
             (skill / "SKILL.md").write_text(pinned)
         stdout = "a" * 40 if command[-1] == "HEAD" else ""
         return subprocess.CompletedProcess(command, 0, stdout, "")
@@ -170,14 +257,6 @@ def test_connor_skill_converge_repairs_owned_drifted_destination(tmp_path, monke
     monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
     monkeypatch.setattr(enroll, "_wire_claude_skill", lambda *_args: "ok")
-    monkeypatch.setattr(
-        enroll,
-        "_public_skill_destination_states",
-        lambda *_args: {
-            (".agents/skills", "drive-local-webapp"): "drifted",
-            (".claude/skills", "drive-local-webapp"): "ok",
-        },
-    )
     monkeypatch.setattr(
         enroll,
         "_manifest",
@@ -191,8 +270,103 @@ def test_connor_skill_converge_repairs_owned_drifted_destination(tmp_path, monke
         },
     )
 
+    # Materialize through the real install path: production code writes the marker.
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    assert skill_ownership(destination) is not None
+    assert skill_destination_status(destination, manifest) == "ok"
+
+    # Simulate drift after the fact — content diverges, identity and ownership do not.
+    (destination / "SKILL.md").write_text("local edits\n")
+    assert skill_destination_status(destination, manifest) == "drifted"
+    assert skill_ownership(destination) is not None
+
+    monkeypatch.setattr(
+        enroll,
+        "_public_skill_destination_states",
+        lambda *_args: {
+            (".agents/skills", "drive-local-webapp"): "drifted",
+            (".claude/skills", "drive-local-webapp"): "ok",
+        },
+    )
+
     assert enroll._install_connor_skills(tmp_path, converge=True).startswith("DO:")
     assert skill_destination_status(destination, manifest) == "ok"
+    assert skill_ownership(destination) is not None
+
+
+def test_connor_skill_converge_repairs_after_a_pin_bump(tmp_path, monkeypatch):
+    """A marker recorded under an old pin still proves ownership after a pin bump.
+
+    Repair fires for the fleet-wide scenario it exists for — every repo's marker
+    outliving the next pin bump — not just a byte-identical pin.
+    """
+    from agentflow import enroll
+
+    state = {
+        "commit": "a" * 40,
+        "pinned": "---\nname: drive-local-webapp\nrelease: old\n---\n",
+        "manifest": None,
+    }
+    state["manifest"] = [
+        {"path": "SKILL.md", "sha256": sha256(state["pinned"].encode()).hexdigest()}
+    ]
+
+    def run(command, **kwargs):
+        if command[0] == "npx":
+            skill = Path(kwargs["cwd"]) / ".agents" / "skills" / "drive-local-webapp"
+            skill.mkdir(parents=True, exist_ok=True)
+            (skill / "SKILL.md").write_text(state["pinned"])
+        stdout = state["commit"] if command[-1] == "HEAD" else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(enroll, "_run_command", run)
+    monkeypatch.setattr(enroll, "_resolved_skill_release", lambda _manifest: (state["commit"], None))
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
+    monkeypatch.setattr(enroll, "_wire_claude_skill", lambda *_args: "ok")
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": state["commit"],
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [{"skill": "drive-local-webapp", "files": state["manifest"]}],
+            "skill_installer": {"package": "skills", "version": "1"},
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+    destination = tmp_path / ".agents" / "skills" / "drive-local-webapp"
+    before = skill_ownership(destination)
+    assert before is not None and before["pin"] == "a" * 40
+
+    # Bump the pin: a new commit and new pinned content, exactly what a fleet-wide skill
+    # release would do to every enrolled repo's marker.
+    state["commit"] = "b" * 40
+    state["pinned"] = "---\nname: drive-local-webapp\nrelease: new\n---\n"
+    state["manifest"] = [
+        {"path": "SKILL.md", "sha256": sha256(state["pinned"].encode()).hexdigest()}
+    ]
+    (destination / "SKILL.md").write_text("stale content from the old pin\n")
+    assert skill_destination_status(destination, state["manifest"]) == "drifted"
+    assert skill_ownership(destination) is not None  # still owned across the pin bump
+
+    monkeypatch.setattr(
+        enroll,
+        "_public_skill_destination_states",
+        lambda *_args: {
+            (".agents/skills", "drive-local-webapp"): "drifted",
+            (".claude/skills", "drive-local-webapp"): "ok",
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path, converge=True).startswith("DO:")
+    assert skill_destination_status(destination, state["manifest"]) == "ok"
+    after = skill_ownership(destination)
+    assert after is not None and after["pin"] == "b" * 40
 
 
 def test_connor_skill_converge_leaves_unowned_drifted_destination_unchanged(
@@ -239,7 +413,7 @@ def test_connor_skill_converge_leaves_incompatible_destination_unchanged(
     destination.mkdir(parents=True)
     manifest = []
     if owned:
-        mark_skill_owned(destination, manifest)
+        mark_skill_owned(destination, "230e71a55ab07f0cd9beaa61649b583cb9d1bde1")
     destination.rmdir()
     destination.symlink_to("elsewhere")
     monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
@@ -276,10 +450,10 @@ def test_claude_skill_materialization_records_its_own_destination_marker(tmp_pat
     (source / "SKILL.md").write_text("pinned\n")
 
     assert enroll._wire_claude_skill(tmp_path, "ui-craft").startswith("DO:")
-    manifest = next(item["files"] for item in enroll._manifest()["capabilities"] if item.get("skill") == "ui-craft")
-    assert skill_ownership(source, manifest) is None
-    ownership = skill_ownership(tmp_path / ".claude" / "skills" / "ui-craft", manifest)
+    assert skill_ownership(source) is None
+    ownership = skill_ownership(tmp_path / ".claude" / "skills" / "ui-craft")
     assert ownership is not None
+    assert ownership["pin"]
     assert ownership["destination"] == ".claude/skills/ui-craft"
 
 

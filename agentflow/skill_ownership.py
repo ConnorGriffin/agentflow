@@ -1,16 +1,26 @@
-"""Durable proof that AgentFlow materialized a vendored skill destination."""
+"""Durable proof that AgentFlow materialized a vendored skill destination.
+
+Provenance means "AgentFlow materialized this path from pin X" — it is recorded once, at
+materialization time, and does not change when the tree later drifts. A marker's validity is
+about identity, not content: a well-formed payload naming this exact destination, backed by a
+destination that is still a regular directory rather than a symlink. The recorded pin is
+provenance data for humans and for callers that want to know what release a destination was
+last (re)built from; it is never compared against the current manifest to decide validity, so a
+pin bump does not retroactively strip ownership from destinations materialized under an older
+pin, and drift does not either — drift is exactly what convergence repair exists to fix.
+"""
 
 from __future__ import annotations
 
 import json
 import os
-import hashlib
 from pathlib import Path
 
 
 MARKER_SCHEMA = 1
 _DESTINATION_ROOTS = (Path(".agents/skills"), Path(".claude/skills"))
 _MARKER_ROOT = Path(".agentflow/skill-ownership")
+_MARKER_KEYS = {"schema", "owner", "destination", "pin"}
 
 
 def _marker_path(destination: Path) -> tuple[Path, str] | None:
@@ -24,33 +34,13 @@ def _marker_path(destination: Path) -> tuple[Path, str] | None:
     return None
 
 
-def _manifest_digest(files_manifest: list[dict]) -> str:
-    return hashlib.sha256(
-        json.dumps(files_manifest, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+def mark_skill_owned(destination: str | Path, pin: str) -> Path:
+    """Record that AgentFlow just materialized ``destination`` from release ``pin``.
 
-
-def _tree_digest(destination: Path) -> str | None:
-    if destination.is_symlink() or not destination.is_dir():
-        return None
-    entries = []
-    try:
-        for path in sorted(destination.rglob("*")):
-            relative = path.relative_to(destination)
-            if "node_modules" in relative.parts:
-                continue
-            if path.is_symlink() or not path.is_file():
-                if path.is_symlink():
-                    return None
-                continue
-            entries.append((relative.as_posix(), hashlib.sha256(path.read_bytes()).hexdigest()))
-    except OSError:
-        return None
-    return hashlib.sha256(json.dumps(entries, separators=(",", ":")).encode()).hexdigest()
-
-
-def mark_skill_owned(destination: str | Path, files_manifest: list[dict]) -> Path:
-    """Mark the just-materialized vendored skill without changing its manifest tree."""
+    ``pin`` is provenance data only (the connor_skills/methodology_skills commit, or a
+    capability's pinned ``version``) — it is written for audit purposes and is never read back
+    as a validity precondition.
+    """
     target = Path(destination)
     resolved = _marker_path(target)
     marker, identity = resolved if resolved is not None else (None, None)
@@ -68,15 +58,11 @@ def mark_skill_owned(destination: str | Path, files_manifest: list[dict]) -> Pat
     marker.parent.mkdir(parents=True, exist_ok=True)
     if marker.parent.is_symlink():
         raise OSError(f"cannot resolve ownership marker for {target}")
-    tree_digest = _tree_digest(target)
-    if tree_digest is None:
-        raise OSError(f"cannot fingerprint ownership marker for {target}")
     payload = {
         "schema": MARKER_SCHEMA,
         "owner": "agentflow",
         "destination": identity,
-        "manifest_sha256": _manifest_digest(files_manifest),
-        "tree_sha256": tree_digest,
+        "pin": pin,
     }
     temporary = marker.with_suffix(f".tmp-{os.getpid()}")
     temporary.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
@@ -84,9 +70,18 @@ def mark_skill_owned(destination: str | Path, files_manifest: list[dict]) -> Pat
     return marker
 
 
-def skill_ownership(destination: str | Path, files_manifest: list[dict]) -> dict | None:
-    """Return a validated ownership marker, or ``None`` for unknown content."""
-    resolved = _marker_path(Path(destination))
+def skill_ownership(destination: str | Path) -> dict | None:
+    """Return a validated ownership marker, or ``None`` for unknown/invalid content.
+
+    Validity is destination identity plus a well-formed payload, checked against the
+    destination's current shape (a regular directory, not a symlink) — not against its
+    content. A marker survives its destination drifting; that is what makes repair possible.
+    An operator who overwrites a marker-owned directory in place is indistinguishable from
+    drift and will read as owned — the residual risk is bounded by marker cleanup on rollback
+    and by the refusal to touch symlinked or incompatible destinations.
+    """
+    target = Path(destination)
+    resolved = _marker_path(target)
     marker, identity = resolved if resolved is not None else (None, None)
     state_root = marker.parents[2] if marker is not None else None
     if (
@@ -97,23 +92,25 @@ def skill_ownership(destination: str | Path, files_manifest: list[dict]) -> dict
         or marker.parent.is_symlink()
         or marker.is_symlink()
         or not marker.is_file()
+        or target.is_symlink()
+        or not target.is_dir()
     ):
         return None
     try:
         payload = json.loads(marker.read_text())
     except (OSError, ValueError):
         return None
-    tree_digest = _tree_digest(Path(destination))
-    if tree_digest is None:
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _MARKER_KEYS
+        or payload.get("schema") != MARKER_SCHEMA
+        or payload.get("owner") != "agentflow"
+        or payload.get("destination") != identity
+        or not isinstance(payload.get("pin"), str)
+        or not payload["pin"]
+    ):
         return None
-    expected = {
-        "schema": MARKER_SCHEMA,
-        "owner": "agentflow",
-        "destination": identity,
-        "manifest_sha256": _manifest_digest(files_manifest),
-        "tree_sha256": tree_digest,
-    }
-    return payload if payload == expected else None
+    return payload
 
 
 def clear_skill_ownership(destination: str | Path) -> None:
