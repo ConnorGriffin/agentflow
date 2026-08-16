@@ -174,7 +174,10 @@ def deploy(*, path: Path | None = None) -> AuthorityResult:
     target = _target(path)
     manifest = _manifest()
     if target.exists():
-        return _result("already-current" if _valid(target, manifest) else "authority-conflict", target)
+        if _valid(target, manifest):
+            return _result("already-current", target)
+        if not EvidenceStore._is_initialized_empty(target):
+            return _result("authority-conflict", target)
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(prefix=".evidence-authority-", dir=target.parent)
     os.close(descriptor)
@@ -182,12 +185,15 @@ def deploy(*, path: Path | None = None) -> AuthorityResult:
     try:
         _build(temporary, manifest)
         _fsync(temporary)
-        try:
-            os.link(temporary, target)
-        except FileExistsError:
+        if target.exists() and EvidenceStore._is_initialized_empty(target):
+            os.replace(temporary, target)
+        elif target.exists():
             return _result("already-current" if _valid(target, manifest) else "authority-conflict", target)
-        finally:
-            temporary.unlink(missing_ok=True)
+        else:
+            try:
+                os.link(temporary, target)
+            except FileExistsError:
+                return _result("already-current" if _valid(target, manifest) else "authority-conflict", target)
         directory = os.open(target.parent, os.O_RDONLY)
         try:
             os.fsync(directory)
