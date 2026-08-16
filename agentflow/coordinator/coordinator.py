@@ -971,6 +971,10 @@ class Coordinator:
         """Retry transient admission refusals and hand immutable ones to a human."""
         if not observed:
             return "unprepared"
+        if code == "route_cell:stale" and self._repin_stale_route_cell(record):
+            self._emit(record, "route_cell:stale; re-pinned current RouteCell; retrying next "
+                               "cycle; no attempt or permit spent")
+            return "unprepared"
         if code in _PERMANENT_ADMISSION_REFUSALS:
             record.hold_reason = refused_before_start_hold_reason(code)
             if not self._hold(record):
@@ -985,6 +989,40 @@ class Coordinator:
         self._emit(record, f"{code}; retrying next cycle; claim retained; "
                            "no attempt or permit spent")
         return "unprepared"
+
+    def _repin_stale_route_cell(self, record: Record) -> bool:
+        """Replace one superseded RouteCell pin with its selected successor, if it is unchanged.
+
+        Admission already proved this exact pin stale.  Reselect through the submission/pool-move
+        seam, then accept only the same routing key and a different immutable digest.  Any routing
+        failure or changed key keeps the original refusal: a stale pin is recoverable, but it is
+        not authority to bypass another admission failure.
+        """
+        identity = (record.repo, record.subject, record.stage, record.target,
+                    record.subject_revision)
+        try:
+            selection = self._route_selector(
+                record.repo, record.stage, record.pool, record.model,
+                complexity=record.complexity, effort=record.effort,
+                builder_complexity=record.builder_complexity)
+            if (selection.repository, selection.stage, selection.provider, selection.model) != (
+                    record.repo, record.stage, record.pool, record.model):
+                return False
+            route = self._store.route_selection_identity(selection)
+        except Exception:
+            return False
+        if (identity != (record.repo, record.subject, record.stage, record.target,
+                         record.subject_revision)
+                or route.route_id != record.route_id
+                or route.route_cell_digest == record.route_cell_digest):
+            return False
+        record.route_id = route.route_id
+        record.route_cell_digest = route.route_cell_digest
+        record.launch_config_digest = route.launch_config_digest
+        self._note_refusal(record, "", False)
+        record.refusals = 0
+        self._clear_stall(record)
+        return self._persist(record)
 
     def _capability_failure(self, record: Record, capability, observed: bool) -> str:
         """Fail a real admission durably; leave speculative provider probes untouched."""

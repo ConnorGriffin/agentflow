@@ -689,12 +689,58 @@ def test_missing_route_authority_retries_after_public_registration(tmp_path):
     store.close()
 
 
-def test_pointer_change_returns_route_cell_stale_without_consumption(tmp_path):
+def test_pointer_change_repins_active_route_without_spending_attempt(tmp_path, monkeypatch):
     receipts = _Receipts()
     coordinator, store, launcher, _adapter, identity = _coordinator(
         tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
         receipts=receipts)
     record = store.record_of(identity)
+    original_identity = (
+        record.repo, record.subject, record.stage, record.target, record.subject_revision)
+    old_digest = record.route_cell_digest
+    monkeypatch.setenv("AGENTFLOW_SESSION_TIMEOUT", "601")
+    authority_store = Store(store.path)
+    authority = OperationalSafety(authority_store, promotion_receipts=receipts)
+    candidate_selection = routing.select_route(
+        record.repo, record.stage, record.pool, record.model,
+        complexity=record.complexity, effort=record.effort,
+        builder_complexity=record.builder_complexity)
+    candidate = authority.register_route_cell(
+        candidate_selection.repository, candidate_selection.stage,
+        candidate_selection.provider, candidate_selection.model,
+        candidate_selection.route_id, candidate_selection.launch_config)
+    request = CanaryActivationRequest("receipt-repin", candidate.digest, old_digest, 0)
+    receipts.issue(request)
+    authority.approve_canary(request)
+    authority_store.close()
+
+    coordinator.cycle("codex")
+
+    repinned = store.record_of(identity)
+    assert repinned.state == "waiting" and repinned.claim
+    assert repinned.route_cell_digest == candidate.digest
+    assert repinned.launch_config_digest == candidate.launch_config_digest
+    assert (repinned.repo, repinned.subject, repinned.stage, repinned.target,
+            repinned.subject_revision) == original_identity
+    assert repinned.refusal == "" and repinned.refusals == 0
+    assert repinned.attempts == 0 and store.permits_used("codex") == 0
+    assert launcher.launches == []
+
+    coordinator.cycle("codex")
+
+    admitted = store.record_of(identity)
+    assert admitted.state == "running" and admitted.attempts == 1
+    assert launcher.identities == [identity]
+    store.close()
+
+
+def test_pointer_change_to_unselected_route_refuses_without_repin_loop(tmp_path):
+    receipts = _Receipts()
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        receipts=receipts)
+    record = store.record_of(identity)
+    original_pin = (record.route_id, record.route_cell_digest, record.launch_config_digest)
     old_digest = record.route_cell_digest
     authority_store = Store(store.path)
     authority = OperationalSafety(authority_store, promotion_receipts=receipts)
@@ -713,15 +759,19 @@ def test_pointer_change_returns_route_cell_stale_without_consumption(tmp_path):
 
     coordinator.cycle("codex")
     _assert_zero_outputs(store, launcher, identity, "route_cell:stale")
+    waiting = store.record_of(identity)
+    assert (waiting.route_id, waiting.route_cell_digest,
+            waiting.launch_config_digest) == original_pin
     store.close()
 
 
-def test_quarantine_returns_named_route_code_without_consumption(tmp_path):
+def test_quarantined_route_is_not_repinned_and_refuses(tmp_path):
     checks = _Checks()
     coordinator, store, launcher, _adapter, identity = _coordinator(
         tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
         checks=checks)
     record = store.record_of(identity)
+    original_pin = (record.route_id, record.route_cell_digest, record.launch_config_digest)
     authority_store = Store(store.path)
     authority = OperationalSafety(authority_store, check_evidence=checks)
     for suffix in ("first", "second"):
@@ -734,6 +784,9 @@ def test_quarantine_returns_named_route_code_without_consumption(tmp_path):
 
     coordinator.cycle("codex")
     _assert_zero_outputs(store, launcher, identity, "route_cell:quarantined")
+    waiting = store.record_of(identity)
+    assert (waiting.route_id, waiting.route_cell_digest,
+            waiting.launch_config_digest) == original_pin
     store.close()
 
 
