@@ -1,8 +1,9 @@
-"""Store-owned, append-only attribution for already-active canary routing.
+"""Store-owned attribution for already-active canary routing.
 
 Canary attribution observes authority selected by OperationalSafety.  It never selects a
 RouteCell, changes routing, or owns a transaction.  The coordinator Store constructs the
 single owner, supplies durable Record facts, and commits the attribution with its successor.
+Rows are append-only except at ADR 627's atomic never-started reservation retirement boundary.
 """
 
 from __future__ import annotations
@@ -72,6 +73,26 @@ CANARY_ATTRIBUTION_SCHEMA_STATEMENTS = (
     ("v2-to-v3:create:no-update-trigger", _NO_UPDATE_SCHEMA),
     ("v2-to-v3:create:no-delete-trigger", _NO_DELETE_SCHEMA),
 )
+
+
+def rollback_never_started_canary_attribution(
+        conn: sqlite3.Connection, stage_identity: str,
+) -> None:
+    """Remove one attribution after its provider launch proved never started.
+
+    The caller owns the transaction that also removes the coordinator record. SQLite has no
+    statement-scoped bypass for an unconditional delete trigger, so this owner must suspend and
+    restore its own trigger inside that transaction. SQLite's transactional DDL restores the
+    trigger with the row if any later step rolls back.
+    """
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError(
+            "never-started canary attribution rollback requires an active transaction")
+    conn.execute("DROP TRIGGER canary_attributions_no_delete")
+    conn.execute(
+        "DELETE FROM canary_attributions WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(_NO_DELETE_SCHEMA)
+
 
 # Exact coordinator Store schema-v2 migration source at #585 merge bd818fa.  Store compares
 # canonical sqlite_master bytes before any v3 DDL is allowed to run.

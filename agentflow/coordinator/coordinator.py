@@ -98,6 +98,11 @@ def parse_permanent_hold_reason(hold_reason: str) -> EndingReason:
 # handoffs read this prefix to pick copy that claims nothing.
 REFUSED_BEFORE_START_HOLD_REASON = "refused before start"
 
+_PERMANENT_ADMISSION_REFUSALS = frozenset({
+    "admission_identity_migration_required",
+    "invalid_overlay_authority",
+})
+
 
 def refused_before_start_hold_reason(refusal: str) -> str:
     """The durable ``hold_reason`` for a stage parked on a refusal that never let it start,
@@ -545,14 +550,22 @@ class Coordinator:
                                r.eligible_at, r.created_at, r.identity))
             cold = sorted((r for r in waiting if not r.continuation),
                           key=lambda r: (not r.interactive, r.stage not in PR_BOUND, r.identity))
+
+            def admit(record: Record) -> str:
+                result = self._admit(record, now)
+                if isinstance(result, StageOutcome):
+                    outcomes.append(result)
+                    return "unprepared"
+                return result
+
             for record in continuations:
                 # An admission (permit/gate) refusal or a launch that never started blocks the
                 # pool head-of-line (ADR 0029); only a preparation miss is skipped, since it
                 # reserved nothing and can retry next cycle without holding capacity hostage.
-                if self._admit(record, now) not in ("started", "unprepared", "deferred"):
+                if admit(record) not in ("started", "unprepared", "deferred"):
                     return outcomes
             for record in cold:
-                self._admit(record, now)
+                admit(record)
             # A stage whose home pool cannot launch it may move here (ADR 0028/0020) — a read-only
             # Review (fresh or continuation) whose review safety allows either pool, and a
             # *never-started* Build (attempts=0, no branch/worktree/PR yet, so its lineage pin is
@@ -802,12 +815,15 @@ class Coordinator:
                            "spent; claim retained pending durable handoff")
         return True
 
-    def _admit(self, record: Record, now: int, *, observed: bool = True) -> str:
+    def _admit(
+            self, record: Record, now: int, *, observed: bool = True,
+    ) -> str | StageOutcome:
         """Try to start one attempt. Returns ``unprepared`` (the stage adapter refused before
         admission — no permit, no attempt), ``deferred`` (an issue-bound stage yielded the pool to
         a waiting PR-bound stage — no permit, non-blocking, #293), ``blocked`` (admission/permits
         refused), ``started`` (a provider family exists and an attempt was consumed), or
         ``not_started`` (admitted but no provider came into existence — no attempt consumed).
+        A permanent immutable-admission refusal returns its finalized human-handoff outcome.
 
         ``observed=False`` marks a *probe* rather than a real turn at the pool — the destination
         trial a pool move runs, which reverts everything it touched when it does not start. A
@@ -898,10 +914,19 @@ class Coordinator:
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
 
-    def _admission_failure(self, record: Record, code: str, observed: bool) -> str:
-        """Persist a content-free retryable refusal while retaining the claim."""
+    def _admission_failure(
+            self, record: Record, code: str, observed: bool,
+    ) -> str | StageOutcome:
+        """Retry transient admission refusals and hand immutable ones to a human."""
         if not observed:
             return "unprepared"
+        if code in _PERMANENT_ADMISSION_REFUSALS:
+            record.hold_reason = refused_before_start_hold_reason(code)
+            if not self._hold(record):
+                return "unprepared"
+            self._emit(record, f"{code}; refusing this immutable admission; no attempt or "
+                               "permit spent; claim retained pending durable handoff")
+            return self._finalize_hold(record) or "unprepared"
         self._note_refusal(record, code, False)
         record.capability_preflight = ""
         if not self._persist(record):

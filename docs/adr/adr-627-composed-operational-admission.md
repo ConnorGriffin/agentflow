@@ -19,8 +19,9 @@ This decision composes these exact prerequisite merges:
 - #585 OperationalSafety and immutable launch authority:
   `bd818fa1d65c92def671192464207e6bc3904a34`.
 - #628 effective-policy briefing resolver:
-  `ab9c1ffa6f86de149db46f0dca96e89499159172`, with effective-policy contract
-  SHA-256 `ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef`.
+  `ab9c1ffa6f86de149db46f0dca96e89499159172`; the composed contract now distinguishes
+  unavailable overlays from invalid immutable overlay authority and has SHA-256
+  `783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d`.
 - #641 Store-owned canary attribution:
   `80f5a144621a990953d8ccacc08dd93a76090eaa`.
 - #645 capability-ready admission facts:
@@ -39,7 +40,7 @@ The composed public contracts are pinned as follows:
   `cba84e63be53884e6ed566a534883912f7d22156aad7e4a5590515140d18fcad`;
   each `capability-ready-v1` fact additionally carries and validates its own canonical digest.
 - effective-policy contract (the #628 pin above):
-  `ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef`.
+  `783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d`.
 - RouteCell v2 contract:
   `14dc4e949ec2a045816040cbfb553118475a570395bb6ffc26d0e1c40c780c47`.
 - OperationalSafety v2 contract:
@@ -71,19 +72,33 @@ post-preparation probe over the final root is admission authority.
 Coordinator resolves a governed briefing for every stage except Converse, then submits one exact
 `ReservationIntent` to Store. Coordinator owns no admission transaction, route registration,
 manifest parsing, sealed Safety/Canary owner access, Evidence write, or self-admission path.
-Content-free policy, capability, and RouteCell refusals remain WAITING with their claim retained
-and are reevaluated on the next cycle or restart. Capacity and lost compare-and-set races are
-ordinary deferrals. No authority refusal consumes a permit, attempt, receipt, or attribution.
+Recoverable content-free policy, capability, and RouteCell refusals remain WAITING with their
+claim retained and are reevaluated on the next cycle or restart. Overlay read errors, timeouts,
+and a repository or revision unavailable at read time retain the existing `invalid_overlay`
+code and retry behavior. Malformed bytes or failed validation from a successfully read exact Git
+object, including an overlay authority mismatch, use `invalid_overlay_authority`; that immutable
+refusal and `admission_identity_migration_required` produce a terminal human handoff. Capacity
+and lost compare-and-set races are ordinary deferrals. No authority refusal consumes a permit,
+attempt, receipt, or attribution.
 
 The Store schema before composed admission was v3; its admission migration is v3 to v4. V4 adds a
 Store-owned `receipt_digest` to the existing receipt row. That ordinary canonical self-digest
 covers `stage_identity` and all nine `AdmissionReceipt` fields. It also adds OperationalSafety's
 permanent `safety_admission_history`, keyed by `stage_identity`, whose row contains the admitted
 `route_cell_digest`, `safety_state_id`, and its ordinary canonical self-digest. Both tables reject
-UPDATE, DELETE, and replacement, and expose no retention or prune operation. This is deliberately
-the minimum integrity boundary for the single-operator, low-stakes deployment: no signer, key
-service, or second public receipt type is introduced, and a coordinated attacker that can rewrite
-both facts and their digests is outside the supported threat model.
+UPDATE, replacement, and ordinary DELETE, and expose no retention or prune operation. The sole
+retirement boundary is Store's existing never-started discard compare-and-set: a durable WAITING
+reservation with zero attempts, no successful start fact, and no live provider family. In one
+`BEGIN IMMEDIATE` transaction it may retire that identity's admission receipt, safety admission
+history, optional canary attribution, optional lesson-use attribution, and coordinator record.
+Each owning module temporarily suspends only its own DELETE trigger; commit restores every
+trigger, while any failure restores both facts and triggers. This does not weaken the forensic
+guarantee: such a reservation has no provider attempt to explain, and retaining its orphan facts
+after freeing the identity would instead poison later reads of a genuinely fresh reservation.
+Every admitted identity outside this single boundary remains append-only with no prune operation.
+This is deliberately the minimum integrity boundary for the single-operator, low-stakes
+deployment: no signer, key service, or second public receipt type is introduced, and a coordinated
+attacker that can rewrite both facts and their digests is outside the supported threat model.
 
 Store v5 is the sole transaction owner. One `BEGIN IMMEDIATE` validates the durable WAITING
 compare-and-set, briefing identity and applicability, capability self-digest/stage/provider,
@@ -97,13 +112,14 @@ races roll back every output. OperationalSafety inserts or validates its history
 participant on Store's already-open connection; it never begins, commits, or rolls back the
 transaction.
 
-Issue #571 extends v4 to v5 with one append-only `lesson_use_attributions` table. When the
+Issue #571 extends v4 to v5 with one normally append-only `lesson_use_attributions` table. When the
 pinned #628 briefing contains one promoted advisory method, Store inserts or validates that
 exact briefing, PromotionReceipt, method revision, and self-digest in the admission transaction
-before publishing RUNNING. Conflicting attribution refuses admission. UPDATE and DELETE are
-forbidden. The table is attribution only: it adds no lesson lifecycle, policy decision, routing,
-Safety, autonomy, or promotion authority. The v4-to-v5 migration is atomic and does not rewrite
-historical Records or admissions.
+before publishing RUNNING. Conflicting attribution refuses admission. UPDATE and ordinary DELETE
+are forbidden; only the never-started reservation retirement boundary above may remove its row.
+The table is attribution only: it adds no lesson lifecycle, policy decision, routing, Safety,
+autonomy, or promotion authority. The v4-to-v5 migration is atomic and does not rewrite historical
+Records or admissions.
 
 `AdmissionResult` contains no launch envelope. After commit, Coordinator obtains the immutable
 envelope from the committed AdmissionReceipt through Store's public historical decoder. If the
@@ -130,8 +146,9 @@ does not weaken the required composed `ReservationIntent` types.
 ## Falsifiable consequences
 
 - `tests/test_issue_627_admission.py` fails if the pre-prepare probe blocks preparation, the final
-  root is not authoritative, named authority failures become terminal, or historical lost-ack
-  recovery consults current authority.
+  root is not authoritative, recoverable authority failures become terminal, immutable overlay
+  invalidity remains retryable, never-started discard leaves or over-deletes an admission fact,
+  trigger restoration is not enforced, or historical lost-ack recovery consults current authority.
 - `tests/test_canary_attribution.py` fails if any callback can mutate Store, any precommit cutpoint
   publishes a partial output, a forged receipt or Safety history reads successfully, either
   admission migration is not atomic, an immutable fact is mutable, or an accepted schema

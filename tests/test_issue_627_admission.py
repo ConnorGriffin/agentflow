@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 import sqlite3
 
 import pytest
 
+from agentflow.canary_attribution import (
+    ATTRIBUTION_CONTRACT_VERSION,
+    ROW_DIGEST_DOMAIN,
+    CanaryAttribution,
+    _digest as _canary_digest,
+)
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
-from agentflow.coordinator import Coordinator, Submission
-from agentflow.coordinator.launcher import STARTED, StartResult
+from agentflow.coordinator import Coordinator, StageOutcome, Submission
+from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.record import RUNNING, Record
 from agentflow.coordinator.store import (
     AdmissionRefused,
@@ -19,8 +25,11 @@ from agentflow.coordinator.store import (
     SafetySources,
     Store,
     StoreUnavailable,
+    _digest as _store_digest,
 )
-from agentflow.effective_policy import NotApplicableBriefing, _finish, _hold
+from agentflow.effective_policy import (
+    EffectivePolicyResolver, NotApplicableBriefing, PolicyValidationError, _finish, _hold,
+)
 from agentflow.evidence import ApprovedAuthority, AuthorityPointer, PromotionReceipt
 from agentflow.operational_safety import CanaryActivationRequest, OperationalSafety
 from agentflow.operational_safety import CheckEvidence, DETERMINISTIC_CHECKS, ObservationRequest
@@ -28,6 +37,15 @@ from agentflow.routing import routing
 
 
 REVISION = "a" * 40
+_ADMISSION_FACT_TABLES = (
+    "admission_receipts",
+    "safety_admission_history",
+    "canary_attributions",
+    "lesson_use_attributions",
+)
+_ADMISSION_FACT_DELETE_TRIGGERS = {
+    table: f"{table}_no_delete" for table in _ADMISSION_FACT_TABLES
+}
 
 
 class _Receipts:
@@ -106,6 +124,14 @@ class _StartedLauncher:
         return family in self.alive
 
 
+class _NeverStartsLauncher:
+    def start(self, _record, _store, _admitted=None):
+        return StartResult(NOT_STARTED)
+
+    def is_alive(self, _family):
+        return False
+
+
 class _Briefings:
     def __init__(self, *, available=True) -> None:
         self.available = available
@@ -135,16 +161,18 @@ def _failure(state, stage="build", provider="codex"):
 
 
 def _coordinator(
-        tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None):
+        tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None,
+        launcher=None):
     path = tmp_path / "coordinator.db"
     receipts = receipts or _Receipts()
     store = Store(path, admission_mode=OperationalSafetyAndCanary(
         SafetySources(check_evidence=checks), receipts))
-    launcher = _StartedLauncher()
+    launcher = launcher or _StartedLauncher()
     adapter = _Prepared()
     coordinator = Coordinator(
         store=store, launcher=launcher, adapter=adapter,
-        capability_preflight=capability, briefing_resolver=briefing or _Briefings(),
+        capability_preflight=capability,
+        briefing_resolver=briefing or _Briefings(),
         route_selector=routing.select_route, daemon_generation="daemon-627")
     identity = coordinator.submit_stage(Submission(
         repo="octo/app", subject="627", stage="build", pool="codex",
@@ -165,6 +193,85 @@ def _assert_zero_outputs(store, launcher, identity, code):
     assert store.permits_used("codex") == 0 and launcher.launches == []
     assert store.read_admission_receipt(identity) is None
     assert store.read_canary_attribution(identity) is None
+
+
+def _insert_optional_admission_facts(store, record):
+    lesson = {
+        "stage_identity": record.identity,
+        "repository": record.repo,
+        "stage": record.stage,
+        "subject_revision": record.subject_revision,
+        "briefing_id": "briefing-v1:" + "b" * 64,
+        "briefing_digest": "b" * 64,
+        "promotion_receipt_id": "receipt-withdraw",
+        "method_revision": "c" * 40,
+    }
+    store._conn.execute(
+        "INSERT INTO lesson_use_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (*lesson.values(), _store_digest({"domain": "lesson-use-attribution-v1", **lesson})),
+    )
+    canary = {
+        "stage_identity": record.identity,
+        "repository": record.repo,
+        "route_cell_digest": record.route_cell_digest,
+        "receipt_binding": "b" * 64,
+        "method_revision": "c" * 40,
+        "cohort_id": "d" * 64,
+        "contract_version": ATTRIBUTION_CONTRACT_VERSION,
+    }
+    attribution = CanaryAttribution(
+        **canary,
+        attribution_digest=_canary_digest({"domain": ROW_DIGEST_DOMAIN, **canary}),
+    )
+    store._conn.execute(
+        "INSERT INTO canary_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        tuple(asdict(attribution).values()),
+    )
+
+
+def _admission_fact_rows(store, identity):
+    return {
+        table: tuple(store._conn.execute(
+            f"SELECT * FROM {table} WHERE stage_identity = ?", (identity,),
+        ).fetchall())
+        for table in _ADMISSION_FACT_TABLES
+    }
+
+
+def _assert_delete_triggers_enforced(store, identity):
+    trigger_names = {
+        row[0] for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'trigger'",
+        ).fetchall()
+    }
+    assert set(_ADMISSION_FACT_DELETE_TRIGGERS.values()) <= trigger_names
+    for table in _ADMISSION_FACT_TABLES:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            store._conn.execute(
+                f"DELETE FROM {table} WHERE stage_identity = ?", (identity,),
+            )
+
+
+def _two_never_started_admissions(tmp_path):
+    coordinator, store, _launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        launcher=_NeverStartsLauncher())
+    unrelated_identity = coordinator.submit_stage(Submission(
+        repo="octo/app", subject="628", stage="build", pool="codex",
+        complexity="deep", subject_revision="b" * 40))
+    unrelated = store.record_of(unrelated_identity)
+    assert unrelated is not None
+    store.register_route_selection(routing.select_route(
+        unrelated.repo, unrelated.stage, unrelated.pool, unrelated.model,
+        complexity=unrelated.complexity, effort=unrelated.effort,
+        builder_complexity=unrelated.builder_complexity))
+
+    coordinator.cycle("codex")
+    records = (store.record_of(identity), store.record_of(unrelated_identity))
+    assert all(record is not None and record.start_fact == NOT_STARTED for record in records)
+    for record in records:
+        _insert_optional_admission_facts(store, record)
+    return coordinator, store, identity, unrelated_identity
 
 
 def _corrupt_committed_authority(path, identity, authority):
@@ -252,7 +359,7 @@ def test_adr_627_pins_every_prerequisite_and_public_contract_digest():
         "#582": "a58dc0c84a7459774631048a67b3e71f8328d144",
         "#585": "bd818fa1d65c92def671192464207e6bc3904a34",
         "#628": "ab9c1ffa6f86de149db46f0dca96e89499159172",
-        "effective-policy": "ea12ea2c28622dcbf2aeed7fa060f54250de3903d3942bfc8f6b8a04ffd53cef",
+        "effective-policy": "783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d",
         "#641": "80f5a144621a990953d8ccacc08dd93a76090eaa",
         "#645": "46e0109a10e08a9ea6a8dc0621dcafde5a1d3d2f",
         "#646": "4ffde0671ff496feb6cad697e7536bb8e4dc0454",
@@ -365,6 +472,149 @@ def test_missing_policy_authority_retries_after_deployment_without_outputs(tmp_p
     assert len(recovered_launcher.launches) == 1
     assert reopened.record_of(identity).state == "running"
     reopened.close()
+
+
+def test_legacy_admission_identity_holds_and_frees_the_pool(tmp_path):
+    class _LegacyBriefings:
+        def brief_for(self, repository, stage, subject_revision):
+            if not subject_revision:
+                return None
+            return _Briefings().brief_for(repository, stage, subject_revision)
+
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing=_LegacyBriefings())
+    legacy = store.record_of(identity)
+    assert legacy is not None
+    legacy.subject_revision = ""
+    legacy.route_id = ""
+    legacy.route_cell_digest = ""
+    legacy.launch_config_digest = ""
+    assert store.upsert(legacy)
+    sibling = coordinator.submit_stage(Submission(
+        repo="octo/app", subject="628", stage="build", pool="codex",
+        complexity="deep", subject_revision="b" * 40))
+
+    outcomes = coordinator.cycle("codex")
+
+    held = store.record_of(identity)
+    started_sibling = store.record_of(sibling)
+    assert held is not None and held.state == "held" and not held.claim
+    assert held.hold_reason == "refused before start — admission_identity_migration_required"
+    assert outcomes == [StageOutcome(identity, "build", "held", held.handoff_kind)]
+    assert started_sibling is not None and started_sibling.state == "running"
+    assert launcher.identities == [sibling]
+    store.close()
+
+
+def test_malformed_immutable_overlay_holds_and_frees_the_pool(tmp_path):
+    class _MalformedOverlay:
+        def __init__(self):
+            self.calls = []
+
+        def read(self, repository, subject_revision):
+            self.calls.append((repository, subject_revision))
+            raise PolicyValidationError("invalid immutable overlay")
+
+    source = _MalformedOverlay()
+    resolver = EffectivePolicyResolver(
+        promotion_receipts=object(), overlay_source=source)
+
+    class _MixedBriefings:
+        def brief_for(self, repository, stage, subject_revision):
+            if subject_revision == REVISION:
+                return resolver.brief_for(repository, stage, subject_revision)
+            return _Briefings().brief_for(repository, stage, subject_revision)
+
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing=_MixedBriefings())
+    sibling = coordinator.submit_stage(Submission(
+        repo="octo/app", subject="628", stage="build", pool="codex",
+        complexity="deep", subject_revision="b" * 40))
+
+    outcomes = coordinator.cycle("codex")
+
+    held = store.record_of(identity)
+    started_sibling = store.record_of(sibling)
+    assert source.calls == [("octo/app", REVISION)]
+    assert held is not None and held.state == "held" and not held.claim
+    assert held.hold_reason == "refused before start — invalid_overlay_authority"
+    assert outcomes == [StageOutcome(identity, "build", "held", held.handoff_kind)]
+    assert started_sibling is not None and started_sibling.state == "running"
+    assert launcher.identities == [sibling]
+    store.close()
+
+
+def test_transient_overlay_unavailability_retries_without_terminal_handoff(tmp_path):
+    class _UnavailableOverlay:
+        def read(self, _repository, _subject_revision):
+            raise OSError("repository temporarily unavailable")
+
+    resolver = EffectivePolicyResolver(
+        promotion_receipts=object(), overlay_source=_UnavailableOverlay())
+
+    class _RecoveringBriefings:
+        available = False
+
+        def brief_for(self, repository, stage, subject_revision):
+            if not self.available:
+                return resolver.brief_for(repository, stage, subject_revision)
+            return _Briefings().brief_for(repository, stage, subject_revision)
+
+    briefings = _RecoveringBriefings()
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing=briefings)
+
+    assert coordinator.cycle("codex") == []
+    waiting = store.record_of(identity)
+    assert waiting is not None and waiting.state == "waiting" and waiting.claim
+    assert waiting.refusal == "invalid_overlay" and waiting.hold_reason is None
+
+    briefings.available = True
+    assert coordinator.cycle("codex") == []
+    assert store.record_of(identity).state == "running"
+    assert launcher.identities == [identity]
+    store.close()
+
+
+def test_withdraw_stage_cleans_only_its_four_composed_admission_facts(tmp_path):
+    coordinator, store, identity, unrelated_identity = _two_never_started_admissions(tmp_path)
+    before = _admission_fact_rows(store, unrelated_identity)
+    assert all(_admission_fact_rows(store, identity).values())
+    assert all(before.values())
+
+    assert coordinator.withdraw_stage(identity) is True
+
+    assert _admission_fact_rows(store, identity) == {
+        table: () for table in _ADMISSION_FACT_TABLES
+    }
+    assert _admission_fact_rows(store, unrelated_identity) == before
+    _assert_delete_triggers_enforced(store, unrelated_identity)
+    store.close()
+
+
+def test_withdraw_stage_failure_rolls_back_all_facts_and_delete_triggers(
+        tmp_path, monkeypatch):
+    import agentflow.canary_attribution as canary_attribution
+
+    coordinator, store, identity, _unrelated_identity = _two_never_started_admissions(tmp_path)
+    before = _admission_fact_rows(store, identity)
+
+    def fail_mid_sequence(_conn, _stage_identity):
+        raise sqlite3.OperationalError("injected discard failure")
+
+    monkeypatch.setattr(
+        canary_attribution, "rollback_never_started_canary_attribution", fail_mid_sequence)
+
+    with pytest.raises(StoreUnavailable, match="cannot discard continuation"):
+        coordinator.withdraw_stage(identity)
+
+    assert store.record_of(identity) is not None
+    assert _admission_fact_rows(store, identity) == before
+    _assert_delete_triggers_enforced(store, identity)
+    store.close()
 
 
 def test_missing_route_authority_retries_after_public_registration(tmp_path):

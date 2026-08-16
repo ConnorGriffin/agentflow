@@ -40,6 +40,7 @@ from agentflow.operational_safety import (
     SafetyRefused,
     decode_admitted_launch,
     materialize_route_cell,
+    rollback_never_started_admission_history,
     _SafetyIdentityMismatch,
     _SafetyMissing,
     _AdmissionContext,
@@ -123,6 +124,28 @@ _LESSON_USE_ATTRIBUTIONS_FINGERPRINT = (
      "createtriggerlesson_use_attributions_no_updatebeforeupdateonlesson_use_attributionsbeginselectraise("
      "abort,'lesson_use_attributionsisappend-only');end"),
 )
+
+
+def _rollback_never_started_store_admission_facts(
+        conn: sqlite3.Connection, stage_identity: str,
+) -> None:
+    """Remove Store-owned reservation facts after the provider launch never started.
+
+    The caller owns the transaction that also removes the record. SQLite has no statement-scoped
+    bypass for these unconditional delete triggers, so Store suspends and restores only its own
+    triggers inside that transaction. Transactional DDL restores them with the rows on rollback.
+    """
+    if not conn.in_transaction:
+        raise sqlite3.OperationalError(
+            "never-started Store admission rollback requires an active transaction")
+    conn.execute("DROP TRIGGER admission_receipts_no_delete")
+    conn.execute("DROP TRIGGER lesson_use_attributions_no_delete")
+    conn.execute(
+        "DELETE FROM admission_receipts WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(
+        "DELETE FROM lesson_use_attributions WHERE stage_identity = ?", (stage_identity,))
+    conn.execute(_ADMISSION_RECEIPTS_NO_DELETE)
+    conn.execute(_LESSON_USE_ATTRIBUTIONS_NO_DELETE)
 
 
 def _store_v4_fingerprint():
@@ -237,7 +260,7 @@ ADMISSION_REFUSAL_CODES = frozenset({
     "capability_environment_failure:drifted",
     "capability_environment_failure:incompatible",
     "briefing_overflow", "incompatible_policy", "invalid_briefing", "invalid_overlay",
-    "invalid_receipt", "missing_policy", "missing_receipt",
+    "invalid_overlay_authority", "invalid_receipt", "missing_policy", "missing_receipt",
 })
 
 
@@ -620,7 +643,7 @@ class Store:
 
     @staticmethod
     def _migrate_v2_to_v3(conn: sqlite3.Connection) -> None:
-        """Add append-only CanaryAttribution state without rewriting existing owners."""
+        """Add normally append-only CanaryAttribution state without rewriting existing owners."""
         committed = False
         try:
             Store._migration_checkpoint("v2-to-v3:before-begin")
@@ -1520,6 +1543,16 @@ class Store:
                         or current.process_alive):
                     self._conn.execute("ROLLBACK")
                     return False
+                # Composed admission may have committed immutable facts before a launcher proves
+                # ``not_started``. This is their one rollback boundary; each owner encapsulates
+                # its own append-only-trigger suspension inside this IMMEDIATE transaction.
+                from agentflow.canary_attribution import (
+                    rollback_never_started_canary_attribution,
+                )
+                _rollback_never_started_store_admission_facts(
+                    self._conn, expected.identity)
+                rollback_never_started_admission_history(self._conn, expected.identity)
+                rollback_never_started_canary_attribution(self._conn, expected.identity)
                 self._conn.execute(
                     "DELETE FROM records WHERE identity = ?", (expected.identity,))
                 self._conn.execute("COMMIT")
