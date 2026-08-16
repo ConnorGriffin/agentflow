@@ -105,6 +105,33 @@ def test_collect_sessions_excludes_manual_worktrees_unless_requested(tmp_path):
     assert with_manual[0]["fleet"] is False
 
 
+def test_collect_codex_keeps_its_first_metadata_and_malformed_rollout_policy(tmp_path):
+    workdir = tmp_path / "checkouts" / "sample-app"
+    workdir.mkdir(parents=True)
+    root = tmp_path / "codex-sessions" / "2026" / "08" / "16"
+    root.mkdir(parents=True)
+    (root / "valid.jsonl").write_text("\n".join((
+        json.dumps({"type": "session_meta", "payload": {
+            "originator": "codex_exec",
+            "cwd": str(workdir / ".agentflow" / "worktrees" / "codex" / "issue-1"),
+        }}),
+        json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 100, "cached_input_tokens": 20,
+                                  "output_tokens": 30},
+        }}}),
+        json.dumps({"type": "response_item", "payload": {
+            "type": "function_call", "arguments": json.dumps({"command": "pytest -q"}),
+        }}),
+    )) + "\n")
+    (root / "malformed.jsonl").write_text("not json\n" + (root / "valid.jsonl").read_text())
+
+    sessions = churn.collect_codex(
+        [RepoConfig(repo="acme/sample-app", workdir=str(workdir))], str(tmp_path / "codex-sessions"))
+
+    assert [(session["label"], session["output_tokens"], session["uncached_input_tokens"])
+            for session in sessions] == [("codex/issue-1", 30, 80)]
+
+
 def test_format_report_ranks_the_higher_churn_session_first(tmp_path):
     quiet = churn._new_session("claude", "quiet.jsonl", "issue-1", "acme/sample-app")
     quiet["output_tokens"] = 100

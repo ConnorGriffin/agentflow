@@ -714,6 +714,26 @@ def test_a_rollout_with_a_different_cwd_is_not_merged(tmp_path, monkeypatch):
     assert observation.usage.model_costs == (ModelCost("fable", 0.01),)
 
 
+def test_a_truncated_matching_rollout_is_not_merged(tmp_path, monkeypatch):
+    """A worker transcript with no cumulative spend fact remains unmeasured, never free."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    rollout = tmp_path / ".codex" / "sessions" / "truncated.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text(json.dumps({"type": "session_meta", "payload": {"cwd": str(workspace)}})
+                       + "\n")
+    _lead_session_artifacts(tmp_path, "lead-truncated")
+
+    record = Record("i", "build", "claude", 1, launch_token="lead-truncated",
+                    model="fable", source=str(workspace), started_at=0)
+
+    observation = ClaudeProviderAdapter().observe(record)
+
+    assert observation.usage.model_costs == (ModelCost("fable", 0.01),)
+
+
 def test_only_resolved_worktree_descendants_in_the_admission_window_are_merged(
         tmp_path, monkeypatch):
     """Sibling, prefix, symlink escape, and pre-admission rollouts stay outside this lead."""

@@ -17,6 +17,7 @@ def test_builtin_helper_reports_the_latest_codex_limit_windows(tmp_path):
     (sessions / "rollout.jsonl").write_text(
         "\n".join(
             [
+                "not JSON",  # ignored like a damaged Codex rollout record in production
                 json.dumps(
                     {
                         "timestamp": "2026-07-28T11:00:00Z",
