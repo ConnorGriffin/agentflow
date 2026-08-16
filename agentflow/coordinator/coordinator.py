@@ -727,6 +727,8 @@ class Coordinator:
         obs = self._adapter.observe(record)
         if getattr(obs, "has_end_fact", False):
             return False  # the provider recorded an end — a real failure, charged like any other
+        self._record_telemetry(record, obs, outcome=None, verified=False,
+                               interrupted_by_restart=True)
         attempt_no = record.attempts
         self._release(record)
         record.attempts -= 1               # refund the up-front charge; the resume re-charges it
@@ -1642,11 +1644,13 @@ class Coordinator:
     def _release(self, record: Record) -> None:
         record.process_alive = False
 
-    def _record_telemetry(self, record: Record, obs, *, outcome, verified: bool) -> None:
-        """Stamp this ended attempt's durable spend entry, keyed by its launch token (ADR 0040).
+    def _record_telemetry(self, record: Record, obs, *, outcome, verified: bool,
+                          interrupted_by_restart: bool = False) -> None:
+        """Stamp an ended or restart-interrupted attempt's durable spend entry by launch token.
 
-        Every attempt that ends is recorded — a completed stage, a superseded retry, a held
-        exhaustion — so no spend is lost. A telemetry write never fails a cycle: the durable
+        Every ended attempt is recorded — a completed stage, a superseded retry, a held
+        exhaustion — and restart recovery records the still-running attempt before re-admission,
+        so no observed helper spend is lost. A telemetry write never fails a cycle: the durable
         session artifact still carries the raw usage to re-derive later if the write is lost."""
         from agentflow.coordinator.profiles import profile_for
 
@@ -1662,9 +1666,11 @@ class Coordinator:
             restart_resumes=record.restart_resumes, round=record.round,
             conflict_round=record.conflict_round,
             verified=verified, outcome=outcome or "",
-            verify_miss=record.verify_miss,
-            cause=obs.cause.value, classification=obs.classification(),
+            verify_miss=record.verify_miss if not interrupted_by_restart else "",
+            cause=obs.cause.value,
+            classification="incomplete" if interrupted_by_restart else obs.classification(),
             started_at=record.started_at, finalized_at=int(time.time()),
+            interrupted_by_restart=interrupted_by_restart,
             usage=getattr(obs, "usage", AttemptUsage()))
         record_attempt(self._store.path, entry)
         # The provider's own five-hour quota fact, when this attempt's stream reported one, is the

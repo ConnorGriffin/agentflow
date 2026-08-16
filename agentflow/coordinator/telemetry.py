@@ -314,17 +314,19 @@ def lead_codex_worker_usage(record) -> tuple:
     ``codex exec --cd <worktree>``, observed from the workers' own rollout files rather than
     self-reported by the lead (frozen decision 2, issue #516 slice 2).
 
-    Every rollout under the sessions root whose ``session_meta.cwd`` realpath-matches the
-    record's workspace, and whose mtime is at/after the attempt's own ``started_at``, contributes
-    its last cumulative ``token_count`` totals, summed per attributed model (falling back to the
-    literal ``"codex"`` identity when no model fact is found). The floor is the attempt's own
+    Every rollout under the sessions root whose ``session_meta.cwd`` resolves to the record's
+    workspace or a descendant of it, and whose mtime is at/after the attempt's own
+    ``started_at``, contributes its last cumulative ``token_count`` totals, summed per attributed
+    model (falling back to the literal ``"codex"`` identity when no model fact is found). Both
+    paths are realpath-resolved before containment is decided, so symlinks and relative paths
+    cannot escape the workspace or match a lexical prefix. The floor is the attempt's own
     admission time, not a backdated slack: a worker cannot start before the attempt that spawned
-    it, so a rollout last written before this attempt was admitted belongs to some earlier
-    attempt that reused the same workspace (a retry, or a prior build before a revise), never to
-    this one — a slack that reached backward past admission would double-book that earlier
-    attempt's spend onto this attempt too. A record with no ``started_at`` (falsy) applies no
-    mtime floor. Failure anywhere — an unreadable sessions root, a malformed rollout, a bad path —
-    degrades to no worker entries; this must never fail the caller's observation.
+    it, so a rollout last written before this attempt was admitted belongs to some earlier attempt
+    that reused the same workspace (a retry, or a prior build before a revise), never to this one
+    — a slack that reached backward past admission would double-book that earlier attempt's spend
+    onto this attempt too. A record with no ``started_at`` (falsy) applies no mtime floor. Failure
+    anywhere — an unreadable sessions root, a malformed rollout, a bad path — degrades to no
+    worker entries; this must never fail the caller's observation.
     """
     try:
         if record.stage not in {"build", "revise"} or record.model not in {"fable", "sol"} \
@@ -352,7 +354,7 @@ def lead_codex_worker_usage(record) -> tuple:
             if cwd is None:
                 continue
             try:
-                if os.path.realpath(cwd) != workspace:
+                if os.path.commonpath((workspace, os.path.realpath(cwd))) != workspace:
                     continue
             except OSError:
                 continue
@@ -387,8 +389,10 @@ class AttemptTelemetry:
 
     It carries the stage identity and routing dials the attempt ran under, the terminal
     provider cause and whether the stage outcome was verified, the wall-clock span the
-    coordinator owns, and the normalized :class:`AttemptUsage`. Restart replays and retries
-    each run under their own launch token, so each is a separate entry.
+    coordinator owns, and the normalized :class:`AttemptUsage`. An entry interrupted by a
+    daemon restart is booked before its replacement run is admitted, so its unrecoverable lead
+    spend remains explicit. Restart replays and retries each run under their own launch token,
+    so each is a separate entry.
     """
 
     token: str                       # launch token — the per-attempt identity and idempotency key
@@ -411,7 +415,8 @@ class AttemptTelemetry:
     cause: str                       # terminal provider cause (none/capacity/permanent/…)
     classification: str              # coordinator label (recoverable/permanent/incomplete/unknown)
     started_at: int                  # epoch the attempt was admitted
-    finalized_at: int                # epoch the coordinator finalized the ended family
+    finalized_at: int                # epoch the coordinator finalized or booked the attempt
+    interrupted_by_restart: bool = False  # no terminal provider bill; the resumed run is separate
     verify_miss: str = ""            # the first failed verification conjunct ("check: detail")
                                      # when unverified and the verifier is typed, else ""
     usage: AttemptUsage = field(default_factory=AttemptUsage)
@@ -534,6 +539,7 @@ def _read_attempt(path: Path, *, strict: bool) -> AttemptTelemetry | None:
 def _learning_safe(entry: AttemptTelemetry) -> bool:
     if (type(entry.token) is not str or not entry.token or type(entry.identity) is not str
             or type(entry.started_at) is not int or type(entry.finalized_at) is not int
+            or type(entry.interrupted_by_restart) is not bool
             or entry.started_at < 0 or entry.finalized_at < 0
             or (entry.started_at and entry.finalized_at
                 and entry.finalized_at < entry.started_at)):
@@ -621,8 +627,9 @@ class ModelSpendRow:
     routing rate card rather than provider-billed — a total mixing billed and estimated
     dollars is itself estimated (issue #516). ``delegate_uncaptured_attempts`` counts, among
     the attempts aggregated into this row, how many are lead-run build/revise attempts whose
-    delegated Codex worker spend has not been captured into their usage — the row is real but
-    known-incomplete, so an aggregate reading it never silently treats it as fully measured.
+    spend is not fully counted: either no delegated Codex worker usage was captured, or a daemon
+    restart made the lead's own spend unrecoverable. The row is real but known-incomplete, so an
+    aggregate reading it never silently treats it as fully measured.
     """
 
     stage: str
@@ -648,8 +655,8 @@ def format_spend_report(report: SpendReport) -> str:
 
     An estimated dollar figure renders flagged (``~1.234567 est``) rather than indistinguishably
     from a provider-billed one; a row with no dollar fact at all renders ``—``, never
-    ``0.000000`` — unknown is never zero. A row aggregating lead-run attempts whose delegate
-    spend was not captured carries a trailing note so the gap is visible, not silent.
+    ``0.000000`` — unknown is never zero. A row aggregating lead-run attempts whose spend is not
+    fully counted carries a trailing note so the gap is visible, not silent.
     """
     lines = ["stage\tmodel\tattempts\ttokens\tdollars\tnote"]
     for row in report.rows:
@@ -662,7 +669,7 @@ def format_spend_report(report: SpendReport) -> str:
             dollars = f"{row.cost_usd:.6f}"
         notes = []
         if row.delegate_uncaptured_attempts:
-            notes.append(f"delegate spend not counted ({row.delegate_uncaptured_attempts})")
+            notes.append(f"spend not fully counted ({row.delegate_uncaptured_attempts})")
         if row.unpriced_cached_input_tokens:
             notes.append(f"cached input not priced ({row.unpriced_cached_input_tokens} tokens)")
         if 0 < row.dollar_covered_attempts < row.attempts:
@@ -723,7 +730,7 @@ def _codex_priced(model: str) -> bool:
 
 
 def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
-    """Whether a Fable or Sol lead has no attributed delegated-helper usage.
+    """Whether a Fable or Sol lead has spend the report cannot fully count.
 
     A Fable parent needs a reported Codex child. A Sol parent accepts any routing-known helper
     model other than its own internal or CLI identity: Terra, Luna, generic Codex, and Claude
@@ -731,6 +738,8 @@ def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
     """
     if entry.stage not in _LEAD_LED_STAGES or entry.model not in {"fable", "sol"}:
         return False
+    if entry.interrupted_by_restart:
+        return True
     from agentflow.routing import routing
     parent = routing.provider_for(entry.model)
     def delegated_helper(cost: ModelCost) -> bool:
