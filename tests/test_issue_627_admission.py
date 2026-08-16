@@ -493,7 +493,7 @@ def test_adr_627_pins_every_prerequisite_and_public_contract_digest():
         "#582": "a58dc0c84a7459774631048a67b3e71f8328d144",
         "#585": "bd818fa1d65c92def671192464207e6bc3904a34",
         "#628": "ab9c1ffa6f86de149db46f0dca96e89499159172",
-        "effective-policy": "783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d",
+        "effective-policy": "f87266dddb953ee684958d8acef2f65b0aaa22cb812199adcd8d4cf912cbb01f",
         "#641": "80f5a144621a990953d8ccacc08dd93a76090eaa",
         "#645": "46e0109a10e08a9ea6a8dc0621dcafde5a1d3d2f",
         "#646": "4ffde0671ff496feb6cad697e7536bb8e4dc0454",

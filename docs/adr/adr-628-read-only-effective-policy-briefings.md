@@ -27,9 +27,10 @@ module SHA-256 is
 
 One `EffectivePolicyResolver` exposes `brief_for(repository, stage, subject_revision)` and
 returns one immutable `briefing-v1` result. It reads only exact #584 receipts through
-`PromotionReceiptReader.read`, the pinned Evaluation policy bundle, and an injected
-`RepositoryOverlaySource.read`. It has no GitHub adapter, Evidence verb, coordinator Store
-type, persistence operation, policy transition, or mutable result state.
+`PromotionReceiptReader.read` and its query-only verified fleet-successor-chain read, the pinned
+Evaluation policy bundle, and an injected `RepositoryOverlaySource.read`. It has no GitHub
+adapter, Evidence verb, coordinator Store type, persistence operation, policy transition, or
+mutable result state.
 
 The resolver folds fleet policy, then a same-repository overlay, then stage applicability.
 An overlay can only remove existing receipt or capability entries, narrow an existing named
@@ -44,8 +45,9 @@ sorted keys, compact separators, non-ASCII preservation, JSON integers only, and
 numbers. Duplicate members are rejected recursively. Object arrays are ordered by element
 canonical bytes. Overlay and briefing self-digests omit only their declared identity fields.
 The overlay is bounded at 8 KiB and the final briefing at 16 KiB; collection and nested-bound
-limits are part of the closed contract. The exact effective-policy contract digest is
-`783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d`.
+limits are part of the closed contract. The exact effective-policy contract digest, amended by
+#694's successor-chain activation, is
+`f87266dddb953ee684958d8acef2f65b0aaa22cb812199adcd8d4cf912cbb01f`.
 
 The result vocabulary is ready, not applicable, or a hold with one of the eight closed codes.
 Holds contain only validated tokens or digests as references. Rejected content, source prose,
@@ -80,3 +82,11 @@ receipt, its stage prompt verifies that the locator and SHA-256 name the deploye
 methodology artifact. The briefing still delivers only receipt authority and never method prose.
 A mismatch refuses before admission, and Store records the same receipt and method revision only
 after this check succeeds.
+
+Issue #694 supplies the missing publication read. The pinned Evaluation receipt anchors version 1;
+the reader revalidates every consecutive verified fleet successor, and the resolver selects the
+newest recognized advisory receipt for each owning stage. Fleet policy may therefore cite receipts
+from earlier transitions rather than requiring every receipt to carry the newest version. The
+briefing's version and applicability scope come from its newest applicable active receipt, preserving
+the #571 unrelated-stage identity guarantee, while repository overlays bind the newest global chain
+version before they may restrict it.

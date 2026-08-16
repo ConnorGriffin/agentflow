@@ -12,8 +12,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from agentflow import (coordinated_research, coordinated_review, coordinated_revise, github,
-                       pipeline, reviewer)
+from agentflow import (coordinated_research, coordinated_review, coordinated_revise,
+                       evaluation_authority, github, pipeline, reviewer)
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
 from agentflow.coordinator import Coordinator, ReviewStageAdapter, StageRouter, Submission
 from agentflow.coordinator.launcher import STARTED, StartResult
@@ -23,11 +23,10 @@ from agentflow.coordinator.revise_stage import ReviseStageAdapter
 from agentflow.coordinator.store import OperationalSafetyAndCanary, SafetySources, Store
 from agentflow.coordinator.telemetry import AttemptTelemetry, AttemptUsage, record_attempt
 from agentflow.effective_policy import (
-    PINNED_EVALUATION_POLICY, CapabilityRequirement, EffectivePolicyResolver,
-    FleetPolicyV1, ReadyBriefing)
+    PINNED_EVALUATION_POLICY, EffectivePolicyResolver, ReadyBriefing)
 from agentflow.evidence import (
     ApprovedAuthority, AuthorityPointer, EvidenceError, EvidenceReceiptReader, EvidenceStore,
-    FakeAuthorityVerifier, PromotionReceipt, PromotionReceiptReader)
+    FakeAuthorityVerifier, PromotionReceiptReader)
 from agentflow.evidence_pipeline import EvidenceMiner, EvidenceProducer, LessonInput
 from agentflow.learning import report
 from agentflow.prompts import stage_prompt_spec
@@ -42,24 +41,15 @@ PROPOSAL_DIGEST = sha256(METHOD_ARTIFACT.read_bytes()).hexdigest()
 METHOD_REVISION = "e" * 40
 METHOD_POINTER = AuthorityPointer(
     "github", REPOSITORY, "pulls/571/files/agentflow/reviewer.py",
-    METHOD_REVISION, "sha256", PROPOSAL_DIGEST, "fleet-policy/0-to-1")
+    METHOD_REVISION, "sha256", PROPOSAL_DIGEST, "fleet-policy/1-to-2")
 METHOD_APPROVAL = ApprovedAuthority(
     METHOD_POINTER, "approval-issue-571", METHOD_REVISION, PROPOSAL_DIGEST,
-    "fleet-policy/0-to-1", "github-authority", "v1", "verified")
+    "fleet-policy/1-to-2", "github-authority", "v1", "verified")
 
 
 class _NoOverlay:
     def read(self, _repository, _revision):
         return None
-
-
-class _PromotionReceipts:
-    def __init__(self, stored, fixed):
-        self.stored = stored
-        self.fixed = {item.receipt_id: item for item in fixed}
-
-    def read(self, receipt_id):
-        return self.fixed.get(receipt_id) or self.stored.read(receipt_id)
 
 
 class _Observer:
@@ -144,20 +134,6 @@ def _ready(record, _materialize):
     return CapabilityPreflightResult(record.stage, record.pool, (), "ready", (), "", fact)
 
 
-def _promotion_receipt(receipt):
-    authority = receipt.authority
-    pointer = AuthorityPointer(
-        authority.authority_kind, authority.repository, authority.locator, authority.revision,
-        authority.content_hash_algorithm, authority.content_hash, authority.scope)
-    approved = ApprovedAuthority(
-        pointer, authority.approval_id, authority.approved_revision, authority.approved_hash,
-        authority.approved_scope, authority.verifier_id, authority.verifier_version,
-        authority.outcome)
-    return PromotionReceipt(
-        receipt.receipt_id, receipt.candidate_id, receipt.approval_id,
-        receipt.policy_version, approved, receipt.authoritative)
-
-
 def test_production_router_wires_terminal_intake_attack_and_research_evidence(tmp_path):
     evidence_path = tmp_path / "terminal-evidence.db"
     evidence = EvidenceStore(path=evidence_path)
@@ -193,7 +169,9 @@ def test_production_router_wires_terminal_intake_attack_and_research_evidence(tm
 
 def test_public_learning_loop_closes_without_network_provider_or_daemon_side_effects(
         tmp_path, monkeypatch):
-    evidence_path = tmp_path / "evidence.db"
+    evidence_path = tmp_path / "state" / "evidence" / "evidence.db"
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path / "state"))
+    assert evaluation_authority.deploy(path=evidence_path).status == "published"
     evidence = EvidenceStore(
         path=evidence_path, verifier=FakeAuthorityVerifier((METHOD_APPROVAL,)))
     producer = EvidenceProducer(evidence, repository=REPOSITORY)
@@ -251,7 +229,7 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
 
     candidates = EvidenceMiner(receipt_reader).candidates(tuple(
         LessonInput(event.event.event_id, PROPOSAL_DIGEST) for event in review_events),
-        policy_version=1, nominated_at=150)
+        policy_version=2, nominated_at=150)
     assert len(candidates) == 1
     candidate = evidence.nominate(candidates[0])
     with pytest.raises(EvidenceError, match="unknown promotion receipt"):
@@ -265,22 +243,8 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
     assert promoted.authoritative and promoted.authority == METHOD_APPROVAL
     assert promoted.authority.approved_hash == sha256(METHOD_ARTIFACT.read_bytes()).hexdigest()
 
-    stored_promotion_reader = PromotionReceiptReader(path=evidence_path)
+    promotion_reader = PromotionReceiptReader(path=evidence_path)
     evaluation_receipt = PINNED_EVALUATION_POLICY.receipts[0]
-    promotion_reader = _PromotionReceipts(
-        stored_promotion_reader, (_promotion_receipt(evaluation_receipt),))
-    policy_receipts = tuple(sorted(
-        (evaluation_receipt, EffectivePolicyResolver._receipt_value(promoted)),
-        key=lambda item: json.dumps(item.value(), sort_keys=True, separators=(",", ":"))))
-    policy = FleetPolicyV1(
-        1, policy_receipts, PINNED_EVALUATION_POLICY.capabilities)
-    implementation = inspect.getclosurevars(
-        EffectivePolicyResolver.brief_for).nonlocals["implementation"]
-
-    def fixture_policy(self, repo, stage, subject_revision):
-        return implementation(self, repo, stage, subject_revision, policy)
-
-    monkeypatch.setattr(EffectivePolicyResolver, "brief_for", fixture_policy)
     resolver = EffectivePolicyResolver(
         promotion_receipts=promotion_reader, overlay_source=_NoOverlay())
     briefing = resolver.brief_for(REPOSITORY, "review", "f" * 40)
@@ -306,17 +270,12 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
 
     unrelated_briefing = resolver.brief_for(REPOSITORY, "research", "9" * 40)
     assert isinstance(unrelated_briefing, ReadyBriefing)
-    evaluation_only_briefing = implementation(
-        resolver, REPOSITORY, "research", "9" * 40, PINNED_EVALUATION_POLICY)
-    assert isinstance(evaluation_only_briefing, ReadyBriefing)
-    assert unrelated_briefing == evaluation_only_briefing
     assert unrelated_briefing.receipts == (evaluation_receipt,)
+    assert unrelated_briefing.policy_version == PINNED_EVALUATION_POLICY.policy_version
     unrelated_prompt = "Research the bounded question."
-    evaluation_only_prompt = stage_prompt_spec("research").with_briefing(
-        unrelated_prompt, evaluation_only_briefing)
-    assert (stage_prompt_spec("research").with_briefing(
-        unrelated_prompt, unrelated_briefing) == evaluation_only_prompt)
-    assert promoted.receipt_id not in evaluation_only_prompt
+    unrelated_with_briefing = stage_prompt_spec("research").with_briefing(
+        unrelated_prompt, unrelated_briefing)
+    assert promoted.receipt_id not in unrelated_with_briefing
 
     unrelated_store = Store(
         tmp_path / "unrelated-stage.db",
@@ -384,12 +343,6 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
         SafetySources(), promotion_reader))
     assert store.read_lesson_use_attribution(identity) == original_attribution
 
-    conflict_policy = FleetPolicyV1(
-        1, policy.receipts,
-        (CapabilityRequirement("fixture-method", "v1", "0" * 64),))
-    conflicting_briefing = implementation(
-        resolver, REPOSITORY, "review", "f" * 40, conflict_policy)
-    assert isinstance(conflicting_briefing, ReadyBriefing)
     conflict_store = Store(
         tmp_path / "conflicting-attribution.db",
         admission_mode=OperationalSafetyAndCanary(SafetySources(), promotion_reader))
@@ -411,8 +364,8 @@ def test_public_learning_loop_closes_without_network_provider_or_daemon_side_eff
         "stage_identity": conflict_identity, "repository": conflict_waiting.repo,
         "stage": conflict_waiting.stage,
         "subject_revision": conflict_waiting.subject_revision,
-        "briefing_id": conflicting_briefing.briefing_id,
-        "briefing_digest": conflicting_briefing.briefing_digest,
+        "briefing_id": "briefing-v1:" + "0" * 64,
+        "briefing_digest": "0" * 64,
         "promotion_receipt_id": promoted.receipt_id,
         "method_revision": promoted.authority.approved_revision,
     }

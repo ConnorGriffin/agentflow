@@ -192,6 +192,10 @@ class EvidenceError(ValueError):
     """Evidence input or durable state was rejected fail-closed."""
 
 
+class PromotionReceiptChainError(EvidenceError):
+    """A verified receipt set did not form one consecutive fleet-policy chain."""
+
+
 def _token(value: str, name: str) -> None:
     if not isinstance(value, str) or not _ID.fullmatch(value) or "?" in value or "#" in value:
         raise EvidenceError(f"invalid {name}")
@@ -650,6 +654,39 @@ class PromotionReceiptReader:
                 return EvidenceStore._receipt(row)
         except sqlite3.Error as error:
             raise EvidenceError("promotion receipt store is unavailable") from error
+
+    def fleet_policy_successors(self, receipt_id: str) -> tuple[PromotionReceipt, ...]:
+        """Return the verified, consecutive fleet-policy chain after one exact receipt."""
+        _token(receipt_id, "receipt_id")
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM receipts WHERE binding_status='verified'"
+                ).fetchall()
+                receipts = tuple(EvidenceStore._receipt(row) for row in rows)
+        except sqlite3.Error as error:
+            raise EvidenceError("promotion receipt store is unavailable") from error
+        from agentflow.promotion_contract import PromotionAuthorityError, parse_promotion_scope
+        chain: list[tuple[object, PromotionReceipt]] = []
+        try:
+            for receipt in receipts:
+                scope = parse_promotion_scope(receipt.authority.approved_scope)
+                if scope.kind == "fleet":
+                    chain.append((scope, receipt))
+        except (AttributeError, PromotionAuthorityError) as error:
+            raise PromotionReceiptChainError(
+                "promotion receipt chain was not accepted") from error
+        chain.sort(key=lambda item: (item[0].new, item[1].receipt_id))
+        if not chain or chain[0][1].receipt_id != receipt_id:
+            raise EvidenceError("unknown promotion receipt")
+        prior = 0
+        for scope, receipt in chain:
+            if (scope.prior != prior or scope.new != prior + 1
+                    or receipt.policy_version != scope.new):
+                raise PromotionReceiptChainError(
+                    "promotion receipt chain was not accepted")
+            prior = scope.new
+        return tuple(receipt for _, receipt in chain[1:])
 
 
 class EvidenceStore:
@@ -1147,6 +1184,8 @@ class EvidenceStore:
                 scope = parse_promotion_scope(authority.scope)
             except PromotionAuthorityError as error:
                 raise EvidenceError("promotion scope was not accepted") from error
+            if scope.new != scope.prior + 1:
+                raise EvidenceError("promotion scope must allocate the next policy version")
             if (candidate["proposal_digest"] != authority.content_hash
                     or candidate["policy_version"] != scope.new):
                 raise EvidenceError("candidate does not bind the promotion authority")
