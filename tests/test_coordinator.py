@@ -154,8 +154,9 @@ def test_historical_record_preflights_retained_source_not_unrelated_capability_r
     calls = []
     monkeypatch.setattr(
         "agentflow.provider_skills.materialize_launch_capabilities",
-        lambda source, destination, provider, *, materialize_runtime: calls.append(
-            (source, destination, provider, materialize_runtime)) or (True, "ok"),
+        lambda source, destination, provider, *, materialize_runtime, requirement_ids:
+            calls.append((source, destination, provider, materialize_runtime, requirement_ids)) or
+            (True, "ok"),
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.preflight",
@@ -170,7 +171,10 @@ def test_historical_record_preflights_retained_source_not_unrelated_capability_r
     result = pipeline._capability_preflight(record, True)
 
     assert result is not None and result.ready
-    assert calls[0] == (unrelated, retained, "claude", True)
+    assert calls[0] == (
+        unrelated, retained, "claude", True,
+        {"ui-craft", "drive-local-webapp", "playwright"},
+    )
     assert calls[1][0] == retained
     assert calls[1][3] == ("ui-craft", "drive-local-webapp", "playwright")
 
@@ -186,8 +190,8 @@ def test_pre_582_record_without_capability_facts_derives_real_worktree_root(
     calls = []
     monkeypatch.setattr(
         "agentflow.provider_skills.materialize_launch_capabilities",
-        lambda source, destination, provider, *, materialize_runtime: calls.append(
-            (source, destination, materialize_runtime)) or (True, "ok"),
+        lambda source, destination, provider, *, materialize_runtime, requirement_ids:
+            calls.append((source, destination, materialize_runtime, requirement_ids)) or (True, "ok"),
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.preflight",
@@ -201,7 +205,7 @@ def test_pre_582_record_without_capability_facts_derives_real_worktree_root(
     result = pipeline._capability_preflight(record, True)
 
     assert result is not None and result.ready
-    assert calls == [(main, retained, False)]
+    assert calls == [(main, retained, False, {"tdd", "codebase-design", "domain-modeling"})]
 
 
 def test_pre_582_record_without_any_safe_surface_fact_fails_closed(tmp_path):
