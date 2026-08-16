@@ -389,8 +389,13 @@ def _checkout_pr_branch(cfg: RepoConfig, branch: str, wt: Path) -> bool:
             return False
         return _run(["git", "-C", str(wt), "reset", "--hard", f"origin/{branch}"]).returncode == 0
     wt.parent.mkdir(parents=True, exist_ok=True)
-    return _run(["git", "-C", cfg.workdir, "worktree", "add", "-B", branch,
-                 str(wt), f"origin/{branch}"]).returncode == 0
+    added = _run(["git", "-C", cfg.workdir, "worktree", "add", "-B", branch,
+                  str(wt), f"origin/{branch}"])
+    if added.returncode != 0:
+        return False
+    from agentflow.worktree_ownership import mark_worktree_owned
+    mark_worktree_owned(wt, disposable=True)
+    return True
 
 
 # --- ADR 0009 merge-time floor: re-rebase survivors after main advances (issue #45) ---

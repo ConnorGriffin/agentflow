@@ -216,6 +216,8 @@ def _ask_worktree_ready(record):
     if added.returncode != 0:
         return unprepared("worktree-add-failed",
                           f"`git worktree add --detach` at {wt} exited {added.returncode}")
+    from agentflow.worktree_ownership import mark_worktree_owned
+    mark_worktree_owned(wt, disposable=False)
     return PREPARED
 
 

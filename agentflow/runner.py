@@ -733,6 +733,8 @@ class _WorktreeRunner:
         add = ["git", "-C", workdir, "worktree", "add"]
         add += [str(wt), branch] if have_branch else ["-b", branch, str(wt), "origin/main"]
         _run(add).check_returncode()
+        from agentflow.worktree_ownership import mark_worktree_owned
+        mark_worktree_owned(wt, disposable=True)
 
     def provision(self, wt: Path) -> None:
         """Ready a prepared checkout for a session: its dependency environment, then commit-time
@@ -792,6 +794,8 @@ class _WorktreeRunner:
                 raise subprocess.CalledProcessError(1, ["git", "status", "--porcelain"])
         wt.parent.mkdir(parents=True, exist_ok=True)
         _run(["git", "-C", workdir, "worktree", "add", "--detach", str(wt), ref]).check_returncode()
+        from agentflow.worktree_ownership import mark_worktree_owned
+        mark_worktree_owned(wt, disposable=True)
 
     def _open_pr_for_branch(self, repo: str, branch: str) -> tuple[bool, bool]:
         """Whether the open-PR lookup for ``branch`` could be made, and whether one exists.

@@ -320,7 +320,9 @@ def test_native_discovery_receipt_is_repaired_and_admitted(
     record = store.record_of(identity)
     assert record is not None and record.state == "running"
     assert len(launcher.launches) == 1
-    assert probes == [(root, "codex")]
+    assert len(probes) == 1 and probes[0][1] == "codex"
+    assert probes[0][0] != root
+    assert not probes[0][0].exists()
     assert native_discovery_status(root, "codex")[0] == "ok"
     assert any(
         "capability repair" in line
@@ -375,7 +377,9 @@ def test_failed_native_discovery_probe_keeps_the_clocked_refusal(tmp_path, monke
     assert record.refusal == "capability_environment_failure:missing"
     assert record.stall_started_at == 0 and record.stall_last_observed_at == 5 * 60
     assert launcher.launches == []
-    assert probes == [(root, "codex")]
+    assert len(probes) == 1 and probes[0][1] == "codex"
+    assert probes[0][0] != root
+    assert not probes[0][0].exists()
     assert preflights == [False, True, True, False, True]
     repair_lines = [line for line in lines if "capability repair" in line]
     assert len(repair_lines) == 1

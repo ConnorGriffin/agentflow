@@ -96,6 +96,7 @@ def test_public_respond_prepare_recreates_only_from_the_owned_remote_pr_branch(
         return SimpleNamespace(returncode=0, stdout="")
 
     monkeypatch.setattr("agentflow.stage_worktree._run", git)
+    monkeypatch.setattr("agentflow.stage_worktree.mark_worktree_owned", lambda *_a, **_k: None)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
     adapter = RespondStageAdapter(
         reply_ready=lambda record, obs: False,
