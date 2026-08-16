@@ -569,18 +569,25 @@ def _decode_usage(data: dict) -> AttemptUsage:
 
 @dataclass(frozen=True)
 class TelemetryTotals:
-    """Summed spend and explicit missing-data counts for one cell (or the fleet)."""
+    """Summed spend and explicit missing-data counts for one cell (or the fleet).
+
+    ``cost_usd`` is provider-billed only; ``estimated_cost_usd`` is separately priced from the
+    routing rate card. Attributed worker estimates can contribute dollars without contributing
+    attempt-level tokens, which remain diagnostic facts of the parent attempt.
+    """
 
     attempts: int = 0
     verified: int = 0
     missing_usage: int = 0            # attempts the provider reported no usage for
-    cost_missing: int = 0             # attempts with no provider dollar cost (all Codex, some Claude)
+    cost_missing: int = 0             # attempts with no billed or estimable dollar fact
     input_tokens: int = 0
     cached_input_tokens: int = 0
     cache_creation_tokens: int = 0
     output_tokens: int = 0
     reasoning_output_tokens: int = 0
-    cost_usd: float = 0.0
+    cost_usd: float = 0.0             # provider-billed dollars only
+    estimated_cost_usd: float = 0.0
+    delegate_uncaptured_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -625,6 +632,8 @@ class ModelSpendRow:
     cost_usd: float | None
     estimated: bool = False
     delegate_uncaptured_attempts: int = 0
+    unpriced_cached_input_tokens: int = 0
+    dollar_covered_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -651,8 +660,14 @@ def format_spend_report(report: SpendReport) -> str:
             dollars = f"~{row.cost_usd:.6f} est"
         else:
             dollars = f"{row.cost_usd:.6f}"
-        note = (f"delegate spend not counted ({row.delegate_uncaptured_attempts})"
-               if row.delegate_uncaptured_attempts else "")
+        notes = []
+        if row.delegate_uncaptured_attempts:
+            notes.append(f"delegate spend not counted ({row.delegate_uncaptured_attempts})")
+        if row.unpriced_cached_input_tokens:
+            notes.append(f"cached input not priced ({row.unpriced_cached_input_tokens} tokens)")
+        if 0 < row.dollar_covered_attempts < row.attempts:
+            notes.append(f"dollar total covers {row.dollar_covered_attempts} of {row.attempts} attempts")
+        note = "; ".join(notes)
         lines.append(f"{row.stage}\t{row.model}\t{row.attempts}\t{tokens}\t{dollars}\t{note}")
     return "\n".join(lines)
 
@@ -729,17 +744,28 @@ def _delegate_spend_uncaptured(entry: AttemptTelemetry) -> bool:
     return not any(delegated_helper(cost) for cost in entry.usage.model_costs)
 
 
-def _priced_dollars(model: str, tokens_in, tokens_out, tokens_reasoning, billed):
+@dataclass(frozen=True)
+class PricedDollars:
+    """One attempt's known dollar fact, including the known cached-input omission."""
+
+    cost_usd: float | None
+    estimated: bool
+    unpriced_cached_input_tokens: int = 0
+
+
+def _priced_dollars(model: str, tokens_in, tokens_out, tokens_reasoning, billed,
+                    cached_input_tokens=None) -> PricedDollars:
     """The dollar figure and whether it is provider-billed, estimated from the rate card, or
     unknown. Billed always wins; an estimate is only produced when a real token fact exists and
     the model prices from the routing table's rate card — never a guess past that."""
     if billed is not None:
-        return billed, False
+        return PricedDollars(billed, False)
     from agentflow.routing import routing
     estimate = routing.estimate_cost_usd(
         model, input_tokens=tokens_in, output_tokens=tokens_out,
         reasoning_output_tokens=tokens_reasoning)
-    return (estimate, True) if estimate is not None else (None, False)
+    return (PricedDollars(estimate, True, cached_input_tokens or 0)
+            if estimate is not None else PricedDollars(None, False))
 
 
 def spend_report(store_path: Path | str, *, start: int | float | date | datetime,
@@ -758,7 +784,8 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
     start_epoch, end_epoch = _window_epoch(start), _window_epoch(end)
     if end_epoch <= start_epoch:
         raise ValueError("spend report end must be after start")
-    # value = [attempts, tokens, token_seen, dollars, dollar_seen, estimated_seen, uncounted]
+    # value = [attempts, tokens, token_seen, dollars, dollar_seen, estimated_seen, uncounted,
+    #          unpriced_cached_input_tokens, dollar_covered_attempts]
     cells: dict[tuple[str, str], list[int | float | bool]] = {}
     for entry in read_attempts(store_path):
         if not start_epoch <= entry.started_at < end_epoch:
@@ -769,24 +796,29 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
             rows = tuple(
                 (cost.model, cost.tokens,
                  _priced_dollars(cost.model, cost.input_tokens, cost.output_tokens,
-                                 cost.reasoning_output_tokens, cost.cost_usd))
+                                 cost.reasoning_output_tokens, cost.cost_usd,
+                                 cost.cached_input_tokens))
                 for cost in attributed)
         else:
             model = entry.usage.model or entry.model
             rows = ((model, _usage_token_total(entry.usage),
                      _priced_dollars(model, entry.usage.input_tokens, entry.usage.output_tokens,
-                                     entry.usage.reasoning_output_tokens, entry.usage.cost_usd)),)
-        for model, tokens, (dollars, estimated) in rows:
-            cell = cells.setdefault((entry.stage, model), [0, 0, False, 0.0, False, False, 0])
+                                     entry.usage.reasoning_output_tokens, entry.usage.cost_usd,
+                                     entry.usage.cached_input_tokens)),)
+        for model, tokens, priced in rows:
+            cell = cells.setdefault(
+                (entry.stage, model), [0, 0, False, 0.0, False, False, 0, 0, 0])
             cell[0] += 1
             if tokens is not None:
                 cell[1] += tokens
                 cell[2] = True
-            if dollars is not None:
-                cell[3] += dollars
+            if priced.cost_usd is not None:
+                cell[3] += priced.cost_usd
                 cell[4] = True
-                if estimated:
+                cell[8] += 1
+                if priced.estimated:
                     cell[5] = True
+                    cell[7] += priced.unpriced_cached_input_tokens
             if uncounted:
                 cell[6] += 1
     return SpendReport(
@@ -797,7 +829,9 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
                           int(values[1]) if values[2] else None,
                           float(values[3]) if values[4] else None,
                           estimated=bool(values[5]),
-                          delegate_uncaptured_attempts=int(values[6]))
+                          delegate_uncaptured_attempts=int(values[6]),
+                          unpriced_cached_input_tokens=int(values[7]),
+                          dollar_covered_attempts=int(values[8]))
             for (stage, model), values in sorted(cells.items())
         ),
     )
@@ -820,10 +854,34 @@ def _accumulate(acc: list, entry: AttemptTelemetry) -> None:
     usage = entry.usage
     if not usage.present:
         acc[idx("missing_usage")] += 1
-    if usage.cost_usd is None:
-        acc[idx("cost_missing")] += 1
+    priced_any = False
+    if usage.model_costs:
+        if usage.cost_usd is not None:
+            acc[idx("cost_usd")] += usage.cost_usd
+            priced_any = True
+        for cost in usage.model_costs:
+            priced = _priced_dollars(
+                cost.model, cost.input_tokens, cost.output_tokens,
+                cost.reasoning_output_tokens, cost.cost_usd, cost.cached_input_tokens)
+            if priced.cost_usd is None:
+                continue
+            if priced.estimated:
+                acc[idx("estimated_cost_usd")] += priced.cost_usd
+                priced_any = True
+            elif usage.cost_usd is None:
+                acc[idx("cost_usd")] += priced.cost_usd
+                priced_any = True
     else:
-        acc[idx("cost_usd")] += usage.cost_usd
+        priced = _priced_dollars(
+            usage.model or entry.model, usage.input_tokens, usage.output_tokens,
+            usage.reasoning_output_tokens, usage.cost_usd, usage.cached_input_tokens)
+        if priced.cost_usd is not None:
+            acc[idx("estimated_cost_usd") if priced.estimated else idx("cost_usd")] += priced.cost_usd
+            priced_any = True
+    if not priced_any:
+        acc[idx("cost_missing")] += 1
+    if _delegate_spend_uncaptured(entry):
+        acc[idx("delegate_uncaptured_attempts")] += 1
     for name in _TOKEN_FIELDS:
         value = getattr(usage, name)
         if value is not None:
