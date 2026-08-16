@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 
 from agentflow import (coordinated_attack, coordinated_build, coordinated_converse,
-                       coordinated_intake, coordinated_mockup, coordinated_research,
+                       coordinated_hold, coordinated_intake, coordinated_mockup, coordinated_research,
                        coordinated_respond, coordinated_review, coordinated_revise, github)
 from agentflow.balancer import BUILD_POOLS, PoolStatus, pick_pair, pick_reviewer, pick_session_lead
 from agentflow.coordinator import (AttackStageAdapter, BuildStageAdapter, ConverseStageAdapter,
@@ -1116,6 +1116,9 @@ def reconcile_and_project(coord: Coordinator, *, _log=None) -> list:
     # triaging label the closure left behind — rather than spending a session triaging or
     # arguing a closed issue the moment pool headroom returns (#438).
     coordinated_intake._retire_dead_intakes(coord)
+    # Human holds outlive their dispatch claim, so reconcile their durable records against the
+    # matching issue/PR state here in the full pass rather than adding GitHub reads to fast ticks.
+    coordinated_hold._retire_closed_holds(coord)
     for pool in BUILD_POOLS:
         outcomes.extend(coord.cycle(pool, now=now))
     # Handoffs are driven from durable state, not only this process's outcomes. A daemon may
