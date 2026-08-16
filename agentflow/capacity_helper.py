@@ -11,6 +11,9 @@ import time
 from pathlib import Path
 from typing import Iterator
 
+from agentflow.codex_transcripts import (
+    codex_sessions_root, latest_rate_limits, rollout_paths, where_did_session_run)
+
 
 FIVE_HOURS = 5 * 60 * 60
 
@@ -40,40 +43,17 @@ def _records(root: Path) -> Iterator[dict]:
 
 
 def _codex_limits() -> dict:
-    latest: tuple[float, dict] | None = None
-    for record in _records(Path.home() / ".codex" / "sessions"):
-        if record.get("type") != "event_msg":
-            continue
-        payload = record.get("payload")
-        if not isinstance(payload, dict) or payload.get("type") != "token_count":
-            continue
-        observed_at = _timestamp(record.get("timestamp"))
-        rate_limits = payload.get("rate_limits")
-        if (
-            observed_at is not None
-            and isinstance(rate_limits, dict)
-            and (latest is None or observed_at > latest[0])
-        ):
-            latest = observed_at, rate_limits
-    if latest is None:
+    limits = latest_rate_limits(codex_sessions_root())
+    if limits is None:
         raise ValueError("no Codex rate-limit event found")
-
-    observed_at, rate_limits = latest
-    windows = []
-    for name in ("primary", "secondary"):
-        window = rate_limits.get(name)
-        if not isinstance(window, dict):
-            continue
-        windows.append(
-            {
-                "used_percent": window.get("used_percent"),
-                "window_minutes": window.get("window_minutes"),
-                "resets_at": window.get("resets_at"),
-            }
-        )
+    windows = [
+        {"used_percent": window.used_percent, "window_minutes": window.window_minutes,
+         "resets_at": window.resets_at}
+        for window in limits.windows
+    ]
     if not windows:
         raise ValueError("latest Codex rate-limit event has no windows")
-    return {"observed_at": observed_at, "windows": windows}
+    return {"observed_at": limits.observed_at, "windows": windows}
 
 
 def _number(value: object) -> float:
@@ -157,37 +137,17 @@ def _recent_claude_activity() -> bool:
     return False
 
 
-def _codex_session_cwd(path: Path) -> str | None:
-    try:
-        with path.open(errors="replace") as stream:
-            for line in stream:
-                if '"session_meta"' not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload")
-                if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
-                    return payload["cwd"]
-    except OSError:
-        pass
-    return None
-
-
 def _recent_codex_activity() -> bool:
     minutes = float(os.environ.get("TRIAGE_ACTIVE_WINDOW_MIN", "10"))
     cutoff = time.time() - minutes * 60
-    root = Path.home() / ".codex" / "sessions"
-    for path in root.rglob("*.jsonl"):
+    root = codex_sessions_root()
+    for path in rollout_paths(root):
         try:
             if path.stat().st_mtime < cutoff:
                 continue
         except OSError:
             continue
-        cwd = _codex_session_cwd(path)
+        cwd = where_did_session_run(path)
         if cwd is not None and "/.agentflow/worktrees/" in cwd:
             continue
         return True

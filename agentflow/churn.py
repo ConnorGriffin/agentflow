@@ -1,7 +1,7 @@
 """Zero-token churn analysis over fleet transcripts.
 
 Parses Claude Code session JSONL (``~/.claude/projects``) and Codex rollout
-JSONL (``~/.codex/sessions``), filters to fleet-spawned sessions for the
+JSONL, filters to fleet-spawned sessions for the
 configured repositories, and ranks them by token-burning churn: tool errors,
 repeated commands, re-reads, screenshot flailing, and compactions. Pure
 stdlib; read-only over both transcript trees.
@@ -20,10 +20,13 @@ import re
 from collections import defaultdict
 from pathlib import Path, PurePath
 
+from agentflow.codex_transcripts import (
+    codex_sessions_root, rollout_paths, was_started_by_codex_exec, where_did_session_run,
+    what_did_session_spend)
 from agentflow.loop import RepoConfig
 
 DEFAULT_CLAUDE_ROOT = os.path.expanduser("~/.claude/projects")
-DEFAULT_CODEX_ROOT = os.path.expanduser("~/.codex/sessions")
+DEFAULT_CODEX_ROOT = str(codex_sessions_root())
 
 SCREENSHOT_RE = re.compile(r"screenshot|playwright|chromium|puppeteer|page\.pdf", re.I)
 TEST_RE = re.compile(r"\b(pytest|npm (run )?test|vitest|jest|cargo test|go test)\b")
@@ -212,12 +215,10 @@ def _repo_for_cwd(cwd: str, repos: list[RepoConfig]) -> str | None:
 
 def parse_codex_file(path, repos: list[RepoConfig]):
     with open(path, errors="replace") as fh:
-        try:
-            meta = json.loads(fh.readline()).get("payload", {})
-        except (json.JSONDecodeError, AttributeError):
+        if not was_started_by_codex_exec(Path(path)):
             return None
-        cwd = meta.get("cwd", "")
-        if meta.get("originator") != "codex_exec" or "worktrees" not in cwd:
+        cwd = where_did_session_run(Path(path))
+        if cwd is None or "worktrees" not in cwd:
             return None
         repo = _repo_for_cwd(cwd, repos)
         if not repo:
@@ -227,7 +228,8 @@ def parse_codex_file(path, repos: list[RepoConfig]):
         s = _new_session("codex", path, label, repo, fleet)
         cmds, reads = defaultdict(int), defaultdict(int)
         streak = 0
-        totals = {}
+        spend = what_did_session_spend(Path(path))
+        fh.readline()                 # the reader checked the required first metadata record
         for line in fh:
             try:
                 d = json.loads(line)
@@ -235,10 +237,7 @@ def parse_codex_file(path, repos: list[RepoConfig]):
                 continue
             p = d.get("payload") or {}
             pt = p.get("type")
-            if d.get("type") == "event_msg" and pt == "token_count":
-                info = p.get("info") or {}
-                totals = info.get("total_token_usage") or totals
-            elif d.get("type") == "response_item":
+            if d.get("type") == "response_item":
                 if pt in ("function_call", "custom_tool_call"):
                     s["tool_calls"] += 1
                     args = p.get("arguments") or p.get("input") or ""
@@ -275,16 +274,15 @@ def parse_codex_file(path, repos: list[RepoConfig]):
             elif d.get("type") == "compacted" or pt == "compacted":
                 s["compactions"] += 1
         s["api_calls"] = 1  # codex reports cumulative usage, not per-call
-        s["output_tokens"] = totals.get("output_tokens", 0)
-        s["uncached_input_tokens"] = totals.get("input_tokens", 0) - totals.get(
-            "cached_input_tokens", 0
-        )
+        s["output_tokens"] = spend.output_tokens if spend and spend.output_tokens is not None else 0
+        s["uncached_input_tokens"] = (
+            (spend.input_tokens or 0) - (spend.cached_input_tokens or 0) if spend else 0)
         return _finish_session(s, cmds, reads, streak)
 
 
 def collect_codex(repos: list[RepoConfig], codex_root: str = DEFAULT_CODEX_ROOT):
     out = []
-    for f in glob.glob(os.path.join(codex_root, "*", "*", "*", "*.jsonl")):
+    for f in rollout_paths(Path(codex_root)):
         s = parse_codex_file(f, repos)
         if s and (s["tool_calls"] or s["output_tokens"]):
             out.append(s)
