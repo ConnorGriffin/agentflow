@@ -4,6 +4,9 @@
 - Date: 2026-08-02
 - Ticket: [#464](https://github.com/ConnorGriffin/agentflow/issues/464)
   (wayfinder map [#463](https://github.com/ConnorGriffin/agentflow/issues/463))
+- Relationship: Retained and converged by [ADR 511](adr-511-slicing-survives-under-the-session-lead.md):
+  the coordinator is ADR 498's session lead and slices run in that lead's session. ADR 511 retires
+  this record's separate route switch and configured slice-model set, not its in-session shape.
 - Constrains: [ADR 0029](0029-static-per-pool-admission.md) (admission is unchanged),
   [ADR 0040](0040-spend-per-success-measurement-contract.md) (attribution),
   [ADR 0043](0043-recovery-state-before-replay.md) (recovery),
