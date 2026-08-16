@@ -177,6 +177,86 @@ def test_learning_report_skips_bad_timestamps_but_emits_other_facts(tmp_path):
     assert [item["subject"] for item in data["subjects"]] == ["good"]
 
 
+@pytest.mark.parametrize(
+    ("override", "value"),
+    (
+        (("usage", "input_tokens"), -1),
+        (("usage", "cost_usd"), float("nan")),
+        (("usage", "cost_usd"), float("inf")),
+        (("started_at",), -1),
+        (("finalized_at",), -1),
+        (("finalized_at",), 9),
+    ),
+)
+def test_learning_report_skips_impossible_numeric_telemetry(tmp_path, override, value):
+    state, path, store = _state(tmp_path)
+    assert store.upsert(Record("unsafe", "review", "codex", 1, repo="owner/repo",
+                               subject="unsafe", state=COMPLETED))
+    store.close()
+    payload = asdict(_attempt("unsafe", "unsafe", finalized=1_704_067_200))
+    if len(override) == 2:
+        payload[override[0]][override[1]] = value
+    else:
+        payload[override[0]] = value
+    directory = telemetry_dir(path)
+    directory.mkdir()
+    (directory / "unsafe.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    result = _run(state, "learning", "report", "--repo", "owner/repo",
+                  "--from", "2024-01-01", "--to", "2024-01-02")
+
+    data = json.loads(result.stdout)
+    assert result.returncode == 0 and data["status"] == "degraded"
+    assert data["telemetry_entries_read"] == 0 and data["telemetry_entries_skipped"] == 1
+    assert "NaN" not in result.stdout and "Infinity" not in result.stdout
+
+
+def test_learning_report_accepts_same_second_attempt(tmp_path):
+    state, path, store = _state(tmp_path)
+    assert store.upsert(Record("same-second", "review", "codex", 1, repo="owner/repo",
+                               subject="same-second", state=COMPLETED))
+    store.close()
+    record_attempt(path, _attempt("same-second", "same-second", started=10, finalized=10))
+
+    result = _run(state, "learning", "report", "--repo", "owner/repo",
+                  "--from", "1970-01-01", "--to", "1970-01-02")
+
+    data = json.loads(result.stdout)
+    assert result.returncode == 0 and data["status"] == "complete"
+    assert data["telemetry_entries_read"] == 1 and data["telemetry_entries_skipped"] == 0
+    assert data["summary"]["attempts"] == 1
+
+
+def test_learning_report_skips_copied_launch_token_telemetry(tmp_path):
+    state, path, store = _state(tmp_path)
+    assert store.upsert(Record("review", "review", "codex", 1, repo="owner/repo",
+                               subject="42", state=COMPLETED))
+    store.close()
+    record_attempt(path, _attempt("launch", "review", finalized=1_704_067_200,
+                                  usage=AttemptUsage(input_tokens=3, cost_usd=1.25)))
+    directory = telemetry_dir(path)
+    (directory / "copied.json").write_bytes((directory / "launch.json").read_bytes())
+
+    result = _run(state, "learning", "report", "--repo", "owner/repo",
+                  "--from", "2024-01-01", "--to", "2024-01-02")
+
+    data = json.loads(result.stdout)
+    assert result.returncode == 0 and data["status"] == "degraded"
+    assert data["telemetry_entries_read"] == 1 and data["telemetry_entries_skipped"] == 1
+    assert data["summary"]["attempts"] == 1
+    assert data["summary"]["tokens"]["total"] == 3
+    assert data["summary"]["cost_usd"]["total"] == 1.25
+
+
+def test_learning_dumps_refuses_nonfinite_report_values(monkeypatch, tmp_path):
+    from agentflow import learning
+
+    monkeypatch.setattr(learning, "report", lambda *_args: {"cost_usd": float("nan")})
+
+    with pytest.raises(ValueError):
+        learning.dumps("owner/repo", None, None, tmp_path / "records.db")
+
+
 def test_learning_required_arguments_and_unavailable_store_exit_two_without_creation(tmp_path):
     state = tmp_path / "state"
     missing = _run(state, "learning", "report")

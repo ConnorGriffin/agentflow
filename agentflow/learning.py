@@ -147,4 +147,4 @@ def report(repository: str, start: date, end: date, store_path: Path | str) -> d
 
 def dumps(repository: str, start: date, end: date, store_path: Path | str) -> str:
     return json.dumps(report(repository, start, end, store_path), sort_keys=True,
-                      separators=(",", ":")) + "\n"
+                      separators=(",", ":"), allow_nan=False) + "\n"
