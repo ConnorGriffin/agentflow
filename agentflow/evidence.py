@@ -659,6 +659,26 @@ class EvidenceStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn: self._initialize(conn)
 
+    @staticmethod
+    def _is_initialized_empty(path: Path) -> bool:
+        encoded = quote(path.resolve().as_posix(), safe="/")
+        conn: sqlite3.Connection | None = None
+        try:
+            conn = sqlite3.connect(f"file:{encoded}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only = ON")
+            conn.execute("BEGIN")
+            EvidenceStore._initialize(conn)
+            tables = ("events", "observations", "evaluations", "candidates",
+                      "candidate_events", "receipts", "event_links")
+            return all(conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is None
+                       for table in tables)
+        except (sqlite3.Error, EvidenceError):
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
+
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
