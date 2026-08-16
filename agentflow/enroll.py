@@ -1176,6 +1176,12 @@ class _EnrollmentJournal:
             else:
                 shutil.copy2(backup, path)
 
+    def discard_created_backups(self) -> None:
+        """Remove rollback copies that a successful enrollment no longer needs."""
+        for path, backup in self._entries:
+            if backup is None and path.name.endswith(".pre-agentflow") and path.is_file():
+                path.unlink()
+
     def close(self) -> None:
         self._temporary.cleanup()
 
@@ -1275,6 +1281,59 @@ def _apply_enrollment(
     return outcomes
 
 
+def _enrollment_write_targets(root: Path, surfaces: tuple[str, ...]) -> list[tuple[Path, str]]:
+    """The repository-local paths enrollment must be able to stage after a clean apply."""
+    targets = [
+        (root / ".gitignore", "enrollment file"),
+        (root / "AGENTS.md", "enrollment file"),
+        (root / "CLAUDE.md", "enrollment file"),
+        (root / "skills-lock.json", "enrollment file"),
+    ]
+    manifest = _manifest()
+    skills = set(manifest["methodology_skills"]["skills"])
+    for spec in manifest["capabilities"]:
+        name = spec.get("skill")
+        if not name or "files" not in spec:
+            continue
+        required = (
+            spec["id"] == "agentflow-skill"
+            or name in skills
+            or (surfaces and spec["requirement"] == "ui")
+        )
+        if not required:
+            continue
+        for location in (".agents/skills", ".claude/skills"):
+            targets.extend(
+                (root / location / name / item["path"], "required capability file")
+                for item in spec["files"]
+            )
+    if surfaces:
+        targets.append((root / "scripts" / "screenshots.mjs", "required capability file"))
+    return targets
+
+
+def _ignored_enrollment_path(root: Path, surfaces: tuple[str, ...]) -> str | None:
+    """Name the first enrollment write Git would exclude, using Git as the rule authority."""
+    for path, kind in _enrollment_write_targets(root, surfaces):
+        if any(parent.is_symlink() for parent in path.parents if parent != root):
+            # A legacy Claude skill link is replaced by a materialized directory during
+            # apply (#708). Git cannot check a would-be child below that link.
+            continue
+        relative = path.relative_to(root)
+        result = _run_command(
+            ["git", "-C", str(root), "check-ignore", "-v", "--", str(relative)], timeout=30
+        )
+        if result.returncode == 1:
+            continue
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip() or "git check-ignore failed"
+            return f"could not verify whether {relative} is ignored — {detail}"
+        rule = (result.stdout or "").strip().split("\t", 1)[0]
+        if rule:
+            return f"{kind} {relative} is ignored by {rule}"
+    return None
+
+
 def enroll_repository(
     workdir: str,
     *,
@@ -1304,6 +1363,7 @@ def enroll_repository(
             or _managed_files_problem(root, surfaces, converge=converge)
             or _skills_problem(root, surfaces, converge=converge)
             or _methodology_problem(root)
+            or _ignored_enrollment_path(root, surfaces)
         )
         if problem:
             print(f"  WARN: {problem} — repository left unchanged")
@@ -1314,6 +1374,8 @@ def enroll_repository(
             if any(outcome.startswith("WARN:") for outcome in outcomes):
                 journal.restore()
                 outcomes.append("WARN: enrollment failed and all managed changes were rolled back")
+            else:
+                journal.discard_created_backups()
         except Exception:
             journal.restore()
             raise
@@ -1367,17 +1429,14 @@ def _repo_drift(root: Path) -> tuple[list[str], list[str]]:
     return drift, notes
 
 
-def _converge_paths(root: Path) -> list[Path]:
-    """The fixed pair of `_asset_text` targets converge may have rewritten — nothing else
-    is ever in the overwrite set, so this is also everything the sweep commit stages."""
-    return [
-        path
-        for path in (
-            root / ".agents" / "skills" / "agentflow" / "SKILL.md",
-            root / "scripts" / "screenshots.mjs",
-        )
-        if path.is_file()
-    ]
+def _uncommitted_paths(status: str) -> list[str]:
+    """The non-index side of porcelain output after converge stages the clean checkout."""
+    paths = []
+    for line in status.splitlines():
+        if len(line) < 4 or (line[:2] != "??" and line[1] == " "):
+            continue
+        paths.append(line[3:])
+    return paths
 
 
 def _current_ref(root: Path) -> str | None:
@@ -1410,21 +1469,22 @@ def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
         report = enroll_repository(str(root), apply=True, converge=True)
         if not report.ready:
             return False, "enrollment did not converge cleanly"
-        paths = _converge_paths(root)
-        if not paths:
-            return True, "nothing to commit"
         add = _run_command(
-            ["git", "-C", str(root), "add", *[str(p) for p in paths]], timeout=30
+            ["git", "-C", str(root), "add", "-A"], timeout=30
         )
-        if add.returncode:
-            return False, "git add failed"
         status = _run_command(["git", "-C", str(root), "status", "--porcelain"], timeout=30)
+        uncommitted = _uncommitted_paths(status.stdout or "")
+        if uncommitted:
+            return False, "enrollment did not converge — uncommitted paths: " + ", ".join(uncommitted)
+        if add.returncode:
+            reason = (add.stderr or add.stdout or "").strip()
+            return False, f"git add failed — {reason}"
         if not (status.stdout or "").strip():
             return True, "already current after converge"
         commit = _run_command(
             [
                 "git", "-C", str(root), "commit", "-s", "-m",
-                "agentflow: converge bundled skill assets to the pinned content",
+                "agentflow: converge repository enrollment artifacts",
             ],
             timeout=30,
         )
@@ -1442,12 +1502,11 @@ def _converge_and_ship(root: Path, repo: str) -> tuple[bool, str]:
         pr = github.create_pr(
             repo,
             head=_SYNC_BRANCH,
-            title="agentflow: converge enrollment to pinned bundled assets",
+            title="agentflow: converge repository enrollment artifacts",
             body=(
-                "Automated by `agentflow enroll --sync --apply`: rewrites this repo's bundled "
-                "AgentFlow skill and/or screenshot harness to match the pinned content recorded "
-                "in capabilities.toml. A drifted vendored skill pack (ui-craft, drive-local-webapp) "
-                "is reported by `agentflow doctor`, not rewritten here."
+                "Automated by `agentflow enroll --sync --apply`: commits every repository-local "
+                "enrollment artifact it materialized or converged. A drifted vendored skill pack "
+                "(ui-craft, drive-local-webapp) is reported by `agentflow doctor`, not rewritten here."
             ),
         )
         if pr.url is None:

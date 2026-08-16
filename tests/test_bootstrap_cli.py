@@ -748,6 +748,7 @@ def test_enroll_replaces_duplicate_instructions_with_a_recoverable_link(
     (tmp_path / "AGENTS.md").write_text(content)
     (tmp_path / "CLAUDE.md").write_text(content)
     monkeypatch.setattr("agentflow.enroll._checkout_problem", lambda root: None)
+    monkeypatch.setattr("agentflow.enroll._ignored_enrollment_path", lambda *_args: None)
     config = tmp_path.parent / f"{tmp_path.name}-config.toml"
     config.write_text(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
@@ -764,7 +765,7 @@ def test_enroll_replaces_duplicate_instructions_with_a_recoverable_link(
 
     assert (tmp_path / "CLAUDE.md").is_symlink()
     assert (tmp_path / "CLAUDE.md").readlink() == Path("AGENTS.md")
-    assert (tmp_path / "CLAUDE.md.pre-agentflow").read_text() == content
+    assert not (tmp_path / "CLAUDE.md.pre-agentflow").exists()
 
 
 def test_enroll_promotes_incomplete_duplicate_instructions_without_splitting(
@@ -774,6 +775,7 @@ def test_enroll_promotes_incomplete_duplicate_instructions_without_splitting(
     (tmp_path / "AGENTS.md").write_text(content)
     (tmp_path / "CLAUDE.md").write_text(content)
     monkeypatch.setattr("agentflow.enroll._checkout_problem", lambda root: None)
+    monkeypatch.setattr("agentflow.enroll._ignored_enrollment_path", lambda *_args: None)
     config = tmp_path.parent / f"{tmp_path.name}-config.toml"
     config.write_text(
         f'[[repositories]]\nrepo = "owner/project"\nworkdir = "{tmp_path}"\n'
@@ -791,7 +793,7 @@ def test_enroll_promotes_incomplete_duplicate_instructions_without_splitting(
     assert (tmp_path / "CLAUDE.md").resolve() == (tmp_path / "AGENTS.md").resolve()
     assert "profile: reviewed" in (tmp_path / "AGENTS.md").read_text()
     assert "ui-surfaces: none" in (tmp_path / "AGENTS.md").read_text()
-    assert (tmp_path / "CLAUDE.md.pre-agentflow").read_text() == content
+    assert not (tmp_path / "CLAUDE.md.pre-agentflow").exists()
 
 
 def test_enroll_apply_refuses_a_dirty_checkout(tmp_path, capsys):
@@ -1254,7 +1256,7 @@ def test_enroll_promotes_claude_only_instructions_and_is_idempotent(
     capsys.readouterr()
     assert claude.is_symlink()
     assert claude.resolve() == (tmp_path / "AGENTS.md").resolve()
-    assert (tmp_path / "CLAUDE.md.pre-agentflow").read_text() == "# Existing instructions\n"
+    assert not (tmp_path / "CLAUDE.md.pre-agentflow").exists()
     subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
     _git_commit(tmp_path, "-qm", "enrolled")
     assert main(["enroll", str(tmp_path), "--apply"]) == 0
