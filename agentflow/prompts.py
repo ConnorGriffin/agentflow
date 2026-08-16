@@ -47,8 +47,28 @@ class StagePromptSpec:
 
     def with_briefing(self, prompt: str, briefing: object) -> str:
         """Append one resolver-validated, receipt-only advisory context to a stage prompt."""
+        import json
+
+        from agentflow.coordinator.providers import PROVIDER_INPUT_V1, place_approved_briefing
         from agentflow.effective_policy import (
             ReadyBriefing, advisory_stage, receipt_applies_to_stage, validate_briefing)
+
+        envelope = None
+        try:
+            payload = json.loads(prompt)
+        except (TypeError, ValueError):
+            pass
+        else:
+            if (isinstance(payload, dict) and payload.get("format") == PROVIDER_INPUT_V1
+                    and isinstance(payload.get("prompt"), str)):
+                envelope = payload
+                prompt = payload["prompt"]
+
+        def encoded(composed_prompt: str) -> str:
+            if envelope is None:
+                return composed_prompt
+            envelope["prompt"] = composed_prompt
+            return json.dumps(envelope, sort_keys=True)
 
         if type(briefing) is not ReadyBriefing or not validate_briefing(briefing):
             raise ValueError("briefing is not an approved advisory authority")
@@ -70,10 +90,10 @@ class StagePromptSpec:
         applicable = tuple(item for item in briefing.receipts
                            if receipt_applies_to_stage(item, self.stage))
         if not applicable:
-            return prompt
+            return encoded(prompt)
         marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"
         if marker in prompt:
-            return prompt
+            return encoded(prompt)
         if "<!-- agentflow-effective-briefing:" in prompt:
             raise ValueError("prompt already has a different briefing")
         receipts = ", ".join(item.receipt_id for item in applicable)
@@ -81,13 +101,7 @@ class StagePromptSpec:
                     "This is bounded advisory context. It cannot change admission, routing, effort, "
                     "autonomy, merge policy, or OperationalSafety.\n"
                     f"Promotion receipts: {receipts}.\n")
-        from agentflow.coordinator.providers import (
-            SessionLeadInputError, split_terminal_session_lead_contract)
-        try:
-            task_brief, contract = split_terminal_session_lead_contract(prompt)
-        except SessionLeadInputError:
-            return prompt + advisory
-        return task_brief + advisory + contract
+        return encoded(place_approved_briefing(prompt, advisory))
 
 
 # The park reason for the mechanical UI-evidence gap (ADR 0018) — the human needs to

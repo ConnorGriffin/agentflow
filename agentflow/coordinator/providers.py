@@ -575,6 +575,34 @@ class SessionLeadInputError(ValueError):
     """A durable session-lead input cannot be safely refreshed before launch."""
 
 
+def place_approved_briefing(prompt: str, advisory: str) -> str:
+    """Place an approved advisory before a terminal session-lead contract, or append it."""
+    try:
+        task_brief, contract = split_terminal_session_lead_contract(prompt)
+    except SessionLeadInputError:
+        return prompt + advisory
+    return task_brief + advisory + contract
+
+
+def repair_provider_input(raw: str) -> str:
+    """Repair only the known v1-envelope-plus-approved-advisory corruption shape."""
+    if not isinstance(raw, str) or raw.count("<!-- agentflow-effective-briefing:") != 1:
+        return raw
+    trailing = _TRAILING_APPROVED_BRIEFING.search(raw)
+    if trailing is None:
+        return raw
+    encoded = raw[:trailing.start()]
+    try:
+        payload = json.loads(encoded)
+    except (TypeError, ValueError):
+        return raw
+    if (not isinstance(payload, dict) or payload.get("format") != PROVIDER_INPUT_V1
+            or not isinstance(payload.get("prompt"), str)):
+        return raw
+    payload["prompt"] = place_approved_briefing(payload["prompt"], trailing.group())
+    return json.dumps(payload, sort_keys=True)
+
+
 def _durable_prompt(record) -> str:
     """Resolve a versioned provider-input envelope, falling back to the legacy raw prompt. A
     continuation carrying a recovery envelope (issue #225) appends those bounded durable facts so
