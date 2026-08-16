@@ -29,6 +29,10 @@ from datetime import date, datetime, time as datetime_time, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from agentflow.codex_transcripts import (
+    codex_sessions_root, rollout_paths, session_identifier, what_did_session_spend,
+    where_did_session_run)
+
 # The usage sub-object keys each provider models. Everything else in a provider's usage
 # object is preserved verbatim under ``AttemptUsage.unrecognized`` so a new provider field is
 # never silently dropped — but only the usage object is read, so no message content can leak.
@@ -227,52 +231,6 @@ def codex_usage(events) -> AttemptUsage:
         unrecognized=tuple(sorted(extra)))
 
 
-def _codex_sessions_root() -> Path:
-    """Where Codex rollout ``.jsonl`` files live (issue #516 slice 2). The root is fixed at the
-    user's own home directory with no override of any kind, so no untrusted path ever reaches
-    the ``rglob`` below."""
-    return Path.home() / ".codex" / "sessions"
-
-
-def _rollout_records(path: Path) -> list[dict]:
-    try:
-        lines = path.read_text(errors="replace").splitlines()
-    except OSError:
-        return []
-    records = []
-    for line in lines:
-        try:
-            record = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(record, dict):
-            records.append(record)
-    return records
-
-
-def _rollout_cwd(records: list[dict]) -> str | None:
-    for record in records:
-        if record.get("type") == "session_meta":
-            payload = record.get("payload")
-            if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
-                return payload["cwd"]
-    return None
-
-
-def _rollout_id(records: list[dict]) -> str | None:
-    """The durable Codex rollout identifier, if this rollout supplies one."""
-    for record in records:
-        if record.get("type") != "session_meta":
-            continue
-        payload = record.get("payload")
-        if not isinstance(payload, dict):
-            continue
-        for key in ("id", "session_id", "thread_id"):
-            if isinstance(payload.get(key), str):
-                return payload[key]
-    return None
-
-
 def _parent_thread_id(record) -> str | None:
     """Read this attempt's parent thread id from its own durable event stream."""
     from agentflow.coordinator.session import read_session
@@ -284,60 +242,35 @@ def _parent_thread_id(record) -> str | None:
     return None
 
 
-def _rollout_worker_usage(records: list[dict]) -> tuple[str, dict] | None:
-    """The last ``token_count`` event's cumulative totals and the model that ran, from one
-    Codex rollout. ``None`` when the rollout carries no token fact at all."""
-    last_totals: dict | None = None
-    model: str | None = None
-    session_meta_model: str | None = None
-    for record in records:
-        rtype = record.get("type")
-        payload = record.get("payload")
-        if rtype == "event_msg" and isinstance(payload, dict) and payload.get("type") == "token_count":
-            info = payload.get("info")
-            totals = info.get("total_token_usage") if isinstance(info, dict) else None
-            if isinstance(totals, dict):
-                last_totals = totals
-        elif rtype == "turn_context" and isinstance(payload, dict) \
-                and isinstance(payload.get("model"), str):
-            model = payload["model"]              # the latest one wins
-        elif rtype == "session_meta" and isinstance(payload, dict) \
-                and isinstance(payload.get("model"), str) and session_meta_model is None:
-            session_meta_model = payload["model"]
-    if last_totals is None:
-        return None
-    return (model or session_meta_model or "codex"), last_totals
-
-
 def lead_codex_worker_usage(record) -> tuple:
     """Codex worker spend a lead (Claude ``fable`` or Codex ``sol``) build/revise attempt delegated to
     ``codex exec --cd <worktree>``, observed from the workers' own rollout files rather than
     self-reported by the lead (frozen decision 2, issue #516 slice 2).
 
-    Every rollout under the sessions root whose ``session_meta.cwd`` resolves to the record's
-    workspace or a descendant of it, and whose mtime is at/after the attempt's own
-    ``started_at``, contributes its last cumulative ``token_count`` totals, summed per attributed
-    model (falling back to the literal ``"codex"`` identity when no model fact is found). Both
-    paths are realpath-resolved before containment is decided, so symlinks and relative paths
-    cannot escape the workspace or match a lexical prefix. The floor is the attempt's own
-    admission time, not a backdated slack: a worker cannot start before the attempt that spawned
-    it, so a rollout last written before this attempt was admitted belongs to some earlier attempt
-    that reused the same workspace (a retry, or a prior build before a revise), never to this one
-    — a slack that reached backward past admission would double-book that earlier attempt's spend
-    onto this attempt too. A record with no ``started_at`` (falsy) applies no mtime floor. Failure
-    anywhere — an unreadable sessions root, a malformed rollout, a bad path — degrades to no
-    worker entries; this must never fail the caller's observation.
+    Every rollout whose recorded directory resolves to the record's workspace or a descendant of
+    it, and whose mtime is at/after the attempt's own ``started_at``, contributes its last
+    cumulative spend, summed per attributed model (falling back to the literal ``"codex"``
+    identity when no model fact is found). Both paths are realpath-resolved before containment is
+    decided, so symlinks and relative paths cannot escape the workspace or match a lexical prefix.
+    The floor is the attempt's own admission time, not a backdated slack: a worker cannot start
+    before the attempt that spawned it, so a rollout last written before this attempt was admitted
+    belongs to some earlier attempt that reused the same workspace (a retry, or a prior build
+    before a revise), never to this one — a slack that reached backward past admission would
+    double-book that earlier attempt's spend onto this attempt too. A record with no
+    ``started_at`` (falsy) applies no mtime floor. Failure anywhere — an unreadable sessions root,
+    a malformed rollout, a bad path — degrades to no worker entries; this must never fail the
+    caller's observation.
     """
     try:
         if record.stage not in {"build", "revise"} or record.model not in {"fable", "sol"} \
                 or not record.source:
             return ()
-        root = _codex_sessions_root()
+        root = codex_sessions_root()
         workspace = os.path.realpath(record.source)
         parent_thread = _parent_thread_id(record) if record.model == "sol" else None
         cutoff = record.started_at if record.started_at else None
         try:
-            paths = list(root.rglob("*.jsonl"))
+            paths = list(rollout_paths(root))
         except OSError:
             return ()
         totals_by_model: dict[str, dict[str, int]] = {}
@@ -347,10 +280,9 @@ def lead_codex_worker_usage(record) -> tuple:
                     continue
             except OSError:
                 continue
-            records = _rollout_records(path)
-            if parent_thread is not None and _rollout_id(records) == parent_thread:
+            if parent_thread is not None and session_identifier(path) == parent_thread:
                 continue
-            cwd = _rollout_cwd(records)
+            cwd = where_did_session_run(path)
             if cwd is None:
                 continue
             try:
@@ -358,19 +290,18 @@ def lead_codex_worker_usage(record) -> tuple:
                     continue
             except OSError:
                 continue
-            found = _rollout_worker_usage(records)
-            if found is None:
+            spend = what_did_session_spend(path)
+            if spend is None:
                 continue
-            model, usage = found
-            acc = totals_by_model.setdefault(model, {
+            acc = totals_by_model.setdefault(spend.model, {
                 "input_tokens": 0, "cached_input_tokens": 0,
                 "output_tokens": 0, "reasoning_output_tokens": 0})
-            gross_input = _int(usage.get("input_tokens")) or 0
-            cached = _int(usage.get("cached_input_tokens")) or 0
+            gross_input = spend.input_tokens or 0
+            cached = spend.cached_input_tokens or 0
             acc["input_tokens"] += max(0, gross_input - cached)   # net cached out, like codex_usage
             acc["cached_input_tokens"] += cached
-            acc["output_tokens"] += _int(usage.get("output_tokens")) or 0
-            acc["reasoning_output_tokens"] += _int(usage.get("reasoning_output_tokens")) or 0
+            acc["output_tokens"] += spend.output_tokens or 0
+            acc["reasoning_output_tokens"] += spend.reasoning_output_tokens or 0
         return tuple(
             ModelCost(model=name, cost_usd=None,
                       input_tokens=totals["input_tokens"] or None,

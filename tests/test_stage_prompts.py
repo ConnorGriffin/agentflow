@@ -146,6 +146,29 @@ def test_approved_briefing_keeps_a_session_lead_contract_terminal_at_provider_la
     assert task_brief in launched_prompt
 
 
+def test_slice_bearing_lead_contract_stays_singular_and_survives_launch_refresh():
+    task_brief = """Implement the durable task.
+
+## Work order
+separability: slice-bearing
+### Domain facts
+- literal
+"""
+    contract = routing.session_lead_instructions(
+        "build", "low", parent_provider="claude", brief=task_brief)
+    record = Record(
+        "session-lead", "build", "claude", 1, model="fable", source="/wt",
+        input_ptr=task_brief + contract, session_lead=True, effort="low")
+
+    command = provider_command(record)
+    launched_prompt = command[command.index("-p") + 1]
+    launched_brief, launched_contract = split_terminal_session_lead_contract(launched_prompt)
+
+    assert task_brief in launched_brief
+    assert "first in-session worker" in launched_contract
+    assert launched_prompt.count("## Session lead — benchmarked capability routing") == 1
+
+
 def test_build_prompt_and_requirements_share_one_skill_authority():
     spec = stage_prompt_spec("build")
 
