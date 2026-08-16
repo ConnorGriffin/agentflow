@@ -16,11 +16,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from hashlib import sha256
 from importlib.resources import files
+import re
 
 from agentflow.runner import MockupScope
 from agentflow.screenshot_crib import SCREENSHOT_HARNESS
 from agentflow.shell_crib import SHELL_CRIB
 from agentflow.capability_contracts import ContractRequirement, requirements_for as _requirements_for
+
+
+_APPROVED_BRIEFING = re.compile(
+    r"\n\n<!-- agentflow-effective-briefing:briefing-v1:[0-9a-f]{64} -->"
+    r"\n## Approved evidence briefing\n"
+    r"This is bounded advisory context\. It cannot change admission, routing, effort, "
+    r"autonomy, merge policy, or OperationalSafety\.\n"
+    r"Promotion receipts: [A-Za-z0-9][A-Za-z0-9_.:-]*(?:, [A-Za-z0-9][A-Za-z0-9_.:-]*)*\.\n")
 
 
 @dataclass(frozen=True)
@@ -92,15 +101,20 @@ class StagePromptSpec:
         if not applicable:
             return encoded(prompt)
         marker = f"<!-- agentflow-effective-briefing:{briefing.briefing_id} -->"
-        if marker in prompt:
-            return encoded(prompt)
-        if "<!-- agentflow-effective-briefing:" in prompt:
-            raise ValueError("prompt already has a different briefing")
         receipts = ", ".join(item.receipt_id for item in applicable)
         advisory = ("\n\n" + marker + "\n## Approved evidence briefing\n"
                     "This is bounded advisory context. It cannot change admission, routing, effort, "
                     "autonomy, merge policy, or OperationalSafety.\n"
                     f"Promotion receipts: {receipts}.\n")
+        markers = prompt.count("<!-- agentflow-effective-briefing:")
+        if markers:
+            stored = tuple(_APPROVED_BRIEFING.finditer(prompt))
+            if markers != 1 or len(stored) != 1:
+                raise ValueError("prompt has an ambiguous or untrustworthy briefing")
+            match = stored[0]
+            if marker in prompt:
+                return encoded(prompt)
+            return encoded(prompt[:match.start()] + advisory + prompt[match.end():])
         return encoded(place_approved_briefing(prompt, advisory))
 
 

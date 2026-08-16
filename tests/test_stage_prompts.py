@@ -37,6 +37,35 @@ def _approved_briefing(stage: str, receipt_id: str = "receipt-1") -> ReadyBriefi
                          applicability)
 
 
+@pytest.mark.parametrize("enveloped", (False, True), ids=("raw", "provider-envelope"))
+def test_stale_approved_briefing_is_replaced_in_place(enveloped):
+    task_brief = "Keep this durable task byte-for-byte.\n"
+    contract = routing.session_lead_instructions("build", "low", parent_provider="claude")
+    spec = stage_prompt_spec("build")
+    stale = spec.with_briefing(task_brief + contract, _approved_briefing("build", "stale"))
+    current = _approved_briefing("build", "current")
+    original = {
+        "format": PROVIDER_INPUT_V1,
+        "prompt": stale,
+        "snapshot": {"body": "exact durable bytes", "number": 7},
+        "source_ref": "abc123",
+    }
+    durable = json.dumps(original, sort_keys=True) if enveloped else stale
+
+    updated = spec.with_briefing(durable, current)
+
+    payload = json.loads(updated) if enveloped else {"prompt": updated}
+    task, terminal_contract = split_terminal_session_lead_contract(payload["prompt"])
+    assert task_brief in task
+    assert terminal_contract == contract
+    assert payload["prompt"].count("<!-- agentflow-effective-briefing:") == 1
+    assert current.briefing_id in payload["prompt"]
+    assert _approved_briefing("build", "stale").briefing_id not in payload["prompt"]
+    if enveloped:
+        assert {key: payload[key] for key in ("format", "snapshot", "source_ref")} == {
+            key: original[key] for key in ("format", "snapshot", "source_ref")}
+
+
 def test_approved_briefing_is_composed_inside_the_provider_input_envelope():
     task_brief = "Implement the durable task exactly.\n"
     contract = routing.session_lead_instructions("build", "low", parent_provider="claude")
@@ -59,7 +88,7 @@ def test_approved_briefing_is_composed_inside_the_provider_input_envelope():
     assert terminal_contract == contract
 
 
-def test_provider_input_envelope_briefing_is_idempotent_and_rejects_a_different_one():
+def test_provider_input_envelope_briefing_is_idempotent():
     envelope = json.dumps({
         "format": PROVIDER_INPUT_V1,
         "prompt": "Review the durable change.",
@@ -71,8 +100,25 @@ def test_provider_input_envelope_briefing_is_idempotent_and_rejects_a_different_
 
     assert spec.with_briefing(first, _approved_briefing("build")) == first
     assert json.loads(first)["prompt"].count("<!-- agentflow-effective-briefing:") == 1
-    with pytest.raises(ValueError, match="prompt already has a different briefing"):
-        spec.with_briefing(first, _approved_briefing("build", "receipt-2"))
+
+
+def test_multiple_approved_briefing_blocks_are_refused_as_ambiguous():
+    spec = stage_prompt_spec("build")
+    current = _approved_briefing("build", "current")
+    first = spec.with_briefing("Review the durable change.", current)
+    second = spec.with_briefing("", _approved_briefing("build", "receipt-2"))
+
+    with pytest.raises(ValueError, match="ambiguous or untrustworthy briefing"):
+        spec.with_briefing(first + second, current)
+
+
+def test_unapproved_or_stage_mismatched_briefing_is_refused():
+    spec = stage_prompt_spec("build")
+
+    with pytest.raises(ValueError, match="not an approved advisory authority"):
+        spec.with_briefing("Review the durable change.", object())
+    with pytest.raises(ValueError, match="stage does not match prompt"):
+        spec.with_briefing("Review the durable change.", _approved_briefing("review"))
 
 
 @pytest.mark.parametrize("stored_tail", [False, True], ids=["new", "durable-tail"])
