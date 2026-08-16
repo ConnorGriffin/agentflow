@@ -305,6 +305,80 @@ def test_audit_names_a_repo_whose_headless_answer_its_checkout_contradicts(tmp_p
     assert "o/genuine" not in report[-1]
 
 
+class TestWorkflowPolicyAudit:
+    """The fleet census reports CI drift without taking ownership of its workflows."""
+
+    @staticmethod
+    def _audit(repo: Path) -> list[str]:
+        return audit_lines([SimpleNamespace(repo="o/project", workdir=str(repo))])
+
+    @staticmethod
+    def _workflow(repo: Path, name: str, contents: str) -> None:
+        path = repo / ".github" / "workflows" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+
+    def test_a_valid_pull_request_only_cancellation_policy_passes(self, tmp_path):
+        self._workflow(
+            tmp_path,
+            "check.yml",
+            """on:\n  pull_request:\n\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n""",
+        )
+
+        assert not [line for line in self._audit(tmp_path) if "WARN:" in line]
+
+    def test_missing_concurrency_on_a_pull_request_workflow_is_reported(self, tmp_path):
+        self._workflow(tmp_path, "check.yml", "on:\n  pull_request:\n")
+
+        report = self._audit(tmp_path)
+
+        assert any("check.yml: pull-request workflow has no top-level concurrency" in line
+                   for line in report)
+        assert "0 declared / 1 undeclared" in report
+
+    def test_blanket_cancellation_on_a_main_publish_workflow_is_reported(self, tmp_path):
+        self._workflow(
+            tmp_path,
+            "release.yml",
+            """on:\n  pull_request:\n  push:\n    branches: [main]\n\nconcurrency:\n  group: release-${{ github.ref }}\n  cancel-in-progress: true\n\njobs:\n  publish:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm publish\n""",
+        )
+
+        report = self._audit(tmp_path)
+
+        assert any("release.yml: main publish can be cancelled" in line for line in report)
+        assert any("npm publish" in line for line in report)
+
+    def test_multiple_pull_request_workflows_are_evaluated_independently(self, tmp_path):
+        self._workflow(
+            tmp_path,
+            "check.yml",
+            """on: pull_request\n\nconcurrency:\n  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: ${{ github.event_name == 'pull_request' }}\n""",
+        )
+        self._workflow(tmp_path, "lint.yml", "on: pull_request\n")
+
+        report = self._audit(tmp_path)
+
+        assert not any("check.yml:" in line and "WARN:" in line for line in report)
+        assert any("lint.yml: pull-request workflow has no top-level concurrency" in line
+                   for line in report)
+
+    def test_a_push_only_workflow_is_exempt_from_the_pull_request_requirement(self, tmp_path):
+        self._workflow(tmp_path, "release.yml", "on:\n  push:\n    branches: [main]\n")
+
+        assert not [line for line in self._audit(tmp_path) if "WARN:" in line]
+
+    def test_the_workflow_audit_performs_no_writes(self, tmp_path):
+        self._workflow(tmp_path, "check.yml", "on:\n  pull_request:\n")
+        before = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*")
+                  if path.is_file()}
+
+        self._audit(tmp_path)
+
+        after = {path.relative_to(tmp_path): path.read_bytes() for path in tmp_path.rglob("*")
+                 if path.is_file()}
+        assert after == before
+
+
 class TestTheImpactPreviewNamesThisCheckoutsOwnRepo:
     """Which repo's open PRs the preview measures — it must be this checkout's, or none."""
 
