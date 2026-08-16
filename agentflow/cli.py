@@ -71,6 +71,10 @@ def main(argv: list[str] | None = None) -> int | None:
     )
     capability_probe.add_argument("--repo", required=True)
     capability_probe.add_argument("--provider", required=True, choices=("claude", "codex"))
+    maintenance_command = commands.add_parser(
+        "maintenance", help="inventory and prune proven disposable AgentFlow residue"
+    )
+    maintenance_command.add_argument("--apply", action="store_true")
     enroll_command.add_argument(
         "--audit", action="store_true",
         help="print the read-only fleet UI-surface and CI-policy census and exit",
@@ -293,6 +297,27 @@ def main(argv: list[str] | None = None) -> int | None:
         ready, detail = prove_native_discovery(args.repo, args.provider)
         print(detail)
         return 0 if ready else 1
+    elif args.command == "maintenance":
+        from agentflow.maintenance import (
+            CodebaseMemoryIndex, maintain, maintenance_sources,
+        )
+
+        try:
+            config = load_config()
+        except ConfigurationError as exc:
+            parser.error(str(exc))
+        live, held, state_available = maintenance_sources(config.repositories)
+        records = maintain(
+            config.repositories,
+            apply=args.apply,
+            live_sources=live,
+            held_sources=held,
+            state_available=state_available,
+            index=CodebaseMemoryIndex(),
+        )
+        for record in records:
+            print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+        return 0
     elif args.command == "decision-map-probe":
         from agentflow.operator_projection import decision_map_probe
 

@@ -754,6 +754,25 @@ def test_freshening_review_checkout_keeps_its_ready_environment(tmp_path):
     assert python.read_text() == "ready"
 
 
+def test_fresh_agentflow_worktree_is_owned_and_carries_no_discovery_probe(tmp_path):
+    from agentflow.provider_skills import NATIVE_DISCOVERY_SKILL
+    from agentflow.worktree_ownership import worktree_ownership
+
+    repo = _repo_with_origin(tmp_path)
+    review = repo / ".agentflow" / "worktrees" / "codex-review" / "pr-1-fresh"
+
+    CodexRunner().prepare_worktree_detached(str(repo), "origin/main", review)
+
+    assert worktree_ownership(review) == {
+        "schema": 1,
+        "owner": "agentflow",
+        "worktree": os.path.realpath(review),
+        "disposable": True,
+    }
+    for location in (".agents", ".claude"):
+        assert not (review / location / "skills" / NATIVE_DISCOVERY_SKILL).exists()
+
+
 def test_recovery_removes_completed_owned_sessions_and_retains_uncertain_or_foreign_work(
         tmp_path, monkeypatch):
     repo = _repo_with_origin(tmp_path)

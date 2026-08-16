@@ -20,7 +20,8 @@ from agentflow.provider_skills import (
     NATIVE_DISCOVERY_MARKER, NATIVE_DISCOVERY_SKILL,
     materialize_launch_capabilities, provider_skill_status,
     native_discovery_output_is_proof, native_discovery_output_is_unavailable,
-    native_discovery_prompt, record_native_discovery_receipt, skill_destination_status)
+    native_discovery_prompt, prove_native_discovery, record_native_discovery_receipt,
+    skill_destination_status)
 
 
 def _ready_ui_launch_source(tmp_path):
@@ -110,6 +111,57 @@ def test_negative_discovery_predicate_rejects_native_or_command_evidence():
         '"item":{"type":"unknown_provider_tool"}}'
     )
     assert native_discovery_output_is_unavailable("claude", "SKILL_UNAVAILABLE")
+
+
+@pytest.mark.parametrize(
+    "ending",
+    ("success", "provider-refusal", "timeout", "interruption", "exception"),
+)
+def test_provider_discovery_probe_is_disposable_on_every_ending(
+    tmp_path, monkeypatch, ending
+):
+    repo = tmp_path / "repo"
+    (repo / ".agents" / "skills").mkdir(parents=True)
+    probe_roots = []
+
+    monkeypatch.setattr(
+        "agentflow.provider_skills.native_discovery_status",
+        lambda *_args: ("missing", "receipt missing"),
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills.record_native_discovery_receipt",
+        lambda *_args: tmp_path / "receipt.json",
+    )
+
+    def run(root, _provider):
+        probe_roots.append(root)
+        if ending == "success":
+            return SimpleNamespace(returncode=0, stdout=NATIVE_DISCOVERY_MARKER, stderr="")
+        if ending == "provider-refusal":
+            return SimpleNamespace(returncode=1, stdout="SKILL_UNAVAILABLE", stderr="")
+        if ending == "timeout":
+            raise subprocess.TimeoutExpired(["codex"], 300)
+        if ending == "interruption":
+            raise KeyboardInterrupt
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setattr("agentflow.provider_skills._run_native_discovery_probe", run)
+
+    if ending in {"timeout", "exception"}:
+        with pytest.raises((subprocess.TimeoutExpired, RuntimeError)):
+            prove_native_discovery(repo, "codex")
+    elif ending == "interruption":
+        with pytest.raises(KeyboardInterrupt):
+            prove_native_discovery(repo, "codex")
+    else:
+        ready, _detail = prove_native_discovery(repo, "codex")
+        assert ready is (ending == "success")
+
+    assert len(probe_roots) == 1
+    assert probe_roots[0] != repo
+    assert not probe_roots[0].exists()
+    for provider_root in (repo / ".agents" / "skills", repo / ".claude" / "skills"):
+        assert not (provider_root / NATIVE_DISCOVERY_SKILL).exists()
 
 
 def test_recommended_native_discovery_repair_is_runnable_idempotent_and_releases_hold(

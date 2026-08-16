@@ -21,6 +21,8 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 649](adr-649-owned-disposable-maintenance.md) — Temporary provider probes, explicit
+  per-worktree Git metadata, dry-run-first JSONL maintenance, and same-run-coupled graph pruning.
 - [ADR 594](adr-594-builds-keep-origin-main-base.md) — Builds retain one hard-coded
   `origin/main` base; a native same-repository blocker edge orders lock-then-build work until its
   mockup contract merges.

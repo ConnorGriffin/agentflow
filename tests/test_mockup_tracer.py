@@ -304,6 +304,7 @@ def test_public_prepare_proves_drawing_claim_before_creating_or_admitting_worktr
                 else frozenset({"agentflow:needs-mockup"}))
 
     monkeypatch.setattr("agentflow.stage_worktree._run", git)
+    monkeypatch.setattr("agentflow.stage_worktree.mark_worktree_owned", lambda *_a, **_k: None)
     monkeypatch.setattr("agentflow.worktree_ref.capture_subject_revision", lambda _workdir: "a" * 40)
     monkeypatch.setattr("agentflow.github.issue_labels", issue_labels)
     monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)

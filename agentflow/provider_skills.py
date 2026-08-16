@@ -15,6 +15,7 @@ from importlib.resources import files
 from pathlib import Path
 import shutil
 import stat
+import tempfile
 import tomllib
 
 from agentflow.filesystem_contracts import (
@@ -271,36 +272,22 @@ def prove_native_discovery(root: str | Path, provider: str) -> tuple[bool, str]:
     skill_root = checkout / location / "skills"
     if (not _regular_directory(skill_root) or not _contained(skill_root, checkout)):
         return False, f"{provider} project-local skill root is missing or incompatible"
-    fixture = skill_root / NATIVE_DISCOVERY_SKILL
-    created = False
     try:
-        if fixture.exists() or fixture.is_symlink():
-            skill_file = fixture / "SKILL.md"
-            if (not _regular_directory(fixture) or not _contained(fixture, checkout)
-                    or skill_file.is_symlink() or not skill_file.is_file()
-                    or skill_file.read_text() != _NATIVE_DISCOVERY_FIXTURE):
-                return False, "native-discovery fixture destination is occupied or incompatible"
-        else:
-            fixture.mkdir()
+        with tempfile.TemporaryDirectory(prefix="agentflow-provider-probe-") as temporary:
+            probe_root = Path(temporary)
+            fixture = probe_root / location / "skills" / NATIVE_DISCOVERY_SKILL
+            fixture.mkdir(parents=True)
             (fixture / "SKILL.md").write_text(_NATIVE_DISCOVERY_FIXTURE)
-            created = True
-        clear_native_discovery_receipt(checkout, provider)
-        result = _run_native_discovery_probe(checkout, provider)
-        output = (result.stdout or "") + (result.stderr or "")
-        proven = result.returncode == 0 and native_discovery_output_is_proof(provider, output)
-        if not proven:
-            return False, f"{provider} did not prove native project skill discovery"
-        receipt = record_native_discovery_receipt(checkout, provider)
-        return True, f"recorded {provider} native-discovery receipt at {receipt}"
+            clear_native_discovery_receipt(checkout, provider)
+            result = _run_native_discovery_probe(probe_root, provider)
+            output = (result.stdout or "") + (result.stderr or "")
+            proven = result.returncode == 0 and native_discovery_output_is_proof(provider, output)
+            if not proven:
+                return False, f"{provider} did not prove native project skill discovery"
+            receipt = record_native_discovery_receipt(checkout, provider)
+            return True, f"recorded {provider} native-discovery receipt at {receipt}"
     except OSError as exc:
         return False, f"native-discovery probe failed: {exc}"
-    finally:
-        if created:
-            try:
-                (fixture / "SKILL.md").unlink()
-                fixture.rmdir()
-            except OSError:
-                pass
 
 
 def provider_skill_status(root: Path, provider: str, spec: dict) -> tuple[str, str]:

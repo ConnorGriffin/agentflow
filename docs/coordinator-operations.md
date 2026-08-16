@@ -117,6 +117,28 @@ Either way, unattended research will never pick this ticket up again, and removi
 does not restart it: the run's record is terminal, so a new question wants a new research
 ticket. Do not restore `wayfinder:resolving` by hand.
 
+## Maintenance
+
+Inventory disposable residue without changing Git, worktrees, files, or Codebase Memory:
+
+```bash
+uv run agentflow maintenance
+```
+
+The command emits JSONL records with `action`, `eligible`, `reason`, and either `path` or
+`project`. Review that complete inventory, then apply the same guarded reconciliation explicitly:
+
+```bash
+uv run agentflow maintenance --apply
+```
+
+Apply removes only missing Git registrations; inactive, clean worktrees carrying AgentFlow's
+validated disposable ownership marker; exact known historical probes in such worktrees; and graph
+projects whose recorded roots are missing or were removed in that run. It refuses dirty, live,
+held, retained, unknown-owned, reachable, and unreachable entries. A second run is a no-op unless
+new eligible residue appeared. Maintenance is operator-invoked and does not run in the dispatch
+loop.
+
 ## Pause and drain
 
 ```bash
