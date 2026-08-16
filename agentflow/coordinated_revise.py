@@ -48,7 +48,8 @@ def _session_lead_prompt(prompt: str, effort: str | None, parent_pool: str) -> s
     """Render the provider-neutral session-lead brief."""
     brief = prompt + routing.session_lead_instructions(
         "revise", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
-        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
+        brief=prompt)
     return brief
 
 

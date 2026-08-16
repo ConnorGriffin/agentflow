@@ -683,7 +683,8 @@ def _refresh_session_lead_contract(record, prompt: str) -> str:
     return task_brief + routing.session_lead_instructions(
         record.stage, record.effort, parent_provider=record.pool,
         codex_spent=codex_spent_at_render(),
-        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)))
+        unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),
+        brief=task_brief)
 
 
 def split_terminal_session_lead_contract(prompt: str) -> tuple[str, str]:

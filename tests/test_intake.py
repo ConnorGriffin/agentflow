@@ -639,6 +639,19 @@ def test_intake_prompt_carries_the_effort_rubric():
     assert '"effort": "low" | "medium" | "high" | "extra" — for "ready"; null for a hold' in prompt
 
 
+def test_intake_records_slice_bearing_and_declined_work_orders_for_deep_work():
+    prompt = intake_prompt("owner/repo", {"number": 1, "title": "t", "body": "b"})
+
+    assert "## Work order" in prompt
+    assert "separability: slice-bearing" in prompt
+    assert "separability: declined" in prompt
+    for durable_fact in ("Domain facts", "Fixtures", "Named invariant tests"):
+        assert durable_fact in prompt
+    assert "https://github.com/ConnorGriffin/agentflow/issues/516" in prompt
+    assert "https://github.com/ConnorGriffin/agentflow/issues/627" in prompt
+    assert "Do not name file-level slices" in prompt
+
+
 def test_intake_prompt_states_the_mockup_scope_contract():
     # ADR 0048: intake must be told to classify scope and emit the mockup_scope field, defaulting
     # to local when unsure.

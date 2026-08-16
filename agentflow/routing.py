@@ -70,6 +70,8 @@ class CapabilityRouting:
         "documentation", "review",
     })
     _SESSION_LED = frozenset({"build", "revise"})
+    _SLICE_BEARING_WORK_ORDER = "\n## Work order\nseparability: slice-bearing\n"
+    _ORIGINAL_ISSUE_MARK = "<!-- agentflow:original-below -->"
 
     def __init__(self, data: dict):
         try:
@@ -376,7 +378,8 @@ class CapabilityRouting:
     def session_lead_instructions(self, stage: str, effort: str | None, *,
                                    parent_provider: str = "claude",
                                    codex_spent: bool = False,
-                                   unavailable_providers: frozenset[str] = frozenset()) -> str:
+                                   unavailable_providers: frozenset[str] = frozenset(),
+                                   brief: str = "") -> str:
         """Render the session-lead brief. ``codex_spent`` is the caller's render-time capacity
         fact (see :func:`agentflow.runner.codex_spent_at_render`) — routing has no seam of its
         own onto Codex account state, so a caller that knows it passes it in; a caller that
@@ -445,13 +448,40 @@ class CapabilityRouting:
             "while active; use its eventual result. Never use `spawn_agent`, `agent_type`, or hidden "
             "role fields."
         )
+        slicing = ""
+        current_brief = "\n" + brief.partition(self._ORIGINAL_ISSUE_MARK)[0]
+        if (stage in self._SESSION_LED
+                and self._SLICE_BEARING_WORK_ORDER in current_brief):
+            slicing = """
+
+This brief carries a slice-bearing Work order. As your first in-session worker, launch a Slicer
+inside this existing Session lead session. The Slicer reads the repository as it stands at pickup
+and returns the file-level slice list; it is not a new stage, session, route, or admission.
+
+Then delegate each slice as implementation work through the ordinary benchmarked capability ladder
+below. Inspect its result and run its named invariant tests plus the repository test gate to
+verify each slice. Never continue from a failed gate; commit once per finished slice before
+starting the next, and name that slice in the commit message; those commits are the only slice ledger.
+
+Give a worker only its slice, the Work order's shared grounding, and one line for each finished
+predecessor. A slice is sealed for deciding: it takes no unnamed domain fact or scope choice from
+outside that input. It is open for reading: the worker may read the repository freely to inspect
+the surrounding code and match house style. The file allow-list is a grounding floor, not a reading ceiling.
+
+If a worker finds a gap, stop that worker and keep its session alive. Answer and resume it only for
+a repository fact you can verify; park on a domain or intent fact. You may merge, split, or reorder
+the Slicer's list within the Work order, but never invent work the order did not name. A finished
+worker returns exactly its one-line summary, commit, named-invariant-test status, and bounded
+unresolved concerns — no transcript or diff. The ordinary ladder's verification escalation and
+provider-failure handback rules below apply unchanged to the Slicer and every slice worker.
+""".rstrip()
         return f"""
 {preamble}
 ## Session lead — benchmarked capability routing
 
 You are the accountable Session lead. Do not write the implementation directly. Plan the work,
 delegate exploration, implementation, and fix work, verify every result, and ship only verified
-work. Fable is lead-only and is never a delegate target.
+work. Fable is lead-only and is never a delegate target.{slicing}
 
 worker reasoning rung: {rung}. {codex_instruction} Reach {opposite_provider.title()} workers through
 {opposite_cli} with the routed CLI id named below; do not consult pool headroom from inside this running session.
