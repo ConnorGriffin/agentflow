@@ -15,11 +15,15 @@ tests/test_coordinator_launcher.py.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import pytest
 
 from conftest import FakeSession, permits, record_of, starts_until_held
 
-from agentflow.coordinator import Submission
+from agentflow import coordinated_intake
+from agentflow.coordinator import IntakeStageAdapter, Submission
 from agentflow.coordinator import providers
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.recovery import (NO_NEW_STATE, REPAIR, Recovery,
@@ -84,6 +88,63 @@ def _review(subject: str = "7", pool: str = "claude", **kw) -> Submission:
 def _build(subject: str = "7", pool: str = "claude", **kw) -> Submission:
     return Submission(repo="o/r", subject=subject, stage="build", pool=pool,
                       builder_lineage=pool, **kw)
+
+
+def test_corrupt_provider_envelope_repairs_before_intake_preparation_and_launch(
+        make_coord, monkeypatch, tmp_path):
+    fake = CapturingSession()
+    prepared = []
+    snapshot_bodies = []
+    monkeypatch.setattr(coordinated_intake, "_run",
+                        lambda command: type("Result", (), {"returncode": 0})())
+    monkeypatch.setattr("agentflow.runner.ClaudeRunner.prepare_worktree_detached",
+                        lambda self, workdir, ref, wt: prepared.append((ref, wt)))
+    monkeypatch.setattr("agentflow.runner.ClaudeRunner.provision", lambda self, wt: None)
+    monkeypatch.setattr("agentflow.intake_attachments.stage_attachments",
+                        lambda body, target: snapshot_bodies.append(body) or [])
+    adapter = IntakeStageAdapter(
+        worktree_reset=coordinated_intake.reset_worktree,
+        observer=fake,
+        apply_route=lambda *args: "proof",
+    )
+    coord = make_coord(fake, adapter=adapter)
+    envelope = json.dumps({
+        "format": providers.PROVIDER_INPUT_V1,
+        "prompt": "Triage the durable issue.",
+        "snapshot": {"body": "original", "number": 7},
+        "source_ref": "abc123",
+    }, sort_keys=True)
+    advisory = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    repaired_source = tmp_path / ".agentflow" / "worktrees" / "claude-intake" / "issue-7"
+    corrupt_source = tmp_path / ".agentflow" / "worktrees" / "claude-intake" / "issue-8"
+    repaired = coord.submit_stage(Submission(
+        repo="o/r", subject="7", stage="intake", pool="claude",
+        source=str(repaired_source), input_ptr=envelope + advisory))
+    refused = coord.submit_stage(Submission(
+        repo="o/r", subject="8", stage="intake", pool="claude",
+        source=str(corrupt_source), input_ptr=envelope + "\nnot an approved briefing"))
+
+    coord.cycle("claude")
+
+    repaired_record = record_of(coord, repaired)
+    refused_record = record_of(coord, refused)
+    repaired_payload = json.loads(repaired_record.input_ptr)
+    assert repaired_record.state == "running" and repaired_record.attempts == 1
+    assert repaired_payload["prompt"].endswith(advisory)
+    assert repaired_payload["prompt"].count("<!-- agentflow-effective-briefing:") == 1
+    assert fake.prompts == [repaired_payload["prompt"]]
+    assert prepared == [("abc123", Path(repaired_source))]
+    assert snapshot_bodies == ["original"]
+    assert refused_record.state == "waiting" and refused_record.attempts == 0
+    assert refused_record.refusal.startswith("input-unreadable:")
+    assert refused_record.input_ptr == envelope + "\nnot an approved briefing"
+    assert all("not an approved briefing" not in prompt for prompt in fake.prompts)
 
 
 _TASK_PREFIX = "Implement issue 529 exactly; preserve its recovery facts.\n"

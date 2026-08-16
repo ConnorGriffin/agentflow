@@ -34,7 +34,7 @@ from agentflow.coordinator.admission import (
 from agentflow.coordinator.launcher import NOT_STARTED, STARTED, LocalLauncher
 from agentflow.coordinator.errors import StoreUnavailable
 from agentflow.coordinator.providers import (EndingReason, ProviderCause, SessionLeadInputError,
-                                             validate_session_lead_input)
+                                             repair_provider_input, validate_session_lead_input)
 from agentflow.coordinator.providers import ProviderObserver as _DefaultAdapter
 from agentflow.coordinator.record import (
     COMPLETED, HELD, RUNNING, STALL_LOG_EVERY, STALL_OBSERVATION_MAX_GAP, STALL_PARK_AFTER,
@@ -830,6 +830,16 @@ class Coordinator:
         probe's refusal is nobody's evidence of anything: it must not count toward the breadcrumb
         or advance a clock, or a stage would escalate on how often it was speculatively tried
         somewhere it does not live (#406)."""
+        # A deployed #696 build may have persisted a canonical provider-input envelope followed
+        # by one approved advisory block. Repair that exact historical shape before Intake reads
+        # its snapshot/source ref; every other malformed durable input remains untouched and is
+        # refused by its stage adapter. Persisting here lets a paused daemon recover next cycle
+        # without reserving capacity or relying on a provider launch.
+        repaired_input = repair_provider_input(record.input_ptr or "")
+        if repaired_input != (record.input_ptr or ""):
+            record.input_ptr = repaired_input
+            if not self._persist(record):
+                return "unprepared"
         # Production's source-root probe is advisory. Preparation may create or repair the final
         # launch root, so only the one post-prepare observation is admission authority.
         composed = self._store.composed_admission

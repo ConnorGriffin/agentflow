@@ -1,9 +1,11 @@
 import ast
+import json
 from pathlib import Path
 
 import pytest
 
-from agentflow.coordinator.providers import provider_command, split_terminal_session_lead_contract
+from agentflow.coordinator.providers import (
+    PROVIDER_INPUT_V1, provider_command, split_terminal_session_lead_contract)
 from agentflow.coordinator.record import Record
 from agentflow.coordinator.tracer import ENABLED_STAGES
 from agentflow.effective_policy import (
@@ -16,13 +18,13 @@ from agentflow.routing import routing
 ROOT = Path(__file__).parents[1]
 
 
-def _approved_briefing(stage: str) -> ReadyBriefing:
+def _approved_briefing(stage: str, receipt_id: str = "receipt-1") -> ReadyBriefing:
     revision = "a" * 40
     authority = BriefingAuthority(
         "github", "octo/repo", "pulls/1/files/policy.json", revision, "sha256", "b" * 64,
         "fleet-policy/0-to-1", "approval-1", revision, "b" * 64, "fleet-policy/0-to-1",
         "github-authority", "v1", "verified")
-    receipt = BriefingReceipt("receipt-1", "candidate-1", "approval-1", 1, True, authority)
+    receipt = BriefingReceipt(receipt_id, "candidate-1", "approval-1", 1, True, authority)
     applicability = ApplicabilityFacts("fleet-policy/0-to-1", stage, revision)
     value = {
         "applicability": applicability.value(), "briefing_digest": "", "briefing_id": "",
@@ -33,6 +35,44 @@ def _approved_briefing(stage: str) -> ReadyBriefing:
     digest, identity, _ = _finish(value)
     return ReadyBriefing("octo/repo", stage, revision, digest, identity, 1, (receipt,), (),
                          applicability)
+
+
+def test_approved_briefing_is_composed_inside_the_provider_input_envelope():
+    task_brief = "Implement the durable task exactly.\n"
+    contract = routing.session_lead_instructions("build", "low", parent_provider="claude")
+    original = {
+        "format": PROVIDER_INPUT_V1,
+        "prompt": task_brief + contract,
+        "snapshot": {"body": "exact durable bytes", "number": 7},
+        "source_ref": "abc123",
+    }
+
+    composed = stage_prompt_spec("build").with_briefing(
+        json.dumps(original, sort_keys=True), _approved_briefing("build"))
+    payload = json.loads(composed)
+    brief, terminal_contract = split_terminal_session_lead_contract(payload["prompt"])
+
+    assert {key: payload[key] for key in ("format", "snapshot", "source_ref")} == {
+        key: original[key] for key in ("format", "snapshot", "source_ref")}
+    assert composed == json.dumps(payload, sort_keys=True)
+    assert brief.count("<!-- agentflow-effective-briefing:") == 1
+    assert terminal_contract == contract
+
+
+def test_provider_input_envelope_briefing_is_idempotent_and_rejects_a_different_one():
+    envelope = json.dumps({
+        "format": PROVIDER_INPUT_V1,
+        "prompt": "Review the durable change.",
+        "snapshot": {"number": 7},
+        "source_ref": "abc123",
+    }, sort_keys=True)
+    spec = stage_prompt_spec("build")
+    first = spec.with_briefing(envelope, _approved_briefing("build"))
+
+    assert spec.with_briefing(first, _approved_briefing("build")) == first
+    assert json.loads(first)["prompt"].count("<!-- agentflow-effective-briefing:") == 1
+    with pytest.raises(ValueError, match="prompt already has a different briefing"):
+        spec.with_briefing(first, _approved_briefing("build", "receipt-2"))
 
 
 @pytest.mark.parametrize("stored_tail", [False, True], ids=["new", "durable-tail"])
