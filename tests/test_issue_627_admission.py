@@ -28,11 +28,13 @@ from agentflow.coordinator.store import (
     _digest as _store_digest,
 )
 from agentflow.effective_policy import (
-    EffectivePolicyResolver, NotApplicableBriefing, PolicyValidationError, _finish, _hold,
+    ApplicabilityFacts, BriefingAuthority, BriefingReceipt, EffectivePolicyResolver,
+    NotApplicableBriefing, PolicyValidationError, ReadyBriefing, _finish, _hold,
 )
 from agentflow.evidence import ApprovedAuthority, AuthorityPointer, PromotionReceipt
 from agentflow.operational_safety import CanaryActivationRequest, OperationalSafety
 from agentflow.operational_safety import CheckEvidence, DETERMINISTIC_CHECKS, ObservationRequest
+from agentflow.prompts import stage_prompt_spec
 from agentflow.routing import routing
 
 
@@ -160,6 +162,24 @@ def _failure(state, stage="build", provider="codex"):
         stage, provider, (), state, ("secret evidence",), "secret repair")
 
 
+def _approved_briefing(repository, stage, subject_revision, receipt_id):
+    authority = BriefingAuthority(
+        "github", repository, "pulls/1/files/policy.json", subject_revision, "sha256", "b" * 64,
+        "fleet-policy/0-to-1", "approval-1", subject_revision, "b" * 64, "fleet-policy/0-to-1",
+        "github-authority", "v1", "verified")
+    receipt = BriefingReceipt(receipt_id, "candidate-1", "approval-1", 1, True, authority)
+    applicability = ApplicabilityFacts("fleet-policy/0-to-1", stage, subject_revision)
+    value = {
+        "applicability": applicability.value(), "briefing_digest": "", "briefing_id": "",
+        "capabilities": [], "policy_version": 1, "receipts": [receipt.value()],
+        "repository": repository, "schema": "briefing-v1", "stage": stage,
+        "status": "ready", "subject_revision": subject_revision,
+    }
+    digest, identity, _ = _finish(value)
+    return ReadyBriefing(repository, stage, subject_revision, digest, identity, 1, (receipt,), (),
+                         applicability)
+
+
 def _coordinator(
         tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None,
         launcher=None):
@@ -193,6 +213,37 @@ def _assert_zero_outputs(store, launcher, identity, code):
     assert store.permits_used("codex") == 0 and launcher.launches == []
     assert store.read_admission_receipt(identity) is None
     assert store.read_canary_attribution(identity) is None
+
+
+def test_stale_durable_briefing_is_refreshed_and_admitted(tmp_path):
+    current = _approved_briefing("octo/app", "build", REVISION, "current")
+    stale = _approved_briefing("octo/app", "build", REVISION, "stale")
+
+    class _CurrentBriefings:
+        def brief_for(self, repository, stage, subject_revision):
+            assert (repository, stage, subject_revision) == ("octo/app", "build", REVISION)
+            return current
+
+    capability = lambda record, _materialize: _ready(record.stage, record.pool)
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, briefing=_CurrentBriefings())
+    waiting = store.record_of(identity)
+    assert waiting is not None
+    waiting.input_ptr = stage_prompt_spec("build").with_briefing(
+        "Build the durable change.\n", stale)
+    assert stale.briefing_id in waiting.input_ptr
+    assert store.upsert(waiting)
+
+    coordinator.cycle("codex")
+
+    admitted = store.record_of(identity)
+    assert admitted is not None and admitted.state == "running"
+    assert admitted.refusal != "briefing_mismatch"
+    assert admitted.input_ptr.count("<!-- agentflow-effective-briefing:") == 1
+    assert current.briefing_id in admitted.input_ptr
+    assert stale.briefing_id not in admitted.input_ptr
+    assert launcher.identities == [identity]
+    store.close()
 
 
 def _insert_optional_admission_facts(store, record):
