@@ -21,6 +21,8 @@ ADRs in that format.
 
 ## Index
 
+- [ADR 694](adr-694-activate-promoted-review-methods.md) — Consecutive fleet-policy versions and
+  query-only successor activation carry approved Review methods into production briefings.
 - [ADR 635](adr-635-immutable-canary-reports.md) — One immutable, content-free report per
   canary stage/version is derived from Store-owned attribution and decoded attempt telemetry;
   retries return the committed final row rather than reinterpreting later telemetry.

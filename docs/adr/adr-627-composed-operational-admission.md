@@ -20,8 +20,9 @@ This decision composes these exact prerequisite merges:
   `bd818fa1d65c92def671192464207e6bc3904a34`.
 - #628 effective-policy briefing resolver:
   `ab9c1ffa6f86de149db46f0dca96e89499159172`; the composed contract now distinguishes
-  unavailable overlays from invalid immutable overlay authority and has SHA-256
-  `783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d`.
+  unavailable overlays from invalid immutable overlay authority. Issue #694 adds verified
+  successor-chain activation; the amended contract has SHA-256
+  `f87266dddb953ee684958d8acef2f65b0aaa22cb812199adcd8d4cf912cbb01f`.
 - #641 Store-owned canary attribution:
   `80f5a144621a990953d8ccacc08dd93a76090eaa`.
 - #645 capability-ready admission facts:
@@ -40,7 +41,7 @@ The composed public contracts are pinned as follows:
   `cba84e63be53884e6ed566a534883912f7d22156aad7e4a5590515140d18fcad`;
   each `capability-ready-v1` fact additionally carries and validates its own canonical digest.
 - effective-policy contract (the #628 pin above):
-  `783ebc4a6de2217b49130ae448f353a8c4ce62b712f0ce94cea49c53a7215c0d`.
+  `f87266dddb953ee684958d8acef2f65b0aaa22cb812199adcd8d4cf912cbb01f`.
 - RouteCell v2 contract:
   `14dc4e949ec2a045816040cbfb553118475a570395bb6ffc26d0e1c40c780c47`.
 - OperationalSafety v2 contract:
