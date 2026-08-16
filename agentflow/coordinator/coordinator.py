@@ -906,8 +906,7 @@ class Coordinator:
             if composed:
                 state = capability.state if capability.state in {
                     "missing", "drifted", "incompatible"} else "incompatible"
-                return self._admission_failure(
-                    record, f"capability_environment_failure:{state}", observed)
+                return self._capability_environment_failure(record, state, now, observed)
             return self._capability_failure(record, capability, observed)
         # Preparation answered yes, so whatever refused it earlier is over — clear it before the
         # later admission checks run, or a stage that is now perfectly preparable would keep
@@ -987,6 +986,34 @@ class Coordinator:
         if not self._persist(record):
             return "unprepared"
         self._emit(record, f"{code}; retrying next cycle; claim retained; "
+                           "no attempt or permit spent")
+        return "unprepared"
+
+    def _capability_environment_failure(
+            self, record: Record, state: str, now: int, observed: bool,
+    ) -> str:
+        """Clock an observed, repairable launch-root capability refusal.
+
+        Capability checks run after preparation, so treating a failed final check as a generic
+        admission refusal used to skip the refusal observer that preparation uses. The preflight
+        itself names a repair command, and a provider, receipt, or pinned launch root can change
+        between cycles; retry remains appropriate. It is nevertheless a human-clearable refusal
+        while it persists, so it shares preparation's durable breadcrumb, stall clock, and
+        refused-before-start handoff rather than retrying invisibly forever.
+        """
+        if not observed:
+            return "unprepared"
+        prepared = unprepared(f"capability_environment_failure:{state}", stall=True)
+        self._note_refusal(record, miss_summary(prepared), refusal_expected(prepared))
+        self._observe_refusal(record, prepared, now)
+        self._breadcrumb_refusal(record)
+        if self._park_refused(record, now):
+            return "unprepared"
+        self._log_stalled(record, now)
+        record.capability_preflight = ""
+        if not self._persist(record):
+            return "unprepared"
+        self._emit(record, f"{record.refusal}; retrying next cycle; claim retained; "
                            "no attempt or permit spent")
         return "unprepared"
 
