@@ -10,7 +10,7 @@ import pytest
 
 from agentflow.capability_contracts import CapabilityPreflightResult, _ready_fact
 from agentflow.coordinator import Coordinator, Submission
-from agentflow.coordinator.launcher import STARTED, StartResult
+from agentflow.coordinator.launcher import NOT_STARTED, STARTED, StartResult
 from agentflow.coordinator.record import RUNNING, Record
 from agentflow.coordinator.store import (
     AdmissionRefused,
@@ -20,7 +20,9 @@ from agentflow.coordinator.store import (
     Store,
     StoreUnavailable,
 )
-from agentflow.effective_policy import NotApplicableBriefing, _finish, _hold
+from agentflow.effective_policy import (
+    EffectivePolicyResolver, NotApplicableBriefing, PolicyValidationError, _finish, _hold,
+)
 from agentflow.evidence import ApprovedAuthority, AuthorityPointer, PromotionReceipt
 from agentflow.operational_safety import CanaryActivationRequest, OperationalSafety
 from agentflow.operational_safety import CheckEvidence, DETERMINISTIC_CHECKS, ObservationRequest
@@ -106,6 +108,14 @@ class _StartedLauncher:
         return family in self.alive
 
 
+class _NeverStartsLauncher:
+    def start(self, _record, _store, _admitted=None):
+        return StartResult(NOT_STARTED)
+
+    def is_alive(self, _family):
+        return False
+
+
 class _Briefings:
     def __init__(self, *, available=True) -> None:
         self.available = available
@@ -135,16 +145,18 @@ def _failure(state, stage="build", provider="codex"):
 
 
 def _coordinator(
-        tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None):
+        tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None,
+        launcher=None):
     path = tmp_path / "coordinator.db"
     receipts = receipts or _Receipts()
     store = Store(path, admission_mode=OperationalSafetyAndCanary(
         SafetySources(check_evidence=checks), receipts))
-    launcher = _StartedLauncher()
+    launcher = launcher or _StartedLauncher()
     adapter = _Prepared()
     coordinator = Coordinator(
         store=store, launcher=launcher, adapter=adapter,
-        capability_preflight=capability, briefing_resolver=briefing or _Briefings(),
+        capability_preflight=capability,
+        briefing_resolver=briefing or _Briefings(),
         route_selector=routing.select_route, daemon_generation="daemon-627")
     identity = coordinator.submit_stage(Submission(
         repo="octo/app", subject="627", stage="build", pool="codex",
@@ -365,6 +377,110 @@ def test_missing_policy_authority_retries_after_deployment_without_outputs(tmp_p
     assert len(recovered_launcher.launches) == 1
     assert reopened.record_of(identity).state == "running"
     reopened.close()
+
+
+def test_legacy_admission_identity_holds_and_frees_the_pool(tmp_path):
+    class _LegacyBriefings:
+        def brief_for(self, repository, stage, subject_revision):
+            if not subject_revision:
+                return None
+            return _Briefings().brief_for(repository, stage, subject_revision)
+
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing=_LegacyBriefings())
+    legacy = store.record_of(identity)
+    assert legacy is not None
+    legacy.subject_revision = ""
+    legacy.route_id = ""
+    legacy.route_cell_digest = ""
+    legacy.launch_config_digest = ""
+    assert store.upsert(legacy)
+    sibling = coordinator.submit_stage(Submission(
+        repo="octo/app", subject="628", stage="build", pool="codex",
+        complexity="deep", subject_revision="b" * 40))
+
+    outcomes = coordinator.cycle("codex")
+
+    held = store.record_of(identity)
+    started_sibling = store.record_of(sibling)
+    assert held is not None and held.state == "held" and not held.claim
+    assert held.hold_reason == "refused before start — admission_identity_migration_required"
+    assert outcomes == []
+    assert started_sibling is not None and started_sibling.state == "running"
+    assert launcher.identities == [sibling]
+    store.close()
+
+
+def test_malformed_immutable_overlay_holds_and_frees_the_pool(tmp_path):
+    class _MalformedOverlay:
+        def __init__(self):
+            self.calls = []
+
+        def read(self, repository, subject_revision):
+            self.calls.append((repository, subject_revision))
+            raise PolicyValidationError("invalid immutable overlay")
+
+    source = _MalformedOverlay()
+    resolver = EffectivePolicyResolver(
+        promotion_receipts=object(), overlay_source=source)
+
+    class _MixedBriefings:
+        def brief_for(self, repository, stage, subject_revision):
+            if subject_revision == REVISION:
+                return resolver.brief_for(repository, stage, subject_revision)
+            return _Briefings().brief_for(repository, stage, subject_revision)
+
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        briefing=_MixedBriefings())
+    sibling = coordinator.submit_stage(Submission(
+        repo="octo/app", subject="628", stage="build", pool="codex",
+        complexity="deep", subject_revision="b" * 40))
+
+    outcomes = coordinator.cycle("codex")
+
+    held = store.record_of(identity)
+    started_sibling = store.record_of(sibling)
+    assert source.calls == [("octo/app", REVISION)]
+    assert held is not None and held.state == "held" and not held.claim
+    assert held.hold_reason == "refused before start — invalid_overlay"
+    assert outcomes == []
+    assert started_sibling is not None and started_sibling.state == "running"
+    assert launcher.identities == [sibling]
+    store.close()
+
+
+def test_withdraw_stage_cleans_up_composed_admission_facts(tmp_path):
+    coordinator, store, _launcher, _adapter, identity = _coordinator(
+        tmp_path, lambda record, _materialize: _ready(record.stage, record.pool),
+        launcher=_NeverStartsLauncher())
+
+    coordinator.cycle("codex")
+    record = store.record_of(identity)
+    assert record is not None and record.start_fact == NOT_STARTED
+    values = {
+        "stage_identity": identity,
+        "repository": record.repo,
+        "stage": record.stage,
+        "subject_revision": record.subject_revision,
+        "briefing_id": "briefing-v1:" + "b" * 64,
+        "briefing_digest": "b" * 64,
+        "promotion_receipt_id": "receipt-withdraw",
+        "method_revision": "c" * 40,
+    }
+    from agentflow.coordinator.store import _digest
+    store._conn.execute(
+        "INSERT INTO lesson_use_attributions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (*values.values(), _digest({"domain": "lesson-use-attribution-v1", **values})))
+    assert store.read_admission_receipt(identity) is not None
+    assert store.read_lesson_use_attribution(identity) is not None
+
+    assert coordinator.withdraw_stage(identity) is True
+
+    assert store.read_admission_receipt(identity) is None
+    assert store.read_lesson_use_attribution(identity) is None
+    store.close()
 
 
 def test_missing_route_authority_retries_after_public_registration(tmp_path):

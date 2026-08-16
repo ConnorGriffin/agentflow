@@ -98,6 +98,11 @@ def parse_permanent_hold_reason(hold_reason: str) -> EndingReason:
 # handoffs read this prefix to pick copy that claims nothing.
 REFUSED_BEFORE_START_HOLD_REASON = "refused before start"
 
+_PERMANENT_ADMISSION_REFUSALS = frozenset({
+    "admission_identity_migration_required",
+    "invalid_overlay",
+})
+
 
 def refused_before_start_hold_reason(refusal: str) -> str:
     """The durable ``hold_reason`` for a stage parked on a refusal that never let it start,
@@ -899,8 +904,16 @@ class Coordinator:
         return STARTED if result.fact == STARTED else "not_started"
 
     def _admission_failure(self, record: Record, code: str, observed: bool) -> str:
-        """Persist a content-free retryable refusal while retaining the claim."""
+        """Retry transient admission refusals and hand immutable ones to a human."""
         if not observed:
+            return "unprepared"
+        if code in _PERMANENT_ADMISSION_REFUSALS:
+            record.hold_reason = refused_before_start_hold_reason(code)
+            if not self._hold(record):
+                return "unprepared"
+            self._emit(record, f"{code}; refusing this immutable admission; no attempt or "
+                               "permit spent; claim retained pending durable handoff")
+            self._finalize_hold(record)
             return "unprepared"
         self._note_refusal(record, code, False)
         record.capability_preflight = ""

@@ -1520,8 +1520,32 @@ class Store:
                         or current.process_alive):
                     self._conn.execute("ROLLBACK")
                     return False
+                # Composed admission may have committed its immutable receipt and attribution
+                # facts before a launcher proves ``not_started``.  This is the one durable
+                # rollback boundary for that never-run reservation, so retire all its owned
+                # facts with the record.  Their append-only triggers are suspended only inside
+                # this IMMEDIATE transaction; a failed delete rolls every schema change back.
+                from agentflow.canary_attribution import _NO_DELETE_SCHEMA
+                from agentflow.operational_safety import _SAFETY_ADMISSION_HISTORY_NO_DELETE
+                guarded_facts = (
+                    ("admission_receipts_no_delete", _ADMISSION_RECEIPTS_NO_DELETE,
+                     "admission_receipts"),
+                    ("lesson_use_attributions_no_delete", _LESSON_USE_ATTRIBUTIONS_NO_DELETE,
+                     "lesson_use_attributions"),
+                    ("safety_admission_history_no_delete", _SAFETY_ADMISSION_HISTORY_NO_DELETE,
+                     "safety_admission_history"),
+                    ("canary_attributions_no_delete", _NO_DELETE_SCHEMA,
+                     "canary_attributions"),
+                )
+                for trigger, _schema, _table in guarded_facts:
+                    self._conn.execute(f"DROP TRIGGER {trigger}")
+                for _trigger, _schema, table in guarded_facts:
+                    self._conn.execute(
+                        f"DELETE FROM {table} WHERE stage_identity = ?", (expected.identity,))
                 self._conn.execute(
                     "DELETE FROM records WHERE identity = ?", (expected.identity,))
+                for _trigger, schema, _table in guarded_facts:
+                    self._conn.execute(schema)
                 self._conn.execute("COMMIT")
                 return True
             except sqlite3.DatabaseError as e:
