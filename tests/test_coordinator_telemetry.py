@@ -430,7 +430,7 @@ def test_spend_report_keeps_delegate_and_dollar_coverage_notes(tmp_path):
 
     rendered = format_spend_report(spend_report(store, start=50, end=150))
 
-    assert "delegate spend not counted (2); dollar total covers 1 of 2 attempts" in rendered
+    assert "spend not fully counted (2); dollar total covers 1 of 2 attempts" in rendered
 
 
 def test_fully_billed_and_dollar_covered_spend_row_has_no_qualification(tmp_path):
@@ -447,7 +447,7 @@ def test_fully_billed_and_dollar_covered_spend_row_has_no_qualification(tmp_path
     assert row.estimated is False
     assert "not priced" not in rendered
     assert "dollar total covers" not in rendered
-    assert "delegate spend not counted" not in rendered
+    assert "spend not fully counted" not in rendered
 
 
 def test_unknown_dollar_figure_is_never_rendered_as_zero(tmp_path):
@@ -479,7 +479,7 @@ def test_lead_run_attempt_without_worker_capture_shows_the_not_counted_mark(tmp_
     report = spend_report(store, start=50, end=150)
     (row,) = report.rows
     assert row.delegate_uncaptured_attempts == 1
-    assert "delegate spend not counted" in format_spend_report(report)
+    assert "spend not fully counted" in format_spend_report(report)
 
 
 def test_lead_run_attempt_with_merged_worker_capture_has_no_not_counted_mark(tmp_path):
@@ -494,7 +494,7 @@ def test_lead_run_attempt_with_merged_worker_capture_has_no_not_counted_mark(tmp
     report = spend_report(store, start=50, end=150)
     for row in report.rows:
         assert row.delegate_uncaptured_attempts == 0
-    assert "delegate spend not counted" not in format_spend_report(report)
+    assert "spend not fully counted" not in format_spend_report(report)
 
 
 def test_sol_lead_helper_usage_is_captured_without_counting_its_parent(tmp_path):
@@ -627,3 +627,47 @@ def test_restart_replay_of_the_same_family_records_spend_once(make_coord, coord_
     replay = make_coord(fake)
     replay.cycle("claude")
     assert len(read_attempts(coord._store.path)) == 1        # exactly once across the restart
+
+
+def test_restart_interruption_keeps_captured_helper_spend_and_qualifies_the_gap(
+        make_coord, coord_state):
+    """A restart books its interrupted lead once, then records its resumed run separately."""
+    fake = FakeSession()
+    coord = make_coord(fake, daemon_generation="before-restart")
+    identity = coord.submit_stage(Submission(
+        repo="o/r", subject="529", stage="build", pool="claude", complexity="deep"))
+    coord.cycle("claude")
+    original = coord._store.load()[identity]
+    interrupted_token = original.launch_token
+    original_facts = {
+        name: getattr(original, name)
+        for name in ("identity", "repo", "subject", "stage", "pool", "model", "complexity",
+                     "effort", "round", "conflict_round", "started_at")
+    }
+    helper_usage = AttemptUsage(model_costs=(
+        ModelCost("fable", 0.03, input_tokens=100, output_tokens=20),
+        ModelCost("codex", None, input_tokens=50, output_tokens=10),
+    ))
+    fake.end(identity, cause=ProviderCause.NONE, end_fact=False, usage=helper_usage)
+
+    resumed = make_coord(fake, daemon_generation="after-restart")
+    resumed.cycle("claude")
+
+    (interrupted,) = read_attempts(coord._store.path)
+    assert interrupted.token == interrupted_token
+    assert {name: getattr(interrupted, name) for name in original_facts} == original_facts
+    assert interrupted.interrupted_by_restart is True
+    assert interrupted.verified is False and interrupted.classification == "incomplete"
+    assert interrupted.usage.model_costs == helper_usage.model_costs
+    report = spend_report(coord._store.path, start=0, end=4_000_000_000)
+    assert "spend not fully counted" in format_spend_report(report)
+
+    resumed.cycle("claude")
+    fake.end(identity, success=True, usage=AttemptUsage(output_tokens=200, cost_usd=0.05))
+    resumed.cycle("claude")
+    replay = make_coord(fake, daemon_generation="after-restart")
+    replay.cycle("claude")
+
+    entries = read_attempts(coord._store.path)
+    assert len(entries) == 2
+    assert len({entry.token for entry in entries}) == 2

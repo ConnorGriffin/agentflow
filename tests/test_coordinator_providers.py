@@ -651,6 +651,26 @@ def test_lead_run_claude_observation_merges_codex_worker_usage_from_matching_rol
     assert len(list(telemetry_dir(store).iterdir())) == 1
 
 
+def test_lead_run_worker_usage_in_a_worktree_subdirectory_is_captured(tmp_path, monkeypatch):
+    """A lead may delegate below its worktree root without losing that helper's spend."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    worker_cwd = workspace / "agentflow" / "webui"
+    worker_cwd.mkdir(parents=True)
+    sessions_root = tmp_path / ".codex" / "sessions"
+    _write_rollout(sessions_root / "worker.jsonl", os.path.relpath(worker_cwd))
+    _lead_session_artifacts(tmp_path, "lead-subdirectory")
+
+    record = Record("i", "build", "claude", 1, launch_token="lead-subdirectory",
+                    model="fable", source=str(workspace), started_at=0)
+
+    costs = {cost.model: cost for cost in
+             ClaudeProviderAdapter().observe(record).usage.model_costs}
+
+    assert costs["gpt-5.6-terra"].input_tokens == 900
+
+
 def test_lead_run_codex_observation_merges_codex_worker_usage_from_matching_rollouts(
         tmp_path, monkeypatch):
     from agentflow.coordinator.providers import CodexProviderAdapter
@@ -692,6 +712,37 @@ def test_a_rollout_with_a_different_cwd_is_not_merged(tmp_path, monkeypatch):
     observation = ClaudeProviderAdapter().observe(record)
 
     assert observation.usage.model_costs == (ModelCost("fable", 0.01),)
+
+
+def test_only_resolved_worktree_descendants_in_the_admission_window_are_merged(
+        tmp_path, monkeypatch):
+    """Sibling, prefix, symlink escape, and pre-admission rollouts stay outside this lead."""
+    monkeypatch.setenv("AGENTFLOW_STATE", str(tmp_path))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    workspace = tmp_path / "worktree"
+    child = workspace / "package"
+    outside = tmp_path / "worktree-other"
+    child.mkdir(parents=True)
+    outside.mkdir()
+    escaped = workspace / "escape"
+    escaped.symlink_to(outside, target_is_directory=True)
+    sessions_root = tmp_path / ".codex" / "sessions"
+    matching = sessions_root / "matching.jsonl"
+    _write_rollout(matching, str(child))
+    _write_rollout(sessions_root / "sibling.jsonl", str(outside))
+    _write_rollout(sessions_root / "prefix.jsonl", str(tmp_path / "worktree-prefix"))
+    _write_rollout(sessions_root / "escape.jsonl", str(escaped))
+    _write_rollout(sessions_root / "too-old.jsonl", str(child))
+    os.utime(sessions_root / "too-old.jsonl", (999, 999))
+    _lead_session_artifacts(tmp_path, "lead-bounded")
+
+    record = Record("i", "build", "claude", 1, launch_token="lead-bounded",
+                    model="fable", source=str(workspace), started_at=1_000)
+
+    costs = {cost.model: cost for cost in
+             ClaudeProviderAdapter().observe(record).usage.model_costs}
+
+    assert costs["gpt-5.6-terra"].input_tokens == 900
 
 
 def test_worker_capture_is_skipped_for_non_lead_run_attempts(tmp_path, monkeypatch):
