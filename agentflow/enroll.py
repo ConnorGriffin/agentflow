@@ -10,7 +10,7 @@ The module owns three closely related jobs:
 
 Usage:
   python -m agentflow.enroll <owner/repo>            # sweep legacy labels
-  python -m agentflow.enroll audit                   # fleet declaration census
+  python -m agentflow.enroll audit                   # fleet declaration and CI-policy census
   python -m agentflow.enroll surfaces <dir> [--apply]  # propose/apply one repo's line
 
 Enrolment seeds `ui-surfaces: none` without looking at the repo, so `surfaces` is also what
@@ -37,6 +37,7 @@ from dataclasses import asdict, dataclass, replace
 from importlib.resources import files
 from pathlib import Path
 
+from agentflow.ci_policy import audit_workflows
 from agentflow.intake import sweep_legacy_labels
 from agentflow.provider_skills import (
     provider_skill_status,
@@ -1616,6 +1617,7 @@ def audit_lines(repos) -> list[str]:
     """One line per enrolled repo plus a census tail, naming every repo the gate cannot fire
     in: the ones that never answered, and the ones whose headless answer their own checkout
     contradicts."""
+    repos = list(repos)
     lines = []
     undeclared = []
     contradicted = []
@@ -1626,9 +1628,10 @@ def audit_lines(repos) -> list[str]:
             state = f"{UI_SURFACES_NONE} — but this checkout has a user-facing surface"
             contradicted.append(cfg.repo)
         lines.append(f"  {cfg.repo}: {state}")
+        lines.extend(f"  {cfg.repo}: {finding}" for finding in audit_workflows(cfg.workdir))
         if not declaration.declared:
             undeclared.append(cfg.repo)
-    declared = len(lines) - len(undeclared)
+    declared = len(repos) - len(undeclared)
     lines.append(f"{declared} declared / {len(undeclared)} undeclared")
     if undeclared:
         lines.append("undeclared (the UI-evidence gate cannot fire there): "
@@ -1714,7 +1717,7 @@ def configured_repositories():
 
 
 def _audit_command() -> None:
-    print("UI-surface declarations across the enrolled fleet")
+    print("Fleet enrollment and CI-policy audit")
     for line in audit_lines(configured_repositories()):
         print(line)
 

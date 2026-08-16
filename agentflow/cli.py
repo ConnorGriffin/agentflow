@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None) -> int | None:
     capability_probe.add_argument("--provider", required=True, choices=("claude", "codex"))
     enroll_command.add_argument(
         "--audit", action="store_true",
-        help="print the fleet-wide UI-surface declaration census and exit",
+        help="print the read-only fleet UI-surface and CI-policy census and exit",
     )
     enroll_command.add_argument(
         "--sync", action="store_true",
