@@ -410,6 +410,54 @@ def test_the_lead_brief_tells_the_lead_to_fall_back_to_claude_on_a_codex_provide
     assert "is never a finding to re-delegate" in brief
 
 
+def test_a_resolvable_single_default_continues_privately_with_its_grounding():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "exactly one materially compatible outcome remains" in brief
+    assert "re-read that exact place at decision time" in brief
+    assert "confirm the resolved text supports the outcome" in brief
+    assert "continue the current stage" in brief
+    assert "no public park comment or maintainer notification" in brief
+    assert "Outcome:" in brief
+    assert "Citation:" in brief
+    assert "Resolved text:" in brief
+
+
+def test_an_unresolvable_default_citation_parks():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "If the citation cannot be resolved or read, park" in brief
+    assert "do not infer or reconstruct its contents" in brief
+
+
+def test_a_citation_whose_text_does_not_support_the_outcome_parks():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "If the resolved text does not support the claimed outcome, park" in brief
+    assert "self-asserted grounding is not evidence" in brief
+
+
+def test_two_materially_compatible_grounded_outcomes_still_park():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "more than one materially compatible outcome remains" in brief
+    assert "park even when every outcome has valid grounding" in brief
+
+
+def test_a_load_bearing_policy_choice_parks_even_with_a_perfect_citation():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "product intent, safety, security, permissions, or another load-bearing policy" in brief
+    assert "park even with a perfect citation" in brief
+
+
+def test_genuinely_unresolved_maintainer_intent_keeps_the_existing_park():
+    brief = routing.session_lead_instructions("review", None)
+
+    assert "genuinely unresolved maintainer intent" in brief
+    assert "existing two-option public decision handoff" in brief
+
+
 @pytest.mark.parametrize("task_brief", [
     "Implement the scoped issue through the existing interface.",
     "## Work order\nseparability: declined\n### Why indivisible\n- one atomic invariant",
@@ -424,6 +472,8 @@ def test_a_brief_without_a_slice_bearing_work_order_keeps_the_existing_lead_cont
     assert rendered == ordinary
     assert "Slicer" not in rendered
     assert ("Fable is lead-only and is never a delegate target.\n\n"
+            "Before parking for a decision") in rendered
+    assert ("Resolved text: <the text re-read from that place>\n\n"
             "worker reasoning rung:") in rendered
 
 

@@ -483,6 +483,30 @@ You are the accountable Session lead. Do not write the implementation directly. 
 delegate exploration, implementation, and fix work, verify every result, and ship only verified
 work. Fable is lead-only and is never a delegate target.{slicing}
 
+Before parking for a decision, check for a grounded default. A grounded default is available only
+when exactly one materially compatible outcome remains and a citation names both a durable artifact
+and the exact place inside it: an ADR path plus heading; an issue or pull-request acceptance
+criterion quoted with its source; a repository rule file plus the rule; or a named explicit default
+in committed configuration; re-read that exact place at decision time.
+Then confirm the resolved text supports the outcome. The citation and resolved artifact text are
+the grounding; self-asserted grounding is not evidence.
+If the citation cannot be resolved or read, park; do not infer or reconstruct its contents.
+If the resolved text does not support the claimed outcome, park.
+When more than one materially compatible outcome remains, park even when every outcome has valid grounding.
+If a choice touches product intent, safety, security, permissions, or another load-bearing policy,
+park even with a perfect citation.
+When grounding is missing, conflicting, or unreadable, or genuinely unresolved maintainer intent
+remains, use the existing two-option public decision handoff and maintainer notification.
+
+When that check succeeds, take the selected outcome and continue the current stage.
+Produce no public park comment or maintainer notification. Record this audit block in the private final handoff/state,
+never in a public comment:
+
+Grounded default
+Outcome: <selected outcome>
+Citation: <durable artifact and exact place>
+Resolved text: <the text re-read from that place>
+
 worker reasoning rung: {rung}. {codex_instruction} Reach {opposite_provider.title()} workers through
 {opposite_cli} with the routed CLI id named below; do not consult pool headroom from inside this running session.
 
