@@ -18,6 +18,7 @@ from conftest import FakeSession, permits, record_of, starts_until_held
 
 from agentflow import coordinated_build, pipeline, stage_worktree, worktree_ref
 from agentflow.coordinator import BuildStageAdapter, Submission
+from agentflow.coordinator.admission import PERMIT_BUDGET
 from agentflow.coordinator import tracer
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.coordinator.telemetry import read_attempts
@@ -126,8 +127,8 @@ def test_interactive_turn_admits_under_a_not_clear_pool(make_coord, monkeypatch)
 
 def test_interactive_turn_defers_only_when_no_permit_fits(make_coord, monkeypatch):
     # True zero capacity — no permit obtainable on the reservation ledger — is the ONLY thing that
-    # may still defer an interactive turn (issue #161). A background build claims all five of the
-    # pool's permits; the Ask turn then cannot reserve its demand and stays waiting.
+    # may still defer an interactive turn (issue #161). Background builds claim the whole pool
+    # budget; the Ask turn then cannot reserve its demand and stays waiting.
     from agentflow.balancer import PoolStatus
     gate = pipeline._production_gate()
     monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [])
@@ -135,9 +136,14 @@ def test_interactive_turn_defers_only_when_no_permit_fits(make_coord, monkeypatc
                         lambda tool, **_: PoolStatus(tool, True, 10.0, windows=(_weekly_clear(),)))
     fake = FakeSession()
     coord = make_coord(fake, gate=gate)
-    background = coord.submit_stage(_build())  # demand 5 — the whole pool
-    coord.cycle("claude")
-    assert record_of(coord, background).state == "running" and permits(coord, "claude") == 5
+    from agentflow.coordinator.launcher import STARTED
+    from agentflow.coordinator.record import Record
+    family = "full-budget-background"
+    fake.alive.add(family)
+    assert coord._store.upsert(Record(
+        "full-budget-background", "build", "claude", PERMIT_BUDGET, state="running",
+        start_fact=STARTED, family=family, process_alive=True))
+    assert permits(coord, "claude") == PERMIT_BUDGET
 
     ask = coord.submit_stage(_converse())
     coord.cycle("claude")
