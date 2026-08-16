@@ -101,6 +101,9 @@ class ReceiptReader:
             raise self.error
         return self.receipts[receipt_id]
 
+    def fleet_policy_successors(self, receipt_id):
+        return tuple(item for key, item in self.receipts.items() if key != receipt_id)
+
 
 def test_repository_overlay_reads_exact_revision_not_mutable_head(tmp_path):
     repo = tmp_path / "repo"
@@ -803,6 +806,14 @@ def test_ready_briefing_validator_accepts_exact_16384_and_rejects_16385():
     over_policy = _sized_policy(16385)
     with pytest.raises(PolicyValidationError, match="briefing overflow"):
         _direct_ready(over_policy)
+
+
+def test_ready_briefing_version_is_its_newest_included_receipt():
+    policy = FleetPolicyV1(
+        2, PINNED_EVALUATION_POLICY.receipts, PINNED_EVALUATION_POLICY.capabilities)
+
+    with pytest.raises(PolicyValidationError, match="receipt policy version mismatch"):
+        _direct_ready(policy)
 
 
 def test_brief_for_accepts_exact_16384_and_returns_overflow_at_16385(monkeypatch):

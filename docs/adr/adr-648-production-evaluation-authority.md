@@ -23,6 +23,12 @@ target is a conflict. Status is likewise read-only and returns only a closed rea
 resolver performs its first read, so missing or corrupt state can become the resolver's existing
 closed hold rather than a composition exception.
 
+Issue #694 defines the published Evaluation receipt as the version-1 anchor of the same canonical
+fleet-policy store, not its terminal contents. Later human-governed promotions append consecutive
+verified receipts to that store. Deploy and status continue to validate the immutable Evaluation
+anchor without replacing a store that contains valid successors; the production resolver validates
+the complete successor chain before activating any learned method.
+
 ## Consequences
 
 Normal daemon startup never creates, migrates, repairs, nominates, promotes, or rewrites
