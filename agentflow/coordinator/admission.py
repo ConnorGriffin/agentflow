@@ -17,7 +17,7 @@ from types import MappingProxyType
 
 # Each pool has an independent permit budget; a session reserves its whole demand
 # atomically. Every stage gets one initial attempt plus at most two continuations.
-PERMIT_BUDGET = int(os.environ.get("AGENTFLOW_PERMIT_BUDGET", "25"))
+PERMIT_BUDGET = int(os.environ.get("AGENTFLOW_PERMIT_BUDGET", "5"))
 ATTEMPT_BUDGET = 3
 
 # The machine ceiling and the per-stage caps the composed admission gate evaluates alongside the

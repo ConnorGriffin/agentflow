@@ -841,13 +841,15 @@ def test_park_refuses_when_the_pr_thread_is_unreadable(monkeypatch):
 
 # --- all production stages share the one gate --------------------------------------------
 
-def test_all_stages_use_the_same_gate_and_pool_budget(make_coord):
+def test_all_stages_use_the_same_gate_and_pool_budget(make_coord, monkeypatch):
     fake = FakeSession()
     coord = make_coord(fake, adapter=_router(fake, pr=[False], verdict=[False], prep=[True]),
                        gate=tracer.build_review_revise_gate)
+    # Pin a five-permit budget so saturation stays reachable under any configured default.
+    monkeypatch.setattr("agentflow.coordinator.coordinator.PERMIT_BUDGET", 5)
     # The PR-bound review (1 permit) and revise (3) drain first (ADR 0039) and fill four permits.
-    # Build is enabled by the same gate, but its low-effort demand (4) waits because the immutable
-    # five-permit pool budget is full.
+    # Build is enabled by the same gate, but its low-effort demand (4) waits because the
+    # pool budget is full.
     build = coord.submit_stage(Submission(repo="o/r", subject="7", stage="build", pool="claude",
                                           complexity="deep", effort="low", source="/wt/issue-7"))
     review = coord.submit_stage(_review("8", pool="claude", builder_lineage="codex"))

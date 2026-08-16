@@ -12,7 +12,7 @@ from agentflow import coordinated_build, coordinated_review, coordinated_revise
 from agentflow import runner as runner_mod
 from agentflow.balancer import LeadAvailability, PoolStatus, choose_session_lead, pick_session_lead
 from agentflow.coordinator.providers import provider_command
-from agentflow.coordinator.admission import ADMISSION_MATRIX, PERMIT_BUDGET, admission_demand
+from agentflow.coordinator.admission import ADMISSION_MATRIX, admission_demand
 from agentflow.coordinator.record import Record
 from agentflow.routing import RoutingConfigError, routing
 
@@ -278,10 +278,10 @@ def test_session_lead_uses_the_selected_parent_demand_against_live_permits(monke
 
     lead, _reviewer, _reason = pick_session_lead(
         operator=True, stage="build", complexity="standard", effort="low",
-        availability=LeadAvailability({"claude": PERMIT_BUDGET - 2, "codex": 0},
+        availability=LeadAvailability({"claude": 3, "codex": 0},
                                       {"claude": False, "codex": False}))
 
-    assert lead is not None and lead.tool == "codex"  # Fable needs 3; Sol reserves the full budget
+    assert lead is not None and lead.tool == "codex"  # Fable needs 3; Sol reserves all five
 
 
 def test_issue_build_yields_a_pool_with_pr_bound_work_but_revise_does_not(monkeypatch):
@@ -371,7 +371,7 @@ def test_synthetic_historical_replay_keeps_the_new_sol_parent_exclusive(make_coo
     coord = make_coord()
     record = coord.stage_record(coord.submit_stage(submission))
 
-    assert record.model == "sol" and record.demand == PERMIT_BUDGET
+    assert record.model == "sol" and record.demand == 5
 
 
 def test_session_parent_and_cheap_review_admission_are_explicit():
@@ -383,13 +383,13 @@ def test_session_parent_and_cheap_review_admission_are_explicit():
         # Revise is effort-blind (ADR 0029): one asserted row per complexity answers every dial.
         assert ("revise", "claude", "fable", complexity, None) in ADMISSION_MATRIX
         assert ("revise", "codex", "sol", complexity, None) in ADMISSION_MATRIX
-        assert admission_demand("revise", "codex", "sol", complexity) == PERMIT_BUDGET
+        assert admission_demand("revise", "codex", "sol", complexity) == 5
         for effort, expected in efforts.items():
             key = ("build", "claude", "fable", complexity, effort)
             assert key in ADMISSION_MATRIX
             assert admission_demand(*key) == expected
             assert admission_demand("revise", "claude", "fable", complexity, effort) == 3
-            assert admission_demand("build", "codex", "sol", complexity, effort) == PERMIT_BUDGET
+            assert admission_demand("build", "codex", "sol", complexity, effort) == 5
 
     assert admission_demand("review", "codex", "luna", "standard") <= \
         admission_demand("review", "codex", "sol", "deep")

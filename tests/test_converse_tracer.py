@@ -22,7 +22,6 @@ from conftest import FakeSession, permits, record_of
 
 from agentflow import coordinated_converse
 from agentflow.coordinator import ConverseStageAdapter, StageRouter, Submission, tracer
-from agentflow.coordinator.admission import PERMIT_BUDGET
 from agentflow.coordinator.providers import ProviderCause
 from agentflow.workspace.store import PAUSED, REPLIED, STAGED, WorkspaceStore
 
@@ -240,20 +239,15 @@ def test_interactive_ask_turn_outranks_background_build_at_admission(make_coord,
     fake = FakeSession()
     coord = _coord(make_coord, fake)
     _seed_conversation()
-    # Four background builds reserve 20 permits. The interactive converse turn reserves two and
-    # the remaining background build reserves four, so only the prioritized turn fits.
-    for subject in range(4):
-        coord.submit_stage(Submission(repo=REPO, subject=f"pre-{subject}", stage="build", pool="claude",
-                                      complexity="deep", effort="extra", builder_lineage="claude"))
-    coord.cycle("claude")
-    assert permits(coord, "claude") == PERMIT_BUDGET - 5
+    # Background build (claude, deep, medium effort) reserves four permits; the interactive
+    # converse turn reserves two — together seven, past the five-permit budget, so only one fits.
     build = coord.submit_stage(Submission(repo=REPO, subject="1", stage="build", pool="claude",
                                           complexity="deep", effort="medium", builder_lineage="claude"))
     ask = coord.submit_stage(_submission(coord_state, ordinal=0))
     coord.cycle("claude")
     assert record_of(coord, ask).state == "running"                  # the operator's turn wins
     assert record_of(coord, build).state == "waiting"               # background build queued behind
-    assert permits(coord, "claude") == PERMIT_BUDGET - 3             # the converse demand reserved
+    assert permits(coord, "claude") == 2                             # only the converse demand reserved
 
 
 def test_priority_never_bypasses_the_permit_ledger(make_coord, coord_state):
@@ -261,13 +255,11 @@ def test_priority_never_bypasses_the_permit_ledger(make_coord, coord_state):
     like any stage (ADR 0034: priority reorders, it never bypasses budgets)."""
     fake = FakeSession()
     coord = _coord(make_coord, fake)
-    # Saturate the pool with background builds first.
-    for subject in range(PERMIT_BUDGET // 5):
-        coord.submit_stage(Submission(repo=REPO, subject=f"saturate-{subject}", stage="build",
-                                      pool="claude", complexity="deep", effort="extra",
-                                      builder_lineage="claude"))
+    # Saturate the pool with a five-permit background build first.
+    coord.submit_stage(Submission(repo=REPO, subject="9", stage="build", pool="claude",
+                                  complexity="deep", effort="extra", builder_lineage="claude"))
     coord.cycle("claude")
-    assert permits(coord, "claude") == PERMIT_BUDGET
+    assert permits(coord, "claude") == 5
     _seed_conversation()
     ask = coord.submit_stage(_submission(coord_state, ordinal=0))
     coord.cycle("claude")
