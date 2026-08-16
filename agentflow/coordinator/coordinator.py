@@ -1023,7 +1023,8 @@ class Coordinator:
             outcome = f"failed — {result.detail}; re-probe {reprobe.state}"
         self._emit(
             record,
-            f"capability repair root={root} requirements={requirements}; outcome={outcome}",
+            f"capability repair root={root} provider={record.pool} requirements={requirements}; "
+            f"outcome={outcome}",
         )
         return reprobe
 

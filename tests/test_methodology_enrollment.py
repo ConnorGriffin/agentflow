@@ -378,16 +378,70 @@ def test_capability_repair_preserves_occupied_claude_destinations(
     else:
         destination.symlink_to(Path("../../.agents/skills") / names[0])
     requirements = tuple(ContractRequirement(name, commit) for name in names)
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.prove_native_discovery",
+        lambda *_args: probes.append(True),
+    )
 
     result = repair_capability_refusal(repo, "claude", requirements)
 
     assert result is None
+    assert not probes
     assert not commands
     assert not (repo / ".claude" / "skills" / names[1]).exists()
     if destination_kind == "drifted":
         assert (destination / "SKILL.md").read_text() == "operator edit\n"
     else:
         assert destination.is_symlink()
+
+
+def test_capability_repair_preserves_an_unknown_harness(tmp_path, monkeypatch):
+    root = _ready_ui_launch_source(tmp_path)
+    harness = root / "scripts" / "screenshots.mjs"
+    harness.write_text("operator-authored harness\n")
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.prove_native_discovery",
+        lambda *_args: probes.append(True),
+    )
+
+    result = repair_capability_refusal(root, "codex", _ui_runtime_requirement())
+
+    assert result is None
+    assert not probes
+    assert harness.read_text() == "operator-authored harness\n"
+
+
+def test_capability_repair_refuses_an_unreadable_native_discovery_receipt(
+    tmp_path, monkeypatch
+):
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == "domain-modeling")
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    receipt = record_native_discovery_receipt(root, "codex")
+    receipt.write_text("operator-authored receipt\n")
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills.prove_native_discovery",
+        lambda *_args: probes.append(True) or (True, "should not run"),
+    )
+
+    result = repair_capability_refusal(
+        root, "codex", (ContractRequirement("domain-modeling", spec["version"]),)
+    )
+
+    assert result is None
+    assert not probes
+    assert receipt.read_text() == "operator-authored receipt\n"
 
 
 @pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))
@@ -437,6 +491,36 @@ def test_capability_repair_is_single_writer_for_a_shared_root(tmp_path, monkeypa
     assert sum(result is None for result in results) == 1
     for name in names:
         assert (repo / ".claude" / "skills" / name / "SKILL.md").is_file()
+
+
+def test_capability_repair_probes_a_shared_root_once(tmp_path, monkeypatch):
+    root = _ready_ui_launch_source(tmp_path)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == "domain-modeling")
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills._run_native_discovery_probe",
+        lambda _root, _provider: probes.append(True) or SimpleNamespace(
+            returncode=0, stdout=NATIVE_DISCOVERY_MARKER, stderr=""),
+    )
+    requirements = (ContractRequirement("domain-modeling", spec["version"]),)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(
+            lambda _index: repair_capability_refusal(root, "codex", requirements), range(2),
+        ))
+
+    assert sum(result is not None and result.repaired for result in results) == 1
+    assert sum(result is None for result in results) == 1
+    assert probes == [True]
 
 
 def test_enrollment_rolls_back_partial_claude_methodology_materialization(

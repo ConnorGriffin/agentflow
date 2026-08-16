@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import json
+from importlib.resources import files
 from pathlib import Path
+import shutil
 import sqlite3
+from types import SimpleNamespace
+import tomllib
 
 import pytest
 
@@ -34,9 +39,13 @@ from agentflow.effective_policy import (
     NotApplicableBriefing, PolicyValidationError, ReadyBriefing, _finish, _hold,
 )
 from agentflow.evidence import ApprovedAuthority, AuthorityPointer, PromotionReceipt
+from agentflow.enroll import repair_capability_refusal
 from agentflow.operational_safety import CanaryActivationRequest, OperationalSafety
 from agentflow.operational_safety import CheckEvidence, DETERMINISTIC_CHECKS, ObservationRequest
 from agentflow.prompts import stage_prompt_spec
+from agentflow.provider_skills import (
+    NATIVE_DISCOVERY_MARKER, native_discovery_status, record_native_discovery_receipt,
+)
 from agentflow.routing import routing
 
 
@@ -164,6 +173,16 @@ def _failure(state, stage="build", provider="codex"):
         stage, provider, (), state, ("secret evidence",), "secret repair")
 
 
+def _native_discovery_contract(tmp_path):
+    root = tmp_path / "capability-root"
+    name = "domain-modeling"
+    source = Path(__file__).parents[1] / ".agents" / "skills" / name
+    shutil.copytree(source, root / ".agents" / "skills" / name)
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    spec = next(item for item in manifest["capabilities"] if item["id"] == name)
+    return root, (ContractRequirement(name, spec["version"]),)
+
+
 def _approved_briefing(repository, stage, subject_revision, receipt_id):
     authority = BriefingAuthority(
         "github", repository, "pulls/1/files/policy.json", subject_revision, "sha256", "b" * 64,
@@ -184,7 +203,7 @@ def _approved_briefing(repository, stage, subject_revision, receipt_id):
 
 def _coordinator(
         tmp_path, capability, *, briefing=None, register=True, receipts=None, checks=None,
-        launcher=None, repair=None, log=None):
+        launcher=None, repair=None, log=None, capability_root=None):
     path = tmp_path / "coordinator.db"
     receipts = receipts or _Receipts()
     store = Store(path, admission_mode=OperationalSafetyAndCanary(
@@ -198,7 +217,7 @@ def _coordinator(
         route_selector=routing.select_route, daemon_generation="daemon-627", log=log)
     identity = coordinator.submit_stage(Submission(
         repo="octo/app", subject="627", stage="build", pool="codex",
-        complexity="deep", subject_revision=REVISION))
+        complexity="deep", subject_revision=REVISION, capability_root=capability_root))
     record = store.record_of(identity)
     assert record is not None
     if register:
@@ -249,6 +268,122 @@ def test_observed_capability_refusal_repairs_once_reprobes_and_admits(tmp_path):
         and "playwright@1.61.1" in line
         and "installed pinned runtime" in line
         for line in lines
+    )
+    store.close()
+
+
+@pytest.mark.parametrize("receipt_state", ("stale", "missing"))
+def test_native_discovery_receipt_is_repaired_and_admitted(
+    tmp_path, monkeypatch, receipt_state
+):
+    root, requirements = _native_discovery_contract(tmp_path)
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which", lambda _name: "/bin/codex"
+    )
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills._run_native_discovery_probe",
+        lambda _root, _provider: probes.append((_root, _provider)) or SimpleNamespace(
+            returncode=0, stdout=NATIVE_DISCOVERY_MARKER, stderr=""),
+    )
+    if receipt_state == "stale":
+        receipt = record_native_discovery_receipt(root, "codex")
+        payload = json.loads(receipt.read_text())
+        payload["manifest_sha256"] = "stale"
+        receipt.write_text(json.dumps(payload))
+    assert native_discovery_status(root, "codex")[0] == (
+        "drifted" if receipt_state == "stale" else "missing"
+    )
+    lines = []
+
+    def capability(record, _materialize):
+        from agentflow.capability_contracts import preflight
+        return preflight(root, record.stage, record.pool, requirements)
+
+    def repair(_record, refusal):
+        return repair_capability_refusal(root, "codex", refusal.contracts)
+
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, capability_root=str(root))
+    coordinator._log = lines.append
+
+    coordinator.cycle("codex")
+
+    record = store.record_of(identity)
+    assert record is not None and record.state == "running"
+    assert len(launcher.launches) == 1
+    assert probes == [(root, "codex")]
+    assert native_discovery_status(root, "codex")[0] == "ok"
+    assert any(
+        "capability repair" in line
+        and str(root) in line
+        and "provider=codex" in line
+        and "domain-modeling@" in line
+        and "native-discovery receipt" in line
+        for line in lines
+    )
+    store.close()
+
+
+def test_failed_native_discovery_probe_keeps_the_clocked_refusal(tmp_path, monkeypatch):
+    root, requirements = _native_discovery_contract(tmp_path)
+    receipts = tmp_path / "receipts"
+    monkeypatch.setattr(
+        "agentflow.provider_skills._repository_key", lambda _root: ("repo-key", receipts)
+    )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which", lambda _name: "/bin/codex"
+    )
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills._run_native_discovery_probe",
+        lambda _root, _provider: probes.append((_root, _provider)) or SimpleNamespace(
+            returncode=1, stdout="", stderr="provider unavailable"),
+    )
+    lines = []
+    preflights = []
+
+    def capability(record, materialize):
+        from agentflow.capability_contracts import preflight
+        preflights.append(materialize)
+        return preflight(root, record.stage, record.pool, requirements)
+
+    def repair(_record, refusal):
+        return repair_capability_refusal(root, "codex", refusal.contracts)
+
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, capability_root=str(root))
+    coordinator._log = lines.append
+
+    coordinator.cycle("codex", now=0)
+    coordinator.cycle("codex", now=5 * 60)
+
+    record = store.record_of(identity)
+    assert record is not None and record.state == "waiting"
+    assert record.refusal == "capability_environment_failure:missing"
+    assert record.stall_started_at == 0 and record.stall_last_observed_at == 5 * 60
+    assert launcher.launches == []
+    assert probes == [(root, "codex")]
+    assert preflights == [False, True, True, False, True]
+    repair_lines = [line for line in lines if "capability repair" in line]
+    assert len(repair_lines) == 1
+    assert (
+        str(root) in repair_lines[0]
+        and "provider=codex" in repair_lines[0]
+        and "outcome=failed" in repair_lines[0]
+        and "did not prove native project skill discovery" in repair_lines[0]
     )
     store.close()
 

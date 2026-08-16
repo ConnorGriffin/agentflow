@@ -184,7 +184,22 @@ def repair_capability_refusal(root: str | Path, provider: str, requirements):
                 return None
             runtime_missing = True
         if not missing and not runtime_missing:
-            return None
+            location = ".agents" if provider == "codex" else ".claude"
+            if not skill_specs or any(
+                _skill_destination_status(
+                    root / location / "skills" / spec["skill"], spec["files"]
+                ) != "ok"
+                for spec in skill_specs
+            ):
+                return None
+            from agentflow.provider_skills import native_discovery_status, prove_native_discovery
+
+            receipt_status, detail = native_discovery_status(root, provider)
+            if (receipt_status != "missing"
+                    and detail != f"{provider} native-discovery receipt is stale or incompatible"):
+                return None
+            repaired, probe_detail = prove_native_discovery(root, provider)
+            return CapabilityRepairResult(repaired, probe_detail)
         journal = _enrollment_journal(root)
         try:
             outcomes = [_wire_claude_skill(root, name) for name in missing]
