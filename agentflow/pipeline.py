@@ -432,6 +432,20 @@ def _capability_preflight(record, materialize: bool):
     return preflight(inspection_root, record.stage, record.pool, requirements)
 
 
+def _repair_capability_refusal(record, capability):
+    """Route deterministic source-root repairs through enrollment's locked operation."""
+    from agentflow.enroll import repair_capability_refusal
+    from agentflow.worktree_ref import WorktreeRef
+
+    root = Path(record.capability_root) if record.capability_root else None
+    if root is None and record.source:
+        parsed = WorktreeRef.parse(record.source)
+        root = Path(parsed.workdir) if parsed is not None else Path(record.source)
+    if root is None:
+        return None
+    return repair_capability_refusal(root, record.pool, capability.contracts)
+
+
 def build_coordinator(_log=None, *, repositories=None, store=None, briefing_resolver=None,
                       evidence_store=None) -> Coordinator:
     """The daemon's coordinator for all nine logical stages (issues #103–#108, ADR 380).
@@ -552,6 +566,7 @@ def build_coordinator(_log=None, *, repositories=None, store=None, briefing_reso
                 repositories, on_diagnostic=_log))
     return Coordinator(
         adapter=router, gate=_production_gate(), capability_preflight=_capability_preflight,
+        capability_repair=_repair_capability_refusal,
         disabled_cold_stages=frozenset({"mockup"}), log=_log or (lambda _line: None),
         store=store, briefing_resolver=briefing_resolver,
         managed_repositories=(frozenset(repositories) if repositories is not None else None),

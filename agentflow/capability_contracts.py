@@ -63,6 +63,12 @@ class CapabilityPreflightResult:
         return self.state == "ready"
 
 
+@dataclass(frozen=True)
+class CapabilityRepairResult:
+    repaired: bool
+    detail: str
+
+
 _TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
 _FAILURE_STATES = frozenset({"missing", "drifted", "incompatible"})

@@ -94,6 +94,8 @@ class Record:
     capability_root: str | None = None  # checkout root whose project-local contracts are authoritative
     capability_context: str = "{}"     # serialized conditional prompt context
     capability_preflight: str = ""      # serialized non-ready preflight; retained across restart
+    capability_repair_refusal: str = "" # last unchanged capability refusal whose repair failed;
+                                         # suppresses identical repair work while its stall clocks
     session_lead: bool = False   # missing historical JSON decodes false; never infer from model
     outcome: str | None = None   # stage-native durable outcome, captured before external projection
     started_at: int = 0                  # epoch when the current attempt was admitted

@@ -20,6 +20,7 @@ injected launcher, gate, and observer collaborators.
 from __future__ import annotations
 
 import os
+from hashlib import sha256
 import json
 import re
 import subprocess
@@ -230,7 +231,8 @@ class Coordinator:
     public operation — the public surface is ``submit_stage``, ``cycle``, and ``park_completed``.
     """
 
-    def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None, log=None,
+    def __init__(self, *, launcher=None, gate=None, adapter=None, capability_preflight=None,
+                 capability_repair=None, log=None,
                  daemon_generation: str | None = None,
                  disabled_cold_stages: frozenset[str] = frozenset(), store=None,
                  route_selector=None, briefing_resolver=None,
@@ -247,6 +249,7 @@ class Coordinator:
         self._adapter = StageCalls(adapter or _DefaultAdapter())
         self._capability_preflight = capability_preflight or (
             lambda _record, _materialize: None)
+        self._capability_repair = capability_repair
         # This process's daemon-lifecycle identity, stamped on every attempt it admits. A restart
         # is a new process with a new pid, so an attempt found dead under a *different* generation
         # — and leaving no supervisor end fact — was taken down with the daemon, not by the
@@ -903,6 +906,8 @@ class Coordinator:
             return "unprepared"
         capability = self._capability_preflight(record, True)
         if capability is not None and not capability.ready:
+            capability = self._repair_capability(record, capability, observed)
+        if capability is not None and not capability.ready:
             if composed:
                 state = capability.state if capability.state in {
                     "missing", "drifted", "incompatible"} else "incompatible"
@@ -913,6 +918,7 @@ class Coordinator:
         # publishing the checkout that used to refuse it while capacity is what actually holds it.
         # `_begin_start` may then put its own capacity reason in the cleared slot.
         self._note_refusal(record, "", False)
+        record.capability_repair_refusal = ""
         if observed:
             record.refusals = 0
             self._clear_stall(record)
@@ -963,6 +969,63 @@ class Coordinator:
         self._started_here.add(record.identity)
         self._commit_start(record, result.fact, result.family)
         return STARTED if result.fact == STARTED else "not_started"
+
+    @staticmethod
+    def _capability_refusal_fingerprint(record: Record, capability) -> str:
+        payload = {
+            "root": record.capability_root or record.source or ".",
+            "stage": capability.stage,
+            "provider": capability.provider,
+            "state": capability.state,
+            "contracts": [
+                (item.id, item.version, item.runtime) for item in capability.contracts
+            ],
+            "evidence": list(capability.evidence),
+        }
+        return sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+    def _repair_capability(self, record: Record, capability, observed: bool):
+        """Attempt one named deterministic repair, then trust only a fresh preflight."""
+        if not observed or self._capability_repair is None:
+            return capability
+        fingerprint = self._capability_refusal_fingerprint(record, capability)
+        if record.capability_repair_refusal == fingerprint:
+            return capability
+        if record.capability_repair_refusal:
+            record.capability_repair_refusal = ""
+        try:
+            result = self._capability_repair(record, capability)
+        except Exception as exc:
+            from agentflow.capability_contracts import CapabilityRepairResult
+            result = CapabilityRepairResult(
+                False, f"{type(exc).__name__}: {exc}")
+        if result is None:
+            return capability
+        try:
+            reprobe = self._capability_preflight(record, True)
+        except Exception as exc:
+            reprobe = capability
+            result = replace(
+                result, repaired=False,
+                detail=f"{result.detail}; re-probe {type(exc).__name__}: {exc}",
+            )
+        root = record.capability_root or record.source or "."
+        requirements = ",".join(
+            f"{item.id}@{item.version}" for item in capability.contracts
+        ) or "none"
+        if reprobe is not None and reprobe.ready:
+            record.capability_repair_refusal = ""
+            outcome = f"ready — {result.detail}"
+        else:
+            reprobe = reprobe or capability
+            record.capability_repair_refusal = self._capability_refusal_fingerprint(
+                record, reprobe)
+            outcome = f"failed — {result.detail}; re-probe {reprobe.state}"
+        self._emit(
+            record,
+            f"capability repair root={root} requirements={requirements}; outcome={outcome}",
+        )
+        return reprobe
 
     def _admission_failure(
             self, record: Record, code: str, observed: bool,
