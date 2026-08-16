@@ -350,6 +350,21 @@ def has_committed_evidence(changed_files: list[str]) -> bool:
     return any(_EVIDENCE_FILE_RE.search(f) for f in changed_files)
 
 
+def ui_verification_required(repo: str, pr_number: int, surfaces: list[str]) -> bool | None:
+    """Whether this exact PR changes a declared UI surface, or ``None`` when unreadable.
+
+    The Review result records whether browser verification ran; this independent read decides
+    whether that declaration was required. It deliberately shares the UI-evidence gate's
+    declaration-only policy instead of inferring a UI from arbitrary source paths.
+    """
+    if not surfaces:
+        return False
+    content = github.pr_content(repo, pr_number)
+    if content is None:
+        return None
+    return touches_ui_surface(list(content.paths), surfaces)
+
+
 def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     """Live: does this PR change a declared UI surface but carry no screenshot in its
     body or an agentflow-marked comment? Fail-safe — a `gh` error with surfaces declared

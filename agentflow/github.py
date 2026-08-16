@@ -953,9 +953,9 @@ class HeadChecks:
 
     ``failing`` carries the red contexts' names (empty means not red), because the revise finding
     and the park body both must name the check, and a second read to fetch names would defeat the
-    first. ``pending`` reports whether anything is still running — it never blocks a settlement,
-    only distinguishes "green" from "not finished" for whoever logs it. A commit with no checks at
-    all reads as neither red nor pending: absent checks settle exactly as today."""
+    first. ``pending`` reports whether anything is still running; it prevents a clean Review
+    settlement and hands the PR to a human rather than spinning. A commit with no checks at all
+    reads as neither red nor pending: absent checks settle exactly as today."""
     sha: str
     failing: tuple[str, ...] = ()
     pending: bool = False

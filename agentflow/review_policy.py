@@ -28,6 +28,14 @@ class ReviewAxis(StrEnum):
     DECISION = "decision"
 
 
+class UIVerification(StrEnum):
+    """The Review's execution result for user-facing behavior."""
+
+    NOT_REQUIRED = "not_required"
+    PASSED = "passed"
+    UNAVAILABLE = "unavailable"
+
+
 class ReviewAction(StrEnum):
     FIX = "fix_before_completion"
     FOLLOW_UP = "necessary_follow_up"
@@ -445,6 +453,7 @@ class ReviewResult:
     findings: tuple[ReviewFinding, ...] = ()
     uncertainty: Uncertainty | None = None
     decision: str = ""
+    ui_verification: UIVerification = UIVerification.NOT_REQUIRED
 
     @property
     def changed(self) -> bool:
@@ -587,18 +596,24 @@ def parse_review_result(payload: str, *, expected_sha: str | None = None,
             return _invalid("decision is not a string")
         if axis is ReviewAxis.DECISION and not decision.strip() and uncertainty is None:
             return _invalid("decision pass returned neither a decision nor uncertainty")
+        try:
+            ui_verification = UIVerification(str(data.get("ui_verification", "not_required")))
+        except ValueError:
+            return _invalid("ui verification state is unknown")
         needs_follow_up = any(item.action is ReviewAction.FOLLOW_UP for item in findings)
         if needs_follow_up != bool(follow_ups):
             return _invalid("necessary follow-up finding and proposal must appear together")
 
         blocking = uncertainty is not None or any(
             finding.action in {ReviewAction.FIX, ReviewAction.ASK} for finding in findings)
-        clean = data.get("verdict") == "PASS" and not blocking
+        clean = (data.get("verdict") == "PASS" and not blocking
+                 and ui_verification is not UIVerification.UNAVAILABLE)
         return ReviewResult(
             clean=clean, parsed=True, depth=depth, depth_reason=depth_reason.strip(), axis=axis,
             change_author_tool=author, reviewed_sha=reviewed_sha, final_sha=final_sha,
             pushed_sha=pushed_sha, fixes=fixes, follow_ups=tuple(follow_ups), checks=checks,
-            findings=tuple(findings), uncertainty=uncertainty, decision=decision.strip())
+            findings=tuple(findings), uncertainty=uncertainty, decision=decision.strip(),
+            ui_verification=ui_verification)
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         return _invalid(f"review result parse error: {type(exc).__name__}")
 
