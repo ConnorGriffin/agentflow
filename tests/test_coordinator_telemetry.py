@@ -231,7 +231,7 @@ def test_projection_totals_and_missing_counts_by_stage_model_outcome(tmp_path):
     record_attempt(store, _entry(token="b", stage="build", model="opus", verified=True,
                                  outcome="pr opened",
                                  usage=AttemptUsage(output_tokens=500, cost_usd=0.20)))
-    # A Codex-style attempt: no provider cost, and one with no usage at all.
+    # A Codex-style attempt: its token facts price from the rate card; the other has no usage.
     record_attempt(store, _entry(token="c", stage="review", model="sol", verified=False,
                                  outcome="", cause="capacity",
                                  usage=AttemptUsage(output_tokens=300)))
@@ -242,12 +242,80 @@ def test_projection_totals_and_missing_counts_by_stage_model_outcome(tmp_path):
     assert proj.total.attempts == 4
     assert proj.total.output_tokens == 1800
     assert proj.total.cost_usd == pytest.approx(0.60)
-    assert proj.total.cost_missing == 2               # the two Codex-style attempts
+    assert proj.total.estimated_cost_usd == pytest.approx(0.009)
+    assert proj.total.cost_missing == 1               # only the attempt that reported nothing
     assert proj.total.missing_usage == 1              # the one attempt that reported nothing
     cells = {(c.stage, c.model, c.outcome): c.totals for c in proj.cells}
     assert cells[("build", "opus", "pr opened")].attempts == 2
     assert cells[("build", "opus", "pr opened")].verified == 2
     assert cells[("review", "sol", "unverified:capacity")].missing_usage == 1
+
+
+def test_rolling_projection_prices_codex_from_the_rate_card_and_marks_it_estimated(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="codex", stage="review", model="luna",
+        usage=AttemptUsage(input_tokens=200, output_tokens=40)))
+
+    totals = project(store).total
+
+    expected = 200 * 1 / 1_000_000 + 40 * 6 / 1_000_000
+    assert totals.cost_usd == 0
+    assert totals.estimated_cost_usd == pytest.approx(expected)
+    assert totals.cost_missing == 0
+
+
+def test_rolling_projection_prices_an_unbilled_attributed_codex_worker(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="worker", stage="build", model="fable",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("gpt-5.6-terra", None, input_tokens=200, output_tokens=40),))))
+
+    totals = project(store).total
+
+    expected = 200 * 2.5 / 1_000_000 + 40 * 15 / 1_000_000
+    assert totals.cost_usd == 0
+    assert totals.estimated_cost_usd == pytest.approx(expected)
+    assert totals.cost_missing == 0
+
+
+def test_rolling_projection_does_not_double_count_an_attributed_provider_bill(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="billed", stage="review", model="sonnet",
+        usage=AttemptUsage(cost_usd=0.05, model_costs=(
+            ModelCost("sonnet", 0.05, output_tokens=1),))))
+
+    totals = project(store).total
+
+    assert totals.cost_usd == pytest.approx(0.05)
+    assert totals.estimated_cost_usd == 0
+
+
+def test_rolling_projection_uses_attributed_bills_without_an_attempt_total(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="attributed-bill", stage="review", model="sonnet",
+        usage=AttemptUsage(model_costs=(ModelCost("sonnet", 0.05, output_tokens=1),))))
+
+    totals = project(store).total
+
+    assert totals.cost_usd == pytest.approx(0.05)
+    assert totals.estimated_cost_usd == 0
+    assert totals.cost_missing == 0
+
+
+def test_rolling_projection_counts_uncaptured_delegate_spend(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="uncaptured", stage="build", model="fable",
+        usage=AttemptUsage(model_costs=(ModelCost("sonnet", 0.05, output_tokens=1),))))
+
+    totals = project(store).total
+
+    assert totals.cost_usd == pytest.approx(0.05)
+    assert totals.delegate_uncaptured_attempts == 1
 
 
 def test_projection_ignores_a_corrupt_entry(tmp_path):
@@ -314,8 +382,72 @@ def test_format_spend_report_flags_every_estimated_row_and_a_total_would_mix_est
         if line.startswith("review\tluna\t"):
             assert "est" in line
             assert "~" in line
+            assert "cached input not priced" not in line
         if line.startswith("review\tsonnet\t"):
             assert "est" not in line   # provider-billed, never flagged
+
+
+def test_spend_report_discloses_cached_input_omitted_from_an_estimate(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="cached", stage="review", model="luna",
+        usage=AttemptUsage(model_costs=(
+            ModelCost("luna", None, input_tokens=5, cached_input_tokens=95, output_tokens=1),))))
+
+    report = spend_report(store, start=50, end=150)
+    (row,) = report.rows
+
+    assert row.estimated is True
+    assert row.unpriced_cached_input_tokens == 95
+    assert "cached input not priced (95 tokens)" in format_spend_report(report)
+
+
+def test_spend_report_discloses_when_a_dollar_total_covers_only_some_attempts(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="priced", stage="build", model="fable",
+        usage=AttemptUsage(output_tokens=1, cost_usd=0.05)))
+    record_attempt(store, _entry(
+        token="unpriced", stage="build", model="fable",
+        usage=AttemptUsage(output_tokens=99)))
+
+    report = spend_report(store, start=50, end=150)
+    (row,) = report.rows
+
+    assert row.attempts == 2
+    assert row.dollar_covered_attempts == 1
+    assert "dollar total covers 1 of 2 attempts" in format_spend_report(report)
+
+
+def test_spend_report_keeps_delegate_and_dollar_coverage_notes(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="priced", stage="build", model="fable",
+        usage=AttemptUsage(output_tokens=1, cost_usd=0.05)))
+    record_attempt(store, _entry(
+        token="unpriced", stage="build", model="fable",
+        usage=AttemptUsage(output_tokens=99)))
+
+    rendered = format_spend_report(spend_report(store, start=50, end=150))
+
+    assert "delegate spend not counted (2); dollar total covers 1 of 2 attempts" in rendered
+
+
+def test_fully_billed_and_dollar_covered_spend_row_has_no_qualification(tmp_path):
+    store = tmp_path / "records.db"
+    record_attempt(store, _entry(
+        token="billed", stage="review", model="sonnet",
+        usage=AttemptUsage(output_tokens=1, cost_usd=0.05)))
+
+    report = spend_report(store, start=50, end=150)
+    (row,) = report.rows
+    rendered = format_spend_report(report)
+
+    assert row.dollar_covered_attempts == row.attempts == 1
+    assert row.estimated is False
+    assert "not priced" not in rendered
+    assert "dollar total covers" not in rendered
+    assert "delegate spend not counted" not in rendered
 
 
 def test_unknown_dollar_figure_is_never_rendered_as_zero(tmp_path):
@@ -329,8 +461,10 @@ def test_unknown_dollar_figure_is_never_rendered_as_zero(tmp_path):
     report = spend_report(store, start=50, end=150)
     (row,) = report.rows
     assert row.cost_usd is None
+    assert row.dollar_covered_attempts == 0
     assert "—" in format_spend_report(report)
     assert "0.000000" not in format_spend_report(report)
+    assert "dollar total covers" not in format_spend_report(report)
 
 
 def test_lead_run_attempt_without_worker_capture_shows_the_not_counted_mark(tmp_path):
