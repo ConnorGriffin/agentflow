@@ -25,9 +25,12 @@ from agentflow import (coordinated_build, coordinated_review, github, pipeline, 
 from agentflow.gate import MAX_REVISES
 from agentflow.coordinator import (BuildStageAdapter, ReviewStageAdapter, StageRouter, Submission,
                                     tracer)
-from agentflow.coordinator.providers import ProviderCause, ProviderObservation
+from agentflow.coordinator.providers import (
+    PROVIDER_INPUT_V1, ProviderCause, ProviderObservation,
+    split_terminal_session_lead_contract)
 from agentflow.coordinator.record import Record
 from agentflow.review_policy import ReviewState
+from agentflow.routing import routing
 
 
 def _review(subject="7", *, pool="claude", target="sha-a", builder_lineage="codex",
@@ -1418,6 +1421,68 @@ def test_review_submission_binds_to_the_head_sha_and_assumes_the_build_claim():
     assert coordinated_review.review_submission(
         Record(identity="x", stage="build", pool="claude", demand=5, repo="o/r", subject="7"),
         "sha", "codex", 42) is None
+
+
+def test_review_submission_reuses_only_the_task_brief_from_a_session_lead_build():
+    task = "Implement the exact durable task.\n"
+    build_contract = routing.session_lead_instructions(
+        "build", "low", parent_provider="claude")
+    briefing = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    durable_build_input = task + build_contract + briefing
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
+        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
+        input_ptr=durable_build_input, session_lead=True, effort="low")
+
+    submission = coordinated_review.review_submission(
+        build, "head-sha-123", "codex", 42, acceptance=durable_build_input)
+
+    assert submission is not None
+    task_brief, review_contract = split_terminal_session_lead_contract(submission.input_ptr)
+    assert submission.input_ptr.count(
+        "\n## Session lead — benchmarked capability routing\n") == 1
+    assert submission.input_ptr.endswith(review_contract)
+    assert task in task_brief
+    assert briefing in task_brief
+
+
+def test_review_submission_reuses_the_prompt_inside_a_provider_input_envelope():
+    task = "Implement the enveloped durable task.\n"
+    briefing = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    build_contract = routing.session_lead_instructions(
+        "build", "low", parent_provider="claude")
+    durable_build_input = json.dumps({
+        "format": PROVIDER_INPUT_V1,
+        "prompt": task + briefing + build_contract,
+        "snapshot": {"body": "exact durable bytes", "number": 7},
+        "source_ref": "abc123",
+    }, sort_keys=True)
+    build = Record(
+        identity="o/r|7|build|-", stage="build", pool="claude", demand=5, repo="o/r",
+        subject="7", source="/home/w/.agentflow/worktrees/claude/issue-7-fix-thing",
+        input_ptr=durable_build_input, session_lead=True, effort="low")
+
+    submission = coordinated_review.review_submission(
+        build, "head-sha-123", "codex", 42, acceptance=durable_build_input)
+
+    assert submission is not None
+    task_brief, review_contract = split_terminal_session_lead_contract(submission.input_ptr)
+    assert submission.input_ptr.endswith(review_contract)
+    assert task in task_brief
+    assert briefing in task_brief
+    assert "exact durable bytes" not in task_brief
 
 
 def test_coordinated_review_submission_is_preparable_as_a_session_lead(make_coord):

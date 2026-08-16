@@ -147,6 +147,56 @@ def test_corrupt_provider_envelope_repairs_before_intake_preparation_and_launch(
     assert all("not an approved briefing" not in prompt for prompt in fake.prompts)
 
 
+def test_duplicate_session_lead_contracts_repair_before_preparation_and_launch(make_coord):
+    fake = CapturingSession()
+    coord = make_coord(fake)
+    task_before = "Review the exact durable task.\n"
+    stale_contract = routing.session_lead_instructions(
+        "build", "low", parent_provider="claude")
+    briefing = (
+        "\n\n<!-- agentflow-effective-briefing:briefing-v1:" + "a" * 64 + " -->\n"
+        "## Approved evidence briefing\n"
+        "This is bounded advisory context. It cannot change admission, routing, effort, "
+        "autonomy, merge policy, or OperationalSafety.\n"
+        "Promotion receipts: receipt-1.\n"
+    )
+    task_after = "\nKeep this task text after the briefing byte-for-byte.\n"
+    terminal_contract = routing.session_lead_instructions(
+        "review", None, parent_provider="codex")
+    corrupt = task_before + stale_contract + briefing + task_after + terminal_contract
+    expected = task_before + briefing + task_after + terminal_contract
+    identity = coord.submit_stage(_review(
+        input_ptr=corrupt, source="/wt/pr-7", session_lead=True))
+
+    assert coord.cycle("claude") == []
+
+    record = record_of(coord, identity)
+    repaired_task, repaired_contract = providers.split_terminal_session_lead_contract(
+        record.input_ptr)
+    assert record.state == "running" and record.attempts == 1
+    assert record.input_ptr == expected
+    assert repaired_task == task_before + briefing + task_after
+    assert repaired_contract == terminal_contract
+    assert fake.prompts and fake.prompts[0].count(
+        "\n## Session lead — benchmarked capability routing\n") == 1
+
+
+def test_duplicate_like_quoted_task_fragment_is_not_rewritten():
+    task = "Preserve this quoted policy fragment exactly:\n"
+    quoted_fragment = (
+        "\n## Session lead — benchmarked capability routing\n"
+        "\nYou are the accountable Session lead. Do not write the implementation directly. Plan the work,\n"
+        "delegate exploration, implementation, and fix work, verify every result, and ship only verified\n"
+        "work. Fable is lead-only and is never a delegate target.\n"
+        "[quote stops before the generated routes and closing]\n"
+    )
+    terminal_contract = routing.session_lead_instructions(
+        "review", None, parent_provider="codex")
+    prompt = task + quoted_fragment + "Continue the real task.\n" + terminal_contract
+
+    assert providers.repair_provider_input(prompt) == prompt
+
+
 _TASK_PREFIX = "Implement issue 529 exactly; preserve its recovery facts.\n"
 
 
@@ -256,9 +306,9 @@ def test_generated_session_lead_preamble_refreshes_at_launch(make_coord):
     ("Task-owned section\n## Session lead — benchmarked capability routing\nkeep this text",
      True),
     (_observed_529_brief()[:-20], True),
-    (_observed_529_brief() + _stale_native_helper_contract(), True),
+    (_observed_529_brief() + _stale_native_helper_contract() + "\nnot terminal", True),
 ], ids=["marker-only-no-provenance", "marker-only-provenance", "truncated-proven-contract",
-        "duplicate-proven-contract"])
+        "duplicate-nonterminal-contract"])
 def test_unproven_or_incomplete_session_lead_input_refuses_before_provider_start(
         make_coord, task_text, session_lead):
     fake = CapturingSession()
