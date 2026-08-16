@@ -93,6 +93,57 @@ def test_connor_skill_materialization_records_only_agentflow_owned_destination(
     assert skill_destination_status(managed, manifest) == "ok"
 
 
+def test_connor_skill_wiring_records_the_same_pin_as_the_agents_destination(
+    tmp_path, monkeypatch
+):
+    """One skill, one enrollment run, one pin.
+
+    `_wire_claude_skill` used to default to the capability's `version` field when no pin
+    was passed, while `_install_connor_skills` recorded the resolved `connor_skills`
+    commit for the same skill's `.agents` destination — two different pins for one skill
+    in one run. The manifest here deliberately gives the capability a `version` that
+    differs from the resolved commit, so a pass would be impossible by accident.
+    """
+    from agentflow import enroll
+
+    pinned = "---\nname: drive-local-webapp\n---\n"
+    manifest = [{"path": "SKILL.md", "sha256": sha256(pinned.encode()).hexdigest()}]
+
+    def run(command, **kwargs):
+        if command[0] == "npx":
+            skill = Path(kwargs["cwd"]) / ".agents" / "skills" / "drive-local-webapp"
+            skill.mkdir(parents=True, exist_ok=True)
+            (skill / "SKILL.md").write_text(pinned)
+        stdout = "a" * 40 if command[-1] == "HEAD" else ""
+        return subprocess.CompletedProcess(command, 0, stdout, "")
+
+    monkeypatch.setattr(enroll, "_run_command", run)
+    monkeypatch.setattr(enroll, "_resolved_skill_release", lambda _manifest: ("a" * 40, None))
+    monkeypatch.setattr(enroll, "_normalize_skill_lock", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(enroll, "_skill_status", lambda *_args: "ok")
+    monkeypatch.setattr(
+        enroll,
+        "_manifest",
+        lambda: {
+            "connor_skills": {
+                "skills": ["drive-local-webapp"], "commit": "a" * 40,
+                "source": "https://example.test/skills.git", "tag": "v1",
+            },
+            "capabilities": [
+                {"skill": "drive-local-webapp", "files": manifest, "version": "v9.9.9"}
+            ],
+            "skill_installer": {"package": "skills", "version": "1"},
+        },
+    )
+
+    assert enroll._install_connor_skills(tmp_path).startswith("DO:")
+
+    agents_ownership = skill_ownership(tmp_path / ".agents" / "skills" / "drive-local-webapp")
+    claude_ownership = skill_ownership(tmp_path / ".claude" / "skills" / "drive-local-webapp")
+    assert agents_ownership is not None and claude_ownership is not None
+    assert agents_ownership["pin"] == claude_ownership["pin"] == "a" * 40
+
+
 def test_skill_ownership_survives_content_drift_but_not_a_symlink_swap(tmp_path):
     """Provenance binds destination identity, not tree content.
 

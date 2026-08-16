@@ -50,12 +50,14 @@ race that.
 
 ## Consequences
 
-Residual risk, accepted: if an operator overwrites a marker-owned directory in place — same path,
-still a regular directory — it is indistinguishable from drift and convergence will repair it back
-to the pin. This is bounded by two things: rollback's marker cleanup keeps orphaned markers from
-outliving the destinations they name, and the refusal to touch symlinked or `incompatible`
-destinations means the residual risk is scoped to "operator edits files in place," not "operator
-replaces the destination with something structurally different."
+Residual risk, accepted: any regular directory that lands at an owned path is repaired to the pin,
+however it got there — an operator editing files in place, or an operator deleting the destination
+and recreating their own directory at the same path (verified empirically: the marker survives
+that too, since it only checks identity and shape). Only a symlinked or structurally
+`incompatible` destination is refused. The one thing that ends ownership is deleting the
+destination *and* its marker together — which is exactly what the rollback paths (a removed
+materialization, a restored enrollment journal) do; deleting just the destination and leaving the
+marker behind produces an orphaned marker for the next materialization at that path to inherit.
 
 Durable daemon state remains outside enrollment rollback. The marker is outside the digest-checked
 skill tree, so it does not affect `skill_destination_status`. A pin bump no longer invalidates

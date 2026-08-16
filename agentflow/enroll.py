@@ -112,7 +112,13 @@ def _manifest() -> dict:
 
 @contextmanager
 def _capability_repair_lock(root: Path):
-    """Serialize enrollment-owned repairs for coordinators sharing one repository root."""
+    """Serialize enrollment-owned repairs for coordinators sharing one repository root.
+
+    Non-reentrant (the per-root ``threading.Lock`` plus the ``flock`` it guards): a nested
+    acquisition on the same root within one call chain deadlocks. Callers must not hold this
+    lock across a call into `_install_connor_skills`/`_replace_skill_tree`, which acquire it
+    themselves.
+    """
     lock_dir = root / ".agentflow"
     if lock_dir.is_symlink() or (lock_dir.exists() and not lock_dir.is_dir()):
         raise OSError(".agentflow repair lock directory is incompatible")
@@ -948,7 +954,7 @@ def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
         or _legacy_claude_skill_link(root, name)
         for name in names
     ):
-        outcomes = [_wire_claude_skill(root, name) for name in names]
+        outcomes = [_wire_claude_skill(root, name, expected) for name in names]
         refreshed = _public_skill_destination_states(root, manifest)
         if not any(outcome.startswith("WARN:") for outcome in outcomes) and all(
             state == "ok" for state in refreshed.values()
@@ -1039,7 +1045,7 @@ def _install_connor_skills(root: Path, *, converge: bool = False) -> str:
                     mark_skill_owned(destination, expected)
                 except OSError as exc:
                     return f"WARN: could not record AgentFlow ownership for {destination}: {exc}"
-            wiring = _wire_claude_skill(root, name)
+            wiring = _wire_claude_skill(root, name, expected)
             if wiring.startswith("WARN:"):
                 return wiring
     states = {
@@ -1192,7 +1198,15 @@ def _legacy_claude_skill_link(root: Path, name: str) -> bool:
     return target.is_symlink() and target.readlink() == desired
 
 
-def _wire_claude_skill(root: Path, name: str) -> str:
+def _wire_claude_skill(root: Path, name: str, pin: str | None = None) -> str:
+    """Materialize a repo skill's Claude-local copy and mark its provenance.
+
+    ``pin`` should be the same resolved pin the caller already recorded for this skill's
+    other destination, so one enrollment run records one pin per skill rather than two —
+    pass it explicitly whenever the caller has already resolved one. Callers that have not
+    (e.g. wiring a pre-existing ``.agents`` destination whose own pin is unknown here) fall
+    back to that destination's own marker, then to the manifest's pinned ``version``.
+    """
     target = root / ".claude" / "skills" / name
     source = root / ".agents" / "skills" / name
     if target.is_dir() and not target.is_symlink():
@@ -1205,9 +1219,14 @@ def _wire_claude_skill(root: Path, name: str) -> str:
         return f"WARN: {source} is not a safe materialization source"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(source, target)
-    specs = {item.get("skill"): item for item in _manifest()["capabilities"]}
     try:
-        pin = specs[name].get("version") or specs[name].get("source") or "unpinned"
+        if pin is None:
+            source_ownership = skill_ownership(source)
+            if source_ownership is not None:
+                pin = source_ownership["pin"]
+            else:
+                specs = {item.get("skill"): item for item in _manifest()["capabilities"]}
+                pin = specs[name].get("version") or specs[name].get("source") or "unpinned"
         mark_skill_owned(target, pin)
     except (KeyError, OSError) as exc:
         shutil.rmtree(target)
