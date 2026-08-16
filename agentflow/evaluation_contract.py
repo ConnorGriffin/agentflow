@@ -848,6 +848,17 @@ class EvaluationContractV1:
         """Dispatch original caller input through the revalidated exact ``evaluate_v1``."""
         candidate, evaluate = self.__validated()
         try:
+            contracts = {row["operation_id"]: row for row in candidate["operation_contracts"]}
+            operation = contracts.get(operation_id)
+            if operation is not None:
+                schema = candidate["schemas"][operation["input_schema"]]
+                if not _value_matches(input_value, schema["root"], schema["definitions"]):
+                    _error("E_SEMANTIC", "<module>")
+        except EvaluationContractError:
+            raise
+        except (KeyError, OSError, RecursionError, TypeError, UnicodeError, ValueError):
+            _error("E_SEMANTIC", "<module>")
+        try:
             result = evaluate(candidate, operation_id, input_value)
         except Exception:
             _error("E_SEMANTIC", "<module>")

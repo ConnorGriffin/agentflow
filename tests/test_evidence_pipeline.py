@@ -171,3 +171,17 @@ def test_miner_rejects_forged_classification_and_method_inputs(tmp_path):
     assert EvidenceMiner(_reader(store)).candidates(
         (LessonInput(finding.failure_event_id, "f" * 64),),
         policy_version=1, nominated_at=2) == ()
+
+
+def test_miner_counts_canonical_failure_recurrences_not_finding_sequences(tmp_path):
+    store = EvidenceStore(path=tmp_path / "evidence.db")
+    producer = EvidenceProducer(store, repository="octo/repo")
+    request = _request(producer)
+    first = _finding(producer, request, sequence=1, upstream="plan-review")
+    second = _finding(producer, request, sequence=2, upstream="plan-review")
+
+    assert first.failure_event_id == second.failure_event_id
+    assert EvidenceMiner(_reader(store)).candidates(
+        (LessonInput(first.event.event_id, "f" * 64),
+         LessonInput(second.event.event_id, "f" * 64)),
+        policy_version=1, nominated_at=3) == ()

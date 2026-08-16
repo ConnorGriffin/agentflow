@@ -474,7 +474,7 @@ class EvidenceMiner:
             if method not in _UPSTREAM_CONTRACTS:
                 continue
             groups.setdefault((method, item.proposal_digest, failure.failure_class,
-                               failure.normalized_signature), set()).add(event.event_id)
+                               failure.normalized_signature), set()).add(failure.event_id)
         return tuple(LessonCandidate(_id("lesson", method, digest, failure_class, signature,
                                          *sorted(events)), tuple(sorted(events)),
             digest, policy_version, nominated_at)

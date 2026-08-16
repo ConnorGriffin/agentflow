@@ -580,6 +580,7 @@ class EvidenceReceiptReader:
         _token(event_id, "event_id")
         try:
             with self._connect() as conn:
+                EvidenceStore._validate_graph(conn)
                 row = conn.execute(
                     "SELECT * FROM events WHERE event_id=?", (event_id,)).fetchone()
                 if row is None:
