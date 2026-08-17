@@ -310,7 +310,8 @@ Issue-keyed records:
   in-session subagents on one pull request, with ADR 465's non-self-scoping work order and ADR
   468's commit-per-slice ledger retained. It supersedes ADR 466's separately-gated route and fixed
   cheap/frontier pair, retires the switch-based revert condition, and records #469's **TUNE**
-  verdict; implementation of in-session slicing remains open work.
+  verdict; in-session slicing shipped in `9fa005d`
+  ([#722](https://github.com/ConnorGriffin/agentflow/pull/722)).
 - [ADR 540](adr-540-bounded-review-follow-up-proposals.md) — A review carries one bounded
   follow-up proposal instead of creating a GitHub issue; historical URLs remain references, and
   public parks use a 2,000-character operator envelope. Amends ADR 0047.
