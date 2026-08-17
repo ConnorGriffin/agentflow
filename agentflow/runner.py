@@ -1007,7 +1007,10 @@ class CodexRunner(_WorktreeRunner):
             argv += ["-c", f"model_reasoning_effort={level}"]
         if schema is not None:
             argv += ["--output-schema", _write_output_schema(schema)]
-        argv.append(_bounded_prompt(_CODEX_HEADLESS_RECOVERY + prompt, cwd))
+        # A stage prompt that already carries the shared blocked-browser recovery (#737) is not
+        # given the launcher's Codex-only copy a second time.
+        recovery = "" if "HEADLESS-SANDBOX-BLOCKED" in prompt else _CODEX_HEADLESS_RECOVERY
+        argv.append(_bounded_prompt(recovery + prompt, cwd))
         return argv
 
     def account_fact(self) -> dict | None:

@@ -147,7 +147,9 @@ def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):
     launcher-wide two-hour constant. An explicit constructor override still wins (tests/ops)."""
     launcher = LocalLauncher()
     assert launcher._session_timeout_for(_record("intake", str(tmp_path))) == 20 * 60
-    assert launcher._session_timeout_for(_record("review", str(tmp_path))) == 30 * 60
+    # Review carries a standard build's 45-minute wall (#737): the browser-verification leg was
+    # added on top of the work the old 30-minute ceiling was sized against.
+    assert launcher._session_timeout_for(_record("review", str(tmp_path))) == 45 * 60
     assert launcher._session_timeout_for(
         _record("build", str(tmp_path), complexity="deep", effort="extra")) == 4 * 60 * 60
     # Build's fixed wall became its immutable lease cap; ordinary activity renews only the

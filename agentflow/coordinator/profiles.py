@@ -61,7 +61,10 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
     # An attack re-reads one draft against the code — the same bounded read-only shape as intake,
     # so it carries the same ceiling (ADR 380).
     "attack": (20 * _MIN, 80),
-    "review": (30 * _MIN, 120),
+    # Review carries a standard build's 45-minute wall (#737): the required browser-verification
+    # leg — boot the app, drive it headless — was added on top of work the 30-minute ceiling was
+    # sized against, and every console PR's review was burning its budget at the old wall.
+    "review": (45 * _MIN, 120),
     "respond": (20 * _MIN, 80),
     "converse": (20 * _MIN, 80),
     "research": (30 * _MIN, 80),
@@ -110,6 +113,9 @@ _STAGE_CEILINGS: dict[str, tuple[int, int]] = {
 _OBSERVED_P95: dict[tuple[str, str | None, str | None], tuple[int, int]] = {
     ("intake", None, None): (335, 45),
     ("attack", None, None): (109, 44),
+    # Read before any review was asked to run the app in a browser; the UI-verification leg
+    # (#737) is on top of this figure, so the 45-minute wall is sized as browser work plus this
+    # reading, not against it alone.
     ("review", None, None): (469, 66),
     ("respond", None, None): (477, 51),
     ("research", None, None): (608, 39),

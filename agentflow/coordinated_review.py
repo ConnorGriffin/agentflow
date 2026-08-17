@@ -1043,6 +1043,38 @@ def _park_review_settlement(record, verdict, workdir: str, pr: int,
     return url
 
 
+def post_repair_notice(record, verdict) -> str | None:
+    """One short public note that this review pass pushed repairs and a verdict is still coming.
+
+    A repair-pushing pass hands its work to the next pass privately, so from the PR a working
+    chain and a dead session used to look identical — repairs appear and no comment ever follows
+    (#737). This line tells a watching operator the chain is alive. It settles nothing and is not
+    a verdict; the chain still speaks its real verdict only at the end. Posted through the shared
+    post-once-then-notify envelope (ADR 0042) keyed on this pass and its pushed head, so a repeat
+    cycle or a crash resume observes the existing comment and never posts a second.
+    """
+    from agentflow.handoff import (DurableHandoff, Notification, Subject, marked_body,
+                                   proof_marker)
+
+    facts = review_source_facts(record)
+    if facts is None or not verdict.pushed_sha:
+        return None
+    _workdir, pr = facts
+    marker = proof_marker(record.identity, f"repairs-pushed:{verdict.pushed_sha}",
+                          tag="review-repairs")
+    body = marked_body(
+        "The independent review pushed repairs to this pull request's branch and handed the "
+        "repaired change to the next review pass. This is progress, not a verdict — the review "
+        "chain posts its verdict when it finishes.", marker)
+    return DurableHandoff().hand_off(
+        Subject(repo=record.repo, number=pr, kind="pr"),
+        identity=record.identity, stage="review-repairs", marker=marker,
+        action=lambda: github.pr_comment(record.repo, pr, body),
+        notification=Notification(
+            "agentflow progress",
+            f"{record.repo} PR #{pr}: review pushed repairs; verdict still coming"))
+
+
 def _settle_review(record) -> str | None:
     """Consume a parsed exact-head verdict through the established repository merge policy."""
     from agentflow import ratchet

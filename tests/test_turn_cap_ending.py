@@ -125,6 +125,44 @@ def test_a_stage_that_spent_its_budget_at_the_turn_cap_records_which_ceiling_sto
     assert TURN_CAP_HOLD_CLAUSE in record.hold_reason
 
 
+def test_a_stage_that_spent_its_budget_at_the_wall_clock_records_that_ceiling(make_coord):
+    """The wall-clock deadline is the other clock-class ceiling (#737): the daemon log already
+    told the two apart, but the durable record carried no clause for it, so a review the clock
+    killed three times parked with the flat executions-failed sentence."""
+    from agentflow.coordinator.coordinator import WALL_CLOCK_HOLD_CLAUSE, ended_at_wall_clock
+
+    fake = FakeSession()
+    coord = make_coord(fake, adapter=fake)
+    identity = coord.submit_stage(Submission(repo="o/r", subject="401", stage="review",
+                                             pool="claude"))
+    for _ in range(8):
+        outcomes = coord.cycle("claude")
+        if any(o.identity == identity and o.status == "held" for o in outcomes):
+            break
+        fake.end(identity, cause=ProviderCause.TIMEOUT)
+    record = record_of(coord, identity)
+
+    assert record.state == "held"
+    assert record.hold_reason.startswith("continuation budget exhausted")
+    assert WALL_CLOCK_HOLD_CLAUSE in record.hold_reason
+    assert ended_at_wall_clock(record.hold_reason)
+    assert not ended_at_turn_cap(record.hold_reason)
+
+
+def test_the_parked_review_names_the_wall_clock_when_that_ceiling_killed_it():
+    from agentflow.coordinator.coordinator import WALL_CLOCK_HOLD_CLAUSE
+
+    record = Record(identity="o/r|398|review|sha-a", stage="review", pool="claude", demand=1,
+                    repo="o/r", subject="398", target="sha-a",
+                    hold_reason="continuation budget exhausted" + WALL_CLOCK_HOLD_CLAUSE)
+    missing = review_park_missing(record)
+
+    assert "45-minute wall-clock limit" in missing
+    assert "having produced nothing" in missing
+    assert "the review executions failed" not in missing
+    assert "Do not treat this as a clean review." in missing
+
+
 def test_a_budget_spent_without_the_turn_cap_keeps_the_plain_exhaustion_reason(make_coord):
     # The control: an ending that is not the ceiling must not borrow the ceiling's words.
     fake = FakeSession()
