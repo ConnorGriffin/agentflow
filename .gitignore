@@ -8,6 +8,7 @@ __pycache__/
 .claude/
 .impeccable/
 agentflow/webui/node_modules/
+/site/
 
 # ui-mockups captures (illustrative/real payloads — not committed)
 mockups/*.capture.json

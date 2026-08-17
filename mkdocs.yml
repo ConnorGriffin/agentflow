@@ -1,0 +1,56 @@
+site_name: AgentFlow
+site_url: https://connorgriffin.github.io/agentflow/
+repo_url: https://github.com/ConnorGriffin/agentflow
+docs_dir: docs
+
+exclude_docs: |
+  adr/
+  scope/
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.sections
+    - navigation.top
+    - toc.follow
+    - content.code.copy
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+
+nav:
+  - Home: index.md
+  - How it works: how-it-works.md
+  - Getting started: getting-started.md
+  - Pipeline: pipeline.md
+  - Capabilities: capabilities.md
+  - Coordinator operations: coordinator-operations.md
+  - Learning pipeline: learning-pipeline.md
+  - Public beta: public-beta.md
+  - Reuse map: reuse-map.md
