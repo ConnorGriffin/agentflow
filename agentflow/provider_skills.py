@@ -13,6 +13,7 @@ import json
 import os
 from importlib.resources import files
 from pathlib import Path
+import re
 import shutil
 import stat
 import tempfile
@@ -42,6 +43,61 @@ When invoked, reply with this exact line and nothing else:
 
 {NATIVE_DISCOVERY_MARKER}
 """
+
+
+def _git_inspection_environment() -> dict[str, str]:
+    """A minimal environment that cannot redirect repository or config discovery."""
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+
+
+def _github_repository(root: Path) -> str:
+    """Return a checkout-root GitHub repository identity, or nothing when it is unavailable."""
+    from agentflow.runner import _run
+
+    environment = _git_inspection_environment()
+    prefix = _run(
+        ["git", "-C", str(root), "rev-parse", "--show-prefix"], env=environment
+    )
+    if prefix.returncode != 0 or (prefix.stdout or "").strip():
+        return ""
+    remote = _run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"], env=environment
+    )
+    if remote.returncode != 0:
+        return ""
+    url = (remote.stdout or "").strip().removesuffix("/").removesuffix(".git")
+    match = re.fullmatch(
+        r"(?:git@github\.com:|https?://github\.com/|ssh://git@github\.com/)"
+        r"([^/]+)/([^/]+)",
+        url,
+    )
+    return f"{match.group(1)}/{match.group(2)}".casefold() if match else ""
+
+
+def _is_packaged_project_source(root: Path) -> bool:
+    """Whether the enrolled source belongs to the repository supplying this package."""
+    package_repository = _github_repository(Path(str(files("agentflow"))).parent)
+    return bool(package_repository) and _github_repository(root) == package_repository
+
+
+def _tracked_destination_harness(root: Path) -> bool:
+    """Whether the destination harness is known to its launch checkout's index."""
+    from agentflow.runner import _run
+
+    environment = _git_inspection_environment()
+    path = "scripts/screenshots.mjs"
+    result = _run(
+        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", path],
+        env=environment,
+    )
+    return result.returncode == 0
 
 
 def _manifest_fingerprint() -> str:
@@ -549,6 +605,11 @@ def materialize_launch_capabilities(
                 if prior_digest == pinned_digest:
                     return None
                 if prior_digest not in frozenset(harness.get("known_old_sha256", ())):
+                    if (
+                        _is_packaged_project_source(source)
+                        and _tracked_destination_harness(destination)
+                    ):
+                        return None
                     return failed(
                         f"{provider} launch screenshot harness is occupied or drifted"
                     )
@@ -599,6 +660,10 @@ def materialize_launch_capabilities(
             status, detail = playwright_runtime_status(
                 destination, version=runtime["version"], node_minimum=runtime["node_minimum"],
                 manifest=manifest, provider=provider,
+                allow_harness_drift=(
+                    _is_packaged_project_source(source)
+                    and _tracked_destination_harness(destination)
+                ),
             )
             if status != "ok":
                 return failed(

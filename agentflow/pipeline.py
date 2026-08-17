@@ -372,7 +372,9 @@ def _capability_preflight(record, materialize: bool, *, _log=None):
     """Validate the prepared provider launch root, including historical durable records."""
     from agentflow.capability_contracts import CapabilityPreflightResult, preflight
     from agentflow.prompts import STAGE_PROMPTS, requirements_for
-    from agentflow.provider_skills import materialize_launch_capabilities
+    from agentflow.provider_skills import (
+        _is_packaged_project_source, materialize_launch_capabilities,
+    )
     from agentflow.repo_facts import surface_declaration
     from agentflow.worktree_ref import WorktreeRef
     if record.stage not in STAGE_PROMPTS:
@@ -435,7 +437,14 @@ def _capability_preflight(record, materialize: bool, *, _log=None):
                 record.stage, record.pool, requirements,
                 "incompatible", (f"launch-root-materialization-failed: {detail}",),
                 f"agentflow enroll {actual_root} --apply")
-    return preflight(inspection_root, record.stage, record.pool, requirements)
+    return preflight(
+        inspection_root, record.stage, record.pool, requirements,
+        allow_owner_harness_drift=(
+            materialize
+            and source_root is not None
+            and _is_packaged_project_source(source_root)
+        ),
+    )
 
 
 def _repair_capability_refusal(record, capability):

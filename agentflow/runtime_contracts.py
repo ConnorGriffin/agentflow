@@ -32,6 +32,7 @@ def playwright_runtime_status(
     node_minimum: int,
     manifest: dict,
     provider: str,
+    allow_harness_drift: bool = False,
 ) -> tuple[str, str]:
     """Inspect the selected provider's pinned browser runtime contract."""
     specs = {item["id"]: item for item in manifest["capabilities"]}
@@ -50,7 +51,10 @@ def playwright_runtime_status(
         return "incompatible", "pinned screenshot harness escapes the project root"
     import hashlib
 
-    if hashlib.sha256(harness.read_bytes()).hexdigest() != harness_spec["sha256"]:
+    if (
+        hashlib.sha256(harness.read_bytes()).hexdigest() != harness_spec["sha256"]
+        and not allow_harness_drift
+    ):
         return "drifted", "pinned screenshot harness is drifted"
     drive = specs["drive-local-webapp"]
     status = skill_destination_status(skill_root / drive["skill"], drive["files"])

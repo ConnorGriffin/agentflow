@@ -152,6 +152,11 @@ def test_historical_record_preflights_retained_source_not_unrelated_capability_r
     unrelated.mkdir()
     (retained / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: frontend/\n")
     calls = []
+    owner_roots = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills._is_packaged_project_source",
+        lambda root: owner_roots.append(root) or root == unrelated,
+    )
     monkeypatch.setattr(
         "agentflow.provider_skills.materialize_launch_capabilities",
         lambda source, destination, provider, *, materialize_runtime, requirement_ids:
@@ -160,8 +165,11 @@ def test_historical_record_preflights_retained_source_not_unrelated_capability_r
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.preflight",
-        lambda root, stage, provider, contracts: calls.append(
-            (root, stage, provider, tuple(item.id for item in contracts))) or
+        lambda root, stage, provider, contracts, **kwargs: calls.append(
+            (
+                root, stage, provider, tuple(item.id for item in contracts),
+                kwargs["allow_owner_harness_drift"],
+            )) or
             CapabilityPreflightResult(stage, provider, contracts, "ready", ("ok",), "repair"),
     )
     record = Record(
@@ -177,6 +185,8 @@ def test_historical_record_preflights_retained_source_not_unrelated_capability_r
     )
     assert calls[1][0] == retained
     assert calls[1][3] == ("ui-craft", "drive-local-webapp", "playwright")
+    assert calls[1][4] is True
+    assert owner_roots == [unrelated]
 
 
 def test_pre_582_record_without_capability_facts_derives_real_worktree_root(
@@ -195,7 +205,7 @@ def test_pre_582_record_without_capability_facts_derives_real_worktree_root(
     )
     monkeypatch.setattr(
         "agentflow.capability_contracts.preflight",
-        lambda root, stage, provider, contracts:
+        lambda root, stage, provider, contracts, **_kwargs:
             CapabilityPreflightResult(stage, provider, contracts, "ready", (str(root),), "repair"),
     )
     record = Record(

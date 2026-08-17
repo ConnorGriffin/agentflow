@@ -15,6 +15,7 @@ import pytest
 
 from agentflow.capability_contracts import ContractRequirement, preflight
 from agentflow.cli import main
+from agentflow.coordinator.record import Record
 from agentflow.enroll import doctor, enroll_repository, repair_capability_refusal
 from agentflow.prompts import requirements_for
 from agentflow.provider_skills import (
@@ -48,6 +49,29 @@ def _ready_ui_launch_source(tmp_path):
     (runtime / ".bin").mkdir()
     (runtime / ".bin" / "playwright").symlink_to("../playwright/cli.js")
     return source
+
+
+_OWNER_REPOSITORY_ORIGIN = "git@github.com:ConnorGriffin/agentflow.git"
+
+
+def _launch_repository(root: Path, origin: str | None = None) -> None:
+    root.mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    if origin is not None:
+        subprocess.run(
+            ["git", "-C", str(root), "remote", "add", "origin", origin], check=True
+        )
+
+
+def _track_harness(root: Path) -> None:
+    subprocess.run(["git", "-C", str(root), "add", "scripts/screenshots.mjs"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(root), "-c", "user.name=Test", "-c",
+            "user.email=test@example.com", "commit", "-qm", "fixture harness",
+        ],
+        check=True,
+    )
 
 
 def _ui_runtime_requirement():
@@ -1123,6 +1147,185 @@ def test_launch_materialization_preserves_an_occupied_harness(tmp_path, harness_
     assert ready is False and "harness" in detail
     assert destination_harness.read_text() == "operator-authored harness\n"
     assert destination_harness.is_symlink() is (harness_kind == "symlinked")
+
+
+def test_launch_materialization_accepts_modified_harness_with_existing_owner_runtime(
+    tmp_path,
+):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    _launch_repository(source, _OWNER_REPOSITORY_ORIGIN)
+    _launch_repository(destination)
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.write_bytes((source / "scripts" / "screenshots.mjs").read_bytes())
+    _track_harness(destination)
+    destination_harness.write_text("in-branch screenshot harness update\n")
+    status = subprocess.run(
+        [
+            "git", "-C", str(destination), "status", "--porcelain", "--",
+            "scripts/screenshots.mjs",
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    assert status.stdout == " M scripts/screenshots.mjs\n"
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is True and "materialized" in detail
+    assert destination_harness.read_text() == "in-branch screenshot harness update\n"
+
+
+@pytest.mark.parametrize(
+    ("allow_owner_harness_drift", "expected_state"),
+    ((True, "ready"), (False, "drifted")),
+)
+def test_preflight_allows_tracked_edited_harness_only_for_owner(
+    tmp_path, monkeypatch, allow_owner_harness_drift, expected_state,
+):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    _launch_repository(destination)
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.write_bytes((source / "scripts" / "screenshots.mjs").read_bytes())
+    _track_harness(destination)
+    destination_harness.write_text("in-branch screenshot harness update\n")
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which", lambda _name: "/bin/codex"
+    )
+
+    result = preflight(
+        destination, "build", "codex", _ui_runtime_requirement(),
+        allow_owner_harness_drift=allow_owner_harness_drift,
+    )
+
+    assert result.state == expected_state
+
+
+def test_non_materializing_owner_source_preflight_rejects_tracked_harness_edit(
+    tmp_path, monkeypatch,
+):
+    from agentflow.pipeline import _capability_preflight
+
+    source = _ready_ui_launch_source(tmp_path)
+    _launch_repository(source, _OWNER_REPOSITORY_ORIGIN)
+    _track_harness(source)
+    (source / "scripts" / "screenshots.mjs").write_text(
+        "tracked edit in enrolled source checkout\n"
+    )
+    (source / "AGENTS.md").write_text("profile: reviewed\nui-surfaces: frontend/\n")
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which", lambda _name: "/bin/codex"
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.provider_skill_status",
+        lambda *_args: ("ok", "provider skill intact"),
+    )
+    record = Record(
+        identity="ConnorGriffin/agentflow|735|review|-", stage="review", pool="codex",
+        demand=1, source=str(source), capability_root=str(source), capability_context="{}",
+    )
+
+    result = _capability_preflight(record, False)
+
+    assert result is not None and result.state == "drifted"
+    assert any("pinned screenshot harness is drifted" in item for item in result.evidence)
+
+
+def test_launch_materialization_refuses_non_harness_runtime_failure_for_owner(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    _launch_repository(source, _OWNER_REPOSITORY_ORIGIN)
+    _launch_repository(destination)
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.write_text("in-branch screenshot harness update\n")
+    _track_harness(destination)
+    runtime = destination / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    (runtime / "playwright" / "package.json").write_text('{"version":"0.0.0"}\n')
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False
+    assert detail == (
+        "codex launch runtime destination is occupied or incompatible: "
+        "installed Playwright metadata does not pin 1.61.1"
+    )
+
+
+def test_launch_materialization_refuses_untracked_harness_for_owner(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    _launch_repository(source, _OWNER_REPOSITORY_ORIGIN)
+    _launch_repository(destination)
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.write_text("in-branch screenshot harness update\n")
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False
+    assert detail == "codex launch screenshot harness is occupied or drifted"
+    assert destination_harness.read_text() == "in-branch screenshot harness update\n"
+
+
+def test_launch_materialization_refuses_spoofed_destination_owner_origin(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    non_owner_origin = "git@github.com:example/not-agentflow.git"
+    _launch_repository(source, non_owner_origin)
+    _launch_repository(destination, non_owner_origin)
+    subprocess.run(
+        [
+            "git", "-C", str(destination), "remote", "set-url", "origin",
+            _OWNER_REPOSITORY_ORIGIN,
+        ],
+        check=True,
+    )
+    shutil.copytree(source / ".agents", destination / ".agents", symlinks=True)
+    (destination / "scripts").mkdir()
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.write_text("in-branch screenshot harness update\n")
+    _track_harness(destination)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False
+    assert detail == "codex launch screenshot harness is occupied or drifted"
+    assert destination_harness.read_text() == "in-branch screenshot harness update\n"
+
+
+def test_launch_materialization_refuses_symlinked_harness_in_packaged_repository(tmp_path):
+    source = _ready_ui_launch_source(tmp_path)
+    destination = tmp_path / "destination"
+    _launch_repository(source, _OWNER_REPOSITORY_ORIGIN)
+    _launch_repository(destination)
+    (destination / "scripts").mkdir()
+    external = tmp_path / "operator-harness.mjs"
+    external.write_text("in-branch screenshot harness update\n")
+    destination_harness = destination / "scripts" / "screenshots.mjs"
+    destination_harness.symlink_to(external)
+
+    ready, detail = materialize_launch_capabilities(
+        source, destination, "codex", materialize_runtime=True
+    )
+
+    assert ready is False
+    assert detail == "codex launch screenshot harness is occupied or incompatible"
+    assert destination_harness.is_symlink()
 
 
 def test_launch_materialization_installs_a_missing_pinned_harness(tmp_path):

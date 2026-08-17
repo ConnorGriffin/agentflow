@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterable, Literal
 import shutil
 
-from agentflow.provider_skills import provider_skill_status
+from agentflow.provider_skills import _tracked_destination_harness, provider_skill_status
 from agentflow.runtime_contracts import playwright_runtime_status
 
 
@@ -202,7 +202,11 @@ def requirements_for(invocations: Iterable[object], context: dict[str, object]) 
     return _checked_requirements(tuple(requirements))
 
 
-def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[ContractRequirement, ...]) -> CapabilityPreflightResult:
+def preflight(
+    root: str | Path, stage: str, provider: str,
+    requirements: tuple[ContractRequirement, ...],
+    *, allow_owner_harness_drift: bool = False,
+) -> CapabilityPreflightResult:
     """Inspect only pinned project-local destinations; ambient skills never count as evidence."""
     root = Path(root)
     manifest_bytes = files("agentflow").joinpath("capabilities.toml").read_bytes()
@@ -235,6 +239,9 @@ def preflight(root: str | Path, stage: str, provider: str, requirements: tuple[C
                 node_minimum=runtime["node_minimum"],
                 manifest=manifest,
                 provider=provider,
+                allow_harness_drift=(
+                    allow_owner_harness_drift and _tracked_destination_harness(root)
+                ),
             )
             if status != "ok":
                 states.append(status if status in _FAILURE_STATES else "incompatible")

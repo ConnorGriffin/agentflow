@@ -238,8 +238,13 @@ def test_runtime_preflight_reuses_trusted_static_inspection_and_fails_closed(
 ):
     calls = []
 
-    def inspect(root, *, version, node_minimum, manifest=None, provider):
-        calls.append((root, version, node_minimum, manifest, provider))
+    def inspect(
+        root, *, version, node_minimum, manifest=None, provider,
+        allow_harness_drift=False,
+    ):
+        calls.append((
+            root, version, node_minimum, manifest, provider, allow_harness_drift,
+        ))
         return runtime_state, f"pinned browser runtime is {runtime_state}"
 
     monkeypatch.setattr("agentflow.capability_contracts.playwright_runtime_status", inspect)
@@ -257,6 +262,7 @@ def test_runtime_preflight_reuses_trusted_static_inspection_and_fails_closed(
     assert result.ready_fact is None
     assert calls and calls[0][0] == tmp_path
     assert calls[0][4] == "codex"
+    assert calls[0][5] is False
 
 
 def test_runtime_preflight_rejects_a_requirement_outside_the_manifest_pin(
