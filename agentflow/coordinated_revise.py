@@ -187,7 +187,8 @@ def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: 
     )
     prompt = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=review_record.repo, findings=f"- {decision}",
-        surfaces="any user-facing surface", screenshot_entry_note=""),
+        surfaces="any user-facing surface",
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(build_worktree))),
         review_record.builder_effort, parent_pool)
     prior = ReviewState.from_record(review_record)
     if prior is None:

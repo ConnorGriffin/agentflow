@@ -393,10 +393,15 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     return True
 
 
-# Paths whose bytes are pinned by digest in `agentflow/capabilities.toml`. A repo-local edit to
-# one of these bricks the repo's enrollment the moment it merges (#735), so the mutation must be
-# caught here, before merge, not at the next launch.
-PINNED_PATHS = ("scripts/screenshots.mjs",)
+# The one digest-pinned path this pre-merge gate actually checks. `agentflow/capabilities.toml`
+# pins dozens more files by digest — every vendored skill file under each methodology/skill
+# capability's `files = [...]` list — and a repo-local edit to any of those bricks enrollment at
+# the next launch exactly the same way a screenshot-harness edit does. This gate does not cover
+# that wider set yet: it catches only the one path `screenshot_crib.py` licenses a session to add
+# back (`scripts/screenshots.mjs`), because that is the mutation observed in production (#735).
+# Widening it to the rest of the manifest is a separate, deliberately deferred decision — the
+# residual gap is real, not implied covered.
+PRE_MERGE_PINNED_PATHS = ("scripts/screenshots.mjs",)
 _PIN_MANIFEST = "agentflow/capabilities.toml"
 
 PINNED_MUTATION_REASON = (
@@ -414,7 +419,7 @@ def pinned_path_mutation(paths, *, owns_pin_manifest: bool) -> bool:
     a non-owner repo touching the pinned file at all, or the owner touching it without the
     lockstep manifest update — is a gap. The test surface for the pre-merge pin gate."""
     files = set(paths)
-    if not files.intersection(PINNED_PATHS):
+    if not files.intersection(PRE_MERGE_PINNED_PATHS):
         return False
     if owns_pin_manifest and _PIN_MANIFEST in files:
         return False
@@ -438,7 +443,7 @@ def pinned_mutation_gap(repo: str, pr_number: int) -> bool | None:
     content = github.pr_content(repo, pr_number)
     if content is None:
         return None
-    touched = set(content.paths) & set(PINNED_PATHS)
+    touched = set(content.paths) & set(PRE_MERGE_PINNED_PATHS)
     if not touched:
         return False
     if not pinned_path_mutation(content.paths, owns_pin_manifest=_owns_pin_manifest(repo)):

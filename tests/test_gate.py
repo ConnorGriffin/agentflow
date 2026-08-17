@@ -472,6 +472,34 @@ class TestPinnedMutationGate:
         monkeypatch.setattr(gate.github, "pr_facts", lambda *a: None)
         assert pinned_mutation_gap("o/r", 7) is None
 
+    # -- _owns_pin_manifest itself: the sanctioned owner-repo path through the gate above was
+    # previously exercised only through the pure predicate (owns_pin_manifest injected as a bool)
+    # or monkeypatched away entirely. These drive the live function through its own seam.
+
+    def test_owns_pin_manifest_is_true_for_the_packaged_repository(self, monkeypatch):
+        monkeypatch.setattr("agentflow.provider_skills._github_repository",
+                            lambda _root: "o/r")
+        assert gate._owns_pin_manifest("o/r") is True
+        assert gate._owns_pin_manifest("O/R") is True  # case-insensitive, like a GitHub slug
+
+    def test_owns_pin_manifest_is_false_for_another_repository(self, monkeypatch):
+        monkeypatch.setattr("agentflow.provider_skills._github_repository",
+                            lambda _root: "o/r")
+        assert gate._owns_pin_manifest("someone-else/other-repo") is False
+
+    def test_owns_pin_manifest_is_false_when_the_package_repository_is_unreadable(
+            self, monkeypatch):
+        """A non-editable/site-packages install of agentflow has no git checkout behind the
+        running package, so `provider_skills._github_repository` returns "" (`git rev-parse` finds
+        no work tree there). Nothing in the code enforces that agentflow always runs from an
+        editable checkout of its own repository when it evaluates its own PRs, so this is
+        reachable, not a state ruled out by an invariant: under it, even the manifest-owning
+        repo's own lockstep re-pin PR would be treated as a non-owner mutation and parked. This
+        pins today's fail-closed behavior rather than papering over it; changing it is a separate
+        decision."""
+        monkeypatch.setattr("agentflow.provider_skills._github_repository", lambda _root: "")
+        assert gate._owns_pin_manifest("o/r") is False
+
 
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------
 

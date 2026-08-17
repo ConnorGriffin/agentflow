@@ -1293,6 +1293,40 @@ def test_a_declaring_repos_revise_prompt_carries_its_entry_point_a_silent_repos_
         assert carries_entry_point is declares
 
 
+def test_a_declaring_repos_conflict_decision_revise_prompt_carries_its_entry_point(
+        tmp_path, monkeypatch):
+    """The conflict-decision opener (`review.review_axis == "decision"`) is a distinct submission
+    path from the ordinary finding-driven revise above — `pipeline._open_revise_on_blocking_review`
+    routes it through `coordinated_revise.conflict_decision_revise_submission`, not
+    `revise_submission`. It must carry the same declared entry point, or a silent repo's unchanged
+    canonical instruction, exactly like the ordinary path (#735)."""
+    review = Record(
+        identity="o/r|7|review|head|adecision|u1", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", conflict_round=1,
+        builder_lineage="claude", builder_complexity="deep",
+        review_depth="full", review_axis="decision", uncertainty_handoffs=1,
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="head", final_sha="head", decision="keep main")
+
+    for declares in (True, False):
+        workdir = tmp_path / ("declaring" if declares else "silent")
+        workdir.mkdir()
+        text = "# repo\n\nui-surfaces: frontend/\n"
+        if declares:
+            text += "screenshot-entry: scripts/screenshots.local.mjs\n"
+        (workdir / "AGENTS.md").write_text(text)
+        monkeypatch.setattr(coordinated_revise, "_revise_builder_source",
+                            lambda _review, _workdir=str(workdir): (_workdir, 42))
+
+        submission = coordinated_revise.conflict_decision_revise_submission(review, verdict)
+
+        assert submission is not None
+        carries_entry_point = (
+            "This repo declares a local capture entry point" in submission.input_ptr)
+        assert carries_entry_point is declares
+
+
 def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypatch):
     """The PR body may propose Focused, but the resolved decision remains Full and must restart
     the product→standards sequence over the resolved head."""
