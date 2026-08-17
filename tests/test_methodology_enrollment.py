@@ -749,6 +749,36 @@ def test_capability_repair_reproves_the_receipt_on_a_runtime_intact_root(
     assert native_discovery_status(root, "codex")[0] == "ok"
 
 
+def test_capability_repair_refuses_codex_content_drift_before_installing_runtime(
+    tmp_path, monkeypatch
+):
+    import agentflow.enroll as enrollment
+
+    root = _ready_ui_launch_source(tmp_path)
+    receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch)
+    _stub_runnable_node(monkeypatch)
+    runtime = root / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    shutil.rmtree(runtime)
+    receipt = _stale_receipt(root, "codex")
+    receipt_before = receipt.read_bytes()
+    (root / ".agents" / "skills" / "ui-craft" / "SKILL.md").write_text(
+        "operator-authored content drift\n"
+    )
+    installs = []
+    monkeypatch.setattr(
+        enrollment, "_install_ui_runtime",
+        lambda *_args, **_kwargs: installs.append(True) or "installed runtime",
+    )
+
+    result = repair_capability_refusal(root, "codex", _ui_skill_requirements())
+
+    assert result is None
+    assert installs == []
+    assert probes == []
+    assert receipt.read_bytes() == receipt_before
+    assert receipts.joinpath("codex.json").read_bytes() == receipt_before
+
+
 @pytest.mark.parametrize("runtime_fault", ("symlinked", "partial"))
 def test_capability_repair_refuses_a_stale_receipt_on_an_occupied_runtime(
     tmp_path, monkeypatch, runtime_fault
@@ -808,7 +838,8 @@ def test_failed_probe_after_materialization_reports_failure_without_rollback(
     root = _runtime_intact_claude_root(tmp_path)
     _receipts, probes = _stub_discovery_receipts(tmp_path, monkeypatch, probe_returncode=1)
     _stub_runnable_node(monkeypatch)
-    _stale_receipt(root, "claude")
+    receipt = _stale_receipt(root, "claude")
+    receipt_before = receipt.read_bytes()
     monkeypatch.setattr(
         enrollment, "_install_ui_runtime",
         lambda *_args, **_kwargs: pytest.fail("an intact runtime must not be reinstalled"),
@@ -821,6 +852,10 @@ def test_failed_probe_after_materialization_reports_failure_without_rollback(
     assert "did not prove native project skill discovery" in result.detail
     assert probes == ["claude"]
     assert (root / ".claude" / "skills" / "ui-craft" / "SKILL.md").is_file()
+    assert receipt.read_bytes() == receipt_before
+    from agentflow.provider_skills import native_discovery_status
+
+    assert native_discovery_status(root, "claude")[0] == "drifted"
 
 
 @pytest.mark.parametrize("destination_kind", ("drifted", "symlinked"))

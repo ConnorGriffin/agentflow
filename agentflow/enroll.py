@@ -203,21 +203,24 @@ def repair_capability_refusal(root: str | Path, provider: str, requirements):
         def prove_receipt():
             """Re-prove only a missing or verbatim-stale receipt; every other state is preserved."""
             receipt_status, receipt_detail = native_discovery_status(root, provider)
-            if (receipt_status != "missing"
-                    and receipt_detail
-                    != f"{provider} native-discovery receipt is stale or incompatible"):
+            if (
+                receipt_status != "missing"
+                and receipt_detail
+                != f"{provider} native-discovery receipt is stale or incompatible"
+            ):
                 return None
             return prove_native_discovery(root, provider)
 
+        location = ".agents" if provider == "codex" else ".claude"
+        if any(
+            spec["skill"] not in missing
+            and _skill_destination_status(
+                root / location / "skills" / spec["skill"], spec["files"]
+            ) != "ok"
+            for spec in skill_specs
+        ):
+            return None
         if not missing and not runtime_missing:
-            location = ".agents" if provider == "codex" else ".claude"
-            if not skill_specs or any(
-                _skill_destination_status(
-                    root / location / "skills" / spec["skill"], spec["files"]
-                ) != "ok"
-                for spec in skill_specs
-            ):
-                return None
             proof = prove_receipt()
             if proof is None:
                 return None

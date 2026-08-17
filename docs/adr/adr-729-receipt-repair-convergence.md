@@ -35,7 +35,8 @@ provider unavailable) leaves the receipt bytes untouched and runs no probe; a re
 materialized content still reports success naming only what it materialized, and the coordinator's
 re-probe fails closed onto the existing one-repair-then-park path. A probe that fails after a
 successful materialization reports failure with the materialization named; the copied files are
-not rolled back.
+not rolled back. A failed probe preserves any pre-existing receipt bytes (so stale remains stale);
+only a successful probe replaces them, while a previously missing receipt remains missing.
 
 A missing or stale receipt is therefore repairable by re-running the proven probe, and an absent
 pinned destination on a runtime-intact root is repairable — superseding the "invalid discovery

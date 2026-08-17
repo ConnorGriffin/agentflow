@@ -334,7 +334,6 @@ def prove_native_discovery(root: str | Path, provider: str) -> tuple[bool, str]:
             fixture = probe_root / location / "skills" / NATIVE_DISCOVERY_SKILL
             fixture.mkdir(parents=True)
             (fixture / "SKILL.md").write_text(_NATIVE_DISCOVERY_FIXTURE)
-            clear_native_discovery_receipt(checkout, provider)
             result = _run_native_discovery_probe(probe_root, provider)
             output = (result.stdout or "") + (result.stderr or "")
             proven = result.returncode == 0 and native_discovery_output_is_proof(provider, output)
