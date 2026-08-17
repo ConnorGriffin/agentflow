@@ -952,6 +952,8 @@ def test_evidenced_claude_browser_unavailable_parks_with_a_distinct_reason(monke
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: ["web/"])
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
     monkeypatch.setattr("agentflow.gate.ui_verification_required", lambda *_args: True)
 

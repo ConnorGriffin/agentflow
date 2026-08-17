@@ -515,7 +515,7 @@ def test_review_sessions_on_both_tools_carry_the_browser_recovery_exactly_once(t
 
     prompt = REVIEW_PROMPT.format(
         pr=7, issue=3, starting_sha="abc123", acceptance="works",
-        surfaces="`frontend/`")
+        surfaces="`frontend/`", screenshot_entry_note="")
     # Codex can request the narrow escalation; Claude's strict launcher has no equivalent and
     # is explicitly instructed to return an evidenced unavailable result instead of bluffing.
     assert "On Claude, the strict launcher provides no sandbox-escalation mechanism" in prompt
