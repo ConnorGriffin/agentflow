@@ -389,6 +389,8 @@ def test_failed_native_discovery_probe_keeps_the_clocked_refusal(tmp_path, monke
         and "outcome=failed" in repair_lines[0]
         and "did not prove native project skill discovery" in repair_lines[0]
     )
+    # `ready` in a capability-repair line is earned by the re-probe; a failed one never says it.
+    assert "ready" not in repair_lines[0]
     store.close()
 
 
@@ -443,6 +445,176 @@ def _real_capability_root(tmp_path, *, ui: bool) -> Path:
         f"profile: reviewed\nui-surfaces: {surfaces}\n"
     )
     return root
+
+
+def _install_intact_codex_runtime(root):
+    """Install the minimal pinned runtime shape the runtime contract accepts as intact."""
+    runtime = root / ".agents" / "skills" / "drive-local-webapp" / "node_modules"
+    (runtime / "playwright" / "lib").mkdir(parents=True)
+    (runtime / "playwright" / "package.json").write_text('{"version":"1.61.1"}\n')
+    (runtime / "playwright" / "lib" / "program.js").write_text('module.exports = "1.61.1";\n')
+    (runtime / "playwright" / "cli.js").write_text('console.log(require("./lib/program"));\n')
+    (runtime / ".bin").mkdir()
+    (runtime / ".bin" / "playwright").symlink_to("../playwright/cli.js")
+    return runtime
+
+
+def _stub_receipt_convergence(tmp_path, monkeypatch, *, stub_repository_key=True):
+    """Stub every discovery seam except ``native_discovery_status`` — the thing under test."""
+    if stub_repository_key:
+        receipts = tmp_path / "receipts"
+        monkeypatch.setattr(
+            "agentflow.provider_skills._repository_key",
+            lambda _root: ("repo-key", receipts),
+        )
+    monkeypatch.setattr(
+        "agentflow.provider_skills._provider_fingerprint",
+        lambda provider: (f"/providers/{provider}", f"{provider}-sha"),
+    )
+    monkeypatch.setattr(
+        "agentflow.capability_contracts.shutil.which", lambda _name: "/bin/provider"
+    )
+    monkeypatch.setattr(
+        "agentflow.runtime_contracts._run_command",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="v22.0.0\n"),
+    )
+    probes = []
+    monkeypatch.setattr(
+        "agentflow.provider_skills._run_native_discovery_probe",
+        lambda _root, provider: probes.append(provider) or SimpleNamespace(
+            returncode=0, stdout=NATIVE_DISCOVERY_MARKER, stderr=""),
+    )
+    from agentflow import pipeline
+
+    return pipeline._capability_preflight, pipeline._repair_capability_refusal, probes
+
+
+@pytest.mark.parametrize("receipt_state", ("stale", "missing"))
+def test_stale_receipt_on_a_runtime_intact_root_converges_in_one_cycle(
+    tmp_path, monkeypatch, receipt_state
+):
+    capability, repair, probes = _stub_receipt_convergence(tmp_path, monkeypatch)
+    root = _real_capability_root(tmp_path, ui=True)
+    _install_intact_codex_runtime(root)
+    if receipt_state == "stale":
+        receipt = record_native_discovery_receipt(root, "codex")
+        payload = json.loads(receipt.read_text())
+        payload["manifest_sha256"] = "stale"
+        receipt.write_text(json.dumps(payload))
+    lines = []
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, log=lines.append
+    )
+    _point_record_at_capability_root(store, identity, root, ui=True)
+
+    coordinator.cycle("codex")
+
+    admitted = store.record_of(identity)
+    assert admitted is not None and admitted.state == RUNNING
+    assert launcher.identities == [identity]
+    assert probes == ["codex"]
+    assert native_discovery_status(root, "codex")[0] == "ok"
+    assert any(
+        f"capability repair root={root}" in line
+        and "provider=codex" in line
+        and "outcome=ready" in line
+        and "native-discovery receipt" in line
+        for line in lines
+    )
+    store.close()
+
+
+def test_content_drift_preserves_a_stale_receipt_and_escalates_to_a_human(
+    tmp_path, monkeypatch
+):
+    capability, repair, probes = _stub_receipt_convergence(tmp_path, monkeypatch)
+    root = _real_capability_root(tmp_path, ui=True)
+    _install_intact_codex_runtime(root)
+    receipt = record_native_discovery_receipt(root, "codex")
+    payload = json.loads(receipt.read_text())
+    payload["manifest_sha256"] = "stale"
+    receipt.write_text(json.dumps(payload))
+    receipt_before = receipt.read_bytes()
+    (root / ".agents" / "skills" / "ui-craft" / "SKILL.md").write_text(
+        "operator-authored content drift\n"
+    )
+    lines = []
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, log=lines.append
+    )
+    _point_record_at_capability_root(store, identity, root, ui=True)
+
+    coordinator.cycle("codex", now=0)
+    for now in range(5 * 60, STALL_PARK_AFTER + 1, 5 * 60):
+        coordinator.cycle("codex", now=now)
+    outcomes = coordinator.cycle("codex", now=STALL_PARK_AFTER + 5 * 60)
+
+    held = store.record_of(identity)
+    assert held is not None and held.state == "held" and held.handoff_proof
+    assert outcomes == [StageOutcome(identity, "build", "held", held.handoff_kind)]
+    assert launcher.identities == []
+    assert probes == []
+    assert receipt.read_bytes() == receipt_before
+    assert native_discovery_status(root, "codex")[0] == "drifted"
+    assert all(
+        "outcome=ready" not in line for line in lines if "capability repair" in line
+    )
+    store.close()
+
+
+def test_receipt_repair_at_the_enrolled_root_admits_its_launch_worktree(
+    tmp_path, monkeypatch
+):
+    # Fleet topology: the record's launch root is a worktree of the enrolled capability
+    # root, so both resolve to one receipt file under the enrolled root's git common dir.
+    # ``_repository_key`` stays real — the sharing is the mechanism under test.
+    capability, repair, probes = _stub_receipt_convergence(
+        tmp_path, monkeypatch, stub_repository_key=False
+    )
+    main = _real_capability_root(tmp_path, ui=True)
+    _install_intact_codex_runtime(main)
+    import os
+    import subprocess
+
+    def git(*argv):
+        subprocess.run(
+            ["git", "-C", str(main), *argv], check=True, capture_output=True,
+            env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                 "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+        )
+
+    git("init", "-q")
+    git("add", "-A")
+    git("commit", "-q", "-m", "enrolled capability root")
+    worktree = tmp_path / "launch-worktree"
+    git("worktree", "add", "--detach", "-q", str(worktree))
+    receipt = record_native_discovery_receipt(main, "codex")
+    assert receipt == main / ".git" / "agentflow-capability-receipts" / "codex.json"
+    payload = json.loads(receipt.read_text())
+    payload["manifest_sha256"] = "stale"
+    receipt.write_text(json.dumps(payload))
+    lines = []
+    coordinator, store, launcher, _adapter, identity = _coordinator(
+        tmp_path, capability, repair=repair, log=lines.append
+    )
+    record = store.record_of(identity)
+    record.source = str(worktree)
+    record.capability_root = str(main)
+    record.capability_context = json.dumps({"ui": True})
+    assert store.upsert(record)
+
+    coordinator.cycle("codex")
+
+    from agentflow.provider_skills import _manifest_fingerprint
+
+    admitted = store.record_of(identity)
+    assert admitted is not None and admitted.state == RUNNING
+    assert launcher.identities == [identity]
+    assert probes == ["codex"]
+    # The shared file — not a per-root copy — carries the fresh manifest fingerprint.
+    assert json.loads(receipt.read_text())["manifest_sha256"] == _manifest_fingerprint()
+    assert not (worktree / ".agentflow" / "capability-receipts").exists()
+    store.close()
 
 
 def _use_real_capability_admission(monkeypatch):

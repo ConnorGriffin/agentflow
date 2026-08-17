@@ -188,24 +188,43 @@ def repair_capability_refusal(root: str | Path, provider: str, requirements):
                 return None
             runtime = drive_root / "node_modules"
             if runtime.exists() or runtime.is_symlink():
-                return None
-            runtime_missing = True
-        if not missing and not runtime_missing:
-            location = ".agents" if provider == "codex" else ".claude"
-            if not skill_specs or any(
-                _skill_destination_status(
-                    root / location / "skills" / spec["skill"], spec["files"]
-                ) != "ok"
-                for spec in skill_specs
+                playwright = manifest["playwright"]
+                status, _detail = _runtime_status(
+                    root, version=playwright["version"],
+                    node_minimum=playwright["node_minimum"],
+                    manifest=manifest, provider=provider,
+                )
+                if status != "ok":
+                    return None
+            else:
+                runtime_missing = True
+        from agentflow.provider_skills import native_discovery_status, prove_native_discovery
+
+        def prove_receipt():
+            """Re-prove only a missing or verbatim-stale receipt; every other state is preserved."""
+            receipt_status, receipt_detail = native_discovery_status(root, provider)
+            if (
+                receipt_status != "missing"
+                and receipt_detail
+                != f"{provider} native-discovery receipt is stale or incompatible"
             ):
                 return None
-            from agentflow.provider_skills import native_discovery_status, prove_native_discovery
+            return prove_native_discovery(root, provider)
 
-            receipt_status, detail = native_discovery_status(root, provider)
-            if (receipt_status != "missing"
-                    and detail != f"{provider} native-discovery receipt is stale or incompatible"):
+        location = ".agents" if provider == "codex" else ".claude"
+        if any(
+            spec["skill"] not in missing
+            and _skill_destination_status(
+                root / location / "skills" / spec["skill"], spec["files"]
+            ) != "ok"
+            for spec in skill_specs
+        ):
+            return None
+        if not missing and not runtime_missing:
+            proof = prove_receipt()
+            if proof is None:
                 return None
-            repaired, probe_detail = prove_native_discovery(root, provider)
+            repaired, probe_detail = proof
             return CapabilityRepairResult(repaired, probe_detail)
         created_skills = [
             (root / ".claude" / "skills" / spec["skill"], spec["files"])
@@ -283,6 +302,12 @@ def repair_capability_refusal(root: str | Path, provider: str, requirements):
             repaired.append("materialized absent pinned capability destinations for Claude")
         if runtime_missing:
             repaired.append("installed pinned Playwright runtime")
+        proof = prove_receipt()
+        if proof is not None:
+            proven, probe_detail = proof
+            if not proven:
+                return CapabilityRepairResult(False, "; ".join(repaired + [probe_detail]))
+            repaired.append(probe_detail)
         return CapabilityRepairResult(True, "; ".join(repaired))
 
 

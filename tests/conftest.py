@@ -83,6 +83,33 @@ def _no_real_gh(request, monkeypatch):
     monkeypatch.setattr(subprocess, "run", guarded)
 
 
+class _RealDiscoveryProbe(BaseException):
+    """A test reached an unstubbed native-discovery probe, which would spawn a real provider
+    session (up to 300 s of real quota). Not an ``Exception`` for the same reason as
+    :class:`_RealGhProcess`."""
+
+
+@pytest.fixture(autouse=True)
+def _no_real_discovery_probe(request, monkeypatch):
+    """Fail any test that lets the real native-discovery probe spawn a provider session.
+
+    Repair now proves discovery as a tail step of every successful materialization, so a test
+    that exercises repair without stubbing ``provider_skills._run_native_discovery_probe`` can
+    reach a live ``claude``/``codex`` launch on a machine that has the binary — and silently
+    take a different branch on CI where it doesn't. A test that wants the probe stubs the seam
+    itself with ``monkeypatch.setattr``, which overrides this guard.
+    """
+    from agentflow import provider_skills
+
+    def probe(_root, provider):
+        raise _RealDiscoveryProbe(
+            f"{request.node.nodeid} reached an unstubbed native-discovery probe for "
+            f"{provider} — stub agentflow.provider_skills._run_native_discovery_probe."
+        )
+
+    monkeypatch.setattr(provider_skills, "_run_native_discovery_probe", probe)
+
+
 def _isolate_ratchet_defaults(monkeypatch, path):
     """``ratchet.record``, ``record_once``, and ``status`` default their ``path`` argument to
     the module-level ``STATE`` constant captured when the function was defined, so patching

@@ -138,13 +138,6 @@ def _receipt_path(root: Path, provider: str) -> tuple[str, Path]:
     return repository, directory / f"{provider}.json"
 
 
-def clear_native_discovery_receipt(root: str | Path, provider: str) -> None:
-    """Invalidate an earlier proof before a fresh positive probe runs."""
-    _repository, path = _receipt_path(Path(root), provider)
-    if path.is_file() and not path.is_symlink():
-        path.unlink()
-
-
 def record_native_discovery_receipt(root: str | Path, provider: str) -> Path:
     """Record a receipt only after the caller has validated the native positive probe output."""
     checkout = Path(root)
@@ -334,7 +327,6 @@ def prove_native_discovery(root: str | Path, provider: str) -> tuple[bool, str]:
             fixture = probe_root / location / "skills" / NATIVE_DISCOVERY_SKILL
             fixture.mkdir(parents=True)
             (fixture / "SKILL.md").write_text(_NATIVE_DISCOVERY_FIXTURE)
-            clear_native_discovery_receipt(checkout, provider)
             result = _run_native_discovery_probe(probe_root, provider)
             output = (result.stdout or "") + (result.stderr or "")
             proven = result.returncode == 0 and native_discovery_output_is_proof(provider, output)
@@ -714,6 +706,8 @@ def materialize_launch_capabilities(
         tree_status, detail = runtime_tree_status(destination_runtime)
         if tree_status != "ok":
             return failed(f"{provider} copied Playwright runtime is incompatible: {detail}")
+    # The audit line reports only what was copied: readiness belongs to the preflight that
+    # runs against the launch root afterward, which this function never observes.
     detail = f"materialized missing {provider} capabilities into the launch root"
-    audit("ready", detail)
+    audit("materialized", f"copied missing {provider} capabilities into the launch root")
     return True, detail

@@ -44,8 +44,10 @@ one named Capability repair through enrollment's locked seam: absent pinned Clau
 may be materialized from intact `.agents` sources, and an entirely absent provider-local Playwright
 runtime may be installed from its committed lockfile. The result is re-probed once in that cycle;
 only a ready re-probe admits. A failed unchanged repair is durably fingerprinted so later clock
-observations do not repeat it. Drift, symlinks, partial or occupied runtime trees, invalid discovery
-receipts, and unknown content are never rewritten and continue toward human escalation. A
+observations do not repeat it. Drift, symlinks, partial or occupied runtime trees, and unknown
+content are never rewritten and continue toward human escalation. Missing and verbatim-stale
+discovery receipts are since [ADR 729](adr-729-receipt-repair-convergence.md) re-proven by the
+discovery probe as a tail step of the same repair call — unreadable receipts still are not. A
 non-mutating source/provider preflight remains before stage preparation. After preparation copies
 missing pinned contracts from the enrolled checkout, a second preflight verifies `record.source` —
 including retained Review and Revise worktrees — before permits, attempts, or provider launch.
