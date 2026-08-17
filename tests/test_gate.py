@@ -16,6 +16,7 @@ from agentflow import github
 from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                             has_committed_evidence, has_image_evidence,
                             maintainer_comment, maintainer_comment_id, reply_pending,
+                            pinned_mutation_gap, pinned_path_mutation,
                             respond_reply_disclaimer, review_resume_passes, squash_merge,
                             touches_ui_surface, ui_evidence_gap)
 from agentflow.coordinator.record import Record
@@ -367,6 +368,50 @@ class TestBackfilledSurfacesActuallyGate:
             raise AssertionError("a headless repo must not be read for UI evidence")
         monkeypatch.setattr(gate.github, "pr_content", explode)
         assert ui_evidence_gap("o/r", 476, []) is False
+
+
+class TestPinnedMutationGate:
+    # Issue #735: a merged edit to a digest-pinned file bricks the repo's own enrollment, so the
+    # mutation must fail a blocking check before merge. The one sanctioned way through is the
+    # owning repo's deliberate re-pin: the pinned bytes and the recorded digest move in one PR.
+
+    def test_touching_the_pinned_harness_in_an_enrolled_repo_is_a_gap(self):
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs", "src/app.py"], owns_pin_manifest=False) is True
+
+    def test_a_repin_shaped_pr_outside_the_owner_repo_is_still_a_gap(self):
+        # Only the manifest's own repo may re-pin; a look-alike manifest path elsewhere is inert.
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs", "agentflow/capabilities.toml"],
+            owns_pin_manifest=False) is True
+
+    def test_the_owners_lockstep_repin_passes(self):
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs", "agentflow/capabilities.toml"],
+            owns_pin_manifest=True) is False
+
+    def test_the_owner_moving_pinned_bytes_without_the_digest_is_a_gap(self):
+        # Half a re-pin is a broken enrollment for every enrolled repo: block it too.
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs"], owns_pin_manifest=True) is True
+
+    def test_a_repo_local_extension_never_trips_the_gate(self):
+        # The sanctioned seam: the extension file and its declaration, pinned bytes untouched.
+        assert pinned_path_mutation(
+            ["scripts/screenshots.local.mjs", "AGENTS.md"], owns_pin_manifest=False) is False
+
+    def test_an_unreadable_pr_defers_rather_than_parks(self, monkeypatch):
+        # None defers settlement to a re-drive (like the head check gate) — a transient gh
+        # failure must neither park the PR nor let it through.
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: None)
+        assert pinned_mutation_gap("o/r", 7) is None
+
+    def test_the_live_gap_reads_the_prs_changed_files(self, monkeypatch):
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        assert pinned_mutation_gap("o/r", 7) is True
 
 
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------

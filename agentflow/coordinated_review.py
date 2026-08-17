@@ -1091,9 +1091,9 @@ def post_repair_notice(record, verdict) -> str | None:
 def _settle_review(record) -> str | None:
     """Consume a parsed exact-head verdict through the established repository merge policy."""
     from agentflow import ratchet
-    from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
-                                post_clean_review_summary, reply_pending, squash_merge,
-                                ui_evidence_gap, ui_verification_required)
+    from agentflow.gate import (PINNED_MUTATION_REASON, MergeDecision, ci_is_green, decide_merge,
+                                pinned_mutation_gap, post_clean_review_summary, reply_pending,
+                                squash_merge, ui_evidence_gap, ui_verification_required)
 
     facts = review_source_facts(record)
     if facts is None:
@@ -1145,6 +1145,19 @@ def _settle_review(record) -> str | None:
         return _park_review_settlement(
             record, verdict, workdir, pr, reason="current head author is unreadable",
             autonomous=autonomous)
+
+    # The pin gate (#735): a PR that mutates a digest-pinned path can never settle clean —
+    # merged, it bricks the repo's own enrollment. Parked before any merge arm, with the one
+    # sanctioned way through (the owner repo's lockstep re-pin) decided inside the gate.
+    pin_gap = pinned_mutation_gap(record.repo, pr)
+    if pin_gap is None:
+        return None   # PR files unreadable — defer and re-drive, like the head check gate
+    if pin_gap:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=PINNED_MUTATION_REASON,
+            autonomous=autonomous, checks=verdict.checks,
+            missing="The PR changes a fleet-pinned file in place instead of extending it "
+                    "through the sanctioned repo-local seam.")
 
     surfaces = ui_surfaces(workdir)
     ui_gap = ui_evidence_gap(record.repo, pr, surfaces)

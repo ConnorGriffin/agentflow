@@ -133,3 +133,41 @@ continues without it.
 GitHub queue labels and pull-request CI are not mutated by this local command.
 Enrollment prints that unverified step explicitly; confirm it before starting
 the daemon.
+
+## Extending the screenshot harness locally
+
+The pinned `scripts/screenshots.mjs` is never edited in place: its SHA-256 is
+recorded in `agentflow/capabilities.toml`, and a repo whose copy drifts from
+that pin stops enrolling. A repo that needs capture behavior the shared harness
+does not provide adds it through the sanctioned repo-local seam (ADR 735):
+
+- Keep the extra behavior in a thin extension file — conventionally
+  `scripts/screenshots.local.mjs` — that imports the pinned harness's exported
+  entry points (`main`, `runConfig`, `captureShots`) and passes its local hooks
+  (for example a `serve` stub for a vendor bundle, or an `applyTheme` override).
+  `tests/fixtures/screenshots-local-extension.mjs` is the reference shape.
+- Declare it with a `screenshot-entry: scripts/screenshots.local.mjs` line in
+  the repo's `AGENTS.md`/`CLAUDE.md`. Build, revise, mockup, respond, and review
+  sessions in that repo are then told to capture through the declared entry
+  point; a repo declaring nothing keeps the unchanged canonical instruction.
+- Enrollment upgrades a harness that still holds the current or a recorded
+  previous pin, and refuses — with the recovery path named — to overwrite one
+  carrying repo-local edits, so a local fork's work is never silently destroyed.
+- A pull request that mutates a pinned path in an enrolled repo fails a blocking
+  pre-merge check with the same redirection to this seam.
+
+### Deliberately re-pinning the harness (owner repo only)
+
+Changing the shared harness itself happens only in the repository that ships
+the manifest, and always in lockstep within one pull request:
+
+1. edit `scripts/screenshots.mjs`;
+2. update the `screenshot-harness` capability's `sha256` in
+   `agentflow/capabilities.toml` to the new file digest, and append the
+   superseded digest to `known_old_sha256` so already-enrolled repos upgrade
+   cleanly instead of all failing at once.
+
+The pre-merge check recognizes exactly this lockstep shape as the sanctioned
+path through; a harness edit without the matching manifest update is blocked
+even in the owner repo, because half a re-pin breaks enrollment for every
+enrolled repo.

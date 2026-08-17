@@ -392,6 +392,56 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
     return True
 
 
+# Paths whose bytes are pinned by digest in `agentflow/capabilities.toml`. A repo-local edit to
+# one of these bricks the repo's enrollment the moment it merges (#735), so the mutation must be
+# caught here, before merge, not at the next launch.
+PINNED_PATHS = ("scripts/screenshots.mjs",)
+_PIN_MANIFEST = "agentflow/capabilities.toml"
+
+PINNED_MUTATION_REASON = (
+    "changes the shared screenshot harness in place — repo-local capture behavior belongs in a "
+    "small local extension that wraps the shared harness (declared with `screenshot-entry:`), so "
+    "the shared file's recorded fingerprint stays intact; merged as-is this would break the "
+    "repo's fleet enrollment (#735)")
+
+
+def pinned_path_mutation(paths, *, owns_pin_manifest: bool) -> bool:
+    """Pure: does this changed-file set mutate a pinned path without the sanctioned way through?
+
+    The one sanctioned path is the harness's own repository re-pinning deliberately: the pinned
+    bytes and the recorded digest in the manifest move in the same PR (#735). Any other mutation —
+    a non-owner repo touching the pinned file at all, or the owner touching it without the
+    lockstep manifest update — is a gap. The test surface for the pre-merge pin gate."""
+    files = set(paths)
+    if not files.intersection(PINNED_PATHS):
+        return False
+    if owns_pin_manifest and _PIN_MANIFEST in files:
+        return False
+    return True
+
+
+def pinned_mutation_gap(repo: str, pr_number: int) -> bool | None:
+    """Live: does this PR mutate a pinned path without the owner's lockstep re-pin?
+
+    ``None`` when the PR's files can't be read — the caller defers settlement and re-drives,
+    the same recovery the head check gate uses, rather than parking on a transient read."""
+    content = github.pr_content(repo, pr_number)
+    if content is None:
+        return None
+    return pinned_path_mutation(content.paths, owns_pin_manifest=_owns_pin_manifest(repo))
+
+
+def _owns_pin_manifest(repo: str) -> bool:
+    """Whether ``repo`` is the repository the pin manifest ships from — the only repo whose PRs
+    may move pinned bytes, and only together with the recorded digest."""
+    from importlib.resources import files
+    from pathlib import Path
+
+    from agentflow.provider_skills import _github_repository
+    package_repository = _github_repository(Path(str(files("agentflow"))).parent)
+    return bool(package_repository) and repo.casefold() == package_repository
+
+
 # --- gh actions ----------------------------------------------------------------
 def ci_is_green(repo: str, pr_number: int, *,
                 timeout: int | None = None,
