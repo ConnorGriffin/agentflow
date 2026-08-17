@@ -18,6 +18,12 @@ ui-surfaces: agentflow/webui/src/
   the snapshot the daemon publishes — it never queries GitHub (ADR 0026). **Any UI
   change goes through `/ui-craft lock` first** (charter gate), and must honor
   `PRODUCT.md`/`DESIGN.md` (no side-stripe accents, etc.).
+- **Driving the pipeline by hand needs the daemon's env.** `AGENTFLOW_PERMIT_BUDGET=25` lives
+  only in the launchd plist, so a by-hand `build_issue` / `review_pr` reads the packaged default
+  of 5 and reports `no pool has headroom` against a budget the daemon is not using. Prefix
+  `AGENTFLOW_PERMIT_BUDGET=25` on by-hand invocations. A by-hand verb reporting Codex as
+  `capacity helper not configured` is the same launchd-only blind spot (#727), not a real
+  misconfiguration — never diagnose Codex capacity from it.
 - **No hazards:** no real data / PHI, no live credentials. (The daemon *spawns* agent
   sessions, but a build session working on this repo doesn't need to.)
 - **Why `reviewed`:** changes to the merge machinery itself are correctness-sensitive —
