@@ -185,9 +185,9 @@ separability: slice-bearing
 
 
 def test_rate_card_estimates_from_the_price_snapshot_and_resolves_both_name_forms():
-    # Terra: $2.50/$15 per million input/output (provenance.price_snapshot).
+    # Terra: $2/$12 per million input/output (provenance.price_snapshot).
     estimate = routing.estimate_cost_usd("terra", input_tokens=300, output_tokens=60)
-    assert estimate == pytest.approx(300 * 2.5 / 1_000_000 + 60 * 15 / 1_000_000)
+    assert estimate == pytest.approx(300 * 2 / 1_000_000 + 60 * 12 / 1_000_000)
     # The provider/CLI id resolves to the same card entry as the internal name.
     assert routing.estimate_cost_usd("gpt-5.6-terra", input_tokens=300, output_tokens=60) \
         == estimate
@@ -199,14 +199,49 @@ def test_rate_card_estimates_from_the_price_snapshot_and_resolves_both_name_form
     # With no output_tokens fact at all, reasoning_output_tokens is the fallback output figure.
     reasoning_only = routing.estimate_cost_usd(
         "terra", input_tokens=300, reasoning_output_tokens=40)
-    assert reasoning_only == pytest.approx(300 * 2.5 / 1_000_000 + 40 * 15 / 1_000_000)
+    assert reasoning_only == pytest.approx(300 * 2 / 1_000_000 + 40 * 12 / 1_000_000)
+
+
+def test_cached_reads_are_priced_at_the_cards_cached_rate(tmp_path):
+    # ADR 750: cached reads are charged at cached_input ($0.20/M for terra), not the fresh rate,
+    # and not dropped. They dominate real attempts, so this is most of the bill.
+    priced = routing.estimate_cost_usd(
+        "terra", input_tokens=300, output_tokens=60, cached_input_tokens=500_000)
+    fresh_only = routing.estimate_cost_usd("terra", input_tokens=300, output_tokens=60)
+    assert priced == pytest.approx(fresh_only + 500_000 * 0.2 / 1_000_000)
+    assert routing.prices_cached_reads("terra") and routing.prices_cached_reads("gpt-5.6-terra")
+    # A cached-read fact alone is a real fact: it prices without any other token field.
+    assert routing.estimate_cost_usd("terra", cached_input_tokens=1_000_000) \
+        == pytest.approx(0.2)
+
+
+def test_a_model_without_a_cached_rate_omits_cached_reads_rather_than_guessing(tmp_path):
+    # The fail-closed path #531 established survives for any model priced before its cached
+    # rate is known: cached reads stay out of the estimate and the caller discloses them.
+    import agentflow.routing as routing_module
+    from agentflow.routing import CapabilityRouting
+
+    source = Path(routing_module.__file__).with_name("model-routing.json")
+    data = json.loads(source.read_text())
+    del data["rate_card"]["terra"]["cached_input"]
+    uncached = tmp_path / "routing.json"
+    uncached.write_text(json.dumps(data))
+    table = CapabilityRouting.from_path(uncached)
+
+    assert table.prices_cached_reads("terra") is False
+    with_cached = table.estimate_cost_usd(
+        "terra", input_tokens=300, output_tokens=60, cached_input_tokens=500_000)
+    assert with_cached == pytest.approx(table.estimate_cost_usd(
+        "terra", input_tokens=300, output_tokens=60))
 
 
 def test_rate_card_never_guesses_an_unknown_model_or_a_fully_absent_fact():
     assert routing.estimate_cost_usd("nonexistent-model", input_tokens=100) is None
     assert routing.provider_for("nonexistent-model") is None
+    assert routing.prices_cached_reads("nonexistent-model") is False
     # fable (session-lead) has no rate-card entry — no price snapshot names one.
     assert routing.estimate_cost_usd("fable", input_tokens=100) is None
+    assert routing.estimate_cost_usd("fable", cached_input_tokens=100) is None
     # No token fact at all is not the same as zero tokens: it must not be guessed either.
     assert routing.estimate_cost_usd("terra") is None
 

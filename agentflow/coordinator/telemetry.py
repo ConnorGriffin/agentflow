@@ -703,9 +703,13 @@ def _priced_dollars(model: str, tokens_in, tokens_out, tokens_reasoning, billed,
     from agentflow.routing import routing
     estimate = routing.estimate_cost_usd(
         model, input_tokens=tokens_in, output_tokens=tokens_out,
-        reasoning_output_tokens=tokens_reasoning)
-    return (PricedDollars(estimate, True, cached_input_tokens or 0)
-            if estimate is not None else PricedDollars(None, False))
+        reasoning_output_tokens=tokens_reasoning, cached_input_tokens=cached_input_tokens)
+    if estimate is None:
+        return PricedDollars(None, False)
+    # Priced cached reads are in the estimate; only a model the card gives no cached rate
+    # still carries the disclosure (ADR 750).
+    unpriced = 0 if routing.prices_cached_reads(model) else (cached_input_tokens or 0)
+    return PricedDollars(estimate, True, unpriced)
 
 
 def spend_report(store_path: Path | str, *, start: int | float | date | datetime,
@@ -717,7 +721,8 @@ def spend_report(store_path: Path | str, *, start: int | float | date | datetime
     dispatched model, keeping token-only rows even when no dollar equivalent exists.
 
     A row whose dollars are not provider-billed is priced at report time from the routing rate
-    card (fresh input + output/reasoning-output tokens; cached reads excluded) and flagged
+    card (fresh input + cached reads + output/reasoning-output tokens; cached reads only for a
+    model the card gives a cached rate, else disclosed as unpriced) and flagged
     ``estimated`` — a total mixing billed and estimated figures is itself estimated. Stored
     telemetry entries are only read here, never rewritten (frozen decision 4).
     """
