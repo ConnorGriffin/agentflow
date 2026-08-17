@@ -1272,7 +1272,7 @@ def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypa
         github, "open_pr_for_branch",
         lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "resolved"))
     monkeypatch.setattr(
-        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none", ""))
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr(pipeline, "pick_reviewer", lambda *_args, **_kwargs: "codex")
     submitted = []
@@ -1303,7 +1303,7 @@ def test_completed_revise_selects_against_its_recorded_head_author(monkeypatch):
         github, "open_pr_for_branch",
         lambda *_args: github.PrRow(42, "agentflow/codex/issue-7-fix", "rebased"))
     monkeypatch.setattr(
-        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none", ""))
     monkeypatch.setattr(
         coordinated_review, "_review_assignment_facts",
         lambda *_args, **_kwargs: (ReviewAssignment(reason="one journey"), ()))
@@ -1334,7 +1334,7 @@ def test_completed_revise_without_a_known_head_author_parks_for_a_maintainer(mon
         github, "open_pr_for_branch",
         lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "rebased"))
     monkeypatch.setattr(
-        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none", ""))
     parked = []
     coord = SimpleNamespace(
         submit_stage=lambda _submission: pytest.fail("unknown authors must not open a review"),

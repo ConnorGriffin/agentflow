@@ -107,9 +107,9 @@ def test_ready_fact_pins_the_public_digest_vector_and_content_free_shape(
     )
 
     assert result.ready_fact is not None
-    assert result.ready_fact.manifest_digest == "aae288b0d75f57505192057245e1bd20f227c0ba4a397c0a8abd575d69608fc2"
-    assert result.ready_fact.capability_digest == "f0d527b2dc7d44acef7b6e0cc60f51ada03c4bc15dd192e208fb6a3718ab28b0"
-    assert result.ready_fact.capability_id == "capability-ready-v1:f0d527b2dc7d44acef7b6e0cc60f51ada03c4bc15dd192e208fb6a3718ab28b0"
+    assert result.ready_fact.manifest_digest == "324b5a79966790ebd0da7267b57ebca9434f344af39b1fbe9db23ca6be9df31b"
+    assert result.ready_fact.capability_digest == "e72f3769562b0d38cafebc5842f3776864fda2148d7067b4cea65feecc64bfa3"
+    assert result.ready_fact.capability_id == "capability-ready-v1:e72f3769562b0d38cafebc5842f3776864fda2148d7067b4cea65feecc64bfa3"
     assert [field.name for field in fields(CapabilityReadyFact)] == [
         "schema", "status", "stage", "provider", "manifest_digest", "contracts",
         "capability_digest", "capability_id",

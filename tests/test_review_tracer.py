@@ -886,6 +886,8 @@ def test_clean_reviewed_settlement_posts_one_summary_and_returns_durable_proof(m
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
 
     monkeypatch.setattr(
         "agentflow.gate.post_clean_review_summary",
@@ -985,6 +987,8 @@ def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeyp
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
     monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: [])
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.gate.ci_is_green", lambda _repo, _pr, **_kwargs: True)
     monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
     monkeypatch.setattr("agentflow.gate.reply_pending", lambda _comments: False)
@@ -1061,6 +1065,8 @@ def test_merged_review_settlement_stays_unsettled_when_build_claim_release_fails
     monkeypatch.setattr(coordinated_review, "_review_pr_facts",
                         lambda _r: {"head": "sha-a", "state": pr_state})
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile",
                         lambda _workdir: "autonomous")
     monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: [])
@@ -1104,6 +1110,8 @@ def test_review_authored_fix_settles_only_at_the_final_reviewed_head(monkeypatch
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "autonomous")
     monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: [])
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.coordinated_review._finish_review", lambda *args, **kwargs: None)
     monkeypatch.setattr("agentflow.gate.ci_is_green", lambda *args, **kwargs: True)
     monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
@@ -1262,6 +1270,8 @@ def test_review_settlement_releases_claim_through_public_coordinator_seam(make_c
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.notify.notify", lambda *args, **kwargs: True)
     monkeypatch.setattr("agentflow.github.commit_head_checks",
                         lambda _repo, sha: github.HeadChecks(sha=sha))
@@ -1452,6 +1462,8 @@ def test_forced_same_tool_autonomous_review_posts_summary_without_waiting_for_ci
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=c["body"], created_at="")
                                             for c in comments])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.gate.ci_is_green",
                         lambda *args, **kwargs: pytest.fail("forced same-tool review skips CI merge"))
     monkeypatch.setattr("agentflow.ratchet.record_once", lambda *args, **kwargs: None)
