@@ -28,8 +28,9 @@ from agentflow.balancer import BUILD_POOLS
 from agentflow.prompts import stage_prompt_spec
 from agentflow.pool_control import POOLS, pool_paused
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX
-from agentflow.repo_facts import surface_declaration, surfaces_phrase
+from agentflow.repo_facts import screenshot_entry, surface_declaration, surfaces_phrase
 from agentflow.routing import routing
+from agentflow.screenshot_crib import screenshot_entry_note
 from agentflow.runner import _run, codex_spent_at_render
 from agentflow.stage_worktree import worktree_owns_head
 from agentflow.worktree_ref import WorktreeKind, WorktreeRef, source_facts
@@ -72,7 +73,9 @@ def survivor_conflict_revise_submission(cfg, *, issue: int, slug: str, builder_t
     ui = bool(declaration.surfaces)
     brief = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=cfg.repo, findings=f"- {_CONFLICT_REVISE_FINDING}",
-        surfaces=surfaces_phrase(declaration)), None, parent_pool)
+        surfaces=surfaces_phrase(declaration),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(cfg.workdir))),
+        None, parent_pool)
     return Submission(
         repo=cfg.repo, subject=str(issue), stage="revise", target=head_sha,
         subject_revision=head_sha,
@@ -99,8 +102,8 @@ def _revise_builder_source(review_record):
     return build.path, review.number
 
 
-def revise_submission(review_record, complexity, findings="", *, surfaces="", target_sha="",
-                      parent_pool: str = "claude"):
+def revise_submission(review_record, complexity, findings="", *, surfaces="",
+                      screenshot_entry_note="", target_sha="", parent_pool: str = "claude"):
     """Translate a blocking Review into one Revise stage submission — the minimal facts the
     coordinator needs (ADR 0030). The revise adopts the original builder's retained PR branch and
     worktree, stays pinned to the builder's tool lineage and its original complexity and effort,
@@ -118,7 +121,8 @@ def revise_submission(review_record, complexity, findings="", *, surfaces="", ta
     build_worktree, pr_number = facts
     brief = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=review_record.repo, findings=findings or "- (see review)",
-        surfaces=surfaces or "any user-facing surface"), review_record.builder_effort, parent_pool)
+        surfaces=surfaces or "any user-facing surface",
+        screenshot_entry_note=screenshot_entry_note), review_record.builder_effort, parent_pool)
     review = ReviewState.from_record(review_record)
     if review is not None:
         review = replace(review, change_author_tool=parent_pool)
@@ -183,7 +187,8 @@ def conflict_decision_revise_submission(review_record, verdict, *, parent_pool: 
     )
     prompt = _session_lead_prompt(stage_prompt_spec("revise").render(
         n=pr_number, repo=review_record.repo, findings=f"- {decision}",
-        surfaces="any user-facing surface"), review_record.builder_effort, parent_pool)
+        surfaces="any user-facing surface", screenshot_entry_note=""),
+        review_record.builder_effort, parent_pool)
     prior = ReviewState.from_record(review_record)
     if prior is None:
         return None

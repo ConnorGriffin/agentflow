@@ -12,10 +12,10 @@ import pytest
 
 from agentflow import github
 from agentflow.enroll import (_audit_command, _converge_and_ship, _install_file,
-                              _skills_problem, _SYNC_BRANCH, audit_lines, checkout_repo,
-                              configured_repositories, declaration_line, enroll_repository,
-                              main, newly_gated_prs, propose_surfaces, sync_fleet,
-                              write_declaration)
+                              _screenshot_entry_warning, _skills_problem, _SYNC_BRANCH,
+                              audit_lines, checkout_repo, configured_repositories,
+                              declaration_line, enroll_repository, main, newly_gated_prs,
+                              propose_surfaces, sync_fleet, write_declaration)
 from agentflow.repo_facts import surface_declaration
 from agentflow.filesystem_contracts import skill_destination_status
 from agentflow.skill_ownership import mark_skill_owned, skill_ownership
@@ -640,6 +640,31 @@ def test_global_wiring_preserves_hand_written_file_and_unknown_link(tmp_path):
     assert codex_global.readlink() == Path("/tmp/unmanaged-agent-instructions")
 
 
+def test_declared_missing_screenshot_entry_is_a_soft_warning(tmp_path):
+    (tmp_path / "AGENTS.md").write_text(
+        "# repo\n\nui-surfaces: frontend/\nscreenshot-entry: scripts/screenshots.local.mjs\n")
+    warning = _screenshot_entry_warning(tmp_path)
+    assert warning is not None
+    assert "scripts/screenshots.local.mjs" in warning
+    assert "does not exist" in warning
+
+
+def test_screenshot_entry_that_aliases_the_pinned_harness_warns(tmp_path):
+    (tmp_path / "AGENTS.md").write_text(
+        "# repo\n\nui-surfaces: frontend/\nscreenshot-entry: scripts/screenshots.mjs\n")
+    warning = _screenshot_entry_warning(tmp_path)
+    assert warning is not None and "aliases the pinned harness" in warning
+
+
+def test_an_existing_declared_screenshot_entry_is_no_warning(tmp_path):
+    (tmp_path / "AGENTS.md").write_text(
+        "# repo\n\nui-surfaces: frontend/\nscreenshot-entry: scripts/screenshots.local.mjs\n")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts" / "screenshots.local.mjs").write_text("import './screenshots.mjs';\n")
+    assert _screenshot_entry_warning(tmp_path) is None
+    assert _screenshot_entry_warning(tmp_path / "nonexistent") is None  # nothing declared
+
+
 def test_seeded_agents_file_declares_ui_surfaces(tmp_path):
     # Issue #337: a newly enrolled repo must start declared one way or the other, so the
     # fleet can tell "headless on purpose" from "nobody filled this in".
@@ -1038,8 +1063,11 @@ class TestConvergeMode:
 
     def test_no_other_call_site_passes_overwrite_true(self):
         source = (ROOT / "agentflow" / "enroll.py").read_text()
-        # The plan's fixed pair: the bundled SKILL.md and the screenshot harness.
-        assert source.count("overwrite=converge") == 2
+        # The bundled SKILL.md still converges unconditionally; the screenshot harness no longer
+        # does — its overwrite is gated on `_harness_convergeable` so a repo-local edit is never
+        # silently lost (#735).
+        assert source.count("overwrite=converge") == 1
+        assert "overwrite = converge and _harness_convergeable(harness, spec)" in source
         assert "overwrite=True" not in source
 
     def test_a_fully_drifted_vendored_skill_pack_is_reported_not_converged(self, tmp_path, monkeypatch):

@@ -23,15 +23,17 @@ from agentflow.runner import ClaudeRunner, MockupScope
 def _commit_prompts() -> dict[str, str]:
     return {
         "build": BUILD_PROMPT.format(
-            repo="o/r", n=357, title="DCO", body="", effort="low", surfaces="none"),
-        "revise": REVISE_PROMPT.format(n=357, repo="o/r", findings="- fix", surfaces="none"),
+            repo="o/r", n=357, title="DCO", body="", effort="low", surfaces="none", screenshot_entry_note=""),
+        "revise": REVISE_PROMPT.format(n=357, repo="o/r", findings="- fix", surfaces="none", screenshot_entry_note=""),
         "respond": RESPOND_PROMPT.format(
-            n=357, baseline="abc", comment="fix it", disclaimer="> *reply*"),
+            n=357, baseline="abc", comment="fix it", disclaimer="> *reply*",
+            screenshot_entry_note=""),
         "mockup": PRODUCE_PROMPT.format(
             repo="o/r", n=357, title="DCO", body="", branch="mockup-357", surfaces="none",
+            screenshot_entry_note="",
             scope_guidance=SCOPE_GUIDANCE[MockupScope.SURFACE], disclaimer=MOCKUP_DISCLAIMER),
         "review": REVIEW_PROMPT.format(
-            pr=357, issue=356, starting_sha="abc", acceptance="DCO", surfaces="none"),
+            pr=357, issue=356, starting_sha="abc", acceptance="DCO", surfaces="none", screenshot_entry_note=""),
     }
 
 

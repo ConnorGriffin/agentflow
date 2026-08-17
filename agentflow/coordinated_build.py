@@ -28,8 +28,9 @@ from agentflow.intake import held_build_result
 from agentflow.labels import BUILDING, complexity_from_labels, effort_from_labels
 from agentflow.prompts import stage_prompt_spec
 from agentflow.pool_control import POOLS, pool_paused
-from agentflow.repo_facts import surface_declaration, surfaces_phrase
+from agentflow.repo_facts import screenshot_entry, surface_declaration, surfaces_phrase
 from agentflow.routing import routing
+from agentflow.screenshot_crib import screenshot_entry_note
 from agentflow.runner import _run, codex_spent_at_render
 from agentflow.worktree_ref import WorktreeRef, capture_subject_revision, source_facts
 
@@ -53,7 +54,8 @@ def build_submission(cfg, issue: dict, *, parent_pool: str = "claude", floodgate
     brief = stage_prompt_spec("build").render(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         effort=effort,
-        surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
+        surfaces=surfaces_phrase(surface_declaration(cfg.workdir)),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(cfg.workdir)))
     brief += routing.session_lead_instructions(
         "build", effort, parent_provider=parent_pool, codex_spent=codex_spent_at_render(),
         unavailable_providers=frozenset(pool for pool in POOLS if pool_paused(pool)),

@@ -21,6 +21,7 @@ from pathlib import Path
 _PROFILE_RE = re.compile(r"^profile:\s*(autonomous|reviewed|guarded)", re.MULTILINE)
 _UI_SURFACES_RE = re.compile(r"^ui-surfaces:\s*(.+)$", re.MULTILINE)
 _ALLOWLIST_RE = re.compile(r"^intake-allowlist:\s*(.+)", re.MULTILINE)
+_SCREENSHOT_ENTRY_RE = re.compile(r"^screenshot-entry:\s*(.+)$", re.MULTILINE)
 
 # The two names a repo may declare its facts in, in the order they win.
 _FACT_FILES = ("AGENTS.md", "CLAUDE.md")
@@ -113,6 +114,21 @@ def surfaces_phrase(declaration: SurfaceDeclaration) -> str:
     if declaration.headless:
         return "none — this repo is headless, so no screenshot is required"
     return "any user-facing surface (frontend, UI templates, etc.)"
+
+
+def screenshot_entry(workdir: str) -> str | None:
+    """The repo's AGENTS.md/CLAUDE.md `screenshot-entry:` line — a repo-local capture entry point
+    (e.g. `scripts/screenshots.local.mjs`) that wraps the pinned harness with this repo's sanctioned
+    extensions. A session captures through it instead of the canonical `scripts/screenshots.mjs`,
+    which stays pinned and unedited (#735). None when the repo declares nothing — silence keeps the
+    canonical harness, never a guess."""
+    for text in _fact_texts(workdir):
+        m = _SCREENSHOT_ENTRY_RE.search(text)
+        if m:
+            entry = m.group(1).strip()
+            if entry:
+                return entry
+    return None
 
 
 def intake_allowlist(repo: str, workdir: str) -> set[str]:

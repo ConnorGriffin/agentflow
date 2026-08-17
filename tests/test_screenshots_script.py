@@ -270,10 +270,39 @@ def test_prompts_tell_a_repo_without_the_harness_what_to_do():
     )
 
 
-def test_shared_clause_has_no_format_braces():
-    """The prompts carrying it are str.format-rendered; a stray brace breaks every render."""
+def test_shared_clause_has_only_its_one_deliberate_placeholder():
+    """The prompts carrying it are str.format-rendered, so the only braces allowed are the one
+    deliberate ``{screenshot_entry_note}`` placeholder every render site fills (#735); any other
+    brace would break every render."""
     from agentflow.screenshot_crib import SCREENSHOT_HARNESS
-    assert "{" not in SCREENSHOT_HARNESS and "}" not in SCREENSHOT_HARNESS, (
-        "SCREENSHOT_HARNESS contains a format brace — every prompt that splices it in will "
-        "raise at render time."
+    assert "{screenshot_entry_note}" in SCREENSHOT_HARNESS, (
+        "SCREENSHOT_HARNESS lost its repo-local capture-entry placeholder — render sites thread a "
+        "note through it."
     )
+    residue = SCREENSHOT_HARNESS.replace("{screenshot_entry_note}", "")
+    assert "{" not in residue and "}" not in residue, (
+        "SCREENSHOT_HARNESS contains a stray format brace beyond its one placeholder — every "
+        "prompt that splices it in will raise at render time."
+    )
+
+
+def test_build_prompt_names_the_repo_local_capture_entry_only_when_declared(tmp_path):
+    """A rendered BUILD prompt redirects to the declared wrapper when the repo declares one, and
+    carries no local-entry sentence otherwise — the canonical harness stands alone (#735)."""
+    from agentflow.prompts import stage_prompt_spec
+    from agentflow.repo_facts import screenshot_entry
+    from agentflow.screenshot_crib import screenshot_entry_note
+
+    def render(workdir):
+        return stage_prompt_spec("build").render(
+            repo="o/r", n=1, title="t", body="b", effort="deep", surfaces="`frontend/`",
+            screenshot_entry_note=screenshot_entry_note(screenshot_entry(str(workdir))))
+
+    (tmp_path / "AGENTS.md").write_text(
+        "# repo\n\nui-surfaces: frontend/\nscreenshot-entry: scripts/screenshots.local.mjs\n")
+    declared = render(tmp_path)
+    assert "scripts/screenshots.local.mjs" in declared
+    assert "local capture entry point" in declared
+
+    (tmp_path / "AGENTS.md").write_text("# repo\n\nui-surfaces: frontend/\n")
+    assert "local capture entry point" not in render(tmp_path)

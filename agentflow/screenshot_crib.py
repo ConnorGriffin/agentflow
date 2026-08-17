@@ -13,7 +13,9 @@ burned their whole turn budget improvising Playwright and returned no verdict at
 in a repo without the harness must be told to port it in, not left to improvise.
 
 Keep it free of ``{`` / ``}`` — the prompts that carry it are ``str.format``-rendered, so an
-unescaped brace here would break every render.
+unescaped brace here would break every render. The one deliberate exception is the
+``{screenshot_entry_note}`` placeholder every render site must fill (see ``screenshot_entry_note``);
+an accidental brace anywhere else would still break every render.
 """
 
 # How a session independently verifies a user-facing change by actually running the app (#737).
@@ -42,4 +44,22 @@ SCREENSHOT_HARNESS = (
     "own copy in at exactly that path and commit it with your change, so the next session inherits "
     "a working harness. Never improvise a throwaway harness in a scratch directory — every session "
     "that does rediscovers the same sandbox walls and burns its whole turn budget on them."
+    "{screenshot_entry_note}"
 )
+
+
+def screenshot_entry_note(entry: str | None) -> str:
+    """The sentence that redirects a session to a repo's own sanctioned capture wrapper.
+
+    Empty when the repo declares no ``screenshot-entry:`` — the canonical-harness instruction stands
+    alone exactly as before. When a repo declares a wrapper that imports the pinned harness, this
+    points the session at it without ever licensing an edit to ``scripts/screenshots.mjs`` itself
+    (#735); a repo-local modification belongs in the extension, never in the pinned bytes.
+    """
+    if not entry:
+        return ""
+    return (
+        f" This repo declares a local capture entry point: run `node {entry} <config.json>` "
+        "instead — it wraps the pinned harness with this repo's sanctioned extensions; still "
+        "never edit `scripts/screenshots.mjs` itself."
+    )

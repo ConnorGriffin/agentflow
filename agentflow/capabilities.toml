@@ -164,8 +164,11 @@ id = "screenshot-harness"
 description = "the canonical Playwright screenshot harness"
 requirement = "ui"
 source = "bundled"
-sha256 = "ca2e1ff3a47e0f6680e7472df83df9fbbe39771546466bc28cf6858c0a35edaa"
-known_old_sha256 = ["ba094b9169747467257fc6f5bfcdc6d0f47a46bd99aa9827f0a3f352a03a84ad"]
+sha256 = "0f580b3c187343c598e9bbca7fd1acd2a0d3fda9e0a1a172c33cf0fae8979c2a"
+known_old_sha256 = [
+  "ba094b9169747467257fc6f5bfcdc6d0f47a46bd99aa9827f0a3f352a03a84ad",
+  "ca2e1ff3a47e0f6680e7472df83df9fbbe39771546466bc28cf6858c0a35edaa",
+]
 
 [[capabilities]]
 id = "playwright"

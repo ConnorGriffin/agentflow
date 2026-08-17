@@ -22,7 +22,8 @@ from agentflow.loop import (RebaseResult, RepoConfig, _free_to_dispatch, _issues
 from agentflow.prompts import (BUILD_PROMPT, MOCKUP_DISCLAIMER, PLAIN_LANGUAGE_RULE,
                                PRODUCE_PROMPT, RESPOND_PROMPT, REVISE_PROMPT, SCOPE_GUIDANCE)
 from agentflow.repo_facts import (SurfaceDeclaration, intake_allowlist, repo_profile,
-                                  surface_declaration, surfaces_phrase, ui_surfaces)
+                                  screenshot_entry, surface_declaration, surfaces_phrase,
+                                  ui_surfaces)
 from agentflow.runner import Complexity, Effort, MockupScope
 from agentflow.worktree_ref import issue_of_branch, slug
 
@@ -185,6 +186,17 @@ def test_repo_profile_prefers_agents_md_then_claude(tmp_path):
 def test_repo_profile_defaults_reviewed_when_absent(tmp_path):
     # ADR 0002 safe default — never auto-merge a repo that didn't opt in.
     assert repo_profile(str(tmp_path)) == "reviewed"
+
+
+def test_screenshot_entry_reads_the_declared_local_capture_wrapper(tmp_path):
+    (tmp_path / "AGENTS.md").write_text(
+        "# repo\n\nui-surfaces: frontend/\nscreenshot-entry: scripts/screenshots.local.mjs\n")
+    assert screenshot_entry(str(tmp_path)) == "scripts/screenshots.local.mjs"
+
+
+def test_screenshot_entry_is_none_when_undeclared(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("# repo\n\nui-surfaces: frontend/\n")
+    assert screenshot_entry(str(tmp_path)) is None
 
 
 def test_intake_allowlist_always_includes_owner(tmp_path):
@@ -431,7 +443,7 @@ def test_build_prompt_formats_and_tells_the_builder_the_pr_gates():
     # builder's marching orders in step with what cross-review now blocks on (ADR 0018),
     # so a UI build self-complies instead of bouncing off the gate.
     body = BUILD_PROMPT.format(repo="o/r", n=7, title="Do a thing", body="details",
-                               effort="medium", surfaces="`agentflow/static/`")
+                               effort="medium", surfaces="`agentflow/static/`", screenshot_entry_note="")
     assert "o/r" in body and "#7" in body and "Do a thing" in body
     assert "screenshot" in body.lower()   # UI-change evidence gate
     assert "jargon" in body.lower()        # plain-language gate
@@ -443,7 +455,7 @@ def test_build_prompt_prescribes_the_browserless_screenshot_path():
     # path (docs/screenshots/ on the branch), pins the image host to the immutable commit
     # (issue #205), and forbids the browser route.
     body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
-                               surfaces="`frontend/`")
+                               surfaces="`frontend/`", screenshot_entry_note="")
     assert "docs/screenshots/issue-7/" in body
     assert "https://github.com/o/r/raw/<commit-sha>/" in body
     assert "upload images through a web browser" in body
@@ -451,7 +463,7 @@ def test_build_prompt_prescribes_the_browserless_screenshot_path():
 
 def test_revise_prompt_prescribes_the_browserless_screenshot_path():
     # A revise sent to fix missing screenshots must not bounce off the same browser wall.
-    body = REVISE_PROMPT.format(n=5, repo="o/r", findings="- fix it", surfaces="`frontend/`")
+    body = REVISE_PROMPT.format(n=5, repo="o/r", findings="- fix it", surfaces="`frontend/`", screenshot_entry_note="")
     assert "docs/screenshots/" in body
     assert "upload images through a web browser" in body
 
@@ -459,7 +471,7 @@ def test_revise_prompt_prescribes_the_browserless_screenshot_path():
 def test_build_prompt_names_the_charter_test_standard():
     # ADR 0022: the builder is told the bar up front, not only caught at cross-review.
     body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
-                               surfaces="`agentflow/static/`")
+                               surfaces="`agentflow/static/`", screenshot_entry_note="")
     assert "public interface" in body
     assert "failed first" in body.lower()
 
@@ -468,7 +480,7 @@ def test_build_prompt_states_the_deletion_test_self_check():
     # issue #382: the builder is told to apply the charter's deep-module rules before the
     # PR goes up, the same way it is told the test standard up front.
     body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
-                               surfaces="`agentflow/static/`")
+                               surfaces="`agentflow/static/`", screenshot_entry_note="")
     assert "deletion" in body.lower()
     assert "interface-depth" in body.lower() or "interface depth" in body.lower()
 
@@ -519,7 +531,7 @@ def test_revise_prompt_carries_both_evidence_gates():
     # A revise pass must not silently degrade compliance: it names both the screenshot
     # gate (with the repo's surfaces) and the plain-language body gate.
     body = REVISE_PROMPT.format(n=5, repo="o/r", findings="- fix it",
-                                surfaces="`agentflow/static/`")
+                                surfaces="`agentflow/static/`", screenshot_entry_note="")
     assert "screenshot" in body.lower()
     assert "agentflow/static/" in body
     assert "plain" in body.lower()
@@ -529,7 +541,7 @@ def test_build_prompt_invokes_the_skill_graph():
     # audit 1.1: the charter-prose sentences stay, but each now names the skill that owns
     # the deeper rule so a session that skips it still sees the rule stand.
     body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
-                               surfaces="`agentflow/static/`")
+                               surfaces="`agentflow/static/`", screenshot_entry_note="")
     assert "/tdd" in body
     assert "/codebase-design" in body
 
@@ -539,21 +551,21 @@ def test_build_prompt_renders_ui_craft_build_mode_for_a_locked_contract():
     # build-mode clause; the unconditional screenshot rules are untouched either way.
     locked_body = BUILD_PROMPT.format(
         repo="o/r", n=7, title="x", effort="high", surfaces="`frontend/`",
-        body="## LOCKED visual contract\nsome contract text")
+        screenshot_entry_note="", body="## LOCKED visual contract\nsome contract text")
     assert "/ui-craft" in locked_body
     assert "build" in locked_body
 
     plain_body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="details",
-                                     effort="high", surfaces="`frontend/`")
+                                     effort="high", surfaces="`frontend/`", screenshot_entry_note="")
     assert "screenshot" in plain_body.lower()
 
 
 def test_plain_language_rule_is_shared_by_build_and_revise():
     # audit 1.4: exactly one shared sentence, interpolated rather than duplicated prose.
     build_body = BUILD_PROMPT.format(repo="o/r", n=7, title="x", body="", effort="high",
-                                     surfaces="`agentflow/static/`")
+                                     surfaces="`agentflow/static/`", screenshot_entry_note="")
     revise_body = REVISE_PROMPT.format(n=5, repo="o/r", findings="- fix it",
-                                       surfaces="`agentflow/static/`")
+                                       surfaces="`agentflow/static/`", screenshot_entry_note="")
     assert PLAIN_LANGUAGE_RULE in build_body
     assert PLAIN_LANGUAGE_RULE in revise_body
 
@@ -1002,7 +1014,7 @@ def test_produce_prompt_drives_ui_mockups_headless_and_one_marked_comment():
     # commit variants to a branch, and post exactly ONE issue comment starting with the marker.
     body = PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
                                  branch="agentflow/claude/mockup-7-a-screen",
-                                 surfaces="`agentflow/static/`",
+                                 surfaces="`agentflow/static/`", screenshot_entry_note="",
                                  scope_guidance=SCOPE_GUIDANCE[MockupScope.SURFACE],
                                  disclaimer=MOCKUP_DISCLAIMER)
     assert "/ui-craft" in body
@@ -1021,6 +1033,7 @@ def test_produce_prompt_scope_branches_local_vs_surface():
     def body(scope):
         return PRODUCE_PROMPT.format(repo="o/r", n=7, title="A screen", body="details",
                                      branch="b", surfaces="`agentflow/webui/src/`",
+                                     screenshot_entry_note="",
                                      scope_guidance=SCOPE_GUIDANCE[scope],
                                      disclaimer=MOCKUP_DISCLAIMER)
     surface, local = body(MockupScope.SURFACE), body(MockupScope.LOCAL)
@@ -1810,16 +1823,18 @@ class TestScreenshotHostingInstruction:
     def _build(self):
         return BUILD_PROMPT.format(
             repo="o/r", n=205, title="t", body="b", effort="medium",
-            surfaces="agentflow/webui/src/")
+            surfaces="agentflow/webui/src/", screenshot_entry_note="")
 
     def _revise(self):
         return REVISE_PROMPT.format(
-            repo="o/r", n=205, findings="- x", surfaces="agentflow/webui/src/")
+            repo="o/r", n=205, findings="- x", surfaces="agentflow/webui/src/",
+            screenshot_entry_note="")
 
     def _mockup(self):
         return PRODUCE_PROMPT.format(
             repo="o/r", n=205, title="t", body="b",
             branch="agentflow/claude/issue-205-x", surfaces="agentflow/webui/src/",
+            screenshot_entry_note="",
             scope_guidance=SCOPE_GUIDANCE[MockupScope.SURFACE],
             disclaimer=MOCKUP_DISCLAIMER)
 
