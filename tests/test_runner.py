@@ -514,13 +514,10 @@ def test_review_sessions_on_both_tools_carry_the_browser_recovery_exactly_once(t
     prompt = REVIEW_PROMPT.format(
         pr=7, issue=3, starting_sha="abc123", acceptance="works",
         surfaces="`frontend/`")
-    # The ui_verification instruction no longer references a recovery the prompt does not state:
-    # the prescribed recovery is spelled out in the prompt itself, before the field description
-    # points back at it.
-    assert "That is the prescribed recovery" in prompt
-    assert "recovery stated above" in prompt
-    assert prompt.index("That is the prescribed recovery") < prompt.index(
-        "recovery stated above")
+    # Codex can request the narrow escalation; Claude's strict launcher has no equivalent and
+    # is explicitly instructed to return an evidenced unavailable result instead of bluffing.
+    assert "On Claude, the strict launcher provides no sandbox-escalation mechanism" in prompt
+    assert "a Claude unavailable result must include" in prompt
 
     repo = _repo_with_origin(tmp_path)
     codex = CodexProviderAdapter().command(Record(
@@ -530,9 +527,13 @@ def test_review_sessions_on_both_tools_carry_the_browser_recovery_exactly_once(t
         "claude-review", "review", "claude", 1,
         model="sonnet", source=str(repo), input_ptr=prompt))
 
-    for launched in (codex[-1], claude[claude.index("-p") + 1]):
-        assert launched.count("HEADLESS-SANDBOX-BLOCKED") == 1
-        assert "sandbox_permissions=require_escalated" in launched
+    codex_prompt = codex[-1]
+    claude_prompt = claude[claude.index("-p") + 1]
+    for launched in (codex_prompt, claude_prompt):
+        assert launched.count("When that driver prints HEADLESS-SANDBOX-BLOCKED") == 1
+        assert "On Claude, the strict launcher provides no sandbox-escalation mechanism" in launched
+    assert "sandbox_permissions=require_escalated" in codex_prompt
+    assert "sandbox_permissions=require_escalated" not in claude_prompt
 
 
 def test_codex_account_fact_uses_typed_limit_windows(monkeypatch):

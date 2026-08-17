@@ -1007,9 +1007,11 @@ class CodexRunner(_WorktreeRunner):
             argv += ["-c", f"model_reasoning_effort={level}"]
         if schema is not None:
             argv += ["--output-schema", _write_output_schema(schema)]
-        # A stage prompt that already carries the shared blocked-browser recovery (#737) is not
-        # given the launcher's Codex-only copy a second time.
-        recovery = "" if "HEADLESS-SANDBOX-BLOCKED" in prompt else _CODEX_HEADLESS_RECOVERY
+        # A stage prompt can name the cross-tool blocked-browser condition while only Codex gets
+        # the actual escalation syntax. Skip the preamble only when that recovery itself is
+        # already present, not merely because Claude's no-recovery contract mentions the token.
+        recovery = ("" if "sandbox_permissions=require_escalated" in prompt
+                    else _CODEX_HEADLESS_RECOVERY)
         argv.append(_bounded_prompt(recovery + prompt, cwd))
         return argv
 

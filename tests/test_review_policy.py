@@ -79,6 +79,20 @@ def test_unavailable_ui_verification_cannot_settle_a_pass():
     assert result.parsed is True and result.clean is False
 
 
+def test_every_agentflow_pr_comment_carries_the_authorship_mark(monkeypatch):
+    """The PR-comment boundary is the guard against our own notice becoming a maintainer reply.
+    Any new caller without the marker fails before GitHub receives an unreadable comment (#737)."""
+    from agentflow import github
+    from agentflow.gate import PR_MARK
+
+    monkeypatch.setattr(github, "_gh", lambda *_args, **_kwargs: type("Result", (), {
+        "returncode": 0})())
+    with pytest.raises(ValueError, match="PR_MARK"):
+        github.pr_comment("o/r", 7, "A bare progress note")
+
+    assert github.pr_comment("o/r", 7, f"> *{PR_MARK} progress.*")
+
+
 def test_follow_up_proposal_is_zero_or_one_and_required_exactly_for_its_finding():
     base = {
         "verdict": "PASS", "depth": "targeted", "depth_reason": "one journey",
@@ -1310,6 +1324,28 @@ def test_a_refused_verdict_park_names_the_refusal_and_never_claims_nothing_judge
     assert "Last unverified check: verdict-parse: review checks are missing" in body
 
 
+def test_empty_reviewer_output_after_three_crashes_never_invents_a_refused_verdict(monkeypatch):
+    """Three crashed attempts leave the finalizer's empty-output parse miss, not evidence that
+    any attempt returned a verdict. The park retains the generic no-verdict ending (#737)."""
+    from agentflow import pipeline
+    from agentflow.pr_park import verdict_refused
+
+    record = _chain_record(
+        "crashed", sequence=0, created=100, axis="combined", held=True,
+        hold_reason="continuation budget exhausted — last unverified check: verdict-parse: "
+                    "empty reviewer output")
+    record.attempts = 3
+    record.verify_miss = "verdict-parse: empty reviewer output"
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [record])
+
+    body = _park_body(monkeypatch, record)
+
+    assert not verdict_refused(record)
+    assert "the review executions failed rather than judging the change" in body
+    assert "returned a verdict" not in body
+    assert "the change was looked at" not in body
+
+
 def test_a_repair_pushing_pass_posts_one_alive_notice_and_never_a_second(monkeypatch):
     """A repair-pushing pass hands off privately, so from the PR a working chain looked identical
     to a dead session. It now posts one short alive notice — once: a repeat cycle observes the
@@ -1332,6 +1368,16 @@ def test_a_repair_pushing_pass_posts_one_alive_notice_and_never_a_second(monkeyp
     assert len(posted) == 1
     assert "pushed repairs" in posted[0]
     assert "not a verdict" in posted[0]
+    from agentflow.gate import MergeDecision, PR_MARK, decide_merge, reply_pending
+    from agentflow.reviewer import Verdict
+
+    comments = [{"body": posted[0]}]
+    assert PR_MARK in posted[0]
+    assert not reply_pending(comments)
+    assert decide_merge(
+        verdict=Verdict(clean=True, reviewer_tool="codex", change_author_tool="claude"),
+        ci_green=True, reviewer_tool="codex", builder_tool="claude", revises_used=0,
+        ui_evidence_missing=False, reply_pending=reply_pending(comments)) is MergeDecision.MERGE
 
     # A repeat cycle or crash resume proves the existing comment instead of posting a second.
     assert coordinated_review.post_repair_notice(record, verdict) is not None

@@ -899,6 +899,66 @@ def test_clean_reviewed_settlement_posts_one_summary_and_returns_durable_proof(m
     assert summarized == [("o/r", 42, "sha-a")]
 
 
+def test_repair_notice_cannot_turn_the_next_clean_settlement_into_a_maintainer_reply(
+        monkeypatch):
+    """A repair-pushing review leaves one progress notice before its successor is submitted.
+    Its marker must keep the clean successor's merge decision independent of that notice (#737)."""
+    from types import SimpleNamespace
+
+    repair_record = _completed_review_record(profile="autonomous")
+    posted = []
+    monkeypatch.setattr("agentflow.github.pr_comments",
+                        lambda _repo, _pr: [github.Comment(body=body, created_at="")
+                                            for body in posted])
+    monkeypatch.setattr("agentflow.github.pr_comment",
+                        lambda _repo, _pr, body: posted.append(body) or True)
+    monkeypatch.setattr("agentflow.notify.notify", lambda *_args, **_kwargs: True)
+
+    assert coordinated_review.post_repair_notice(
+        repair_record, SimpleNamespace(pushed_sha="sha-b")) is not None
+
+    settled = _settle_autonomous_clean_review(
+        monkeypatch, surfaces=[], content=github.PrContent(body="", paths=(), comments=[]),
+        comments=[{"body": posted[0]}], merges=True)
+
+    assert settled.asked and settled.asked[0]["reply_pending"] is False
+    assert settled.parked == [] and settled.merged == [42]
+
+
+def test_evidenced_claude_browser_unavailable_settles_without_a_false_park(monkeypatch):
+    """Claude cannot recover a driver blocked by its enforced sandbox. An exact recorded blocked
+    command closes the review honestly; it is not an action a maintainer can resolve (#737)."""
+    from agentflow.review_policy import UIVerification
+    from agentflow.reviewer import Verdict
+
+    record = _completed_review_record()
+    record.pool = "claude"
+    record.builder_lineage = "codex"
+    record.change_author_tool = "codex"
+    finished, summarized = [], []
+    monkeypatch.setattr(
+        coordinated_review, "_review_verdict",
+        lambda _r: Verdict(clean=False, parsed=True,
+                           checks=("node driver.mjs: HEADLESS-SANDBOX-BLOCKED",),
+                           ui_verification=UIVerification.UNAVAILABLE))
+    monkeypatch.setattr(coordinated_review, "_review_pr_facts",
+                        lambda _r: {"head": "sha-a", "state": "OPEN"})
+    monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
+    monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: ["web/"])
+    monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.gate.ui_evidence_gap", lambda *_args: False)
+    monkeypatch.setattr("agentflow.gate.ui_verification_required", lambda *_args: True)
+    monkeypatch.setattr("agentflow.github.commit_head_checks",
+                        lambda _repo, sha: github.HeadChecks(sha=sha))
+    monkeypatch.setattr("agentflow.gate.post_clean_review_summary",
+                        lambda *_args: summarized.append(True) or True)
+    monkeypatch.setattr("agentflow.coordinated_review._finish_review",
+                        lambda *args, **kwargs: finished.append(True))
+
+    assert coordinated_review._settle_review(record) == "https://github.com/o/r/pull/42"
+    assert summarized == [True] and finished == [True]
+
+
 def test_clean_taint_clearing_autonomous_review_reenters_full_merge_gate(monkeypatch):
     from agentflow.reviewer import Verdict
 

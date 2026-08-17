@@ -17,22 +17,22 @@ unescaped brace here would break every render.
 """
 
 # How a session independently verifies a user-facing change by actually running the app (#737).
-# The recovery paragraph used to live only in the Codex launcher preamble, so a Claude review was
-# asked whether verification "passed" without ever being told the procedure or the recovery it
-# names. Embedding it in the stage prompt reaches every session regardless of tool; the Codex
-# launcher skips its own copy when the prompt already carries this text. Same brace constraint as
-# the harness above: the prompts carrying it are format-rendered.
+# Codex's launcher adds its narrow browser-escalation recovery; Claude's strict sandbox exposes no
+# equivalent. State both contracts in the review prompt so a reviewer never pretends it can recover
+# on Claude or reports an unavailable browser without the evidence settlement needs. Same brace
+# constraint as the harness above: the prompts carrying it are format-rendered.
 UI_VERIFICATION_PROCEDURE = (
     "When the change touches a declared user-facing surface, verify it by running the app "
     "yourself, headless — the same procedure a build follows. Boot the app locally, then drive it "
     "with the shared drive-local-webapp driver to load the affected screens and exercise the "
     "changed behavior. When that driver prints HEADLESS-SANDBOX-BLOCKED, the sandbox blocked the "
-    "browser, not the change: rerun that exact driver command with escalated sandbox permissions "
-    "(on Codex, sandbox_permissions=require_escalated — the launcher reviews this narrow request "
-    "unattended) and continue; keep the app server and every other command inside the workspace "
-    "sandbox. That is the prescribed recovery for a blocked browser: apply it and continue rather "
-    "than reporting the verification unavailable, and never substitute a written explanation for "
-    "actually running the app."
+    "browser, not the change. On Codex, use the Codex-only browser recovery supplied by your "
+    "launcher and continue; keep the app server and every other command inside the workspace "
+    "sandbox. On Claude, the strict launcher provides no sandbox-escalation mechanism, so do not "
+    "claim a "
+    "recovery exists: report ui_verification as unavailable, including the exact command and "
+    "HEADLESS-SANDBOX-BLOCKED in checks. Never substitute a written explanation for actually "
+    "running the app."
 )
 
 SCREENSHOT_HARNESS = (

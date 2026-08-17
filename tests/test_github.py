@@ -313,7 +313,7 @@ def test_checks_that_could_not_be_confirmed_are_not_passed(monkeypatch):
     lambda: github.edit_title(REPO, 5, "new title"),
     lambda: github.edit_body(REPO, 5, "new body"),
     lambda: github.comment(REPO, 5, "hello"),
-    lambda: github.pr_comment(REPO, 9, "hello"),
+    lambda: github.pr_comment(REPO, 9, f"> *{github.PR_MARK} hello.*"),
     lambda: github.edit_comment("IC_kwDO", "updated"),
     lambda: github.close(REPO, 5),
     lambda: github.pr_ready(REPO, 9),

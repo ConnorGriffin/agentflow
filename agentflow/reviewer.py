@@ -326,9 +326,11 @@ schema natively, so you do not hand-write or fence the JSON; just produce these 
 - "checks": exact proof/checks you completed
 - "ui_verification": "not_required" when the PR changes no declared user-facing surface,
   "passed" only after you ran the required UI verification, or "unavailable" when the browser
-  verification could not run even after the blocked-browser sandbox recovery stated above. If it
-  is unavailable after that recovery, return `BLOCK` and record the exact failed command and
-  environment cause in "checks"; never replace UI proof with an explanation.
+  verification could not run. On Codex, first apply the Codex-only recovery supplied by the
+  launcher; on Claude, `HEADLESS-SANDBOX-BLOCKED` has no escalation recovery, so `unavailable` is
+  the honest answer. In either case return `BLOCK` and record the exact failed command and
+  environment cause in "checks"; a Claude unavailable result must include
+  `HEADLESS-SANDBOX-BLOCKED`. Never replace UI proof with an explanation.
 - "follow_ups": zero or one necessary follow-up proposal as {{"evidence", "desired_outcome"}}.
   Supply exactly one when a `necessary_follow_up` finding is present, otherwise supply none.
 - "findings": unresolved/discarded observations as {{"action", "file", "line", "summary",

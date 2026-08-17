@@ -161,6 +161,13 @@ def test_wall_ceiling_is_threaded_per_record_from_the_profile(tmp_path):
     assert pinned._session_timeout_for(_record("build", str(tmp_path))) == 0.1
 
 
+def test_building_and_reviewing_docs_state_the_review_ceiling():
+    from pathlib import Path
+
+    docs = Path("docs/how-it-works/building-and-reviewing.md").read_text()
+    assert "review 45 minutes and 120" in docs
+
+
 def test_build_profile_exposes_a_progress_lease_with_an_immutable_cap(tmp_path):
     """Build gets the #570 child-local lease; every other stage keeps one fixed ceiling."""
     from agentflow.coordinator.profiles import profile_for

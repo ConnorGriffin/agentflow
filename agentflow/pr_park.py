@@ -161,12 +161,12 @@ def _recorded_review_passes(record) -> int:
 def verdict_refused(record) -> bool:
     """Whether the last attempt returned a verdict that verification refused to record (#737).
 
-    ``verify_miss`` durably names the first failed verification conjunct; a ``verdict-parse``
-    miss means the session produced a final answer and the refusal — not a dead execution — is
-    why no verdict was recorded. Without this distinction the park headline claims nothing judged
-    the change while the last-unverified-check line directly beneath it names the refused verdict.
+    ``verify_miss`` durably names the first failed verification conjunct. Only a parse miss with
+    a non-empty payload proves the session returned a final answer; an empty reviewer output is a
+    dead execution and must reach the generic ending rather than inventing a verdict (#737).
     """
-    return getattr(record, "verify_miss", "").startswith("verdict-parse")
+    return (getattr(record, "verify_miss", "").startswith("verdict-parse")
+            and "empty reviewer output" not in getattr(record, "verify_miss", ""))
 
 
 def review_park_missing(record) -> str:
@@ -179,6 +179,7 @@ def review_park_missing(record) -> str:
     count those durable facts prove. Pure (test surface, #501)."""
     from agentflow.coordinator.coordinator import (ended_at_turn_cap, ended_at_wall_clock,
                                                    refused_before_start)
+    from agentflow.coordinator.profiles import profile_for
     hold_reason = getattr(record, "hold_reason", None)
     passes = _recorded_review_passes(record)
     noun = "pass" if passes == 1 else "passes"
@@ -208,12 +209,13 @@ def review_park_missing(record) -> str:
                 "cut off at its per-stage turn ceiling before it could reach one — it was stopped "
                 "mid-review, not left short of an answer. Do not treat this as a clean review.")
     if ended_at_wall_clock(hold_reason):
+        wall_minutes = profile_for(record).wall_ceiling_s // 60
         if passes:
-            return ("The last review session was cut off at its 45-minute wall-clock limit "
+            return (f"The last review session was cut off at its {wall_minutes}-minute wall-clock limit "
                     f"having produced nothing — it went silent, not judged the change. "
                     f"{pass_sentence} Do not treat this as a clean review.")
         return ("No review verdict was recorded for this exact head: the last review session was "
-                "cut off at its 45-minute wall-clock limit having produced nothing — it went "
+                f"cut off at its {wall_minutes}-minute wall-clock limit having produced nothing — it went "
                 "silent and the clock killed it, so nothing here judged the change or cleared "
                 "it. Do not treat this as a clean review.")
     if verdict_refused(record):

@@ -1053,6 +1053,7 @@ def post_repair_notice(record, verdict) -> str | None:
     post-once-then-notify envelope (ADR 0042) keyed on this pass and its pushed head, so a repeat
     cycle or a crash resume observes the existing comment and never posts a second.
     """
+    from agentflow.gate import PR_MARK
     from agentflow.handoff import (DurableHandoff, Notification, Subject, marked_body,
                                    proof_marker)
 
@@ -1063,9 +1064,9 @@ def post_repair_notice(record, verdict) -> str | None:
     marker = proof_marker(record.identity, f"repairs-pushed:{verdict.pushed_sha}",
                           tag="review-repairs")
     body = marked_body(
-        "The independent review pushed repairs to this pull request's branch and handed the "
-        "repaired change to the next review pass. This is progress, not a verdict — the review "
-        "chain posts its verdict when it finishes.", marker)
+        f"> *{PR_MARK} review progress.*\n\n"
+        "The independent review pushed repairs to this pull request's branch. This is progress, "
+        "not a verdict — the review chain posts its verdict when it finishes.", marker)
     return DurableHandoff().hand_off(
         Subject(repo=record.repo, number=pr, kind="pr"),
         identity=record.identity, stage="review-repairs", marker=marker,
@@ -1143,18 +1144,31 @@ def _settle_review(record) -> str | None:
             autonomous=autonomous, checks=verdict.checks,
             missing="The pipeline could not determine whether the reviewed change requires UI "
                     "verification.")
-    if not ui_gap and verdict.ui_verification.value == "unavailable":
+    claude_browser_unavailable = (
+        record.pool == "claude"
+        and ui_verification_needed
+        and verdict.ui_verification.value == "unavailable"
+        and "HEADLESS-SANDBOX-BLOCKED" in "\n".join(verdict.checks)
+        and not verdict.blocking
+        and not verdict.actions)
+    if not ui_gap and verdict.ui_verification.value == "unavailable" and not claude_browser_unavailable:
         return _park_review_settlement(
             record, verdict, workdir, pr, reason=UI_VERIFICATION_UNAVAILABLE_REASON,
             autonomous=autonomous, checks=verdict.checks,
             missing="The reviewer could not execute the required UI verification.")
-    if ui_verification_needed and verdict.ui_verification.value != "passed":
+    if (ui_verification_needed and verdict.ui_verification.value != "passed"
+            and not claude_browser_unavailable):
         return _park_review_settlement(
             record, verdict, workdir, pr,
             reason="did not record the required UI verification", autonomous=autonomous,
             checks=verdict.checks,
             missing="The reviewed change touches a declared UI surface but has no runnable UI "
                     "verification result.")
+    if claude_browser_unavailable:
+        # Claude's launcher forbids unsandboxed commands and exposes no escalation mechanism. A
+        # blocked shared driver in checks is therefore a tool limitation, not a repairable review
+        # action; normalize only this evidenced structured result for settlement (#737).
+        verdict = replace(verdict, clean=True)
     # The head check gate (ADR 417): a clean exit first reads the checks on the exact reviewed
     # head, from GitHub — a reviewer cannot clear it by not looking. It is consulted only on the
     # exits that would otherwise finish clean: an unreadable answer defers only the clean
