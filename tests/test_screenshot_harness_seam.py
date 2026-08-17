@@ -14,6 +14,7 @@ Playwright/Chromium can't run, mirroring tests/test_screenshots_script.py.
 from __future__ import annotations
 
 import json
+import hashlib
 import shutil
 import struct
 import subprocess
@@ -203,6 +204,79 @@ def test_selector_crop_is_smaller_than_viewport(tmp_path):
     )
 
 
+def test_js_clicks_and_focus_presses_change_captured_state(tmp_path):
+    """Per-shot synthetic clicks and keyboard steps capture the states they reveal."""
+    page = tmp_path / "interactions.html"
+    page.write_text(
+        "<!DOCTYPE html><html><body style='margin:0;background:white;height:100vh'>"
+        "<button id='js' style='width:0;height:0;padding:0;border:0' "
+        "onclick=\"document.body.style.background='lime'\"></button>"
+        "<input id='keys' onkeydown=\"if(event.key==='ArrowRight') "
+        "document.body.style.background='blue'\">"
+        "</body></html>"
+    )
+    config = {
+        "shots": [
+            {"url": str(page), "out": str(tmp_path / "initial.png")},
+            {
+                "url": str(page),
+                "jsClicks": ["#js"],
+                "out": str(tmp_path / "js-click.png"),
+            },
+            {
+                "url": str(page),
+                "focus": "#keys",
+                "presses": ["ArrowRight"],
+                "out": str(tmp_path / "key-press.png"),
+            },
+        ]
+    }
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps(config))
+
+    result = _run_node([str(SCRIPT), str(cfg)], cwd=tmp_path)
+    output = _skip_if_env_unavailable(result)
+
+    assert result.returncode == 0, f"interaction run failed:\n{output}"
+    digests = {
+        hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()
+        for name in ("initial.png", "js-click.png", "key-press.png")
+    }
+    assert len(digests) == 3, "the interaction steps did not produce distinct captured states"
+
+
+def test_scroll_top_false_preserves_a_page_scroll_position(tmp_path):
+    """The default shot resets to its red top, while `scrollTop: false` keeps its blue lower view."""
+    page = tmp_path / "scroll.html"
+    page.write_text(
+        "<!DOCTYPE html><html><body style='margin:0'>"
+        "<div style='height:900px;background:red'></div>"
+        "<div style='height:900px;background:blue'></div>"
+        "<script>window.scrollTo(0, 900)</script>"
+        "</body></html>"
+    )
+    config = {
+        "shots": [
+            {"url": str(page), "out": str(tmp_path / "reset.png")},
+            {
+                "url": str(page),
+                "scrollTop": False,
+                "out": str(tmp_path / "preserved.png"),
+            },
+        ]
+    }
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps(config))
+
+    result = _run_node([str(SCRIPT), str(cfg)], cwd=tmp_path)
+    output = _skip_if_env_unavailable(result)
+
+    assert result.returncode == 0, f"scroll run failed:\n{output}"
+    assert hashlib.sha256((tmp_path / "reset.png").read_bytes()).hexdigest() != hashlib.sha256(
+        (tmp_path / "preserved.png").read_bytes()
+    ).hexdigest(), "scrollTop: false did not preserve a distinct lower-page capture"
+
+
 def test_thin_extension_fixture_runs_end_to_end(tmp_path):
     """The ~30-line wrapper fixture reproduces the forked behavior without touching the pinned file.
 
@@ -244,7 +318,6 @@ def test_thin_extension_fixture_runs_end_to_end(tmp_path):
     assert result.returncode == 0, f"thin extension run failed:\n{output}"
     assert (tmp_path / "ext.png").exists()
     # The whole point of the seam: the repo-local behavior ran without the pinned file moving.
-    import hashlib
     import tomllib
 
     manifest = tomllib.loads(

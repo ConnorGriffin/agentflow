@@ -153,8 +153,12 @@ does not provide adds it through the sanctioned repo-local seam (ADR 735):
 - Enrollment upgrades a harness that still holds the current or a recorded
   previous pin, and refuses — with the recovery path named — to overwrite one
   carrying repo-local edits, so a local fork's work is never silently destroyed.
-- A pull request that mutates a pinned path in an enrolled repo fails a blocking
-  pre-merge check with the same redirection to this seam.
+- AgentFlow's autonomous Review settlement parks a pull request that mutates a
+  pinned path in an enrolled repo before its own merge arm, with the same
+  redirection to this seam. This is not a GitHub required status check: a human
+  merge, or any merge path that bypasses AgentFlow Review, is not blocked by it.
+  Independently, the manifest-owning repo's normal pytest CI asserts that the
+  shipped harness bytes match its recorded pin.
 
 ### Deliberately re-pinning the harness (owner repo only)
 
@@ -167,7 +171,8 @@ the manifest, and always in lockstep within one pull request:
    superseded digest to `known_old_sha256` so already-enrolled repos upgrade
    cleanly instead of all failing at once.
 
-The pre-merge check recognizes exactly this lockstep shape as the sanctioned
-path through; a harness edit without the matching manifest update is blocked
-even in the owner repo, because half a re-pin breaks enrollment for every
-enrolled repo.
+AgentFlow Review settlement recognizes exactly this lockstep shape as the
+sanctioned path through; a harness edit without the matching manifest update is
+parked even in the owner repo, because half a re-pin breaks enrollment for every
+enrolled repo. It remains an AgentFlow merge-path guard, not a block on manual
+or other non-AgentFlow merges.

@@ -39,14 +39,20 @@ in the owning repo's deliberate re-pin.
    (`agentflow/repo_facts.py`) routes every stage's capture instruction
    (`agentflow/screenshot_crib.py`) to the declared entry point; silence keeps
    the canonical instruction unchanged.
-3. **Enrollment never destroys local work.** Converge upgrades a harness still
-   holding the current or a recorded previous pin, and refuses — naming the
-   file and the recovery path — to overwrite one carrying any other bytes
-   (`agentflow/enroll.py`).
-4. **Pinned-path mutation fails a blocking check before merge.** Review
-   settlement parks a PR that mutates a pinned path (`agentflow/gate.py`,
-   `pinned_mutation_gap`) with an actionable reason pointing at the seam — the
-   signal arrives before merge, not as a post-merge enrollment brick.
+3. **Enrollment never destroys local work.** Converge and launch
+   materialization upgrade a harness still holding the current or a recorded
+   previous pin, and refuse — naming the file and the recovery path — to
+   overwrite one carrying any other bytes (`agentflow/enroll.py`). Doctor and
+   `repair_capability_refusal` still compare only against the current `sha256`,
+   so they report a recorded previous pin as drifted and decline self-repair;
+   that pre-existing behavior is outside this decision.
+4. **Pinned-path mutation is stopped in AgentFlow Review settlement.**
+   `agentflow/coordinated_review.py` calls `pinned_mutation_gap`
+   (`agentflow/gate.py`) and parks the PR with `PINNED_MUTATION_REASON` before
+   AgentFlow's merge arm. It is not a GitHub required status check: a human
+   merge, or any merge path not mediated by AgentFlow Review, is not blocked by
+   this guard. Separately, the manifest-owning repo's normal pytest CI asserts
+   that the shipped harness bytes match its recorded pin.
 5. **The owner repo re-pins in lockstep.** The one sanctioned way through the
    check: the repository that ships the manifest moves the pinned bytes and the
    recorded digest in the same PR, appending the superseded digest to
