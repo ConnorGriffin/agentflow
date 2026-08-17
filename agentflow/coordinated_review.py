@@ -45,7 +45,9 @@ from agentflow.pool_control import POOLS, pool_paused
 from agentflow.pr_park import (chain_uncertainty, exact_head_review_chain, park_context,
                                park_proof_marker)
 from agentflow.prompts import UI_GAP_REASON, stage_prompt_spec
-from agentflow.repo_facts import repo_profile, surface_declaration, surfaces_phrase, ui_surfaces
+from agentflow.repo_facts import (
+    repo_profile, screenshot_entry, surface_declaration, surfaces_phrase, ui_surfaces)
+from agentflow.screenshot_crib import screenshot_entry_note
 from agentflow.review_policy import current_head_author
 from agentflow.reviewer import review_worktree
 from agentflow.routing import routing
@@ -153,8 +155,8 @@ def _build_source_parts(record):
 
 
 def review_submission(build_record, head_sha, reviewer_tool, pr_number,
-                      *, acceptance="", surfaces="", conflict_resolution=False,
-                      review=None):
+                      *, acceptance="", surfaces="", screenshot_entry_note="",
+                      conflict_resolution=False, review=None):
     """Translate a completed Build (or completed Revise) and its PR head SHA into one Review stage
     submission — the minimal facts the coordinator needs (ADR 0030). The review is bound to the
     *exact* head SHA (its immutable target, so a new head SHA starts a fresh review stage), assumes
@@ -190,7 +192,8 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
     brief = REVIEW_PROMPT.format(
         pr=pr_number, issue=build_record.subject, starting_sha=head_sha,
         acceptance=acceptance or "(none provided)",
-        surfaces=surfaces or "any user-facing surface")
+        surfaces=surfaces or "any user-facing surface",
+        screenshot_entry_note=screenshot_entry_note)
     state = review or ReviewState()
     assignment = state.assignment
     author = current_head_author(build_record.change_author_tool, build_record.builder_lineage)
@@ -229,7 +232,8 @@ def review_submission(build_record, head_sha, reviewer_tool, pr_number,
 
 
 def conflict_decision_review_submission(revise_record, *, head_sha: str, pr_number: int,
-                                        acceptance: str, surfaces: str):
+                                        acceptance: str, surfaces: str,
+                                        screenshot_entry_note: str = ""):
     """Open the one private other-tool decision pass for genuine conflict ambiguity."""
     import json
     from agentflow.review_policy import (
@@ -263,7 +267,8 @@ def conflict_decision_review_submission(revise_record, *, head_sha: str, pr_numb
         return None
     return review_submission(
         revise_record, head_sha, reviewer_tool, pr_number,
-        acceptance=acceptance, surfaces=surfaces, conflict_resolution=True,
+        acceptance=acceptance, surfaces=surfaces,
+        screenshot_entry_note=screenshot_entry_note, conflict_resolution=True,
         review=ReviewState(
             assignment=ReviewAssignment(
                 ReviewDepth.FULL, "competing product behaviors in a conflict",
@@ -553,7 +558,8 @@ def survivor_review_submission(cfg, *, issue: int, slug: str, builder_tool: str,
     prompt = REVIEW_PROMPT.format(
         pr=pr_number, issue=issue, starting_sha=head_sha,
         acceptance=acceptance or "(none provided)",
-        surfaces=surfaces_phrase(surface_declaration(cfg.workdir)))
+        surfaces=surfaces_phrase(surface_declaration(cfg.workdir)),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(cfg.workdir)))
     state = review or ReviewState()
     assignment = state.assignment
     author = state.change_author_tool
@@ -1085,9 +1091,9 @@ def post_repair_notice(record, verdict) -> str | None:
 def _settle_review(record) -> str | None:
     """Consume a parsed exact-head verdict through the established repository merge policy."""
     from agentflow import ratchet
-    from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
-                                post_clean_review_summary, reply_pending, squash_merge,
-                                ui_evidence_gap, ui_verification_required)
+    from agentflow.gate import (PINNED_MUTATION_REASON, MergeDecision, ci_is_green, decide_merge,
+                                pinned_mutation_gap, post_clean_review_summary, reply_pending,
+                                squash_merge, ui_evidence_gap, ui_verification_required)
 
     facts = review_source_facts(record)
     if facts is None:
@@ -1139,6 +1145,19 @@ def _settle_review(record) -> str | None:
         return _park_review_settlement(
             record, verdict, workdir, pr, reason="current head author is unreadable",
             autonomous=autonomous)
+
+    # The pin gate (#735): a PR that mutates a digest-pinned path can never settle clean —
+    # merged, it bricks the repo's own enrollment. Parked before any merge arm, with the one
+    # sanctioned way through (the owner repo's lockstep re-pin) decided inside the gate.
+    pin_gap = pinned_mutation_gap(record.repo, pr)
+    if pin_gap is None:
+        return None   # PR files unreadable — defer and re-drive, like the head check gate
+    if pin_gap:
+        return _park_review_settlement(
+            record, verdict, workdir, pr, reason=PINNED_MUTATION_REASON,
+            autonomous=autonomous, checks=verdict.checks,
+            missing="The PR changes a fleet-pinned file in place instead of extending it "
+                    "through the sanctioned repo-local seam.")
 
     surfaces = ui_surfaces(workdir)
     ui_gap = ui_evidence_gap(record.repo, pr, surfaces)
@@ -1293,8 +1312,10 @@ def _settle_review(record) -> str | None:
     return f"https://github.com/{record.repo}/pull/{pr}"
 
 
-def _review_context(record) -> tuple[str, str] | None:
-    """The issue-anchored acceptance brief and declared UI surfaces for a Review."""
+def _review_context(record) -> tuple[str, str, str] | None:
+    """The issue-anchored acceptance brief, declared UI surfaces, and repo-local capture-entry note
+    for a Review — all three read from the reviewed checkout so the prompt names this repo's own
+    facts (#735)."""
 
     parts = _build_source_parts(record)
     if parts is None:
@@ -1305,7 +1326,11 @@ def _review_context(record) -> tuple[str, str] | None:
         acceptance = github.issue_body(record.repo, record.subject)
         if acceptance is None:   # unreadable stays unknown — the opener refuses rather than guesses
             return None
-    return acceptance, surfaces_phrase(surface_declaration(workdir))
+    return (
+        acceptance,
+        surfaces_phrase(surface_declaration(workdir)),
+        screenshot_entry_note(screenshot_entry(workdir)),
+    )
 
 
 def _review_assignment_facts(repo: str, pr_number: int, *, conflict_resolution: bool = False,

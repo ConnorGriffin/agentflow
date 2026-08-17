@@ -172,7 +172,8 @@ separability: slice-bearing
 def test_build_prompt_and_requirements_share_one_skill_authority():
     spec = stage_prompt_spec("build")
 
-    assert "/tdd" in spec.render(repo="o/r", n=1, title="x", body="", effort="low", surfaces="none")
+    assert "/tdd" in spec.render(repo="o/r", n=1, title="x", body="", effort="low", surfaces="none",
+                                 screenshot_entry_note="")
     assert {requirement.id for requirement in requirements_for("build", {"ui": False})} >= {
         "tdd", "codebase-design", "domain-modeling"
     }

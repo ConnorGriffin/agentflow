@@ -1785,3 +1785,70 @@ def test_launch_materialization_reports_failed_mkdir_rollback(
     assert ready is False and "creation failed" in detail
     assert ("rollback failed" in detail) is cleanup_denied
     assert provider_root.exists() is cleanup_denied
+
+
+def _harness_spec():
+    manifest = tomllib.loads(files("agentflow").joinpath("capabilities.toml").read_text())
+    return next(item for item in manifest["capabilities"] if item["id"] == "screenshot-harness")
+
+
+def test_converge_refuses_a_locally_modified_screenshot_harness(tmp_path):
+    """A drifted harness that is neither the current nor a recorded previous pin is a repo-local
+    edit: converge must stop with an actionable message and never touch the bytes (#735)."""
+    from agentflow import enroll
+
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    harness = root / "scripts" / "screenshots.mjs"
+    modified = b"// repo-local capture tweaks\nimport './screenshots.mjs';\n"
+    harness.write_bytes(modified)
+
+    problem = enroll._managed_files_problem(root, ("frontend/",), converge=True)
+
+    assert problem is not None
+    assert str(harness) in problem
+    assert "scripts/screenshots.local.mjs" in problem
+    assert harness.read_bytes() == modified  # preflight refused before any write
+
+
+def test_write_site_never_overwrites_a_locally_modified_harness(tmp_path):
+    """Belt and braces: even a caller that skipped the preflight cannot overwrite a modified
+    harness, because the write site computes ``overwrite`` from the same digest test (#735)."""
+    from agentflow import enroll
+
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    harness = root / "scripts" / "screenshots.mjs"
+    modified = b"// repo-local capture tweaks\n"
+    harness.write_bytes(modified)
+
+    spec = _harness_spec()
+    assert enroll._harness_convergeable(harness, spec) is False
+    outcome = enroll._install_file(
+        harness, enroll._asset_text("scripts/screenshots.mjs"),
+        overwrite=enroll._harness_convergeable(harness, spec))
+
+    assert outcome.startswith("WARN:")
+    assert harness.read_bytes() == modified
+
+
+def test_converge_upgrades_a_known_old_pinned_harness(tmp_path):
+    """The untouched-upgrade path is preserved: a harness still holding a recorded previous pin is
+    convergeable and the write site overwrites it with the current pinned bytes (#735)."""
+    from agentflow import enroll
+
+    checkout = Path(__file__).parents[1]
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    harness = root / "scripts" / "screenshots.mjs"
+    harness.write_bytes((checkout / "tests" / "fixtures" / "old-screenshots.mjs").read_bytes())
+
+    spec = _harness_spec()
+    assert enroll._managed_files_problem(root, ("frontend/",), converge=True) is None
+    assert enroll._harness_convergeable(harness, spec) is True
+    pinned = enroll._asset_text("scripts/screenshots.mjs")
+    outcome = enroll._install_file(
+        harness, pinned, overwrite=enroll._harness_convergeable(harness, spec))
+
+    assert outcome.startswith("DO:")
+    assert harness.read_text() == pinned

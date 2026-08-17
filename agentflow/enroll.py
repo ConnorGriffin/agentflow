@@ -43,7 +43,7 @@ from agentflow.provider_skills import (
     skill_destination_status as _skill_destination_status,
 )
 from agentflow.repo_facts import (UI_SURFACES_NONE, SurfaceDeclaration, _UI_SURFACES_RE,
-                                  surface_declaration)
+                                  screenshot_entry, surface_declaration)
 from agentflow.runtime_contracts import playwright_runtime_status as _runtime_status
 from agentflow.skill_ownership import clear_skill_ownership, mark_skill_owned, skill_ownership
 
@@ -339,6 +339,26 @@ def _file_status(path: Path, expected_sha256: str) -> str:
     if hashlib.sha256(path.read_bytes()).hexdigest() != expected_sha256:
         return "drifted"
     return "ok"
+
+
+def _harness_convergeable(harness: Path, spec: dict) -> bool:
+    """Whether converge may overwrite a drifted harness in place, using the same digest test the
+    launch materializer applies (`provider_skills.materialize_harness`). Only a harness still
+    holding the current pin or a recorded previous pin is an untouched upgrade; any other bytes are
+    a repo-local modification whose silent loss enrollment must refuse (#735)."""
+    if not harness.is_file():
+        return False
+    digest = hashlib.sha256(harness.read_bytes()).hexdigest()
+    return digest == spec["sha256"] or digest in frozenset(spec.get("known_old_sha256", ()))
+
+
+def _harness_modification_refusal(harness: Path) -> str:
+    """The actionable stop when a drifted harness carries repo-local edits rather than an old pin."""
+    return (
+        f"{harness} has repo-local modifications; move them into a thin extension at "
+        "scripts/screenshots.local.mjs (which imports the pinned harness) and restore the pinned "
+        "bytes, then re-run"
+    )
 
 
 def _skill_status(root: Path, name: str, files_manifest: list[dict]) -> str:
@@ -828,8 +848,10 @@ def _managed_files_problem(
         )
         status = _file_status(harness, spec["sha256"])
         if status != "ok" and (harness.exists() or harness.is_symlink()):
-            if converge and status == "drifted" and harness.is_file():
-                pass  # convergeable
+            if converge and status == "drifted" and _harness_convergeable(harness, spec):
+                pass  # convergeable: an untouched previous pin being upgraded
+            elif converge and status == "drifted" and harness.is_file():
+                return _harness_modification_refusal(harness)  # never overwrite local edits (#735)
             else:
                 return f"managed screenshot harness is {status} at {harness}"
     return None
@@ -1400,9 +1422,17 @@ def _apply_enrollment(
 
     if surfaces:
         harness = root / "scripts" / "screenshots.mjs"
+        spec = next(
+            item
+            for item in _manifest()["capabilities"]
+            if item["id"] == "screenshot-harness"
+        )
+        # Belt and braces with the preflight: never overwrite a harness carrying repo-local edits,
+        # so a caller that skipped `_managed_files_problem` still cannot cause silent loss (#735).
+        overwrite = converge and _harness_convergeable(harness, spec)
         outcomes.append(
             _install_file(
-                harness, _asset_text("scripts/screenshots.mjs"), overwrite=converge
+                harness, _asset_text("scripts/screenshots.mjs"), overwrite=overwrite
             )
         )
         outcomes.append(
@@ -1466,6 +1496,21 @@ def _ignored_enrollment_path(root: Path, surfaces: tuple[str, ...]) -> str | Non
     return None
 
 
+def _screenshot_entry_warning(root: Path) -> str | None:
+    """A soft advisory when a repo declares a `screenshot-entry:` that cannot be honored — the file
+    is absent, or it aliases the pinned `scripts/screenshots.mjs` it is meant to wrap. It is never a
+    hard failure: the declaration is the repo's own to fix, and enrollment still installs the pinned
+    harness the wrapper imports (#735). None when nothing is declared or the wrapper is intact."""
+    entry = screenshot_entry(str(root))
+    if entry is None:
+        return None
+    if entry == "scripts/screenshots.mjs":
+        return f"declared screenshot-entry {entry} aliases the pinned harness it should wrap"
+    if not (root / entry).is_file():
+        return f"declared screenshot-entry {entry} does not exist"
+    return None
+
+
 def enroll_repository(
     workdir: str,
     *,
@@ -1486,6 +1531,11 @@ def enroll_repository(
     print(f"AgentFlow enrollment — {root}")
     print(f"  profile: {profile}")
     print(f"  {declaration_line(surfaces)}")
+    entry_warning = _screenshot_entry_warning(root)
+    if entry_warning:
+        # Visible in both doctor (dry run) and apply, but never blocks: a broken capture wrapper is
+        # the repo's own to repair, not a reason to withhold the pinned harness it imports (#735).
+        print(f"  WARN: {entry_warning}")
     if apply:
         problem = (
             _checkout_problem(root)

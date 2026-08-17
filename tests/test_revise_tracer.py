@@ -1254,6 +1254,79 @@ def test_decision_revise_waits_for_capacity_without_parking_the_completed_review
     assert coord.parked == []
 
 
+def test_a_declaring_repos_revise_prompt_carries_its_entry_point_a_silent_repos_does_not(
+        tmp_path, monkeypatch):
+    """Issue #735 acceptance criterion 10: a repo that declares `screenshot-entry:` gets every
+    stage's capture instruction routed through its wrapper — including Revise, the stage most
+    likely to be fixing a missing screenshot. A repo that declares nothing keeps the unchanged
+    canonical instruction."""
+    review = Record(
+        identity="o/r|7|review|sha-a", stage="review", pool="codex", demand=1,
+        repo="o/r", subject="7", target="sha-a", builder_lineage="claude",
+        branch_lineage="claude", builder_complexity="deep", builder_effort="low",
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    monkeypatch.setattr(pipeline.tracer, "load_records", lambda: [review])
+    monkeypatch.setattr(coordinated_review, "_review_verdict",
+                        lambda _r: Verdict(clean=False, findings=(Finding("blocking", "fix it"),)))
+    monkeypatch.setattr(pipeline, "pick_session_lead",
+                        lambda **_kwargs: (SimpleNamespace(tool="claude"), None, ""))
+
+    for declares in (True, False):
+        workdir = tmp_path / ("declaring" if declares else "silent")
+        workdir.mkdir()
+        text = "# repo\n\nui-surfaces: frontend/\n"
+        if declares:
+            text += "screenshot-entry: scripts/screenshots.local.mjs\n"
+        (workdir / "AGENTS.md").write_text(text)
+        monkeypatch.setattr(coordinated_revise, "_revise_builder_source",
+                            lambda _review, _workdir=str(workdir): (_workdir, 42))
+        submitted = []
+        coord = SimpleNamespace(
+            submit_stage=submitted.append,
+            park_completed=lambda *_a: pytest.fail("must not park"))
+
+        pipeline._open_revise_on_blocking_review(coord, review.identity)
+
+        assert len(submitted) == 1
+        carries_entry_point = (
+            "This repo declares a local capture entry point" in submitted[0].input_ptr)
+        assert carries_entry_point is declares
+
+
+def test_a_declaring_repos_conflict_decision_revise_prompt_carries_its_entry_point(
+        tmp_path, monkeypatch):
+    """The conflict-decision opener (`review.review_axis == "decision"`) is a distinct submission
+    path from the ordinary finding-driven revise above — `pipeline._open_revise_on_blocking_review`
+    routes it through `coordinated_revise.conflict_decision_revise_submission`, not
+    `revise_submission`. It must carry the same declared entry point, or a silent repo's unchanged
+    canonical instruction, exactly like the ordinary path (#735)."""
+    review = Record(
+        identity="o/r|7|review|head|adecision|u1", stage="review", pool="codex", demand=2,
+        repo="o/r", subject="7", target="head", conflict_round=1,
+        builder_lineage="claude", builder_complexity="deep",
+        review_depth="full", review_axis="decision", uncertainty_handoffs=1,
+        source="/work/.agentflow/worktrees/codex-review/pr-42-fix")
+    verdict = Verdict(
+        clean=True, reviewed_sha="head", final_sha="head", decision="keep main")
+
+    for declares in (True, False):
+        workdir = tmp_path / ("declaring" if declares else "silent")
+        workdir.mkdir()
+        text = "# repo\n\nui-surfaces: frontend/\n"
+        if declares:
+            text += "screenshot-entry: scripts/screenshots.local.mjs\n"
+        (workdir / "AGENTS.md").write_text(text)
+        monkeypatch.setattr(coordinated_revise, "_revise_builder_source",
+                            lambda _review, _workdir=str(workdir): (_workdir, 42))
+
+        submission = coordinated_revise.conflict_decision_revise_submission(review, verdict)
+
+        assert submission is not None
+        carries_entry_point = (
+            "This repo declares a local capture entry point" in submission.input_ptr)
+        assert carries_entry_point is declares
+
+
 def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypatch):
     """The PR body may propose Focused, but the resolved decision remains Full and must restart
     the product→standards sequence over the resolved head."""
@@ -1272,7 +1345,7 @@ def test_resolved_private_conflict_decision_reopens_full_product_review(monkeypa
         github, "open_pr_for_branch",
         lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "resolved"))
     monkeypatch.setattr(
-        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none", ""))
     monkeypatch.setattr("agentflow.coordinated_review.repo_profile", lambda _workdir: "reviewed")
     monkeypatch.setattr(pipeline, "pick_reviewer", lambda *_args, **_kwargs: "codex")
     submitted = []
@@ -1303,7 +1376,7 @@ def test_completed_revise_selects_against_its_recorded_head_author(monkeypatch):
         github, "open_pr_for_branch",
         lambda *_args: github.PrRow(42, "agentflow/codex/issue-7-fix", "rebased"))
     monkeypatch.setattr(
-        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none", ""))
     monkeypatch.setattr(
         coordinated_review, "_review_assignment_facts",
         lambda *_args, **_kwargs: (ReviewAssignment(reason="one journey"), ()))
@@ -1334,7 +1407,7 @@ def test_completed_revise_without_a_known_head_author_parks_for_a_maintainer(mon
         github, "open_pr_for_branch",
         lambda *_args: github.PrRow(42, "agentflow/claude/issue-7-fix", "rebased"))
     monkeypatch.setattr(
-        coordinated_review, "_review_context", lambda _record: ("acceptance", "none"))
+        coordinated_review, "_review_context", lambda _record: ("acceptance", "none", ""))
     parked = []
     coord = SimpleNamespace(
         submit_stage=lambda _submission: pytest.fail("unknown authors must not open a review"),

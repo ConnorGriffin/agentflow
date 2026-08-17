@@ -377,7 +377,7 @@ def test_codex_review_pr_reads_stay_in_the_existing_networked_sandbox(tmp_path):
     _detached_worktree(repo, wt)
     prompt = REVIEW_PROMPT.format(
         pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
-        surfaces="`agentflow/webui/`")
+        surfaces="`agentflow/webui/`", screenshot_entry_note="")
 
     command = CodexRunner().structured_argv(prompt, "gpt-5.6-terra", str(wt))
     config = [command[index + 1] for index, value in enumerate(command[:-1]) if value == "-c"]
@@ -470,15 +470,17 @@ def test_unattended_stage_submissions_offer_narrow_codex_browser_recovery_only(t
     repo = _repo_with_origin(tmp_path)
     stage_prompts = [
         ("build", BUILD_PROMPT.format(
-            repo="o/r", n=7, title="x", body="", effort="low", surfaces="`frontend/`")),
+            repo="o/r", n=7, title="x", body="", effort="low", surfaces="`frontend/`",
+            screenshot_entry_note="")),
         ("revise", REVISE_PROMPT.format(
-            n=7, repo="o/r", findings="- attach proof", surfaces="`frontend/`")),
+            n=7, repo="o/r", findings="- attach proof", surfaces="`frontend/`",
+            screenshot_entry_note="")),
         ("respond", RESPOND_PROMPT.format(
             n=7, baseline="abc123", comment="show the screen",
-            disclaimer="> *agentflow reply*")),
+            disclaimer="> *agentflow reply*", screenshot_entry_note="")),
         ("mockup", PRODUCE_PROMPT.format(
             repo="o/r", n=7, title="x", body="", branch="mockup-7",
-            surfaces="`frontend/`", scope_guidance="SCOPE: local",
+            surfaces="`frontend/`", screenshot_entry_note="", scope_guidance="SCOPE: local",
             disclaimer="> *agentflow mockup*")),
     ]
 
@@ -513,7 +515,7 @@ def test_review_sessions_on_both_tools_carry_the_browser_recovery_exactly_once(t
 
     prompt = REVIEW_PROMPT.format(
         pr=7, issue=3, starting_sha="abc123", acceptance="works",
-        surfaces="`frontend/`")
+        surfaces="`frontend/`", screenshot_entry_note="")
     # Codex can request the narrow escalation; Claude's strict launcher has no equivalent and
     # is explicitly instructed to return an evidenced unavailable result instead of bluffing.
     assert "On Claude, the strict launcher provides no sandbox-escalation mechanism" in prompt

@@ -4,6 +4,7 @@ The one thing that must never happen: MERGE without independent review + green C
 + clean verdict.
 """
 
+import hashlib
 import json
 import time
 from dataclasses import replace
@@ -16,6 +17,7 @@ from agentflow import github
 from agentflow.gate import (MergeDecision, ci_is_green, decide_merge,
                             has_committed_evidence, has_image_evidence,
                             maintainer_comment, maintainer_comment_id, reply_pending,
+                            pinned_mutation_gap, pinned_path_mutation,
                             respond_reply_disclaimer, review_resume_passes, squash_merge,
                             touches_ui_surface, ui_evidence_gap)
 from agentflow.coordinator.record import Record
@@ -367,6 +369,136 @@ class TestBackfilledSurfacesActuallyGate:
             raise AssertionError("a headless repo must not be read for UI evidence")
         monkeypatch.setattr(gate.github, "pr_content", explode)
         assert ui_evidence_gap("o/r", 476, []) is False
+
+
+class TestPinnedMutationGate:
+    # Issue #735: a merged edit to a digest-pinned file bricks the repo's own enrollment, so the
+    # mutation must fail a blocking check before merge. The one sanctioned way through is the
+    # owning repo's deliberate re-pin: the pinned bytes and the recorded digest move in one PR.
+
+    def test_touching_the_pinned_harness_in_an_enrolled_repo_is_a_gap(self):
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs", "src/app.py"], owns_pin_manifest=False) is True
+
+    def test_a_repin_shaped_pr_outside_the_owner_repo_is_still_a_gap(self):
+        # Only the manifest's own repo may re-pin; a look-alike manifest path elsewhere is inert.
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs", "agentflow/capabilities.toml"],
+            owns_pin_manifest=False) is True
+
+    def test_the_owners_lockstep_repin_passes(self):
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs", "agentflow/capabilities.toml"],
+            owns_pin_manifest=True) is False
+
+    def test_the_owner_moving_pinned_bytes_without_the_digest_is_a_gap(self):
+        # Half a re-pin is a broken enrollment for every enrolled repo: block it too.
+        assert pinned_path_mutation(
+            ["scripts/screenshots.mjs"], owns_pin_manifest=True) is True
+
+    def test_a_repo_local_extension_never_trips_the_gate(self):
+        # The sanctioned seam: the extension file and its declaration, pinned bytes untouched.
+        assert pinned_path_mutation(
+            ["scripts/screenshots.local.mjs", "AGENTS.md"], owns_pin_manifest=False) is False
+
+    def test_an_unreadable_pr_defers_rather_than_parks(self, monkeypatch):
+        # None defers settlement to a re-drive (like the head check gate) — a transient gh
+        # failure must neither park the PR nor let it through.
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: None)
+        assert pinned_mutation_gap("o/r", 7) is None
+
+    def test_the_live_gap_reads_the_prs_changed_files(self, monkeypatch):
+        # Path membership alone is a candidate gap, not the verdict: the digest read below is what
+        # actually confirms these are repo-local tampering rather than a legitimate re-addition.
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(gate, "_pinned_digests", lambda: frozenset({"the-canonical-digest"}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: b"repo-local tampering")
+        assert pinned_mutation_gap("o/r", 7) is True
+
+    def test_a_pr_that_adds_back_exactly_the_canonical_bytes_is_not_a_gap(self, monkeypatch):
+        # screenshot_crib.py tells every session without a copy of the harness to port agentflow's
+        # own in at exactly this path — that PR's changed-file set touches the pinned path, but it
+        # ships the canonical bytes and must not be parked as a mutation (#735).
+        canonical = b"canonical harness bytes"
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(
+            gate, "_pinned_digests",
+            lambda: frozenset({hashlib.sha256(canonical).hexdigest()}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: canonical)
+        assert pinned_mutation_gap("o/r", 7) is False
+
+    def test_a_pr_that_restores_a_known_old_pin_is_not_a_gap(self, monkeypatch):
+        # A digest the manifest once canonically held (before a deliberate re-pin) is also not a
+        # mutation — the harness's own drift-repair path can land one of these too.
+        old_bytes = b"a previously-canonical harness revision"
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(
+            gate, "_pinned_digests",
+            lambda: frozenset({"unrelated-current-digest", hashlib.sha256(old_bytes).hexdigest()}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: old_bytes)
+        assert pinned_mutation_gap("o/r", 7) is False
+
+    def test_unreadable_bytes_at_the_pr_head_defer_rather_than_park(self, monkeypatch):
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts",
+                            lambda *a: github.PrFacts("branch", "deadbeef", "OPEN", ()))
+        monkeypatch.setattr(gate, "_pinned_digests", lambda: frozenset({"anything"}))
+        monkeypatch.setattr(gate.github, "file_at_ref", lambda *a: None)
+        assert pinned_mutation_gap("o/r", 7) is None
+
+    def test_an_unreadable_head_sha_defers_rather_than_parks(self, monkeypatch):
+        content = github.PrContent(
+            body="", paths=("scripts/screenshots.mjs",), comments=[])
+        monkeypatch.setattr(gate.github, "pr_content", lambda *a: content)
+        monkeypatch.setattr(gate, "_owns_pin_manifest", lambda repo: False)
+        monkeypatch.setattr(gate.github, "pr_facts", lambda *a: None)
+        assert pinned_mutation_gap("o/r", 7) is None
+
+    # -- _owns_pin_manifest itself: the sanctioned owner-repo path through the gate above was
+    # previously exercised only through the pure predicate (owns_pin_manifest injected as a bool)
+    # or monkeypatched away entirely. These drive the live function through its own seam.
+
+    def test_owns_pin_manifest_is_true_for_the_packaged_repository(self, monkeypatch):
+        monkeypatch.setattr("agentflow.provider_skills._github_repository",
+                            lambda _root: "o/r")
+        assert gate._owns_pin_manifest("o/r") is True
+        assert gate._owns_pin_manifest("O/R") is True  # case-insensitive, like a GitHub slug
+
+    def test_owns_pin_manifest_is_false_for_another_repository(self, monkeypatch):
+        monkeypatch.setattr("agentflow.provider_skills._github_repository",
+                            lambda _root: "o/r")
+        assert gate._owns_pin_manifest("someone-else/other-repo") is False
+
+    def test_owns_pin_manifest_is_false_when_the_package_repository_is_unreadable(
+            self, monkeypatch):
+        """A non-editable/site-packages install of agentflow has no git checkout behind the
+        running package, so `provider_skills._github_repository` returns "" (`git rev-parse` finds
+        no work tree there). Nothing in the code enforces that agentflow always runs from an
+        editable checkout of its own repository when it evaluates its own PRs, so this is
+        reachable, not a state ruled out by an invariant: under it, even the manifest-owning
+        repo's own lockstep re-pin PR would be treated as a non-owner mutation and parked. This
+        pins today's fail-closed behavior rather than papering over it; changing it is a separate
+        decision."""
+        monkeypatch.setattr("agentflow.provider_skills._github_repository", lambda _root: "")
+        assert gate._owns_pin_manifest("o/r") is False
 
 
 # --- issue #18: an unanswered maintainer comment blocks auto-merge --------------

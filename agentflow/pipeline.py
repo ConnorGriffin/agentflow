@@ -40,8 +40,10 @@ from agentflow.coordinator.store import (
 from agentflow.gate import MAX_REVISES, revise_round_budget_remains
 from agentflow.labels import BUILDING, DRAWING, RESOLVING, TRIAGING
 from agentflow.pr_park import park_pr
-from agentflow.repo_facts import repo_profile
+from agentflow.repo_facts import (repo_profile, screenshot_entry, surface_declaration,
+                                  surfaces_phrase)
 from agentflow.review_policy import CONFLICT_UNCERTAINTY_PREFIX, current_head_author
+from agentflow.screenshot_crib import screenshot_entry_note
 from agentflow.stage_worktree import worktree_ready
 from agentflow.worktree_ref import source_facts
 
@@ -801,7 +803,7 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
     context = coordinated_review._review_context(build)
     if context is None:
         return
-    acceptance, surfaces = context
+    acceptance, surfaces, entry_note = context
     from agentflow.review_policy import ReviewState
     profile = repo_profile(_workdir)
     author = current_head_author(build.change_author_tool, build.builder_lineage)
@@ -817,7 +819,7 @@ def _open_review_on_completed_build(coord: Coordinator, build_identity: str) -> 
                 # build keeps its claim and this opener re-drives next cycle.
     submission = coordinated_review.review_submission(
         build, pr.head_ref_oid, reviewer_tool, pr.number,
-        acceptance=acceptance, surfaces=surfaces,
+        acceptance=acceptance, surfaces=surfaces, screenshot_entry_note=entry_note,
         review=ReviewState(assignment=assignment, change_author_tool=author))
     if submission is not None:
         coord.submit_stage(submission)
@@ -937,10 +939,13 @@ def _open_revise_on_blocking_review(coord: Coordinator, review_identity: str) ->
         coord.park_completed(review_identity)
         return
     findings = "\n".join(f"- {f.summary}" for f in verdict.blocking)
+    workdir, _pr_number = facts
     lead, _reviewer, _block_msg = pick_session_lead(
         stage="revise", complexity=complexity, effort=review.builder_effort)
     submission = (coordinated_revise.revise_submission(
         review, complexity, findings, target_sha=verdict.final_sha or review.target,
+        surfaces=surfaces_phrase(surface_declaration(workdir)),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(workdir)),
         parent_pool=lead.tool) if lead is not None else None)
     if submission is not None:
         coord.submit_stage(submission)
@@ -992,6 +997,8 @@ def _open_revise_on_red_check(coord: Coordinator, review, records: dict) -> None
         stage="revise", complexity=complexity, effort=review.builder_effort)
     submission = (coordinated_revise.revise_submission(
         review, complexity, findings, target_sha=reviewed_head,
+        surfaces=surfaces_phrase(surface_declaration(workdir)),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(workdir)),
         parent_pool=lead.tool) if lead is not None else None)
     if submission is not None:
         coord.submit_stage(submission)
@@ -1019,11 +1026,11 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
     context = coordinated_review._review_context(revise)
     if context is None:
         return
-    acceptance, surfaces = context
+    acceptance, surfaces, entry_note = context
     if revise.outcome and revise.outcome.startswith(CONFLICT_UNCERTAINTY_PREFIX):
         submission = coordinated_review.conflict_decision_review_submission(
             revise, head_sha=pr.head_ref_oid, pr_number=pr.number,
-            acceptance=acceptance, surfaces=surfaces)
+            acceptance=acceptance, surfaces=surfaces, screenshot_entry_note=entry_note)
         if submission is not None:
             coord.submit_stage(submission)
         return
@@ -1053,7 +1060,7 @@ def _open_review_on_completed_revise(coord: Coordinator, revise_identity: str) -
                 # revise keeps its claim and this opener re-drives next cycle.
     submission = coordinated_review.review_submission(
         revise, pr.head_ref_oid, reviewer_tool, pr.number,
-        acceptance=acceptance, surfaces=surfaces,
+        acceptance=acceptance, surfaces=surfaces, screenshot_entry_note=entry_note,
         conflict_resolution=conflict_resolution,
         review=review)  # ADR 0038: add discard-check lens
     if submission is not None:

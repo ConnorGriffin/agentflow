@@ -105,6 +105,8 @@ def _wire_clean_settlement(monkeypatch, record, *, profile="reviewed", head_chec
     monkeypatch.setattr("agentflow.coordinated_review.ui_surfaces", lambda _workdir: [])
     monkeypatch.setattr("agentflow.github.pr_comment_rows", lambda _repo, _pr: [])
     monkeypatch.setattr("agentflow.github.pr_comments", lambda _repo, _pr: [])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.github.edit_comment",
                         lambda comment_id, body: edited.append(comment_id) or True)
     monkeypatch.setattr("agentflow.github.commit_head_checks",
@@ -297,6 +299,8 @@ def test_a_repeat_park_with_a_changed_failing_set_leaves_the_comment_byte_identi
     monkeypatch.setattr("agentflow.github.pr_comments",
                         lambda _repo, _pr: [github.Comment(body=body, created_at="")
                                             for body in posted])
+    monkeypatch.setattr("agentflow.github.pr_content",
+                        lambda _repo, _pr: github.PrContent(body="", paths=(), comments=[]))
     monkeypatch.setattr("agentflow.github.edit_comment",
                         lambda comment_id, body: edited.append(comment_id) or True)
     monkeypatch.setattr("agentflow.gate.park", _park)
@@ -338,12 +342,14 @@ def _wire_opener(monkeypatch, review, *, head_checks, pr_state="OPEN", pr_head="
     captured = {}
     real_submission = coordinated_revise.revise_submission
 
-    def _submission(review_record, complexity, findings, *, target_sha="", parent_pool="claude"):
+    def _submission(review_record, complexity, findings, *, target_sha="", surfaces="",
+                    screenshot_entry_note="", parent_pool="claude"):
         captured.update(complexity=complexity, findings=findings, target_sha=target_sha,
+                        surfaces=surfaces, screenshot_entry_note=screenshot_entry_note,
                         parent_pool=parent_pool)
         return real_submission(
-            review_record, complexity, findings, target_sha=target_sha,
-            parent_pool=parent_pool)
+            review_record, complexity, findings, target_sha=target_sha, surfaces=surfaces,
+            screenshot_entry_note=screenshot_entry_note, parent_pool=parent_pool)
 
     monkeypatch.setattr("agentflow.coordinated_revise.revise_submission", _submission)
     monkeypatch.setattr(pipeline, "pick_session_lead",

@@ -24,8 +24,9 @@ from agentflow import github
 from agentflow.labels import BUILDING
 from agentflow.pr_park import park_pr_number
 from agentflow.prompts import stage_prompt_spec
-from agentflow.repo_facts import surface_declaration
+from agentflow.repo_facts import screenshot_entry, surface_declaration
 from agentflow.runner import _run
+from agentflow.screenshot_crib import screenshot_entry_note
 from agentflow.worktree_ref import BUILD_BRANCH_RE, WorktreeRef, source_facts
 
 
@@ -48,6 +49,7 @@ def respond_submission(cfg, pr_number, branch, comment, target, baseline):
     tool, n, sl = m.group(1), int(m.group(2)), m.group(3)
     brief = stage_prompt_spec("respond").render(
         n=pr_number, comment=comment, baseline=baseline,
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(cfg.workdir)),
         disclaimer=respond_reply_disclaimer(str(target)))
     return Submission(
         repo=cfg.repo, subject=str(n), stage="respond", target=str(target),

@@ -15,6 +15,7 @@ import threading
 import time
 from dataclasses import dataclass
 from enum import Enum
+from hashlib import sha256
 
 from agentflow import github
 from agentflow.reviewer import Verdict, parse_verdict
@@ -390,6 +391,101 @@ def ui_evidence_gap(repo: str, pr_number: int, surfaces: list[str]) -> bool:
         if PR_MARK in comment.body and has_image_evidence(comment.body):
             return False
     return True
+
+
+# The one digest-pinned path this pre-merge gate actually checks. `agentflow/capabilities.toml`
+# pins dozens more files by digest — every vendored skill file under each methodology/skill
+# capability's `files = [...]` list — and a repo-local edit to any of those bricks enrollment at
+# the next launch exactly the same way a screenshot-harness edit does. This gate does not cover
+# that wider set yet: it catches only the one path `screenshot_crib.py` licenses a session to add
+# back (`scripts/screenshots.mjs`), because that is the mutation observed in production (#735).
+# Widening it to the rest of the manifest is a separate, deliberately deferred decision — the
+# residual gap is real, not implied covered.
+PRE_MERGE_PINNED_PATHS = ("scripts/screenshots.mjs",)
+_PIN_MANIFEST = "agentflow/capabilities.toml"
+
+PINNED_MUTATION_REASON = (
+    "changes the shared screenshot harness in place — repo-local capture behavior belongs in a "
+    "small local extension that wraps the shared harness (declared with `screenshot-entry:`), so "
+    "the shared file's recorded fingerprint stays intact; merged as-is this would break the "
+    "repo's fleet enrollment (#735)")
+
+
+def pinned_path_mutation(paths, *, owns_pin_manifest: bool) -> bool:
+    """Pure: does this changed-file set mutate a pinned path without the sanctioned way through?
+
+    The one sanctioned path is the harness's own repository re-pinning deliberately: the pinned
+    bytes and the recorded digest in the manifest move in the same PR (#735). Any other mutation —
+    a non-owner repo touching the pinned file at all, or the owner touching it without the
+    lockstep manifest update — is a gap. The test surface for the pre-merge pin gate."""
+    files = set(paths)
+    if not files.intersection(PRE_MERGE_PINNED_PATHS):
+        return False
+    if owns_pin_manifest and _PIN_MANIFEST in files:
+        return False
+    return True
+
+
+def pinned_mutation_gap(repo: str, pr_number: int) -> bool | None:
+    """Live: does this PR mutate a pinned path without the owner's lockstep re-pin, and land bytes
+    the manifest doesn't already recognize?
+
+    A path-only "yes" from :func:`pinned_path_mutation` isn't the final answer: `screenshot_crib.py`
+    tells every session without a copy of the harness to port agentflow's own in at exactly the
+    pinned path, so a PR can legitimately ADD `scripts/screenshots.mjs` back — with exactly the
+    canonical bytes, or a digest the manifest once canonically held. That is a restoration or a
+    first adoption, not a mutation, and parking it with "changes the shared harness in place" would
+    be false (#735). So a path-only gap is downgraded when every touched pinned path's bytes at the
+    PR's own head hash to a digest `_pinned_digests` already accepts. ``None`` when the PR's files,
+    its head SHA, or a touched pinned file's bytes can't be read — the caller defers settlement and
+    re-drives, the same recovery the head check gate uses, rather than parking on a transient or
+    partial read."""
+    content = github.pr_content(repo, pr_number)
+    if content is None:
+        return None
+    touched = set(content.paths) & set(PRE_MERGE_PINNED_PATHS)
+    if not touched:
+        return False
+    if not pinned_path_mutation(content.paths, owns_pin_manifest=_owns_pin_manifest(repo)):
+        return False
+    facts = github.pr_facts(repo, pr_number)
+    if facts is None or not facts.head_ref_oid:
+        return None
+    accepted = _pinned_digests()
+    for path in sorted(touched):
+        data = github.file_at_ref(repo, path, facts.head_ref_oid)
+        if data is None:
+            return None
+        if sha256(data).hexdigest() not in accepted:
+            return True
+    return False
+
+
+def _owns_pin_manifest(repo: str) -> bool:
+    """Whether ``repo`` is the repository the pin manifest ships from — the only repo whose PRs
+    may move pinned bytes, and only together with the recorded digest."""
+    from importlib.resources import files
+    from pathlib import Path
+
+    from agentflow.provider_skills import _github_repository
+    package_repository = _github_repository(Path(str(files("agentflow"))).parent)
+    return bool(package_repository) and repo.casefold() == package_repository
+
+
+def _pinned_digests() -> frozenset[str]:
+    """Every digest the packaged manifest currently accepts for the pinned screenshot harness: its
+    canonical bytes, plus every digest it has ever canonically held. The identical test the launch
+    materializer and enrollment convergence already apply to the same file
+    (`provider_skills.materialize_harness`, `enroll._harness_convergeable`) — a PR landing one of
+    these digests is adding or restoring the harness, not mutating it."""
+    import tomllib
+    from importlib.resources import files
+
+    manifest = tomllib.loads(
+        files("agentflow").joinpath("capabilities.toml").read_bytes().decode("utf-8"))
+    harness = next(
+        item for item in manifest["capabilities"] if item["id"] == "screenshot-harness")
+    return frozenset({harness["sha256"], *harness.get("known_old_sha256", ())})
 
 
 # --- gh actions ----------------------------------------------------------------

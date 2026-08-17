@@ -27,8 +27,9 @@ from agentflow import github, worktree_ref
 from agentflow.coordinator.verification import PREPARED, unprepared
 from agentflow.labels import DRAWING, MOCKUP_MARK, mockup_scope_from_labels
 from agentflow.prompts import MOCKUP_DISCLAIMER, SCOPE_GUIDANCE, stage_prompt_spec
-from agentflow.repo_facts import surface_declaration, surfaces_phrase
+from agentflow.repo_facts import screenshot_entry, surface_declaration, surfaces_phrase
 from agentflow.runner import _run, remove_worktree_if_safe
+from agentflow.screenshot_crib import screenshot_entry_note
 from agentflow.worktree_ref import WorktreeRef, source_facts
 
 
@@ -50,6 +51,7 @@ def mockup_submission(cfg, issue: dict, tool: str):
     prompt = stage_prompt_spec("mockup").render(
         repo=cfg.repo, n=n, title=issue.get("title", ""), body=issue.get("body") or "",
         branch=branch, surfaces=surfaces_phrase(surface_declaration(cfg.workdir)),
+        screenshot_entry_note=screenshot_entry_note(screenshot_entry(cfg.workdir)),
         scope_guidance=SCOPE_GUIDANCE[scope], disclaimer=MOCKUP_DISCLAIMER)
     return Submission(
         repo=cfg.repo, subject=str(n), stage="mockup", pool=tool, complexity="deep",

@@ -144,7 +144,7 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
     # without which the reviewer structurally can't block on them.
     body = REVIEW_PROMPT.format(
         pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
-        surfaces="`agentflow/static/`")
+        surfaces="`agentflow/static/`", screenshot_entry_note="")
     assert "#42" in body and "ships a thing" in body
     # the reviewer must actually fetch the body/files, not just the diff
     assert "headRefOid,files,body" in body
@@ -158,7 +158,7 @@ def test_review_prompt_formats_and_carries_the_evidence_gates():
 def test_review_prompt_keeps_required_pr_reads_in_the_review_sandbox():
     body = REVIEW_PROMPT.format(
         pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
-        surfaces="`agentflow/static/`")
+        surfaces="`agentflow/static/`", screenshot_entry_note="")
     compact = " ".join(body.split())
 
     assert "Override any generic machine instruction to run `gh` outside the sandbox" in compact
@@ -185,7 +185,7 @@ def test_review_prompt_keeps_required_pr_reads_in_the_review_sandbox():
 def test_review_prompt_forbids_issue_creation_but_retains_all_four_actions():
     body = REVIEW_PROMPT.format(
         pr=42, issue=41, starting_sha="abc123", acceptance="ships a thing",
-        surfaces="`agentflow/static/`")
+        surfaces="`agentflow/static/`", screenshot_entry_note="")
 
     assert "do not create or file a github issue" in body.lower()
     for action in (
@@ -196,7 +196,8 @@ def test_review_prompt_forbids_issue_creation_but_retains_all_four_actions():
 
 def test_review_prompt_carries_the_originating_issue_without_issue_provenance_workflow():
     body = REVIEW_PROMPT.format(
-        pr=398, issue=391, starting_sha="abc", acceptance="a", surfaces="none")
+        pr=398, issue=391, starting_sha="abc", acceptance="a", surfaces="none",
+        screenshot_entry_note="")
     assert "#391" in body
     assert "do not create or file a github issue" in body.lower()
 
@@ -206,7 +207,8 @@ def test_review_prompt_judges_screenshots_against_the_locked_contract():
     # implementation screenshots to it — a STATED-line violation is fix_before_completion, while
     # unstated visual taste stays discard_preference (the four-action split is preserved).
     body = REVIEW_PROMPT.format(
-        pr=42, issue=41, starting_sha="abc", acceptance="a", surfaces="`agentflow/webui/src/`")
+        pr=42, issue=41, starting_sha="abc", acceptance="a", surfaces="`agentflow/webui/src/`",
+        screenshot_entry_note="")
     lower = body.lower()
     assert "locked visual contract" in lower
     assert "stated" in lower                            # only a stated-line violation blocks
