@@ -46,7 +46,14 @@ markdown_extensions:
 
 nav:
   - Home: index.md
-  - How it works: how-it-works.md
+  - How it works:
+      - Overview: how-it-works/index.md
+      - The operator's view: how-it-works/operators-view.md
+      - Humans in the loop: how-it-works/humans-in-the-loop.md
+      - The engine: how-it-works/engine.md
+      - Building and reviewing: how-it-works/building-and-reviewing.md
+      - State, tags, and learning: how-it-works/state-and-learning.md
+      - Pitfalls and future work: how-it-works/pitfalls.md
   - Getting started: getting-started.md
   - Pipeline: pipeline.md
   - Capabilities: capabilities.md
