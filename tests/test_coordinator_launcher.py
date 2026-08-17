@@ -849,16 +849,17 @@ def test_bounded_worker_changes_after_completion_do_not_renew(coord_state, tmp_p
     script = (
         "import json,pathlib,sys,time\n"
         f"print(json.dumps({started!r}), flush=True)\n"
-        "time.sleep(.08)\n"
+        "time.sleep(.40)\n"
         f"print(json.dumps({completed!r}), flush=True)\n"
-        "time.sleep(.12)\n"
+        "time.sleep(.60)\n"
         "pathlib.Path(sys.argv[1]).write_text('after worker\\n')\n"
-        "time.sleep(.20)\n"
+        "time.sleep(1.00)\n"
         "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+        "time.sleep(.50)\n"
     )
     provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
     coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.28, 0.50, 1.0)))
+        provider, timeout=5, build_lease=(1.40, 2.50, 5.0)))
     identity = coord.submit_stage(_build("codex", "post-worker-change", str(source)))
     coord.cycle("codex")
 
@@ -916,8 +917,8 @@ def test_bounded_worker_snapshot_rechecks_current_authorization(
             pass
 
         def wait(self, timeout=None):
-            if timeout is None or clock.now + timeout >= 0.22:
-                clock.now = 0.22
+            if timeout is None or clock.now + timeout >= 0.45:
+                clock.now = 0.45
                 return 0
             clock.now += timeout
             raise subprocess.TimeoutExpired("provider", timeout)
@@ -1025,16 +1026,18 @@ def test_prior_unapproved_change_is_not_reclassified_when_worker_starts(coord_st
     script = (
         "import json,pathlib,sys,time\n"
         f"print(json.dumps({unapproved_started!r}), flush=True)\n"
-        "time.sleep(.12)\n"
+        "time.sleep(.60)\n"
         "pathlib.Path(sys.argv[1]).write_text('unapproved change\\n')\n"
         f"print(json.dumps({unapproved_completed!r}), flush=True)\n"
+        "time.sleep(.30)\n"
         f"print(json.dumps({worker_started!r}), flush=True)\n"
-        "time.sleep(.18)\n"
+        "time.sleep(.95)\n"
         "pathlib.Path(sys.argv[2]).write_text('incorrectly renewed')\n"
+        "time.sleep(.50)\n"
     )
     provider = lambda record: [sys.executable, "-c", script, str(target), str(marker)]
     coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.22, 0.50, 1.0)))
+        provider, timeout=5, build_lease=(1.10, 2.50, 5.0)))
     identity = coord.submit_stage(_build("codex", "prior-unapproved-change", str(source)))
     coord.cycle("codex")
 
@@ -1752,9 +1755,11 @@ def test_shell_interpretation_shapes_never_gain_test_grace(
     assert not marker.exists()
 
 
-def test_codex_read_only_command_events_do_not_renew(coord_state, tmp_path):
-    """A paired successful Codex read is durable output, but never a Build progress fact."""
-    marker = tmp_path / "read-renewed-silence"
+def test_codex_read_only_command_completion_is_liveness_without_test_grace(
+        coord_state, tmp_path):
+    """A paired successful Codex read renews silence as liveness, but gains no test grace."""
+    marker = tmp_path / "read-only-liveness"
+    late_marker = tmp_path / "read-only-test-grace"
     started = _codex_command_event("sed -n '1,80p' README.md")
     completed = _codex_command_event("sed -n '1,80p' README.md", completed=True)
     script = ("import json,pathlib,sys,time\n"
@@ -1762,22 +1767,115 @@ def test_codex_read_only_command_events_do_not_renew(coord_state, tmp_path):
               "time.sleep(.12)\n"
               f"print(json.dumps({completed!r}), flush=True)\n"
               "time.sleep(.20)\n"
-              "pathlib.Path(sys.argv[1]).write_text('incorrectly renewed')\n")
-    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+              "pathlib.Path(sys.argv[1]).write_text('liveness')\n"
+              "time.sleep(.45)\n"
+              "pathlib.Path(sys.argv[2]).write_text('test grace')\n")
+    provider = lambda record: [sys.executable, "-c", script, str(marker), str(late_marker)]
     coord = Coordinator(launcher=LocalLauncher(
-        provider, timeout=5, build_lease=(0.20, 0.80, 1.0)))
+        provider, timeout=5, build_lease=(0.50, 0.20, 2.0)))
     identity = coord.submit_stage(_build("codex", "read-only-events", str(tmp_path)))
     coord.cycle("codex")
 
-    record = _wait_for_real_child(identity, "Codex read-only events renewed Build silence")
+    record = _wait_for_real_child(identity, "Codex read-only completion starved its session")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert marker.read_text() == "liveness"
+    assert not late_marker.exists()
+
+
+@pytest.mark.parametrize("pool", ["claude", "codex"])
+def test_composed_verification_liveness_renews_silence_without_commits(
+        coord_state, tmp_path, pool):
+    """The #698 shape: a verify phase of wrapper/pipeline commands, no commits, stays alive."""
+    wrapper = ".sandbox/run.sh node --test frontend/app.test.js 2>&1 | tail -7"
+    pipeline = "uv run pytest tests/one -q | tee out.log"
+    events = []
+    if pool == "claude":
+        for call_id, command, error in (("v1", wrapper, False), ("v2", pipeline, True)):
+            events.append({"type": "assistant", "message": {
+                "type": "message", "role": "assistant", "content": [
+                    {"type": "tool_use", "id": call_id, "name": "Bash",
+                     "input": {"command": command}}]}})
+            events.append({"type": "user", "message": {
+                "type": "message", "role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": call_id, "is_error": error,
+                     "content": "verify output"}]}})
+    else:
+        for call_id, command, exit_code in (("v1", wrapper, 0), ("v2", pipeline, 1)):
+            item = {"id": call_id, "type": "command_execution",
+                    "command": shlex.join(["/bin/zsh", "-lc", command]),
+                    "aggregated_output": "", "exit_code": None, "status": "in_progress"}
+            events.append({"type": "item.started", "item": item})
+            events.append({"type": "item.completed", "item": dict(
+                item, aggregated_output="verify output", exit_code=exit_code,
+                status="completed")})
+    started_one, completed_one, started_two, completed_two = events
+    script = (
+        "import json,time\n"
+        f"print(json.dumps({started_one!r}), flush=True)\n"
+        "time.sleep(.15)\n"
+        f"print(json.dumps({completed_one!r}), flush=True)\n"
+        "time.sleep(.40)\n"
+        f"print(json.dumps({started_two!r}), flush=True)\n"
+        f"print(json.dumps({completed_two!r}), flush=True)\n"
+        "time.sleep(.35)\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.60, 0.80, 2.0)))
+    identity = coord.submit_stage(_build(pool, f"composed-verify-{pool}", str(tmp_path)))
+    coord.cycle(pool)
+
+    record = _wait_for_real_child(identity, "composed verification was starved as silent")
+    assert _build_observation(record).timed_out is False
+
+
+def test_build_without_provider_events_expires_at_its_silent_lease(coord_state, tmp_path):
+    """A session that emits no provider events cannot extend its silent lease."""
+    marker = tmp_path / "no-events-crossed-silence"
+    script = (
+        "import pathlib,sys,time\n"
+        "time.sleep(.35)\n"
+        "pathlib.Path(sys.argv[1]).write_text('too late')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.20, 0.80, 1.0)))
+    identity = coord.submit_stage(_build("codex", "no-provider-events", str(tmp_path)))
+    coord.cycle("codex")
+
+    record = _wait_for_real_child(identity, "silent Build session did not expire")
+    assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert not marker.exists()
+
+
+def test_liveness_renewals_cannot_cross_the_immutable_absolute_cap(coord_state, tmp_path):
+    """Continuous non-canonical completions still end at Build's absolute attempt cap."""
+    marker = tmp_path / "liveness-past-absolute-cap"
+    script = (
+        "import json,pathlib,sys,time\n"
+        "for n in range(8):\n"
+        " event={'type':'user','message':{'type':'message','role':'user','content':[\n"
+        "  {'type':'tool_result','tool_use_id':'v%d'%n,'is_error':True,'content':'x'}]}}\n"
+        " print(json.dumps(event), flush=True)\n"
+        " time.sleep(.10)\n"
+        "pathlib.Path(sys.argv[1]).write_text('too late')\n"
+    )
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
+    coord = Coordinator(launcher=LocalLauncher(
+        provider, timeout=5, build_lease=(0.25, 0.50, 0.45)))
+    identity = coord.submit_stage(_build("claude", "liveness-absolute-cap", str(tmp_path)))
+    coord.cycle("claude")
+
+    record = _wait_for_real_child(identity, "liveness renewals crossed the absolute cap")
     assert _build_observation(record).cause is ProviderCause.TIMEOUT
     assert not marker.exists()
 
 
 @pytest.mark.parametrize("pool", ["claude", "codex"])
-def test_malformed_test_completion_ends_supervision_without_renewing(
+def test_malformed_test_completion_ends_test_grace_but_renews_liveness(
         coord_state, tmp_path, pool):
-    """A valid start cannot lend test grace to an ambiguous provider completion."""
+    """A malformed completion revokes test grace but still renews the silent lease."""
+    marker = tmp_path / f"malformed-{pool}-crossed-silence"
     if pool == "claude":
         started = {"type": "assistant", "message": {"type": "message", "role": "assistant",
                    "content": [{"type": "tool_use", "id": "t1", "name": "Bash",
@@ -1793,12 +1891,15 @@ def test_malformed_test_completion_ends_supervision_without_renewing(
         malformed = {"type": "item.completed", "item": {"id": "t1",
                      "type": "command_execution", "command": command,
                      "aggregated_output": "looks green", "status": "completed"}}
-    script = ("import json,time\n"
+    script = ("import json,pathlib,sys,time\n"
               f"print(json.dumps({started!r}), flush=True)\n"
               "time.sleep(.15)\n"
               f"print(json.dumps({malformed!r}), flush=True)\n"
-              "time.sleep(.40)\n")
-    provider = lambda record: [sys.executable, "-c", script]
+              "time.sleep(.18)\n"
+              "pathlib.Path(sys.argv[1]).write_text('liveness')\n"
+              "time.sleep(.25)\n"
+              "pathlib.Path(sys.argv[1]).write_text('test grace')\n")
+    provider = lambda record: [sys.executable, "-c", script, str(marker)]
     coord = Coordinator(launcher=LocalLauncher(
         provider, timeout=5, build_lease=(0.25, 0.80, 1.0)))
     identity = coord.submit_stage(_build(pool, f"malformed-completion-{pool}", str(tmp_path)))
@@ -1806,6 +1907,7 @@ def test_malformed_test_completion_ends_supervision_without_renewing(
 
     record = _wait_for_real_child(identity, "malformed completion retained test supervision")
     assert _build_observation(record).cause is ProviderCause.TIMEOUT
+    assert marker.read_text() == "liveness"
 
 
 def test_overlapping_tests_are_each_bounded_by_the_test_cap(coord_state, tmp_path):

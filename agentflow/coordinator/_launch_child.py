@@ -683,8 +683,22 @@ class _ProgressStream:
         self.may_have_unread = False
         self.calls: dict[str, tuple[str, object] | None] = {}
         self.seen: set[str] = set()
+        self.live: set[str] = set()
         self.active_tests: dict[str, float] = {}
         self.active_workers: set[str] = set()
+
+    def _alive(self, call_id: object) -> bool:
+        """One completed non-text provider item per id is liveness, regardless of its shape.
+
+        A working session keeps producing completed items even when none match the canonical
+        progress facts (composed verification pipelines, wrapper scripts, reads). Each renews
+        the silent lease once; replaying a consumed id fails closed, and the immutable
+        absolute cap still bounds a session that only churns (#736).
+        """
+        if not isinstance(call_id, str) or not call_id or call_id in self.live:
+            return False
+        self.live.add(call_id)
+        return True
 
     def _remember(self, call_id: object, value: tuple[str, object], now: float) -> None:
         if not isinstance(call_id, str) or not call_id:
@@ -723,6 +737,8 @@ class _ProgressStream:
             return False
         call_id = item.get("id")
         item_type = item.get("type")
+        alive = (event_type == "item.completed" and isinstance(item_type, str)
+                 and item_type not in {"agent_message", "reasoning"} and self._alive(call_id))
         if item_type == "command_execution":
             command = item.get("command")
             kind = ("test" if _recognized_test(command, "codex") else
@@ -737,7 +753,7 @@ class _ProgressStream:
                 if isinstance(call_id, str):
                     self.active_tests.pop(call_id, None)
                     self.active_workers.discard(call_id)
-                return False
+                return alive
             exit_code = item.get("exit_code")
             valid = (item.get("status") == "completed"
                      and isinstance(exit_code, int) and not isinstance(exit_code, bool))
@@ -745,23 +761,23 @@ class _ProgressStream:
                 self.active_tests.pop(call_id, None)
                 self.active_workers.discard(call_id)
                 self.calls[call_id] = None
-                return False
+                return alive
             if kind == "worker":
                 self._complete(call_id, expected, False)
-                return False
-            return self._complete(call_id, expected, exit_code == 0)
+                return alive
+            return self._complete(call_id, expected, exit_code == 0) or alive
         if event_type != "item.completed" or item_type != "file_change":
-            return False
+            return alive
         changes = item.get("changes")
         valid = (item.get("status") == "completed" and isinstance(changes, list) and changes
                  and all(isinstance(change, dict)
                          and change.get("kind") in {"add", "update", "delete"}
                          and self._local_change(change.get("path")) for change in changes))
         if not valid:
-            return False
+            return alive
         expected = ("edit", tuple((change["path"], change["kind"]) for change in changes))
         self._remember(call_id, expected, now)
-        return self._complete(call_id, expected, True)
+        return self._complete(call_id, expected, True) or alive
 
     def _local_change(self, value: object) -> bool:
         return _worktree_path(value, self.working_dir)
@@ -793,6 +809,7 @@ class _ProgressStream:
                         self._remember(block.get("id"), ("edit", (name, path)), now)
             elif event_type == "user" and block.get("type") == "tool_result":
                 call_id = block.get("tool_use_id")
+                renewed = self._alive(call_id) or renewed
                 call = self.calls.get(call_id) if isinstance(call_id, str) else None
                 if call is None:
                     continue
